@@ -122,8 +122,11 @@ fn a_d2_trunk_commit_syncs_its_wal_with_full_fsync() {
     }
 }
 
-/// D2: a branch's first write is synced with F_FULLFSYNC only (arena, then log: two barriers until
-/// M2's no-force page images).
+/// D2: a branch's first write flushes its log with F_FULLFSYNC, its arena slots reaching the device
+/// first by one plain fsync(2) (ruling 85a032f01).
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01, a registered law change): it asserted no fsync(2)
+/// (the arena was F_FULLFSYNC'd, then barriered); it pins the ruling's (1 fsync, 1 F_FULLFSYNC).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_branch_commit_syncs_only_with_full_fsync() {
@@ -138,8 +141,7 @@ fn a_d2_branch_commit_syncs_only_with_full_fsync() {
         let counted = syncs_of(|| {
             bc.execute("UPDATE t SET v = 'mine' WHERE id = 3").unwrap();
         });
-        assert_eq!(counted.0, 0, "catalog={catalog}: a D2 branch commit issued fsync(2): {counted:?}");
-        assert!(counted.1 >= 1, "catalog={catalog}: a D2 branch commit issued no F_FULLFSYNC");
+        assert_eq!(counted, (1, 1), "catalog={catalog}: a D2 branch commit's (fsync, F_FULLFSYNC)");
     }
 }
 
@@ -1545,10 +1547,12 @@ fn a_flight_that_fails_to_write_fail_stops_every_later_write() {
 
 // ---- lead review 1 item 1: one full flush per flight (the arena ordered by a barrier) ----
 
-/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC and no fsync(2). Its
-/// slots need only be ORDERED before the log record that names them (F_BARRIERFSYNC on Apple); the
-/// log's F_FULLFSYNC then drains the device's cache, slots included. Two full flushes (arena, then
-/// log) were the shape before.
+/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC: its slots only reach
+/// the device first (one plain fsync, ruling 85a032f01), and the log's F_FULLFSYNC drains the
+/// device's cache, slots included. Two full flushes (arena, then log) were the shape before.
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01): it pinned (fsync 0, F_FULLFSYNC 1) for the barrier
+/// design; the ruling's design is (1, 1).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_first_write_is_exactly_one_full_fsync() {
@@ -1561,7 +1565,7 @@ fn a_d2_first_write_is_exactly_one_full_fsync() {
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
         let counted = syncs_of(|| write_v(&bc, 3, "mine"));
-        assert_eq!(counted, (0, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
+        assert_eq!(counted, (1, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
     }
 }
 
@@ -1588,7 +1592,9 @@ fn v1_in_process_create_then_first_write_is_two_full_fsyncs_at_c1() {
             }
         });
         let per_pair = counted.1 as f64 / pairs as f64;
-        assert_eq!(counted.0, 0, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
+        // FLAGGED TEST EDIT (lead ruling 85a032f01): each first write's arena takes one plain
+        // fsync(2) ahead of its log's F_FULLFSYNC; it asserted none (the barrier design).
+        assert_eq!(counted.0, pairs, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
         assert!(
             (2.0..=2.01).contains(&per_pair),
             "catalog={catalog}: {} F_FULLFSYNC over {pairs} create+first-write pairs = {per_pair:.4} per pair",
@@ -1617,8 +1623,11 @@ fn the_sync_counter_counts_a_barrier_under_its_own_primitive() {
     assert_eq!(counted(SyncClass::FullFsync), (0, 0, 1), "a D2 barrier is one F_BARRIERFSYNC");
 }
 
-/// Lead review 1 item 1, the other half: a D2 first write still ORDERS its slots before its record
-/// — exactly one F_BARRIERFSYNC beside its one F_FULLFSYNC. Mutant `no_arena_barrier` must fail it.
+/// Lead review 1 item 1, the other half: a D2 first write still sends its slots to the device before
+/// its record's flush — exactly one plain fsync(2) beside its one F_FULLFSYNC, and no barrier.
+/// Mutant `no_arena_sync` must fail it.
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01): it pinned one F_BARRIERFSYNC (the barrier design).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_first_write_orders_its_slots_with_one_barrier() {
@@ -1633,7 +1642,8 @@ fn a_d2_first_write_orders_its_slots_with_one_barrier() {
         let before = sync_counts();
         write_v(&bc, 3, "mine");
         let after = sync_counts();
-        assert_eq!(after.barrier - before.barrier, 1, "catalog={catalog}: the slots were not ordered");
+        assert_eq!(after.fsync - before.fsync, 1, "catalog={catalog}: the slots were not synced");
+        assert_eq!(after.barrier - before.barrier, 0, "catalog={catalog}");
         assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
     }
 }
@@ -1982,7 +1992,9 @@ impl Drop for Threshold {
 #[test]
 fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
     let _s = serial();
-    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(400u64);
+    // FLAGGED TEST EDIT (own test, premise only): 800 pairs, not 400, since end frames no longer
+    // count toward the threshold (review 2 #8) and 400 ran two checkpoints.
+    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(800u64);
     for class in [SyncClass::Fsync, SyncClass::FullFsync] {
         let dir = tempfile::TempDir::new().unwrap();
         let db = open_at(&dir.path().join("ckpt-nosync.db"), opts(true, class));
@@ -2168,10 +2180,18 @@ fn a_last_flight_whose_slot_never_reached_the_disk_is_dropped() {
             let incarnation = db.incarnation;
             drop(trunk);
             drop(db);
-            // The slot's bytes never reached the disk.
+            // The slot's bytes never reached the disk — and neither did the confirmation the flight
+            // writes, unsynced, once its flush returned (FLAGGED TEST EDIT, own test from
+            // f112173f6: the power cut it models loses that write too; a confirmed flight's bad
+            // slot is damage, refused when read, by a_corrupted_arena_slot_is_an_error_not_a_wrong_page).
             let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
             use std::os::unix::fs::FileExt;
             f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .open(arena.to_str().unwrap().replace("-branch-arena", "-branch-log"))
+                .unwrap();
+            log.write_all_at(&[0u8; 4], 36).unwrap();
             (id, incarnation)
         };
         let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
@@ -2219,4 +2239,619 @@ fn a_catalog_store_names_its_catalog_and_refuses_a_missing_arena() {
         Arc::new(SqliteDialect),
     );
     assert!(opened.is_err(), "a catalog store opened with its log and arena gone");
+}
+
+// ---- review 3 #1 (= skill 2 #1): a pre-image kept by a refused decision pass is still made durable
+// before the commit's frames ----
+
+/// Review 3 #1: a trunk commit whose decision pass is refused after it kept page P's pre-image, and
+/// retried, takes no decision for P again (P's written epoch is the commit's own). The pre-image's
+/// record must still be durable before the commit's frames: when the process then dies with nothing
+/// else flushed, the live child reads its fork-point row after the reopen. Second arm: the refused
+/// transaction rolls back, and a later one rewrites the same page.
+#[test]
+fn a_pre_image_kept_by_a_refused_decision_pass_is_durable_before_the_commit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for rollback in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("retain-floor.db");
+            let (child, incarnation) = {
+                let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+                let a = db.connect().unwrap();
+                seed_wide(&a);
+                let child = a.fork_branch().unwrap();
+                db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+                if rollback {
+                    a.execute("BEGIN").unwrap();
+                    a.execute("UPDATE t SET v = 'refused' WHERE id = 3").unwrap();
+                    let refused = a.execute("COMMIT");
+                    assert!(matches!(refused, Err(LimboError::Busy)), "premise: {refused:?}");
+                    let _ = a.execute("ROLLBACK");
+                    write_v(&a, 3, "new");
+                } else {
+                    let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+                    assert!(matches!(stmt.run_ignore_rows(), Err(LimboError::Busy)), "premise");
+                    stmt.run_ignore_rows().unwrap();
+                }
+                let id = child.into_id();
+                // The process ends here: nothing else is flushed.
+                (id, db.incarnation)
+            };
+            let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+            let b = db.branch(child).unwrap();
+            assert_eq!(
+                read_wide(&b.connect().unwrap(), 3),
+                "trunk-3",
+                "catalog={catalog} rollback={rollback}: the child reads the trunk's new row after a crash"
+            );
+        }
+    }
+}
+
+// ---- review 3 #2: a catalog probe refused part-way is made again, not skipped for the process ----
+
+/// Review 3 #2: the once-per-page catalog probe that dates a trunk page's last write
+/// (`trunk_written_known`) is refused (`Busy`, as the catalog's lock would refuse it). The page must
+/// not be taken as dated: when the probe was skipped for the rest of the process, the retried trunk
+/// commit dated the page's last write at 0 and kept its pre-image for EVERY child back to 0, so a
+/// child forked before the page's checkpointed version read the newer row. Arms: the refused probe
+/// is the trunk commit's own (retried by its statement), or a branch read's before the commit.
+#[test]
+fn a_refused_catalog_probe_is_made_again() {
+    let _s = serial();
+    for refused_by_read in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("probe-busy.db");
+        let (old, incarnation) = {
+            let db = open_at(&path, opts(true, SyncClass::Fsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let old = a.fork_branch().unwrap();
+            write_v(&a, 3, "mid");
+            // The pre-image kept for `old` (trunk-3) goes to the catalog; the reopen forgets every
+            // page's written epoch.
+            db.branch_compact_now().unwrap();
+            (old.into_id(), db.incarnation)
+        };
+        let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+        let a = db.connect().unwrap();
+        let young = a.fork_branch().unwrap();
+        let y = young.connect().unwrap();
+        // A point read (`read_wide` scans the table): every page the operations below touch but
+        // row 3's leaf is probed here, so the failpoint's probe is that leaf's.
+        let r50 = y.prepare("SELECT v FROM t WHERE id = 50").unwrap().run_collect_rows().unwrap();
+        assert!(r50[0][0].to_string().starts_with("trunk-50-"), "premise: {:?}", r50[0][0]);
+        let probes = db.branch_twk_counters().0;
+        db.branch_failpoint(Some(BranchFailpoint::TrunkProbeBusy));
+        if refused_by_read {
+            let seen = y.prepare("SELECT v FROM t WHERE id = 3").unwrap().run_collect_rows();
+            assert!(matches!(seen, Err(LimboError::Busy)), "premise: the read's probe was refused: {seen:?}");
+            write_v(&a, 3, "new");
+        } else {
+            let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+            let first = stmt.run_ignore_rows();
+            assert!(matches!(first, Err(LimboError::Busy)), "premise: the decision's probe was refused: {first:?}");
+            stmt.run_ignore_rows().unwrap();
+        }
+        assert_eq!(read_wide(&y, 3), "mid", "refused_by_read={refused_by_read}: the young child");
+        let b = db.branch(old).unwrap();
+        assert_eq!(
+            read_wide(&b.connect().unwrap(), 3),
+            "trunk-3",
+            "refused_by_read={refused_by_read}: the old child reads a row the trunk wrote after its fork"
+        );
+        assert!(
+            db.branch_twk_counters().0 > probes,
+            "refused_by_read={refused_by_read}: the refused probe was not made again"
+        );
+    }
+}
+
+// ---- review 4 #1 (= skill 2 #2): a fuzzy checkpoint commits nothing a failed flight carried ----
+
+/// Review 4 #1 (= skill 2 #2): a fuzzy checkpoint captured while an operation's flight is in the
+/// air commits the catalog only once everything it captured is durable. When that flight FAILS the
+/// commit is refused, so an operation whose caller was told it failed never becomes durable through
+/// the catalog. `fork`: the operation is a fork, else the release of a branch that wrote a page.
+/// Returns the branch that must be there after a reopen, the live count it must show, and the
+/// incarnation.
+fn checkpoint_over_a_failed_flight(path: &Path, fork: bool) -> (BranchId, usize, u64) {
+    let db = open_at(path, opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _anchor = trunk.fork_branch().unwrap().into_id();
+    let x = trunk.fork_branch().unwrap();
+    write_v(&x.connect().unwrap(), 3, "x");
+    let owned = x.owned_slots();
+    assert!(!owned.is_empty(), "premise: the branch owns a slot");
+    let live = db.branch_stats().unwrap().live_branches;
+    let hold = db.branches.trunk_commit_hold.clone();
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+    let (x_id, op) = if fork {
+        let x_id = x.into_id();
+        let db = db.clone();
+        (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| drop(b.into_id()))))
+    } else {
+        (x.id(), std::thread::spawn(move || x.reap().map(|_| ())))
+    };
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    let started = db.branch_checkpoint_fuzzy_now();
+    hold.store(0, std::sync::atomic::Ordering::Release);
+    assert!(started.unwrap(), "fork={fork}: premise: a fuzzy checkpoint started");
+    assert!(op.join().unwrap().is_err(), "fork={fork}: premise: the operation's flight failed");
+    db.branch_checkpoint_wait();
+    if !fork {
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot} was freed by a checkpoint though the release that frees it failed"
+            );
+        }
+    }
+    (x_id, live, db.incarnation)
+}
+
+fn after_the_reopen(path: &Path, fork: bool, (x_id, live, incarnation): (BranchId, usize, u64)) {
+    let db = reopen(path, opts(true, SyncClass::Fsync), incarnation);
+    assert_eq!(
+        db.branch_stats().unwrap().live_branches,
+        live,
+        "fork={fork}: the failed operation became durable through the checkpoint"
+    );
+    let x = db.branch(x_id).expect("the branch is there after a reopen");
+    assert_eq!(read_v(&x.connect().unwrap(), 3), "x", "fork={fork}");
+}
+
+/// Review 4 #1, release arm: the released branch's slots stay out of the allocator, and the branch
+/// is back after a reopen.
+#[test]
+fn a_fuzzy_checkpoint_never_commits_a_release_whose_flight_failed() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-failed-release.db");
+    let kept = checkpoint_over_a_failed_flight(&path, false);
+    after_the_reopen(&path, false, kept);
+}
+
+/// Review 4 #1, fork arm: the fork whose flight failed is not a live branch after a reopen.
+#[test]
+fn a_fuzzy_checkpoint_never_commits_a_fork_whose_flight_failed() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-failed-fork.db");
+    let kept = checkpoint_over_a_failed_flight(&path, true);
+    after_the_reopen(&path, true, kept);
+}
+
+/// Review 4 #1: a fuzzy checkpoint whose store fail-stops after its wait and before its commit
+/// commits nothing: a fail-stopped store writes nothing more (B-F1), the catalog included, so no
+/// install is counted, and after a reopen the branch whose release failed is back. Mutant
+/// `commit_poisoned` (the check before the commit left out) must fail it.
+#[test]
+fn a_fuzzy_checkpoint_commits_nothing_after_a_fail_stop() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-after-fail-stop.db");
+    let (id, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let id = x.id();
+        let installed = db.branch_checkpoint_counters()[0];
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(x.reap().is_err(), "premise: the release's flight failed");
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        assert_eq!(
+            db.branch_checkpoint_counters()[0],
+            installed,
+            "a checkpoint committed and installed after the store fail-stopped"
+        );
+        (id, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let x = db.branch(id).expect("the branch whose release failed is back after a reopen");
+    assert_eq!(read_v(&x.connect().unwrap(), 3), "x");
+}
+
+// ---- skill review 2 #3: a logged Release raises the trunk's barrier floor ----
+
+/// Skill review 2 #3: a Release logged in the store's class (a lease expiry's, through `log_all`)
+/// rather than early-released is still durable in the trunk's class before the next trunk commit's
+/// frames, so the commit's barrier covers it: the first trunk commit after the expiry syncs the
+/// branch log (a barrier, or a flush) on top of its WAL's own sync, and the next one does not.
+/// Arms: a D1 store under a fullfsync trunk, and a D0 store under a synchronous trunk, in which the
+/// Release is only written. Mutant `log_all_no_floor` (the raise left out) must fail it.
+#[test]
+fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit() {
+    let _s = serial();
+    let all = |c: SyncCounts| c.fsync + c.full_fsync + c.barrier;
+    for catalog in [false, true] {
+        for (store, pragma) in [
+            (SyncClass::Fsync, "PRAGMA fullfsync = ON"),
+            (SyncClass::Off, "PRAGMA synchronous = FULL"),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let lease = Some(std::time::Duration::from_secs(1));
+            let db = open_at(&dir.path().join("logged-release.db"), opts(catalog, store).with_branch_lease(lease));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute(pragma).unwrap();
+            let x = trunk.fork_branch().unwrap().into_id();
+            db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+            assert!(db.expire_branches().unwrap().reaped.contains(&x), "premise: the lease expired");
+            let before = all(sync_counts());
+            write_v(&trunk, 7, "new");
+            let first = all(sync_counts()) - before;
+            let before = all(sync_counts());
+            write_v(&trunk, 8, "new");
+            let second = all(sync_counts()) - before;
+            assert!(second >= 1, "catalog={catalog} store={store:?}: premise: the trunk commit synced its WAL");
+            assert!(
+                first > second,
+                "catalog={catalog} store={store:?}: the first trunk commit after a logged Release made \
+                 it no more durable than the store's class ({first} syncs, then {second})"
+            );
+        }
+    }
+}
+
+// ---- review 3 #4: a failed barrier fail-stops; only an unsupported one falls back ----
+
+/// Review 3 #4: an ordered flight's `F_BARRIERFSYNC` that fails as an I/O error does (EIO) is not
+/// retried as an F_FULLFSYNC that may report success for pages the failed call lost: the flight
+/// fails, the trunk commit relying on it is refused, and the store fail-stops (the next branch
+/// commit is refused). Only a barrier the file system does not support (ENOTSUP) falls back to the
+/// full sync, and the fallback is counted.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for (errno, name) in [(libc::EIO, "EIO"), (libc::ENOTSUP, "ENOTSUP")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("barrier-errno.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            super::journal::fail_next_barrier(errno);
+            let before = sync_counts();
+            let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+            let after = sync_counts();
+            let fallbacks = after.barrier_fallback - before.barrier_fallback;
+            if errno == libc::ENOTSUP {
+                committed.unwrap();
+                assert_eq!(fallbacks, 1, "catalog={catalog} {name}: the fallback was not counted");
+                assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {name}");
+                continue;
+            }
+            assert_eq!(fallbacks, 0, "catalog={catalog} {name}: a failed barrier fell back");
+            assert!(
+                committed.is_err(),
+                "catalog={catalog} {name}: a trunk commit relied on a barrier that failed"
+            );
+            let mine = b.connect().and_then(|bc| bc.execute("UPDATE t SET v = 'mine' WHERE id = 3"));
+            assert!(
+                mine.is_err(),
+                "catalog={catalog} {name}: the store did not fail-stop after a failed barrier"
+            );
+        }
+    }
+}
+
+// ---- review 3 #3: ordered trunk mode trusts only a real F_FULLFSYNC of the branch files' device ----
+
+/// An IO over the platform's whose files report, as `File::full_fsync_device`, what `device` says
+/// (`None`: the file cannot say; `Some(d)`: d), and whose sync is a no-op when `noop_sync` is set.
+struct DeviceIo {
+    inner: Arc<dyn IO>,
+    noop_sync: bool,
+    device: fn(&dyn crate::io::File) -> Option<u64>,
+}
+
+struct DeviceFile {
+    inner: Arc<dyn crate::io::File>,
+    noop_sync: bool,
+    device: fn(&dyn crate::io::File) -> Option<u64>,
+}
+
+impl crate::io::Clock for DeviceIo {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for DeviceIo {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
+        Ok(Arc::new(DeviceFile {
+            inner: self.inner.open_file(path, flags, direct)?,
+            noop_sync: self.noop_sync,
+            device: self.device,
+        }))
+    }
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn step(&self) -> crate::Result<()> {
+        self.inner.step()
+    }
+    fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+impl crate::io::File for DeviceFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pread(pos, c)
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<crate::Buffer>>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwritev(pos, buffers, c)
+    }
+    fn sync(&self, c: crate::Completion, sync_type: crate::io::FileSyncType) -> crate::Result<crate::Completion> {
+        if self.noop_sync {
+            c.complete(0);
+            return Ok(c);
+        }
+        self.inner.sync(c, sync_type)
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.truncate(len, c)
+    }
+    fn full_fsync_device(&self) -> Option<u64> {
+        (self.device)(&*self.inner)
+    }
+}
+
+/// Review 3 #3: a trunk commit under a fullfsync trunk lets its WAL F_FULLFSYNC make a kept
+/// pre-image durable (ordered mode: the pre-image is only barriered) only when that flush is a real
+/// F_FULLFSYNC of the branch files' own device, as the opened WAL file itself reports. A WAL whose
+/// sync does nothing (any IO that is not the platform's), or one on another device (a symlinked
+/// `-wal` on another volume), must cost the pre-image its own F_FULLFSYNC. Control: the platform's
+/// file, reporting its own device, stays ordered.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn ordered_trunk_mode_trusts_only_a_full_fsync_of_the_branch_files_device() {
+    let _s = serial();
+    let other = |f: &dyn crate::io::File| -> Option<u64> { Some(f.full_fsync_device().map_or(1, |d| d ^ 1)) };
+    let arms: [(&str, bool, fn(&dyn crate::io::File) -> Option<u64>); 3] = [
+        ("no-op sync", true, |_| None),
+        ("another device", false, other),
+        ("control", false, |f| f.full_fsync_device()),
+    ];
+    for catalog in [false, true] {
+        for (arm, noop_sync, device) in arms {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("ordered.db");
+            let io: Arc<dyn IO> = Arc::new(DeviceIo {
+                inner: Arc::new(PlatformIO::new().unwrap()),
+                noop_sync,
+                device,
+            });
+            let db = Database::open_file_with_flags(
+                io,
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                opts(catalog, SyncClass::Fsync),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            let before = sync_counts();
+            trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
+            let after = sync_counts();
+            let (full, barrier) = (after.full_fsync - before.full_fsync, after.barrier - before.barrier);
+            let wal = u64::from(!noop_sync);
+            if arm == "control" {
+                assert!(barrier >= 1 && full == wal, "catalog={catalog} {arm}: not ordered: full={full} barrier={barrier}");
+            } else {
+                assert!(
+                    full > wal && barrier == 0,
+                    "catalog={catalog} {arm}: the pre-image counted on a WAL flush that cannot carry it: \
+                     full={full} (the WAL's own: {wal}) barrier={barrier}"
+                );
+            }
+            assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {arm}");
+        }
+    }
+}
+
+// ---- review 3 #5: an arena sync failure in a compaction or a checkpoint fail-stops ----
+
+/// Review 3 #5: an arena sync that fails during a compaction (snapshot store) or a catalog
+/// checkpoint (here a fuzzy one, captured while a branch commit's flight is in the air, so it syncs
+/// the arena) fail-stops the store: a later sync of the same file may report success for pages the
+/// failed one lost, so nothing more may be acknowledged. The next branch commit is refused, and a
+/// branch released afterwards frees nothing. Mutant `checkpoint_sync_error_kept` (the checkpoint's
+/// fail-stop left out) must fail the catalog arm.
+#[test]
+fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("arena-sync-fails.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let owned = x.owned_slots();
+        if catalog {
+            let y = trunk.fork_branch().unwrap();
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+            let writer = std::thread::spawn(move || {
+                let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
+                drop(y.into_id());
+                r
+            });
+            wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+            db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+            let started = db.branch_checkpoint_fuzzy_now();
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            assert!(started.unwrap(), "premise: a fuzzy checkpoint started");
+            writer.join().unwrap().unwrap();
+            db.branch_checkpoint_wait();
+        } else {
+            db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+            assert!(db.branch_compact_now().is_err(), "premise: the compaction's arena sync failed");
+        }
+        let committed = x.connect().and_then(|xc| xc.execute("UPDATE t SET v = 'after' WHERE id = 4"));
+        assert!(
+            committed.is_err(),
+            "catalog={catalog}: a branch commit was acknowledged after an arena sync failed"
+        );
+        let _ = x.reap();
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "catalog={catalog}: slot {slot} was freed after the store should have fail-stopped"
+            );
+        }
+    }
+}
+
+// ---- review 3 #7: the name filter is bounded, sharded, built off the mutex and retried ----
+
+/// Review 3 #7 (a): under churn of unique names (each created and dropped again), the name filter
+/// never stalls one create with a rehash of every name it holds, and it holds about the names
+/// held, not every name ever held. Over `n` cycles the most entries one insert moved stays within a
+/// small multiple of n/256 (256 shards), and the filter ends under n/2 entries (a rebuild keeps it
+/// near twice the larger of the live names and its rebuild floor). Before: one insert moved half
+/// of all the names ever created, and the filter held all n.
+#[test]
+fn the_name_filter_stays_bounded_under_churn() {
+    let _s = serial();
+    let n = std::env::var("FE_NAME_CHURN").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000u64);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("name-churn.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..n {
+        let name = format!("churn-{i}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+    }
+    db.branch_wait_name_filter();
+    let (built, entries, moved, _, _) = db.branch_name_filter_stats();
+    assert!(built, "premise: the name filter is built");
+    assert!(
+        moved <= 4 * n / 256 + 64,
+        "one insert into the name filter moved {moved} entries ({n} names created)"
+    );
+    assert!(entries < n / 2, "the name filter holds {entries} entries after {n} create-and-drop cycles");
+}
+
+/// Review 3 #7 (d): a name filter whose catalog scan fails once is built by a retry, and the
+/// failure is counted. Before, it stayed unbuilt for the life of the process, and every named
+/// create went back to one catalog query under the store mutex.
+#[test]
+fn a_failed_name_scan_is_retried() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("name-retry.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("held").unwrap();
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    super::store::NAME_SCAN_FAILS.store(true, std::sync::atomic::Ordering::Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    let consumed = !super::store::NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
+    assert!(consumed, "premise: the open's build met the failing scan");
+    let (built, _, _, builds, failed) = db.branch_name_filter_stats();
+    assert_eq!(failed, 1, "the failed scan was not counted");
+    assert!(built && builds == 1, "the name filter was not built after its scan failed once");
+    assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
+}
+
+/// Review 3 #7 (e): each way a held name reaches the filter is load-bearing once the name's state
+/// is evicted (resident cap 0) and only the filter stands between a create and the catalog: a name
+/// created after the build (`note` into the built set), one created while the build ran (`note`
+/// into `pending`, merged at the install), and one created before the build but not yet
+/// checkpointed (the build's seed). Each must still be refused after a checkpoint evicted it.
+/// Mutants `no_note_built`, `no_note_pending`, `no_pending_merge` and `no_seed` must fail it.
+#[test]
+fn every_held_name_reaches_the_name_filter() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for arm in ["built", "pending", "seeded"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("name-inputs.db");
+        let incarnation = {
+            let db = open_at(&path, opts(true, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.create_branch("old").unwrap();
+            db.branch_compact_now().unwrap();
+            if arm == "built" {
+                db.branch_set_resident_cap(Some(0));
+                trunk.create_branch("x").unwrap();
+                db.branch_compact_now().unwrap();
+                assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
+                continue;
+            }
+            if arm == "seeded" {
+                // In the log only: replayed at the reopen, before the filter's build starts.
+                trunk.create_branch("x").unwrap();
+            }
+            db.incarnation
+        };
+        super::store::NAME_SCAN_HOLD.store(1, O::Release);
+        let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+        let t = std::time::Instant::now();
+        while super::store::NAME_SCAN_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+            if t.elapsed() > std::time::Duration::from_secs(10) {
+                super::store::NAME_SCAN_HOLD.store(0, O::Release);
+                panic!("{arm}: the name filter's build never reached its scan");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let trunk = db.connect().unwrap();
+        if arm == "pending" {
+            trunk.create_branch("x").unwrap();
+        }
+        super::store::NAME_SCAN_HOLD.store(0, O::Release);
+        db.branch_wait_name_filter();
+        assert!(db.branch_name_filter_stats().0, "{arm}: premise: the name filter is built");
+        db.branch_set_resident_cap(Some(0));
+        db.branch_compact_now().unwrap();
+        assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
+        assert!(trunk.create_branch("old").is_err(), "{arm}: a checkpointed name was given again");
+    }
 }

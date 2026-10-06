@@ -4591,7 +4591,7 @@ impl Pager {
                 && self.trunk_pre_images.lock().is_empty()
                 && !crate::branch::store::fe_mutant("childless_commit_gated");
             if childless {
-                self.trunk_required.store(store.release_floor(), Ordering::Release);
+                self.trunk_required.store(store.barrier_floor(), Ordering::Release);
             } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
                 let decided = {
@@ -4629,10 +4629,13 @@ impl Pager {
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
-            store.durability_barrier_to(
-                crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type()),
-                self.trunk_required.load(Ordering::Acquire),
-            )?;
+            let trunk = crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type());
+            // Whether this commit's WAL flush carries the branch files (ordered mode) is read from
+            // the WAL file it syncs, each time (review 3 #3).
+            if trunk == crate::branch::SyncClass::FullFsync {
+                store.note_trunk_wal(self.wal.as_ref().and_then(|wal| wal.full_fsync_device()));
+            }
+            store.durability_barrier_to(trunk, self.trunk_required.load(Ordering::Acquire))?;
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);

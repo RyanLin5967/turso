@@ -753,6 +753,11 @@ pub trait Wal: Debug + Send + Sync {
     ) -> Result<Option<Completion>>;
     fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+    /// The device `sync(FileSyncType::FullFsync)` drains (`File::full_fsync_device` of the WAL
+    /// file it syncs); `None` when the WAL is not enabled or not open, or its file cannot say.
+    fn full_fsync_device(&self) -> Option<u64> {
+        None
+    }
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
     /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
@@ -4020,6 +4025,21 @@ impl Wal for WalFile {
             }
         );
         self.coordination.publish_backfill(max_frame);
+    }
+
+    fn full_fsync_device(&self) -> Option<u64> {
+        // `wal_file` asserts an enabled WAL; a disabled one has no flush to count on.
+        let enabled = self
+            .coordination
+            .shared_wal_state()
+            .read()
+            .metadata
+            .enabled
+            .load(Ordering::Relaxed);
+        if !enabled {
+            return None;
+        }
+        self.coordination.wal_file().ok()?.full_fsync_device()
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]

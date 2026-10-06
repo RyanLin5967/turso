@@ -4,10 +4,14 @@
 //! # Files, next to the database file `<db>`
 //!
 //! * `<db>-branch-arena` — page slots; see [`super::arena`].
-//! * `<db>-branch-log` — a 32-byte header, then frames `[payload_len u32][crc32c(payload) u32]
-//!   [payload]`, all little-endian. Each payload is one [`Record`]. Replay stops at the first frame
-//!   that is short or fails its CRC and truncates the file there: a torn append is exactly a crash
-//!   before that record was durable (LevelDB's log reader; Redis `aof-load-truncated`).
+//! * `<db>-branch-log` — a 40-byte header carrying the incarnation's nonce, then FLIGHTS: each one
+//!   write of frames `[payload_len u32][crc32c(payload) u32][payload]` (each payload one
+//!   [`Record`]) closed by a 17-byte end frame (its tag saying whether the flight was synced, its
+//!   length and crc32c, both checksums seeded with the nonce), all little-endian. Replay keeps
+//!   whole flights only: a flight cut short, torn or garbled anywhere was never acknowledged and is
+//!   cut whole (LevelDB's log reader; ext4's journal commit block), unless a synced flight's end at
+//!   or after the damage is followed by any whole frame, which proves the damaged write was
+//!   acknowledged: then the store is refused. The last flight's arena slots are checked too.
 //! * `<db>-branch-snap` — the whole live state (see [`SnapshotState`]) with a generation number,
 //!   written to a temp file, fsynced and renamed into place. A log belongs to the snapshot with the
 //!   same generation; a log with an OLDER generation is what a crash between the rename and the log
@@ -23,9 +27,12 @@
 //!
 //! # The ordering rule
 //!
-//! [`Journal::flush`] syncs the arena BEFORE it writes and syncs the buffered records, and records
-//! are only ever written by a flush. A record on disk therefore never names a slot whose bytes are
-//! not already durable, even if the OS writes the log page early.
+//! A flight sends the arena's written slots to the device (a plain fsync) BEFORE it writes and
+//! flushes its records, and records are only ever written by a flight; the log's flush drains the
+//! device, slots included (ruling 85a032f01, on one device: `one_device`). A power cut before that
+//! flush returns can keep the records and lose a slot, so recovery checks every slot the LAST
+//! flight names and drops the flight if one fails (`last_flight_slots_hold`); an older flight's
+//! slots were durable before the next flight was written.
 //!
 //! # One store per set of files
 //!
@@ -76,8 +83,15 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// in flights, each ending in a `FlightEnd` frame, and read by the flight rule (see
 /// `Journal::recover_base`). A 7 or 8 log has no end frames, and this rule would cut every record of
 /// it as a torn flight, so it is refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 9;
-const SPLICE_FORMAT_VERSION: u32 = 10;
+///
+/// 11 and 12 (fastest-engine, review 2 #1-3/#7/#8): a 40-byte log header carrying a random nonce
+/// under its checksum — a new one for every incarnation of the log (each reset, cut and compaction),
+/// so no flight of an older incarnation is ever taken for one of this — and a 17-byte end frame (a
+/// frame-layer marker, no longer a record): a tag saying whether the flight was synced, the
+/// flight's length, and its crc32c, both the end frame's own checksum and the flight's seeded with
+/// the nonce. A 9 or 10 log ("written before the log nonce") is refused, never reinterpreted.
+const FORMAT_VERSION: u32 = 11;
+const SPLICE_FORMAT_VERSION: u32 = 12;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -88,8 +102,19 @@ pub(crate) fn format_version(splice: bool) -> u32 {
         FORMAT_VERSION
     }
 }
-const LOG_HEADER_LEN: usize = 32;
+/// magic(8) format(4) page size(4) generation(8) nonce(4) crc32c of the 28 bytes before it(4),
+/// then the raised class (`HEADER_RAISED_AT`, outside the checksum: rewritten in place) and 4
+/// reserved bytes.
+const LOG_HEADER_LEN: usize = 40;
 const FRAME_HEADER_LEN: usize = 8;
+/// The end frame's tags: a flight written in a class that does not sync, and one that does (or is
+/// ordered ahead of a trunk commit's flush). No record tag takes either value.
+const END_TAG: u8 = 0xE0;
+const END_SYNCED_TAG: u8 = 0xE1;
+/// tag(1) flight length(4) the flight's crc32c, seeded with the nonce(4).
+const END_PAYLOAD_LEN: usize = 9;
+/// An end frame: its frame header, whose checksum is seeded with the nonce too, and its payload.
+const END_FRAME_LEN: usize = FRAME_HEADER_LEN + END_PAYLOAD_LEN;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
 /// never more than a constant factor of the live state and compaction work is amortised O(1).
 const COMPACT_MIN_LOG_BYTES: u64 = 1 << 20;
@@ -229,17 +254,6 @@ pub(crate) enum Record {
     Checkpoint {
         generation: u64,
     },
-    /// The last frame of every flight (every write of buffered records, `Journal::take_flight` and
-    /// `Journal::flush`): where the flight began and the crc32c of its frames before this one (a
-    /// transactional checksum, as ext4's journal and OptFS put in a commit block). It lets recovery
-    /// tell a flight torn in the air — never synced, so never acknowledged — from an acknowledged
-    /// flight lost under a later one (r12-noforce). Recovery consumes it; it is never replayed.
-    FlightEnd {
-        start: u64,
-        /// Every log byte below this was synced before the flight was written (review B-F5).
-        synced: u64,
-        crc: u32,
-    },
 }
 
 const TAG_FORK: u8 = 1;
@@ -254,8 +268,6 @@ const TAG_RELEASE_OPEN: u8 = 8;
 const TAG_CLOSE: u8 = 9;
 /// fastest-engine M1 item 4.
 const TAG_FORK_NAMED: u8 = 10;
-/// fastest-engine (r12-noforce's 12, renumbered past `ForkNamed`).
-const TAG_FLIGHT_END: u8 = 11;
 
 /// Every record tag is distinct (r13-compose S-4): two equal tag constants would compile, with only an
 /// unreachable-pattern warning, and decode one record as the other. Refused at compile time instead.
@@ -271,7 +283,8 @@ const _: () = {
         TAG_RELEASE_OPEN,
         TAG_CLOSE,
         TAG_FORK_NAMED,
-        TAG_FLIGHT_END,
+        END_TAG,
+        END_SYNCED_TAG,
     ];
     let mut i = 0;
     while i < tags.len() {
@@ -357,12 +370,6 @@ impl Record {
                 out.push(TAG_CHECKPOINT);
                 put_u64(out, *generation);
             }
-            Record::FlightEnd { start, synced, crc } => {
-                out.push(TAG_FLIGHT_END);
-                put_u64(out, *start);
-                put_u64(out, *synced);
-                put_u32(out, *crc);
-            }
         }
     }
 
@@ -411,11 +418,6 @@ impl Record {
             TAG_CLOCK => Record::Clock { now_ms: r.u64()? },
             TAG_CHECKPOINT => Record::Checkpoint {
                 generation: r.u64()?,
-            },
-            TAG_FLIGHT_END => Record::FlightEnd {
-                start: r.u64()?,
-                synced: r.u64()?,
-                crc: r.u32()?,
             },
             _ => return None,
         };
@@ -651,6 +653,8 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// See [`Journal::fail_next_arena_sync`].
+    fail_next_arena_sync: bool,
     /// See [`Journal::fail_next_take`].
     fail_next_take: bool,
     /// The format version this journal writes and was read at (`format_version`).
@@ -667,14 +671,9 @@ pub(crate) struct Journal {
     /// checkpoint and its log cut), which therefore syncs in `rewrite_class` (fastest-engine review
     /// B-F3). Kept in the log header, so a restart keeps it too.
     raised: SyncClass,
-    /// Below this log offset every byte was synced before the next flight was written: what a
-    /// flight's end frame records (`FlightEnd::synced`), so recovery refuses only damage that a
-    /// LATER flight proves had been synced (fastest-engine review B-F5).
-    synced_to: u64,
-    /// Where the flight in the air ends if it syncs: `synced_to` once the next flight is taken
-    /// (one flight at a time, and a failed one fail-stops the journal, so the next take means it
-    /// landed).
-    flight_synced_end: Option<u64>,
+    /// This incarnation of the log's nonce (format 11): in its header, and seeding every end
+    /// frame's checksums, so recovery never takes an older incarnation's flight for one of this.
+    nonce: u32,
     /// The header's raised-class field must be rewritten by the next write (`raised` grew).
     header_stale: bool,
     /// Every rewrite of the log file (a reset, a cut, a compaction) moves this: a cut prepared off
@@ -700,6 +699,7 @@ pub(crate) struct CutSource {
     raised: SyncClass,
     class: SyncClass,
     tmp: PathBuf,
+    nonce: u32,
 }
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
@@ -712,6 +712,9 @@ pub(crate) struct CutPrep {
     generation: u64,
     /// Bytes after the header.
     written: u64,
+    /// The new log's nonce, and the old one's (the delta the install copies is framed in it).
+    nonce: u32,
+    old_nonce: u32,
 }
 
 impl Journal {
@@ -771,13 +774,13 @@ impl Journal {
             poisoned: Arc::new(AtomicBool::new(false)),
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_arena_sync: false,
             fail_next_take: false,
             format: FORMAT_VERSION,
             lsn: 0,
             pending_class: SyncClass::Off,
             raised: SyncClass::Off,
-            synced_to: 0,
-            flight_synced_end: None,
+            nonce: 0,
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
@@ -907,7 +910,7 @@ impl Journal {
             (Some((ps, g, state, len)), _) => {
                 (ps, g, catalog.is_none().then_some(state), len)
             }
-            (None, Some((ps, g))) => {
+            (None, Some((ps, g, _))) => {
                 if g != 0 {
                     return Err(corrupt("log generation is past 0 but there is no snapshot"));
                 }
@@ -928,13 +931,13 @@ impl Journal {
             poisoned: Arc::new(AtomicBool::new(false)),
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_arena_sync: false,
             fail_next_take: false,
             format,
             lsn: 0,
             pending_class: SyncClass::Off,
             raised,
-            synced_to: 0,
-            flight_synced_end: None,
+            nonce: 0,
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
@@ -948,14 +951,17 @@ impl Journal {
         // an older one, cut at the checkpoint's marker below (F-FZ).
         let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
         match header {
-            Some((log_ps, log_gen)) if replayable(log_gen) => {
+            Some((log_ps, log_gen, nonce)) if replayable(log_gen) => {
                 if log_ps != page_size {
                     return Err(corrupt("log and snapshot disagree on the page size"));
                 }
+                journal.nonce = nonce;
                 let mut pos = LOG_HEADER_LEN;
                 // Where the last whole flight ends, and how many records precede it. The header is
                 // a flight boundary: a log whose first flight is torn keeps no record.
                 let mut whole = (LOG_HEADER_LEN, 0usize);
+                // The last whole flight that holds records: where it starts, and its first record.
+                let mut last_flight: Option<(usize, usize)> = None;
                 // How the scan stopped: `None` at the clean end of the file, else what it met.
                 let mut damage: Option<&str> = None;
                 loop {
@@ -980,66 +986,97 @@ impl Journal {
                         damage = Some("a short frame");
                         break;
                     };
-                    if scan_crc(payload) != crc {
-                        damage = Some("a damaged frame");
-                        break;
-                    }
-                    let record =
-                        Record::decode(payload).ok_or_else(|| corrupt("undecodable log record"))?;
-                    if let Record::FlightEnd {
-                        start: from,
-                        crc: flight_crc,
-                        ..
-                    } = record
-                    {
-                        // An end frame ends a whole flight only if the flight began where the last
-                        // whole one ended and its checksum covers every frame since: anything else
-                        // (a frame lost or replaced inside the flight, an end frame left over from
-                        // another log) is damage, as at any torn frame.
-                        let ends_whole = from == whole.0 as u64
-                            && bytes
-                                .get(whole.0..pos)
-                                .is_some_and(|flight| scan_crc(flight) == flight_crc);
-                        if !ends_whole {
+                    // Mutants (test builds only, review 2 #11): `skip_frame_crc` trusts every
+                    // frame's own checksum, `skip_flight_crc` every end frame's flight checksum,
+                    // `skip_flight_start` every end frame's flight length.
+                    let frame_ok = |seeded: bool| {
+                        super::store::fe_mutant("skip_frame_crc")
+                            || if seeded { scan_crc_seeded(nonce, payload) } else { scan_crc(payload) } == crc
+                    };
+                    if is_end(len, payload[0]) {
+                        // An end frame of THIS incarnation (its checksum is seeded with the
+                        // nonce), ending a flight that began where the last whole one ended and
+                        // whose checksum covers every frame since. Anything else — a frame lost or
+                        // replaced inside the flight, an end frame left from an older incarnation —
+                        // is damage, as at any torn frame.
+                        if !frame_ok(true) {
+                            damage = Some("an end frame of another incarnation, or a damaged one");
+                            break;
+                        }
+                        let flight_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+                        let flight_crc = u32::from_le_bytes(payload[5..9].try_into().unwrap());
+                        let starts_right =
+                            pos - whole.0 == flight_len || super::store::fe_mutant("skip_flight_start");
+                        let sums_right = super::store::fe_mutant("skip_flight_crc")
+                            || bytes
+                                .get(pos.saturating_sub(flight_len)..pos)
+                                .is_some_and(|flight| scan_crc_seeded(nonce, flight) == flight_crc);
+                        if !(starts_right && sums_right) {
                             damage = Some("a flight whose end frame does not match it");
                             break;
+                        }
+                        if records.len() > whole.1 {
+                            last_flight = Some(whole);
                         }
                         pos = start + len;
                         whole = (pos, records.len());
                         continue;
                     }
+                    if !frame_ok(false) {
+                        damage = Some("a damaged frame");
+                        break;
+                    }
+                    let record =
+                        Record::decode(payload).ok_or_else(|| corrupt("undecodable log record"))?;
                     records.push(record);
                     pos = start + len;
                     ends.push(pos);
                 }
                 if let Some(what) = damage {
                     // Is the damage a torn flight — nothing acknowledged lost — or an acknowledged
-                    // flight lost under a later one (possible under macOS plain fsync, or a device
-                    // that reorders)? A flight is written only after the one before it is synced
-                    // (one flight in the air at a time), so the damage is a torn flight unless a
-                    // WHOLE later flight follows it: a whole end frame naming a start past the
-                    // damage. The damaged flight's own end frame, if it survived, names a start at
-                    // or before the damage and does not count. The flight the damage lies in was
-                    // never acknowledged, whatever survived of it, and is cut below (r12-noforce's
-                    // one damage rule, 02c5ce7f0 R2-3/4).
-                    if let Some(at) = later_whole_flight(&bytes, pos) {
+                    // flight lost (possible under macOS plain fsync, or a device that reorders)? A
+                    // flight is written only after the one before it was synced (one flight in the
+                    // air at a time), so the damage was acknowledged exactly when a synced flight
+                    // at or after it is followed by any whole frame (`synced_flight_over`; review 2
+                    // #2). A flight written in a class that does not sync (D0) proves nothing, so
+                    // under D0 every damage is a torn flight and cut. The flight the damage lies in
+                    // was never acknowledged otherwise, whatever survived of it, and is cut below.
+                    if let Some(at) = synced_flight_over(&bytes, pos, nonce) {
                         // No truncation is offered (review 7 item 1, the lead's decision): the
-                        // later flight was acknowledged, so the damaged one was too.
+                        // flight was acknowledged.
+                        let state = if catalog_store { &files.cat } else { &files.snap };
                         return Err(corrupt(&format!(
-                            "branch log {log}: {what} at byte {pos} is followed by a whole later \
-                             flight at byte {at}, so this is not a torn flight. The flight it lies \
-                             in was acknowledged, and cutting the log there is not safe: it would \
-                             drop trunk pre-image records whose trunk commits are durable, and \
-                             branches forked before them would then read newer trunk pages without \
-                             any error. The safe remedy: keep a copy of all three branch files \
-                             ({log}, {arena}, {snap}) — a restore needs all three, and is safe \
-                             only while the trunk has not been written since they were moved aside \
-                             — then move all three aside. Every branch is lost; the trunk is \
-                             intact, because it never depends on branch files",
+                            "branch log {log}: {what} at byte {pos} lies under a synced flight that \
+                             ends at byte {at}, and a later frame follows it, so this is not a torn \
+                             flight. The flight it lies in was acknowledged, and cutting the log \
+                             there is not safe: it would drop trunk pre-image records whose trunk \
+                             commits are durable, and branches forked before them would then read \
+                             newer trunk pages without any error. The safe remedy: keep a copy of \
+                             all three branch files ({log}, {arena}, {state}) — a restore needs \
+                             all three, and is safe only while the trunk has not been written since \
+                             they were moved aside — then move all three aside. Every branch is \
+                             lost; the trunk is intact, because it never depends on branch files",
                             log = files.log.display(),
                             arena = files.arena.display(),
-                            snap = files.snap.display()
+                            state = state.display()
                         )));
+                    }
+                }
+                // The last flight's slots must hold what it says (ruling 85a032f01: the arena is
+                // synced by plain fsync before the log's flush): one that does not was never
+                // acknowledged, and goes like a torn one.
+                // A last flight confirmed in the header (its sync returned) keeps its records whatever
+                // its slots hold: a slot failing then is damage, refused when read, never a
+                // silently older page.
+                let confirmed = bytes
+                    .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
+                    .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+                if let Some((start, first)) = last_flight.filter(|&(start, _)| start < whole.0) {
+                    let last_crc = u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap());
+                    if confirmed != Some(last_crc)
+                        && !last_flight_slots_hold(files, page_size, &records[first..whole.1])
+                    {
+                        whole = (start, first);
                     }
                 }
                 // Only whole flights are kept: a flight is synced only after all of it is written,
@@ -1050,6 +1087,13 @@ impl Journal {
                     records.truncate(whole.1);
                     ends.truncate(whole.1);
                     pos = whole.0;
+                }
+                if pos < bytes.len() {
+                    tracing::warn!(
+                        "branch log {}: a torn flight cut at byte {pos} ({} bytes)",
+                        files.log.display(),
+                        bytes.len() - pos
+                    );
                 }
                 journal.len = pos as u64;
                 // fastest-engine mutant `no_torn_tail_cut` (test builds only): the torn tail is
@@ -1062,11 +1106,10 @@ impl Journal {
                     set_file_len(&journal.file, pos as u64)?;
                 }
                 // What is kept is synced before anything follows it, cut or not: the last whole
-                // flight may have been written and never synced by the process that died, and the
-                // next flight's end frame will say every byte before it was (review B-F5).
+                // flight may have been written and never synced by the process that died, and a
+                // later flight's frames will prove it was.
                 if sync.syncs() {
                     fsync_file(&journal.file, sync)?;
-                    journal.synced_to = pos as u64;
                 }
                 if log_gen != generation {
                     // F-FZ crash state S1: the catalog holds everything up to its checkpoint's
@@ -1088,7 +1131,7 @@ impl Journal {
                     journal.rewrite_from(cut as u64, generation)?;
                 }
             }
-            Some((_, log_gen)) if log_gen > generation => {
+            Some((_, log_gen, _)) if log_gen > generation => {
                 return Err(corrupt("log generation is ahead of the snapshot"));
             }
             // An older generation in a snapshot store (a compaction crashed after its rename, before
@@ -1132,6 +1175,12 @@ impl Journal {
     /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
     pub(crate) fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// Fail the arena sync of the next compaction as an I/O error would (the `ArenaSyncFails`
+    /// failpoint, snapshot stores).
+    pub(crate) fn fail_next_arena_sync(&mut self) {
+        self.fail_next_arena_sync = true;
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -1178,17 +1227,13 @@ impl Journal {
         if !kept.is_empty() {
             read_at(&self.file, &mut kept, file_from)?;
         }
-        // Re-framed as ONE flight from the new header: the cut can fall inside a flight, and the
-        // end frames kept after it name starts in the old log, which the new one does not have
-        // (fastest-engine; r12-noforce's port had no log rewrite). Every flight is in the file
-        // whole here, so the new one is too, once its sync below returns.
-        let mut suffix = record_frames(&kept)?;
-        if !suffix.is_empty() {
-            let end = flight_end_frame(LOG_HEADER_LEN as u64, LOG_HEADER_LEN as u64, &suffix);
-            suffix.extend_from_slice(&end);
-        }
         // Every kept record, raised ones included, stays as durable as it was (review B-F3).
         let class = self.rewrite_class();
+        // Framed again for a new incarnation, every kept flight keeping its boundary (review 2
+        // #3); the cut can fall inside a flight, whose kept part becomes a flight of its own.
+        // Every flight is in the file whole here, so each new one is too once its sync returns.
+        let nonce = fresh_nonce(self.nonce);
+        let (suffix, last_crc) = reframe(&kept, self.nonce, nonce, class.syncs())?;
         let tmp = self.files.log_tmp();
         let written = (|| -> Result<File> {
             let f = open_rw(&tmp, true)?;
@@ -1196,9 +1241,11 @@ impl Journal {
             // the rename finds this lock, as it found the old one.
             lock_exclusive(&f, &tmp)?;
             // r13-compose S-3: the header carries THIS log's format (a splice-arm log stays 6).
-            write_at(&f, &log_header(self.format, self.page_size, generation, self.raised), 0)?;
+            write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+                // Synced with the rest below: the kept last flight is confirmed.
+                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
             }
             if class.syncs() {
                 fsync_file(&f, class)?;
@@ -1221,9 +1268,8 @@ impl Journal {
         self.rewrites += 1;
         self.compact_after = 0;
         self.generation = generation;
+        self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-        self.synced_to = if class.syncs() { self.len } else { 0 };
-        self.flight_synced_end = None;
         self.header_stale = false;
         self.snapshot_len = 0;
         let drop_pending = from.saturating_sub(file_from) as usize;
@@ -1259,6 +1305,7 @@ impl Journal {
             raised: self.raised,
             class: self.rewrite_class(),
             tmp: self.files.log_tmp(),
+            nonce: self.nonce,
         }))
     }
 
@@ -1270,17 +1317,15 @@ impl Journal {
         if !kept.is_empty() {
             read_at(&src.log, &mut kept, from)?;
         }
-        let mut suffix = record_frames(&kept)?;
-        if !suffix.is_empty() {
-            let end = flight_end_frame(LOG_HEADER_LEN as u64, LOG_HEADER_LEN as u64, &suffix);
-            suffix.extend_from_slice(&end);
-        }
+        let nonce = fresh_nonce(src.nonce);
+        let (suffix, last_crc) = reframe(&kept, src.nonce, nonce, src.class.syncs())?;
         let written = (|| -> Result<File> {
             let f = open_rw(&src.tmp, true)?;
             lock_exclusive(&f, &src.tmp)?;
-            write_at(&f, &log_header(src.format, src.page_size, generation, src.raised), 0)?;
+            write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
             }
             if src.class.syncs() {
                 fsync_file(&f, src.class)?;
@@ -1295,6 +1340,8 @@ impl Journal {
                 rewrites: src.rewrites,
                 generation,
                 written: suffix.len() as u64,
+                nonce,
+                old_nonce: src.nonce,
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&src.tmp);
@@ -1312,6 +1359,7 @@ impl Journal {
     pub(crate) fn finish_cut(&mut self, prep: CutPrep, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
         let usable = prep.rewrites == self.rewrites
+            && prep.old_nonce == self.nonce
             && prep.from == from
             && prep.generation == generation
             && prep.upto <= self.len
@@ -1326,11 +1374,10 @@ impl Journal {
         if self.len > prep.upto {
             let mut delta = vec![0u8; (self.len - prep.upto) as usize];
             read_at(&self.file, &mut delta, prep.upto)?;
-            let mut frames = record_frames(&delta)?;
+            let (frames, last_crc) = reframe(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
-                let end = flight_end_frame(len, len, &frames);
-                frames.extend_from_slice(&end);
                 write_at(&prep.file, &frames, len)?;
+                write_at(&prep.file, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
                 if class.syncs() {
                     fsync_file(&prep.file, class)?;
                 }
@@ -1346,9 +1393,8 @@ impl Journal {
         self.rewrites += 1;
         self.compact_after = 0;
         self.generation = generation;
+        self.nonce = prep.nonce;
         self.len = len;
-        self.synced_to = if class.syncs() { self.len } else { 0 };
-        self.flight_synced_end = None;
         self.header_stale = false;
         self.snapshot_len = 0;
         self.dir_dirty = class.syncs();
@@ -1459,7 +1505,6 @@ impl Journal {
             return Ok(());
         }
         let class = class.max(self.pending_class);
-        self.land_flight();
         self.note_class(class);
         let header = self.take_header_patch();
         let dir = match self.take_dirty_dir(class) {
@@ -1470,9 +1515,9 @@ impl Journal {
             }
         };
         // One flight: the buffered frames and their end frame, in one write.
-        let mut frames = Vec::with_capacity(self.pending.len() + 32);
+        let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
-        frames.extend_from_slice(&flight_end_frame(self.len, self.synced_to, &self.pending));
+        frames.extend_from_slice(&end_frame(self.nonce, class.syncs(), &self.pending));
         let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -1483,9 +1528,6 @@ impl Journal {
         match written {
             Ok(()) => {
                 self.len += frames.len() as u64;
-                if class.syncs() {
-                    self.synced_to = self.len;
-                }
                 self.pending.clear();
                 self.pending_slots.clear();
                 self.pending_class = SyncClass::Off;
@@ -1517,8 +1559,9 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if class.syncs() && !super::store::fe_mutant("no_arena_barrier") {
-            arena.barrier(class)?;
+        // The slots before the log's sync, a plain fsync (ruling 85a032f01; see `Flight::write`).
+        if class.syncs() && !super::store::fe_mutant("no_arena_sync") {
+            arena.sync(SyncClass::Fsync)?;
         }
         if let Some(raised) = header {
             write_at(&self.file, &raised, HEADER_RAISED_AT)?;
@@ -1529,6 +1572,10 @@ impl Journal {
         }
         if class.syncs() {
             fsync_file(&self.file, class)?;
+            if !super::store::fe_mutant("no_flight_confirm") {
+                let crc = end_frame_crc(frames[frames.len() - END_FRAME_LEN..].try_into().unwrap());
+                write_at(&self.file, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+            }
         }
         Ok(())
     }
@@ -1571,9 +1618,6 @@ impl Journal {
     ) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
-        // The flight before this one landed: one is in the air at a time, and a failed one
-        // fail-stopped this journal.
-        self.land_flight();
         let class = class.max(self.sync).max(self.pending_class);
         let end_lsn = self.lsn;
         if self.pending.is_empty() && !upgrade {
@@ -1588,6 +1632,7 @@ impl Journal {
                 header: None,
                 ordered: false,
                 dir: None,
+                nonce: self.nonce,
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -1639,14 +1684,13 @@ impl Journal {
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
         let at = self.len;
-        // The flight's end frame goes in the same write (an upgrade has no frames and no end).
+        // The flight's end frame goes in the same write, built by `Flight::write` with no lock held
+        // (review 2 #8); its room is reserved here. An upgrade has no frames and no end.
         if !bytes.is_empty() {
-            let end = flight_end_frame(at, self.synced_to, &bytes);
-            bytes.extend_from_slice(&end);
+            bytes.reserve_exact(END_FRAME_LEN);
+            self.len += END_FRAME_LEN as u64;
         }
         self.len += bytes.len() as u64;
-        // Once it lands, everything up to its end is synced (an upgrade syncs what precedes it).
-        self.flight_synced_end = class.syncs().then_some(self.len);
         Ok(Flight {
             log: Some(log),
             arena,
@@ -1658,6 +1702,7 @@ impl Journal {
             header,
             ordered: false,
             dir,
+            nonce: self.nonce,
         })
     }
 
@@ -1673,13 +1718,6 @@ impl Journal {
         let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
         self.dir_dirty = false;
         Ok(Some(d))
-    }
-
-    /// The flight in the air landed (see `flight_synced_end`).
-    fn land_flight(&mut self) {
-        if let Some(end) = self.flight_synced_end.take() {
-            self.synced_to = self.synced_to.max(end);
-        }
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -1713,10 +1751,25 @@ impl Journal {
         // Every record the snapshot replaces stays as durable as it was, raised ones included
         // (review B-F3).
         let class = self.rewrite_class();
-        // The snapshot names slots that buffered-but-unwritten records also name; they are ordered
-        // before it, and its sync below makes them durable with it.
+        // The snapshot names slots that buffered-but-unwritten records also name; they reach the
+        // device before it, and its flush below makes them durable with it (ruling 85a032f01).
         if class.syncs() {
-            arena.barrier(class)?;
+            let synced = if std::mem::take(&mut self.fail_next_arena_sync) {
+                Err(LimboError::InternalError(
+                    "failpoint: the compaction's arena sync failed".to_string(),
+                ))
+            } else {
+                arena.sync(SyncClass::Fsync)
+            };
+            if let Err(e) = synced {
+                // A later sync of the arena may report success for pages this one lost, so nothing
+                // more may be acknowledged (review 3 #5). Mutant `compaction_sync_error_kept` (test
+                // builds only): as before, the store goes on.
+                if !super::store::fe_mutant("compaction_sync_error_kept") {
+                    self.set_poisoned();
+                }
+                return Err(e);
+            }
         }
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
@@ -1766,33 +1819,82 @@ impl Journal {
     }
 
     /// Truncate the log to a bare header for `generation`.
+    ///
+    /// A new incarnation, written whole beside the old log and renamed over it, then the directory
+    /// synced (review 2 #1): a truncation in place could reach the disk after the new header, or
+    /// never, and leave the old incarnation's flights behind it. Mutant `reset_in_place` (test
+    /// builds only): the old in-place truncation. Blind spot: off unix (no rename over an open
+    /// file) the reset is in place; the nonce still keeps the old flights out.
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let class = self.rewrite_class();
-        let header = log_header(self.format, self.page_size, generation, self.raised);
+        let nonce = fresh_nonce(self.nonce);
+        let header = log_header(self.format, self.page_size, generation, nonce, self.raised);
         self.rewrites += 1;
         self.compact_after = 0;
-        set_file_len(&self.file, 0)?;
-        write_at(&self.file, &header, 0)?;
-        if class.syncs() {
-            fsync_file(&self.file, class)?;
+        if cfg!(unix) && !super::store::fe_mutant("reset_in_place") {
+            let tmp = self.files.log_tmp();
+            let written = (|| -> Result<File> {
+                let f = open_rw(&tmp, true)?;
+                lock_exclusive(&f, &tmp)?;
+                write_at(&f, &header, 0)?;
+                if class.syncs() {
+                    fsync_file(&f, class)?;
+                }
+                Ok(f)
+            })();
+            let f = match written {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(io_error(e, "rename branch log reset"));
+            }
+            self.file = f;
+            if class.syncs() {
+                fsync_dir_of(&self.files.log, class)?;
+            }
+        } else {
+            set_file_len(&self.file, 0)?;
+            write_at(&self.file, &header, 0)?;
+            if class.syncs() {
+                fsync_file(&self.file, class)?;
+            }
         }
         self.generation = generation;
+        self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64;
-        self.synced_to = if class.syncs() { self.len } else { 0 };
-        self.flight_synced_end = None;
         self.header_stale = false;
+        self.dir_dirty = false;
         Ok(())
     }
 
     pub(crate) fn log_path(&self) -> &Path {
         &self.files.log
     }
+
+    /// The device the log's open file lives on (`fstat`'s `st_dev`); `None` where it cannot be read
+    /// or off unix.
+    pub(crate) fn device(&self) -> Option<u64> {
+        file_device(&self.file)
+    }
 }
 
 /// Where the header keeps the strongest class any record was made durable in (`Journal::raised`):
-/// its last four bytes, outside the checksum, so a flight that raises the class rewrites them in
-/// place and syncs them with its own frames.
-const HEADER_RAISED_AT: u64 = 28;
+/// outside the checksum, so a flight that raises the class rewrites them in place and syncs them
+/// with its own frames.
+const HEADER_RAISED_AT: u64 = 32;
+/// The nonce, and the header checksum after it (over every byte before it).
+const HEADER_NONCE_AT: usize = 24;
+const HEADER_CRC_AT: usize = 28;
+/// The checksum of the last flight whose sync RETURNED, written (not synced) right after it: its
+/// presence proves the flight was acknowledged, so a slot of it failing its CRC at recovery is
+/// damage, not a slot that never reached the disk (`last_flight_slots_hold`). Outside the header
+/// checksum; 0 when no flight is confirmed.
+const HEADER_CONFIRM_AT: u64 = 36;
 
 fn class_code(class: SyncClass) -> u32 {
     match class {
@@ -1805,7 +1907,7 @@ fn class_code(class: SyncClass) -> u32 {
 /// The header's raised class. Outside the checksum, so an unknown value reads as the strongest:
 /// a rewrite in too strong a class costs time, one in too weak a class can lose a record.
 fn header_raised(bytes: &[u8]) -> SyncClass {
-    let Some(field) = bytes.get(HEADER_RAISED_AT as usize..LOG_HEADER_LEN) else {
+    let Some(field) = bytes.get(HEADER_RAISED_AT as usize..HEADER_RAISED_AT as usize + 4) else {
         return SyncClass::Off;
     };
     match u32::from_le_bytes(field.try_into().unwrap()) {
@@ -1815,8 +1917,9 @@ fn header_raised(bytes: &[u8]) -> SyncClass {
     }
 }
 
-/// A log header for `generation` at `page_size`, saying records were made durable in `raised`.
-fn log_header(format: u32, page_size: u32, generation: u64, raised: SyncClass) -> Vec<u8> {
+/// A log header for `generation` at `page_size`, of the incarnation `nonce`, saying records were made
+/// durable in `raised`.
+fn log_header(format: u32, page_size: u32, generation: u64, nonce: u32, raised: SyncClass) -> Vec<u8> {
     // r13-compose §5 mutant (S-3): the header back to the build's default version.
     let format = if super::store::mutant("r13_log_header_fixed") {
         FORMAT_VERSION
@@ -1828,11 +1931,33 @@ fn log_header(format: u32, page_size: u32, generation: u64, raised: SyncClass) -
     put_u32(&mut header, format);
     put_u32(&mut header, page_size);
     put_u64(&mut header, generation);
+    put_u32(&mut header, nonce);
+    debug_assert_eq!(header.len(), HEADER_CRC_AT);
     let crc = crc32c::crc32c(&header);
     put_u32(&mut header, crc);
     put_u32(&mut header, class_code(raised));
+    put_u32(&mut header, 0);
     debug_assert_eq!(header.len(), LOG_HEADER_LEN);
     header
+}
+
+/// A nonce for a new incarnation of the log: random, never 0, never `old`.
+fn fresh_nonce(old: u32) -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(DRAWN.fetch_add(1, Ordering::Relaxed));
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        let nonce = h.finish() as u32;
+        if nonce != 0 && nonce != old {
+            return nonce;
+        }
+    }
 }
 
 /// The arena slots the records in `frames` (whole encoded frames, as `Journal::pending` holds
@@ -1858,7 +1983,7 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
 }
 
 /// One group flight (fastest-engine M1 item 2; gc 389b474b4): frames taken from a journal's buffer
-/// and their `FlightEnd` frame, the log offset they go to, the arena descriptor to sync first, and the class to sync in. Written
+/// (their end frame is built by `write`), the log offset they go to, the arena descriptor to sync first, and the class to sync in. Written
 /// by [`Flight::write`] with no lock held; the journal already counts the region as written, so a
 /// failed write must fail-stop it.
 pub(crate) struct Flight {
@@ -1878,6 +2003,8 @@ pub(crate) struct Flight {
     /// The log's directory after a cut renamed the log into place (`Journal::dir_dirty`): synced
     /// before the log, so the flight's own flush makes the rename durable too.
     dir: Option<File>,
+    /// The log incarnation's nonce, for the end frame `write` builds.
+    nonce: u32,
 }
 
 impl Flight {
@@ -1888,7 +2015,7 @@ impl Flight {
 
     /// `write`, running `after_pwrite` between the frames' write and the log's sync (mutant M-b's
     /// seam: an acknowledgement there is an ack after the pwrite and before the sync).
-    pub(crate) fn write_with(self, after_pwrite: impl FnOnce()) -> Result<()> {
+    pub(crate) fn write_with(mut self, after_pwrite: impl FnOnce()) -> Result<()> {
         if self.fail {
             return Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -1900,11 +2027,19 @@ impl Flight {
         // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
         // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
         let syncs = self.class.syncs() && !super::store::fe_mutant("no_flight_sync");
-        // The slots these frames name are ordered before them; the log's sync below makes both
-        // durable (lead review 1 item 1). Mutant `no_arena_barrier` (test builds only) drops it.
-        if syncs && !super::store::fe_mutant("no_arena_barrier") {
+        // The slots these frames name reach the device before the log's sync, which drains it
+        // (ruling 85a032f01): a plain fsync, not a flush of their own. A power cut before that sync
+        // returns can keep the records and lose a slot, which recovery checks for in the last
+        // flight (`last_flight_slots_hold`). An ORDERED flight has no flush after it before the trunk
+        // commit's, so its slots are barriered ahead of its records instead. Mutant
+        // `no_arena_sync` (test builds only) drops it.
+        if syncs && !super::store::fe_mutant("no_arena_sync") {
             if let Some(arena) = &self.arena {
-                barrier_file(arena, self.class)?;
+                if self.ordered {
+                    barrier_file(arena, self.class)?;
+                } else {
+                    fsync_file(arena, SyncClass::Fsync)?;
+                }
             }
         }
         super::store::kill_point("flight.arena_synced");
@@ -1912,6 +2047,9 @@ impl Flight {
             write_at(&log, raised, HEADER_RAISED_AT)?;
         }
         if !self.bytes.is_empty() {
+            // The end frame, built here with no lock held (review 2 #8), in the same write.
+            let end = end_frame(self.nonce, self.class.syncs(), &self.bytes);
+            self.bytes.extend_from_slice(&end);
             write_at(&log, &self.bytes, self.at)?;
         }
         super::store::kill_point("flight.log_written");
@@ -1923,6 +2061,12 @@ impl Flight {
         }
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
+            // The flush returned: confirm the flight (`HEADER_CONFIRM_AT`; not synced: its absence
+            // proves nothing, its presence that this sync returned). Mutant `no_flight_confirm`.
+            if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
+                let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
+                write_at(&log, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+            }
         }
         // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
         // log and the trunk's WAL removed. Caught by C1b.
@@ -1988,22 +2132,6 @@ pub(crate) fn cannot_exist(e: &std::io::Error) -> bool {
     }
 }
 
-/// The first offset at or after `from` where a whole, valid, decodable frame starts. Frames are
-/// variable-length and the hole's length is unknown, so every offset is tried; an offset whose
-/// length field is zero or runs past the end is rejected before any CRC is computed.
-fn first_whole_frame_after(bytes: &[u8], from: usize) -> Option<usize> {
-    let last = bytes.len().checked_sub(FRAME_HEADER_LEN)?;
-    (from..=last).find(|&at| {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
-        let start = at + FRAME_HEADER_LEN;
-        len > 0
-            && bytes.get(start..start.saturating_add(len)).is_some_and(|payload| {
-                scan_crc(payload) == crc && Record::decode(payload).is_some()
-            })
-    })
-}
-
 /// crc32c of what a recovery scan checks, counted in test builds (review 2 #7's instrument: the
 /// scan's CRC work must stay linear in the log).
 fn scan_crc(data: &[u8]) -> u32 {
@@ -2012,107 +2140,228 @@ fn scan_crc(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
 }
 
+/// `scan_crc`, seeded (an end frame's checksums, with the incarnation's nonce).
+fn scan_crc_seeded(seed: u32, data: &[u8]) -> u32 {
+    #[cfg(test)]
+    SCAN_CRC_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+    crc32c::crc32c_append(seed, data)
+}
+
 #[cfg(test)]
 pub(crate) static SCAN_CRC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The end frame of a flight that began at `start`, written when every byte below `synced` had
-/// been synced, and holding the frames `flight`.
-fn flight_end_frame(start: u64, synced: u64, flight: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(24);
-    Record::FlightEnd {
-        start,
-        synced,
-        crc: crc32c::crc32c(flight),
-    }
-    .encode(&mut payload);
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    put_u32(&mut frame, payload.len() as u32);
-    put_u32(&mut frame, crc32c::crc32c(&payload));
-    frame.extend_from_slice(&payload);
+/// A flight's end frame (format 11): the tag (synced or not), the flight's length, and its crc32c,
+/// the frame's own checksum and the flight's both seeded with the incarnation's `nonce`.
+fn end_frame(nonce: u32, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
+    let mut frame = [0u8; END_FRAME_LEN];
+    let p = FRAME_HEADER_LEN;
+    frame[p] = if synced { END_SYNCED_TAG } else { END_TAG };
+    frame[p + 1..p + 5].copy_from_slice(&(flight.len() as u32).to_le_bytes());
+    frame[p + 5..p + 9].copy_from_slice(&crc32c::crc32c_append(nonce, flight).to_le_bytes());
+    frame[0..4].copy_from_slice(&(END_PAYLOAD_LEN as u32).to_le_bytes());
+    let crc = crc32c::crc32c_append(nonce, &frame[p..]);
+    frame[4..8].copy_from_slice(&crc.to_le_bytes());
     frame
 }
 
-/// The start of a WHOLE later flight that proves the damage at `damage` hit synced bytes: a whole
-/// end frame whose flight was written after every byte below its `synced` — past the damage — had
-/// been synced (fastest-engine review B-F5; under D0 none ever is, so no damage is ever refused).
-/// Every whole frame after the damage is visited; after one, the next is looked for at its end, so
-/// a run of frames costs one pass.
-fn later_whole_flight(bytes: &[u8], damage: usize) -> Option<usize> {
-    // fastest-engine mutant `damage_always_torn` (test builds only): every damage is a torn flight,
-    // so an acknowledged flight lost under a later one is cut instead of refused.
+/// Whether a frame of `len` payload bytes whose tag is `tag` is an end frame.
+fn is_end(len: usize, tag: u8) -> bool {
+    len == END_PAYLOAD_LEN && (tag == END_TAG || tag == END_SYNCED_TAG)
+}
+
+/// Whether the bytes at `at` could begin a whole frame, from its length, its tag and the count a
+/// variable-length record carries alone: checked before any CRC, so a search over damage costs
+/// O(bytes), not a checksum at every offset (review 2 #7). Returns the payload length.
+fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
+    let word = |o: usize| bytes.get(o..o + 4).map(|f| u32::from_le_bytes(f.try_into().unwrap()) as usize);
+    let len = word(at)?;
+    let p = at + FRAME_HEADER_LEN;
+    let tag = *bytes.get(p)?;
+    let ok = match tag {
+        TAG_FORK => len == 17,
+        TAG_FORK_NAMED => (21..=21 + 255).contains(&len) && word(p + 17) == Some(len - 21),
+        TAG_COMMIT => len >= 13 && (len - 13) % 12 == 0 && word(p + 9) == Some((len - 13) / 12),
+        TAG_TRUNK_RETAIN => len == 29,
+        TAG_RELEASE | TAG_RELEASE_OPEN | TAG_CLOSE | TAG_CLOCK | TAG_CHECKPOINT => len == 9,
+        TAG_LEASE => len == 25,
+        END_TAG | END_SYNCED_TAG => len == END_PAYLOAD_LEN,
+        _ => false,
+    };
+    (ok && p + len <= bytes.len()).then_some(len)
+}
+
+/// The first whole frame at or after `from`: `(offset, payload length, a synced end frame)`. An end
+/// frame is whole only under this incarnation's `nonce`; a record frame by its own checksum and
+/// decoding.
+fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, bool)> {
+    let last = bytes.len().checked_sub(FRAME_HEADER_LEN + 1)?;
+    (from..=last).find_map(|at| {
+        let len = plausible_frame(bytes, at)?;
+        let crc = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+        let payload = &bytes[at + FRAME_HEADER_LEN..at + FRAME_HEADER_LEN + len];
+        if is_end(len, payload[0]) {
+            scan_crc_seeded(nonce, payload)
+                .eq(&crc)
+                .then_some((at, len, payload[0] == END_SYNCED_TAG))
+        } else {
+            (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, false))
+        }
+    })
+}
+
+/// Whether the damage at `damage` lies in, or before, a flight known to have been synced (review 2
+/// #2): a synced end frame of this incarnation after the damage, followed by any whole frame. A
+/// flight is written only after the one before it was synced, so a frame after a synced flight's end
+/// proves that sync returned: an acknowledged write was lost. Returns that end frame's offset.
+///
+/// Blind spot: a synced flight whose own end frame was lost too, with no frame after the next
+/// flight's end, reads as a torn tail.
+fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32) -> Option<usize> {
+    // fastest-engine mutant `damage_always_torn` (test builds only): every damage is a torn flight.
     if super::store::fe_mutant("damage_always_torn") {
         return None;
     }
-    let mut at = damage + 1;
-    while let Some(found) = first_whole_frame_after(bytes, at) {
-        let len = u32::from_le_bytes(bytes[found..found + 4].try_into().unwrap()) as usize;
-        let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
-        if let Some(Record::FlightEnd { start, synced, .. }) = Record::decode(payload) {
-            // fastest-engine mutant `synced_ignored` (test builds only): any later whole flight
-            // proves the damage was synced, as before review B-F5.
-            let proves = synced as usize > damage || super::store::fe_mutant("synced_ignored");
-            if proves && synced <= start && (start as usize) < found {
-                return Some(start as usize);
-            }
+    // From the damage itself: an end frame whose own checksum holds but whose flight's does not
+    // is where the scan stopped, and it is a synced flight covering the damage.
+    let mut at = damage;
+    let mut synced_end = None;
+    while let Some((found, len, synced)) = next_whole_frame(bytes, at, nonce) {
+        if synced_end.is_some() {
+            return synced_end;
+        }
+        if synced {
+            synced_end = Some(found);
         }
         at = found + FRAME_HEADER_LEN + len;
     }
     None
 }
 
-/// The record frames of `bytes` (whole frames, as a log holds them from a flight boundary or a
-/// mark), with every `FlightEnd` frame dropped: what `Journal::rewrite_from` re-frames as one
-/// flight. A frame that is not whole is refused: the region was written whole before it was read.
-fn record_frames(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len());
+/// The record frames of `kept` (whole frames of an incarnation of nonce `old`, from a flight boundary
+/// or a mark inside a flight, to a flight boundary) framed again for an incarnation of nonce `new`:
+/// one end frame per kept flight, so every flight's boundary is kept (review 2 #3), and none for a
+/// flight with no kept record. A frame that is not whole is refused: the region was written whole
+/// before it was read. Returns the bytes and the last flight's checksum (for `HEADER_CONFIRM_AT`).
+fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
+    let mut out = Vec::with_capacity(kept.len());
+    let mut flight_at = 0;
+    let mut last_crc = 0;
     let mut pos = 0;
-    while pos < bytes.len() {
-        let whole = bytes.get(pos..pos + FRAME_HEADER_LEN).and_then(|head| {
+    while pos < kept.len() {
+        let whole = kept.get(pos..pos + FRAME_HEADER_LEN).and_then(|head| {
             let len = u32::from_le_bytes(head[0..4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(head[4..8].try_into().unwrap());
-            let payload = bytes.get(pos + FRAME_HEADER_LEN..pos + FRAME_HEADER_LEN + len)?;
-            (len > 0 && crc32c::crc32c(payload) == crc)
-                .then(|| Record::decode(payload))
-                .flatten()
-                .map(|r| (len, r))
+            let payload = kept.get(pos + FRAME_HEADER_LEN..pos + FRAME_HEADER_LEN + len)?;
+            let end = len > 0 && is_end(len, payload[0]);
+            let ok = if end {
+                crc32c::crc32c_append(old, payload) == crc
+            } else {
+                len > 0 && crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
+            };
+            ok.then_some((len, end))
         });
-        let Some((len, record)) = whole else {
+        let Some((len, end)) = whole else {
             return Err(corrupt(&format!(
                 "branch log rewrite met a frame that is not whole at byte {pos} of its kept suffix"
             )));
         };
         let next = pos + FRAME_HEADER_LEN + len;
-        if !matches!(record, Record::FlightEnd { .. }) {
-            out.extend_from_slice(&bytes[pos..next]);
+        if !end {
+            out.extend_from_slice(&kept[pos..next]);
+        } else if out.len() > flight_at {
+            let frame = end_frame(new, synced, &out[flight_at..]);
+            last_crc = end_frame_crc(&frame);
+            out.extend_from_slice(&frame);
+            flight_at = out.len();
         }
         pos = next;
     }
-    Ok(out)
+    if out.len() > flight_at {
+        let frame = end_frame(new, synced, &out[flight_at..]);
+        last_crc = end_frame_crc(&frame);
+        out.extend_from_slice(&frame);
+    }
+    Ok((out, last_crc))
 }
 
-/// `Some((page_size, generation))` if the header is whole and valid, `None` if it is torn (a crash
-/// before it was durable). A whole header of ANOTHER format version is an error, not a torn one:
-/// taking it for torn would start an empty store over it, or reset its log.
-fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64)>> {
-    let Some(h) = bytes.get(..LOG_HEADER_LEN) else {
+/// The flight checksum an end frame carries.
+fn end_frame_crc(frame: &[u8; END_FRAME_LEN]) -> u32 {
+    let p = FRAME_HEADER_LEN;
+    u32::from_le_bytes(frame[p + 5..p + 9].try_into().unwrap())
+}
+
+/// Whether every arena slot the records of the log's LAST flight name holds what they say (ruling
+/// 85a032f01): the arena is synced only by plain fsync before the log's flush, so a power cut can
+/// keep the last flight's records and lose a slot. Only the last flight's: an older flight's slot
+/// may have been freed and reused since. A slot that cannot be read fails.
+fn last_flight_slots_hold(files: &BranchFiles, page_size: u32, records: &[Record]) -> bool {
+    let slots: Vec<(Slot, u32)> = records
+        .iter()
+        .flat_map(|r| match r {
+            Record::Commit { pages, .. } => pages.iter().map(|&(_, slot, crc)| (slot, crc)).collect(),
+            Record::TrunkRetain { slot, crc, .. } => vec![(*slot, *crc)],
+            _ => Vec::new(),
+        })
+        .collect();
+    if slots.is_empty() || super::store::fe_mutant("skip_slot_crc_check") {
+        return true;
+    }
+    let Ok(arena) = File::open(&files.arena) else {
+        return false;
+    };
+    let mut page = vec![0u8; page_size as usize];
+    slots.iter().all(|&(slot, crc)| {
+        read_at(&arena, &mut page, slot as u64 * page_size as u64).is_ok() && crc32c::crc32c(&page) == crc
+    })
+}
+
+/// `Some((page_size, generation, nonce))` if the header is whole and valid, `None` if it is torn (a
+/// crash before it was durable). A whole header of ANOTHER format version is an error, not a torn
+/// one: taking it for torn would start an empty store over it, or reset its log.
+fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>> {
+    // A header of a format before 11 is 32 bytes, its checksum at 24: read the version first, so
+    // such a log is refused by name rather than taken for a torn header.
+    let Some(h) = bytes.get(..16) else {
         return Ok(None);
     };
     if &h[0..8] != LOG_MAGIC {
         return Ok(None);
     }
-    let field = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
-    if crc32c::crc32c(&h[..24]) != field(24) {
-        return Ok(None);
-    }
-    let version = field(8);
-    if version != format {
+    let field = |at: usize| bytes.get(at..at + 4).map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+    let version = field(8).expect("16 bytes read");
+    let old = version < 11
+        && bytes.len() >= 28
+        && crc32c::crc32c(&bytes[..24]) == field(24).expect("28 bytes read");
+    if old || (version != format && bytes.len() >= LOG_HEADER_LEN && crc32c::crc32c(&bytes[..HEADER_CRC_AT]) == field(HEADER_CRC_AT).expect("40 bytes")) {
         return Err(corrupt(&format!(
-            "log format version {version}; this store reads version {format} (8 is the F7 \
-             splice arm's: open with the same DatabaseOpts::with_branch_splice)"
+            "log format version {version}; this store reads version {format}{}",
+            version_hint(version, format)
         )));
     }
+    let Some(h) = bytes.get(..LOG_HEADER_LEN) else {
+        return Ok(None);
+    };
+    if crc32c::crc32c(&h[..HEADER_CRC_AT]) != field(HEADER_CRC_AT).expect("40 bytes") {
+        return Ok(None);
+    }
     let generation = u64::from_le_bytes(h[16..24].try_into().unwrap());
-    Ok(Some((field(12), generation)))
+    let nonce = field(HEADER_NONCE_AT).expect("40 bytes");
+    Ok(Some((field(12).expect("40 bytes"), generation, nonce)))
+}
+
+/// What a refused format version is (review 2 #13): the other arm's, or one written before the log
+/// nonce (format 11), or before flight framing (format 9), which this build cannot read.
+pub(crate) fn version_hint(version: u32, format: u32) -> String {
+    let other = if format == FORMAT_VERSION { SPLICE_FORMAT_VERSION } else { FORMAT_VERSION };
+    if version == other {
+        format!(" ({other} is the other F7 splice arm's: open with that arm's DatabaseOpts::with_branch_splice)")
+    } else if version < 9 {
+        " (written before flight framing; recreate the branch files)".to_string()
+    } else if version < 11 {
+        " (written before the log nonce; recreate the branch files)".to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
@@ -2410,6 +2659,35 @@ mod lose_unsynced {
     }
 }
 
+/// The device an open file lives on (`fstat`'s `st_dev`); `None` where it cannot be read or off
+/// unix.
+pub(crate) fn file_device(file: &File) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().ok().map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Ruling 85a032f01's guard: the arena is synced by plain fsync before the LOG's flush makes it
+/// durable, which holds only on one device (a flush drains one device's cache). The log and the
+/// arena, as opened, must be on the same one; a device that cannot be read is refused too.
+pub(crate) fn one_device(log: Option<u64>, arena: Option<u64>) -> Result<()> {
+    match (log, arena) {
+        (Some(log), Some(arena)) if log == arena => Ok(()),
+        _ if cfg!(not(unix)) => Ok(()),
+        (log, arena) => Err(LimboError::InvalidArgument(format!(
+            "the branch log (device {log:?}) and the branch arena (device {arena:?}) must be on one \
+             device: the log's flush is what makes the arena durable"
+        ))),
+    }
+}
+
 /// Sync `file` in `class` (see [`SyncClass`]): `Fsync` is `fsync(2)`, as Turso's own
 /// `FileSyncType::Fsync`; `FullFsync` is `fcntl(F_FULLFSYNC)` on Apple platforms, as Turso's
 /// `FileSyncType::FullFsync` (`io/unix.rs`), and `fsync(2)` elsewhere. `Off` syncs nothing.
@@ -2463,14 +2741,44 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         // acknowledgement resting on a barrier alone is C1b's to catch, not C1's).
         #[cfg(test)]
         lose_unsynced::apply(file)?;
+        #[cfg(test)]
+        let injected = BARRIER_ERRNO.swap(0, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected = 0;
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+        if injected == 0 && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
             crate::io::count_barrier();
             return Ok(());
         }
-        return fsync_file(file, class);
+        let e = match injected {
+            0 => std::io::Error::last_os_error(),
+            errno => std::io::Error::from_raw_os_error(errno),
+        };
+        // Only a barrier the file system does not offer falls back to the full flush, which orders
+        // the writes too. Any other failure is the sync's own (review 3 #4): retried, a later sync
+        // of the file could report success for pages this one lost. Mutant `barrier_retries_any`
+        // (test builds only): every failure falls back, as before.
+        let unsupported = matches!(
+            e.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
+        );
+        if unsupported || super::store::fe_mutant("barrier_retries_any") {
+            crate::io::count_barrier_fallback();
+            return fsync_file(file, class);
+        }
+        return Err(io_error(e, "F_BARRIERFSYNC branch file"));
     }
     fsync_file(file, class)
+}
+
+/// Test builds: the next `F_BARRIERFSYNC` fails with this errno (0: none), as the fcntl would.
+#[cfg(test)]
+static BARRIER_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
+#[cfg(test)]
+pub(crate) fn fail_next_barrier(errno: i32) {
+    BARRIER_ERRNO.store(errno, std::sync::atomic::Ordering::Release);
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
@@ -2494,6 +2802,28 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nonce in the header of the log at `path` (format 11).
+    pub(super) fn log_nonce(path: &Path) -> u32 {
+        let bytes = std::fs::read(path).unwrap();
+        u32::from_le_bytes(bytes[HEADER_NONCE_AT..HEADER_NONCE_AT + 4].try_into().unwrap())
+    }
+
+    /// An end frame for the record frames `flight`, as the log at `path` would write it.
+    pub(super) fn forged_end(path: &Path, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
+        end_frame(log_nonce(path), synced, flight)
+    }
+
+    /// Two whole SYNCED flights of `frames` each, as the log at `path` would write them: what proves,
+    /// to recovery, that whatever was lost before them had been synced (review 2 #2).
+    pub(super) fn forged_synced_flights(path: &Path, frames: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out.extend_from_slice(frames);
+            out.extend_from_slice(&forged_end(path, true, frames));
+        }
+        out
+    }
 
     #[test]
     fn every_record_round_trips() {
@@ -2580,11 +2910,11 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
-        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): the foreign write is a whole
-        // flight, its frame and its end frame. A bare frame is a torn flight's remnant in a log
-        // written in flights, and recovery cuts it (r12-noforce's damage rule).
-        let start = std::fs::metadata(&files.log).unwrap().len();
-        frame.extend_from_slice(&flight_end_frame(start, start, &frame));
+        // fastest-engine format 9/11 (FLAGGED TEST EDIT, fixture only): the foreign write is a whole
+        // flight, its frame and its end frame under the log's nonce. A bare frame is a torn
+        // flight's remnant in a log written in flights, and recovery cuts it.
+        let end = forged_end(&files.log, false, &frame);
+        frame.extend_from_slice(&end);
         {
             use std::io::Write;
             let mut foreign = OpenOptions::new().append(true).open(&files.log).unwrap();
@@ -2706,12 +3036,11 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
-        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): the later write that survived
-        // is a whole later FLIGHT, its frame and its end frame. A bare frame after the hole is a
-        // torn flight's remnant in a log written in flights, and recovery cuts it (r12-noforce's
-        // damage rule; `flight_tests` pins both sides).
-        let later = std::fs::metadata(&files.log).unwrap().len() + 25;
-        frame.extend_from_slice(&flight_end_frame(later, later, &frame));
+        // fastest-engine format 9/11 (FLAGGED TEST EDIT, fixture only): what survived after the hole
+        // is a whole SYNCED later flight with a frame after it (format 11's proof that the lost
+        // write's sync had returned, review 2 #2). A bare frame after the hole is a torn flight's
+        // remnant in a log written in flights, and recovery cuts it (`flight_tests` pins both).
+        let frame = forged_synced_flights(&files.log, &frame);
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
@@ -2744,9 +3073,9 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
-        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): a whole later flight, as in
-        // `a_zeroed_hole_followed_by_whole_frames_is_corrupt`.
-        frame.extend_from_slice(&flight_end_frame(hole_at + 25, hole_at + 25, &frame));
+        // fastest-engine format 9/11 (FLAGGED TEST EDIT, fixture only): a whole synced later flight
+        // and a frame after it, as in `a_zeroed_hole_followed_by_whole_frames_is_corrupt`.
+        let frame = forged_synced_flights(&files.log, &frame);
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
@@ -2911,16 +3240,10 @@ mod tests {
     /// each made to fire alone: in the second half the log is of the READING arm's version.
     #[test]
     fn each_splice_arm_reads_only_its_own_format_version() {
+        // FLAGGED TEST EDIT (format 11, fixture only): the header's format-11 layout, nonce
+        // under its checksum.
         fn header(format: u32, generation: u64) -> Vec<u8> {
-            let mut header = Vec::new();
-            header.extend_from_slice(LOG_MAGIC);
-            put_u32(&mut header, format);
-            put_u32(&mut header, 512);
-            put_u64(&mut header, generation);
-            let crc = crc32c::crc32c(&header);
-            put_u32(&mut header, crc);
-            put_u32(&mut header, 0);
-            header
+            log_header(format, 512, generation, 0x5EED, SyncClass::Off)
         }
         fn snapshot(format: u32, generation: u64) -> Vec<u8> {
             let mut snap = Vec::new();
@@ -3330,6 +3653,99 @@ mod format_tests {
         let crc = SCAN_CRC_BYTES.load(Ordering::Relaxed) - before;
         assert_eq!(forks(&recovered.records), vec![1]);
         assert!(crc <= 4 * tail, "recovery computed {crc} CRC bytes over a {tail}-byte tail");
+    }
+
+    /// Review 2 #11: a garbled tag byte in the LAST flight is a torn flight: cut, the flights before
+    /// it kept. Mutant `skip_frame_crc` must fail it (the garbled record would be decoded).
+    #[test]
+    fn a_garbled_tag_in_the_last_flight_is_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        let bytes = std::fs::read(&files.log).unwrap();
+        let tag = bytes[starts[2] as usize + FRAME_HEADER_LEN];
+        overwrite(&files.log, starts[2] + FRAME_HEADER_LEN as u64, &[tag ^ 0x40]);
+        let recovered = Journal::recover(&files, SyncClass::Off).expect("a torn last flight").expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 11]);
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
+    }
+
+    /// Review 2 #11: a record replaced by another whole, CRC-valid one is caught by its flight's
+    /// checksum: in a middle flight (a synced flight after it) the store is refused; in the last
+    /// flight it is cut. Mutant `skip_flight_crc` must fail it.
+    #[test]
+    fn a_replaced_record_fails_its_flights_checksum() {
+        for (flight, refused) in [(1usize, true), (2, false)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+            // Same size, valid frame checksum, different record: Fork{child: 77}.
+            let mut payload = Vec::new();
+            Record::Fork { child: 77, parent: 0 }.encode(&mut payload);
+            let mut frame = Vec::new();
+            put_u32(&mut frame, payload.len() as u32);
+            put_u32(&mut frame, crc32c::crc32c(&payload));
+            frame.extend_from_slice(&payload);
+            overwrite(&files.log, starts[flight], &frame);
+            let got = Journal::recover(&files, SyncClass::Off);
+            if refused {
+                assert!(got.is_err(), "flight {flight}: a replaced record under a later synced flight was taken");
+            } else {
+                let got = got.unwrap().expect("state");
+                assert_eq!(forks(&got.records), vec![1, 11], "flight {flight}: the replaced record was replayed");
+            }
+        }
+    }
+
+    /// Review 2 #11: a whole flight moved to where it did not begin is rejected: its end frame names
+    /// its own length, which no longer reaches back to the last whole flight's end. Mutant
+    /// `skip_flight_start` must fail it.
+    #[test]
+    fn a_flight_at_the_wrong_offset_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[2, 1], SyncClass::Fsync);
+        let bytes = std::fs::read(&files.log).unwrap();
+        // Flight 2 (one record and its end) moved back over the second record of flight 1.
+        let second = {
+            let at = starts[0] as usize;
+            at + FRAME_HEADER_LEN + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        };
+        let flight2 = bytes[starts[1] as usize..].to_vec();
+        let mut image = bytes[..second].to_vec();
+        image.extend_from_slice(&flight2);
+        std::fs::write(&files.log, &image).unwrap();
+        let recovered = Journal::recover(&files, SyncClass::Off).expect("a torn flight").expect("state");
+        assert_eq!(forks(&recovered.records), Vec::<u64>::new(), "a flight at the wrong offset was taken");
+    }
+
+    /// Review 2 #1(b): a log reset (a compaction's) is a new file renamed over the old one, never a
+    /// truncation in place. Mutant `reset_in_place` must fail it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_log_is_a_new_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+        let before = std::fs::metadata(&files.log).unwrap().ino();
+        journal.reset_log(1).unwrap();
+        assert_ne!(std::fs::metadata(&files.log).unwrap().ino(), before, "the log was reset in place");
+    }
+
+    /// Ruling 85a032f01's guard: a log and an arena on two devices are refused (one device's flush
+    /// does not make the other's writes durable), and so is a device that cannot be read.
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_the_arena_must_share_a_device() {
+        assert!(one_device(Some(7), Some(7)).is_ok());
+        assert!(one_device(Some(7), Some(8)).is_err(), "two devices were accepted");
+        assert!(one_device(None, Some(8)).is_err(), "an unreadable device was accepted");
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = File::create(dir.path().join("a")).unwrap();
+        let b = File::create(dir.path().join("b")).unwrap();
+        assert!(one_device(file_device(&a), file_device(&b)).is_ok(), "siblings read as two devices");
     }
 
     /// Review 2 #8: a flight's end frame is 17 bytes — a 9-byte payload: a tag that says whether the

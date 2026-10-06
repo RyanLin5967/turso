@@ -305,16 +305,25 @@ pub(crate) struct BranchStore {
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
     #[cfg(test)]
     publish_wait_ms: AtomicU64,
-    /// The trunk's WAL is on the branch files' device (`note_trunk_wal`, `ordered_trunk`).
+    /// The trunk's WAL flush is an F_FULLFSYNC of the branch files' device (`note_trunk_wal`,
+    /// `ordered_trunk`).
     trunk_same_device: AtomicBool,
+    /// The device the branch log and arena were opened on (`StoreInner::files_device`), shared
+    /// with the store's inner state; `NO_DEVICE` until they are.
+    files_dev: Arc<AtomicU64>,
     /// Trunk commit barriers that took the store mutex (observation only; lead review 1 item 10).
     barrier_locks: AtomicU64,
     /// A catalog store's checkpoints are fuzzy (`BranchCheckpoint`; lead review 1 item 7).
     fuzzy: bool,
-    /// The log sequence number that makes the newest early-released Release durable: every trunk
-    /// commit's barrier covers it, since a commit retains nothing for a child released before its
-    /// decisions (gc3's N1; lead review 1 item 10).
+    /// The log sequence number that makes the newest Release durable (early-released or logged):
+    /// every trunk commit's barrier covers it, since a commit retains nothing for a child released
+    /// before its decisions (gc3's N1; lead review 1 item 10; skill review 2 #3).
     last_release_lsn: AtomicU64,
+    /// The log sequence number that makes the newest TrunkRetain durable: every trunk commit's
+    /// barrier covers it too, since a pre-image kept by a decision pass that was then refused (or
+    /// rolled back) is not decided again by the retry — the page's written epoch already is the
+    /// commit's own — yet the commit overwrites what it kept (review 3 #1).
+    retain_floor: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -769,6 +778,9 @@ struct StoreInner {
     /// The store's fail-stop flag, shared by its journal and its group: set once, by whichever fails
     /// first, and read by every write path through `Journal::check_live` (review B-F1).
     fail_stop: Arc<AtomicBool>,
+    /// The device the branch log and arena are on (`files_device`), `NO_DEVICE` until both are
+    /// open; shared with `BranchStore::files_dev`.
+    files_dev: Arc<AtomicU64>,
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
     last_fork_lsn: u64,
@@ -1082,11 +1094,38 @@ pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
+/// Test builds: the next build of a name filter finds its first catalog scan failing, as an I/O
+/// error would (review 3 #7). Set before the open that starts the build.
+#[cfg(test)]
+pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test builds: while it holds 1, a name filter's builder waits before its catalog scan, having
+/// marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 3 #7). Process-wide, so a
+/// test can set it before the open that starts the build.
+#[cfg(test)]
+pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
+fn pause_name_scan() {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering as O;
+        let arrived = 1 | HOLD_ARRIVED;
+        if NAME_SCAN_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+            while NAME_SCAN_HOLD.load(O::Acquire) == arrived {
+                crate::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
 
 /// How long a waiter an ordered flight covers waits for the trunk commit's WAL flush before it
 /// leads an upgrade flight of its own (liveness, should that commit stall: its caller may be the
 /// thread that drives it).
 const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
+
+/// `files_dev` before the branch files are open, or when their device could not be read.
+const NO_DEVICE: u64 = u64::MAX;
 
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
@@ -1432,6 +1471,11 @@ struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
     built: Option<HashSet<u64, BuildIdHasher>>,
     pending: Option<HashSet<u64, BuildIdHasher>>,
+    /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
+    /// and catalog scans that failed.
+    moved_max: u64,
+    builds: u64,
+    failed_scans: u64,
 }
 
 impl NameFilter {
@@ -1447,6 +1491,9 @@ impl NameFilter {
         }
         let h = self.hash(name);
         if let Some(built) = self.built.as_mut() {
+            if built.len() == built.capacity() {
+                self.moved_max = self.moved_max.max(built.len() as u64);
+            }
             built.insert(h);
         }
         if let Some(pending) = self.pending.as_mut() {
@@ -1931,7 +1978,15 @@ struct Captured {
     /// durable. They stay out of the allocator until the install takes them out of memory; a
     /// failed write leaves them waiting for their flight (lead review 1 item 7).
     deferred: Vec<Slot>,
+    /// The journal's sequence number at the capture, its `Record::Checkpoint` included: every
+    /// record the capture covers lies below it. A fuzzy checkpoint commits only once all of it is
+    /// durable in `log_class` (review 4 #1); the deferred frees mature at it.
     deferred_lsn: u64,
+    /// The journal's own class: what an operation the capture covers was acknowledged in.
+    log_class: SyncClass,
+    /// The store's fail-stop flag (shared with its journal and group): read just before the catalog
+    /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
+    fail_stop: Arc<AtomicBool>,
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
@@ -1948,6 +2003,8 @@ struct Captured {
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
     /// catalog commit, on the sharp path and on a fuzzy flight alike (D-T2's failed-write order).
     fail_write: bool,
+    /// BranchFailpoint::ArenaSyncFails, taken at a capture that syncs the arena: that sync fails.
+    fail_arena_sync: bool,
     /// githost-shape instrument (observing only; r13-compose S-1): when the capture began, and the
     /// rows, trunk versions inserted and trunk versions deleted it captured. Counted at the install.
     shape_started: Instant,
@@ -1967,10 +2024,27 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
         ));
     }
-    // Every slot the catalog is about to name is ordered before its commit, whose sync makes them
-    // durable with it (lead review 1 item 1).
+    // Every slot the catalog is about to name reaches the device before its commit, whose flush
+    // makes them durable with it (ruling 85a032f01: a plain fsync). A failed sync fail-stops the
+    // store (review 3 #5): a later sync of the same file may report success for pages it lost.
     if let Some(file) = cap.arena.as_ref() {
-        super::journal::barrier_file(file, cap.arena_sync)?;
+        if cap.arena_sync.syncs() {
+            let synced = if cap.fail_arena_sync {
+                Err(LimboError::InternalError(
+                    "failpoint: the checkpoint's arena sync failed".to_string(),
+                ))
+            } else {
+                super::journal::fsync_file(file, SyncClass::Fsync)
+            };
+            if let Err(e) = synced {
+                // Mutant `checkpoint_sync_error_kept` (test builds only): as before, the store
+                // goes on.
+                if !fe_mutant("checkpoint_sync_error_kept") {
+                    cap.fail_stop.store(true, Ordering::Release);
+                }
+                return Err(e);
+            }
+        }
     }
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.raise_sync(cap.arena_sync)?;
@@ -2026,7 +2100,15 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     })()
     .and_then(|()| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
-        catalog.commit()
+        // A store fail-stopped since the capture commits nothing more (review 4 #1); checked
+        // last, so no failure before the commit is missed. Mutant `commit_poisoned` (test builds
+        // only): it commits regardless.
+        if cap.fail_stop.load(Ordering::Acquire) && !fe_mutant("commit_poisoned") {
+            return Err(group_poisoned());
+        }
+        // A failed commit may or may not have reached the catalog: from here on, only a reopen
+        // can tell, so the store fail-stops.
+        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))
     });
     if let Err(e) = written {
         catalog.rollback();
@@ -2071,6 +2153,18 @@ fn run_flight(
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Everything the capture covers is durable before the catalog restates it (review 4 #1):
+        // a record still buffered or in the air at the capture belongs to an operation whose
+        // caller may yet be told it failed, and then the catalog must not hold it. Waited for
+        // holding no lock, but the store mutex for the moment it takes to lead a flight if none
+        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once.
+        if !fe_mutant("commit_unsettled") {
+            let settled =
+                BranchStore::wait_durable_on(&inner, &group, None, cap.deferred_lsn, cap.log_class);
+            if let Err(e) = settled {
+                return (Err(e), 0);
+            }
+        }
         let mut w = writer.lock();
         let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
@@ -2166,14 +2260,15 @@ impl Drop for CutGate<'_> {
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
-/// no flight to be in the air; fly first what of the capture is still buffered; then stop group
-/// flights (`cutting`) and copy the kept part of the log into the temp log and sync it
-/// (`Journal::prepare_cut`). `None` (nothing prepared, the install cuts under the mutex as
-/// before): a poisoned store, a failed copy, or a log that changed under the capture.
+/// no flight to be in the air; then stop group flights (`cutting`) and copy the kept part of the
+/// log into the temp log and sync it (`Journal::prepare_cut`). Everything the capture covers was
+/// flown before the commit (`run_flight`), so the copy starts at a written position. `None`
+/// (nothing prepared, the install cuts under the mutex as before): a poisoned store, a failed copy,
+/// or a log that changed under the capture.
 fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option<CutGate<'a>> {
     loop {
         let src = {
-            let mut guard = inner.lock();
+            let guard = inner.lock();
             let g = group.lock();
             if group.poisoned() {
                 return None;
@@ -2183,31 +2278,9 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
                 drop(group.wait(g));
                 continue;
             }
-            let buffered = guard.journal.as_ref()?.log_len() < cap.log_from;
-            if buffered {
-                // What the capture covers is still partly buffered: one flight writes it, as any
-                // leader would, and the cut is tried again after it lands.
-                let class = guard.journal.as_ref()?.sync_class();
-                let mut g = g;
-                let flight = match BranchStore::take_flight(&mut guard, class, false) {
-                    Ok(Some(flight)) if !flight.is_empty() => flight,
-                    Ok(_) => return None,
-                    Err(e) => {
-                        group.fail(&mut g);
-                        tracing::warn!("branch log cut not prepared: {e}");
-                        return None;
-                    }
-                };
-                g.flushing = true;
-                drop(g);
-                drop(guard);
-                let (end, class) = (flight.end_lsn, flight.class);
-                let written = flight.write();
-                group.land(end, class, written.is_ok());
-                if written.is_err() {
-                    return None;
-                }
-                continue;
+            // Only under mutant `commit_unsettled` is any of it still buffered.
+            if guard.journal.as_ref()?.log_len() < cap.log_from {
+                return None;
             }
             let src = match guard.journal.as_ref()?.cut_source(cap.log_from) {
                 Ok(Some(src)) => src,
@@ -2500,8 +2573,10 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            retain_floor: AtomicU64::new(0),
             fuzzy: false,
         }
     }
@@ -2659,6 +2734,7 @@ impl BranchStore {
                         stats.arena_ns = ns(t);
                         stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
                         stats.arena_free = arena.free_count() as u64;
+                        inner.files_device(recovered.journal.device(), arena.device())?;
                         let mut arena = arena;
                         if closed {
                             recovered.journal.flush(&mut arena)?;
@@ -2704,8 +2780,10 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            files_dev: inner.files_dev.clone(),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            retain_floor: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -2800,12 +2878,34 @@ impl BranchStore {
         let format = super::journal::format_version(inner.splice);
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog {}: format version {}; this store reads version {format} (6 is the \
-                 F7 splice arm's: open with the same DatabaseOpts::with_branch_splice; 0 was written \
-                 before the catalog carried the key)",
+                "branch catalog {}: format version {}; this store reads version {format}{}",
                 files.cat.display(),
-                m.format
+                m.format,
+                if m.format == 0 {
+                    " (0 was written before the catalog carried the key)".to_string()
+                } else {
+                    super::journal::version_hint(m.format, format)
+                }
             )));
+        }
+        // A catalog that names branch state is never opened over a missing log or arena (review 2
+        // #12): it would open with every branch's slots gone, and say nothing.
+        if let Some(m) = meta.filter(|m| m.in_use > 0 || m.states > 0) {
+            for (what, path) in [("log", &files.log), ("arena", &files.arena)] {
+                if !path.exists() {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog {} names {} branch states, but the branch {what} {} is \
+                         missing: the branch files were moved apart; put all three back together \
+                         ({}, {}, {})",
+                        files.cat.display(),
+                        m.states,
+                        path.display(),
+                        files.log.display(),
+                        files.arena.display(),
+                        files.cat.display()
+                    )));
+                }
+            }
         }
         // r12-catload: the catalog's prewarm, before the replay reads: its pages (`interior`,
         // `buffer`), or its files unless `R12_PREWARM_FILES` leaves the catalog out.
@@ -2944,6 +3044,7 @@ impl BranchStore {
         let in_use = u64::try_from(in_use)
             .map_err(|_| LimboError::Corrupt("branch catalog: negative arena use".into()))?;
         let mut arena = Arena::open_file_catalog(&files.arena, page_size, high_water, in_use, free_mem)?;
+        inner.files_device(recovered.journal.device(), arena.device())?;
         if closed {
             recovered.journal.flush(&mut arena)?;
         }
@@ -3122,6 +3223,16 @@ impl BranchStore {
             for record in &records {
                 journal.buffer(record)?;
             }
+            // A Release flushed here, in the store's class, must still be covered by the next trunk
+            // commit's barrier in the trunk's (skill review 2 #3).
+            // Mutant `log_all_no_floor` (test builds only): as at 5f7f68120, it does not.
+            if records
+                .iter()
+                .any(|r| matches!(r, Record::Release { .. } | Record::ReleaseOpen { .. }))
+                && !fe_mutant("log_all_no_floor")
+            {
+                self.last_release_lsn.fetch_max(journal.lsn(), Ordering::AcqRel);
+            }
         }
         self.flush_locked(inner, SyncClass::Off)?;
         inner.lease.flushed();
@@ -3201,6 +3312,25 @@ impl BranchStore {
     /// is in the air: an ordinary one if anything is buffered, an UPGRADE one if the bytes were made
     /// durable only in a weaker class (see [`Group`]). Called WITHOUT the store mutex.
     pub(crate) fn wait_durable(&self, lsn: u64, class: SyncClass) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&*self.trunk_commit_hold);
+        #[cfg(not(test))]
+        let hold = None;
+        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)
+    }
+
+    /// `wait_durable` for a caller holding only the store's shared parts: a fuzzy checkpoint's
+    /// thread (`run_flight`), which waits for what its capture covers before its catalog commit.
+    /// `hold` is the test hook a leader pauses at once its flight is taken.
+    fn wait_durable_on(
+        store: &StoreMutex,
+        group: &Group,
+        hold: Option<&AtomicU8>,
+        lsn: u64,
+        class: SyncClass,
+    ) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = hold;
         // Mutant M-c (PREREG v1 amendment 36): the operation is acknowledged before its records
         // are even written.
         if lsn == 0 || fe_mutant("ack_before_pwrite") {
@@ -3210,7 +3340,7 @@ impl BranchStore {
         let mut first = true;
         loop {
             {
-                let mut g = self.group.lock();
+                let mut g = group.lock();
                 if first {
                     g.waits += 1;
                 }
@@ -3221,7 +3351,7 @@ impl BranchStore {
                         }
                         return Ok(());
                     }
-                    if self.group.poisoned() {
+                    if group.poisoned() {
                         return Err(group_poisoned());
                     }
                     // An ordered flight carries these bytes and a trunk commit's WAL flush is
@@ -3229,8 +3359,7 @@ impl BranchStore {
                     // rather than led past with an upgrade flight, a second flusher.
                     if need > 0 && g.pending_full.is_some_and(|p| p >= lsn) {
                         first = false;
-                        let (woken, timeout) = self
-                            .group
+                        let (woken, timeout) = group
                             .cv
                             .wait_timeout(g, PENDING_FULL_WAIT)
                             .unwrap_or_else(|e| e.into_inner());
@@ -3248,18 +3377,21 @@ impl BranchStore {
                         break;
                     }
                     first = false;
-                    g = self.group.wait(g);
+                    g = group.wait(g);
                 }
             }
             first = false;
             // Lead: take what is buffered under the store mutex, then write it holding nothing.
             let flight = {
-                let mut inner = self.lock_counted();
-                let mut g = self.group.lock();
+                let mut inner = Counted {
+                    guard: store.lock(),
+                    since: Instant::now(),
+                };
+                let mut g = group.lock();
                 if g.durable[need] >= lsn {
                     return Ok(());
                 }
-                if self.group.poisoned() {
+                if group.poisoned() {
                     return Err(group_poisoned());
                 }
                 if g.flushing || g.cutting {
@@ -3280,29 +3412,29 @@ impl BranchStore {
                     // air: only a failed flush does that, and it poisons the group.
                     Ok(_) => return Err(group_poisoned()),
                     Err(e) => {
-                        self.group.fail(&mut g);
+                        group.fail(&mut g);
                         return Err(e);
                     }
                 }
             };
             kill_point("flight.taken");
             #[cfg(test)]
-            pause_at(Some(&*self.trunk_commit_hold), HOLD_FLIGHT_TAKEN);
+            pause_at(hold, HOLD_FLIGHT_TAKEN);
             let (end, flight_class) = (flight.end_lsn, flight.class);
             // Mutant M-b (PREREG v1 amendment 36): the waiters are acknowledged after the pwrite
             // and before the sync. Caught by C1b and V2, not by SIGKILL.
             let written = if fe_mutant("ack_before_sync") {
-                flight.write_with(|| self.group.mark_durable(end, flight_class))
+                flight.write_with(|| group.mark_durable(end, flight_class))
             } else {
                 flight.write()
             };
             if written.is_err() {
                 // Fail-stops the group and the journal in one step (they share the flag), and
                 // wakes the waiters, some of whom hold the store mutex while they wait.
-                self.group.land(end, flight_class, false);
+                group.land(end, flight_class, false);
                 return written;
             }
-            self.group.land(end, flight_class, true);
+            group.land(end, flight_class, true);
             kill_point("flight.landed");
         }
     }
@@ -3626,7 +3758,8 @@ impl BranchStore {
         self.mature(inner);
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
-        let cap = match inner.checkpoint_capture_mode(false, true) {
+        let flight_in_air = self.group.lock().flushing;
+        let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
@@ -4458,16 +4591,21 @@ impl BranchStore {
         kill_point("trunk.decided");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
-        Ok(retained_end.max(self.release_floor()))
+        if fe_mutant("barrier_own_only") {
+            return Ok(retained_end);
+        }
+        Ok(retained_end.max(self.barrier_floor()))
     }
 
-    /// What a trunk commit that took no copy decision — its trunk had no live child — must still
-    /// make durable before its first frame: every early-released Release (gc3's N1).
-    pub(crate) fn release_floor(&self) -> u64 {
+    /// What every trunk commit — one that took no copy decision too — must make durable before its
+    /// first frame: every Release (gc3's N1) and every pre-image kept (review 3 #1) so far.
+    pub(crate) fn barrier_floor(&self) -> u64 {
         if fe_mutant("barrier_own_only") {
             return 0;
         }
-        self.last_release_lsn.load(Ordering::Acquire)
+        self.last_release_lsn
+            .load(Ordering::Acquire)
+            .max(self.retain_floor.load(Ordering::Acquire))
     }
 
     /// `begin_trunk_commit`'s decisions, one per page the commit writes, at `epoch`.
@@ -4603,6 +4741,10 @@ impl BranchStore {
                     crc,
                 })?;
                 self.unsynced.store(true, Ordering::Release);
+                // fastest-engine mutant `no_retain_floor` (test builds only).
+                if !fe_mutant("no_retain_floor") {
+                    self.retain_floor.fetch_max(journal.lsn(), Ordering::AcqRel);
+                }
             }
         }
         trunk.written.insert(page, epoch);
@@ -4731,28 +4873,20 @@ impl BranchStore {
             && !fe_mutant("trunk_unordered")
     }
 
-    /// Record whether the trunk's WAL at `wal_path` is on the branch files' device (see
-    /// `ordered_trunk`): their directories' `st_dev`. Anything unknown reads as "not".
-    pub(crate) fn note_trunk_wal(&self, wal_path: &str) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let dev = |path: &std::path::Path| {
-                let dir = match path.parent() {
-                    Some(dir) if !dir.as_os_str().is_empty() => dir,
-                    _ => std::path::Path::new("."),
-                };
-                std::fs::metadata(dir).ok().map(|m| m.dev())
-            };
-            let log = self.inner.lock().files.as_ref().map(|f| f.log.clone());
-            let same = log.is_some_and(|log| {
-                let ours = dev(&log);
-                ours.is_some() && ours == dev(std::path::Path::new(wal_path))
-            });
+    /// Record whether this trunk commit's WAL flush drains the branch files' device (see
+    /// `ordered_trunk`): `wal_device` is what the WAL file being synced reports
+    /// (`Wal::full_fsync_device`: `Some` only for an F_FULLFSYNC on its own descriptor), and it must
+    /// be the device the branch log and arena were opened on, read from their descriptors
+    /// (`files_device`). Anything unknown reads as "not" (review 3 #3). Called by every trunk
+    /// commit that syncs its WAL in FullFsync, before its barrier.
+    pub(crate) fn note_trunk_wal(&self, wal_device: Option<u64>) {
+        let files = self.files_dev.load(Ordering::Acquire);
+        // Mutant `trust_any_wal` (test builds only): as before review 3 #3, any WAL flush counts
+        // once the branch files' device is known.
+        let same = files != NO_DEVICE && (wal_device == Some(files) || fe_mutant("trust_any_wal"));
+        if self.trunk_same_device.load(Ordering::Relaxed) != same {
             self.trunk_same_device.store(same, Ordering::Release);
         }
-        #[cfg(not(unix))]
-        let _ = wal_path;
     }
 
     /// Make the journal's first `lsn` bytes ORDERED ahead of a trunk commit's frames, leading an
@@ -5181,6 +5315,20 @@ impl BranchStore {
     }
 
     /// See `Database::branch_wait_name_filter`.
+    /// The name filter (observation, review 3 #7): `(built, entries, the most entries one insert
+    /// moved, builds installed, failed catalog scans)`.
+    pub(crate) fn name_filter_stats(&self) -> (bool, u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        let f = &inner.names.filter;
+        (
+            f.built.is_some(),
+            f.built.as_ref().map_or(0, |b| b.len() as u64),
+            f.moved_max,
+            f.builds,
+            f.failed_scans,
+        )
+    }
+
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {
             let _ = build.join();
@@ -5217,14 +5365,23 @@ impl BranchStore {
             reader
         };
         let hasher = self.inner.lock().names.filter.hasher.clone();
+        #[cfg(test)]
+        let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(test))]
+        let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
                 use std::hash::BuildHasher;
+                pause_name_scan();
                 let mut reader = reader;
-                let scanned = reader.name_hashes(|name| hasher.hash_one(name), &stop);
+                let scanned = if fail_scan {
+                    Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
+                } else {
+                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                };
                 let mut inner = shared.lock();
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
@@ -5233,8 +5390,12 @@ impl BranchStore {
                         let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
                         built.extend(pending);
                         filter.built = Some(built);
+                        filter.builds += 1;
                     }
-                    Err(e) => tracing::debug!("branch name filter not built: {e}"),
+                    Err(e) => {
+                        filter.failed_scans += 1;
+                        tracing::debug!("branch name filter not built: {e}")
+                    }
                 }
             });
         match spawned {
@@ -5418,6 +5579,11 @@ impl BranchStore {
         if fail {
             inner.failpoint = None;
         }
+        if inner.cat.is_none() && inner.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some() {
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.fail_next_arena_sync();
+            }
+        }
         self.compact(&mut inner, fail)
     }
 
@@ -5453,7 +5619,7 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn capture_fuzzy_for_test(&self) -> Result<()> {
         let mut inner = self.inner.lock();
-        let cap = inner.checkpoint_capture_mode(false, true)?;
+        let cap = inner.checkpoint_capture_mode(false, true, true)?;
         let cat = inner.cat.as_mut().expect("captured");
         cat.catalog.end_read_snapshot();
         cat.flight = false;
@@ -5602,8 +5768,17 @@ impl StoreInner {
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
             fail_stop: Arc::new(AtomicBool::new(false)),
+            files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
         }
+    }
+
+    /// Ruling 85a032f01's guard over the branch log and arena as opened (`one_device`), recording
+    /// their device for `BranchStore::note_trunk_wal` (review 3 #3).
+    fn files_device(&self, log: Option<u64>, arena: Option<u64>) -> Result<()> {
+        super::journal::one_device(log, arena)?;
+        self.files_dev.store(log.unwrap_or(NO_DEVICE), Ordering::Release);
+        Ok(())
     }
 
     /// F-W1: the live-id set as the listing before it computed the list: every resident state that
@@ -6049,13 +6224,24 @@ impl StoreInner {
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
     /// last catalog version, as an eager recovery rebuilds it (the largest `died`), by ONE probe per
-    /// page per process. The page's other versions are not read (C-P).
+    /// page per process. The page's other versions are not read (C-P). The page counts as known
+    /// only once its probe has answered: a probe refused (`Busy`, an I/O error) is made again by the
+    /// next caller, never taken as "no catalog version" (review 3 #2).
     fn trunk_written_known(&mut self, page: u32) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
-        if !cat.trunk_known.insert(page) {
+        if cat.trunk_known.contains(&page) {
             return Ok(());
+        }
+        // Mutant `probe_marked_first` (test builds only): as before review 3 #2, the page is known
+        // before its probe answers.
+        if fe_mutant("probe_marked_first") {
+            cat.trunk_known.insert(page);
+        }
+        if self.failpoint == Some(BranchFailpoint::TrunkProbeBusy) {
+            self.failpoint = None;
+            return Err(LimboError::Busy);
         }
         cat.trunk_probes += 1;
         cat.twk_probes += 1;
@@ -6075,6 +6261,7 @@ impl StoreInner {
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
         }
+        cat.trunk_known.insert(page);
         Ok(())
     }
 
@@ -6341,6 +6528,7 @@ impl StoreInner {
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
+                self.files_device(self.journal.as_ref().and_then(Journal::device), arena.device())?;
                 // The journal's create synced the directory before the arena file existed.
                 if self.sync.syncs() {
                     super::journal::fsync_dir_of(&files.arena, self.sync)?;
@@ -6358,7 +6546,7 @@ impl StoreInner {
     /// `Arena::open_file` counts whole slots of the recovered page size.
     fn restart_empty(&mut self, page_size: usize) -> Result<()> {
         let Some(files) = self.files.clone() else {
-            self.arena = Some(Arena::new(page_size));
+            self.restarted_arena(Arena::new(page_size));
             return Ok(());
         };
         if self.cat.is_some() {
@@ -6375,7 +6563,7 @@ impl StoreInner {
                 return Err(e);
             }
             match Arena::open_file(&files.arena, page_size, true, &[]) {
-                Ok(arena) => self.arena = Some(arena),
+                Ok(arena) => self.restarted_arena(arena),
                 Err(e) => {
                     if let Some(journal) = self.journal.as_mut() {
                         journal.poison();
@@ -6401,7 +6589,7 @@ impl StoreInner {
         self.lease.queued(snapshot.lease_now_ms);
         self.lease.flushed();
         match Arena::open_file(&files.arena, page_size, true, &[]) {
-            Ok(arena) => self.arena = Some(arena),
+            Ok(arena) => self.restarted_arena(arena),
             Err(e) => {
                 // The snapshot and the log header already say the new page size; the arena in
                 // memory still has the old one. Fail-stop rather than run on with the two
@@ -6413,6 +6601,17 @@ impl StoreInner {
             }
         }
         Ok(())
+    }
+
+    /// The restarted empty store's arena replaces the old one, and with it go the frees deferred
+    /// for releases whose flights had not landed (skill review 1 (f)): their slots were the old
+    /// arena's, and the empty state the restart wrote made those releases durable. Mutant
+    /// `restart_keeps_deferred` (test builds only).
+    fn restarted_arena(&mut self, arena: Arena) {
+        self.arena = Some(arena);
+        if !fe_mutant("restart_keeps_deferred") {
+            self.pending_free.clear();
+        }
     }
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
@@ -6472,7 +6671,8 @@ impl StoreInner {
     /// every other in-memory set stays as it is until the install, so between now and then the
     /// store reads exactly as it does between checkpoints.
     fn checkpoint_capture(&mut self, fail_after_commit: bool) -> Result<Box<Captured>> {
-        self.checkpoint_capture_mode(fail_after_commit, false)
+        // The sharp path quiesced first: no flight is in the air.
+        self.checkpoint_capture_mode(fail_after_commit, false, false)
     }
 
     /// G-c (r13-compose A2.R4a): the capture knows whether it serves a fuzzy checkpoint, and a fuzzy
@@ -6482,6 +6682,7 @@ impl StoreInner {
         &mut self,
         fail_after_commit: bool,
         fuzzy: bool,
+        flight_in_air: bool,
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
         CAPTURE_ENTERED.with(|c| c.set(c.get() + 1));
@@ -6614,7 +6815,11 @@ impl StoreInner {
                 arena.in_use()
             );
         }
-        let arena_file = if self.sync.syncs() {
+        // The arena is synced before the catalog commit only if a slot was written since its last
+        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
+        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
+        let rewrite_syncs = journal.rewrite_class().syncs();
+        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
             match arena.sync_handle() {
                 Ok(f) => f,
                 Err(e) => {
@@ -6650,6 +6855,8 @@ impl StoreInner {
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
+            log_class: self.journal.as_ref().map_or(self.sync, Journal::sync_class),
+            fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
             // C-F1, the capture takes the names out of the index.
             names_gone: if fe_mutant("names_taken_at_capture") {
@@ -6664,6 +6871,8 @@ impl StoreInner {
                 .failpoint
                 .take_if(|f| *f == BranchFailpoint::CheckpointWriteFails)
                 .is_some(),
+            fail_arena_sync: arena_file.is_some()
+                && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some(),
             shape_started: started,
             shape_rows: n_rows,
             shape_trunk_new: n_trunk_new,
@@ -7651,10 +7860,6 @@ impl StoreInner {
             // A checkpoint that did not commit (or did, and this is the log recovery cut after
             // it): nothing to redo (F-FZ).
             Record::Checkpoint { .. } => Ok(()),
-            // Recovery's scan consumes every end frame; one here is a scan defect.
-            Record::FlightEnd { .. } => Err(LimboError::InternalError(
-                "a branch log flight's end frame reached replay".to_string(),
-            )),
         }
     }
 
@@ -7899,6 +8104,31 @@ mod tests {
             .expect("state");
         assert_eq!(recovered.page_size, 1024, "the store kept the old page size");
         assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
+    }
+
+    /// Skill review 1 (f): an empty store's page-size restart drops the deferred frees of a release
+    /// whose flight had not landed (here: one under a sequence number nothing has reached). Their
+    /// slots are the truncated arena's: matured into the new arena's free list, each would be
+    /// handed out twice, from the list and from the high-water mark.
+    #[test]
+    fn a_page_size_restart_drops_the_old_arenas_deferred_frees() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        let far = inner.journal.as_ref().unwrap().lsn() + 1;
+        inner.pending_free.push_back((far, vec![1, 2]));
+        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        store.group.mark_durable(far, SyncClass::Off);
+        store.mature(&mut inner);
+        let arena = inner.arena.as_mut().unwrap();
+        let mut seen = HashSet::new();
+        for _ in 0..4 {
+            let slot = arena.alloc();
+            assert!(seen.insert(slot), "slot {slot} handed out twice after a page-size restart");
+        }
     }
 
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
