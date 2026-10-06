@@ -1415,7 +1415,10 @@ impl Journal {
                 let last = last_flight.filter(|&(start, _)| {
                     start < whole.0
                         && confirmed
-                            != Some(u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap()))
+                            != Some(confirm_word(
+                                u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap()),
+                                whole.0 as u64,
+                            ))
                 });
                 // Only whole flights are kept: a flight is synced only after all of it is written,
                 // so one cut short, torn or garbled anywhere was never acknowledged, and all of it
@@ -1561,8 +1564,12 @@ impl Journal {
             write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
-                // Synced with the rest below: the kept last flight is confirmed.
-                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+                // Synced with the rest below: the kept last flight is confirmed, when that sync
+                // proves stable storage (review 6 #1).
+                if cut_confirms(class) {
+                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
+                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+                }
             }
             if class.syncs() {
                 fsync_file(&f, class)?;
@@ -1642,7 +1649,10 @@ impl Journal {
             write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
-                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+                if cut_confirms(src.class) {
+                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
+                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+                }
             }
             if src.class.syncs() {
                 fsync_file(&f, src.class)?;
@@ -1701,7 +1711,10 @@ impl Journal {
             let (frames, last_crc) = reframe(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
-                write_at(&prep.file, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+                if cut_confirms(class) {
+                    let end = len + frames.len() as u64;
+                    write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+                }
                 if class.syncs() {
                     fsync_file(&prep.file, class)?;
                 }
@@ -1898,9 +1911,12 @@ impl Journal {
         }
         if class.syncs() {
             fsync_file(&self.file, class)?;
-            if !super::store::fe_mutant("no_flight_confirm") {
+            // At open, outside any acknowledgement window: confirmed at once when the sync proved
+            // stable storage (review 6 #1).
+            if proves_stable(class) && !super::store::fe_mutant("no_flight_confirm") {
                 let crc = end_frame_crc(frames[frames.len() - END_FRAME_LEN..].try_into().unwrap());
-                write_at(&self.file, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+                let end = self.len + frames.len() as u64;
+                write_at(&self.file, &confirm_word(crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
             }
         }
         Ok(())
@@ -2230,11 +2246,83 @@ const HEADER_RAISED_AT: u64 = 32;
 /// The nonce, and the header checksum after it (over every byte before it).
 const HEADER_NONCE_AT: usize = 24;
 const HEADER_CRC_AT: usize = 28;
-/// The checksum of the last flight whose sync RETURNED, written (not synced) right after it: its
-/// presence proves the flight was acknowledged, so a slot of it failing its CRC at recovery is
-/// damage, not a slot that never reached the disk (`Scanned::last_flight_slots`). Outside the header
-/// checksum; 0 when no flight is confirmed.
+/// The confirmation of the last flight whose sync RETURNED in a class that proves stable storage
+/// (`confirm_word`): its presence proves the flight was acknowledged, so a slot of it failing its
+/// CRC at recovery is damage, not a slot that never reached the disk (`Scanned::last_flight_slots`).
+/// Written unsynced, never inside an acknowledgement window: by the store's confirmation writer
+/// once the log is idle, and at close (review 6 #1). A whole later flight already proves an earlier
+/// one was synced (`synced_flight_over`), so the word matters only for the log's idle tail. Outside
+/// the header checksum; 0 when no flight is confirmed.
 const HEADER_CONFIRM_AT: u64 = 36;
+
+/// The word that confirms a last flight whose end frame carries `crc` and which ends at byte `end`
+/// of the log (review 6 #1): bound to where it ends, so a byte-identical flight elsewhere in the
+/// log can never match it. Mutant `confirm_unbound` (test builds only): the end frame's checksum
+/// alone, as before.
+pub(crate) fn confirm_word(crc: u32, end: u64) -> u32 {
+    if super::store::fe_mutant("confirm_unbound") {
+        return crc;
+    }
+    crc32c::crc32c_append(crc, &end.to_le_bytes())
+}
+
+/// Whether a sync in `class` proves its bytes reached stable storage (review 6 #1): on Apple only
+/// F_FULLFSYNC drains the device's cache, while fsync(2) does elsewhere. Mutant
+/// `confirm_unproven` (test builds only): any syncing class, as before.
+pub(crate) fn proves_stable(class: SyncClass) -> bool {
+    if cfg!(target_vendor = "apple") && !super::store::fe_mutant("confirm_unproven") {
+        class == SyncClass::FullFsync
+    } else {
+        class.syncs()
+    }
+}
+
+/// Whether a cut writes the confirmation of the flight it keeps last (review 6 #1): only when its
+/// own sync proves stable storage. Mutant `cut_confirms_unsynced` (test builds only): always, as
+/// before.
+fn cut_confirms(class: SyncClass) -> bool {
+    proves_stable(class) || super::store::fe_mutant("cut_confirms_unsynced")
+}
+
+/// A landed flight's confirmation (review 6 #1): the word for the log's header and the log it goes
+/// to, handed to the store's confirmation writer instead of being written inside the flight's
+/// acknowledgement window. The log may since have been replaced by a cut: the word then goes to
+/// the old file, which no recovery reads, and matches nothing in the new one.
+pub(crate) struct Confirm {
+    log: File,
+    word: u32,
+    /// The flight's sync proved stable storage (`proves_stable`); otherwise only a close, after a
+    /// full flush of its own, may write the word.
+    proved: bool,
+    /// The `ConfirmWriteFails` failpoint.
+    fail: bool,
+}
+
+impl Confirm {
+    /// Whether the word may be written as is (`proved`).
+    pub(crate) fn proved(&self) -> bool {
+        self.proved
+    }
+
+    /// Write the word (unsynced: its absence proves nothing, its presence that the sync returned).
+    pub(crate) fn write(&self) -> Result<()> {
+        if self.fail {
+            return Err(LimboError::InternalError(
+                "failpoint: a flight's confirmation word was not written".to_string(),
+            ));
+        }
+        write_at(&self.log, &self.word.to_le_bytes(), HEADER_CONFIRM_AT)
+    }
+
+    /// At a clean close: a flight whose sync did not prove stable storage is made stable first,
+    /// by a full flush of the log (which drains the device's cache, the arena's writes with it).
+    pub(crate) fn write_at_close(&self) -> Result<()> {
+        if !self.proved {
+            fsync_file(&self.log, SyncClass::FullFsync)?;
+        }
+        self.write()
+    }
+}
 
 fn class_code(class: SyncClass) -> u32 {
     match class {
@@ -2350,21 +2438,24 @@ pub(crate) struct Flight {
 }
 
 impl Flight {
-    /// Arena first, then the frames, then the log: the order `Journal::flush` keeps.
-    pub(crate) fn write(self) -> Result<()> {
+    /// Arena first, then the frames, then the log: the order `Journal::flush` keeps. Returns the
+    /// flight's confirmation (`Confirm`) when its sync returned, for the store to write once the log
+    /// is idle (review 6 #1): nothing is written after the sync, so nothing sits between it and the
+    /// acknowledgement.
+    pub(crate) fn write(self) -> Result<Option<Confirm>> {
         self.write_with(|| {})
     }
 
     /// `write`, running `after_pwrite` between the frames' write and the log's sync (mutant M-b's
     /// seam: an acknowledgement there is an ack after the pwrite and before the sync).
-    pub(crate) fn write_with(mut self, after_pwrite: impl FnOnce()) -> Result<()> {
+    pub(crate) fn write_with(mut self, after_pwrite: impl FnOnce()) -> Result<Option<Confirm>> {
         if self.fail {
             return Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
             ));
         }
         let Some(log) = self.log else {
-            return Ok(());
+            return Ok(None);
         };
         // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
         // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
@@ -2402,27 +2493,34 @@ impl Flight {
             fsync_file(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
         }
+        let mut confirm = None;
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
-            // The flush returned: confirm the flight (`HEADER_CONFIRM_AT`; not synced: its absence
-            // proves nothing, its presence that this sync returned). Mutant `no_flight_confirm`.
+            // The flush returned: the flight's confirmation (`HEADER_CONFIRM_AT`), for the store's
+            // writer. Mutant `no_flight_confirm`: none. Mutant `confirm_in_ack_window` (test builds
+            // only): written here, inside the acknowledgement window, as before (review 6 #1).
             if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
-                if self.fail_confirm {
-                    return Err(LimboError::InternalError(
-                        "failpoint: a flight's confirmation word was not written".to_string(),
-                    ));
-                }
                 let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
-                write_at(&log, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+                let c = Confirm {
+                    word: confirm_word(crc, self.at + self.bytes.len() as u64),
+                    proved: proves_stable(self.class),
+                    fail: self.fail_confirm,
+                    log,
+                };
+                if super::store::fe_mutant("confirm_in_ack_window") {
+                    c.write()?;
+                } else {
+                    confirm = Some(c);
+                }
             }
         }
         // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
         // log and the trunk's WAL removed. Caught by C1b.
-        if syncs && self.ordered && !super::store::fe_mutant("no_log_barrier") {
+        else if syncs && self.ordered && !super::store::fe_mutant("no_log_barrier") {
             barrier_file(&log, self.class)?;
         }
         super::store::kill_point("flight.log_synced");
-        Ok(())
+        Ok(confirm)
     }
 
     /// Make this flight ORDERED instead of synced (see `ordered`): only for a trunk commit that will

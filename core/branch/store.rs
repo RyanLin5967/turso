@@ -217,7 +217,7 @@ use super::arena::{Arena, Slot};
 use super::catalog::{CatBranch, Catalog, Meta};
 use super::prewarm::{self, Prewarm, PrewarmStats, Targets};
 use super::id_set::{IdSet, IdSetWork};
-use super::journal::{BranchFiles, Flight, Journal, Record, SnapBranch, SnapshotState};
+use super::journal::{BranchFiles, Confirm, Flight, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::table::BranchTable;
 use super::{
@@ -239,6 +239,10 @@ pub(crate) struct BranchStore {
     /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
     /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
+    /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
+    /// if it could not be started (the close then writes the last word).
+    confirm_writer: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
     name_filter_build: Mutex<Option<crate::thread::JoinHandle<()>>>,
     name_filter_stop: Arc<std::sync::atomic::AtomicBool>,
@@ -365,6 +369,9 @@ pub(crate) struct BranchStore {
 pub(crate) struct Group {
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
+    /// Wakes the confirmation writer (`run_confirm_writer`): a landing that left a confirmation to
+    /// write where there was none, and the store's close.
+    confirm_cv: std::sync::Condvar,
     /// `GroupState::durable`, readable without the group's lock (lead review 1 item 10): written
     /// under it, after the state, by `set_durable`.
     durable_now: [AtomicU64; 3],
@@ -404,6 +411,11 @@ struct GroupState {
     /// whose write failed.
     confirms_written: u64,
     confirm_failures: u64,
+    /// The confirmation of the last flight that landed, and when it landed (review 6 #1): written
+    /// by the confirmation writer once no flight has landed for `confirm_quiet()`, or at close.
+    confirm: Option<(Instant, Confirm)>,
+    /// The store is closing: the confirmation writer stops (the close writes what is left).
+    confirm_stop: bool,
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -422,6 +434,7 @@ impl Group {
                 ..GroupState::default()
             }),
             cv: std::sync::Condvar::new(),
+            confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
         }
@@ -464,18 +477,32 @@ impl Group {
     }
 
     /// Record a flight's outcome and wake every waiter: on success every byte below `end` is
-    /// durable in `class` and every weaker one.
-    fn land(&self, end: u64, class: SyncClass, ok: bool) {
+    /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) replaces
+    /// the last one for the confirmation writer.
+    fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) {
         let mut g = self.lock();
         g.flushing = false;
+        let mut replaced = None;
         if ok {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
+            }
+            if let Some(confirm) = confirm {
+                // The writer sleeps without a deadline while it holds nothing it may write: woken
+                // when that changes.
+                let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
+                replaced = g.confirm.replace((Instant::now(), confirm));
+                if wake {
+                    self.confirm_cv.notify_one();
+                }
             }
         } else {
             self.failed.store(true, Ordering::Release);
         }
         self.cv.notify_all();
+        drop(g);
+        // The replaced confirmation's descriptor is closed holding no lock.
+        drop(replaced);
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -505,7 +532,100 @@ impl Group {
         for c in 0..=class_index(class) {
             self.set_durable(&mut g, c, end);
         }
+        // The rewrite replaced the log, and confirmed what it kept itself (`Journal::rewrite_from`):
+        // a confirmation of a flight before it names the old file.
+        let stale = g.confirm.take();
         self.cv.notify_all();
+        drop(g);
+        drop(stale);
+    }
+
+    /// Stop the confirmation writer and return the confirmation it left (the store's close).
+    fn stop_confirms(&self) -> Option<Confirm> {
+        let mut g = self.lock();
+        g.confirm_stop = true;
+        self.confirm_cv.notify_all();
+        g.confirm.take().map(|(_, c)| c)
+    }
+
+    /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
+    /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
+    fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
+        let written = if at_close { confirm.write_at_close() } else { confirm.write() };
+        let mut g = self.lock();
+        match written {
+            Ok(()) => g.confirms_written += 1,
+            Err(e) => {
+                g.confirm_failures += 1;
+                tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
+                if fe_mutant("confirm_error_fails_flight") {
+                    self.fail(&mut g);
+                }
+            }
+        }
+    }
+}
+
+/// How long the group must stay idle (no flight landed) before the confirmation writer writes the
+/// last flight's word (review 6 #1). Under load a whole later flight proves each earlier one
+/// synced, so the word is written only into an idle tail, once per idle period.
+const CONFIRM_QUIET: Duration = Duration::from_millis(5);
+
+fn confirm_quiet() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = CONFIRM_QUIET_MS.load(Ordering::Acquire);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    CONFIRM_QUIET
+}
+
+/// The confirmation writer, one thread per durable store (review 6 #1; listed in the PREREG annex
+/// as background work). It writes the last landed flight's confirmation word into the log's
+/// header once no flight has landed for `confirm_quiet()` and none is in the air — holding the
+/// group's flight slot (`flushing`) for its one unsynced pwrite, so the word never sits inside an
+/// acknowledgement window and no flight's sync is taken while it is written. A flight whose sync
+/// did not prove stable storage (`Confirm::proved`) waits for the close. Nothing is written once
+/// the store is fail-stopped.
+fn run_confirm_writer(group: Arc<Group>) {
+    let mut g = group.lock();
+    loop {
+        if g.confirm_stop {
+            return;
+        }
+        let landed = match g.confirm.as_ref() {
+            Some((at, c)) if c.proved() && !group.poisoned() => *at,
+            _ => {
+                g = group.confirm_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+        };
+        let idle = landed.elapsed();
+        if idle < confirm_quiet() || g.flushing || g.cutting {
+            let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
+            g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
+            continue;
+        }
+        let (_, confirm) = g.confirm.take().expect("checked above");
+        g.flushing = true;
+        drop(g);
+        group.write_confirm(&confirm, false);
+        g = group.lock();
+        g.flushing = false;
+        group.cv.notify_all();
+        drop(g);
+        drop(confirm);
+        g = group.lock();
+    }
+}
+
+/// A flight's outcome and its confirmation (review 6 #1), apart.
+fn split_confirm(written: Result<Option<Confirm>>) -> (Result<()>, Option<Confirm>) {
+    match written {
+        Ok(confirm) => (Ok(()), confirm),
+        Err(e) => (Err(e), None),
     }
 }
 
@@ -2626,6 +2746,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
+            confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
@@ -2877,6 +2998,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
+            confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
@@ -2891,6 +3013,9 @@ impl BranchStore {
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
         };
+        if store.inner.lock().files.is_some() {
+            store.start_confirm_writer();
+        }
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
         // what makes a crashed agent's branch temporary. The clock resumed where it was last
@@ -3443,13 +3568,13 @@ impl BranchStore {
         g.locked_flushes += 1;
         drop(g);
         let (end, class) = (flight.end_lsn, flight.class);
-        let written = flight.write();
+        let (written, confirm) = split_confirm(flight.write());
         if written.is_err() {
             if let Some(journal) = inner.journal.as_mut() {
                 journal.poison();
             }
         }
-        self.group.land(end, class, written.is_ok());
+        self.group.land(end, class, written.is_ok(), confirm);
         written?;
         self.mature(inner);
         Ok(())
@@ -3570,18 +3695,18 @@ impl BranchStore {
             let (end, flight_class) = (flight.end_lsn, flight.class);
             // Mutant M-b (PREREG v1 amendment 36): the waiters are acknowledged after the pwrite
             // and before the sync. Caught by C1b and V2, not by SIGKILL.
-            let written = if fe_mutant("ack_before_sync") {
+            let (written, confirm) = split_confirm(if fe_mutant("ack_before_sync") {
                 flight.write_with(|| group.mark_durable(end, flight_class))
             } else {
                 flight.write()
-            };
+            });
             if written.is_err() {
                 // Fail-stops the group and the journal in one step (they share the flag), and
                 // wakes the waiters, some of whom hold the store mutex while they wait.
-                group.land(end, flight_class, false);
+                group.land(end, flight_class, false, None);
                 return written;
             }
-            group.land(end, flight_class, true);
+            group.land(end, flight_class, true, confirm);
             kill_point("flight.landed");
         }
     }
@@ -3976,6 +4101,38 @@ impl BranchStore {
                     *cat.dirty.entry(id).or_insert(0) |= what;
                 }
                 FlightStart::Failed
+            }
+        }
+    }
+
+    /// Start the confirmation writer (review 6 #1). If it cannot start, the store runs on and its
+    /// close writes the last flight's word.
+    fn start_confirm_writer(&self) {
+        let group = self.group.clone();
+        match crate::thread::Builder::new()
+            .name("branch-confirm".to_string())
+            .spawn(move || run_confirm_writer(group))
+        {
+            Ok(handle) => *self.confirm_writer.lock() = Some((std::process::id(), handle)),
+            Err(e) => tracing::warn!("branch log confirmation writer not started: {e}"),
+        }
+    }
+
+    /// Stop the confirmation writer and write the last landed flight's word: a clean close leaves
+    /// the log's tail confirmed (review 6 #1). Nothing is written by a fail-stopped store.
+    fn close_confirms(&self) {
+        let left = self.group.stop_confirms();
+        // A fork(2) child has neither the writer nor the right to write the parent's log.
+        let mut ours = true;
+        if let Some((pid, handle)) = self.confirm_writer.lock().take() {
+            ours = pid == std::process::id();
+            if ours && handle.join().is_err() {
+                tracing::warn!("the branch log confirmation writer panicked");
+            }
+        }
+        if let Some(confirm) = left {
+            if ours && !self.group.poisoned() {
+                self.group.write_confirm(&confirm, true);
             }
         }
     }
@@ -5160,7 +5317,8 @@ impl BranchStore {
                 }
             };
             let end = flight.end_lsn;
-            let written = flight.write();
+            // An ordered flight is barriered, not synced: it has no confirmation.
+            let (written, _) = split_confirm(flight.write());
             self.group.land_ordered(end, written.is_ok());
             written?;
         }
@@ -5939,6 +6097,9 @@ impl Drop for BranchStore {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
             }
         }
+        // After the stamp, which is a flight of its own.
+        drop(inner);
+        self.close_confirms();
     }
 }
 
