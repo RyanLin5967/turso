@@ -941,6 +941,8 @@ pub(crate) struct Journal {
     fail_next_arena_sync: bool,
     /// See [`Journal::fail_next_take`].
     fail_next_take: bool,
+    /// See [`Journal::fail_next_confirm`].
+    fail_next_confirm: bool,
     /// The format version this journal writes and was read at (`format_version`).
     format: u32,
     /// Frame bytes ever buffered by this journal: the log sequence number a group flight makes
@@ -1064,6 +1066,7 @@ impl Journal {
             fail_next_write: false,
             fail_next_arena_sync: false,
             fail_next_take: false,
+            fail_next_confirm: false,
             format: FORMAT_VERSION,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -1261,6 +1264,7 @@ impl Journal {
             fail_next_write: false,
             fail_next_arena_sync: false,
             fail_next_take: false,
+            fail_next_confirm: false,
             format,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -1482,6 +1486,12 @@ impl Journal {
     /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
     pub(crate) fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// Fail the confirmation word of the next flight as an I/O error would (the
+    /// `ConfirmWriteFails` failpoint; review 6 #1).
+    pub(crate) fn fail_next_confirm(&mut self) {
+        self.fail_next_confirm = true;
     }
 
     /// Fail the arena sync of the next compaction as an I/O error would (the `ArenaSyncFails`
@@ -1933,6 +1943,7 @@ impl Journal {
         upgrade: bool,
     ) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
+        let fail_confirm = std::mem::take(&mut self.fail_next_confirm);
         self.check_live()?;
         let class = class.max(self.sync).max(self.pending_class);
         // A raised flight in a D0 store makes its records durable where D0's never are: the slots
@@ -1952,6 +1963,7 @@ impl Journal {
                 at: self.len,
                 class,
                 fail: false,
+                fail_confirm: false,
                 end_lsn,
                 header: None,
                 ordered: false,
@@ -2022,6 +2034,7 @@ impl Journal {
             at,
             class,
             fail,
+            fail_confirm,
             end_lsn,
             header,
             ordered: false,
@@ -2320,6 +2333,8 @@ pub(crate) struct Flight {
     at: u64,
     pub(crate) class: SyncClass,
     fail: bool,
+    /// The `ConfirmWriteFails` failpoint: this flight's confirmation word fails to be written.
+    fail_confirm: bool,
     /// The journal's `lsn` at the end of these frames: what the flight makes durable.
     pub(crate) end_lsn: u64,
     /// The header's raised-class field, when this flight is the first in a stronger class.
@@ -2392,6 +2407,11 @@ impl Flight {
             // The flush returned: confirm the flight (`HEADER_CONFIRM_AT`; not synced: its absence
             // proves nothing, its presence that this sync returned). Mutant `no_flight_confirm`.
             if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
+                if self.fail_confirm {
+                    return Err(LimboError::InternalError(
+                        "failpoint: a flight's confirmation word was not written".to_string(),
+                    ));
+                }
                 let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
                 write_at(&log, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
             }

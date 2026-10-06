@@ -497,6 +497,9 @@ pub enum BranchFailpoint {
     CaptureFails,
     /// The next fuzzy checkpoint's thread cannot be spawned (review 4 #2).
     SpawnFails,
+    /// The confirmation word of the next group flight fails to reach the log's header, as an I/O
+    /// error would (review 6 #1).
+    ConfirmWriteFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -1409,6 +1412,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
         self.branches.checkpoint_counters()
+    }
+
+    /// Confirmation words written into the branch log's header, and those whose write failed
+    /// (review 6 #1; observing only).
+    #[doc(hidden)]
+    pub fn branch_confirm_counts(&self) -> [u64; 2] {
+        self.branches.confirm_counts()
     }
 
     /// Start a fuzzy catalog checkpoint now (F-FZ): its write runs on a thread of its own. `false`:

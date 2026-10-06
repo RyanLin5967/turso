@@ -3513,3 +3513,217 @@ fn a_capture_that_fails_appends_no_checkpoint_marker() {
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no checkpoint started after the failed one");
     db.branch_checkpoint_wait();
 }
+
+/// The branch log's header confirmation word, the checksum of its last end frame and its length
+/// (review 6 #1).
+fn log_confirmation_at(log: &Path) -> (u32, u32, u64) {
+    let bytes = std::fs::read(log).unwrap();
+    let n = bytes.len();
+    let word = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    (word, u32::from_le_bytes(bytes[n - 4..].try_into().unwrap()), n as u64)
+}
+
+fn log_confirmation(db: &Arc<Database>) -> (u32, u32, u64) {
+    log_confirmation_at(&db.branch_log_path().expect("a durable store"))
+}
+
+/// The word that confirms a last flight whose end frame's checksum is `crc` and which ends at byte
+/// `end` of the log (review 6 #1: bound to where it ends, so no other flight can match it).
+fn bound_word(crc: u32, end: u64) -> u32 {
+    crc32c::crc32c_append(crc, &end.to_le_bytes())
+}
+
+/// Sets `store::CONFIRM_QUIET_MS` for one test, and clears it when dropped.
+struct ConfirmQuiet;
+
+impl ConfirmQuiet {
+    fn set(ms: u64) -> Self {
+        super::store::CONFIRM_QUIET_MS.store(ms, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ConfirmQuiet {
+    fn drop(&mut self) {
+        super::store::CONFIRM_QUIET_MS.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Poll `f` until it holds, for up to 10 s.
+fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !f() {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Review 6 #1: a create is acknowledged before anything is written into the log's header. The
+/// flight wrote its confirmation word after its sync and before its acknowledgement, so every D2
+/// acknowledgement followed an unsynced write (PREREG V2), and every flight paid a pwrite and a
+/// second dirty block. Here the word is held back for 60 s: whatever is in the header right after
+/// the acknowledgement was there before the flight.
+#[test]
+fn a_flights_acknowledgement_comes_before_any_confirmation_word() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(60_000);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ackwin.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _second = trunk.fork_branch().unwrap().into_id();
+        let (word, last, len) = log_confirmation(&db);
+        assert!(
+            word != last && word != bound_word(last, len),
+            "catalog={catalog}: the create was acknowledged after its flight's confirmation word was written ({word:#x})"
+        );
+    }
+}
+
+/// Review 6 #1: once the log is idle, its last flight is confirmed, by a word bound to the
+/// flight's end frame AND to the offset where it ends.
+#[test]
+fn an_idle_logs_last_flight_is_confirmed_bound_to_where_it_ends() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("idletail.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _second = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("catalog={catalog}: the idle log's last flight was never confirmed"), || {
+            log_confirmation(&db).0 != 0
+        });
+        let (word, last, len) = log_confirmation(&db);
+        assert_eq!(word, bound_word(last, len), "catalog={catalog}: the confirmation is not bound to the last flight's end");
+    }
+}
+
+/// Review 6 #1: a confirmation word that cannot be written changes no flight's outcome. The flight
+/// is durable once its sync returned; its word only lets recovery tell damage from a lost write,
+/// so a failure to write it is counted and the store goes on.
+#[test]
+fn a_confirmation_that_cannot_be_written_fails_no_flight() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("confirmfail.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        db.branch_failpoint(Some(BranchFailpoint::ConfirmWriteFails));
+        let created = trunk.fork_branch().map(|b| b.into_id());
+        assert!(created.is_ok(), "catalog={catalog}: a durable create failed with its confirmation word: {:?}", created.err());
+        eventually(&format!("catalog={catalog}: the failed confirmation was not counted"), || {
+            db.branch_confirm_counts()[1] == 1
+        });
+        trunk.fork_branch().unwrap_or_else(|e| panic!("catalog={catalog}: the store stopped over a confirmation word: {e}"));
+    }
+}
+
+/// Review 6 #1: on Apple a plain fsync does not drain the device's cache, so a D1 flight proves
+/// nothing reached stable storage and is not confirmed while the store runs. A clean close makes
+/// the log stable with a full flush and then confirms its last flight.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_plain_fsync_confirms_no_flight_until_a_close_on_apple() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = {
+            let db = open_at(&dir.path().join("d1confirm.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let _first = trunk.fork_branch().unwrap().into_id();
+            let _second = trunk.fork_branch().unwrap().into_id();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(log_confirmation(&db).0, 0, "catalog={catalog}: a D1 flight was confirmed on Apple");
+            db.branch_log_path().unwrap()
+        };
+        let (word, last, len) = log_confirmation_at(&log);
+        assert_eq!(word, bound_word(last, len), "catalog={catalog}: the closed log's last flight is not confirmed");
+    }
+}
+
+/// Review 6 #1: a cut confirms the flight it keeps last only when its own sync proves stable
+/// storage. A D0 cut syncs nothing, yet wrote the word: recovery then takes a bad slot of that
+/// flight for damage and refuses the branch, where the slot was only never written.
+#[test]
+fn a_d0_cut_confirms_no_flight() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("d0cut.db"),
+        opts(true, SyncClass::Off).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let installed = db.branch_checkpoint_counters()[0];
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    // A flight after the capture: the cut keeps it, as its last.
+    let _second = trunk.fork_branch().unwrap().into_id();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "premise: the checkpoint installed");
+    let (word, _, len) = log_confirmation(&db);
+    assert!(len > 40, "premise: the cut log keeps the flight after the capture");
+    assert_eq!(word, 0, "a D0 cut confirmed a flight no sync proved");
+}
+
+/// Review 6 #1: a header word that names the last flight's end frame but not where that flight
+/// ends (the word as it was written before) confirms nothing: the flight is checked, and its lost
+/// slot drops it, as for a flight never confirmed.
+#[cfg(unix)]
+#[test]
+fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("unbound.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::FullFsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            write_v(&bc, 3, "durable");
+            let before: std::collections::HashSet<u32> = b.owned_slots().into_iter().collect();
+            write_v(&bc, 3, "lost");
+            let fresh: Vec<u32> = b.owned_slots().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(fresh.len(), 1, "catalog={catalog}: premise: the last write took one fresh slot");
+            drop(bc);
+            let arena = arena_path(&db);
+            let log = db.branch_log_path().unwrap();
+            let id = b.into_id();
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
+            f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
+            let (_, last, _) = log_confirmation_at(&log);
+            let l = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+            l.write_all_at(&last.to_le_bytes(), 36).unwrap();
+            (id, incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::FullFsync), incarnation);
+        let b = db.branch(id).unwrap();
+        let got = b.connect().and_then(|c| c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows()));
+        match got {
+            Ok(rows) => assert_eq!(rows[0][0], crate::Value::from_text("durable"), "catalog={catalog}: the dropped flight's write was read"),
+            Err(e) => panic!("catalog={catalog}: an unbound word confirmed the last flight, and its lost slot was refused: {e}"),
+        }
+    }
+}
+

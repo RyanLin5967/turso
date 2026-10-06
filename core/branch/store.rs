@@ -400,6 +400,10 @@ struct GroupState {
     already_durable: u64,
     upgrades: u64,
     riders: u64,
+    /// Observation only (review 6 #1): confirmation words written into the log's header, and those
+    /// whose write failed.
+    confirms_written: u64,
+    confirm_failures: u64,
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -1132,6 +1136,12 @@ const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
 /// a stall on `pending_full` unmistakable instead of timing a 100 ms one (review 3 #9).
 #[cfg(test)]
 pub(crate) static PENDING_FULL_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test builds: how long the group must stay idle before the confirmation word of its last flight
+/// is written, in milliseconds when set (0: the default), so a test can hold the word back or have
+/// it written at once (review 6 #1).
+#[cfg(test)]
+pub(crate) static CONFIRM_QUIET_MS: AtomicU64 = AtomicU64::new(0);
 
 fn pending_full_wait() -> Duration {
     #[cfg(test)]
@@ -3394,6 +3404,10 @@ impl BranchStore {
             *failpoint = None;
             // Fails as the flight is taken, after this operation is applied.
             journal.fail_next_take();
+        }
+        if *failpoint == Some(BranchFailpoint::ConfirmWriteFails) {
+            *failpoint = None;
+            journal.fail_next_confirm();
         }
         for record in records {
             journal.buffer(record)?;
@@ -5827,6 +5841,13 @@ impl BranchStore {
             .cat
             .as_ref()
             .map_or([0; 9], |c| c.ckpt.as_array())
+    }
+
+    /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
+    /// observing only).
+    pub(crate) fn confirm_counts(&self) -> [u64; 2] {
+        let g = self.group.lock();
+        [g.confirms_written, g.confirm_failures]
     }
 
     /// The log's sequence number: every byte buffered or written so far (tests only).
