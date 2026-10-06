@@ -736,11 +736,20 @@ alive=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && aliv
 [ $alive = 1 ] && : "$( { printf '%s %s\n' "stale.0.0" "f14z" >&"${STAMPER[1]}"; } 2>/dev/null )"
 sleep 0.2
 s3=$(clock_pair f14c); s4=$(clock_pair f14d)
+# ...and a ( ) subshell that reopened the stamper's fd numbers onto a decoy file and /dev/null: the fds are open but
+# are not the coproc's pipes, so the /proc inode half of stamper_fds_ok must refuse them -- one-shot, and nothing
+# written into the decoy (fifth re-review, finding 1: no case made that half refuse). Linux /proc is required.
+decoy="$OUT/f14.decoy"; : >"$decoy"
+s5=$( ( eval "exec ${STAMPER[1]}>\"\$decoy\" ${STAMPER[0]}</dev/null"; clock_pair f14e ) 2>/dev/null )
+dsz=$(wc -c <"$decoy" | tr -d ' ')
+haveproc=0; [ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
 if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
-  $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped: [$s3]"
+  $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
+  $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds refused (0 bytes written): [$s3]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive [$s3] [$s4]"; fails=$((fails + 1))
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes"
+  fails=$((fails + 1))
 fi
 
 rm -rf "$DIR/fc"
