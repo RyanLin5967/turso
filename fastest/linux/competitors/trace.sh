@@ -47,8 +47,11 @@ ST_PID=
 # records NAME_src=coproc|oneshot, so the raw says which path served it (third re-review, finding 3).
 # Requests are "NONCE NAME" and replies "NONCE NAME=...": a reply left in the pipe by an earlier call that timed out is
 # skipped by its nonce instead of being taken as this call's. A shell whose coproc fds are not open (bash closes them
-# in ( ), & and pipeline subshells; only command substitutions keep them) uses the one-shot path and never touches the
-# stamper: the old desync rule killed the shared, healthy stamper from such a subshell (third re-review, finding 2).
+# in ( ), & and pipeline subshells; command and process substitutions keep them), or whose fds of those numbers are
+# not the coproc's pipes (on Linux: the same inodes as in the shell that started it), uses the one-shot path and never
+# touches the stamper: the old desync rule killed the shared, healthy stamper from such a subshell (third re-review,
+# finding 2; fourth re-review, findings 4 and 5). A reply waits at most 2 s, so a stuck stamper costs 2 s per stamp,
+# each still the moment it was taken (fourth re-review, finding 3).
 STAMP_PY='
 import sys, time
 # CLOCK_MONOTONIC itself, system-wide, so the coproc and a fallback process read the same clock: time.monotonic() has
@@ -69,20 +72,28 @@ for req in sys.stdin:
           flush=True)
 '
 coproc STAMPER { exec python3 -B -I -u -c "$STAMP_PY"; }
+STAMPER_SHELL=$BASHPID
 STAMP_SEQ=0
+stamper_fds_ok() { # the coproc's two fds are open in THIS shell and, where /proc says so, are the coproc's own pipes
+  local f
+  for f in "${STAMPER[0]}" "${STAMPER[1]}"; do
+    { true >&"$f"; } 2>/dev/null || { true <&"$f"; } 2>/dev/null || return 1
+    if [ -d "/proc/$STAMPER_SHELL/fd" ]; then [ "/proc/$BASHPID/fd/$f" -ef "/proc/$STAMPER_SHELL/fd/$f" ] || return 1; fi
+  done
+}
 clock_pair() {
   local name=$1 line="" src=oneshot nonce
   STAMP_SEQ=$((STAMP_SEQ + 1))
   nonce="$BASHPID.$STAMP_SEQ.$RANDOM"
   # The coproc only from a shell that still holds its fds (an fd test, not a pid test: a command substitution keeps
   # them, a ( ) subshell does not), and only while it lives.
-  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && { : >&"${STAMPER[1]}"; } 2>/dev/null; then
+  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && stamper_fds_ok; then
     # In a command substitution: a stamper that died between the check and the write costs that subshell its
     # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
     line=$( {
       printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
       for ((k = 0; k < 8; k++)); do
-        IFS= read -r -t 5 l <&"${STAMPER[0]}" || exit 1
+        IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
         case $l in "$nonce $name="*) printf '%s' "${l#"$nonce "}"; exit 0 ;; esac
       done
       exit 1
@@ -192,7 +203,7 @@ fdsync_scan() {
         { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
         [ -n "$fl" ] || continue
         n=$((n + 1))
-        # FDSYNC_SCAN_HOOK (the fire-check's F6d only; unset everywhere else) runs once per try after its first fd,
+        # FDSYNC_SCAN_HOOK (the fire-check's F6d and F6e only; run_system.sh refuses it) runs once per try after its first fd,
         # with the fdinfo dir being read: F6d makes that task exit there to force the rescan and "unscanned" paths.
         if [ "$n" = 1 ] && [ -n "${FDSYNC_SCAN_HOOK:-}" ]; then "$FDSYNC_SCAN_HOOK" "$fdd"; fi
         if (((8#$fl & 8#04010000) != 0)); then
