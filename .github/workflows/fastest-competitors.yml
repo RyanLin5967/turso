@@ -164,3 +164,37 @@ jobs:
           name: competitors-${{ matrix.system }}-${{ matrix.runner }}-${{ matrix.fs }}
           path: fastest-raw/
           retention-days: 90
+
+  # The run's verdict, computed on CI from every job's raw (QUIET mode allows no local post-processing): reduce.py
+  # over the downloaded competitors-* artifacts, against the workflow at this commit and its pinned matrix, cells and
+  # fire-check names. Fails when an expected job or cell is missing or not ok (exit 1) or the expectation cannot be
+  # determined (exit 2); its output is uploaded as competitors-reduce, which bank.sh banks with the rest.
+  reduce:
+    name: reduce (every expected job and cell)
+    needs: run
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: competitors-*
+          path: ${{ runner.temp }}/runs
+      - name: reduce.py
+        run: |
+          mkdir -p "$RUNNER_TEMP/reduce"
+          rc=0
+          timeout 1200 python3 -B fastest/linux/competitors/reduce.py "$RUNNER_TEMP/runs" \
+            >"$RUNNER_TEMP/reduce/reduce.tsv" 2>"$RUNNER_TEMP/reduce/reduce.err" || rc=$?
+          echo "reduce_rc=$rc git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT" | tee "$RUNNER_TEMP/reduce/reduce-rc.txt"
+          grep '^JOBS' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
+          echo "CELLS rows: $(grep '^CELLS' "$RUNNER_TEMP/reduce/reduce.tsv" | awk 'END {print NR - 1}')"
+          cat "$RUNNER_TEMP/reduce/reduce.err"
+          exit $rc
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitors-reduce
+          path: ${{ runner.temp }}/reduce/
+          retention-days: 90
