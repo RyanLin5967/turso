@@ -349,19 +349,29 @@ else
 fi
 stop_probe2 fork-pre
 
-# storm_misses LOG T0 [STRACEPID] -> how many fork-storm children fsynced after T0 while untraced (TracerPid 0), then
-# how many fsynced while traced -- by STRACEPID only, when given: a strace_attach that needed a second try had a FIRST
-# strace whose traced children fsynced into its discarded trace (run 37400500051: 4 jobs, attach_tries=2, 112
-# "traced" children against 86 fsyncs in the kept trace).
+# storm_misses LOG T0 [STRACEPID] -> how many fork-storm children fsynced after T0 while not traced by STRACEPID
+# (TracerPid 0, or any tracer but STRACEPID when given: a strace_attach that needed a second try had a FIRST strace
+# whose children fsynced into its discarded trace -- run 37400500051), then how many fsynced while traced by it.
 storm_misses() {
   python3 -c "
 import sys
 t0 = float(sys.argv[2]); st = sys.argv[3] if len(sys.argv) > 3 else None; miss = traced = 0
 for ln in open(sys.argv[1]):
     pid, tp, t = ln.split()
-    if tp == '0' and float(t) > t0: miss += 1
-    if tp != '0' and (st is None or tp == st): traced += 1
+    mine = tp != '0' and (st is None or tp == st)
+    if not mine and float(t) > t0: miss += 1
+    if mine: traced += 1
 print(miss, traced)" "$@"
+}
+# storm_pids_match LOG TRACE STRACEPID -> exit 0 when the children that logged STRACEPID as their tracer are exactly
+# the pids with an fsync line in TRACE (fourth review, finding 4: a set check, not fsyncs >= traced).
+storm_pids_match() {
+  python3 -c "
+import re, sys
+logged = {ln.split()[0] for ln in open(sys.argv[1]) if ln.split()[1] == sys.argv[3]}
+seen = {m.group(1) for m in (re.match(r'^(\d+)\s+(?:[\d.]+\s+)?fsync\(', ln) for ln in open(sys.argv[2])) if m}
+print('logged', len(logged), 'in trace', len(seen), 'only logged', sorted(logged - seen)[:5], 'only traced', sorted(seen - logged)[:5])
+sys.exit(0 if logged and logged == seen else 1)" "$@"
 }
 # F10c, the negative control: a parent-only attach (no enumeration, no freeze) to a fork storm MUST miss children
 # that were alive at the seize and fsync after it -- or the storm does not exercise the race and F10d proves nothing.
@@ -401,13 +411,15 @@ if start_probe2 forkstorm; then
     sleep 0.2
     strace_detach "$OUT/f10d"
     count f10d
-    read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$(sed -n 's/.* strace_pid=\([0-9]*\) .*/\1/p' "$OUT/f10d.window")")
+    kept=$(sed -n 's/.* strace_pid=\([0-9]*\) .*/\1/p' "$OUT/f10d.window")
+    read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$kept")
     cp "$DIR/fc/forkstorm.log" "$OUT/f10d.forkstorm.log.txt" 2>/dev/null  # the probe's own record, kept with the raw
-    if [ "$miss" = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" &&
-      python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r['verdict']=='ok' and r['flush_by_syscall']['fsync'] >= int(sys.argv[2]) > 0 else 1)" "$OUT/f10d.json" "$traced"; then
-      log "PASS F10d-storm-attach-complete: 0 untraced child fsyncs after t0, frozen=1, $traced traced children, trace fsyncs $(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['flush_by_syscall']['fsync'])" "$OUT/f10d.json")"
+    match=$(storm_pids_match "$DIR/fc/forkstorm.log" "$OUT/f10d.strace" "$kept"); mrc=$?
+    if [ "$miss" = 0 ] && [ $mrc = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" &&
+      python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r['verdict']=='ok' else 1)" "$OUT/f10d.json"; then
+      log "PASS F10d-storm-attach-complete: 0 child fsyncs after t0 outside the kept trace, frozen=1, $traced children traced by it = the fsync pids in it ($match)"
     else
-      log "FAIL F10d-storm-attach-complete: miss=$miss traced=$traced window=[$(head -1 "$OUT/f10d.window" | cut -c1-200)] verdict=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['verdict'][:200], r['flush_by_syscall'])" "$OUT/f10d.json" 2>&1)"
+      log "FAIL F10d-storm-attach-complete: miss=$miss traced=$traced pid-sets: $match window=[$(head -1 "$OUT/f10d.window" | cut -c1-200)] verdict=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['verdict'][:200], r['flush_by_syscall'])" "$OUT/f10d.json" 2>&1)"
       fails=$((fails + 1))
     fi
   else
