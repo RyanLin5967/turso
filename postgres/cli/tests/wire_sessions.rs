@@ -3081,3 +3081,131 @@ fn an_error_outside_a_statements_run_fails_its_block() {
         "the failed UPDATE was kept"
     );
 }
+
+/// A correlated generate_series column is the name of its own SELECT only, as in PostgreSQL. It
+/// was one name for the whole statement: a bare `g` in a sublink, another UNION arm, a CTE body,
+/// a derived table's parent, RETURNING or an outer ORDER BY read the series, and two series
+/// columns named alike overwrote each other. The answers are PostgreSQL's (by the semantics of
+/// these fixtures; a PG18 re-recording is owed with item 17): `NOT IN (SELECT g FROM u)` reads
+/// u's g and keeps all 3 rows, where it gave 0 (gap review item 1).
+#[test]
+fn a_correlated_generate_series_column_is_scoped_to_its_select() {
+    let dir = Scratch::new("seriesscope");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT)").ok("s");
+    a.q("INSERT INTO s VALUES (1), (2)").ok("s rows");
+    a.q("CREATE TABLE u(k INT, g INT)").ok("u");
+    a.q("INSERT INTO u VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .ok("u rows");
+    a.q("CREATE TABLE w(k INT)").ok("w");
+    a.q("INSERT INTO w VALUES (1), (2), (3), (4), (5)")
+        .ok("w rows");
+    a.q("CREATE TABLE ins(g INT)").ok("ins");
+    let series = "FROM s, generate_series(1, s.x) AS g";
+    let col = |r: &Reply| -> Vec<String> {
+        r.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.clone().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect()
+    };
+    let rows = |a: &mut Wire, sql: &str| -> Vec<String> { col(&a.q(sql).ok(sql)) };
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // Premise: the series itself.
+    assert_eq!(
+        rows(&mut a, &format!("SELECT g {series} ORDER BY g")),
+        s(&["1", "1", "2"])
+    );
+    // A sublink's bare g is its own relation's column.
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!("SELECT g {series} WHERE g NOT IN (SELECT g FROM u) ORDER BY g")
+        ),
+        s(&["1", "1", "2"])
+    );
+    // A correlated reference by the series' alias reads it.
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!("SELECT g {series} WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g.g) ORDER BY g")
+        ),
+        s(&["1", "1", "2"])
+    );
+    // A bare correlated reference names a column w lacks: PostgreSQL reads the series; here it
+    // may be refused, but never answered from another column.
+    let r = a.q(&format!(
+        "SELECT g {series} WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g) ORDER BY g"
+    ));
+    if r.error.is_none() {
+        assert_eq!(col(&r), s(&["1", "1", "2"]), "a bare correlated g");
+    }
+    // A derived table's parent reads the derived column.
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!("SELECT g FROM (SELECT s.x, g {series}) AS sub ORDER BY g")
+        ),
+        s(&["1", "1", "2"])
+    );
+    // Another UNION arm's g is u's, in either order.
+    let both = s(&["1", "1", "2", "10", "20", "30", "40", "50"]);
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!("SELECT g {series} UNION ALL SELECT g FROM u ORDER BY 1")
+        ),
+        both
+    );
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!("SELECT g FROM u UNION ALL SELECT g {series} ORDER BY 1")
+        ),
+        both
+    );
+    // A CTE body and a scalar subquery read their own relations' g.
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!(
+                "WITH c AS (SELECT g FROM u) SELECT (SELECT sum(g) FROM c), g {series} ORDER BY g"
+            )
+        ),
+        s(&["150,1", "150,1", "150,2"])
+    );
+    // RETURNING names the inserted table's column.
+    let mut returned = rows(
+        &mut a,
+        &format!("INSERT INTO ins SELECT g {series} RETURNING g"),
+    );
+    returned.sort();
+    assert_eq!(returned, s(&["1", "1", "2"]));
+    // An outer ORDER BY after a sublink that declared the series reads the outer g.
+    assert_eq!(
+        rows(
+            &mut a,
+            &format!(
+                "SELECT k, g FROM u WHERE EXISTS (SELECT 1 {series} WHERE g.g = u.k) ORDER BY g"
+            )
+        ),
+        s(&["1,10", "2,20"])
+    );
+    // Two series columns named alike, by their aliases; bare, ambiguous (42702).
+    let two = "FROM s, generate_series(1, s.x) AS a(i), generate_series(s.x, 2) AS b(i)";
+    assert_eq!(
+        rows(&mut a, &format!("SELECT a.i, b.i {two} ORDER BY 1, 2")),
+        s(&["1,1", "1,2", "1,2", "2,2"])
+    );
+    assert_eq!(
+        a.q(&format!("SELECT i {two}"))
+            .err("bare i of two series")
+            .code,
+        "42702"
+    );
+}
