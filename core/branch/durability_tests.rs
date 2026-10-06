@@ -1742,7 +1742,22 @@ fn a_forked_child_cannot_write_through_an_inherited_database() {
     assert_ne!(code, 100, "the forked child panicked");
     assert_eq!(code & 3, 3, "a forked child's write was accepted (bits: 1 branch, 2 trunk): {code}");
     assert_eq!(std::fs::read(&arena).unwrap(), arena_before, "a forked child wrote the parent's arena");
-    assert_eq!(std::fs::read(&log).unwrap(), log_before, "a forked child wrote the parent's log");
+    // FLAGGED TEST EDIT (engine review 8 #13): the PARENT's confirmation writer puts its word at
+    // log bytes 36..40 about one quiet period after the last flight, which off Apple can fall after
+    // the snapshot (every flight's sync proves stable storage there): the test then blamed the
+    // child. Those four bytes are masked in both copies; blind spot: a child's write of exactly
+    // them alone.
+    let masked = |mut bytes: Vec<u8>| {
+        if bytes.len() >= 40 {
+            bytes[36..40].fill(0);
+        }
+        bytes
+    };
+    assert_eq!(
+        masked(std::fs::read(&log).unwrap()),
+        masked(log_before),
+        "a forked child wrote the parent's log"
+    );
     assert_eq!(code & 12, 12, "a forked child's refusal did not name the fork (bits: 4 branch, 8 trunk): {code}");
     drop(bc);
     let bc = b.connect().unwrap();

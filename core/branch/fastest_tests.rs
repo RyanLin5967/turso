@@ -3936,8 +3936,13 @@ fn an_idle_logs_last_flight_is_confirmed_bound_to_where_it_ends() {
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
         let _second = trunk.fork_branch().unwrap().into_id();
+        // FLAGGED TEST EDIT (engine review 8 #12): waited for until the word is the LAST flight's,
+        // not merely nonzero: with a 1 ms quiet period the first fork's word could satisfy the
+        // wait, and the assert then compared it with the second flight's (a flake on correct
+        // code). A word never written, or never bound, still fails, on the deadline.
         eventually(&format!("catalog={catalog}: the idle log's last flight was never confirmed"), || {
-            log_confirmation(&db).0 != 0
+            let (word, last, len) = log_confirmation(&db);
+            word == bound_word(last, len)
         });
         let (word, last, len) = log_confirmation(&db);
         assert_eq!(word, bound_word(last, len), "catalog={catalog}: the confirmation is not bound to the last flight's end");
@@ -4404,6 +4409,57 @@ fn every_trunk_wal_sync_failure_site_fail_stops_on_its_own() {
             assert_fail_stopped(db.connect().unwrap().fork_branch().map(|x| x.into_id()), &format!("{what}: the next fork"));
             drop(b);
         }
+    }
+}
+
+/// Engine review 8 #14 (review 3 #9's pager half): a trunk commit with no frames to sync whose
+/// barrier ORDERED a Release (its child just released, so the trunk is childless and the commit
+/// gate-less) relied on a WAL F_FULLFSYNC that never comes. The pager drops the `pending_full` it
+/// set when the commit ends (`close_trunk_gate`), or the release's waiter stalls for the whole
+/// pending-full wait (60 s here) before it leads its own flush. The store-level red never built a
+/// pager, so it could not reach that drop. Mutant `ordered_pending_kept`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_frameless_trunk_commit_that_ordered_a_release_stalls_no_waiter() {
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::PENDING_FULL_WAIT_MS.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("frameless.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let x = trunk.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_RELEASE_BUFFERED, std::sync::atomic::Ordering::Release);
+        let release = std::thread::spawn(move || x.reap().map(|_| ()));
+        wait_hold(&hold, super::store::HOLD_RELEASE_BUFFERED);
+        super::store::PENDING_FULL_WAIT_MS.store(60_000, std::sync::atomic::Ordering::Release);
+        let before = sync_counts();
+        trunk.execute("UPDATE t SET v = v WHERE id = -1").unwrap();
+        let after = sync_counts();
+        let t = std::time::Instant::now();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        release.join().unwrap().unwrap();
+        let waited = t.elapsed();
+        super::store::PENDING_FULL_WAIT_MS.store(0, std::sync::atomic::Ordering::Release);
+        assert!(after.barrier > before.barrier, "catalog={catalog}: premise: the commit's barrier ordered the Release");
+        assert_eq!(
+            after.full_fsync - before.full_fsync,
+            0,
+            "catalog={catalog}: premise: the frameless commit's WAL took no F_FULLFSYNC"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "catalog={catalog}: the release's waiter stalled ({waited:?}) on a WAL flush a frameless commit never makes"
+        );
     }
 }
 

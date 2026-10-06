@@ -1431,6 +1431,12 @@ pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
 /// (engine review 9 #3).
 #[cfg(test)]
 pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a release waits here,
+/// its Release buffered and applied, the store mutex released, before it waits for its flight
+/// (engine review 8 #14: a trunk commit's barrier then orders the Release).
+#[cfg(test)]
+pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -5085,6 +5091,8 @@ impl BranchStore {
         let class = inner.sync;
         drop(inner);
         kill_point("release.applied");
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_RELEASE_BUFFERED);
         if let Err(e) = self.wait_durable(lsn, class) {
             // Applied in memory and not durable: the store is fail-stopped, and the slots it freed
             // never return (no flight will cover them); the branch comes back at the next open.
@@ -10129,6 +10137,7 @@ mod sota_tree_tests {
     /// a WAL flush that never comes left `pending_full` set, and a waiter its flight covered then
     /// stalled for the pending-full wait before leading its own flush. Here that wait is 60 s, so a
     /// stall cannot pass for a slow sync.
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_commit_whose_wal_is_not_full_fsynced_orders_nothing() {
         use std::sync::atomic::Ordering as O;
@@ -10146,6 +10155,9 @@ mod sota_tree_tests {
         let _x = store.fork_trunk_locked(Arc::new(Schema::default()), PAGE).unwrap();
         // The trunk's WAL on the branch files' device, as an F_FULLFSYNC-capable file reports it.
         store.note_trunk_wal(Some(store.files_dev.load(O::Acquire)));
+        // FLAGGED TEST EDIT (engine review 8 #14): the premise that this store orders at all (Apple,
+        // the WAL on the branch files' device): off Apple nothing orders, and the test proved nothing.
+        assert!(store.ordered_trunk(), "premise: the store takes the ordered path for a FULLFSYNC trunk");
         let lsn = {
             let mut inner = store.inner.lock();
             store.buffer_records(&mut inner, &[Record::Clock { now_ms: 7 }]).unwrap()
