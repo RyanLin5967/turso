@@ -2579,3 +2579,28 @@ fn an_extended_alter_add_constraint_adds_it_once() {
     a.read_reply().ok("Describe S then Execute");
     assert_eq!(constraints(&mut a, "e4", "PRIMARY KEY"), "1");
 }
+
+/// Describe never performs a statement, however it is written: one behind a comment is still
+/// answered from its parse (0ddc38bc5 classified the special statements by their first word, so a
+/// leading comment sent this ALTER through Describe's prepare, which performs it).
+#[test]
+fn describe_never_performs_a_statement_behind_a_comment() {
+    let dir = Scratch::new("extaltercomment");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE e5(id INT, v INT)").ok("table");
+    a.q("INSERT INTO e5 VALUES (1, 10)").ok("row");
+    a.x("/* app */ ALTER TABLE e5 ADD PRIMARY KEY (id)", &[])
+        .ok("extended ALTER behind a comment");
+    assert_eq!(
+        a.q("SELECT count(*) FROM information_schema.table_constraints \
+             WHERE table_name = 'e5' AND constraint_type = 'PRIMARY KEY'")
+            .single("constraints"),
+        "1"
+    );
+    let file = dir.0.join("rows.tsv");
+    std::fs::write(&file, "2\t20\n").unwrap();
+    a.x(&format!("-- load\nCOPY e5 FROM '{}'", file.display()), &[])
+        .ok("extended COPY behind a comment");
+    assert_eq!(a.q("SELECT count(*) FROM e5").single("rows"), "2");
+}
