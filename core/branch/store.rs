@@ -3898,11 +3898,15 @@ impl BranchStore {
             // waits for nothing.
             let _ = flights.remove(0).join();
         }
-        let spawned = crate::thread::Builder::new()
-            .name("branch-checkpoint".to_string())
-            .spawn(move || {
-                run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
-            });
+        let spawned = if inner.failpoint.take_if(|f| *f == BranchFailpoint::SpawnFails).is_some() {
+            Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
+        } else {
+            crate::thread::Builder::new()
+                .name("branch-checkpoint".to_string())
+                .spawn(move || {
+                    run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+                })
+        };
         match spawned {
             Ok(handle) => {
                 flights.push(handle);
@@ -7038,7 +7042,12 @@ impl StoreInner {
         } else {
             None
         };
-        if let Err(e) = cat.catalog.begin_read_snapshot() {
+        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
+            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
+        } else {
+            cat.catalog.begin_read_snapshot()
+        };
+        if let Err(e) = snapshot {
             cat.dirty = dirty;
             return Err(e);
         }

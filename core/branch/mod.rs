@@ -492,6 +492,11 @@ pub enum BranchFailpoint {
     /// The next arena sync a compaction (snapshot store) or a catalog checkpoint makes fails as an
     /// I/O error would (review 3 #5).
     ArenaSyncFails,
+    /// The next fuzzy checkpoint's capture fails at its read snapshot, as a catalog error would
+    /// (review 4 #2).
+    CaptureFails,
+    /// The next fuzzy checkpoint's thread cannot be spawned (review 4 #2).
+    SpawnFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

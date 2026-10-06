@@ -3455,3 +3455,37 @@ fn a_d0_release_of_a_slot_a_synced_record_names_waits_for_a_sync() {
         assert_eq!(read_wide(&x.connect().unwrap(), 3), "trunk-3", "catalog={catalog}: the child's fork point");
     }
 }
+
+/// Review 4 #2: a fuzzy checkpoint that cannot start — its capture fails, or its thread cannot be
+/// spawned — backs off as a failed write does, instead of being retried by every later operation
+/// (each retry a capture under the store mutex, O(branches dirty since the last checkpoint): N
+/// creates cost O(N^2)). After the failed attempt, the next creates enter no capture.
+#[test]
+fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
+    let _s = serial();
+    for fp in [BranchFailpoint::CaptureFails, BranchFailpoint::SpawnFails] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("ckpt-start-fails.db"),
+            opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _t = Threshold::set(8 << 10);
+        db.branch_failpoint(Some(fp));
+        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let before = entered();
+        let t = std::time::Instant::now();
+        while entered() == before {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "{fp:?}: no checkpoint was attempted");
+        }
+        db.branch_checkpoint_wait();
+        let after = entered();
+        for _ in 0..5 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        assert_eq!(entered(), after, "{fp:?}: the next creates retried the checkpoint's capture");
+    }
+}
