@@ -63,6 +63,13 @@ SEQ = {"real-all": (ALL, 300, False), "real-4k": ("ow4k,fdatasync4k,nosync25", 4
 FRAME_ARM = "append64"
 M1_FLIGHT_MAX_B = 60
 CLOCKSOURCES = ["tsc", "arch_sys_counter"]
+# A flush an op issues itself shows in EVERY window of its arm (append25 reads 1.00 per op on write-back NVMe, run
+# 37475543956). The leaf drive of a hosted runner is shared with the whole system (its root filesystem's jbd2
+# commits, other processes' fsyncs), so a foreign flush request can land in an occasional window: run 37475543956's
+# x86 ext4 cell saw one jbd2 commit (1 flush + 1 FUA) inside 1 of nosync25's 200 windows. On that shared drive a
+# no-flush arm may therefore show a request in at most this share of its windows (self-issued would be 100%);
+# devices private to the cell (its loop devices, brd) and write-through devices are held to exactly 0.
+SHARED_MAX_FRAC = 0.05
 LEAF_DRIVERS = ["nvme", "sd", "virtio_blk"]
 # crash.sh cases per filesystem kind: (case, arm, flags, rule). "survive" and "lost" are gated (the controls and the
 # rig's own fire-check); "record" cases are recorded with their prediction (review 2 item 3), never gated.
@@ -101,7 +108,8 @@ RUNSH = {
     "R_runsh_dir": "not allowed through run.sh", "R_runsh_out": "not allowed through run.sh",
     "R_runsh_n": "not allowed through run.sh", "R_runsh_fcenv": "V3FLOOR_FIRECHECK", "R_runsh_brdenv": "V3FLOOR_BRD",
     "R_runsh_nocell": "V3_CELL", "R_runsh_badcell": "V3_CELL", "R_runsh_planted": "planted",
-    "R_runsh_shape": "pass", "R_runsh_count": "plan", "R_runsh_cellv": "cell", "R_runsh_t3": "governor",
+    "R_runsh_shape": "pass", "R_runsh_count": "plan", "R_runsh_cellv": "cell",
+    "R_runsh_t3": "T3 preconditions do not hold",
 }
 RUNSH_POST = {"R_runsh_post": ["exe_sha256", "mutant_nosync"]}  # the probe ran; run.sh refused after it (rc 2)
 
@@ -860,11 +868,23 @@ def main(argv):
           and (d.get("by_kind") or {}).get("flush") == 50,
           {"loop": lp_dev, "devfsync": fs, "refused": br.get("refused")},
           "50 fsync(2)s of a raw write-back loop device: exactly one flush request issued to it in each window")
-    quiet = {a: arms.get(a, {}) for a in ("devwrite", "idle")}
-    qbad = [(a, r.get("ops"), r.get("devices")) for a, r in quiet.items() if r.get("ops") != 50 or r.get("devices")]
-    amb = (br.get("windows") or {}).get("ambiguous")
-    check("B:quiet", not qbad and amb == 0, {"bad": qbad, "ambiguous": amb},
-          "50 buffered writes and 50 empty windows: no flush request on any device; no event at a window edge")
+    rootd = (kv.get("root_disk") or "").split(" ")[0]
+    qbad, qrec = [], {}
+    for a in ("devwrite", "idle"):
+        r = arms.get(a, {})
+        if r.get("ops") != 50:
+            qbad.append((a, "ops", r.get("ops")))
+        for dev, x in (r.get("devices") or {}).items():
+            hit = r.get("ops", 50) - x.get("zero_windows", 50)
+            qrec["%s/%s" % (a, dev)] = hit
+            if dev == lp_dev or (dev == rootd and hit > SHARED_MAX_FRAC * r.get("ops", 50)):
+                qbad.append((a, dev, hit))
+    ambd = (br.get("windows") or {}).get("ambiguous_by_device") or {}
+    check("B:quiet", not qbad and not ambd.get(lp_dev) and lp_dev != "",
+          {"bad": qbad, "windows_hit": qrec, "ambiguous_by_device": ambd, "root_disk": rootd},
+          "50 buffered writes and 50 empty windows: no flush request on the loop, at most %d%% of windows with a foreign "
+          "one on the shared root drive (others' devices recorded); no event at a window edge on the loop"
+          % int(SHARED_MAX_FRAC * 100))
     ov = rj(os.path.join(OUT, "B", "overflow.json")) or {}
     check("B:overflow", rc_of(os.path.join(OUT, "B", "overflow.rc")) == 2 and "lost" in str(ov.get("refused", "")),
           {"rc": rc_of(os.path.join(OUT, "B", "overflow.rc")), "report": ov},
@@ -885,7 +905,8 @@ def main(argv):
         rc = rc_of(os.path.join(OUT, "F4", "R_ficlone_accept.rc"))
         txt = rd(os.path.join(OUT, "F4", "R_ficlone_accept.txt")) or ""
         made = os.path.exists(os.path.join(OUT, "F4", "R_ficlone_accept.out"))
-        left = (rd(os.path.join(OUT, "F4", "R_ficlone_accept.left")) or "MISSING").strip()
+        left = rd(os.path.join(OUT, "F4", "R_ficlone_accept.left"))
+        left = "MISSING" if left is None else left.strip()  # an empty file is the pass case
         check("F4:R_ficlone_accept", rc == 1 and "ACCEPTED a trial FICLONE" in txt and not made and left == "",
               {"rc": rc, "text": txt[-300:], "out_made": made, "work_left": left},
               "strace inject makes ext4's trial FICLONE succeed: rc 1 'ACCEPTED a trial FICLONE', no out dir, empty work dir")
@@ -925,6 +946,9 @@ def main(argv):
          "run_id": kv.get("run_id"), "utc": kv.get("utc"), "pass": npass, "total": len(results),
          "all_pass": npass == len(results) and len(results) > 0 and ids == the_plan, "clock": clock_note,
          "F2b_mutant_ratios_from_raw": mut_ratios, "F3": f3rec, "d0_threshold_derivation": d0, "crash": crash,
+         "t3_positive": {"rule_holds_on_this_box": kv.get("t3_rule_holds"),
+                         "P_runsh_t3_rc": rc_of(os.path.join(OUT, "F4", "P_runsh_t3.rc")),
+                         "note": "recorded, not a check: only some runners expose cpufreq on 'performance'"},
          "unplanted_refusals": unplanted(arch, leaf), "checks": results}
     with open(os.path.join(OUT, "verdict.json"), "w") as f:
         json.dump(v, f, indent=1)
@@ -1028,19 +1052,27 @@ def check_real(o3, rc, kv, leaf):
         nrun = len(ran(arms, KIND))
         if w.get("n_windows") != n * nrun:
             dbad.append(("windows", w.get("n_windows"), n * nrun))
-        if w.get("ambiguous") != 0:
-            dbad.append(("ambiguous events", w.get("ambiguous"), w.get("ambiguous_sample")))
         wa = w.get("arms") or {}
-        for dev, r in (wa.get("nosync25", {}).get("devices") or {}).items():
-            if r.get("events"):
-                dbad.append(("nosync25 windows hold flush requests", dev, r))
         layers = sj.get("flush_path") or []
         leafinfo = sj.get("leaf") or {}
+        amb = w.get("ambiguous_by_device") or {}
+        shared = []  # the leaf drive (and its multipath disks), unless the leaf is brd
         for k, l in enumerate(layers):
             names = [l.get("disk")]
             if k == len(layers) - 1:
                 names += [p.get("disk") for p in leafinfo.get("multipath") or []]
             is_brd = k == len(layers) - 1 and leafinfo.get("kind") == "brd"
+            private = k < len(layers) - 1 or is_brd
+            if not private:
+                shared += names
+            n0 = wa.get("nosync25", {})
+            for x in names:
+                r = (n0.get("devices") or {}).get(x)
+                hit = (n0.get("ops", n) - r.get("zero_windows", n)) if r else 0
+                if hit and (private or hit > SHARED_MAX_FRAC * n0.get("ops", n)):
+                    dbad.append(("nosync25 windows hold flush requests", x, "private" if private else "shared", r))
+                if private and amb.get(x):
+                    dbad.append(("events at a window edge on a private device", x, amb.get(x), w.get("ambiguous_sample")))
             total = sum((rep.get("devices") or {}).get(x, {}).get("total", 0) for x in names)
             if l.get("write_cache") == "write back" and not is_brd:
                 for a in GATED:
@@ -1064,9 +1096,16 @@ def check_real(o3, rc, kv, leaf):
                 dbad.append(("device_flushes_per_op lacks a gated arm", a))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
+        rec["shared_devices"] = shared
+        rec["ambiguous_by_device"] = amb
+        n0ops = wa.get("nosync25", {}).get("ops", n)
+        rec["nosync25_windows_hit"] = {x: n0ops - r.get("zero_windows", n0ops)
+                                       for x, r in (wa.get("nosync25", {}).get("devices") or {}).items()}
     check("F3:devflush", not dbad, {"bad": dbad[:8]},
-          "blkflush: device_flushes_per_op for every gated arm; nosync25's windows hold no flush request on any device; "
-          "every gated op issues >= 1 to each write-back layer and none reaches a write-through one; no edge events")
+          "blkflush: device_flushes_per_op for every gated arm; nosync25's windows hold no flush request on a device "
+          "private to the cell (and at most %d%% of them a foreign one on the shared drive); every gated op issues "
+          ">= 1 to each write-back layer and none reaches a write-through one; no edge event on a private device"
+          % int(SHARED_MAX_FRAC * 100))
     mb = []
     if merged is None:
         mb.append("no summary.json")

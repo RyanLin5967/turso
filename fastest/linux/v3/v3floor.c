@@ -97,8 +97,8 @@
  * Fire-check flags (refused unless V3FLOOR_FIRECHECK=1, which only firecheck.sh sets; run.sh refuses it):
  *   --mutant-nosync skips every flush in the flushed arms: a fire-check that the control above fails it;
  *   --trace-clock reads the clock with a real clock_gettime syscall, so strace sees each timed window's edges;
- *   --crash-op ARM sets up one copy arm, runs op 0 and exits without teardown, for crash.sh (--crash-aim also dirties
- *     and fsyncs an unrelated file between the create and the copy). It checks only the filesystem type.
+ *   --crash-op ARM sets up one copy arm, runs op 0 and exits without teardown, for crash.sh (--crash-aim also appends
+ *     1 B to and fsyncs an unrelated file between the create and the copy). It checks only the filesystem type.
  *
  * Blind spots, stated: foreign I/O on the device and cgroup I/O throttling are not observed here (run.sh's stamps
  *   record /proc/diskstats and PSI around the batch); device-mapper, md and network block layers below D are not
@@ -426,8 +426,10 @@ static void op(int a, armst *s, uint64_t i) {
         snprintf(nm, sizeof nm, "c%llu", (unsigned long long)i);
         int fd = openat(s->dfd, nm, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
         if (fd < 0) die("clone create");
-        if (s->aimfd >= 0) { /* crash mode only: force the log past the create, before the copy */
-            if (pwrite(s->aimfd, buf, 1, 0) != 1 || fsync(s->aimfd) != 0) die("aim fsync");
+        if (s->aimfd >= 0) { /* crash mode only: force the log past the create, before the copy. An APPEND, so the
+                              * aim inode's size changes and its fsync must force the log (run 37475543956: an
+                              * overwrite inside one coarse timestamp left the inode clean and forced nothing) */
+            if (pwrite(s->aimfd, buf, 1, 4096) != 1 || fsync(s->aimfd) != 0) die("aim fsync");
         }
         if (a == CFR2B) {
             off64_t oin = 0;

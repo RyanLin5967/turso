@@ -356,7 +356,9 @@ def report(out, device=None, windows=None):
         rep["windows"] = {"source": windows, "n_windows": len(w), "arms": arms, "ambiguous": len(amb),
                           "outside": len(outside),
                           "ambiguous_sample": [list(e[:5]) for e in amb[:5]],
-                          "outside_by_device": {}}
+                          "ambiguous_by_device": {}, "outside_by_device": {}}
+        for e in amb:
+            rep["windows"]["ambiguous_by_device"][e[2]] = rep["windows"]["ambiguous_by_device"].get(e[2], 0) + 1
         for e in outside:
             rep["windows"]["outside_by_device"][e[2]] = rep["windows"]["outside_by_device"].get(e[2], 0) + 1
     return rep

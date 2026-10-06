@@ -330,7 +330,26 @@ refuse R_runsh_n env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_n)" 5 --arms 
 refuse R_runsh_fcenv env V3_SMOKE=1 V3FLOOR_FIRECHECK=1 bash "$RS" "$V3" "$W" "$(o R_runsh_fcenv)" 5 --arms append25,nosync25
 refuse R_runsh_nocell env -u V3_CELL V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nocell)" 5 --arms append25,nosync25
 refuse R_runsh_badcell env V3_CELL=bogus V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_badcell)" 5 --arms append25,nosync25
-refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
+# item 17: V3_REQUIRE_T3=1 on a box where the T3 rule is false. Some x86 runners expose cpufreq with every CPU on
+# "performance" (run 37475543956), where the rule holds: there it is shown accepting (P_runsh_t3, recorded) and then
+# made false for the plant by moving cpu0 to another governor, restored after.
+GOV0=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+if python3 -B "$GATE" t3pre > "$OUT/F4/t3pre.json" 2>&1; then
+  echo "t3_rule_holds=1" >> "$OUT/info.txt"
+  refuse P_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o P_runsh_t3)" 5 --arms append25,nosync25
+  alt=$(tr ' ' '\n' < "${GOV0%/*}/scaling_available_governors" | grep -v -x -e performance -e '' | head -1)
+  if [ -n "$alt" ]; then
+    echo "$alt" | sudo tee "$GOV0" > /dev/null
+    refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
+    echo performance | sudo tee "$GOV0" > /dev/null
+    echo "cpu0 governor: performance -> $alt -> $(cat "$GOV0")" > "$OUT/F4/R_runsh_t3.gov"
+  else
+    echo "only 'performance' is available: the T3 rule cannot be made false here" > "$OUT/F4/R_runsh_t3.txt"; echo missing > "$OUT/F4/R_runsh_t3.rc"
+  fi
+else
+  echo "t3_rule_holds=0" >> "$OUT/info.txt"
+  refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
+fi
 # after the run: a wrapper "binary" that runs the real probe with the mutant (summary names another binary)
 printf '#!/bin/sh\nV3FLOOR_FIRECHECK=1 exec "%s" "$@" --mutant-nosync\n' "$V3" > "$OUT/F4/wrapper.sh"
 chmod +x "$OUT/F4/wrapper.sh"
@@ -347,6 +366,7 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   red() { local tag=$1; shift; timeout 600 "$@" > "$R/$tag.txt" 2>&1; echo $? > "$R/$tag.rc"; }
   rfx() { # tag fixture: the base probe on a fixture
     local tag=$1 name=$2 dir=$FX/$2/w
+    [ -f "$FX/$name.dir" ] && dir=$(cat "$FX/$name.dir")
     [ -f "$FX/$name.ok" ] || { echo "fixture $name missing" > "$R/$tag.na"; return; }
     red "$tag" "$BB" --dir "$dir" --out "$R/$tag.out" --n 5 --arms append25,nosync25
   }

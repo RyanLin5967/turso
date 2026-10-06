@@ -25,6 +25,9 @@
 set -u
 base=${1:?usage: mkfixtures.sh BASE}
 me="$(id -u):$(id -g)"
+# every fixture ext4 is made whole now (no lazyinit thread writing and committing later, which would put foreign
+# flush requests on the loop devices during the fire-check)
+MKE4="mkfs.ext4 -F -q -E lazy_itable_init=0,lazy_journal_init=0"
 sudo mkdir -p "$base"
 fail=0
 ok() { sudo touch "$base/$1.ok"; echo "fixture $1: OK $2"; }
@@ -40,7 +43,7 @@ mkw() { sudo mkdir -p "$1/w" && sudo chown "$me" "$1/w"; }
 f_nb() {
   local d1 d2
   sudo mkdir -p "$base/nb" "$base/nbx"
-  d1=$(newloop /v3fx-nb.img 3G) && sudo mkfs.ext4 -F -q "$d1" && sudo mount -o nobarrier "$d1" "$base/nb" && mkw "$base/nb" || return 1
+  d1=$(newloop /v3fx-nb.img 3G) && sudo $MKE4 "$d1" && sudo mount -o nobarrier "$d1" "$base/nb" && mkw "$base/nb" || return 1
   case ",$(opts "$base/nb/w")," in *,nobarrier,*) ok nb "$d1 $(opts "$base/nb/w")" ;; *) bad nb "not nobarrier"; return 1 ;; esac
   sudo truncate -s 1G "$base/nb/x.img"
   d2=$(sudo losetup --find --show "$base/nb/x.img") && sudo mkfs.xfs -f -q "$d2" && sudo mount "$d2" "$base/nbx" && mkw "$base/nbx" || return 1
@@ -52,27 +55,38 @@ f_ht() {
   sudo mkdir -p "$base/ht/sub"
   d=$(newloop /v3fx-ht.img 1G) && sudo mkfs.xfs -f -q "$d" && sudo mount "$d" "$base/ht/sub" || return 1
   sudo mount -t tmpfs -o size=64m tmpfs "$base/ht" && sudo mkdir -p "$base/ht/sub" && mkw "$base/ht/sub" || return 1
-  [ "$(findmnt -n -o FSTYPE -T "$base/ht/sub/w")" = tmpfs ] && findmnt -n "$base/ht/sub" > /dev/null \
-    && ok ht "D on tmpfs, hidden xfs still in the table: $(grep " $base/ht/sub " /proc/self/mountinfo | head -1)" \
-    || bad ht "layout not as planted"
+  echo "$base/ht/sub/w" | sudo tee "$base/ht.dir" > /dev/null
+  # proof by statfs and device numbers, not findmnt -T (which walks path prefixes, the very trap planted here)
+  if [ "$(stat -f -c %T "$base/ht/sub/w")" = tmpfs ] && [ "$(stat -c %d "$base/ht/sub/w")" = "$(stat -c %d "$base/ht")" ] \
+     && grep -q " $base/ht/sub " /proc/self/mountinfo; then
+    ok ht "D on tmpfs (dev $(stat -c %d "$base/ht/sub/w")); hidden xfs still in the table: $(grep " $base/ht/sub " /proc/self/mountinfo | head -1); findmnt -T says $(findmnt -n -o FSTYPE -T "$base/ht/sub/w")"
+  else
+    bad ht "layout not as planted: $(stat -f -c %T "$base/ht/sub/w") dev $(stat -c %d "$base/ht/sub/w") vs $(stat -c %d "$base/ht")"
+  fi
 }
 f_hn() {
   local d1 d2
   sudo mkdir -p "$base/hn/sub"
-  d1=$(newloop /v3fx-hn1.img 1G) && sudo mkfs.ext4 -F -q "$d1" && sudo mount "$d1" "$base/hn/sub" || return 1
-  d2=$(newloop /v3fx-hn2.img 1G) && sudo mkfs.ext4 -F -q "$d2" && sudo mount -o nobarrier "$d2" "$base/hn" || return 1
+  d1=$(newloop /v3fx-hn1.img 1G) && sudo $MKE4 "$d1" && sudo mount "$d1" "$base/hn/sub" || return 1
+  d2=$(newloop /v3fx-hn2.img 1G) && sudo $MKE4 "$d2" && sudo mount -o nobarrier "$d2" "$base/hn" || return 1
   sudo mkdir -p "$base/hn/sub" && mkw "$base/hn/sub" || return 1
-  case ",$(opts "$base/hn/sub/w")," in
-    *,nobarrier,*) ok hn "D on $(findmnt -n -o SOURCE -T "$base/hn/sub/w") nobarrier; hidden barrier $d1 at hn/sub still in the table" ;;
-    *) bad hn "D is not on the nobarrier mount" ;;
-  esac
+  echo "$base/hn/sub/w" | sudo tee "$base/hn.dir" > /dev/null
+  # proof by device numbers: D sits on the nobarrier fs mounted at hn, while findmnt -T (path prefix) names the
+  # hidden barrier mount at hn/sub -- the trap the old probe fell into
+  if [ "$(stat -c %d "$base/hn/sub/w")" = "$(stat -c %d "$base/hn")" ] && grep -q " $base/hn/sub " /proc/self/mountinfo \
+     && case ",$(findmnt -n -o OPTIONS "$base/hn" | tail -1)," in *,nobarrier,*) true ;; *) false ;; esac; then
+    ok hn "D dev $(stat -c %d "$base/hn/sub/w") = the nobarrier $d2 at hn; hidden barrier $d1 at hn/sub; findmnt -T says $(findmnt -n -o SOURCE,OPTIONS -T "$base/hn/sub/w")"
+  else
+    bad hn "D is not on the nobarrier mount: dev $(stat -c %d "$base/hn/sub/w") vs $(stat -c %d "$base/hn"); $(findmnt -n -o OPTIONS "$base/hn")"
+  fi
 }
 f_lz() {
   local d1 d2 shown
   sudo mkdir -p "$base/lz/a" "$base/lz/b"
-  d1=$(newloop /v3fx-lz.img 1G) && sudo mkfs.ext4 -F -q "$d1" && sudo mount "$d1" "$base/lz/a" || return 1
+  d1=$(newloop /v3fx-lz.img 1G) && sudo $MKE4 "$d1" && sudo mount "$d1" "$base/lz/a" || return 1
   sudo truncate -s 512M "$base/lz/a/x.img"
-  d2=$(sudo losetup --find --show "$base/lz/a/x.img") && sudo mkfs.ext4 -F -q "$d2" && sudo mount "$d2" "$base/lz/b" && mkw "$base/lz/b" || return 1
+  d2=$(sudo losetup --find --show "$base/lz/a/x.img") && sudo $MKE4 "$d2" && sudo mount "$d2" "$base/lz/b" && mkw "$base/lz/b" || return 1
+  echo "$base/lz/b/w" | sudo tee "$base/lz.dir" > /dev/null
   sudo umount -l "$base/lz/a" || return 1
   shown=$(cat "/sys/block/${d2##*/}/loop/backing_file")
   case $shown in /*) [ -e "$shown" ] || { sudo mkdir -p "$(dirname "$shown")"; sudo truncate -s 512M "$shown"; } ;; *) bad lz "sysfs shows '$shown'"; return 1 ;; esac
@@ -81,7 +95,7 @@ f_lz() {
 f_del() {
   local d
   sudo mkdir -p "$base/del"
-  d=$(newloop /v3fx-del.img 1G) && sudo mkfs.ext4 -F -q "$d" && sudo mount "$d" "$base/del" && mkw "$base/del" || return 1
+  d=$(newloop /v3fx-del.img 1G) && sudo $MKE4 "$d" && sudo mount "$d" "$base/del" && mkw "$base/del" || return 1
   sudo rm -f /v3fx-del.img
   case "$(cat "/sys/block/${d##*/}/loop/backing_file")" in *"(deleted)"*) ok del "$(cat "/sys/block/${d##*/}/loop/backing_file")" ;; *) bad del "backing not shown deleted" ;; esac
 }
@@ -90,7 +104,7 @@ f_nest() {
   for k in 1 2 3 4; do
     sudo mkdir -p "$base/n$k"
     if [ $k = 1 ]; then d=$(newloop "$prev" $size); else sudo truncate -s $size "$prev" && d=$(sudo losetup --find --show "$prev"); fi
-    [ -n "$d" ] && sudo mkfs.ext4 -F -q "$d" && sudo mount "$d" "$base/n$k" && mkw "$base/n$k" || { bad "n$k" "level $k"; return 1; }
+    [ -n "$d" ] && sudo $MKE4 "$d" && sudo mount "$d" "$base/n$k" && mkw "$base/n$k" || { bad "n$k" "level $k"; return 1; }
     prev="$base/n$k/x.img"
     size=$(( ${size%M} * 2 / 3 ))M
     ok "n$k" "$d on $(losetup -n -O BACK-FILE "$d" | xargs)"
@@ -99,7 +113,7 @@ f_nest() {
 f_ds() {
   local d
   sudo mkdir -p "$base/ds"
-  d=$(newloop /v3fx-ds.img 1G) && sudo mkfs.ext4 -F -q "$d" && sudo mount -o dirsync "$d" "$base/ds" && mkw "$base/ds" || return 1
+  d=$(newloop /v3fx-ds.img 1G) && sudo $MKE4 "$d" && sudo mount -o dirsync "$d" "$base/ds" && mkw "$base/ds" || return 1
   case ",$(findmnt -n -o OPTIONS "$base/ds")," in *,dirsync,*) ok ds "$(findmnt -n -o OPTIONS "$base/ds")" ;; *) bad ds "no dirsync in the options" ;; esac
 }
 f_ld() {
@@ -113,7 +127,7 @@ f_ej() {
   local dj dd
   sudo mkdir -p "$base/ej"
   dj=$(newloop /v3fx-ejj.img 128M) && dd=$(newloop /v3fx-ejd.img 1G) || return 1
-  sudo mkfs.ext4 -F -q -O journal_dev -b 4096 "$dj" && sudo mkfs.ext4 -F -q -b 4096 -J device="$dj" "$dd" && sudo mount "$dd" "$base/ej" && mkw "$base/ej" || return 1
+  sudo mkfs.ext4 -F -q -O journal_dev -b 4096 "$dj" && sudo $MKE4 -b 4096 -J device="$dj" "$dd" && sudo mount "$dd" "$base/ej" && mkw "$base/ej" || return 1
   ls /proc/fs/jbd2/ | grep -q "^${dd##*/}-" && bad ej "an internal journal is listed" || ok ej "jbd2: $(ls /proc/fs/jbd2/ | xargs)"
 }
 f_md() {
@@ -128,7 +142,7 @@ f_md() {
 f_wt() {
   local d
   sudo mkdir -p "$base/wt"
-  d=$(newloop /v3fx-wt.img 1G) && sudo mkfs.ext4 -F -q "$d" && sudo mount "$d" "$base/wt" && mkw "$base/wt" || return 1
+  d=$(newloop /v3fx-wt.img 1G) && sudo $MKE4 "$d" && sudo mount "$d" "$base/wt" && mkw "$base/wt" || return 1
   echo "write through" | sudo tee "/sys/block/${d##*/}/queue/write_cache" > /dev/null
   [ "$(cat "/sys/block/${d##*/}/queue/write_cache")" = "write through" ] && ok wt "${d##*/} write_cache=write through" || bad wt "write_cache did not change"
 }
@@ -136,14 +150,14 @@ f_brd() {
   sudo mkdir -p "$base/brd"
   [ -e /dev/ram1 ] || sudo modprobe brd rd_nr=2 rd_size=3145728 || return 1
   [ -e /dev/ram1 ] || { bad brd "no /dev/ram1"; return 1; }
-  sudo mkfs.ext4 -F -q /dev/ram1 && sudo mount /dev/ram1 "$base/brd" && mkw "$base/brd" && ok brd "ext4 on /dev/ram1"
+  sudo $MKE4 /dev/ram1 && sudo mount /dev/ram1 "$base/brd" && mkw "$base/brd" && ok brd "ext4 on /dev/ram1"
 }
 f_dm() {
   local d sz
   sudo mkdir -p "$base/dm"
   d=$(newloop /v3fx-dm.img 1G) || return 1
   sz=$(sudo blockdev --getsz "$d")
-  sudo dmsetup create v3fx-dm --table "0 $sz linear $d 0" && sudo mkfs.ext4 -F -q /dev/mapper/v3fx-dm \
+  sudo dmsetup create v3fx-dm --table "0 $sz linear $d 0" && sudo $MKE4 /dev/mapper/v3fx-dm \
     && sudo mount /dev/mapper/v3fx-dm "$base/dm" && mkw "$base/dm" && ok dm "ext4 on $(readlink -f /dev/mapper/v3fx-dm) over $d"
 }
 f_root() {

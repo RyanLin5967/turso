@@ -10,8 +10,10 @@
 # and the clone c0 is read back: "survived" = it is 1 MiB and byte-equal to the source, else "lost"; the source's
 # own bytes must be intact (src_ok), else the rig itself broke. Cases (check.py CRASH, predictions pre-registered in
 # frontier/fastest/linux/v3/RESUME.md before the first run):
-#   xfs    clone2b, cfr2b (controls: must survive), clone1b and clone1b-aim (an unrelated file dirtied and fsynced
-#          between the create and the FICLONE; recorded), clone2b-mutant (--mutant-nosync: no fsync; must be lost)
+#   xfs    clone2b, cfr2b (controls: must survive), clone1b and clone1b-aim (1 B appended to an unrelated file and
+#          fsynced between the create and the FICLONE, so the log is forced past the create; recorded),
+#          clone2b-mutant (--mutant-nosync: no fsync; must be lost)
+# ext4 is made with lazy_itable_init=0: a lazyinit commit in the crash window would commit the op's transaction too.
 #   btrfs  clone2b, cfr2b (must survive), clone1b (recorded), clone2b-mutant (must be lost)
 #   ext4   cfr2b (must survive), cfr2b-mutant (must be lost)
 # Blind spots, stated: a loop's backing file lives in the root filesystem's page cache, so this models "what the
@@ -35,7 +37,7 @@ one() { # name arm [probe flags]
   case $K in
     xfs) sudo mkfs.xfs -f -q -m reflink=1 "$dev" ;;
     btrfs) sudo mkfs.btrfs -f -q "$dev" ;;
-    ext4) sudo mkfs.ext4 -F -q "$dev" ;;
+    ext4) sudo mkfs.ext4 -F -q -E lazy_itable_init=0,lazy_journal_init=0 "$dev" ;;
   esac
   if [ "$K" = btrfs ]; then
     sz=$(sudo blockdev --getsz "$dev")

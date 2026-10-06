@@ -108,6 +108,9 @@ jobs:
             xfs|btrfs) bash fastest/linux/v3/mkbrd.sh "$CELL" "$MNT" ;;
           esac 2>&1 | tee "$RAW/mkcell.txt"
           test "${PIPESTATUS[0]}" -eq 0
+          # a fresh ext4's lazyinit thread zeroes inode tables and commits in the background: that would put flush
+          # requests on the cell's own (private) loop device inside the fire-check's windows. Stop it.
+          if [ "$CELL" = ext4loop ]; then sudo mount -o remount,noinit_itable "$MNT"; echo "remount: $(findmnt -n -o OPTIONS "$MNT")" | tee -a "$RAW/mkcell.txt"; fi
       - name: Refusal fixtures
         run: |
           # a fixture that fails is recorded and its plant then fails in check.py; the fire-check still runs
