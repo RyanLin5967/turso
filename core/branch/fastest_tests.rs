@@ -2003,7 +2003,12 @@ fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
     let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(800u64);
     for class in [SyncClass::Fsync, SyncClass::FullFsync] {
         let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("ckpt-nosync.db"), opts(true, class));
+        // FLAGGED TEST EDIT (lead-directed, review 4 #8): pinned to fuzzy checkpoints, the mode its
+        // claim is about; it followed R11_CKPT, and went red in the catsharp arm.
+        let db = open_at(
+            &dir.path().join("ckpt-nosync.db"),
+            opts(true, class).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
@@ -2102,7 +2107,12 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
 fn a_failed_checkpoint_is_not_retried_by_the_next_create() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open_at(&dir.path().join("ckpt-backoff.db"), opts(true, SyncClass::Fsync));
+    // FLAGGED TEST EDIT (lead-directed, review 4 #8): pinned to fuzzy checkpoints (it followed
+    // R11_CKPT).
+    let db = open_at(
+        &dir.path().join("ckpt-backoff.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let _first = trunk.fork_branch().unwrap().into_id();
