@@ -8856,6 +8856,44 @@ mod sota_tree_tests {
 
     const PAGES: u32 = 6;
 
+    /// Review 5 #18, the D1/D2 half: a free matures only once the Release that frees it is durable
+    /// in the store's class. A Release that rode an ORDERED flight (written and barriered, durable
+    /// only when a trunk commit's WAL flush returns) is not, so its slots stay out of the allocator
+    /// until that flush; a power cut before it would bring the branch back over reused slots.
+    /// Before, frees matured at durable(Off), which an ordered landing reaches.
+    #[test]
+    fn a_free_ridden_ordered_waits_for_the_trunks_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: SyncClass::FullFsync }, None, path).unwrap();
+        let x = store.fork_trunk_locked(Arc::new(Schema::default()), PAGE).unwrap();
+        store.begin_write(x).unwrap();
+        store.first_write_branch(x, 1).unwrap();
+        store.commit_pages(x, &[page_with(1, 1)]).unwrap();
+        let owned = store.owned_slots(x);
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        // release_handle's early-release core, its flight left to a trunk commit's ordered one.
+        let lsn = {
+            let mut inner = store.inner.lock();
+            let record = inner.release_record(x);
+            let lsn = store.buffer_records(&mut inner, &[record]).unwrap();
+            let mut freed = Vec::new();
+            inner.apply_release(x, &mut freed).unwrap();
+            inner.defer_frees(lsn, freed);
+            lsn
+        };
+        store.order_for_trunk(lsn).unwrap();
+        assert!(store.group.durable(SyncClass::Off) >= lsn, "premise: the ordered flight landed");
+        for &slot in &owned {
+            assert!(!store.slot_is_free(slot), "slot {slot} was freed by a Release that is only ordered");
+        }
+        store.trunk_wal_synced(lsn);
+        for &slot in &owned {
+            assert!(store.slot_is_free(slot), "slot {slot} not freed once its Release was durable");
+        }
+    }
+
     /// A committed branch page holding `image(generation)`, as the pager hands it to
     /// `commit_pages`.
     fn page_with(page: u32, generation: u64) -> PageRef {

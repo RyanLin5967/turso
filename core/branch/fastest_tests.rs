@@ -3403,3 +3403,55 @@ fn the_installs_free_accounting_counts_every_slot_once() {
         let _ = b.into_id();
     }
 }
+
+// ---- review 5 #18: a D0 free of a slot a synced record names waits for a sync ----
+
+/// Review 5 #18, the D0 half: in a D0 store whose trunk is synchronous, a trunk commit keeps a
+/// pre-image (TrunkRetain{S}) in a RAISED, synced flight; the child it was kept for is then
+/// released by a D0 flight, which nothing syncs. If S were reused at once, a power cut that keeps
+/// the synced record and loses the unsynced Release would leave the child alive over S's new
+/// bytes. So S stays out of the allocator until a sync covers its Release: the image after such a
+/// cut (log as of the raised flight, the arena as it is) still reads the child's fork-point row.
+#[cfg(unix)]
+#[test]
+fn a_d0_release_of_a_slot_a_synced_record_names_waits_for_a_sync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("d0-synced-free.db");
+        let (x_id, cut, log, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed_wide(&trunk);
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
+            let x = trunk.fork_branch().unwrap();
+            let x_id = x.id();
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            write_v(&trunk, 3, "new");
+            let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the commit kept one pre-image");
+            let log = db.branch_log_path().unwrap();
+            // The raised flight is the last synced one: the cut keeps the log up to here.
+            let cut = std::fs::metadata(&log).unwrap().len();
+            x.reap().unwrap();
+            // A new branch's write takes a slot; the freed one, if it was handed back at once.
+            let y = trunk.fork_branch().unwrap();
+            let fresh_before: std::collections::HashSet<u32> = y.owned_slots().into_iter().collect();
+            write_v(&y.connect().unwrap(), 40, "y");
+            let took: Vec<u32> = y.owned_slots().into_iter().filter(|s| !fresh_before.contains(s)).collect();
+            assert!(
+                !took.contains(&kept[0]),
+                "catalog={catalog}: the slot a synced record names was reused before a sync covered its free"
+            );
+            let _ = y.into_id();
+            (x_id, cut, log, db.incarnation)
+        };
+        // The power cut: nothing D0 wrote after the raised flight survives in the log.
+        let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        f.set_len(cut).unwrap();
+        drop(f);
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        let x = db.branch(x_id).expect("the child whose Release was lost is back");
+        assert_eq!(read_wide(&x.connect().unwrap(), 3), "trunk-3", "catalog={catalog}: the child's fork point");
+    }
+}
