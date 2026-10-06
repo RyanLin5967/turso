@@ -555,6 +555,19 @@ impl Group {
         drop(stale);
     }
 
+    /// Every byte below `end` was made durable in `class` (and every weaker one) by a catalog
+    /// commit that returned before anything it waited on was refused (engine review 9 #6: the
+    /// checkpoint refuses to commit on a store already fail-stopped). Marked even when the store
+    /// fail-stopped since, by the cut that followed the commit: that durability was established
+    /// before the fail-stop, unlike a landing after it (`accepts`).
+    fn mark_committed(&self, end: u64, class: SyncClass) {
+        let mut g = self.lock();
+        for c in 0..=class_index(class) {
+            self.set_durable(&mut g, c, end);
+        }
+        self.cv.notify_all();
+    }
+
     /// Stop the confirmation writer and return the confirmation it left (the store's close).
     fn stop_confirms(&self) -> Option<Confirm> {
         let mut g = self.lock();
@@ -4245,7 +4258,24 @@ impl BranchStore {
             // (`Captured::deferred`).
             self.mature(inner);
             drop(self.group.quiesce());
-            inner.checkpoint_catalog(fail_after_rename)?;
+            // Everything buffered now is in the capture (this holds the store mutex), and the
+            // catalog's commit makes it durable in the rewrite class. Marked as soon as that commit
+            // landed, before the cut's outcome is known (engine review 9 #6): a cut that fails after
+            // it fail-stops the store, yet what the commit made durable was durable before that.
+            // Mutant `cut_failure_unacknowledges` (test builds only): marked only on success.
+            let covered = inner
+                .journal
+                .as_ref()
+                .map(|j| (j.lsn(), j.rewrite_class()));
+            let generation = inner.cat.as_ref().map(|c| c.generation);
+            let checkpointed = inner.checkpoint_catalog(fail_after_rename);
+            if let Some((lsn, class)) = covered {
+                let committed = inner.cat.as_ref().map(|c| c.generation) != generation;
+                if committed && !fe_mutant("cut_failure_unacknowledges") {
+                    self.group.mark_committed(lsn, class);
+                }
+            }
+            checkpointed?;
             if let Some(journal) = inner.journal.as_ref() {
                 // The catalog holds what preceded the capture; the cut log holds, synced, what
                 // followed it in the file.
