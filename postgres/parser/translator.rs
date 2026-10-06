@@ -8065,4 +8065,36 @@ mod tests {
             assert!(!out.to_uppercase().contains("LATERAL"), "{sql}: {out}");
         }
     }
+
+    /// An inlined LATERAL column is visible where PostgreSQL's would be: in its own SELECT and in
+    /// the subqueries under it, unless one of them names another relation the same. It was one
+    /// map per statement, never scoped or cleared, so `o.n` in a sublink over a table aliased `o`,
+    /// in another UNION leaf, or in a CTE read the lateral's expression (wire review 2 item 6).
+    #[test]
+    fn an_inlined_lateral_column_is_scoped_to_its_select() {
+        let lateral = "FROM t CROSS JOIN LATERAL (SELECT t.x + 100) AS o(n)";
+        for sql in [
+            format!("SELECT o.n {lateral} WHERE EXISTS (SELECT 1 FROM u AS o WHERE o.n = 1)"),
+            format!("SELECT o.n {lateral} UNION ALL SELECT o.n FROM u AS o"),
+            format!("SELECT o.n FROM u AS o UNION ALL SELECT o.n {lateral}"),
+            format!("WITH c AS (SELECT o.n FROM u AS o) SELECT o.n {lateral}"),
+            format!("SELECT o.n, (SELECT max(o.n) FROM u AS o) {lateral}"),
+        ] {
+            let out = translated_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(
+                out.matches("t.x + 100").count(),
+                1,
+                "{sql}: only the lateral's own SELECT reads its expression: {out}"
+            );
+            assert!(
+                out.contains("o.n"),
+                "{sql}: the other relation's o.n is gone: {out}"
+            );
+        }
+        // A subquery under the lateral's SELECT that names no other `o` reads it, as a
+        // correlated reference does in PostgreSQL.
+        let sql = format!("SELECT t.x {lateral} WHERE EXISTS (SELECT 1 FROM u WHERE u.k = o.n)");
+        let out = translated_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(out.contains("u.k = (t.x + 100)"), "{sql}: {out}");
+    }
 }
