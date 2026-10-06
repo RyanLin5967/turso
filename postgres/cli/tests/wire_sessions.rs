@@ -3022,3 +3022,62 @@ fn information_schema_catalog_is_the_current_database() {
         }
     }
 }
+
+/// An extended-protocol error raised outside a statement's run fails the block it is in, as any
+/// other error does: the pipeline's implicit block up to Sync is rolled back, and a client block is
+/// failed (status E, its COMMIT answers ROLLBACK). An Execute of a portal that does not exist,
+/// and a binary value with no encoder or out of its type's range, never reached the block's
+/// bookkeeping: Sync committed the pipeline's write, and a client block stayed 'T' and committed
+/// (wire review 4 item 1).
+#[test]
+fn an_error_outside_a_statements_run_fails_its_block() {
+    let dir = Scratch::new("pipelinefail");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // P, B and E of an INSERT, then an Execute of portal "nope", then Sync.
+    let pipeline = |a: &mut Wire, id: i32| {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(format!("INSERT INTO t VALUES ({id}, 'p')").as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        a.send(b'P', &parse);
+        a.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'E', b"nope\0\0\0\0\0");
+        a.send(b'S', &[]);
+        a.read_reply()
+    };
+    let count = |a: &mut Wire, id: i32| {
+        a.q(&format!("SELECT count(*) FROM t WHERE id = {id}"))
+            .single("count")
+    };
+    let r = pipeline(&mut a, 4);
+    assert!(r.error.is_some(), "no error for portal nope: {:?}", r.tags);
+    assert_eq!(r.status, b'I');
+    assert_eq!(count(&mut a, 4), "0", "Sync committed the pipeline");
+    a.q("BEGIN").ok("begin");
+    let r = pipeline(&mut a, 5);
+    assert!(r.error.is_some(), "no error for portal nope: {:?}", r.tags);
+    assert_eq!(r.status, b'E', "the client block is not failed");
+    let r = a.q("COMMIT").ok("the block's end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(count(&mut a, 5), "0", "the failed block committed");
+    // A binary result type with no encoder: refused before the statement runs.
+    a.q("CREATE TABLE ev(id INT, d DATE)").ok("ev");
+    let r = a.x_binary("INSERT INTO ev VALUES (1, '2026-01-01') RETURNING d");
+    assert_eq!(r.err("binary date").code, "0A000");
+    assert_eq!(
+        a.q("SELECT count(*) FROM ev").single("count"),
+        "0",
+        "the refused INSERT was kept"
+    );
+    // A value out of its binary type's range: the statement fails, and nothing of it is kept.
+    a.q("CREATE TABLE big(id INT, n INT)").ok("big");
+    a.q("INSERT INTO big VALUES (1, 5000)").ok("row");
+    let r = a.x_binary("UPDATE big SET n = n * 1000000 WHERE id = 1 RETURNING n");
+    assert_eq!(r.err("binary int4 out of range").code, "22003");
+    assert_eq!(
+        a.q("SELECT n FROM big WHERE id = 1").single("n"),
+        "5000",
+        "the failed UPDATE was kept"
+    );
+}
