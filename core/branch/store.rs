@@ -8676,6 +8676,40 @@ mod tests {
         }
     }
 
+    /// Review 6 #4: a CATALOG store's page-size restart leaves the new arena no slot of the old
+    /// one. Its checkpoint wrote the old arena's free slots (those on the in-memory list, beside the
+    /// free table's rows it had not moved into memory) and the old high-water mark, and the first
+    /// allocation after it took them back from the free table into an arena whose high-water mark
+    /// is 0: an abort (`add_free`'s assert), or, without the assert, slots handed out twice.
+    #[test]
+    fn a_catalog_page_size_restart_leaves_the_new_arena_no_old_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        // Slots 0..4 freed and checkpointed: they are in the catalog's free table. Slots 4..6 freed
+        // since: they are on the in-memory list.
+        for n in [4, 2] {
+            let arena = inner.arena.as_mut().unwrap();
+            let slots: Vec<Slot> = (0..n).map(|_| arena.alloc()).collect();
+            for slot in slots {
+                arena.release(slot);
+            }
+            if n == 4 {
+                inner.checkpoint_catalog(false).unwrap();
+            }
+        }
+        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        let mut seen = HashSet::new();
+        for n in 0..8 {
+            let slot = inner.alloc_slot().unwrap();
+            assert_eq!(slot, n, "the restarted arena handed out slot {slot}, not its high-water mark");
+            assert!(seen.insert(slot), "slot {slot} handed out twice after a page-size restart");
+        }
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
