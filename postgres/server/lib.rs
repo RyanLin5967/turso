@@ -52,8 +52,8 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type, DEFAULT_NAME,
-    METADATA_DATABASE,
+    ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    DEFAULT_NAME, METADATA_DATABASE,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::{DataRow, NoData, ParameterDescription, RowDescription};
@@ -318,10 +318,88 @@ fn run_session(
             }
         };
         let session = Arc::new(Session::new(shared));
-        if let Err(e) = process_socket(socket, None, SessionHandlers(session)).await {
+        if let Err(e) = serve_session(socket, session).await {
             error!("Error processing connection from {}: {}", addr, e);
         }
     });
+}
+
+/// How long a client has to finish its startup, as pgwire's process_socket allows (and
+/// PostgreSQL's authentication_timeout's default).
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// pgwire's process_socket, plus the end of a session. pgwire drops a Terminate ('X') and serves
+/// on until the client's socket reaches EOF, so a session, its branch connection and its in-use
+/// entry outlived the client's close: bbload's synchronous close waits for the server's EOF and
+/// failed every connect op after 5 s, and a delete right after a close met 55006 (wire review 3
+/// items 3 and 4). Here a Terminate ends the session, and on every way out the session releases
+/// its branch and its in-use entry BEFORE the socket closes (the socket is dropped on return).
+async fn serve_session(
+    socket: tokio::net::TcpStream,
+    session: Arc<Session>,
+) -> Result<(), std::io::Error> {
+    let startup_timeout = tokio::time::sleep(STARTUP_TIMEOUT);
+    tokio::pin!(startup_timeout);
+    let socket = tokio::select! {
+        _ = &mut startup_timeout => return Ok(()),
+        socket = pgwire::tokio::server::negotiate_tls::<String>(socket, None) => socket?,
+    };
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+    let handlers = SessionHandlers(session.clone());
+    let startup_handler = handlers.startup_handler();
+    let simple_query_handler = handlers.simple_query_handler();
+    let extended_query_handler = handlers.extended_query_handler();
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+    let result = loop {
+        let msg = if matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                msg = socket.next() => msg,
+            }
+        } else {
+            socket.next().await
+        };
+        let Some(Ok(msg)) = msg else {
+            break Ok(());
+        };
+        if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
+            break Ok(());
+        }
+        let is_extended_query = match socket.state() {
+            PgWireConnectionState::CopyInProgress(extended) => extended,
+            _ => msg.is_extended_query(),
+        };
+        if let Err(mut e) = pgwire::tokio::server::process_message(
+            msg,
+            &mut socket,
+            startup_handler.clone(),
+            simple_query_handler.clone(),
+            extended_query_handler.clone(),
+            copy_handler.clone(),
+            cancel_handler.clone(),
+        )
+        .await
+        {
+            error_handler.on_error(&socket, &mut e);
+            if let Err(io) =
+                pgwire::tokio::server::process_error(&mut socket, e, is_extended_query).await
+            {
+                break Err(io);
+            }
+        }
+    };
+    // The session's branch and in-use entry go first; the socket closes when it drops below.
+    session.end();
+    drop(socket);
+    result
 }
 
 /// Raise this process's open-file soft limit so `max_connections` sessions fit. A session holds
@@ -1134,14 +1212,27 @@ impl Session {
     }
 }
 
-impl Drop for Session {
-    /// The session's branch is free once its connection is closed.
-    fn drop(&mut self) {
-        let left = self.state().branch.take();
-        if let Some((name, conn)) = left {
+impl Session {
+    /// The session's end: its engine connections close (a statement Describe kept holds one, so
+    /// it goes first) and its branch is released in the in-use map. Run when the client
+    /// terminates or goes, before its socket closes (serve_session), and again, as a no-op, when
+    /// the session drops.
+    fn end(&self) {
+        let mut st = self.state();
+        st.described = None;
+        st.implicit = false;
+        st.trunk = None;
+        if let Some((name, conn)) = st.branch.take() {
             drop(conn);
             self.shared.release(&name);
         }
+    }
+}
+
+impl Drop for Session {
+    /// The session's branch is free once its connection is closed.
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
