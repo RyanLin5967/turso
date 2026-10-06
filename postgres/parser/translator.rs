@@ -421,12 +421,25 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
+        // Whether the attribute nodes that follow (DEFERRABLE, INITIALLY DEFERRED) belong to
+        // the column's foreign key: PostgreSQL attaches them to the constraint before them.
+        let mut attrs_to_fk = false;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
+            let is_attr = matches!(
+                contype,
+                ConstrType::ConstrAttrDeferrable
+                    | ConstrType::ConstrAttrNotDeferrable
+                    | ConstrType::ConstrAttrDeferred
+                    | ConstrType::ConstrAttrImmediate
+            );
+            if !is_attr {
+                attrs_to_fk = contype == ConstrType::ConstrForeign;
+            }
             match contype {
                 ConstrType::ConstrPrimary => is_primary_key = true,
                 ConstrType::ConstrNotnull => is_not_null = true,
@@ -453,6 +466,30 @@ impl PostgreSQLTranslator {
                 }
                 ConstrType::ConstrForeign => {
                     foreign_key = extract_foreign_key(constraint);
+                }
+                // A column constraint's deferral arrives as attribute nodes after it in the raw
+                // parse (wire review 3 item 6); those after the foreign key set its deferral.
+                ConstrType::ConstrAttrDeferrable => {
+                    if let Some(fk) = foreign_key.as_mut().filter(|_| attrs_to_fk) {
+                        fk.deferrable = true;
+                    }
+                }
+                ConstrType::ConstrAttrNotDeferrable => {
+                    if let Some(fk) = foreign_key.as_mut().filter(|_| attrs_to_fk) {
+                        fk.deferrable = false;
+                        fk.initially_deferred = false;
+                    }
+                }
+                ConstrType::ConstrAttrDeferred => {
+                    if let Some(fk) = foreign_key.as_mut().filter(|_| attrs_to_fk) {
+                        fk.deferrable = true;
+                        fk.initially_deferred = true;
+                    }
+                }
+                ConstrType::ConstrAttrImmediate => {
+                    if let Some(fk) = foreign_key.as_mut().filter(|_| attrs_to_fk) {
+                        fk.initially_deferred = false;
+                    }
                 }
                 _ => {}
             }
@@ -547,7 +584,7 @@ impl PostgreSQLTranslator {
                 name: None,
                 constraint: ast::ColumnConstraint::ForeignKey {
                     clause,
-                    defer_clause: None,
+                    defer_clause: pg_fk_defer_clause(fk),
                 },
             });
         }
@@ -614,7 +651,7 @@ impl PostgreSQLTranslator {
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
-                defer_clause: None,
+                defer_clause: pg_fk_defer_clause(fk),
             },
         }
     }
@@ -4452,6 +4489,9 @@ struct PgForeignKey {
     ref_columns: Vec<String>,
     on_delete: Option<String>,
     on_update: Option<String>,
+    /// DEFERRABLE, and INITIALLY DEFERRED: checked at COMMIT (wire review 3 item 6).
+    deferrable: bool,
+    initially_deferred: bool,
 }
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
@@ -4718,6 +4758,8 @@ fn extract_foreign_key(constraint: &pg_query::protobuf::Constraint) -> Option<Pg
         ref_columns,
         on_delete,
         on_update,
+        deferrable: constraint.deferrable || constraint.initdeferred,
+        initially_deferred: constraint.initdeferred,
     })
 }
 
@@ -5059,6 +5101,19 @@ fn parse_ref_act(action: &str) -> Option<ast::RefAct> {
         "NO ACTION" => Some(ast::RefAct::NoAction),
         _ => None,
     }
+}
+
+/// The DEFERRABLE clause of a foreign key, or None for the default NOT DEFERRABLE, so a
+/// deferred key is checked at COMMIT and not at each statement (wire review 3 item 6).
+fn pg_fk_defer_clause(fk: &PgForeignKey) -> Option<ast::DeferSubclause> {
+    fk.deferrable.then(|| ast::DeferSubclause {
+        deferrable: true,
+        init_deferred: Some(if fk.initially_deferred {
+            ast::InitDeferredPred::InitiallyDeferred
+        } else {
+            ast::InitDeferredPred::InitiallyImmediate
+        }),
+    })
 }
 
 /// Deparse a PG expression node into a SQL string.
