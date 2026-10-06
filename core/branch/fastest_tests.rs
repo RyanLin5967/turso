@@ -4066,3 +4066,43 @@ fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno()
     }
 }
 
+
+// ---- engine review 7 #3: a stopped store reports what a reopen would ----
+
+/// Engine review 7 #3 (review 3 #17's release half): a fail-stopped store lists, and finds by
+/// name, a branch whose Release never became durable, because a reopen brings it back. Before,
+/// the Release's apply took the name and the listing entry away before its flight was written,
+/// so after that flight failed the stopped store reported the branch absent and its name free.
+/// Both a named branch (dropped by name) and an unnamed one (reaped).
+#[test]
+fn a_stopped_store_lists_and_finds_a_branch_whose_release_failed() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("relfail.db");
+        let (named, unnamed, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let named = trunk.create_branch("goes-away").unwrap();
+            let x = trunk.fork_branch().unwrap();
+            let unnamed = x.id();
+            db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+            assert!(db.drop_branch("goes-away").is_err(), "premise: the named release's flight failed");
+            assert!(x.reap().is_err(), "catalog={catalog}: premise: the store is stopped");
+            let listed = db.branch_ids().unwrap();
+            assert!(listed.contains(&named), "catalog={catalog}: a branch a reopen brings back is not listed");
+            assert!(listed.contains(&unnamed), "catalog={catalog}: a reaped branch a reopen brings back is not listed");
+            assert_eq!(
+                db.branch_named("goes-away").unwrap(),
+                Some(named),
+                "catalog={catalog}: the stopped store reports a name free that a reopen still holds"
+            );
+            (named, unnamed, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let listed = db.branch_ids().unwrap();
+        assert!(listed.contains(&named) && listed.contains(&unnamed), "catalog={catalog}: premise: the reopen brings both back");
+        assert_eq!(db.branch_named("goes-away").unwrap(), Some(named), "catalog={catalog}: premise");
+    }
+}
