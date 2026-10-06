@@ -1032,6 +1032,7 @@ impl Journal {
         sync: SyncClass,
         fail_lock: bool,
     ) -> Result<Journal> {
+        refuse_links(files, files.cat.exists())?;
         // Lock before touching anything, so a refused create has truncated nothing.
         if fail_lock {
             open_rw(&files.log, false)?;
@@ -1186,6 +1187,7 @@ impl Journal {
         format: u32,
     ) -> Result<Option<Scanned>> {
         let catalog_store = catalog.is_some();
+        refuse_links(files, catalog_store)?;
         // Lock before reading anything (review N1). The log is opened, never created: a missing
         // log is refused once a snapshot or a catalog meta row says the store held state (review 5
         // #2), and otherwise there is nothing to recover.
@@ -3017,6 +3019,31 @@ pub(crate) fn file_device(file: &File) -> Option<u64> {
         let _ = file;
         None
     }
+}
+
+/// Refuse branch files that are symbolic links (review 5 #13). A rename that replaces the log (a
+/// reset, a cut, a compaction) replaces the link and not its target, so the log and the arena would
+/// drift apart; and the one-device guard rests on the sidecars sharing their directory's device,
+/// which a link to another directory escapes. Mutant `links_followed` (test builds only).
+pub(crate) fn refuse_links(files: &BranchFiles, catalog: bool) -> Result<()> {
+    if super::store::fe_mutant("links_followed") {
+        return Ok(());
+    }
+    let cat_wal = PathBuf::from(format!("{}-wal", files.cat.display()));
+    for path in [&files.log, &files.arena, &files.snap, &files.cat, &cat_wal] {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            let state = if catalog { &files.cat } else { &files.snap };
+            return Err(LimboError::InvalidArgument(format!(
+                "branch file {} is a symbolic link; the branch files must be plain files in the \
+                 database's directory ({}, {}, {})",
+                path.display(),
+                files.log.display(),
+                files.arena.display(),
+                state.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Ruling 85a032f01's guard: the arena is synced by plain fsync before the LOG's flush makes it

@@ -2960,6 +2960,7 @@ impl BranchStore {
         (warm, targets): (Prewarm, Targets),
     ) -> Result<()> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        super::journal::refuse_links(files, true)?;
         let t = Instant::now();
         let mut catalog = Catalog::open(&files.cat, sync)?;
         let meta = catalog.meta()?;
@@ -6641,7 +6642,7 @@ impl StoreInner {
                 }
                 return Err(e);
             }
-            match Arena::open_file(&files.arena, page_size, true, &[]) {
+            match self.reopen_arena_checked(&files, page_size) {
                 Ok(arena) => self.restarted_arena(arena),
                 Err(e) => {
                     if let Some(journal) = self.journal.as_mut() {
@@ -6667,7 +6668,7 @@ impl StoreInner {
         }
         self.lease.queued(snapshot.lease_now_ms);
         self.lease.flushed();
-        match Arena::open_file(&files.arena, page_size, true, &[]) {
+        match self.reopen_arena_checked(&files, page_size) {
             Ok(arena) => self.restarted_arena(arena),
             Err(e) => {
                 // The snapshot and the log header already say the new page size; the arena in
@@ -6680,6 +6681,17 @@ impl StoreInner {
             }
         }
         Ok(())
+    }
+
+    /// An empty store's restart reopens the arena at the new page size, truncated, under the same
+    /// one-device guard as every other arena open (review 5 #13). Mutant `restart_device_unchecked`
+    /// (test builds only).
+    fn reopen_arena_checked(&self, files: &BranchFiles, page_size: usize) -> Result<Arena> {
+        let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
+        if !fe_mutant("restart_device_unchecked") {
+            self.files_device(self.journal.as_ref().and_then(Journal::device), arena.device())?;
+        }
+        Ok(arena)
     }
 
     /// The restarted empty store's arena replaces the old one, and with it go the frees deferred
