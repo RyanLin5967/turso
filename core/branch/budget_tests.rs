@@ -52,6 +52,8 @@ const GROWTH: u64 = 23_040;
 /// round, so a checkpoint every ~60 rounds.
 const CKPT_THRESHOLD: u64 = 8 << 10;
 const CKPT_ROUNDS: u64 = 240;
+/// The shared-flight arm's rounds per thread.
+const SHARED_ROUNDS: u64 = 48;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
 const NAME_LEN: u64 = 6;
 
@@ -185,6 +187,7 @@ fn kernel_delta(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 struct Outside {
     log: Option<u64>,
     cat: (u64, u64, u64, u64),
+    cat_written: u64,
     ckpt: [u64; 9],
     reads: (u64, u64),
 }
@@ -194,6 +197,7 @@ impl Outside {
         Self {
             log: log_len(db),
             cat: db.branch_catalog_counters(),
+            cat_written: db.branch_catalog_rows_written(),
             ckpt: db.branch_checkpoint_counters(),
             reads: db.branch_read_counters(),
         }
@@ -203,6 +207,7 @@ impl Outside {
         Self {
             log,
             cat: (0, 0, 0, 0),
+            cat_written: 0,
             ckpt: [0; 9],
             reads: (0, 0),
         }
@@ -236,6 +241,7 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
     s.insert("catalog_rows", delta(o0.cat.3, o1.cat.3));
+    s.insert("catalog_writes", delta(o0.cat_written, o1.cat_written));
     s.insert("resolves", delta(o0.reads.0, o1.reads.0));
     s.insert("slot_reads", delta(o0.reads.1, o1.reads.1));
     s.insert("ckpt_started", delta(o0.ckpt[1], o1.ckpt[1]));
@@ -469,6 +475,43 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     super::journal::set_compact_threshold(0);
 }
 
+/// The shared-flight arm (LEAP L3): `c` threads, released together, each making `SHARED_ROUNDS`
+/// named creates (arm `shared_create`), then each `SHARED_ROUNDS` create-then-first-write cycles
+/// (arm `shared_cfw`), closed loop. One line per arm: the durable acknowledgements (creates, plus
+/// first writes in the cfw arm) and the flushes issued meanwhile, process-wide.
+fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
+    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true)] {
+        let gate = std::sync::Barrier::new(c as usize + 1);
+        let s0 = sync_counts();
+        std::thread::scope(|s| {
+            for t in 0..c {
+                let gate = &gate;
+                s.spawn(move || {
+                    let trunk = db.connect().unwrap();
+                    gate.wait();
+                    for i in 0..SHARED_ROUNDS {
+                        let name = format!("{arm}-{t}-{i:04}");
+                        fork_one(&trunk, Some(&name));
+                        if cfw {
+                            let b = db.connect_named(&name).unwrap();
+                            exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                        }
+                    }
+                });
+            }
+            gate.wait();
+        });
+        let s1 = sync_counts();
+        let mut m = Sample::new();
+        m.insert("threads", c);
+        m.insert("acks", c * SHARED_ROUNDS * if cfw { 2 } else { 1 });
+        m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
+        m.insert("fsync", s1.fsync - s0.fsync);
+        m.insert("barrier", s1.barrier - s0.barrier);
+        line(out, cell, arm, 0, &m);
+    }
+}
+
 /// The instruments' fire-checks, in the child (nothing else runs there): each counter moves by
 /// exactly what was done, and by nothing when nothing was.
 fn run_instruments(cell: &str) -> String {
@@ -577,6 +620,9 @@ fn run_instruments(cell: &str) -> String {
     put("fc_lookup_cataloged", &s);
     let (_, s) = measure(&db, base, || db.branch_named("never-seen").unwrap());
     put("fc_lookup_unseen", &s);
+    // The catalog's write counter: a checkpoint writes rows, a lookup none.
+    let (_, s) = measure(&db, base, || db.branch_compact_now().unwrap());
+    put("fc_checkpoint_writes", &s);
     // The log counter: a create appends, a lookup does not.
     let trunk = db.connect().unwrap();
     let (_, s) = measure(&db, base, || trunk.create_branch("fc-new").unwrap());
@@ -598,7 +644,7 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" => (10, false, true),
+            "ckpt_n10" | "shared_c4" | "shared_c16" | "shared_c64" => (10, false, true),
             "growth_n1e4" | "ckpt_n1e4" => (N_LARGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -615,7 +661,9 @@ fn budget_child() {
         probe::arm(true);
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if spec.starts_with("growth") {
+        if let Some(c) = spec.strip_prefix("shared_c") {
+            shared(&spec, &db, c.parse().unwrap(), &mut text);
+        } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
         } else if spec.starts_with("ckpt") {
             checkpoints(&spec, &db, base, &mut text);
@@ -827,9 +875,10 @@ fn assert_budgets(op: &str, budgets: &[Budget]) {
 }
 
 /// Counters whose every sample is deterministic: compared as (min, max).
-const EXACT: [&str; 14] = [
+const EXACT: [&str; 15] = [
     "syscalls",
     "held_syncs",
+    "catalog_writes",
     "fsync",
     "full_fsync",
     "barrier",
@@ -917,14 +966,13 @@ const NOT_FULL: &str = "full_fsync";
 
 /// Frame sizes of the documented log format (journal.rs: `[len u32][crc u32][payload]`): a
 /// `ForkNamed` of an `NAME_LEN`-byte name (tag, child, parent, name length, name), a one-page
-/// `Commit` (tag, branch, count, page/slot/crc), a `Release` (tag, branch), and the flight end of
-/// the current format (tag, start, synced, crc) and of review 2 #8's (17 B, queued in the engine's
-/// format bump).
+/// `Commit` (tag, branch, count, page/slot/crc), a `Release` (tag, branch), and a flight's end frame
+/// in format 11 (tag, flight length, crc: `END_FRAME_LEN`), the 17 B review 2 #8 asked for (format
+/// 9's was 29 B).
 const FORK_NAMED_FRAME: u64 = 8 + 1 + 8 + 8 + 4 + NAME_LEN;
 const COMMIT_1_FRAME: u64 = 8 + 1 + 8 + 4 + 12;
 const RELEASE_FRAME: u64 = 8 + 1 + 8;
-const FLIGHT_END_NOW: u64 = 8 + 1 + 8 + 8 + 4;
-const FLIGHT_END_TARGET: u64 = 17;
+const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 
 // ---- the instruments ----
 
@@ -956,6 +1004,8 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_lookup_unseen", "catalog_queries"), 0, "a name the filter never saw was asked for");
     assert!(get("fc_create_logs", "log_bytes") > 0, "a create appended nothing to the log");
     assert_eq!(get("fc_lookup_unseen", "log_bytes"), 0, "a lookup appended to the log");
+    assert_eq!(get("fc_lookup_unseen", "catalog_writes"), 0, "a lookup wrote a catalog row");
+    assert!(get("fc_checkpoint_writes", "catalog_writes") >= 1, "a checkpoint of 50 branches wrote no catalog row");
     assert_eq!(get("fc_thread_count", "with"), get("fc_thread_count", "base") + 1, "a live thread uncounted");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
@@ -1018,8 +1068,8 @@ fn create_logs_its_record_and_one_flight_end() {
         "create",
         &[every(
             "log_bytes",
-            Want::Exactly(FORK_NAMED_FRAME + FLIGHT_END_NOW),
-            "journal.rs format: its own ForkNamed and one flight end",
+            Want::Exactly(FORK_NAMED_FRAME + FLIGHT_END),
+            "journal.rs format 11: its own ForkNamed and one 17 B flight end (review 2 #8)",
         )],
     );
 }
@@ -1039,11 +1089,6 @@ fn create_issues_no_syscall_under_the_store_mutex() {
 #[test]
 fn create_allocates_at_most_once_under_the_store_mutex() {
     assert_budgets("create", &[steady("held_allocs", Want::AtMost(1), "review 1 LOW 25: in-place frames, one Arc for the name")]);
-}
-
-#[test]
-fn create_flight_end_is_review_2s_17_bytes() {
-    assert_budgets("create", &[every("log_bytes", Want::AtMost(FORK_NAMED_FRAME + FLIGHT_END_TARGET), "review 2 #8: 17 B flight end")]);
 }
 
 #[test]
@@ -1187,7 +1232,7 @@ fn first_write_asks_the_catalog_nothing() {
 fn first_write_logs_one_commit_and_one_flight_end() {
     assert_budgets(
         "first_write",
-        &[every("log_bytes", Want::Exactly(COMMIT_1_FRAME + FLIGHT_END_NOW), "journal.rs: one Commit, one flight end")],
+        &[every("log_bytes", Want::Exactly(COMMIT_1_FRAME + FLIGHT_END), "journal.rs format 11: one Commit, one 17 B flight end")],
     );
 }
 
@@ -1215,11 +1260,6 @@ fn first_write_issues_no_syscall_under_the_store_mutex() {
         "first_write",
         &[every("held_syscalls", Want::Exactly(0), "PREREG M2, review 1 LOW 26 / #14: slot writes and flight taking off the mutex")],
     );
-}
-
-#[test]
-fn first_write_flight_end_is_review_2s_17_bytes() {
-    assert_budgets("first_write", &[every("log_bytes", Want::AtMost(COMMIT_1_FRAME + FLIGHT_END_TARGET), "review 2 #8: 17 B flight end")]);
 }
 
 #[test]
@@ -1311,7 +1351,7 @@ fn delete_asks_the_catalog_nothing() {
 fn delete_logs_its_release_and_one_flight_end() {
     assert_budgets(
         "delete",
-        &[every("log_bytes", Want::Exactly(RELEASE_FRAME + FLIGHT_END_NOW), "DESIGN §3: one Release, one flight end")],
+        &[every("log_bytes", Want::Exactly(RELEASE_FRAME + FLIGHT_END), "DESIGN §3, format 11: one Release, one 17 B flight end")],
     );
 }
 
@@ -1325,11 +1365,6 @@ fn delete_issues_at_most_three_syscalls() {
 #[test]
 fn delete_issues_no_syscall_under_the_store_mutex() {
     assert_budgets("delete", &[every("held_syscalls", Want::Exactly(0), "DESIGN §3; review 1 #14, review 2 #6")]);
-}
-
-#[test]
-fn delete_flight_end_is_review_2s_17_bytes() {
-    assert_budgets("delete", &[every("log_bytes", Want::AtMost(RELEASE_FRAME + FLIGHT_END_TARGET), "review 2 #8: 17 B flight end")]);
 }
 
 #[test]
@@ -1581,9 +1616,10 @@ fn assert_instructions(op: &str) {
 
 /// Every counter but instructions (what `assert_instructions` skips: the D2 cells check them).
 #[cfg(target_vendor = "apple")]
-const EXACT_AND_ALLOC: [&str; 18] = [
+const EXACT_AND_ALLOC: [&str; 19] = [
     "syscalls",
     "held_syncs",
+    "catalog_writes",
     "fsync",
     "full_fsync",
     "barrier",
@@ -1648,4 +1684,98 @@ fn recovery_instructions_are_independent_of_live_branches_and_size() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---- LEAP class budgets (DECISIONS.md 2026-10-05T02:58Z, BIG LEAPS): the cost CLASS each leap must
+// reach. Red until its leap lands, and the gate the leap is judged by: a leap has landed when its
+// class budget is green, measured. L1 (async create) has no API in the engine yet; its class
+// budget waits beside the suite (lanes/budgets/leaps/L1-async-create.rs) for the stubs
+// ASYNC-DESIGN.md §2 lands first. L5 (the wire fast path) is the wire lane's.
+
+/// LEAP L2, a create path with NO store mutex (per-thread id blocks, an atomic log-buffer
+/// reservation, tables that never rehash on the path, a name map readable without the lock): a
+/// create takes no store-mutex acquisition at all, its flight's included. That deletes as a class
+/// the reds for syscalls, allocations and rehash under the mutex.
+#[test]
+fn leap_l2_a_create_takes_no_store_mutex() {
+    assert_budgets("create", &[every("locks", Want::Exactly(0), "LEAP L2: no store mutex on the create path")]);
+}
+
+/// The acknowledgements per F_FULLFSYNC at `spec`, per arm.
+fn shared_ratio(spec: &str) -> Vec<(String, u64, u64, u64)> {
+    let c = cell(spec);
+    ["shared_create", "shared_cfw"]
+        .iter()
+        .map(|arm| {
+            let s = &c.ops[*arm][0];
+            (arm.to_string(), s["threads"], s["acks"], s[FULL])
+        })
+        .collect()
+}
+
+/// LEAP L3, creates and first writes always ride shared flights: one F_FULLFSYNC carries every
+/// acknowledgement in flight, so at C clients in a closed loop each flush carries at least 0.9·C
+/// (PREREG §11 M2 exit 1: "(creates + deletes) per sync >= 0.9·C"; DESIGN §2: one flight in the
+/// air, an adaptive hold), for creates alone and for create-then-first-write cycles, at C = 4 and
+/// C = 16. (Alternating cohorts, review 1 #9, give about C/2.) C = 64 is run and reported, not
+/// held: on this shared box 64 runnable threads may not all be on a core inside one flight.
+#[test]
+fn leap_l3_every_flush_carries_nine_tenths_of_the_clients() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for spec in ["shared_c4", "shared_c16", "shared_c64"] {
+        for (arm, c, acks, flushes) in shared_ratio(spec) {
+            assert!(flushes > 0, "{spec}: {arm}: no flush counted: the instrument saw nothing");
+            let per = acks as f64 / flushes as f64;
+            let _ = write!(seen, " {spec}/{arm} {per:.2} ({acks}/{flushes});");
+            if c <= 16 && per < 0.9 * c as f64 {
+                let _ = writeln!(failures, "  {spec}: {arm}: {acks} acknowledgements over {flushes} flushes = {per:.2} per flush, budget >= {:.1}", 0.9 * c as f64);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L3 not reached (all:{seen}):\n{failures}");
+}
+
+/// LEAP L4, creation is a pure log record: no catalog read and no catalog write on create, connect
+/// by name, first write, disconnect or delete, at 10 and at 10^4 live branches and in the large
+/// database (budget reds it deletes: connect 1, first write 1, delete 3 queries).
+#[test]
+fn leap_l4_the_branch_lifecycle_reads_and_writes_no_catalog() {
+    for op in ["create", "connect_named", "first_write", "disconnect", "delete"] {
+        if let Err(e) = std::panic::catch_unwind(|| {
+            assert_budgets(
+                op,
+                &[
+                    every("catalog_queries", Want::Exactly(0), "LEAP L4: no catalog read"),
+                    every("catalog_writes", Want::Exactly(0), "LEAP L4: no catalog write"),
+                ],
+            )
+        }) {
+            panic!("LEAP L4 not reached: {}", e.downcast_ref::<String>().cloned().unwrap_or_default());
+        }
+    }
+}
+
+/// LEAP L4's open: the in-memory name and branch map is rebuilt from the log, so an open reads the
+/// catalog for its meta row only (DESIGN.md §3 Recovery, step 1): at most one catalog query, at
+/// both N.
+#[test]
+fn leap_l4_an_open_reads_only_the_catalog_meta_row() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["n10_small", "n1e4_small", "n10_small_unnamed", "n1e4_small_unnamed"] {
+        let c = cell(spec);
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 1 {
+                let _ = writeln!(failures, "  {spec}: open {i}: {q} catalog queries, {} rows", s["catalog_rows"]);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached at open (budget: 1 query, the meta row):\n{failures}");
 }
