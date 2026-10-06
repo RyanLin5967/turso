@@ -317,14 +317,27 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     # cannot be trusted; and every call stamp must lie inside [tseize, tend]. Comparing call stamps with each other
     # (above) misses a step before the first call or after the last (fifth-review re-review, finding 2). A missing
     # pair refuses the window.
-    clock = {}
+    clock, seen = {}, {}
     for name, sfx, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono|_err)?=(\d+\.\d+)", win, re.M):
         clock.setdefault(name + sfx, float(val))
+        seen[name + sfx] = seen.get(name + sfx, 0) + 1
     out_clock = None
     if attached:
         chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
         absent = [k for n in chain for k in (n, n + "_mono") if k not in clock]
         loose = [n for n in chain if clock.get(n + "_err", 0.0) > 0.0005]
+        # One stamp of each, in the order the attach writes them: t1 (the detach request) before strace's exit status,
+        # tend after it. A second t1 (a stray strace_mark OUT t1) or a t1 stamped after the wait would otherwise move
+        # the window's end without a trace (second re-review, finding 5).
+        twice = sorted(k for k, n in seen.items() if n > 1)
+        lines = win.splitlines()
+        pos = {k: next((i for i, ln in enumerate(lines) if re.match(rf"{k}=", ln)), None)
+               for k in ("t1", "strace_rc", "tend")}
+        if twice:
+            problems.append(f"attach window with repeated stamp(s) {twice}: which one is the window's cannot be told")
+        if None not in pos.values() and not pos["t1"] < pos["strace_rc"] < pos["tend"]:
+            problems.append(f"attach window's t1, strace_rc and tend lines out of order {pos}: t1 must be stamped "
+                            "before the detach's wait, tend after it")
         if absent:
             problems.append(f"attach window without its clock pair(s) {absent}: a clock step could not be seen")
         elif loose:

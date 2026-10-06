@@ -10,7 +10,8 @@
 #                              if it never completes (review finding 4). MAIN is SIGSTOPped from before the enumeration
 #                              until the seize is proven (freeze/thaw; window field frozen=1), so it cannot fork into
 #                              that gap at all (second review, finding 3).
-#   strace_detach OUT          SIGINT to that strace (it detaches and writes the -c table), wait for it to exit.
+#   strace_detach OUT [keep-t1]  stamp t1 (unless keep-t1: a t1 already marked), SIGINT to that strace (it detaches
+#                              and writes the -c table), wait for it to exit, stamp tend.
 #                              Records whether the strace and MAIN were still alive when the detach was requested:
 #                              stracecount refuses the window if either was not (review finding 5).
 #   strace_mark OUT NAME       stamp NAME=<CLOCK_REALTIME now> (with NAME_mono, clock_pair) into OUT.window inside an
@@ -290,10 +291,11 @@ strace_attach() {
 }
 
 strace_detach() {
-  local out=$1 rc=0 sa=1 ma=1 main
-  # t1 is the detach request, unless the window already holds one (only the fire-check's F12 stamps it earlier, with
-  # strace_mark OUT t1, so that calls exist after it and the t1 cut is exercised).
-  grep -q '^t1=' "$out.window" || clock_pair t1 >>"$out.window"
+  local out=$1 keep=${2:-} rc=0 sa=1 ma=1 main
+  # t1 is the detach request. Only `strace_detach OUT keep-t1` keeps a t1 stamped earlier with strace_mark OUT t1 (the
+  # fire-check's F12, so that calls exist after it); without it a stray t1 mark leaves two t1 stamps, which
+  # stracecount refuses, instead of silently moving the window's end (second re-review, finding 5).
+  [ "$keep" = keep-t1 ] || clock_pair t1 >>"$out.window"
   main=$(sed -n 's/^main=\([0-9][0-9]*\) .*/\1/p' "$out.window" | head -1)
   kill -0 "$ST_PID" 2>/dev/null || sa=0
   { [ -n "$main" ] && kill -0 "$main" 2>/dev/null; } || ma=0

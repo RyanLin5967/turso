@@ -522,7 +522,7 @@ fi
 stop_probe2 split
 
 # F12: the t1 cut (fifth-review re-review, finding 1: no attach probe had a call after t1). One attach of the split
-# probe: fsync x2, then t1 is stamped (strace_mark OUT t1; strace_detach keeps it), then fsync x3, then the detach.
+# probe: fsync x2, then t1 is stamped (strace_mark OUT t1; strace_detach OUT keep-t1), then fsync x3, then the detach.
 # The count must end at t1: 2 fsyncs counted, the 3 after it (and the probe's later calls) in calls_after_t1.
 if start_probe2 split && strace_attach "$OUT/f12" "$PP2"; then
   touch "$DIR/fc/go-split"
@@ -532,7 +532,7 @@ if start_probe2 split && strace_attach "$OUT/f12" "$PP2"; then
   touch "$DIR/fc/go-split.2"
   for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.done" ] && break; sleep 0.05; done
   sleep 0.2
-  strace_detach "$OUT/f12"
+  strace_detach "$OUT/f12" keep-t1
   count f12
   check F12-t1-cut "$OUT/f12.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==2 and r["flushes"]==2 and r["calls_after_t1"]>=3'
 else
