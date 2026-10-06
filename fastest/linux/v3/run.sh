@@ -13,18 +13,21 @@
 # Binding (review 2 item 8). Exactly one of:
 #   V3_FIRECHECK_VERDICT=<verdict.json>  check.py's whole verdict shape (batchgate.py verdict): every planned check
 #                                        passing, for THIS binary (sha256), arch, DIR's fstype and V3_CELL, no
-#                                        "planted" key, a leaf that is not brd; V3FLOOR_BRD in the env refuses.
-#                                        binary.txt records the verdict's sha256 and run id
+#                                        "planted" key, a leaf that is not brd, and the fire-check's own binding
+#                                        record next to it (<verdict>.bind.json) passed for this verdict, or pending
+#                                        for it; V3FLOOR_BRD in the env refuses. binary.txt records the verdict's
+#                                        sha256 and run id, and the gate re-hashes the verdict after the run
 #   V3_SMOKE=1                           an explicitly unbound smoke batch, recorded as such, never credited
 # Neither, or both: refused (rc 2) before anything runs.
 # V3_REQUIRE_T3=1: also refuse before anything runs unless the registered T3 preconditions hold (every CPU on the
 # "performance" governor, clocksource tsc or arch_sys_counter: review 2 items 16-17; batchgate.py t3pre).
 # LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH in the environment refuses (an interposer would not change the sha256).
 # After the probe (batchgate.py post): refused (rc 2) if the summary carries mutant_nosync or trace_clock != 0, names
-# another binary (exe_sha256), another layout, no gated arm ran, or (bound) a brd leaf, another leaf class or another
-# layer stack than the verdict's; also refused when the gate itself fails (any rc but 0/2/3, or no gate.json), never
+# another binary (exe_sha256), another layout, has no drive or brd leaf record, no gated arm ran, or (bound) a brd
+# leaf, another leaf class, layer stack, leaf driver or drive model, or virtualization than the verdict's, or the
+# verdict changed during the run; also refused when the gate itself fails (any rc but 0/2/3, or no gate.json), never
 # read as a pass. VOID (rc 3) if the leaf reports write-back and its flush count is below n x gated arms, or a gated
-# op issued it no flush request. A killed run.sh stops its tracefs instance (EXIT trap).
+# op's window holds no flush-carrying request to it. A killed run.sh stops its tracefs instance (EXIT trap).
 # Exit: 2 refused or a record could not be taken; else the probe's rc (0 ok, 1 op failed, 3 void), or 3 from the gate.
 # Not a credited measurement unless the PREREG is registered with its T3 rules.
 set -uo pipefail

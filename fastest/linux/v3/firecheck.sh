@@ -9,7 +9,12 @@
 #   V3_FX    (env) the base dir mkfixtures.sh made. Unset or a fixture missing: its plants FAIL in check.py.
 #   V3_BASE  (env) a dir holding the base (df4b39e53) v3floor binary and run.sh/stamp.py/check.py: the red column
 #            (OUT/red/, check.py writes red.json; never part of the verdict). V3_BASE_SHA names it.
-#   V3_SHIM  (env) statfs_shim.so, for the R_statfs_shim plant.
+#   V3_SHIM  (env) statfs_shim.so, for the R_statfs_shim plant (run on V3_DYN).
+#   V3_DYN   (env) a dynamic build of the same v3floor.c: V3FLOOR is the static build (fourth review M4), which no
+#            preload reaches, so the statfs-shim plant and the /etc/ld.so.preload refusal run this one.
+#   V3_NOOP  (env) noop_shim.so, the library the /etc/ld.so.preload plants name.
+#   V3_PREV  (env) a dir holding the previous tip's (V3_PREV_SHA, 40a3c9502) v3floor, batchgate.py, check.py and
+#            v3cell.py: the second red column (OUT/prev/, check.py writes prev.json; never part of the verdict).
 # Stages (verdicts by check.py, which reads only OUT; every expectation there comes from the arm definitions):
 #   F1  each arm set under strace -f -c at n = 1, 2, 3, 40: per-op syscalls equal the definitions, flush totals equal
 #       setup + definition x n + teardown (ASLR off: setarch -R).
@@ -26,8 +31,10 @@
 #   F4  refusals: rc 2, the reason in the message, no out dir; the plants of review 2 items 1, 7-16; run.sh's
 #       argument allowlist, environment refusals and verdict binding.
 #   R   (V3_BASE set) the red column: the same plants against the base probe and scripts.
+#   R2  (V3_PREV set) the fourth review's plants against the previous tip's probe and gate.
 #   bind after check.py: run.sh bound to the cell's own verdict (P_runsh_ok), or refused on a brd cell
-#       (P_runsh_brd); check.py --bind records it in OUT/bind.json.
+#       (P_runsh_brd); check.py --bind records it in OUT/verdict.bind.json, the binding record run.sh requires
+#       next to a verdict (check.py leaves OUT/verdict.bind.pending until then).
 # The fire-check-only flags need V3FLOOR_FIRECHECK=1, which this script sets only on those runs (F1b, F2, F2b, F2d,
 # R_mutnod0, crash.sh) and run.sh refuses.
 # Exit: 0 when check.py's verdict and the binding both pass; 1 a check failed; 2 usage.
@@ -52,6 +59,7 @@ WSRC=$(findmnt -n -o SOURCE -T "$W")
 ME=$(id -un)
 FX=${V3_FX:-/nonexistent}
 RS="$HERE/run.sh" GATE="$HERE/batchgate.py" BLK="$HERE/blkflush.py"
+V3DYN=$(readlink -f "${V3_DYN:-/nonexistent}") NOOP=$(readlink -f "${V3_NOOP:-/nonexistent}")
 export V3_CELL=$CELL
 BRD=0
 case $WSRC in /dev/ram*) BRD=1; export V3FLOOR_BRD=1 ;; esac
@@ -95,8 +103,16 @@ grant
   echo "personality_under_setarch_R=$(setarch "$ARCH" -R cat /proc/self/personality)"
   for d in /sys/block/*; do echo "block ${d##*/} write_cache=[$(cat "$d/queue/write_cache" 2>/dev/null)] fua=[$(cat "$d/queue/fua" 2>/dev/null)]"; done
   for d in /dev/loop[0-9]* /dev/nvme[0-9] /dev/sd[a-z]; do [ -e "$d" ] && echo "acl $d $(getfacl -cp "$d" 2>/dev/null | grep "^user:$ME" | xargs)"; done
-  echo "harness_sha256=$(cd "$HERE" && sha256sum run.sh batchgate.py check.py blkflush.py stamp.py v3cell.py | sha256sum | cut -d' ' -f1)"
+  # an instrument outside the probe for its virtualization verdict (fourth review M1)
+  echo "detect_virt=$(systemd-detect-virt 2>/dev/null)"
+  echo "scsi_hosts=$(for h in /sys/class/scsi_host/host*; do printf '%s:%s ' "${h##*/}" "$(cat "$h/proc_name" 2>/dev/null)"; done)"
+  echo "v3dyn_sha256=$(sha256sum "$V3DYN" 2>/dev/null | cut -d' ' -f1) noop_sha256=$(sha256sum "$NOOP" 2>/dev/null | cut -d' ' -f1)"
+  echo "prev_sha=${V3_PREV_SHA:-}"
+  [ -n "${V3_PREV:-}" ] && echo "prev_v3floor_sha256=$(sha256sum "$V3_PREV/v3floor" | cut -d' ' -f1)"
+  echo "ldso_preload_before=$(cat /etc/ld.so.preload 2>/dev/null | xargs)"
 } > "$OUT/info.txt" 2>&1
+# the harness as it is now; check.py compares it with the harness at check time (fourth review L9)
+python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import check; print(json.dumps(check.harness_sha256(sys.argv[1]), indent=1, sort_keys=True))' "$HERE" > "$OUT/harness_start.json"
 cat "$OUT/info.txt"
 
 tagof() { if [ "$1" = "$ALL" ]; then echo all; else echo "${1//,/+}"; fi; }
@@ -249,9 +265,29 @@ fx R_loop_wt wt
 fx R_brd brd env -u V3FLOOR_BRD
 fx R_driver dm
 fx P_nest3 n3
+fx R_datajournal dj
+# fourth review M2: a write-back SCSI drive (scsi_debug, WCE=1): accepted only under the fire-check flag, and the
+# kernel's copy flipped to "temporary write through" against the drive's WCE=1 refuses
+fx P_sdbg_wb sdbg env V3FLOOR_FIRECHECK=1
+fx R_sdbg_noenv sdbg env -u V3FLOOR_FIRECHECK
+SDBG=$(cat "$FX/sdbg.disk" 2>/dev/null)
+if [ -f "$FX/sdbg.ok" ] && [ -n "$SDBG" ]; then
+  sct=$(ls /sys/block/"$SDBG"/device/scsi_disk/*/cache_type 2>/dev/null | head -1)
+  swc=/sys/block/$SDBG/queue/write_cache
+  sbefore=$(cat "$swc")
+  echo "temporary write through" | sudo tee "$sct" > /dev/null
+  sduring=$(cat "$swc")
+  [ "$sduring" != "$sbefore" ] && echo "changed=1 $SDBG write_cache '$sbefore' -> '$sduring' (cache_type $(cat "$sct"))" > "$OUT/F4/R_sdbg_flip.state"
+  refuse R_sdbg_flip env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o R_sdbg_flip)" --n 5 --arms append25,nosync25
+  echo "temporary write back" | sudo tee "$sct" > /dev/null
+  echo "$SDBG write_cache: before '$sbefore', during '$sduring', after '$(cat "$swc")'" > "$OUT/F4/R_sdbg_flip.flip"
+else
+  echo "fixture sdbg missing" > "$OUT/F4/R_sdbg_flip.txt"; echo missing > "$OUT/F4/R_sdbg_flip.rc"
+fi
 if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
   # the shim is a fire-check tool, so the probe's own LD_PRELOAD refusal is lifted for it (V3FLOOR_FIRECHECK=1) ...
-  refuse R_statfs_shim env V3FLOOR_FIRECHECK=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3" --dir "$W" --out "$(o R_statfs_shim)" --n 5 --arms append25,nosync25
+  # (on the dynamic build of the same source: the static V3FLOOR loads no preload at all)
+  refuse R_statfs_shim env V3FLOOR_FIRECHECK=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3DYN" --dir "$W" --out "$(o R_statfs_shim)" --n 5 --arms append25,nosync25
   # ... and without it the preload itself refuses (fresh review: an interposer under an unchanged exe_sha256)
   refuse R_ldpreload env -u V3FLOOR_FIRECHECK LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3" --dir "$W" --out "$(o R_ldpreload)" --n 5 --arms append25,nosync25
 else
@@ -310,6 +346,41 @@ flip() { # tag cmd...
   echo "$ROOTDISK write_cache: before '$before', during '$during', after '$after'" >> "$tag.flip"
 }
 flip "$OUT/F4/R_leaf_flip" refuse R_leaf_flip "$V3" --dir "$ROOTW" --out "$(o R_leaf_flip)" --n 5 --arms append25,nosync25
+# fourth review M1: cpuinfo's hypervisor flag and DMI's names hidden from the probe by bind mounts in a private mount
+# namespace (read back inside it before the probe starts, as the premise); the probe runs as this user (setpriv)
+virt_hidden() { # tag binary outdir
+  local tag=$1 bin=$2 o=$3 d
+  d=$(dirname "$o")/$tag.fake
+  mkdir -p "$d"
+  sed -E 's/ hypervisor( |$)/\1/' /proc/cpuinfo > "$d/cpuinfo"
+  echo "Dell Inc." > "$d/sys_vendor"
+  echo "PowerEdge R650" > "$d/product_name"
+  timeout 300 sudo unshare -m --propagation private sh -c '
+    mount --bind "$1/cpuinfo" /proc/cpuinfo && mount --bind "$1/sys_vendor" /sys/class/dmi/id/sys_vendor &&
+      mount --bind "$1/product_name" /sys/class/dmi/id/product_name || exit 97
+    { echo "product_name=$(cat /sys/class/dmi/id/product_name)"; echo "sys_vendor=$(cat /sys/class/dmi/id/sys_vendor)";
+      echo "hypervisor_flags=$(grep -c -w hypervisor /proc/cpuinfo)"; } > "$2"
+    exec setpriv --reuid="$3" --regid="$4" --init-groups "$5" --dir "$6" --out "$7" --n 5 --arms append25,nosync25' \
+    sh "$d" "${o%.out}.premise" "$(id -u)" "$(id -g)" "$bin" "$ROOTW" "$o" > "${o%.out}.txt" 2>&1
+  echo $? > "${o%.out}.rc"
+}
+virt_hidden R_virt_hidden "$V3" "$(o R_virt_hidden)"
+# fourth review M4: /etc/ld.so.preload names the noop library for one run, then is restored
+ldso() { # tag binary dir
+  local tag=$1 bin=$2 dir=$3
+  : > "$dir/$tag.mark"
+  [ -e /etc/ld.so.preload ] && sudo cp /etc/ld.so.preload "$dir/$tag.ldso-before"
+  if [ -f "$NOOP" ]; then
+    echo "$NOOP" | sudo tee /etc/ld.so.preload > /dev/null
+    [ "$(cat /etc/ld.so.preload)" = "$NOOP" ] && echo "changed=1 /etc/ld.so.preload names $NOOP" > "$dir/$tag.state"
+  fi
+  timeout 300 env V3_NOOP_MARK="$dir/$tag.mark" "$bin" --dir "$W" --out "$dir/$tag.out" --n 5 --arms append25,nosync25 > "$dir/$tag.txt" 2>&1
+  echo $? > "$dir/$tag.rc"
+  if [ -f "$dir/$tag.ldso-before" ]; then sudo cp "$dir/$tag.ldso-before" /etc/ld.so.preload; else sudo rm -f /etc/ld.so.preload; fi
+}
+ldso R_ldso_preload "$V3DYN" "$OUT/F4"
+ldso P_ldso_static "$V3" "$OUT/F4"
+echo "ldso_preload_after=$(cat /etc/ld.so.preload 2>/dev/null | xargs)" >> "$OUT/info.txt"
 # item 16: a clocksource other than tsc/arch_sys_counter, then restored
 csalt() { # tag cmd...
   local tag=$1 cur alt
@@ -380,6 +451,9 @@ t3false "$OUT/F4/R_runsh_t3" refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 ba
 [ -f "$OUT/F4/R_runsh_t3.na" ] && { cp "$OUT/F4/R_runsh_t3.na" "$OUT/F4/R_runsh_t3.txt"; echo missing > "$OUT/F4/R_runsh_t3.rc"; }
 # fresh review I-H2 and I-M2: a stale harness, a library preload, no gated arm
 refuse R_runsh_harness "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture harness harness)" bash "$RS" "$V3" "$W" "$(o R_runsh_harness)" 5 --arms append25,nosync25
+# fourth review L3: the fire-check's own binding record failed for this verdict, or is absent
+refuse R_runsh_bindfail "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture bindfail bindfail)" bash "$RS" "$V3" "$W" "$(o R_runsh_bindfail)" 5 --arms append25,nosync25
+refuse R_runsh_nobind "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture nobind "")" bash "$RS" "$V3" "$W" "$(o R_runsh_nobind)" 5 --arms append25,nosync25
 if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
   refuse R_runsh_ldpreload env V3_SMOKE=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" bash "$RS" "$V3" "$W" "$(o R_runsh_ldpreload)" 5 --arms append25,nosync25
 else
@@ -391,10 +465,12 @@ refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated
 GH="$OUT/F4/gatecrash-harness"
 cp -r "$HERE" "$GH" && printf 'import sys\nsys.exit(1 if sys.argv[1:2] == ["post"] else 2)\n' > "$GH/batchgate.py"
 refuse R_runsh_gatecrash env V3_SMOKE=1 bash "$GH/run.sh" "$V3" "$W" "$(o R_runsh_gatecrash)" 5 --arms append25,nosync25
-# fresh review I-M5: batchgate.py post on copies of the F3 batch, each with one field planted (bound mode)
-for p in traceclock cell leaf brd; do
+# fresh review I-M5, fourth review M3/M5/L9: batchgate.py post on copies of the F3 batch, each with one field
+# planted (bound mode), and the control with nothing planted
+for p in traceclock cell leaf brd stack driver virt verdictswap verdictbad nostamp noblk blkrefused; do
   refuse "R_post_$p" python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/R_post_$p" "$CELL" "$SHA" "$p"
 done
+refuse P_post_none python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/P_post_none" "$CELL" "$SHA" none
 # after the run: a wrapper "binary" that runs the real probe with the mutant (summary names another binary)
 printf '#!/bin/sh\nV3FLOOR_FIRECHECK=1 exec "%s" "$@" --mutant-nosync\n' "$V3" > "$OUT/F4/wrapper.sh"
 chmod +x "$OUT/F4/wrapper.sh"
@@ -469,6 +545,28 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   gzip -9 "$R/base-trace"
   ls -A "$WR" > "$R/work-leftover.txt"
   python3 -B "$HERE/red.py" offline "$V3_BASE/check.py" "$R/base-trace.gz" "$WR" "$CELL" "$R/offline.json" > "$R/offline.txt" 2>&1
+fi
+
+if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
+  echo "== R2: the fourth review's plants against the previous tip (${V3_PREV_SHA:-?})"
+  R2=$OUT/prev PB=$V3_PREV/v3floor
+  mkdir -p "$R2"
+  pv() { local tag=$1; shift; timeout 300 "$@" > "$R2/$tag.txt" 2>&1; echo $? > "$R2/$tag.rc"; }
+  virt_hidden prev_M1_virt "$PB" "$R2/prev_M1_virt.out"
+  if [ -f "$FX/sdbg.ok" ]; then
+    pv prev_M2_sdbg env -u V3FLOOR_FIRECHECK "$PB" --dir "$FX/sdbg/w" --out "$R2/prev_M2_sdbg.out" --n 5 --arms append25,nosync25
+  else
+    echo "fixture sdbg missing" > "$R2/prev_M2_sdbg.na"
+  fi
+  pv prev_M3_driver python3 -B "$HERE/postplant.py" "$OUT/F3" "$R2/prev_M3_driver" "$CELL" "$SHA" driver "$V3_PREV/batchgate.py"
+  ldso prev_M4_preload "$PB" "$R2"
+  pv prev_L1_claim python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import batchgate as b; print(b.claim_from_counts({"leaf_write_cache": "write back", "leaf": {"kind": "drive"}, "fstype": "ext4"}, {"append25": 1.0, "nosync25": 0.0}))' "$V3_PREV"
+  if [ -f "$FX/dj.ok" ]; then
+    pv prev_L6_datajournal "$PB" --dir "$FX/dj/w" --out "$R2/prev_L6_datajournal.out" --n 5 --arms append25,nosync25
+  else
+    echo "fixture dj missing" > "$R2/prev_L6_datajournal.na"
+  fi
+  pv prev_L9_verdictswap python3 -B "$HERE/postplant.py" "$OUT/F3" "$R2/prev_L9_verdictswap" "$CELL" "$SHA" verdictswap "$V3_PREV/batchgate.py"
 fi
 
 sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null

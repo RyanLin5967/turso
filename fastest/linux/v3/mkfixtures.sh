@@ -21,6 +21,10 @@
 #   brd   ext4 on /dev/ram1 (brd)                                                        R_brd (1a)
 #   dm    ext4 on a device-mapper linear target over a loop                              R_driver (1a)
 #   root  a directory on the root filesystem itself (leaf = the runner's own disk)       R_leaf_flip, R_clocksource
+#   dj    an ext4 loop whose superblock default is data=journal (tune2fs -o journal_data): mountinfo omits it,
+#         /proc/fs/ext4/<dev>/options shows it                                          R_datajournal (fourth review L6)
+#   sdbg  ext4 on a scsi_debug disk (RAM posing as a SCSI drive; its caching page says WCE=1, so sd reads write
+#         back): the MODE SENSE WCE=1 branch                                            P_sdbg_wb, R_sdbg_flip, R_sdbg_noenv (M2)
 # Exit 0 when every fixture proved itself, 1 otherwise (the workflow records it and runs the fire-check anyway).
 set -u
 base=${1:?usage: mkfixtures.sh BASE}
@@ -165,7 +169,42 @@ f_root() {
   sudo mkdir -p /var/tmp/v3fx-root/w && sudo chown "$me" /var/tmp/v3fx-root/w && echo /var/tmp/v3fx-root/w | sudo tee "$base/root.dir" > /dev/null \
     && ok root "$(findmnt -n -o SOURCE,FSTYPE,OPTIONS -T /var/tmp/v3fx-root/w)"
 }
-for f in nb ht hn lz del nest ds ld ej md wt brd dm root; do
+f_dj() {
+  local d
+  sudo mkdir -p "$base/dj"
+  d=$(newloop /v3fx-dj.img 1G) && sudo $MKE4 "$d" && sudo tune2fs -o journal_data "$d" > /dev/null \
+    && sudo mount "$d" "$base/dj" && mkw "$base/dj" || return 1
+  # the premise: data=journal is effective, and mountinfo does not show it (so only the effective-options pass sees it)
+  if grep -qx 'data=journal' "/proc/fs/ext4/${d##*/}/options" && ! findmnt -n -o OPTIONS "$base/dj" | tr , '\n' | grep -qx 'data=journal'; then
+    ok dj "${d##*/} effective $(grep '^data=' "/proc/fs/ext4/${d##*/}/options"); mountinfo: $(findmnt -n -o OPTIONS "$base/dj")"
+  else
+    bad dj "data=journal not effective, or shown in mountinfo: $(grep '^data=' "/proc/fs/ext4/${d##*/}/options" 2>&1); $(findmnt -n -o OPTIONS "$base/dj")"
+  fi
+}
+f_sdbg() {
+  local b d="" ct k
+  sudo mkdir -p "$base/sdbg"
+  if ! sudo modprobe scsi_debug dev_size_mb=256 2>/dev/null; then
+    timeout 600 sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" > /dev/null 2>&1
+    sudo modprobe scsi_debug dev_size_mb=256 || { bad sdbg "no scsi_debug module for $(uname -r)"; return 1; }
+  fi
+  for k in $(seq 1 30); do
+    sudo udevadm settle 2>/dev/null
+    for b in /sys/block/sd*; do
+      case "$(readlink -f "$b/device")" in */pseudo_*) d=${b##*/} ;; esac
+    done
+    [ -n "$d" ] && [ -b "/dev/$d" ] && break
+    sleep 1
+  done
+  [ -n "$d" ] && [ -b "/dev/$d" ] || { bad sdbg "no scsi_debug disk appeared"; return 1; }
+  echo "$d" | sudo tee "$base/sdbg.disk" > /dev/null
+  ct=$(cat /sys/block/"$d"/device/scsi_disk/*/cache_type)
+  [ "$ct" = "write back" ] || { bad sdbg "$d cache_type '$ct', not write back (scsi_debug's caching page default is WCE=1)"; return 1; }
+  sudo $MKE4 "/dev/$d" && sudo mount "/dev/$d" "$base/sdbg" && mkw "$base/sdbg" || return 1
+  sudo setfacl -m "u:$(id -un):r" "/dev/$d" 2>/dev/null || sudo chmod o+r "/dev/$d"
+  ok sdbg "/dev/$d cache_type '$ct' write_cache '$(cat /sys/block/"$d"/queue/write_cache)' hosts $(cat /sys/class/scsi_host/host*/proc_name 2>/dev/null | xargs) path $(readlink -f "/sys/block/$d/device")"
+}
+for f in nb ht hn lz del nest ds ld ej md wt brd dm root dj sdbg; do
   "f_$f" || bad "$f" "a step failed"
 done
 echo "mkfixtures: $(ls "$base"/*.ok 2>/dev/null | wc -l) fixtures proved; fail=$fail"
