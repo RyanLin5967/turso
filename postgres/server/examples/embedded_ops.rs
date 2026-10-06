@@ -4,7 +4,12 @@
 //! C1b tracers stamp (CLOCK_UPTIME_RAW), so their events can be attributed to steps.
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
-//!                [--rows N] [--warmup N] [--ops N] --out FILE
+//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra] --out FILE
+//!
+//! `--siblings K` creates K live branches before the ops, so every measured create forks a trunk
+//! that already has children (the path credited cells take; wire review 1 item 18). `--plant extra`
+//! (a budget fire-check) also commits a trunk row inside each create step, as the wire side's
+//! `--plant both` does, so the two sides stay equal and only the budget's absolute counts can fail.
 //!
 //! The cycle, per op k (the statements the wire side sends, and the engine call each maps to):
 //!   create  SELECT turso_branch_create('b_k')   Connection::create_branch on the trunk connection
@@ -80,6 +85,8 @@ struct Args {
     rows: u64,
     warmup: u64,
     ops: u64,
+    siblings: u64,
+    plant_extra: bool,
     out: String,
 }
 
@@ -87,7 +94,8 @@ fn args() -> Args {
     let mut a = std::env::args().skip(1);
     let (mut db, mut out) = (None, None);
     let (mut durability, mut store) = ("full".to_string(), "catalog".to_string());
-    let (mut rows, mut warmup, mut ops) = (1000, 20, 200);
+    let (mut rows, mut warmup, mut ops, mut siblings) = (1000, 20, 200, 0);
+    let mut plant_extra = false;
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
         match k.as_str() {
@@ -97,6 +105,11 @@ fn args() -> Args {
             "--rows" => rows = v().parse().unwrap(),
             "--warmup" => warmup = v().parse().unwrap(),
             "--ops" => ops = v().parse().unwrap(),
+            "--siblings" => siblings = v().parse().unwrap(),
+            "--plant" => match v().as_str() {
+                "extra" => plant_extra = true,
+                other => panic!("--plant {other}: extra"),
+            },
             "--out" => out = Some(v()),
             other => panic!("unknown argument {other}"),
         }
@@ -118,6 +131,8 @@ fn args() -> Args {
         rows,
         warmup,
         ops,
+        siblings,
+        plant_extra,
         out: out.expect("--out"),
     }
 }
@@ -129,8 +144,13 @@ fn run(conn: &PgConnection, sql: &str) {
 fn main() {
     let a = args();
     let opts = turso_pg_server::database_opts(a.branches);
-    let (_io, db) =
-        turso_pg::open_database(&a.db, None, turso_core::OpenFlags::default(), opts).unwrap();
+    let (_io, db) = turso_pg::open_database(
+        &a.db,
+        None,
+        turso_core::OpenFlags::default(),
+        opts.turso_cli(),
+    )
+    .unwrap();
     // The session's trunk connection, as a server session opens it.
     let trunk = PgConnection::new(db.connect().unwrap());
     turso_pg::attach_schema_files(&trunk, &a.db);
@@ -142,6 +162,9 @@ fn main() {
         run(&trunk, &format!("INSERT INTO t VALUES ({id}, 0)"));
     }
     run(&trunk, "COMMIT");
+    for k in 0..a.siblings {
+        trunk.inner().create_branch(&format!("sib_{k}")).unwrap();
+    }
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
     writeln!(
@@ -180,6 +203,9 @@ fn main() {
 
         let p0 = Probe::now();
         trunk.inner().create_branch(&name).unwrap();
+        if a.plant_extra {
+            run(&trunk, &format!("INSERT INTO t2 VALUES ({seq})"));
+        }
         rec(seq, phase, "create", p0, Probe::now());
 
         let p0 = Probe::now();
