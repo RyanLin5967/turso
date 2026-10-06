@@ -8793,7 +8793,25 @@ mod sota_index_tests {
             };
             check(&store, "live");
             if durable && rng.below(25) == 0 {
-                if rng.below(3) == 0 {
+                // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
+                // (before or after its catalog commit), the crash image taken while it is held,
+                // and the live store checked again after its install.
+                let held = (mode.catalog() && rng.below(2) == 0)
+                    .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
+                let in_flight = held.is_some_and(|stage| {
+                    store.checkpoint_hold(stage);
+                    let started = store.checkpoint_fuzzy_now().unwrap();
+                    let t = Instant::now();
+                    while started && store.checkpoint_held() != stage | HOLD_ARRIVED {
+                        assert!(t.elapsed() < Duration::from_secs(60), "the fuzzy checkpoint never reached its hold");
+                        crate::thread::sleep(Duration::from_millis(1));
+                    }
+                    if !started {
+                        store.checkpoint_hold(0);
+                    }
+                    started
+                });
+                if held.is_none() && rng.below(3) == 0 {
                     store.compact_now().unwrap();
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
@@ -8802,9 +8820,14 @@ mod sota_index_tests {
                 assert_eq!(
                     recovered.slots_in_use(),
                     store.slots_in_use(),
-                    "{mode:?} seed {seed:#x} step {step}: recovery changed the live slot set"
+                    "{mode:?} seed {seed:#x} step {step}: recovery changed the live slot set (fuzzy in flight: {in_flight})"
                 );
                 check(&recovered, "after recovery");
+                if in_flight {
+                    store.checkpoint_hold(0);
+                    store.checkpoint_wait();
+                    check(&store, "after a fuzzy checkpoint's install");
+                }
             }
         }
         assert!(
@@ -8964,7 +8987,25 @@ mod sota_tree_tests {
             };
             check(&store, "live");
             if durable && rng.below(20) == 0 {
-                if rng.below(2) == 0 {
+                // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
+                // (before or after its catalog commit), the crash image taken while it is held,
+                // and the live store checked again after its install.
+                let held = (mode.catalog() && rng.below(2) == 0)
+                    .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
+                let in_flight = held.is_some_and(|stage| {
+                    store.checkpoint_hold(stage);
+                    let started = store.checkpoint_fuzzy_now().unwrap();
+                    let t = Instant::now();
+                    while started && store.checkpoint_held() != stage | HOLD_ARRIVED {
+                        assert!(t.elapsed() < Duration::from_secs(60), "the fuzzy checkpoint never reached its hold");
+                        crate::thread::sleep(Duration::from_millis(1));
+                    }
+                    if !started {
+                        store.checkpoint_hold(0);
+                    }
+                    started
+                });
+                if held.is_none() && rng.below(2) == 0 {
                     store.compact_now().unwrap();
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
@@ -8973,9 +9014,14 @@ mod sota_tree_tests {
                 assert_eq!(
                     recovered.slots_in_use(),
                     store.slots_in_use(),
-                    "{mode:?} seed {seed:#x} step {step}: recovery changed the live slot set"
+                    "{mode:?} seed {seed:#x} step {step}: recovery changed the live slot set (fuzzy in flight: {in_flight})"
                 );
                 check(&recovered, "after recovery");
+                if in_flight {
+                    store.checkpoint_hold(0);
+                    store.checkpoint_wait();
+                    check(&store, "after a fuzzy checkpoint's install");
+                }
             }
         }
         // The shapes the page maps exist for must have occurred, or a green run says nothing.
