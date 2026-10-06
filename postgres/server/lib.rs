@@ -147,10 +147,10 @@ impl Backoff {
 /// a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page). Dropped there, a write
 /// whose RETURNING rows went out is committed by the engine's reset, and prepared anew it ran
 /// again in full: applied twice, its rows returned twice (wire review 5 item 2). A Busy before it
-/// changed anything is the statement's, for [`Session::engine_statement`] to run it anew: stepped
-/// again there, a read came back done with no rows (gate suite at 0b803949e,
-/// a_conflicting_write_fails_with_a_retryable_sqlstate_or_serialises). Past the lock wait the
-/// Busy is the statement's.
+/// changed anything is the statement's, for [`Session::engine_statement`] to run it anew, as
+/// before 64ba2c66b: that the engine resumes a statement refused at its first lock is not
+/// established (the commit's contract test is the only resume shown). Past the lock wait the Busy
+/// is the statement's.
 fn run_waiting(
     stmt: &mut turso_core::Statement,
     backoff: &mut Backoff,
