@@ -175,6 +175,8 @@ python3 -B "$BLK" self-test > "$B/selftest.txt" 2>&1
 echo $? > "$B/selftest.rc"
 python3 -B "$GATE" self-test "$HERE/testdata" > "$B/batchgate-selftest.txt" 2>&1
 echo $? > "$B/batchgate-selftest.rc"
+python3 -B "$HERE/check.py" --self-test > "$B/check-selftest.txt" 2>&1
+echo $? > "$B/check-selftest.rc"
 img=/var/tmp/v3blk-$$.img
 sudo rm -f "$img"; sudo truncate -s 64M "$img"
 bdev=$(sudo losetup --find --show "$img")
@@ -346,25 +348,45 @@ flip() { # tag cmd...
   echo "$ROOTDISK write_cache: before '$before', during '$during', after '$after'" >> "$tag.flip"
 }
 flip "$OUT/F4/R_leaf_flip" refuse R_leaf_flip "$V3" --dir "$ROOTW" --out "$(o R_leaf_flip)" --n 5 --arms append25,nosync25
-# fourth review M1: cpuinfo's hypervisor flag and DMI's names hidden from the probe by bind mounts in a private mount
-# namespace (read back inside it before the probe starts, as the premise); the probe runs as this user (setpriv)
-virt_hidden() { # tag binary outdir
-  local tag=$1 bin=$2 o=$3 d
-  d=$(dirname "$o")/$tag.fake
-  mkdir -p "$d"
-  sed -E 's/ hypervisor( |$)/\1/' /proc/cpuinfo > "$d/cpuinfo"
-  echo "Dell Inc." > "$d/sys_vendor"
-  echo "PowerEdge R650" > "$d/product_name"
-  timeout 300 sudo unshare -m --propagation private sh -c '
-    mount --bind "$1/cpuinfo" /proc/cpuinfo && mount --bind "$1/sys_vendor" /sys/class/dmi/id/sys_vendor &&
-      mount --bind "$1/product_name" /sys/class/dmi/id/product_name || exit 97
-    { echo "product_name=$(cat /sys/class/dmi/id/product_name)"; echo "sys_vendor=$(cat /sys/class/dmi/id/sys_vendor)";
-      echo "hypervisor_flags=$(grep -c -w hypervisor /proc/cpuinfo)"; } > "$2"
-    exec setpriv --reuid="$3" --regid="$4" --init-groups "$5" --dir "$6" --out "$7" --n 5 --arms append25,nosync25' \
-    sh "$d" "${o%.out}.premise" "$(id -u)" "$(id -g)" "$bin" "$ROOTW" "$o" > "${o%.out}.txt" 2>&1
-  echo $? > "${o%.out}.rc"
+# fourth review M1, fifth review M1/M2/L6: what the probe reads from /proc and /sys planted by bind mounts in a
+# private mount namespace (nsfake.sh: the premise read back inside it before the probe starts; the probe runs as this
+# user). HIDE hides cpuinfo's hypervisor flag and DMI's names.
+FAKE=$OUT/F4/fake
+mkdir -p "$FAKE"
+sed -E 's/ hypervisor( |$)/\1/' /proc/cpuinfo > "$FAKE/cpuinfo"
+echo "Dell Inc." > "$FAKE/sys_vendor"
+echo "PowerEdge R650" > "$FAKE/product_name"
+echo tcm_loopback > "$FAKE/proc_name"
+echo tcp > "$FAKE/transport"
+HIDE=("$FAKE/cpuinfo:/proc/cpuinfo" "$FAKE/sys_vendor:/sys/class/dmi/id/sys_vendor" "$FAKE/product_name:/sys/class/dmi/id/product_name")
+nsrun() { # prefix SRC:DST... -- cmd...: prefix.premise, prefix.txt, prefix.rc
+  local pre=$1
+  shift
+  timeout 300 sudo unshare -m --propagation private bash "$HERE/nsfake.sh" "$pre.premise" "$(id -u)" "$(id -g)" "$@" > "$pre.txt" 2>&1
+  echo $? > "$pre.rc"
 }
-virt_hidden R_virt_hidden "$V3" "$(o R_virt_hidden)"
+# the leaf alone (driver, model, host path) must still show the VM
+nsrun "$OUT/F4/R_virt_hidden" "${HIDE[@]}" -- "$V3" --dir "$ROOTW" --out "$(o R_virt_hidden)" --n 5 --arms append25,nosync25
+# a leaf with no VM evidence of its own (scsi_debug), cpuinfo and DMI hidden: bare metal on x86_64 (the CPUID bit is
+# the positive evidence), not ruled out on arm64 -- the only CI run of the plain and the null labels (fifth review L6)
+if [ -f "$FX/sdbg.ok" ]; then
+  nsrun "$OUT/F4/P_virt_bare" "${HIDE[@]}" -- env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o P_virt_bare)" --n 5 --arms append25,nosync25
+else
+  echo "fixture sdbg missing" > "$OUT/F4/P_virt_bare.txt"; echo missing > "$OUT/F4/P_virt_bare.rc"
+fi
+# the root disk's leaf made remote: an sd leaf's SCSI host named tcm_loopback, or an NVMe controller's transport tcp
+# (fifth review M1, M2: both outside their allowlists)
+RD=/sys/block/$ROOTDISK
+if [ -d "$RD/device/scsi_disk" ]; then
+  rhost=$(readlink -f "$RD/device" | grep -o '/host[0-9]*/' | head -1 | tr -d /)
+  echo "faked=sd_host $rhost" > "$OUT/F4/R_leaf_remote.what"
+  nsrun "$OUT/F4/R_leaf_remote" "$FAKE/proc_name:/sys/class/scsi_host/$rhost/proc_name" -- "$V3" --dir "$ROOTW" --out "$(o R_leaf_remote)" --n 5 --arms append25,nosync25
+elif rctrl=$(basename "$(readlink -f "$RD/device")") && [ -f "/sys/class/nvme/$rctrl/transport" ]; then
+  echo "faked=nvme_transport $rctrl" > "$OUT/F4/R_leaf_remote.what"
+  nsrun "$OUT/F4/R_leaf_remote" "$FAKE/transport:/sys/class/nvme/$rctrl/transport" -- "$V3" --dir "$ROOTW" --out "$(o R_leaf_remote)" --n 5 --arms append25,nosync25
+else
+  echo "the root disk $ROOTDISK is neither sd nor nvme" > "$OUT/F4/R_leaf_remote.txt"; echo missing > "$OUT/F4/R_leaf_remote.rc"
+fi
 # fourth review M4: /etc/ld.so.preload names the noop library for one run, then is restored
 ldso() { # tag binary dir
   local tag=$1 bin=$2 dir=$3
@@ -405,7 +427,7 @@ fixture() { # name mod -> a planted full-shape verdict (batchgate.py fixture), p
   python3 -B "$GATE" fixture "$OUT/F4/verdict-$1.json" "$CELL" "${4:-$ARCH}" "$FIXLEAF" "${3:-$SHA}" "${5:-$WFS}" ${2:+"$2"}
   echo "$OUT/F4/verdict-$1.json"
 }
-NB=(env -u V3FLOOR_BRD -u V3_SMOKE)
+NB=(env -u V3FLOOR_BRD -u V3_SMOKE -u V3_BIND_PENDING_SHA)
 refuse R_runsh_none env -u V3_SMOKE -u V3_FIRECHECK_VERDICT -u V3FLOOR_BRD bash "$RS" "$V3" "$W" "$(o R_runsh_none)" 5 --arms append25,nosync25
 refuse R_runsh_both env V3_SMOKE=1 V3_FIRECHECK_VERDICT="$(fixture both "")" bash "$RS" "$V3" "$W" "$(o R_runsh_both)" 5 --arms append25,nosync25
 refuse R_runsh_sha "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture sha "" 0000)" bash "$RS" "$V3" "$W" "$(o R_runsh_sha)" 5 --arms append25,nosync25
@@ -454,6 +476,8 @@ refuse R_runsh_harness "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture harness harnes
 # fourth review L3: the fire-check's own binding record failed for this verdict, or is absent
 refuse R_runsh_bindfail "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture bindfail bindfail)" bash "$RS" "$V3" "$W" "$(o R_runsh_bindfail)" 5 --arms append25,nosync25
 refuse R_runsh_nobind "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture nobind "")" bash "$RS" "$V3" "$W" "$(o R_runsh_nobind)" 5 --arms append25,nosync25
+# fifth review L1: a pending record outside the bind step (V3_BIND_PENDING_SHA unset) binds nothing
+refuse R_runsh_pending "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture pending pending)" bash "$RS" "$V3" "$W" "$(o R_runsh_pending)" 5 --arms append25,nosync25
 if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
   refuse R_runsh_ldpreload env V3_SMOKE=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" bash "$RS" "$V3" "$W" "$(o R_runsh_ldpreload)" 5 --arms append25,nosync25
 else
@@ -467,7 +491,7 @@ cp -r "$HERE" "$GH" && printf 'import sys\nsys.exit(1 if sys.argv[1:2] == ["post
 refuse R_runsh_gatecrash env V3_SMOKE=1 bash "$GH/run.sh" "$V3" "$W" "$(o R_runsh_gatecrash)" 5 --arms append25,nosync25
 # fresh review I-M5, fourth review M3/M5/L9: batchgate.py post on copies of the F3 batch, each with one field
 # planted (bound mode), and the control with nothing planted
-for p in traceclock cell leaf brd stack driver virt verdictswap verdictbad nostamp noblk blkrefused; do
+for p in traceclock cell leaf brd stack driver virt verdictswap verdictbad nostamp noblk blkrefused leafkind model; do
   refuse "R_post_$p" python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/R_post_$p" "$CELL" "$SHA" "$p"
 done
 refuse P_post_none python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/P_post_none" "$CELL" "$SHA" none
@@ -552,7 +576,7 @@ if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
   R2=$OUT/prev PB=$V3_PREV/v3floor
   mkdir -p "$R2"
   pv() { local tag=$1; shift; timeout 300 "$@" > "$R2/$tag.txt" 2>&1; echo $? > "$R2/$tag.rc"; }
-  virt_hidden prev_M1_virt "$PB" "$R2/prev_M1_virt.out"
+  nsrun "$R2/prev_M1_virt" "${HIDE[@]}" -- "$PB" --dir "$ROOTW" --out "$R2/prev_M1_virt.out" --n 5 --arms append25,nosync25
   if [ -f "$FX/sdbg.ok" ]; then
     pv prev_M2_sdbg env -u V3FLOOR_FIRECHECK "$PB" --dir "$FX/sdbg/w" --out "$R2/prev_M2_sdbg.out" --n 5 --arms append25,nosync25
   else
@@ -573,11 +597,12 @@ sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null
 ls -A "$W" > "$OUT/work-leftover.txt"
 python3 -B "$HERE/check.py" "$OUT" "$CELL"
 crc=$?
-echo "== bind: run.sh bound to this cell's own verdict"
+echo "== bind: run.sh bound to this cell's own verdict (the bind step names it: V3_BIND_PENDING_SHA)"
+VSHA=$(sha256sum "$OUT/verdict.json" 2>/dev/null | cut -d' ' -f1)
 if [ "$BRD" = 1 ]; then
-  refuse P_runsh_brd env -u V3FLOOR_BRD -u V3_SMOKE V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_brd)" 5 --arms append25,nosync25
+  refuse P_runsh_brd env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_brd)" 5 --arms append25,nosync25
 else
-  refuse P_runsh_ok env -u V3FLOOR_BRD -u V3_SMOKE V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 5 --arms append25,nosync25
+  refuse P_runsh_ok env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 5 --arms append25,nosync25
 fi
 python3 -B "$HERE/check.py" --bind "$OUT" "$CELL"
 brc=$?

@@ -10,7 +10,8 @@
   batchgate.py leafclass SUMMARY                      wb | wt | brd for a probe summary (exit 2 if it has none)
   batchgate.py fixture OUT CELL ARCH LEAF SHA FSTYPE [MOD]   a PLANTED full-shape verdict for firecheck.sh's F4 plants,
                                                       always "planted": true (MOD: allfail | fail-one | drop-one |
-                                                      cell=<c> | harness | bindfail: also a failed binding record)
+                                                      cell=<c> | harness | bindfail: also a failed binding record |
+                                                      pending: also a pending one)
   batchgate.py self-test DATA                         the gates on banked and planted inputs; exit 0 iff all as expected
 
 Binding (item 8): a verdict binds only if it has check.py's whole shape -- a "checks" list whose ids equal
@@ -18,7 +19,8 @@ check.plan(cell, arch, leaf class), every check passing, pass == total, all_pass
 arch and fstype, with "unplanted_refusals" listed, a leaf class that is not brd, no "planted" key, and the sha256 of
 every fire-check harness file equal to this run.sh's own copies (a verdict vouches only for the checker that wrote
 it), and the fire-check's own binding record next to it (<verdict>.bind.json, check.py --bind) passed for this very
-verdict, or is still pending for it (<verdict>.bind.pending, written with the verdict; fourth review L3). Each
+verdict; a pending record (<verdict>.bind.pending, written with the verdict) binds only firecheck.sh's own bind step,
+which names the verdict's sha256 in V3_BIND_PENDING_SHA (fourth review L3, fifth review L1). Each
 refusal reason starts with its rule's own name. Its sha256 and run id go into binary.txt. Threat model, stated: this
 stops a wrong, failed, truncated, foreign, stale or planted verdict; it does not stop a forged one.
 
@@ -37,7 +39,7 @@ flush request (REQ_OP_FLUSH) reached the leaf in >= 95% of the clean arm's windo
 item 2; fourth review L9); else no bare-flush baseline, saying so when the clean arm did not run (L1). On a leaf that
 is virtual, or not shown bare metal, the claim carries that qualifier on both leaf classes (L2).
 """
-import copy as _copy, glob, hashlib, json, os, sys
+import copy as _copy, glob, hashlib, json, os, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -90,12 +92,14 @@ def bind_path(verdict_path):
     return b + ".bind.json", b + ".bind.pending"
 
 
-def bind_problems(verdict_path, vsha):
+def bind_problems(verdict_path, vsha, pending_sha=None):
     """Fourth review L3: a verdict binds only if the fire-check's own binding check (run.sh bound to this verdict,
-    check.py --bind) passed for THIS verdict, or is pending for it (the window in which that check runs: check.py
-    writes the pending record with the verdict, check.py --bind replaces it with the result). A failed, foreign or
-    missing record refuses. Blind spot, stated: a fire-check killed inside that window leaves its pending record, and
-    the verdict then binds without its binding check."""
+    check.py --bind) passed for THIS verdict. Between check.py writing the verdict (and a pending record for it) and
+    check.py --bind replacing that record with the result, only firecheck.sh's own bind step may bind it: it names the
+    verdict's sha256 in V3_BIND_PENDING_SHA (fifth review L1: a fire-check that dies in that window leaves a pending
+    record that binds nothing). A failed, foreign or missing record refuses."""
+    if pending_sha is None:
+        pending_sha = os.environ.get("V3_BIND_PENDING_SHA", "")
     bj, bp = bind_path(verdict_path)
     if os.path.exists(bj):
         try:
@@ -114,9 +118,12 @@ def bind_problems(verdict_path, vsha):
             pend = load(bp)
         except (OSError, ValueError) as e:
             return ["bind: the pending record %s is unreadable: %r" % (bp, e)]
-        if isinstance(pend, dict) and pend.get("verdict_sha256") == vsha:
-            return []
-        return ["bind: the pending record %s is for another verdict" % bp]
+        if not isinstance(pend, dict) or pend.get("verdict_sha256") != vsha:
+            return ["bind: the pending record %s is for another verdict" % bp]
+        if pending_sha != vsha:
+            return ["bind: pending: the fire-check's own binding check has not finished for this verdict (%s); only "
+                    "firecheck.sh's bind step (V3_BIND_PENDING_SHA naming it) may bind it before it has" % bp]
+        return []
     return ["bind: no binding record next to the verdict (%s): the fire-check's own binding check never ran for it" % bj]
 
 
@@ -147,7 +154,7 @@ def verdict_problems(v, cell, sha, arch, fstype):
         bad.append("unplanted_refusals: absent")
     mine = harness()
     theirs = v.get("harness_sha256") if isinstance(v.get("harness_sha256"), dict) else {}
-    diff = sorted(f for f in mine if theirs.get(f) != mine[f] or mine[f] is None)
+    diff = sorted(f for f in set(mine) | set(theirs) if theirs.get(f) != mine.get(f) or mine.get(f) is None)
     if diff:  # a verdict vouches only for the checker that wrote it (fresh review I-M2)
         bad.append("harness: the verdict was made by a different fire-check harness than this run.sh's (%s differ)" %
                    ", ".join(diff[:6]))
@@ -442,10 +449,15 @@ def fixture(out, cell, arch, leaf, sha, fstype, mod):
         v["cell"] = mod[5:]
     elif mod == "harness":
         v["harness_sha256"] = dict(v["harness_sha256"], **{"check.py": "0" * 64})
-    elif mod and mod != "bindfail":
+    elif mod and mod not in ("bindfail", "pending"):
         raise SystemExit("batchgate fixture: unknown MOD %r" % mod)
     with open(out, "w") as f:
         json.dump(v, f, indent=1)
+    if mod == "pending":  # a pending record for THIS fixture, outside the bind step (fifth review L1)
+        with open(out, "rb") as f:
+            vs = hashlib.sha256(f.read()).hexdigest()
+        with open(bind_path(out)[1], "w") as f:
+            json.dump({"verdict_sha256": vs, "planted": True}, f)
     if mod == "bindfail":  # a binding record for THIS fixture whose own binding check failed (fourth review L3)
         with open(out, "rb") as f:
             vs = hashlib.sha256(f.read()).hexdigest()
@@ -469,6 +481,69 @@ BANKED = [
     ("37254957355-v3-ubuntu-24.04-ext4", "wt", None, 0),
     ("37254957355-v3-ubuntu-24.04-ext4loop", "wt", None, 0),
 ]
+
+
+def _post_batch(d, sha, mod):
+    """a minimal run.sh OUT for post(): a write-back NVMe ext4 batch, every op's window holding a bare flush."""
+    os.makedirs(os.path.join(d, "blkflush"))
+    sj = {"mutant_nosync": 0, "trace_clock": 0, "exe_sha256": sha, "fstype": "ext4", "mount_source": "/dev/nvme0n1",
+          "flush_path": [{"fstype": "ext4", "source": "/dev/nvme0n1", "loop_backing": "", "disk": "nvme0n1",
+                          "sys": "/sys/block/nvme0n1", "mount": "/d", "write_cache": "write back"}],
+          "leaf": {"kind": "drive", "driver": "nvme", "model": "M1", "multipath": []}, "leaf_write_cache": "write back",
+          "virtualization": {"virtualized": False, "evidence": []}, "n": 5,
+          "arms": {"append25": {}, "nosync25": {}}, "flush_control_arms": {"append25": {"gated": True}}}
+    win = {"events": 5, "zero_windows": 0, "flush_carrying_zero_windows": 0, "bare_flush_zero_windows": 0, "per_op": 1.0}
+    rep = {"proves": "planted", "devices": {}, "windows": {"arms": {"append25": {"ops": 5, "devices": {"nvme0n1": win}},
+                                                                    "nosync25": {"ops": 5, "devices": {}}}}}
+    if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
+        rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
+    if mod == "leafkind":
+        sj["leaf"]["kind"] = "scsi_debug"
+    with open(os.path.join(d, "summary.json"), "w") as f:
+        json.dump(sj, f)
+    with open(os.path.join(d, "stamp_end.json"), "w") as f:
+        json.dump({"diskstats_delta": {"nvme0n1": {"flushes": 50}}}, f)
+    with open(os.path.join(d, "blkflush", "report.json"), "w") as f:
+        json.dump(rep, f)
+    v = {"leaf_class": "wb", "F3": {"flush_path": [["/d", "ext4", "/dev/nvme0n1", "nvme0n1", "write back"]],
+                                    "leaf": dict(sj["leaf"], kind="drive"), "virtualization": {"virtualized": False}}}
+    if mod == "model":
+        v["F3"]["leaf"]["model"] = "M2"
+    raw = json.dumps(v).encode()
+    vp = d + ".verdict.json"
+    with open(vp, "wb") as f:
+        f.write(raw)
+    with open(os.path.join(d, "binary.txt"), "w") as f:
+        f.write("verdict_sha256=%s\n" % hashlib.sha256(raw).hexdigest())
+    return vp
+
+
+def post_selftest(chk):
+    import contextlib, io, tempfile
+    td = tempfile.mkdtemp(prefix="batchgate-post-")
+    sha = "cd" * 32
+    for name, mod, mode, want_rc, want in (("the control, bound", "", "bound", 0, None),
+                                           ("the control, smoke", "", "smoke", 0, None),
+                                           ("a FUA-only window in a gated arm", "fuaonly", "smoke", 3, "VOID"),
+                                           ("a scsi_debug leaf record", "leafkind", "smoke", 2, "leaf: the summary's leaf record"),
+                                           ("another drive model than the verdict's", "model", "bound", 2, "leaf drive:")):
+        d = os.path.join(td, mod or ("control-" + mode))
+        vp = _post_batch(d, sha, mod)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = post(d, "ext4", sha, mode, vp if mode == "bound" else None)
+        g = load(os.path.join(d, "gate.json"))
+        refs = g.get("refusals")
+        if want is None:
+            ok = rc == want_rc and refs == [] and g["flush_gate"]["blkflush_leaf_gate"]["outcome"] == "pass"
+        elif want == "VOID":
+            bk = g["flush_gate"]["blkflush_leaf_gate"]
+            ok = rc == 3 and refs == [] and bk["outcome"] == "FAIL" and \
+                bk["arms"]["append25"]["windows_without_a_flush_carrying_request"] == 1
+        else:
+            ok = rc == want_rc and bool(refs) and all(str(r).startswith(want) for r in refs)
+        chk("fifth review M3: post() on a planted batch, %s -> rc %d%s" % (name, want_rc, "" if want is None else
+                                                                              " (%s)" % want), ok, (rc, g))
+    shutil.rmtree(td)
 
 
 def self_test(data):
@@ -610,8 +685,12 @@ def self_test(data):
         [x for x in bind_problems(vp, vs) if x.startswith("bind: no binding record")], bind_problems(vp, vs))
     with open(bp, "w") as f:
         json.dump({"verdict_sha256": vs}, f)
-    chk("L3 bind: pending for this verdict -> binds", bind_problems(vp, vs) == [], bind_problems(vp, vs))
-    chk("L3 bind: pending for another verdict -> refused", bind_problems(vp, "00" * 32) != [])
+    chk("L3 bind: pending for this verdict, from the bind step (its sha named) -> binds",
+        bind_problems(vp, vs, pending_sha=vs) == [], bind_problems(vp, vs, pending_sha=vs))
+    b = bind_problems(vp, vs, pending_sha="")
+    chk("fifth review L1: pending for this verdict outside the bind step -> refused ('bind: pending')",
+        bool(b) and all(x.startswith("bind: pending") for x in b), b)
+    chk("L3 bind: pending for another verdict -> refused", bind_problems(vp, "00" * 32, pending_sha="00" * 32) != [])
     ok_rec = {"verdict_sha256": vs, "all_pass": True, "checks": [{"id": "bind:P_runsh_ok", "pass": True}]}
     for name, rec, prefix in (("passed for this verdict", ok_rec, None),
                               ("failed", dict(ok_rec, all_pass=False, checks=[{"id": "bind:P_runsh_ok", "pass": False}]),
@@ -622,11 +701,23 @@ def self_test(data):
                               ("for another verdict", dict(ok_rec, verdict_sha256="00" * 32), "bind: the binding record")):
         with open(bj, "w") as f:
             json.dump(rec, f)
-        b = bind_problems(vp, vs)  # the pending record is still there: a result, once written, decides
+        b = bind_problems(vp, vs, pending_sha=vs)  # the pending record is still there: a result, once written, decides
         chk("L3 bind: a record that %s -> %s" % (name, "binds" if prefix is None else "refused by '%s'" % prefix),
             b == [] if prefix is None else bool(b) and all(x.startswith(prefix) for x in b), b)
-    import shutil
     shutil.rmtree(td)
+    # fifth review L2: a harness file the verdict names that this tree lacks (or the reverse) is a mismatch
+    v = _copy.deepcopy(good)
+    v["harness_sha256"]["gone.py"] = "0" * 64
+    b = verdict_problems(v, cell, sha, arch, "xfs")
+    chk("fifth review L2: a harness file only in the verdict -> refused by the harness rule",
+        bool(b) and all(x.startswith("harness:") for x in b) and "gone.py" in b[0], b)
+    v = _copy.deepcopy(good)
+    v["harness_sha256"].pop("run.sh")
+    b = verdict_problems(v, cell, sha, arch, "xfs")
+    chk("fifth review L2: a harness file only here -> refused by the harness rule",
+        bool(b) and all(x.startswith("harness:") for x in b), b)
+    # fifth review M3: post() itself on planted batches (a write-back NVMe ext4 batch of append25 + nosync25)
+    post_selftest(chk)
     # item 17: the T3 rule on planted states
     chk("item 17: no cpufreq refuses", t3_problems({"governors": {"cpu0": None}, "clocksource": "tsc"}) != [])
     chk("item 17: powersave refuses", t3_problems({"governors": {"cpu0": "performance", "cpu1": "powersave"}, "clocksource": "tsc"}) != [])

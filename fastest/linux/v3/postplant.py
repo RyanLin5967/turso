@@ -18,6 +18,8 @@ revision's gate on the same plant.
   nostamp      stamp_end.json removed                                  -> "no stamp_end.json"
   noblk        blkflush/report.json removed                            -> "no blkflush report"
   blkrefused   blkflush/report.json says refused                       -> "blkflush refused:"
+  leafkind     the summary's leaf kind is scsi_debug                   -> "leaf: the summary's leaf record"
+  model        the verdict's drive model differs from the batch's      -> "leaf drive:"
   none         nothing planted: the control (no refusal at all)        -> refusals == []
 """
 import copy, hashlib, json, os, shutil, subprocess, sys
@@ -26,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OTHER_CELL = {"ext4": "ext4loop", "ext4loop": "ext4", "xfs": "xfsloop", "xfsloop": "xfs", "btrfs": "btrfsloop",
               "btrfsloop": "btrfs"}
 PLANTS = ("traceclock", "cell", "leaf", "brd", "stack", "driver", "virt", "verdictswap", "verdictbad", "nostamp",
-          "noblk", "blkrefused", "none")
+          "noblk", "blkrefused", "leafkind", "model", "none")
 OTHER_FS = {"ext4": "xfs", "xfs": "btrfs", "btrfs": "ext4"}
 
 
@@ -68,6 +70,12 @@ def main(a):
     elif plant == "driver":
         vl = v["F3"]["leaf"] or {}
         vl["driver"] = "nvme" if vl.get("driver") == "virtio_blk" else "virtio_blk"
+        v["F3"]["leaf"] = vl
+    elif plant == "leafkind":
+        sj.setdefault("leaf", {})["kind"] = "scsi_debug"
+    elif plant == "model":
+        vl = v["F3"]["leaf"] or {}
+        vl["model"] = "%s (another model)" % vl.get("model")
         v["F3"]["leaf"] = vl
     elif plant == "virt":
         vz = v["F3"]["virtualization"] or {}

@@ -97,10 +97,11 @@
  *     a layer whose device, queue/write_cache or options cannot be read refuses too;
  *   - the leaf's driver is not nvme, sd or virtio_blk: brd, zram, nbd, dm, md and anything unknown refuse. brd is
  *     accepted only with V3FLOOR_BRD=1 (set by firecheck.sh's brd cells, refused by run.sh in a bound batch), and its
- *     summary says "fire-check only, never credited"; an sd leaf on a scsi_debug host (a RAM disk posing as a SCSI
- *     drive) or a tcm_loop host (a LIO loopback target) refuses, scsi_debug accepted only under V3FLOOR_FIRECHECK=1
- *     (the WCE=1 fire-check fixture; never through run.sh); an NVMe controller whose transport is not pcie, tcp, rdma
- *     or fc (nvme-loop: a fabrics loopback target) refuses;
+ *     summary says "fire-check only, never credited"; an sd leaf's SCSI host must be in an allowlist of local HBAs
+ *     and paravirtual VM hosts (SD_HOSTS: a LIO loopback, iSCSI, FC, SRP, USB bridges and unknown hosts refuse), and
+ *     a scsi_debug host (a RAM disk posing as a SCSI drive) is accepted only under V3FLOOR_FIRECHECK=1 (the WCE=1
+ *     fire-check fixture; never through run.sh); an NVMe controller's transport must be pcie (nvme-loop and the
+ *     fabrics tcp, rdma, fc refuse);
  *   - the kernel's write_cache disagrees with the drive's own report, or that report cannot be read;
  *   - nice != 0, a scheduling policy other than SCHED_OTHER, or an I/O priority other than the default;
  *   - D's path is too long, the out dir exists, n is not a positive integer, an unknown or repeated arm;
@@ -118,8 +119,8 @@
  *
  * Blind spots, stated: foreign I/O on the device and cgroup I/O throttling are not observed here (run.sh's stamps
  *   record /proc/diskstats and PSI around the batch); device-mapper, md and network block layers below D are not
- *   followed (only loop devices are; such a leaf refuses on its driver), but network disks that present as SCSI
- *   (iSCSI, FC, SRP) use sd and are accepted. NVMe VWC says a cache is present, not enabled (Get Features 06h needs
+ *   followed (only loop devices are; such a leaf refuses on its driver, a network SCSI or NVMe leaf on its host or
+ *   transport allowlist). NVMe VWC says a cache is present, not enabled (Get Features 06h needs
  *   CAP_SYS_ADMIN). The VM test can miss a hypervisor that hides itself. On Linux an fsync is per inode plus the
  *   filesystem's journal, not a device-wide cache flush as F_FULLFSYNC is on Apple.
  * Also refused: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH set (outside the fire-check), and inode flags on D or an arm
@@ -841,12 +842,13 @@ static void nvme_ctrls(const char *disk, leafinfo *li) {
 static const char *nvme_vwc(const char *ctrl, int *vwc, char *model, size_t mcap, char *transport, size_t tcap) {
     char node[64], p[PATH_MAX], dv[32];
     snprintf(node, sizeof node, "/dev/%s", ctrl);
-    /* the transport, an allowlist: nvme-loop is a fabrics loopback target (a file or RAM behind it), not a drive */
+    /* the transport, an allowlist of one: a local PCIe drive. nvme-loop is a loopback target over a file or RAM, and a
+     * fabrics target (tcp, rdma, fc) is another machine's storage whose flush may end anywhere (fifth review M2) */
     pathf(p, sizeof p, "/sys/class/nvme/%s/transport", ctrl);
     if (read_line(p, transport, tcap) != 0) return whyf("cannot read %s", p);
-    if (strcmp(transport, "pcie") && strcmp(transport, "tcp") && strcmp(transport, "rdma") && strcmp(transport, "fc"))
-        return whyf("NVMe controller %s has transport '%s', not pcie, tcp, rdma or fc (nvme-loop is a loopback target "
-                    "over a file or RAM, not a drive)", ctrl, transport);
+    if (strcmp(transport, "pcie"))
+        return whyf("NVMe controller %s has transport '%s', not pcie: a fabrics or loopback target (nvme-loop, tcp, rdma, "
+                    "fc) is not a local drive", ctrl, transport);
     pathf(p, sizeof p, "/sys/class/nvme/%s/dev", ctrl);
     unsigned maj = 0, mnr = 0;
     struct stat sb;
@@ -980,6 +982,11 @@ static const char *VM_DMI[] = {"Virtual", "VMware", "QEMU", "KVM", "Xen", "Bochs
 static const char *VM_MODEL[] = {"Virtual", "VMware", "QEMU", "VBOX", "MSFT", "Msft", "Google", "PersistentDisk", "Amazon",
                                  "Xen", "Hyper-V", "BHYVE", "virtio", NULL};
 static const char *VM_SCSI_HOST[] = {"storvsc", "virtio_scsi", "vmw_pvscsi", "xen-scsifront", "ibmvscsi", NULL};
+/* the SCSI hosts an sd leaf may sit on (exact proc_name): local SATA/SAS/RAID HBAs, then paravirtual VM hosts
+ * (storvsc_host is Hyper-V's, read on the hosted runners; the others as their drivers name themselves, unverified
+ * here: a wrong name only refuses) */
+static const char *SD_HOSTS[] = {"ahci", "ata_piix", "mpt3sas", "mpt2sas", "megaraid_sas", "smartpqi", "hpsa", "aacraid",
+                                 "mvsas", "isci", "pm80xx", "storvsc_host", "virtio_scsi", "vmw_pvscsi", "ibmvscsi", NULL};
 static const char *VM_DEVPATH[] = {"VMBUS", "vmbus", "MSFT1000", "/virtio", "/xen", NULL};
 
 static const char *name_hit(const char *s, const char **list) {
@@ -1087,17 +1094,20 @@ static const char *leaf_checks(const layer *l) {
         if (realpath(p, dp)) copy(li->devpath, sizeof li->devpath, dp);
     }
     if (!strcmp(li->driver, "sd")) {
-        /* the host under sd: a RAM disk posing as a SCSI drive (scsi_debug) or a LIO loopback (tcm_loop) is no drive */
+        /* the host under sd, an allowlist (fifth review M1, M2): local HBAs and the paravirtual hosts of the VMs the
+         * fire-check runs on. A RAM disk posing as a SCSI drive (scsi_debug) is fire-check only; a LIO loopback
+         * (tcm_loop), iSCSI, FC, SRP, a USB bridge and any host not named here refuse */
         scsi_host_of(l->disk, li->sd_host, sizeof li->sd_host, li->devpath, sizeof li->devpath);
-        if (!strcmp(li->sd_host, "tcm_loop") || !strcmp(li->sd_host, "tcm_loop_host"))
-            return whyf("the leaf %s is on SCSI host '%s' (a LIO loopback target over a file or RAM), not a drive",
-                        l->diskname, li->sd_host);
         if (!strcmp(li->sd_host, "scsi_debug") || strstr(li->devpath, "/pseudo_")) {
             if (!firecheck_env())
                 return whyf("the leaf %s is a scsi_debug disk (RAM posing as a SCSI drive, host '%s', %s): scsi_debug is "
                             "fire-check only (V3FLOOR_FIRECHECK=1), never a measured device", l->diskname, li->sd_host,
                             li->devpath);
             snprintf(li->kind, sizeof li->kind, "scsi_debug");
+        } else if (!opt_in(li->sd_host, SD_HOSTS)) {
+            return whyf("the leaf %s is on SCSI host '%s' (%s), not in the allowlist of local HBAs and paravirtual VM "
+                        "hosts: a LIO loopback, iSCSI, FC, SRP, a USB bridge or an unknown host may never put a flush "
+                        "on media", l->diskname, li->sd_host[0] ? li->sd_host : "unreadable", li->devpath);
         }
         pathf(p, sizeof p, "%s/device/scsi_disk", l->disk);
         DIR *sd = opendir(p);
@@ -1202,7 +1212,7 @@ static int mapped_files(int *other) {
     FILE *m = fopen("/proc/self/maps", "r");
     if (!m) return -1;
     char line[PATH_MAX + 256], seen[64][512];
-    int nseen = 0;
+    int nseen = 0, exe_seen = 0;
     while (fgets(line, sizeof line, m)) {
         unsigned maj = 0, mnr = 0;
         unsigned long long ino = 0;
@@ -1214,12 +1224,19 @@ static int mapped_files(int *other) {
         for (int k = 0; k < nseen; k++) dup |= !strcmp(seen[k], path);
         if (dup) continue;
         if (nseen < 64) copy(seen[nseen++], sizeof seen[0], path);
-        if (!(maj == major(ex.st_dev) && mnr == minor(ex.st_dev) && ino == (unsigned long long)ex.st_ino)) (*other)++;
+        /* the executable, by stat() of the mapped path against stat() of /proc/self/exe (both through stat, so a
+         * btrfs subvolume's or overlayfs's device numbering is the same on both sides; fifth review L4); the inode
+         * the maps line names must be that path's too, so a path replaced since the mapping is not the executable */
+        struct stat ps;
+        int is_exe = stat(path, &ps) == 0 && ps.st_dev == ex.st_dev && ps.st_ino == ex.st_ino &&
+                     (unsigned long long)ps.st_ino == ino;
+        exe_seen |= is_exe;
+        if (!is_exe) (*other)++;
         size_t h = strlen(MAPPED);
         snprintf(MAPPED + h, sizeof MAPPED - h, "%s%s", h ? "|" : "", path);
     }
     fclose(m);
-    return 0;
+    return exe_seen ? 0 : -1; /* no mapping of the executable read: cannot determine what is mapped */
 }
 
 /* after the loop, before teardown: does a copy arm's c0 share its extents with the source (a reflink) or not (a
@@ -1621,13 +1638,19 @@ int main(int argc, char **argv) {
             : wb ? (vm == 0 ? "yes: the leaf reports a volatile write cache and the drive agrees, so a flush the filesystem "
                               "issues reaches it; how many each arm's op issues is the device flush record "
                               "(device_flushes_per_op)"
-                            : "yes, to the virtual device: the leaf reports a volatile write cache and its device report "
-                              "agrees, so a flush the filesystem issues reaches the (virtual) device; whether the host "
-                              "forwards it to media is unknown; how many each arm's op issues is the device flush record "
-                              "(device_flushes_per_op)")
+                    : vm > 0 ? "yes, to the virtual device: the leaf reports a volatile write cache and its device report "
+                               "agrees, so a flush the filesystem issues reaches the (virtual) device; whether the host "
+                               "forwards it to media is unknown; how many each arm's op issues is the device flush "
+                               "record (device_flushes_per_op)"
+                             : "yes, to the device (virtualization not ruled out): the leaf reports a volatile write cache "
+                               "and its device report agrees, so a flush the filesystem issues reaches the device; that "
+                               "it is a drive and not a host's emulation is not shown; how many each arm's op issues is "
+                               "the device flush record (device_flushes_per_op)")
             : vm == 0 ? "no: the leaf reports write-through and the drive agrees, so the block layer sends it no flush"
-                      : "no: the (virtual) leaf reports write-through and its device report agrees, so the block layer "
-                        "sends it no flush; the host's own caching is unknown");
+            : vm > 0 ? "no: the (virtual) leaf reports write-through and its device report agrees, so the block layer "
+                       "sends it no flush; the host's own caching is unknown"
+                     : "no: the leaf reports write-through and its device report agrees, so the block layer sends it no "
+                       "flush (virtualization not ruled out: a host's own caching would be unknown)");
     fprintf(f, ",\"floor_kind\":\"%s\"", brd ? "brd: no drive (fire-check only, never credited)"
             : wb ? (vm > 0 ? "virtual drive flush: reach to media unknown"
                     : vm == 0 ? "drive flush" : "drive flush, virtualization not ruled out: reach to media unknown")
@@ -1636,7 +1659,7 @@ int main(int argc, char **argv) {
                               : "no volatile cache (virtualization not ruled out): no drive flush, host caching unknown"));
     /* the review's sentence is for ext4/XFS; btrfs's clean fsync issues no flush at all (run 37476867864), so it gets
      * no bare-flush baseline; batchgate.py writes floor_claim_from_counts from the batch's own device flush counts */
-    fprintf(f, ",\"floor_claim\":\"%s\"",
+    fprintf(f, ",\"floor_claim\":\"%s%s\"",
             brd ? "none: a brd floor backs no sentence"
             : !wb ? "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor "
                     "'above a same-batch drive flush' may be written"
@@ -1644,7 +1667,9 @@ int main(int argc, char **argv) {
                                              "the device flush record shows the clean arm issuing a flush per op "
                                              "(floor_claim_from_counts); never 'one drive flush' without that count"
                                            : "per stack: the measured per-arm device flush counts only; on btrfs a clean "
-                                             "fsync can issue no flush, so no bare-flush baseline is claimed");
+                                             "fsync can issue no flush, so no bare-flush baseline is claimed",
+            brd || vm == 0 ? "" : vm > 0 ? "; on a virtual drive: reach to media unknown"
+                                         : "; virtualization not ruled out: reach to media unknown");
     fprintf(f, ",\"uname\":");
     char un[600];
     snprintf(un, sizeof un, "%s %s %s", u.sysname, u.release, u.machine);

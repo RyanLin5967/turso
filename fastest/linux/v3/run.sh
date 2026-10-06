@@ -14,9 +14,11 @@
 #   V3_FIRECHECK_VERDICT=<verdict.json>  check.py's whole verdict shape (batchgate.py verdict): every planned check
 #                                        passing, for THIS binary (sha256), arch, DIR's fstype and V3_CELL, no
 #                                        "planted" key, a leaf that is not brd, and the fire-check's own binding
-#                                        record next to it (<verdict>.bind.json) passed for this verdict, or pending
-#                                        for it; V3FLOOR_BRD in the env refuses. binary.txt records the verdict's
-#                                        sha256 and run id, and the gate re-hashes the verdict after the run
+#                                        record next to it (<verdict>.bind.json) passed for this verdict (a pending
+#                                        record binds only firecheck.sh's own bind step, which names the verdict's
+#                                        sha256 in V3_BIND_PENDING_SHA); V3FLOOR_BRD in the env refuses. binary.txt
+#                                        records the verdict's sha256 and run id; the gate re-hashes the verdict after
+#                                        the run
 #   V3_SMOKE=1                           an explicitly unbound smoke batch, recorded as such, never credited
 # Neither, or both: refused (rc 2) before anything runs.
 # V3_REQUIRE_T3=1: also refuse before anything runs unless the registered T3 preconditions hold (every CPU on the

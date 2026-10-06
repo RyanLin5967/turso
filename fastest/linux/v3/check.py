@@ -2,7 +2,10 @@
 """check.py OUT CELL -- the verdicts of a V3 fire-check, read ONLY from the raw files firecheck.sh wrote under OUT.
 CELL is explicit (v3cell.py: ext4|xfs|btrfs on a block device, ext4loop|xfsloop|btrfsloop on a loop), never inferred.
 
-  check.py OUT CELL            write OUT/verdict.json (and OUT/red.json, the base column) and print PASS/FAIL lines
+  check.py OUT CELL            write OUT/verdict.json and OUT/verdict.bind.pending (and OUT/red.json, the base
+                               column; OUT/prev.json, the previous tip's column) and print PASS/FAIL lines
+  check.py --self-test         the checker's own leaf, virtualization, linkage, qualifier, harness and MODE SENSE
+                               byte rules on planted records; exit 0 iff all fire as written
   check.py --bind OUT CELL     after run.sh was bound to OUT/verdict.json (firecheck.sh's last step): write
                                OUT/verdict.bind.json (the binding record run.sh requires) and remove the pending one
   check.py --plan CELL ARCH LEAF   print the check ids a verdict for that cell, arch and leaf class must hold
@@ -122,6 +125,8 @@ RUNSH = {
     "R_runsh_t3": "T3 preconditions do not hold",
     # fourth review L3: the fire-check's own binding record
     "R_runsh_bindfail": "bind: the fire-check's own binding check failed", "R_runsh_nobind": "bind: no binding record",
+    # fifth review L1: a pending record binds only for firecheck.sh's own bind step
+    "R_runsh_pending": "bind: pending",
 }
 # the probe ran; run.sh refused after it (rc 2): tag -> reasons that must all appear
 RUNSH_POST = {"R_runsh_post": ["exe_sha256: the probe that ran", "mutant_nosync=1"],
@@ -133,11 +138,15 @@ POST_PLANTS = {"R_post_traceclock": "trace_clock=1 in the summary", "R_post_cell
                "R_post_driver": "leaf drive:", "R_post_virt": "virtualization:",
                "R_post_verdictswap": "verdict: changed during the run",
                "R_post_verdictbad": "verdict: unreadable after the run", "R_post_nostamp": "no stamp_end.json",
-               "R_post_noblk": "no blkflush report", "R_post_blkrefused": "blkflush refused:", "P_post_none": None}
+               "R_post_noblk": "no blkflush report", "R_post_blkrefused": "blkflush refused:",
+               # fifth review M3: the leaf-kind rule, the model half of the drive rule
+               "R_post_leafkind": "leaf: the summary's leaf record", "R_post_model": "leaf drive:",
+               "P_post_none": None}
 # the fire-check harness a verdict vouches for (fourth review L9: the fixtures' and plants' sources, the banked test
 # data, the loop maker and the workflow too); a missing file is a mismatch
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
-           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "statfs_shim.c", "noop_shim.c", "../fs/mkloop.sh",
+           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "statfs_shim.c", "noop_shim.c",
+           "../fs/mkloop.sh",
            "../../../.github/workflows/fastest-v3.yml"]
 
 
@@ -209,7 +218,7 @@ def plan(cell, arch, leaf):
     ids.append("frame:append")
     if v3cell.is_loop(cell):
         ids += ["C:%s" % c for c, _ in CRASH[k]]
-    ids += ["B:selftest", "B:fsync", "B:quiet", "B:overflow", "B:misuse", "S:batchgate"]
+    ids += ["B:selftest", "B:fsync", "B:quiet", "B:overflow", "B:misuse", "S:batchgate", "S:check"]
     for t in REFUSALS:
         ids.append("F4:" + t)
     ids.append("F4:P_nest3")
@@ -225,7 +234,8 @@ def plan(cell, arch, leaf):
         ids.append("F4:" + t)
     for t in POST_PLANTS:
         ids.append("F4:" + t)
-    ids += ["F4:P_sdbg_wb", "F4:R_sdbg_flip", "F4:R_virt_hidden", "F4:R_ldso_preload", "F4:P_ldso_static"]
+    ids += ["F4:P_sdbg_wb", "F4:R_sdbg_flip", "F4:R_virt_hidden", "F4:P_virt_bare", "F4:R_leaf_remote",
+            "F4:R_ldso_preload", "F4:P_ldso_static"]
     ids += ["work:empty", "harness:stable"]
     return ids
 
@@ -720,6 +730,78 @@ def wce_from_hex(src):
     return (page[2] >> 2) & 1, bad
 
 
+# the SCSI hosts an sd leaf may sit on, written by hand from the probe's header (fifth review M1, M2)
+SD_HOSTS = ["ahci", "ata_piix", "mpt3sas", "mpt2sas", "megaraid_sas", "smartpqi", "hpsa", "aacraid", "mvsas", "isci",
+            "pm80xx", "storvsc_host", "virtio_scsi", "vmw_pvscsi", "ibmvscsi"]
+QUAL = {True: "a virtual drive", None: "virtualization not ruled out"}
+
+
+def leaf_problems(lf, brd_cell):
+    """A drive leaf record's problems (cell:leaf), from the record alone."""
+    bad = []
+    if lf.get("driver") not in LEAF_DRIVERS:
+        bad.append(("driver", lf.get("driver")))
+    if lf.get("kind") != "drive" or lf.get("creditable") is not True:
+        bad.append(("kind/creditable", lf.get("kind"), lf.get("creditable")))
+    if lf.get("drive_reports") != lf.get("write_cache"):
+        bad.append(("drive report vs kernel", lf.get("drive_reports"), lf.get("write_cache")))
+    if lf.get("driver") == "sd":  # the WCE bit re-read from the recorded reply bytes (fourth review M2)
+        w, hp = wce_from_hex(lf.get("drive_report_source"))
+        if hp or w is None or ("write back" if w else "write through") != lf.get("drive_reports"):
+            bad.append(("MODE SENSE bytes vs the drive report", w, hp, lf.get("drive_reports")))
+        if lf.get("sd_host") not in SD_HOSTS:
+            bad.append(("sd host outside the allowlist", lf.get("sd_host")))
+    if lf.get("driver") == "nvme" and (not lf.get("nvme_transport") or any(t != "pcie" for t in lf.get("nvme_transport"))):
+        bad.append(("nvme transport", lf.get("nvme_transport")))
+    if brd_cell:
+        bad.append("a brd cell whose leaf is not brd")
+    return bad
+
+
+def virt_problems(vz, dvirt, arch):
+    """virtualization against systemd-detect-virt (an instrument outside the probe; fourth review M1)."""
+    vm = vz.get("virtualized", "absent")
+    bad = []
+    if vm not in (True, False, None):
+        bad.append("virtualized is %r, not true, false or null" % (vm,))
+    if (vm is True) != bool(vz.get("evidence")):
+        bad.append("virtualized %r with %d evidence items" % (vm, len(vz.get("evidence") or [])))
+    if not dvirt:
+        bad.append("systemd-detect-virt gave nothing (the independent instrument is missing)")
+    elif dvirt != "none" and vm is not True:
+        bad.append("systemd-detect-virt says %r, the probe says virtualized %r" % (dvirt, vm))
+    if vm is False and (arch != "x86_64" or dvirt != "none"):
+        bad.append("bare metal claimed on %s with systemd-detect-virt %r" % (arch, dvirt))
+    return bad
+
+
+def linkage_problems(sj):
+    """the binary that ran is the static build: only its own file mapped (fourth review M4)."""
+    mf = sj.get("mapped_files")
+    if sj.get("linkage") != "static" or not isinstance(mf, list) or len(mf) != 1:
+        return [("linkage/mapped_files", sj.get("linkage"), mf)]
+    return []
+
+
+def qualifier_problems(text, vm, leaf, what):
+    """a label on a wb or wt leaf carries the VM qualifier unless bare metal is shown, and only then (L2, L3)."""
+    if leaf not in ("wb", "wt"):
+        return []
+    q = QUAL.get(vm) if vm is not False else None
+    if q and q not in text:
+        return [("%s lacks the qualifier" % what, text, q)]
+    if vm is False and "virtual" in text:
+        return [("%s qualified on bare metal" % what, text)]
+    return []
+
+
+def harness_moved(start, now):
+    """files whose hash differs, or that are missing on either side (both key sets: fifth review L2)."""
+    if not isinstance(start, dict):
+        return ["no start-time harness record"]
+    return sorted(f for f in set(start) | set(now) if start.get(f) != now.get(f) or now.get(f) is None)
+
+
 VIRT_KIND = {  # leaf class -> virtualized (True, False, None) -> floor_kind, written by hand from the probe's header
     "wb": {False: "drive flush", True: "virtual drive flush: reach to media unknown",
            None: "drive flush, virtualization not ruled out: reach to media unknown"},
@@ -739,8 +821,74 @@ def find_leaf_class():
 
 
 # ---- main -------------------------------------------------------------------------------------------------------
+def self_test():
+    """The checker's own rules on planted records, expectations by hand (fifth review M3)."""
+    res = []
+
+    def chk(name, ok, detail=""):
+        res.append(bool(ok))
+        print(("PASS " if ok else "FAIL ") + name + ("" if ok else ": " + str(detail)[:300]), flush=True)
+
+    hexs = ("SCSI MODE SENSE(10) caching page WCE=0 via SG_IO on /dev/sda (reply header 00 12 00 10 00 00 00 00; page "
+            "at 8 08 0a 00 00 00 00 00 00 00 00 00 00; sd's cache_type reads 'write through')")
+    sd = {"driver": "sd", "kind": "drive", "creditable": True, "write_cache": "write through",
+          "drive_reports": "write through", "drive_report_source": hexs, "sd_host": "storvsc_host"}
+    nv = {"driver": "nvme", "kind": "drive", "creditable": True, "write_cache": "write back", "drive_reports": "write back",
+          "nvme_transport": ["pcie"]}
+    chk("leaf: a write-through Hyper-V sd leaf passes", leaf_problems(sd, False) == [], leaf_problems(sd, False))
+    chk("leaf: a pcie NVMe leaf passes", leaf_problems(nv, False) == [], leaf_problems(nv, False))
+    for name, lf in (("sd host tcm_loopback", dict(sd, sd_host="tcm_loopback")), ("sd host unreadable", dict(sd, sd_host="")),
+                     ("NVMe over tcp", dict(nv, nvme_transport=["pcie", "tcp"])), ("no NVMe transport", dict(nv, nvme_transport=[])),
+                     ("MODE SENSE bytes say WCE=1 under a write-through report",
+                      dict(sd, drive_report_source=hexs.replace("08 0a 00", "08 0a 04"))),
+                     ("no MODE SENSE bytes", dict(sd, drive_report_source="SCSI x")),
+                     ("a scsi_debug kind", dict(sd, kind="scsi_debug", creditable=False)), ("driver dm", dict(nv, driver="dm"))):
+        chk("leaf refused: %s" % name, leaf_problems(lf, False) != [], lf)
+    chk("leaf refused: a drive leaf on a brd cell", leaf_problems(sd, True) != [])
+    ev = ["leaf: drive model 'Virtual Disk' names 'Virtual'"]
+    chk("virt: a VM with evidence and detect-virt microsoft passes",
+        virt_problems({"virtualized": True, "evidence": ev}, "microsoft", "aarch64") == [])
+    chk("virt: x86 bare metal with detect-virt none passes", virt_problems({"virtualized": False, "evidence": []}, "none", "x86_64") == [])
+    chk("virt: arm64 not ruled out with detect-virt none passes", virt_problems({"virtualized": None, "evidence": []}, "none", "aarch64") == [])
+    for name, vz, dv, ar in (("false under detect-virt microsoft", {"virtualized": False, "evidence": []}, "microsoft", "x86_64"),
+                             ("null under detect-virt kvm", {"virtualized": None, "evidence": []}, "kvm", "x86_64"),
+                             ("false on aarch64", {"virtualized": False, "evidence": []}, "none", "aarch64"),
+                             ("true without evidence", {"virtualized": True, "evidence": []}, "microsoft", "x86_64"),
+                             ("false with evidence", {"virtualized": False, "evidence": ev}, "none", "x86_64"),
+                             ("detect-virt missing", {"virtualized": True, "evidence": ev}, "", "x86_64"),
+                             ("a bool-less value", {"virtualized": "yes", "evidence": ev}, "microsoft", "x86_64")):
+        chk("virt refused: %s" % name, virt_problems(vz, dv, ar) != [], (vz, dv, ar))
+    chk("linkage: static with one mapped file passes", linkage_problems({"linkage": "static", "mapped_files": ["/x/v3floor"]}) == [])
+    for name, sj in (("dynamic", {"linkage": "not static", "mapped_files": ["/x/v3floor"]}),
+                     ("two mapped files", {"linkage": "static", "mapped_files": ["/x/v3floor", "/lib/libc.so.6"]}),
+                     ("no record", {})):
+        chk("linkage refused: %s" % name, linkage_problems(sj) != [], sj)
+    for vm, leaf, text, ok in ((True, "wb", "x; a virtual drive: reach to media unknown", True), (True, "wb", "x", False),
+                               (None, "wt", "x (virtualization not ruled out: ...)", True), (None, "wt", "x (a virtual drive)", False),
+                               (False, "wb", "x", True), (False, "wt", "x (a virtual drive: ...)", False),
+                               (True, "brd", "none: a brd floor", True)):
+        chk("qualifier: %r on %s, %r -> %s" % (vm, leaf, text, "ok" if ok else "refused"),
+            (qualifier_problems(text, vm, leaf, "t") == []) == ok, qualifier_problems(text, vm, leaf, "t"))
+    a = {"run.sh": "1", "check.py": "2"}
+    chk("harness: equal sets pass", harness_moved(dict(a), dict(a)) == [])
+    chk("harness: a changed file", harness_moved(dict(a), dict(a, **{"check.py": "3"})) == ["check.py"])
+    chk("harness: a file missing now", harness_moved(dict(a), dict(a, **{"check.py": None})) == ["check.py"])
+    chk("harness: a file only at the start (deleted since)", harness_moved(dict(a, extra="4"), dict(a)) == ["extra"])
+    chk("harness: a file only now (added since)", harness_moved(dict(a), dict(a, extra="4")) == ["extra"])
+    chk("harness: no start record", harness_moved(None, dict(a)) != [])
+    w1 = hexs.replace("WCE=0", "WCE=1").replace("08 0a 00", "08 0a 04")
+    chk("MODE SENSE bytes: WCE=0 and WCE=1 read back", wce_from_hex(hexs)[0] == 0 and wce_from_hex(w1)[0] == 1)
+    chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
+        wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
+    ok = all(res) and len(res) > 0
+    print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
 def main(argv):
     global OUT, CELL, KIND, W
+    if argv == ["--self-test"]:
+        return self_test()
     if len(argv) == 4 and argv[0] == "--plan":
         if argv[1] not in v3cell.CELLS:
             return 2
@@ -782,24 +930,10 @@ def main(argv):
         if lf.get("creditable") is not False:
             lbad.append("a brd leaf not marked creditable false")
     else:
-        if lf.get("driver") not in LEAF_DRIVERS:
-            lbad.append(("driver", lf.get("driver")))
-        if lf.get("kind") != "drive" or lf.get("creditable") is not True:
-            lbad.append(("kind/creditable", lf.get("kind"), lf.get("creditable")))
-        if lf.get("drive_reports") != lf.get("write_cache"):
-            lbad.append(("drive report vs kernel", lf.get("drive_reports"), lf.get("write_cache")))
-        if lf.get("driver") == "sd":  # the WCE bit re-read from the recorded reply bytes (fourth review M2)
-            w, hp = wce_from_hex(lf.get("drive_report_source"))
-            if hp or w is None or ("write back" if w else "write through") != lf.get("drive_reports"):
-                lbad.append(("MODE SENSE bytes vs the drive report", w, hp, lf.get("drive_reports")))
-        if lf.get("driver") == "nvme" and (not lf.get("nvme_transport") or
-                                           any(t not in ("pcie", "tcp", "rdma", "fc") for t in lf.get("nvme_transport"))):
-            lbad.append(("nvme transport", lf.get("nvme_transport")))
-        if kv.get("brd_cell") == "1":
-            lbad.append("a brd cell whose leaf is not brd")
+        lbad += leaf_problems(lf, kv.get("brd_cell") == "1")
     check("cell:leaf", not lbad, {"leaf": lf, "class": leaf, "from": leaf_src, "bad": lbad},
-          "the leaf is an allowlisted drive (kind drive, creditable; NVMe over an allowlisted transport) whose own cache "
-          "report agrees with the kernel, an sd report re-read from its MODE SENSE bytes (or brd on a brd cell)")
+          "the leaf is an allowlisted drive (kind drive, creditable; NVMe over pcie; sd on an allowlisted host) whose own "
+          "cache report agrees with the kernel, an sd report re-read from its MODE SENSE bytes (or brd on a brd cell)")
 
     # F1: per-op syscall counts under strace -f -c at n = 1, 2, 3, 40
     f1 = {}
@@ -1008,6 +1142,12 @@ def main(argv):
           and m.group(1) == m.group(2) and int(m.group(2)) > 0, {"tail": st[-400:]},
           "batchgate.py self-test in this cell (the flush gate on the banked cells, every verdict-shape refusal by its "
           "own reason, the T3 rule): the binding's rules are tested in the verdict that relies on them")
+    st = rd(os.path.join(OUT, "B", "check-selftest.txt")) or ""
+    m = re.search(r"CHECK SELF-TEST (\d+)/(\d+) PASS\s*$", st)
+    check("S:check", rc_of(os.path.join(OUT, "B", "check-selftest.rc")) == 0 and m is not None
+          and m.group(1) == m.group(2) and int(m.group(2)) > 0, {"tail": st[-400:]},
+          "check.py --self-test in this cell: the checker's own leaf, virtualization, linkage, qualifier, MODE SENSE "
+          "byte and harness rules each fire on planted records")
 
     # F4: refusals
     for tag, want in REFUSALS.items():
@@ -1063,10 +1203,8 @@ def main(argv):
     check("work:empty", left is not None and left.strip() == "", {"leftover": (left or "MISSING")[:400]},
           "the work dir is empty after every run (teardown and the ext4 FICLONE trial clean up)")
     # the harness this verdict vouches for is the one that ran: hashed at the start (info.txt) and now (L9)
-    start = rj(os.path.join(OUT, "harness_start.json"))
-    now = harness_sha256()
-    moved = sorted(f for f in now if (start or {}).get(f) != now[f] or now[f] is None)
-    check("harness:stable", isinstance(start, dict) and not moved, {"changed_or_missing": moved[:8]},
+    moved = harness_moved(rj(os.path.join(OUT, "harness_start.json")), harness_sha256())
+    check("harness:stable", not moved, {"changed_or_missing": moved[:8]},
           "every fire-check harness file hashes the same at the start of the run and at check time, and none is missing")
 
     # the plan: exactly these ids, in this order (run.sh binds only a verdict whose ids equal its plan)
@@ -1136,6 +1274,43 @@ def fourth_review_plants(arch):
            "text": (rd(os.path.join(f4, "R_virt_hidden.txt")) or "")[-300:]},
           "with cpuinfo's hypervisor flag and DMI's names hidden (a bind mount in a private namespace, read back), the "
           "leaf alone (driver, model, host path) still makes the run virtualized, and its floor_kind says so")
+    # fifth review L6: a leaf with no VM evidence of its own (scsi_debug), cpuinfo and DMI hidden: bare metal on x86_64,
+    # not ruled out on arm64, and the labels that go with each
+    rc = rc_of(os.path.join(f4, "P_virt_bare.rc"))
+    sj = rj(os.path.join(f4, "P_virt_bare.out", "summary.json")) or {}
+    vz = sj.get("virtualization") or {}
+    prem = rd(os.path.join(f4, "P_virt_bare.premise")) or ""
+    want = False if arch == "x86_64" else None
+    premise = "product_name=PowerEdge R650" in prem and "sys_vendor=Dell Inc." in prem and "hypervisor_flags=0" in prem
+    fst = {False: "yes: the leaf reports a volatile write cache and the drive agrees",
+           None: "yes, to the device (virtualization not ruled out)"}[want]
+    vb = []
+    if not (rc in (0, 3) and premise):
+        vb.append(("rc/premise", rc, prem.strip()))
+    if "virtualized" not in vz or vz.get("virtualized") is not want or vz.get("evidence") != []:
+        vb.append(("virtualization", vz))
+    if (sj.get("leaf") or {}).get("kind") != "scsi_debug" or leaf_class_of(dict(sj, leaf=dict(sj.get("leaf") or {}, kind="drive"))) != "wb":
+        vb.append(("leaf", sj.get("leaf")))
+    if sj.get("floor_kind") != VIRT_KIND["wb"][want]:
+        vb.append(("floor_kind", sj.get("floor_kind"), VIRT_KIND["wb"][want]))
+    if not str(sj.get("flush_sent_to_device", "")).startswith(fst):
+        vb.append(("flush_sent_to_device", sj.get("flush_sent_to_device"), fst))
+    vb += qualifier_problems(str(sj.get("floor_claim", "")), want, "wb", "floor_claim")
+    check("F4:P_virt_bare", not vb, {"bad": vb, "text": (rd(os.path.join(f4, "P_virt_bare.txt")) or "")[-300:]},
+          "a write-back leaf with no VM evidence (scsi_debug) with cpuinfo's flag and DMI's names hidden: virtualized %r "
+          "with no evidence, floor_kind %r, and the matching flush_sent_to_device and floor_claim" % (want, VIRT_KIND["wb"][want]))
+    # fifth review M1, M2: the root disk's leaf made remote (an sd host or an NVMe transport outside its allowlist)
+    rc = rc_of(os.path.join(f4, "R_leaf_remote.rc"))
+    txt = rd(os.path.join(f4, "R_leaf_remote.txt")) or ""
+    what = (rd(os.path.join(f4, "R_leaf_remote.what")) or "").strip()
+    prem = rd(os.path.join(f4, "R_leaf_remote.premise")) or ""
+    exp = {"sd_host": ("proc_name=tcm_loopback", "is on SCSI host 'tcm_loopback'"),
+           "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(what.split(" ")[0])
+    check("F4:R_leaf_remote", exp is not None and rc == 2 and exp[0] in prem and exp[1] in txt
+          and not os.path.exists(os.path.join(f4, "R_leaf_remote.out")),
+          {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:]},
+          "the root disk's leaf with its SCSI host named tcm_loopback (sd) or its NVMe transport tcp, read back inside a "
+          "private mount namespace: refused by the host or transport allowlist (rc 2)")
     # M4: /etc/ld.so.preload names a library; the dynamic build loads it and refuses, the static build never loads it
     rc = rc_of(os.path.join(f4, "R_ldso_preload.rc"))
     txt = rd(os.path.join(f4, "R_ldso_preload.txt")) or ""
@@ -1163,8 +1338,9 @@ def unplanted(arch, leaf):
          "or parsed", "NVMe controllers of one subsystem disagreeing on VWC", "a brd leaf whose write_cache is not "
          "write-through", "the drive's report unreadable (a closed NVMe or sd node, MODE SENSE failing or without a "
          "caching page; the CI grants read access)", "inode flags unreadable", "D's mount id changing between the "
-         "lookup and the run", "an NVMe controller over nvme-loop or another transport outside pcie/tcp/rdma/fc",
-         "an sd leaf on a tcm_loop host", "a MODE SENSE reply that is short (resid), sub-page format (SPF) or has a "
+         "lookup and the run", "whichever of the sd-host and NVMe-transport allowlists the runner's root disk does not "
+         "exercise (R_leaf_remote plants the one it does; check.py --self-test covers both rules in the checker)",
+         "a MODE SENSE reply that is short (resid), sub-page format (SPF) or has a "
          "zero page length (scsi_debug always answers whole)", "/proc/self/maps unreadable",
          "a hypervisor that hides the CPUID bit and presents non-virtual DMI and drive identities (the stated blind spot; "
          "the plant hides cpuinfo and DMI only)"]
@@ -1369,27 +1545,14 @@ def check_real(o3, rc, kv, leaf):
     # recorded by firecheck.sh; "not virtualized" needs x86_64 and detect-virt saying none
     vz = sj.get("virtualization") or {}
     vm = vz.get("virtualized", "absent")
-    dvirt = (kv.get("detect_virt") or "").strip()
-    vbad = []
-    if vm not in (True, False, None):
-        vbad.append("virtualized is %r, not true, false or null" % (vm,))
-    if (vm is True) != bool(vz.get("evidence")):
-        vbad.append("virtualized %r with %d evidence items" % (vm, len(vz.get("evidence") or [])))
-    if not dvirt:
-        vbad.append("systemd-detect-virt gave nothing (the independent instrument is missing)")
-    elif dvirt != "none" and vm is not True:
-        vbad.append("systemd-detect-virt says %r, the probe says virtualized %r" % (dvirt, vm))
-    if vm is False and (arch_of(kv) != "x86_64" or dvirt != "none"):
-        vbad.append("bare metal claimed on %s with systemd-detect-virt %r" % (arch_of(kv), dvirt))
+    vbad = virt_problems(vz, (kv.get("detect_virt") or "").strip(), arch_of(kv))
     if vbad:
         rb.append(("virtualization", vbad, vz))
     fk = VIRT_KIND[leaf].get(vm) if leaf in VIRT_KIND and vm in (True, False, None) else \
         "brd: no drive (fire-check only, never credited)" if leaf == "brd" else None
     if sj.get("floor_kind") != fk:
         rb.append(("floor_kind", sj.get("floor_kind"), fk, "virtualized", vm))
-    # the binary that ran is the static build: only its own file mapped (fourth review M4)
-    if sj.get("linkage") != "static" or not isinstance(sj.get("mapped_files"), list) or len(sj.get("mapped_files")) != 1:
-        rb.append(("linkage/mapped_files", sj.get("linkage"), sj.get("mapped_files")))
+    rb += linkage_problems(sj)
     # the claim the batch may make, re-derived here from the device flush record's clean windows (fresh reviews
     # P-H1, B-H2; fourth review L1, L2, L9)
     fpl = sj.get("flush_path") or []
@@ -1410,9 +1573,8 @@ def check_real(o3, rc, kv, leaf):
     claim = str((merged or {}).get("floor_claim_from_counts", ""))
     if not claim.startswith(want_claim):
         rb.append(("floor_claim_from_counts", claim, want_claim, clean_k))
-    qual = {True: "a virtual drive", None: "virtualization not ruled out"}.get(vm) if leaf in ("wb", "wt") else None
-    if (qual and qual not in claim) or (leaf in ("wb", "wt") and vm is False and "virtual" in claim):
-        rb.append(("floor_claim_from_counts virtualization qualifier", claim, qual))
+    rb += qualifier_problems(claim, vm, leaf, "floor_claim_from_counts")
+    rb += qualifier_problems(str(sj.get("floor_claim", "")), vm, leaf, "floor_claim")
     if sj.get("fstype") == "btrfs" and "bare flush" in str(sj.get("floor_claim", "")) and "no bare-flush" not in str(sj.get("floor_claim", "")):
         rb.append(("btrfs floor_claim promises a bare flush", sj.get("floor_claim")))
     if not str(sj.get("flush_sent_to_device", "")).startswith("yes" if leaf == "wb" else "no"):

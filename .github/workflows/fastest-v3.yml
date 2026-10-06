@@ -50,10 +50,12 @@ jobs:
           mkdir -p st
           python3 -B fastest/linux/v3/blkflush.py self-test 2>&1 | tee st/blkflush-selftest.txt
           python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
+          python3 -B fastest/linux/v3/check.py --self-test 2>&1 | tee st/check-selftest.txt
           for c in ext4 xfs btrfs ext4loop xfsloop btrfsloop; do for a in x86_64 aarch64; do for l in wb wt brd; do
             echo "$c $a $l $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" | wc -l)"; done; done; done | tee st/plan-sizes.txt
           grep -q '^BLKFLUSH SELF-TEST .* PASS$' st/blkflush-selftest.txt
           grep -q '^BATCHGATE SELF-TEST .* PASS$' st/batchgate-selftest.txt
+          grep -q '^CHECK SELF-TEST .* PASS$' st/check-selftest.txt
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
