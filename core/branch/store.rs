@@ -5392,7 +5392,8 @@ impl BranchStore {
             || g.pending_full.is_some()
             || g.flushing
             || g.arena_syncing;
-        if !(drains && at_risk) && !fe_mutant("drain_failure_ignores_risk") {
+        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
+        if !stop {
             return;
         }
         tracing::warn!("branch store fail-stopped: a trunk file's sync failed with branch records not yet drained");
@@ -5670,7 +5671,8 @@ impl BranchStore {
                     if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    if !g.flushing && !g.cutting && !(gated && g.arena_syncing) {
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
+                    if !blocked {
                         break;
                     }
                     g = self.group.wait(g);
