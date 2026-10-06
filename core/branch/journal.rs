@@ -1241,7 +1241,11 @@ impl Journal {
             }
             (None, Some((ps, g, _))) => {
                 if g != 0 {
-                    return Err(corrupt("log generation is past 0 but there is no snapshot"));
+                    return Err(corrupt(if catalog_store {
+                        "log generation is past 0 but the catalog has no meta row"
+                    } else {
+                        "log generation is past 0 but there is no snapshot"
+                    }));
                 }
                 (ps, 0, None, 0)
             }
@@ -1282,7 +1286,11 @@ impl Journal {
         let end = match header {
             Some((log_ps, log_gen, nonce)) if replayable(log_gen) => {
                 if log_ps != page_size {
-                    return Err(corrupt("log and snapshot disagree on the page size"));
+                    return Err(corrupt(if catalog_store {
+                        "log and catalog disagree on the page size"
+                    } else {
+                        "log and snapshot disagree on the page size"
+                    }));
                 }
                 journal.nonce = nonce;
                 let mut pos = LOG_HEADER_LEN;
@@ -1377,7 +1385,7 @@ impl Journal {
                     // #2). A flight written in a class that does not sync (D0) proves nothing, so
                     // under D0 every damage is a torn flight and cut. The flight the damage lies in
                     // was never acknowledged otherwise, whatever survived of it, and is cut below.
-                    if let Some(at) = synced_flight_over(&bytes, pos, nonce) {
+                    if let Some(at) = synced_flight_over(&bytes, pos, nonce, sync.syncs()) {
                         // No truncation is offered (review 7 item 1, the lead's decision): the
                         // flight was acknowledged.
                         let state = if catalog_store { &files.cat } else { &files.snap };
@@ -1429,7 +1437,11 @@ impl Journal {
                 }
             }
             Some((_, log_gen, _)) if log_gen > generation => {
-                return Err(corrupt("log generation is ahead of the snapshot"));
+                return Err(corrupt(if catalog_store {
+                    "log generation is ahead of the catalog's"
+                } else {
+                    "log generation is ahead of the snapshot"
+                }));
             }
             // An older generation in a snapshot store (a compaction crashed after its rename, before
             // the log reset) or a torn header: nothing in it is newer than the snapshot. (A whole header of
@@ -2517,13 +2529,14 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
 }
 
 /// Whether the damage at `damage` lies in, or before, a flight known to have been synced (review 2
-/// #2): a synced end frame of this incarnation after the damage, followed by any whole frame. A
-/// flight is written only after the one before it was synced, so a frame after a synced flight's end
-/// proves that sync returned: an acknowledged write was lost. Returns that end frame's offset.
-///
-/// Blind spot: a synced flight whose own end frame was lost too, with no frame after the next
-/// flight's end, reads as a torn tail.
-fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32) -> Option<usize> {
+/// #2): a synced end frame of this incarnation after the damage, followed by any whole frame; or
+/// (review 5 #26) a synced end frame whose flight's own checksum holds from a frame boundary past
+/// the damage, a whole later flight — taken as proof only in a store whose class syncs (`syncs`),
+/// where every flight is synced before the next is written; under D0 an unsynced flight can be
+/// followed by a raised, synced one. A flight is written only after the one before it was synced,
+/// so either proves that sync returned: an acknowledged write was lost. Returns that end frame's
+/// offset.
+fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32, syncs: bool) -> Option<usize> {
     // fastest-engine mutant `damage_always_torn` (test builds only): every damage is a torn flight.
     if super::store::fe_mutant("damage_always_torn") {
         return None;
@@ -2537,6 +2550,17 @@ fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32) -> Option<usize> 
             return synced_end;
         }
         if synced {
+            // Mutant `whole_later_flight_ignored` (test builds only): as before review 5 #26.
+            let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
+            let flight_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+            let flight_crc = u32::from_le_bytes(payload[5..9].try_into().unwrap());
+            let whole_later = syncs
+                && found.checked_sub(flight_len).is_some_and(|start| {
+                    start > damage && scan_crc_seeded(nonce, &bytes[start..found]) == flight_crc
+                });
+            if whole_later && !super::store::fe_mutant("whole_later_flight_ignored") {
+                return Some(found);
+            }
             synced_end = Some(found);
         }
         at = found + FRAME_HEADER_LEN + len;
@@ -2583,10 +2607,12 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
         }
         pos = next;
     }
+    // The region ends at a flight boundary (review 5 #27): frames after its last end frame would be
+    // a flight never written whole, and closing them with an end frame of their own would forge one.
     if out.len() > flight_at {
-        let frame = end_frame(new, synced, &out[flight_at..]);
-        last_crc = end_frame_crc(&frame);
-        out.extend_from_slice(&frame);
+        return Err(LimboError::InternalError(
+            "branch log rewrite: the kept region does not end at a flight boundary".to_string(),
+        ));
     }
     Ok((out, last_crc))
 }
