@@ -330,8 +330,10 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         # tend after it. A second t1 (a stray strace_mark OUT t1) or a t1 stamped after the wait would otherwise move
         # the window's end without a trace (second re-review, finding 5).
         twice = sorted(k for k, n in seen.items() if n > 1)
-        lines = win.splitlines()
-        pos = {k: next((i for i, ln in enumerate(lines) if re.match(rf"{k}=", ln)), None)
+        # NOT `lines`: that name holds the per-syscall call-line counts the table check reads below; reusing it switched
+        # that check off for every attach window (third re-review, finding 1).
+        wlines = win.splitlines()
+        pos = {k: next((i for i, ln in enumerate(wlines) if re.match(rf"{k}=", ln)), None)
                for k in ("t1", "strace_rc", "tend")}
         if twice:
             problems.append(f"attach window with repeated stamp(s) {twice}: which one is the window's cannot be told")
