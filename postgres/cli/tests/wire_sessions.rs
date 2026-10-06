@@ -2913,3 +2913,65 @@ fn alter_add_constraint_rebuilds_long_names_and_serial_tables_cleanly() {
         "the serial's sequence restarted"
     );
 }
+
+/// A primary key column is NOT NULL, as in PostgreSQL and in the engine's STRICT tables (a NULL key
+/// is refused with 23502): information_schema.columns says is_nullable NO and pg_attribute's
+/// attnotnull matches a NOT NULL column's for it, declared at column level, at table level, or
+/// SERIAL. Both reported a key column declared without NOT NULL as nullable, and ORM introspection
+/// made nullable key fields of it (wire review 2 item 9).
+#[test]
+fn primary_key_columns_are_reported_not_null() {
+    let dir = Scratch::new("pknotnull");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE pk1(id INT PRIMARY KEY, v INT, nn INT NOT NULL)")
+        .ok("pk1");
+    a.q("CREATE TABLE pk2(a INT, b INT, v INT, PRIMARY KEY (a, b))")
+        .ok("pk2");
+    a.q("CREATE TABLE pk3(id SERIAL PRIMARY KEY, v INT)")
+        .ok("pk3");
+    let e = a.q("INSERT INTO pk1 VALUES (NULL, 1, 1)").err("a NULL key");
+    assert_eq!(e.code, "23502", "premise: the key is NOT NULL: {e:?}");
+    let r = a
+        .q(
+            "SELECT table_name, column_name, is_nullable FROM information_schema.columns \
+            WHERE table_name IN ('pk1', 'pk2', 'pk3') ORDER BY table_name, ordinal_position",
+        )
+        .ok("columns");
+    let rows: Vec<Vec<Option<String>>> = [
+        ["pk1", "id", "NO"],
+        ["pk1", "v", "YES"],
+        ["pk1", "nn", "NO"],
+        ["pk2", "a", "NO"],
+        ["pk2", "b", "NO"],
+        ["pk2", "v", "YES"],
+        ["pk3", "id", "NO"],
+        ["pk3", "v", "YES"],
+    ]
+    .iter()
+    .map(|r| r.iter().map(|x| Some(x.to_string())).collect())
+    .collect();
+    assert_eq!(r.rows, rows);
+    let r = a
+        .q(
+            "SELECT c.relname, a.attname, a.attnotnull FROM pg_attribute a \
+            JOIN pg_class c ON a.attrelid = c.oid \
+            WHERE c.relname IN ('pk1', 'pk2', 'pk3') AND a.attnum > 0 \
+            ORDER BY c.relname, a.attnum",
+        )
+        .ok("pg_attribute");
+    let notnull = |table: &str, column: &str| -> Option<String> {
+        r.rows
+            .iter()
+            .find(|row| row[0].as_deref() == Some(table) && row[1].as_deref() == Some(column))
+            .unwrap_or_else(|| panic!("no {table}.{column}: {:?}", r.rows))[2]
+            .clone()
+    };
+    let yes = notnull("pk1", "nn");
+    let no = notnull("pk1", "v");
+    assert_ne!(yes, no, "premise: attnotnull tells NOT NULL apart");
+    for (table, column) in [("pk1", "id"), ("pk2", "a"), ("pk2", "b"), ("pk3", "id")] {
+        assert_eq!(notnull(table, column), yes, "{table}.{column}");
+    }
+    assert_eq!(notnull("pk2", "v"), no);
+}
