@@ -2051,9 +2051,15 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
         hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
         let release = std::thread::spawn(move || x.reap().map(|_| ()));
         wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        // FLAGGED TEST EDIT (engine review 7 #7's judge): the capture call's own waits are counted
+        // on its thread (`thread_waits`) and must be 0; the deadline below is liveness only.
         let starter = {
             let db = db.clone();
-            std::thread::spawn(move || db.branch_checkpoint_fuzzy_now())
+            std::thread::spawn(move || {
+                let waits = super::store::thread_waits();
+                let started = db.branch_checkpoint_fuzzy_now();
+                (started, super::store::thread_waits() - waits)
+            })
         };
         // FLAGGED TEST EDIT (engine review 7 #7; review 4 asked for it): 60 s, not 2 s. A capture
         // that waits for the held flight never finishes, so the check still fires; a slow box no
@@ -2075,9 +2081,11 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
                 "slot {slot} was freed before the release that frees it was durable"
             );
         }
+        let (started, waits) = starter.join().unwrap();
         hold.store(0, std::sync::atomic::Ordering::Release);
         release.join().unwrap().unwrap();
-        assert!(starter.join().unwrap().unwrap(), "premise: a fuzzy checkpoint started");
+        assert!(started.unwrap(), "premise: a fuzzy checkpoint started");
+        assert_eq!(waits, 0, "the capture waited ({waits} times) for a flight in the air");
         db.branch_checkpoint_wait();
         let in_use = db.branch_slots_in_use();
         for slot in &owned {
@@ -4460,11 +4468,11 @@ fn the_install_forgets_a_captured_deferred_free_exactly_once() {
         owned_x.iter().all(|s| deferred.contains(s)),
         "premise: x's frees still wait at the install ({deferred:?}, x owned {owned_x:?})"
     );
-    let forgotten = super::arena::FORGET_LISTED.load(O::Acquire);
+    let forgotten = db.branches.forget_listed_for_test();
     db.branch_checkpoint_hold(0);
     db.branch_checkpoint_wait();
     assert!(
-        super::arena::FORGET_LISTED.load(O::Acquire) - forgotten >= owned_x.len() as u64,
+        db.branches.forget_listed_for_test() - forgotten >= owned_x.len() as u64,
         "premise: the install took x's listed slots out of memory"
     );
     let in_use = db.branch_slots_in_use();
@@ -4484,6 +4492,62 @@ fn the_install_forgets_a_captured_deferred_free_exactly_once() {
         z.owned_slots()
     );
     let _ = (anchor, z.into_id());
+}
+
+/// Engine review 7 #7 (c), as the flagged-edit judge of 268e9e053 asked: a release buffered AFTER
+/// a fuzzy checkpoint's capture, its flight held from before the install, is not the install's to
+/// list or forget. The install waits for that flight (no flight may write the log it cuts), and
+/// then leaves its frees to mature on their own: no `forget_listed` call (a per-store count, read
+/// without maturing), and once matured y's slots are free, counted in use nowhere. Mutant
+/// `install_forgets_after_capture`.
+#[test]
+fn the_install_leaves_a_release_after_its_capture_to_mature_on_its_own() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("after-capture.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let anchor = trunk.fork_branch().unwrap();
+    write_v(&anchor.connect().unwrap(), 1, "anchor");
+    let anchor = anchor.into_id();
+    let y = trunk.fork_branch().unwrap();
+    write_v(&y.connect().unwrap(), 4, "y");
+    let owned_y = y.owned_slots();
+    assert!(!owned_y.is_empty(), "premise: y owns a slot");
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let forgotten = db.branches.forget_listed_for_test();
+    // y's release, buffered after the capture, its flight held across the install. Nothing below
+    // takes the store mutex until the flight is let go: the install holds it while it waits.
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+    let release = std::thread::spawn(move || y.reap().map(|_| ()));
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    db.branch_checkpoint_hold(0);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    hold.store(0, O::Release);
+    release.join().unwrap().unwrap();
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branches.forget_listed_for_test() - forgotten,
+        0,
+        "the install forgot frees of a release it did not capture"
+    );
+    let in_use = db.branch_slots_in_use();
+    for slot in &owned_y {
+        assert!(!in_use.contains(slot), "slot {slot} is in use after y's release matured");
+        assert!(db.branch_slot_is_free(*slot), "slot {slot} is not free after y's release matured");
+    }
+    assert_eq!(
+        db.branch_stats().unwrap().arena_slots_in_use as usize,
+        in_use.len(),
+        "the in-use count disagrees with the slots in use"
+    );
+    let _ = anchor;
 }
 
 // ---- engine review 7 #12: the release half of the listing's durability wait ----

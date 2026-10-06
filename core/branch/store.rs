@@ -483,6 +483,8 @@ impl Group {
     }
 
     fn wait<'a>(&self, g: std::sync::MutexGuard<'a, GroupState>) -> std::sync::MutexGuard<'a, GroupState> {
+        #[cfg(test)]
+        note_wait();
         self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
     }
 
@@ -826,6 +828,26 @@ thread_local! {
 #[cfg(test)]
 fn thread_syncs() -> u64 {
     THREAD_SYNCS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Condition-variable waits this thread made inside the store: for a flight, for a trunk
+    /// commit's WAL flush, for a checkpoint's install, for a trunk commit's publication (test
+    /// builds; review 7 #7 as the flagged-edit judge asked: a wait is counted, not timed).
+    static THREAD_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One wait (`THREAD_WAITS`).
+#[cfg(test)]
+fn note_wait() {
+    THREAD_WAITS.with(|n| n.set(n.get() + 1));
+}
+
+/// See `THREAD_WAITS`.
+#[cfg(test)]
+pub(crate) fn thread_waits() -> u64 {
+    THREAD_WAITS.with(std::cell::Cell::get)
 }
 
 /// See `SYNCS_UNDER_STORE_MUTEX`.
@@ -2665,6 +2687,8 @@ impl Drop for Backpressure<'_> {
                 tracing::warn!("branch store back-pressure: no checkpoint install in 60 s");
                 return;
             }
+            #[cfg(test)]
+            note_wait();
             n = installed
                 .wait_timeout(n, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner())
@@ -3799,6 +3823,8 @@ impl BranchStore {
                     // rather than led past with an upgrade flight, a second flusher.
                     if need > 0 && g.pending_full.is_some_and(|p| p >= lsn) {
                         first = false;
+                        #[cfg(test)]
+                        note_wait();
                         let (woken, timeout) = group
                             .cv
                             .wait_timeout(g, pending_full_wait())
@@ -4295,6 +4321,17 @@ impl BranchStore {
             }
         }
         self.mature(inner);
+        // Mutant `capture_waits_bounded` (test builds only; review 7 #7's flagged-edit judge): the
+        // capture waits, at most 3 s, for a flight in the air: a bounded wait a deadline-only
+        // check lets pass.
+        #[cfg(test)]
+        if fe_mutant("capture_waits_bounded") {
+            let g = self.group.lock();
+            if g.flushing {
+                note_wait();
+                let _ = self.group.cv.wait_timeout(g, Duration::from_secs(3));
+            }
+        }
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
@@ -4483,6 +4520,8 @@ impl BranchStore {
             if started.elapsed() > limit {
                 return Err(LimboError::Busy);
             }
+            #[cfg(test)]
+            note_wait();
             guard = closed
                 .wait_timeout(guard, Duration::from_millis(100))
                 .unwrap_or_else(|e| e.into_inner())
@@ -6086,6 +6125,12 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn arena_slot_free_for_test(&self, slot: Slot) -> bool {
         self.inner.lock().arena.as_ref().is_some_and(|a| a.is_free(slot))
+    }
+
+    /// Test builds: this store's arena's `forget_listed` calls (engine review 7 #7).
+    #[cfg(test)]
+    pub(crate) fn forget_listed_for_test(&self) -> u64 {
+        self.inner.lock().arena.as_ref().map_or(0, |a| a.forget_listed)
     }
 
     /// Test builds: the class the log's rewrites sync in (the store's, or the raised one).
@@ -7922,12 +7967,13 @@ impl StoreInner {
             // The deferred frees the catalog now lists, still waiting for their flight: free in the
             // catalog, so out of memory (their releases are durable with it). One that matured
             // since the capture is on the in-memory list, and leaves it below like any listed slot.
+            // Only those the capture covers: a release buffered after it is not in the catalog, and
+            // its frees mature on their own. Mutant `install_forgets_after_capture` (test builds
+            // only; review 7 #7 (c)): the install takes those too.
             let mut still_deferred: HashSet<Slot> = HashSet::new();
-            while self
-                .pending_free
-                .front()
-                .is_some_and(|&(lsn, _)| lsn <= cap.deferred_lsn)
-            {
+            while self.pending_free.front().is_some_and(|&(lsn, _)| {
+                lsn <= cap.deferred_lsn || fe_mutant("install_forgets_after_capture")
+            }) {
                 let (_, slots) = self.pending_free.pop_front().expect("just looked");
                 for slot in slots {
                     arena.forget_listed(slot);
