@@ -2423,3 +2423,99 @@ fn schema_ddl_is_refused_in_server_mode() {
     a.q("SELECT turso_branch_create('afterschema2')")
         .ok("a create in the session that asked");
 }
+
+/// ALTER TABLE ADD PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works in every transaction state a
+/// client can be in (autocommit; right after BEGIN; after BEGIN and a read; after BEGIN and a
+/// write): it commits with the block, keeps every row, takes effect, and leaves no aside table.
+/// At 15e96b3a9 the rebuild ran with the engine's nested-statement flag up (its catalog lookup
+/// statement stayed alive), so it opened no transaction and the DDL reached SetCookie's
+/// unreachable! in every state but the last (wire review 2 item 1).
+#[test]
+fn alter_table_add_constraint_works_in_every_transaction_state() {
+    let dir = Scratch::new("addstates");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE par(id INT PRIMARY KEY)").ok("parent");
+    a.q("INSERT INTO par VALUES (1), (2)").ok("parents");
+    let kinds = [
+        (
+            "PRIMARY KEY (id)",
+            "INSERT INTO {t} VALUES (1, 99, 1)",
+            "23505",
+        ),
+        ("UNIQUE (v)", "INSERT INTO {t} VALUES (9, 10, 1)", "23505"),
+        (
+            "FOREIGN KEY (p) REFERENCES par (id)",
+            "INSERT INTO {t} VALUES (9, 90, 99)",
+            "23503",
+        ),
+        (
+            "CHECK (id > 0)",
+            "INSERT INTO {t} VALUES (0, 0, 1)",
+            "23514",
+        ),
+    ];
+    let states = ["autocommit", "begin", "begin+read", "begin+write"];
+    for (k, (constraint, violation, code)) in kinds.iter().enumerate() {
+        for (s, state) in states.iter().enumerate() {
+            let t = format!("c{k}{s}");
+            a.q(&format!("CREATE TABLE {t}(id INT, v INT, p INT)"))
+                .ok("table");
+            a.q(&format!("INSERT INTO {t} VALUES (1, 10, 1), (2, 20, 2)"))
+                .ok("rows");
+            let alter = format!("ALTER TABLE {t} ADD {constraint}");
+            let mut rows = 2;
+            match *state {
+                "autocommit" => {}
+                "begin" => {
+                    a.q("BEGIN").ok("begin");
+                }
+                "begin+read" => {
+                    a.q("BEGIN").ok("begin");
+                    a.q(&format!("SELECT count(*) FROM {t}")).ok("read");
+                }
+                _ => {
+                    a.q("BEGIN").ok("begin");
+                    a.q(&format!("INSERT INTO {t} VALUES (3, 30, 1)"))
+                        .ok("write");
+                    rows = 3;
+                }
+            }
+            let r = a.q(&alter).ok(&alter);
+            assert_eq!(r.tags, vec!["ALTER TABLE".to_string()], "{alter} {state}");
+            let r = if *state == "autocommit" {
+                r
+            } else {
+                let r = a.q("COMMIT").ok("commit");
+                assert_eq!(r.tags, vec!["COMMIT".to_string()], "{alter} {state}");
+                r
+            };
+            assert_eq!(r.status, b'I', "{alter} {state}");
+            assert_eq!(
+                a.q(&format!("SELECT count(*) FROM {t}")).single("rows"),
+                rows.to_string(),
+                "{alter} {state}"
+            );
+            let sql = violation.replace("{t}", &t);
+            assert_eq!(a.q(&sql).err(&sql).code, *code, "{alter} {state}");
+        }
+    }
+    // A unique constraint the rows break is refused and changes nothing.
+    a.q("CREATE TABLE d(id INT, v INT)").ok("table");
+    a.q("INSERT INTO d VALUES (1, 5), (2, 5)").ok("duplicates");
+    assert_eq!(
+        a.q("ALTER TABLE d ADD UNIQUE (v)")
+            .err("unique over duplicates")
+            .code,
+        "23505"
+    );
+    assert_eq!(a.q("SELECT count(*) FROM d").single("rows"), "2");
+    a.q("INSERT INTO d VALUES (3, 5)")
+        .ok("no unique constraint was left behind");
+    assert_eq!(
+        a.q("SELECT count(*) FROM pg_class WHERE relname LIKE '%turso_rebuild%'")
+            .single("aside tables"),
+        "0",
+        "an aside table was left behind"
+    );
+}
