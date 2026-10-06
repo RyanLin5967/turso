@@ -3248,3 +3248,65 @@ fn copy_from_runs_inside_the_block_it_is_in() {
     assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
     assert_eq!(count(&mut a), "4", "the failed block kept rows");
 }
+
+/// An undeclared parameter has the type PostgreSQL infers from its context, the same at Describe
+/// and at Bind: the column it is compared with, assigned to or inserted into, an aggregate it is
+/// compared with, LIMIT's bigint, a cast's type; text where nothing says. A $n with an unused $k
+/// below it is refused with 42P18. Bind guessed from the value (an integer, then a float, then a
+/// boolean), so '007', 't' and '1e3' went into a text column as 7, 1 and 1000.0 while Describe
+/// said text; and a failed bind was dropped (wire review 4 item 3).
+#[test]
+fn an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind() {
+    const INT8: u32 = 20;
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    let dir = Scratch::new("paraminfer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Bind: a text column's value as given.
+    for (id, v) in [("2", "007"), ("3", "t"), ("4", "1e3")] {
+        a.xt(
+            "INSERT INTO t VALUES ($1, $2)",
+            &[(0, 0, id.as_bytes()), (0, 0, v.as_bytes())],
+        )
+        .ok("insert, undeclared");
+        assert_eq!(
+            a.q(&format!("SELECT v FROM t WHERE id = {id}")).single("v"),
+            v,
+            "the text parameter was rewritten"
+        );
+    }
+    // An integer column's parameter compares as an integer; so does one compared with count(*).
+    let r = a.xt("SELECT v FROM t WHERE id = $1", &[(0, 0, b"2")]);
+    assert_eq!(r.ok("by key").rows, vec![vec![Some("007".to_string())]]);
+    let r = a.xt(
+        "SELECT count(*) FROM t HAVING count(*) > $1",
+        &[(0, 0, b"1")],
+    );
+    assert_eq!(
+        r.ok("having").rows.len(),
+        1,
+        "count(*) > $1 compared as text"
+    );
+    let r = a.xt("SELECT id FROM t ORDER BY id LIMIT $1", &[(0, 0, b"2")]);
+    assert_eq!(r.ok("limit").rows.len(), 2);
+    // Describe says the same.
+    for (sql, want) in [
+        ("SELECT v FROM t WHERE id = $1", vec![INT4]),
+        ("INSERT INTO t VALUES ($1, $2)", vec![INT4, TEXT]),
+        ("UPDATE t SET v = $2 WHERE id = $1", vec![INT4, TEXT]),
+        ("SELECT count(*) FROM t HAVING count(*) > $1", vec![INT8]),
+        ("SELECT id FROM t LIMIT $1", vec![INT8]),
+        ("SELECT $1::int4", vec![INT4]),
+        ("SELECT $1", vec![TEXT]),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(want), "{sql}");
+    }
+    // A gap below the highest $n: PostgreSQL cannot type $1.
+    let r = a.describe_statement("SELECT v FROM t WHERE id = $2");
+    assert_eq!(r.err("$2 alone").code, "42P18");
+    // One parameter more than the statement has: the bind fails.
+    let r = a.xt("SELECT 1", &[(0, 0, b"1")]);
+    assert_eq!(r.err("an extra parameter").code, "08P01");
+}
