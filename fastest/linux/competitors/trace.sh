@@ -40,19 +40,35 @@ descendants() { # descendants PID -> every live, non-zombie descendant pid of PI
 # task_state STAT_FILE -> the one-letter state of /proc/<pid>[/task/<tid>]/stat (parsed after the last ')': the comm
 # field may hold spaces); empty when the task is gone.
 task_state() { awk '{ s = $0; sub(/.*\) /, "", s); split(s, a, " "); print a[1] }' "$1" 2>/dev/null; }
+# task_st TASKDIR -> "<state letter> <TracerPid>" from ONE read of TASKDIR/status, empty when the task is gone. Reading
+# the state and the tracer in two reads let a traced child exit and be reaped between them and look untraced
+# (fourth review, finding 3: every one of F10d's 7 incomplete first tries was that).
+task_st() { awk '/^State:/ {s = $2} /^TracerPid:/ {t = $2} END {if (s != "") print s, t}' "$1/status" 2>/dev/null; }
+is_dead_state() { case $1 in Z|X|x|"") return 0 ;; esac; return 1; }
 # dead_task TASKDIR -> 0 for a zombie, a dead task, or one gone: it can no longer issue a syscall, so it needs no
 # tracer. A child that exits while the postmaster is frozen stays a zombie (only the postmaster reaps it) and reads
 # TracerPid 0 (third review, finding 2: under the freeze it stalled the attach for 20 s, then failed it).
-dead_task() { case $(task_state "$1/stat") in Z|X|x|"") return 0 ;; esac; return 1; }
+dead_task() { is_dead_state "$(task_state "$1/stat")"; }
+# dead_proc PID -> 0 only when EVERY task of PID is dead: a process whose leader exited (pthread_exit) shows the
+# leader's Z in /proc/PID/stat while its other threads still run with its fds (fourth review, finding 2).
+dead_proc() {
+  local t
+  [ -d "/proc/$1" ] || return 0
+  for t in /proc/"$1"/task/*; do
+    [ -e "$t" ] || continue
+    dead_task "$t" || return 1
+  done
+  return 0
+}
 
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
-  local st=$1 p t tp
+  local st=$1 p t s tp
   shift
   for p in "$@"; do
     for t in /proc/"$p"/task/*; do
       [ -e "$t/status" ] || continue
-      dead_task "$t" && continue
-      tp=$(awk '/^TracerPid:/{print $2}' "$t/status" 2>/dev/null)
+      read -r s tp < <(task_st "$t")
+      is_dead_state "$s" && continue
       [ -z "$tp" ] || [ "$tp" = "$st" ] || echo "${t#/proc/}"
     done
   done
@@ -86,7 +102,7 @@ fdsync_scan() {
     done
     # A process caught exiting (zombie or dead, its files already closed) holds no fd and can write nothing: it is
     # recorded as exiting, not as a scan of zero fds, and pid_roster leaves it out (third review, finding 8).
-    if [ "$n" = 0 ] && dead_task "/proc/$p"; then echo "exiting $p" >>"$out.fdsync"; else echo "scanned $p $n" >>"$out.fdsync"; fi
+    if [ "$n" = 0 ] && dead_proc "$p"; then echo "exiting $p" >>"$out.fdsync"; else echo "scanned $p $n" >>"$out.fdsync"; fi
   done
 }
 
@@ -97,7 +113,7 @@ pid_roster() {
   local out=$1 p t cl
   shift
   for p in "$@"; do
-    dead_task "/proc/$p" && continue  # exiting: no syscall left to attribute
+    dead_proc "$p" && continue  # exiting: no syscall left to attribute
     cl=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
     for t in /proc/"$p"/task/*; do
       [ -e "$t" ] && echo "${t##*/} $p $cl"
@@ -113,9 +129,9 @@ traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and 
     [ -d "/proc/$p" ] || continue  # a descendant that exited between enumeration and attach: nothing left to trace
     for t in /proc/"$p"/task/*; do
       [ -e "$t/status" ] || continue
-      dead_task "$t" && continue
-      tp=$(awk '/^TracerPid:/{print $2}' "$t/status" 2>/dev/null) || return 1
-      [ -z "$tp" ] && continue  # the task exited while we read it
+      local s tp
+      read -r s tp < <(task_st "$t")
+      is_dead_state "$s" && continue  # zombie, dead, or gone while we read it
       [ "$tp" = "$st" ] || return 1
     done
   done
