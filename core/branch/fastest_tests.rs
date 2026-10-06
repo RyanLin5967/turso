@@ -2886,6 +2886,7 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
         write_v(&x.connect().unwrap(), 3, "x");
         let owned = x.owned_slots();
         if catalog {
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
             trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
             assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the D0 log");
             // Another branch's write, so x's slots stay as they were.
@@ -4200,6 +4201,7 @@ fn a_raised_d0_fuzzy_checkpoint_syncs_its_slots_through_the_group_before_its_com
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let b = trunk.fork_branch().unwrap();
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
     assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
     let c = trunk.fork_branch().unwrap();
@@ -4230,6 +4232,7 @@ fn raised_d0_with_an_unsynced_slot(dir: &Path) -> (Arc<Database>, Arc<Connection
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let b = trunk.fork_branch().unwrap();
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
     assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
     let c = trunk.fork_branch().unwrap();
