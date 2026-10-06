@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, split_statements, PgBranchArg, PgBranchCall, PgConnection,
-    CONNECTION_BROKEN,
+    StatementTypes, CONNECTION_BROKEN,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -653,8 +653,8 @@ struct Described {
     conn: Arc<turso_core::Connection>,
     sql: String,
     stmt: turso_core::Statement,
-    /// The result types the parse gave (see [`PgConnection::prepare_typed`]).
-    types: Vec<Option<u32>>,
+    /// The types the parse gave (see [`PgConnection::prepare_typed`]).
+    types: StatementTypes,
 }
 
 /// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
@@ -1094,28 +1094,22 @@ impl Session {
 
     /// The result columns of the statement [`Session::describe_prepare`] kept.
     fn described_fields(&self, format: &Format) -> Vec<FieldInfo> {
-        self.state()
-            .described
-            .as_ref()
-            .map_or_else(Vec::new, |d| result_fields(&d.stmt, &d.types, format))
+        self.state().described.as_ref().map_or_else(Vec::new, |d| {
+            result_fields(&d.stmt, &d.types.columns, format)
+        })
     }
 
-    /// The highest $n the statement [`Session::describe_prepare`] kept uses (the engine names
-    /// each PostgreSQL parameter `$n`), 0 for none.
-    fn described_parameters(&self) -> usize {
+    /// The parameter types of the statement [`Session::describe_prepare`] kept (see
+    /// [`parameter_types`]); only the declared ones when it kept none.
+    fn described_parameters(&self, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
         let st = self.state();
-        let Some(d) = st.described.as_ref() else {
-            return 0;
-        };
-        let params = d.stmt.parameters();
-        (1..=params.count())
-            .filter_map(|i| {
-                let name = params.name(NonZero::new(i)?)?;
-                let n = name.strip_prefix('$').or_else(|| name.strip_prefix('?'))?;
-                n.parse::<usize>().ok()
-            })
-            .max()
-            .unwrap_or(0)
+        match st.described.as_ref() {
+            Some(d) => parameter_types(&d.stmt, &d.types.params, declared),
+            None => Ok(declared
+                .iter()
+                .map(|t| t.clone().unwrap_or(Type::TEXT))
+                .collect()),
+        }
     }
 
     /// The statement a Describe prepared for this Execute, if it is this text on this connection.
@@ -1123,7 +1117,7 @@ impl Session {
         &self,
         conn: &PgConnection,
         sql: &str,
-    ) -> Option<(turso_core::Statement, Vec<Option<u32>>)> {
+    ) -> Option<(turso_core::Statement, StatementTypes)> {
         let mut st = self.state();
         match st.described.take() {
             Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => {
@@ -1191,7 +1185,8 @@ impl Session {
         };
         self.shared.cleanup_dropped_schema_file(sql);
         if let Some(portal) = portal {
-            bind_portal_parameters(&mut stmt, portal).map_err(|e| unprepared(wire_info(e)))?;
+            bind_portal_parameters(&mut stmt, portal, &types.params)
+                .map_err(|e| unprepared(wire_info(e)))?;
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql, backoff)
@@ -1201,7 +1196,7 @@ impl Session {
             execute_query(
                 &mut stmt,
                 format,
-                &types,
+                &types.columns,
                 &conn.inner().current_schema(),
                 backoff,
             )
@@ -2204,8 +2199,10 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(&target.statement)?;
         let fields = self.described_fields(&Format::UnifiedText);
-        let used = self.described_parameters();
-        Ok(DescribeStatementResponse::new(param_types(used), fields))
+        let params = self
+            .described_parameters(&target.parameter_types)
+            .map_err(PgWireError::UserError)?;
+        Ok(DescribeStatementResponse::new(params, fields))
     }
 
     async fn do_describe_portal<C>(
@@ -2648,39 +2645,76 @@ fn execute_non_query(
     Ok(Response::Execution(tag))
 }
 
-/// Extract parameters from a Portal and bind them to a prepared statement.
-///
-/// PostgreSQL parameters ($1, $2, ...) map to portal parameters 0, 1, ...
-/// The bytecode compiler may allocate internal parameter indices in a different
-/// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
-/// look up each parameter's internal index by name.
+/// The type of each parameter, $1 up to the highest the statement uses or the client declared:
+/// the declared one, else the one its context gives (`inferred`, see
+/// [`StatementTypes::params`]), else text, as PostgreSQL resolves a parameter nothing types. One
+/// below the highest that the statement does not use and the client did not declare cannot be
+/// typed: 42P18, as PostgreSQL refuses it (wire review 4 item 3). Describe and Bind read the
+/// same list.
+fn parameter_types(
+    stmt: &turso_core::Statement,
+    inferred: &[Option<u32>],
+    declared: &[Option<Type>],
+) -> SqlResult<Vec<Type>> {
+    let params = stmt.parameters();
+    (1..=params.count().max(declared.len()))
+        .map(|n| {
+            if let Some(Some(t)) = declared.get(n - 1) {
+                if *t != Type::UNKNOWN {
+                    return Ok(t.clone());
+                }
+            }
+            if !params.has_index(NonZero::new(n).expect("n >= 1")) {
+                return Err(error(
+                    "42P18",
+                    format!("could not determine data type of parameter ${n}"),
+                ));
+            }
+            Ok(inferred
+                .get(n - 1)
+                .copied()
+                .flatten()
+                .and_then(Type::from_oid)
+                .unwrap_or(Type::TEXT))
+        })
+        .collect()
+}
+
+/// Bind a portal's parameters to its statement, each converted from its text by its type (see
+/// [`parameter_types`]): an undeclared parameter's is the one its context gives, the type Describe
+/// reported, not one guessed from the value (an integer, then a float, then a boolean: '007' went
+/// into a text column as 7; wire review 4 item 3). A parameter count other than the statement's
+/// (08P01, as PostgreSQL's Bind answers), or a value the engine refuses, fails the bind. The
+/// engine numbers PostgreSQL's $n as its parameter n.
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
     portal: &Portal<String>,
+    inferred: &[Option<u32>],
 ) -> PgWireResult<()> {
-    for i in 0..portal.parameter_len() {
+    let types = parameter_types(stmt, inferred, &portal.statement.parameter_types)
+        .map_err(PgWireError::UserError)?;
+    if portal.parameter_len() != types.len() {
+        return Err(PgWireError::UserError(error(
+            "08P01",
+            format!(
+                "bind message supplies {} parameters, but prepared statement \"{}\" requires {}",
+                portal.parameter_len(),
+                portal.statement.id,
+                types.len()
+            ),
+        )));
+    }
+    for (i, pg_type) in types.iter().enumerate() {
         let value = match &portal.parameters[i] {
             None => Value::Null,
-            Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
-            }
+            Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
         };
-        // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
-        // Look up the internal index that the bytecode compiler assigned to $N.
-        let pg_param_name = format!("${}", i + 1);
-        let idx = stmt
-            .parameter_index(&pg_param_name)
-            .unwrap_or_else(|| NonZero::new(i + 1).expect("parameter index must be non-zero"));
-        // Ignore bind errors: parameter index mismatches or value coercion
-        // failures surface as wire-protocol errors during the subsequent
-        // execute, with a more useful message than a generic Bind failure.
-        let _ = stmt.bind_at(idx, value);
+        let index = NonZero::new(i + 1).expect("i + 1 >= 1");
+        // A declared parameter the statement does not use binds nothing.
+        if stmt.parameters().has_index(index) {
+            stmt.bind_at(index, value)
+                .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
+        }
     }
     Ok(())
 }
@@ -2732,22 +2766,8 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 Ok(Value::from_blob(bytes.to_vec()))
             }
         }
-        // UNKNOWN: try to infer type from text content (numeric-looking values
-        // should be bound as numbers so comparisons with COUNT/SUM etc. work)
-        Type::UNKNOWN => {
-            if let Ok(i) = text.parse::<i64>() {
-                Ok(Value::from_i64(i))
-            } else if let Ok(f) = text.parse::<f64>() {
-                Ok(Value::from_f64(f))
-            } else if text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("t") {
-                Ok(Value::from_i64(1))
-            } else if text.eq_ignore_ascii_case("false") || text.eq_ignore_ascii_case("f") {
-                Ok(Value::from_i64(0))
-            } else {
-                Ok(Value::from_text(text.to_owned()))
-            }
-        }
-        // TEXT, VARCHAR, and all other types → text
+        // TEXT, VARCHAR, UNKNOWN and all other types: the text as given (a parameter nothing
+        // types is text, as in PostgreSQL; wire review 4 item 3).
         _ => Ok(Value::from_text(text.to_owned())),
     }
 }

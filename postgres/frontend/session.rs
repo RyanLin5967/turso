@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
+use crate::result_types::StatementTypes;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
@@ -95,12 +96,13 @@ impl PgConnection {
         prepare_statement(&self.inner, sql.as_ref())
     }
 
-    /// [`PgConnection::prepare`], with PostgreSQL's type OID for each result column the engine
-    /// cannot type itself, read from the same parse (aggregates; see
-    /// [`crate::result_types::aggregate_types`]). `None` (or a short list) where the engine types
-    /// the column.
-    pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, Vec<Option<u32>>)> {
-        let mut types = Vec::new();
+    /// [`PgConnection::prepare`], with the types the same parse gives: PostgreSQL's type OID for
+    /// each result column the engine cannot type itself (aggregates; see
+    /// [`crate::result_types::aggregate_types`]; `None`, or a short list, where the engine types
+    /// the column), and for each parameter its context types (see
+    /// [`crate::result_types::parameter_types`]).
+    pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, StatementTypes)> {
+        let mut types = StatementTypes::default();
         let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
         Ok((stmt, types))
     }
@@ -112,8 +114,8 @@ impl PgConnection {
     pub fn prepare_for_describe(
         &self,
         sql: impl AsRef<str>,
-    ) -> Result<Option<(Statement, Vec<Option<u32>>)>> {
-        let mut types = Vec::new();
+    ) -> Result<Option<(Statement, StatementTypes)>> {
+        let mut types = StatementTypes::default();
         let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
@@ -394,11 +396,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     prepare_statement_typed(pg_conn, sql, None)
 }
 
-/// [`prepare_statement`], filling `types` (when asked) with the result types the parse gives.
+/// [`prepare_statement`], filling `types` (when asked) with the types the parse gives.
 fn prepare_statement_typed(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
-    types: Option<&mut Vec<Option<u32>>>,
+    types: Option<&mut StatementTypes>,
 ) -> Result<Statement> {
     prepare_statement_inner(pg_conn, sql, types, false)?.ok_or_else(|| {
         LimboError::InternalError("only a Describe declines to prepare a statement".to_string())
@@ -423,7 +425,7 @@ fn performs_at_prepare(parse_result: &turso_pg_parser::pg_query::ParseResult) ->
 fn prepare_statement_inner(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
-    types: Option<&mut Vec<Option<u32>>>,
+    types: Option<&mut StatementTypes>,
     describe: bool,
 ) -> Result<Option<Statement>> {
     let sql = sql.trim();
@@ -445,8 +447,12 @@ fn prepare_statement_inner(
         return Ok(Some(stmt));
     }
     if let Some(types) = types {
-        *types =
-            crate::result_types::aggregate_types(&parse_result, &pg_conn.conn.current_schema());
+        let schema = pg_conn.conn.current_schema();
+        types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
+        // Only a statement that can hold a $n pays the walk (a dollar quote reaches it too).
+        if sql.contains('$') {
+            types.params = crate::result_types::parameter_types(&parse_result, &schema);
+        }
     }
 
     let translator = PostgreSQLTranslator::new();

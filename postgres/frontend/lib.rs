@@ -4,6 +4,7 @@ mod copy;
 mod functions;
 mod information_schema;
 mod result_types;
+pub use result_types::StatementTypes;
 mod session;
 
 pub use session::PgConnection as Connection;
