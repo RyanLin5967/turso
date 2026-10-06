@@ -619,6 +619,12 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+    /// Snapshot stores (engine review 7 #4): copies of the recovered snapshot state made at the
+    /// open, and replays of snapshot and log (a second one when the last flight's check failed),
+    /// and the slots the last flight's check read.
+    pub snapshot_copies: u64,
+    pub replays: u64,
+    pub checked_slots: u64,
 }
 
 /// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an

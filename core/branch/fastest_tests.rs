@@ -4098,6 +4098,42 @@ fn a_d0_cut_confirms_no_flight() {
     assert_eq!(word, 0, "a D0 cut confirmed a flight no sync proved");
 }
 
+/// Engine review 7 #4: a snapshot store's open deep-copied the whole recovered snapshot state
+/// before its replay whenever the last flight was unconfirmed (every D0 open whose last flight
+/// names a slot), to replay again only if that flight's check failed. The copy is O(state) and
+/// doubles peak memory, at every such open, though the check passes on nearly all of them. Budget:
+/// no copy when the check passes, at 10 and at 1000 branches. Mutant `snapshot_copied_at_open`.
+#[test]
+fn a_snapshot_stores_open_copies_no_state_when_the_last_flight_checks_out() {
+    let _s = serial();
+    for n in [10usize, 1000] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("snapcopy.db");
+        let incarnation = {
+            let db = open_at(&path, opts(false, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            for _ in 0..n {
+                let _ = trunk.fork_branch().unwrap().into_id();
+            }
+            db.branch_compact_now().unwrap();
+            let b = trunk.fork_branch().unwrap();
+            write_v(&b.connect().unwrap(), 3, "last");
+            let _ = b.into_id();
+            db.incarnation
+        };
+        let db = reopen(&path, opts(false, SyncClass::Off), incarnation);
+        let stats = db.branch_open_stats();
+        assert!(stats.snap_bytes > 0, "n={n}: premise: the open read a snapshot");
+        assert!(stats.checked_slots > 0, "n={n}: premise: the open checked the last flight's slots");
+        assert_eq!(stats.replays, 1, "n={n}: premise: the check passed (one replay)");
+        assert_eq!(
+            stats.snapshot_copies, 0,
+            "n={n}: the open copied the recovered snapshot state though the last flight checked out"
+        );
+    }
+}
+
 /// Engine review 8 #4: once a D0 store's log is raised (here by a trunk commit under a fullfsync
 /// trunk), its rewrite class proves stable storage, so a cut confirmed whatever flight it kept
 /// last by the class alone: a plain D0 flight too, whose slot no sync covered (it landed after

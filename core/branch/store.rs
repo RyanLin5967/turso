@@ -3203,6 +3203,9 @@ impl BranchStore {
                         let check = scanned.last_flight_slots();
                         let snapshot = scanned.take_snapshot();
                         let again = (!check.is_empty()).then(|| (inner.fresh_again(), snapshot.clone()));
+                        if again.as_ref().is_some_and(|(_, s)| s.is_some()) {
+                            stats.snapshot_copies += 1;
+                        }
                         Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
                         if let Some((fresh, snapshot)) = again {
                             let referenced: HashSet<Slot> = inner.referenced_slots().into_iter().collect();
@@ -3212,6 +3215,7 @@ impl BranchStore {
                                 .into_iter()
                                 .filter(|(slot, _)| referenced.contains(slot) || fe_mutant("check_all_named_slots"))
                                 .collect();
+                            stats.checked_slots += named.len() as u64;
                             if !super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
                                 scanned.drop_last_flight();
                                 inner = fresh;
@@ -3438,6 +3442,7 @@ impl BranchStore {
         stats: &mut BranchOpenStats,
     ) -> Result<()> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        stats.replays += 1;
         let t = Instant::now();
         if let Some(snapshot) = snapshot {
             stats.snap_branches = snapshot.branches.len() as u64;
