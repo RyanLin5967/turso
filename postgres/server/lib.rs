@@ -1185,12 +1185,43 @@ fn fatal(code: &str, message: &str) -> PgWireError {
 /// The SQLSTATE an engine error is reported with. Lock contention is PostgreSQL's
 /// lock_not_available, and a stale snapshot its serialization_failure: both tell a client to retry.
 fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
-    let code = match e {
+    error(sqlstate(e), e.to_string())
+}
+
+/// PostgreSQL's SQLSTATE (errcodes.txt) for an engine error, so a driver raises the right class
+/// (wire review 1 item 7). The engine types a constraint failure's kind only in SQLite's fixed
+/// message forms ("UNIQUE constraint failed: ..."), and a statement it cannot compile only as a
+/// ParseError whose text comes from libpg_query ("Invalid statement: ...", always a grammar
+/// error), the translator ("... not supported ...") or the planner ("no such table: ..."); those
+/// forms are read here. Anything unrecognised stays XX000, internal_error.
+fn sqlstate(e: &LimboError) -> &'static str {
+    match e {
         LimboError::Busy => "55P03",
         LimboError::BusySnapshot => "40001",
+        LimboError::ForeignKeyConstraint(_) => "23503",
+        LimboError::Constraint(m) if m.starts_with("UNIQUE constraint failed") => "23505",
+        LimboError::Constraint(m) if m.starts_with("NOT NULL constraint failed") => "23502",
+        LimboError::Constraint(m) if m.starts_with("CHECK constraint failed") => "23514",
+        LimboError::Constraint(m) if m.starts_with("invalid ") => "22P02",
+        LimboError::Constraint(_) => "23000",
+        LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
+        LimboError::ParseError(m)
+            if m.starts_with("no such table") || m.starts_with("no such view") =>
+        {
+            "42P01"
+        }
+        LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
+        LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
+        LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
+            "0A000"
+        }
+        LimboError::ParseError(_) => "42601",
+        LimboError::IntegerOverflow => "22003",
+        LimboError::ReadOnly => "25006",
+        LimboError::DatabaseFull(_) => "53100",
+        LimboError::Interrupt => "57014",
         _ => "XX000",
-    };
-    error(code, e.to_string())
+    }
 }
 
 fn wire_info(e: PgWireError) -> Box<ErrorInfo> {
