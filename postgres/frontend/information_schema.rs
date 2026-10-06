@@ -14,9 +14,6 @@ use turso_core::{
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 
-/// The database every view reports as table_catalog.
-const CATALOG: &str = "turso";
-
 type Load = fn(&Connection) -> Result<Vec<Vec<Value>>>;
 
 /// A virtual table whose rows `load` computes at every scan.
@@ -231,12 +228,16 @@ fn constraints(name: &str, table: &BTreeTable) -> Vec<(String, &'static str, Vec
 
 fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
+    // The catalog columns of every view name the database as current_database() and pg_database
+    // do, by the file's stem, so `WHERE table_catalog = current_database()` keeps every row (wire
+    // review 2 item 10).
+    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         for (i, col) in table.columns().iter().enumerate() {
             let (data_type, udt, len, prec, radix, scale) = column_type(col);
             rows.push(vec![
-                text(CATALOG),
+                text(catalog.as_str()),
                 text("public"),
                 text(name.as_str()),
                 text(col.name.clone().unwrap_or_default()),
@@ -256,7 +257,7 @@ fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
                 opt_int(prec),
                 opt_int(radix),
                 opt_int(scale),
-                text(CATALOG),
+                text(catalog.as_str()),
                 text("pg_catalog"),
                 text(udt),
             ]);
@@ -267,11 +268,12 @@ fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_tables(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
+    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
     let mut rows: Vec<Vec<Value>> = user_tables_sorted(&schema)
         .into_iter()
         .map(|(name, _)| {
             vec![
-                text(CATALOG),
+                text(catalog.as_str()),
                 text("public"),
                 text(name.as_str()),
                 text("BASE TABLE"),
@@ -282,7 +284,7 @@ fn load_tables(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     views.sort();
     for view in views {
         rows.push(vec![
-            text(CATALOG),
+            text(catalog.as_str()),
             text("public"),
             text(view.as_str()),
             text("VIEW"),
@@ -293,6 +295,7 @@ fn load_tables(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_table_constraints(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
+    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         let Table::BTree(bt) = table.as_ref() else {
@@ -300,10 +303,10 @@ fn load_table_constraints(conn: &Connection) -> Result<Vec<Vec<Value>>> {
         };
         for (conname, kind, _) in constraints(name, bt) {
             rows.push(vec![
-                text(CATALOG),
+                text(catalog.as_str()),
                 text("public"),
                 text(conname),
-                text(CATALOG),
+                text(catalog.as_str()),
                 text("public"),
                 text(name.as_str()),
                 text(kind),
@@ -317,6 +320,7 @@ fn load_table_constraints(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_key_column_usage(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
+    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         let Table::BTree(bt) = table.as_ref() else {
@@ -325,10 +329,10 @@ fn load_key_column_usage(conn: &Connection) -> Result<Vec<Vec<Value>>> {
         for (conname, _, cols) in constraints(name, bt) {
             for (i, col) in cols.iter().enumerate() {
                 rows.push(vec![
-                    text(CATALOG),
+                    text(catalog.as_str()),
                     text("public"),
                     text(conname.clone()),
-                    text(CATALOG),
+                    text(catalog.as_str()),
                     text("public"),
                     text(name.as_str()),
                     text(col.clone()),
