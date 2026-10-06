@@ -50,7 +50,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased |
+| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
