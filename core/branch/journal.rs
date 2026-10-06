@@ -3325,10 +3325,19 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         // the writes too. Any other failure is the sync's own (review 3 #4): retried, a later sync
         // of the file could report success for pages this one lost. Mutant `barrier_retries_any`
         // (test builds only): every failure falls back, as before.
+        //
+        // And only on a kernel that does not fall back itself (review 6 #6): from Darwin 23
+        // (macOS 14, xnu-10002) the kernel turns an F_BARRIERFSYNC the file system does not
+        // support into an F_FULLFSYNC and latches that per mount, so ENOTSUP, EOPNOTSUPP, EINVAL
+        // or ENOTTY reaching userland is that full sync's own failure, and a userland fallback
+        // would be the fsyncgate retry. (The kernel also retries EINVAL itself; and EOPNOTSUPP
+        // there can be either the file system's refusal or the full sync's, which it cannot tell
+        // apart from here — the reason the version, not the errno, decides.) Mutant
+        // `barrier_retries_on_new_kernel` (test builds only): the errno decides on every kernel.
         let unsupported = matches!(
             e.raw_os_error(),
             Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
-        );
+        ) && (darwin_major() < 23 || super::store::fe_mutant("barrier_retries_on_new_kernel"));
         if unsupported || super::store::fe_mutant("barrier_retries_any") {
             crate::io::count_barrier_fallback();
             return fsync_file(file, class);
@@ -3344,8 +3353,39 @@ static BARRIER_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI3
 
 /// Test builds: the Darwin major version `barrier_file` takes the kernel for (0: the running
 /// kernel's), so both of its kernel arms run on one machine (review 6 #6).
-#[cfg(test)]
+#[cfg(all(test, target_vendor = "apple"))]
 pub(crate) static DARWIN_MAJOR_FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The running kernel's Darwin major version (`uname`'s release, "25.6.0" -> 25), read once. One
+/// that cannot be read counts as a new kernel (u32::MAX): then no failed barrier is retried, which
+/// costs an old kernel on a file system without barriers its fail-stop instead of a fallback, and
+/// never retries a failed full sync (review 6 #6).
+#[cfg(target_vendor = "apple")]
+fn darwin_major() -> u32 {
+    #[cfg(test)]
+    {
+        let forced = DARWIN_MAJOR_FORCED.load(std::sync::atomic::Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    static MAJOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        // SAFETY: `uname` fills the struct it is given; a zeroed `utsname` is a valid value.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut name) } != 0 {
+            return u32::MAX;
+        }
+        // SAFETY: `uname` NUL-terminates `release` within the array.
+        let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+        release
+            .to_str()
+            .ok()
+            .and_then(|r| r.split('.').next())
+            .and_then(|major| major.parse().ok())
+            .unwrap_or(u32::MAX)
+    })
+}
 
 /// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
 #[cfg(test)]
