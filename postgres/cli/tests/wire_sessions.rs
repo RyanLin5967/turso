@@ -3333,6 +3333,13 @@ fn having_without_group_by_filters_the_aggregate_row() {
         .q("SELECT count(*) FROM t HAVING count(*) > 3")
         .ok("having, true");
     assert_eq!(r.rows, vec![vec![Some("4".to_string())]]);
-    let r = a.x("SELECT count(*) FROM t HAVING count(*) > $1", &["5"]);
-    assert_eq!(r.ok("having $1, false").rows.len(), 0);
+    // An undeclared $1 is bigint here (count(*)'s type), so it compares as a number.
+    let having = "SELECT count(*) FROM t HAVING count(*) > $1";
+    let r = a.xt(having, &[(0, 0, b"5")]);
+    assert_eq!(r.ok("having $1 = 5").rows.len(), 0);
+    let r = a.xt(having, &[(0, 0, b"3")]);
+    assert_eq!(
+        r.ok("having $1 = 3").rows,
+        vec![vec![Some("4".to_string())]]
+    );
 }
