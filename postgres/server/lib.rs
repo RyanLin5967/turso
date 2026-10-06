@@ -3539,4 +3539,42 @@ mod tests {
             "the INSERT was applied more than once"
         );
     }
+
+    /// A COMMIT that meets Busy at the trunk's commit is not run again: the failed COMMIT already
+    /// ended the block (rolled back), so a COMMIT prepared anew found no transaction and answered
+    /// XX000. It answers 40001, a serialization failure the client retries, with the block's write
+    /// gone and the session idle (wire review 5 item 8).
+    #[test]
+    fn a_commit_that_meets_busy_is_a_serialization_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT, v TEXT)");
+        ok(&s, "INSERT INTO t VALUES (1, 'a')");
+        ok(&s, "SELECT turso_branch_create('c')");
+        ok(&s, "BEGIN");
+        ok(&s, "INSERT INTO t VALUES (9, 'x')");
+        s.shared
+            .db
+            .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
+        let replies = s.simple("COMMIT");
+        match replies.as_slice() {
+            [Response::Error(e)] => assert_eq!(e.code, "40001", "{}", e.message),
+            other => panic!("COMMIT answered {} replies, not one error", other.len()),
+        }
+        assert!(
+            matches!(s.transaction_status(), TransactionStatus::Idle),
+            "the failed COMMIT left a block open"
+        );
+        let conn = s.shared.db.connect().unwrap();
+        let count = conn
+            .prepare("SELECT count(*) FROM t WHERE id = 9")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            count,
+            vec![vec![Value::from_i64(0)]],
+            "the block's write was kept"
+        );
+    }
 }
