@@ -497,16 +497,21 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         if cfw && c > 64 {
             continue;
         }
-        let gate = std::sync::Barrier::new(c as usize + 1);
+        // A start flag, not a Barrier: a thread that fails to start, or panics before the start,
+        // cannot leave the others parked for ever.
+        let go = std::sync::atomic::AtomicBool::new(false);
         let s0 = sync_counts();
         std::thread::scope(|s| {
-            for t in 0..c {
-                let gate = &gate;
+            let started = (0..c).try_for_each(|t| {
+                let go = &go;
                 std::thread::Builder::new()
                     .stack_size(8 << 20)
                     .spawn_scoped(s, move || {
-                        let trunk = db.connect().unwrap();
-                        gate.wait();
+                        let trunk = db.connect();
+                        while !go.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        let trunk = trunk.unwrap();
                         for i in 0..rounds {
                             let name = format!("{arm}-{t}-{i:04}");
                             fork_one(&trunk, Some(&name));
@@ -516,9 +521,10 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                             }
                         }
                     })
-                    .unwrap();
-            }
-            gate.wait();
+                    .map(|_| ())
+            });
+            go.store(true, std::sync::atomic::Ordering::Release);
+            started.unwrap_or_else(|e| panic!("{cell}: a thread of {c} did not start: {e}"));
         });
         let s1 = sync_counts();
         let mut m = Sample::new();
@@ -531,10 +537,10 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     }
 }
 
-/// Rounds per thread in the shared-flight arm: 48, down to 4 at C = 1024, so every cell makes at
-/// most 3,072 creates per arm (C·rounds: 48, 384, 3,072, 3,072, 4,096).
+/// Rounds per thread in the shared-flight arm: 48, down to 8 at C = 1024 (C·rounds: 48, 384,
+/// 3,072, 3,072, 8,192), so the start and drain flights weigh little in every cell.
 fn shared_rounds(c: u64) -> u64 {
-    (3_072 / c).clamp(4, 48)
+    (3_072 / c).clamp(8, 48)
 }
 
 /// The memory arm (the L4 memory ruling, DECISIONS.md 2026-10-06T02:55Z (i)): one open of the built
@@ -544,6 +550,7 @@ fn shared_rounds(c: u64) -> u64 {
 fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let base = probe::threads();
     let _ = probe::take_hold_maxima();
+    let foot0 = probe::phys_footprint();
     let before = probe::live_heap_bytes();
     let db = open_at(&built.path);
     assert_ne!(db.incarnation, built.incarnation, "{cell}: the registry returned the old Database: not a reopen");
@@ -552,8 +559,18 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let settled = quiesce(&db, base);
     let after = probe::live_heap_bytes();
     let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let foot1 = probe::phys_footprint();
     let mut s = Sample::new();
-    s.insert("resident_bytes", u64::try_from(after - before).unwrap_or(0));
+    // A negative delta (the open freed more than it kept) is recorded as such, never clamped: the
+    // test refuses it.
+    match u64::try_from(after - before) {
+        Ok(v) => s.insert("resident_bytes", v),
+        Err(_) => s.insert("resident_negative", u64::try_from(before - after).unwrap_or(u64::MAX)),
+    };
+    if let (Some(f0), Some(f1)) = (foot0, foot1) {
+        // Reported, not budgeted (allocator rounding, caches and mmap'd pages; noisier).
+        s.insert(if f1 >= f0 { "footprint_bytes" } else { "footprint_negative" }, f1.abs_diff(f0));
+    }
     s.insert("max_hold_alloc_bytes", hold_bytes);
     s.insert("max_hold_catalog_rows", hold_rows);
     s.insert("quiet", u64::from(settled));
@@ -628,14 +645,27 @@ fn run_instruments(cell: &str) -> String {
     let l2 = probe::live_heap_bytes();
     s.insert("live_while", u64::try_from(l1 - l0).unwrap_or(u64::MAX));
     s.insert("live_after", u64::try_from(l2 - l0).unwrap_or(u64::MAX));
+    let l3 = probe::live_heap_bytes();
+    let mut grown: Vec<u8> = Vec::with_capacity(16);
+    grown.reserve_exact(1024);
+    let l4 = probe::live_heap_bytes();
+    let zeroed = std::hint::black_box(vec![0u8; 4096]);
+    let l5 = probe::live_heap_bytes();
+    drop((grown, zeroed));
+    s.insert("live_realloc", u64::try_from(l4 - l3).unwrap_or(u64::MAX));
+    s.insert("live_zeroed", u64::try_from(l5 - l4).unwrap_or(u64::MAX));
     let _ = probe::take_hold_maxima();
     probe::store_locked();
     for i in 0..3u64 {
         std::hint::black_box(Box::new(i));
     }
     probe::store_unlocked();
+    // A nested hold is one hold: its outermost lock to its unlock.
     probe::store_locked();
     std::hint::black_box(Box::new(0u64));
+    probe::store_locked();
+    std::hint::black_box(Box::new(0u64));
+    probe::store_unlocked();
     probe::store_unlocked();
     let (hold_bytes, hold_rows) = probe::take_hold_maxima();
     s.insert("max_hold_alloc_bytes", hold_bytes);
@@ -692,7 +722,9 @@ fn run_instruments(cell: &str) -> String {
     );
     probe::arm(false);
     let base = probe::threads();
-    let (_, s) = measure(&db, base, || db.branch_named("pop-7").unwrap());
+    let _ = probe::take_hold_maxima();
+    let (_, mut s) = measure(&db, base, || db.branch_named("pop-7").unwrap());
+    s.insert("max_hold_catalog_rows", probe::take_hold_maxima().1);
     put("fc_lookup_cataloged", &s);
     let (_, s) = measure(&db, base, || db.branch_named("never-seen").unwrap());
     put("fc_lookup_unseen", &s);
@@ -772,12 +804,34 @@ fn run_child(spec: &str) -> CellData {
     let exe = std::env::current_exe().unwrap();
     let out = std::env::temp_dir().join(format!("fe-budget-{}-{spec}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
-    let output = std::process::Command::new(exe)
+    // The child's stdout and stderr go to files and it is waited for with a deadline
+    // (`FE_BUDGET_CHILD_TIMEOUT_S`, default 1800): a child that hangs is killed and its cell fails,
+    // instead of stalling every test behind it.
+    let log = |kind: &str| std::env::temp_dir().join(format!("fe-budget-{}-{spec}.{kind}", std::process::id()));
+    let (stdout_path, stderr_path) = (log("stdout"), log("stderr"));
+    let mut child = std::process::Command::new(exe)
         .args(["branch::budget_tests::budget_child", "--exact", "--test-threads=1", "--nocapture"])
         .env("FE_BUDGET_CHILD", spec)
         .env("FE_BUDGET_OUT", &out)
-        .output()
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(env_u64("FE_BUDGET_CHILD_TIMEOUT_S", 1800));
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = (std::fs::remove_file(&stdout_path), std::fs::remove_file(&stderr_path));
     let text = std::fs::read_to_string(&out).unwrap_or_default();
     if let Ok(dir) = std::env::var("FE_BUDGET_RAW_DIR") {
         let _ = std::fs::create_dir_all(&dir);
@@ -785,11 +839,9 @@ fn run_child(spec: &str) -> CellData {
     }
     let _ = std::fs::remove_file(&out);
     assert!(
-        output.status.success() && text.ends_with(&format!("done cell={spec}\n")),
-        "budget cell {spec}: the child failed ({}):\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.is_some_and(|s| s.success()) && text.ends_with(&format!("done cell={spec}\n")),
+        "budget cell {spec}: the child failed ({}):\n{stdout}\n{stderr}",
+        status.map_or("killed at its deadline".to_string(), |s| s.to_string()),
     );
     let mut ops: BTreeMap<String, Vec<BTreeMap<String, u64>>> = BTreeMap::new();
     for l in text.lines().filter(|l| l.starts_with("sample ")) {
@@ -1092,12 +1144,20 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_lookup_unseen", "log_bytes"), 0, "a lookup appended to the log");
     assert_eq!(get("fc_lookup_unseen", "catalog_stmts"), 0, "a lookup of an unseen name ran a catalog statement");
     assert!(get("fc_lookup_cataloged", "catalog_stmts") >= 1, "a cataloged name's lookup ran no catalog statement");
+    assert!(get("fc_lookup_cataloged", "catalog_rows_touched") >= 1, "a cataloged name's lookup read no catalog row");
+    assert!(
+        get("fc_lookup_cataloged", "max_hold_catalog_rows") >= 1,
+        "a lookup made under the store mutex read no catalog row inside a hold"
+    );
+    assert_eq!(get("fc_lookup_unseen", "catalog_rows_touched"), 0, "a lookup of an unseen name read a catalog row");
     assert_eq!(get("fc_lookup_cataloged", "catalog_writes"), 0, "a lookup wrote the catalog");
     assert!(get("fc_checkpoint_writes", "catalog_writes") >= 1, "a sharp checkpoint of a dirty store wrote no catalog row");
     assert_eq!(get("fc_thread_count", "with"), get("fc_thread_count", "base") + 1, "a live thread uncounted");
     assert_eq!(get("fc_live_and_hold", "live_while"), 1 << 20, "a live 1 MiB buffer");
     assert_eq!(get("fc_live_and_hold", "live_after"), 0, "a freed buffer still counted live");
-    assert_eq!(get("fc_live_and_hold", "max_hold_alloc_bytes"), 24, "the larger of two holds (3 boxes of a u64, then 1)");
+    assert_eq!(get("fc_live_and_hold", "live_realloc"), 1024, "a 16 B buffer reallocated to 1 KiB");
+    assert_eq!(get("fc_live_and_hold", "live_zeroed"), 4096, "a zeroed 4 KiB buffer");
+    assert_eq!(get("fc_live_and_hold", "max_hold_alloc_bytes"), 24, "the largest of two holds (3 boxes of a u64; then a nested hold of 2)");
     assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
@@ -1794,18 +1854,6 @@ fn leap_l2_a_create_takes_no_store_mutex() {
     assert_budgets("create", &[every("locks", Want::Exactly(0), "LEAP L2: no store mutex on the create path")]);
 }
 
-/// The acknowledgements per F_FULLFSYNC at `spec`, per arm.
-fn shared_ratio(spec: &str) -> Vec<(String, u64, u64, u64)> {
-    let c = cell(spec);
-    ["shared_create", "shared_cfw"]
-        .iter()
-        .map(|arm| {
-            let s = &c.ops[*arm][0];
-            (arm.to_string(), s["threads"], s["acks"], s[FULL])
-        })
-        .collect()
-}
-
 /// LEAP L3, creates and first writes always ride shared flights: one F_FULLFSYNC carries every
 /// acknowledgement in flight. At C clients in a closed loop:
 /// - each flush carries at least 0.9·C acknowledgements up to C = 64, for creates and for
@@ -1814,7 +1862,9 @@ fn shared_ratio(spec: &str) -> Vec<(String, u64, u64, u64)> {
 /// - creates per flush RISE with C at every step 1, 8, 64, 256, 1024 (lead, 2026-10-06), "near-linear
 ///   until CPU-bound" (DECISIONS L3): past 64 the serial section, not the flush, may bound it, so only
 ///   the rise is held there.
-/// Alternating cohorts (review 1 #9) give about C/2 per flush.
+/// Alternating cohorts (review 1 #9) give about C/2 per flush: the 0.9·C bound up to 64 catches
+/// them; the rise alone above 64 does not (C/2 rises too), and a CPU ceiling past 64 would fail
+/// the rise while L3 is reached — that case is argued from its numbers, not waived.
 #[test]
 fn leap_l3_creates_per_flush_rise_with_the_clients() {
     if in_child() {
@@ -1895,9 +1945,14 @@ fn leap_l4_an_open_reads_only_the_catalog_meta_row() {
 /// The L4 memory ruling (DECISIONS.md 2026-10-06T02:55Z (i): "about 50-100 MB at 10^6 live branches
 /// ... a budget test measures resident bytes per live branch at 10^4 and 10^5 and asserts the
 /// slope"): the heap an open leaves resident once its background work has settled grows by at most
-/// 100 B per live branch between 10^4 and 10^5 named branches. Fixed costs cancel in the slope; a
-/// catalog page cache's fill counts (it is resident), its cap bounds it. Memory is reported, not a
-/// won metric: this is a guard on L4, green before it and required after it.
+/// 100 B per live branch between 10^4 and 10^5 named branches. Fixed costs cancel in the slope.
+/// The count is of REQUESTED heap bytes (the counting allocator's): the allocator's rounding (a
+/// 6-9 B name occupies a 16 B block) and pages the buffer pool maps itself are not in it; the
+/// kernel's physical footprint, which has them, is reported beside it. BLIND SPOT: a table that
+/// grows by doubling is measured at the load these two N give it (hashbrown: 16,384 and 131,072
+/// buckets for 10,016 and 100,016 entries), and at 10^6 (2,097,152 buckets) costs more per entry
+/// than this slope says. Memory is reported, not a won metric: this is a guard on L4, green
+/// before it and required after it.
 #[test]
 fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
     if in_child() {
@@ -1906,18 +1961,32 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
     assert!(sa["quiet"] == 1 && sb["quiet"] == 1, "a background thread outlived the wait: the heap was still moving");
-    let (ra, rb) = (sa["resident_bytes"], sb["resident_bytes"]);
+    let resident = |s: &Map, n: u64| {
+        *s.get("resident_bytes").unwrap_or_else(|| {
+            panic!("at {n}: the open's resident delta is negative ({:?} B): the measurement is broken", s.get("resident_negative"))
+        })
+    };
+    let (ra, rb) = (resident(sa, N_LARGE), resident(sb, N_HUGE));
     let slope = (rb as f64 - ra as f64) / (N_HUGE - N_LARGE) as f64;
+    let foot = match (sa.get("footprint_bytes"), sb.get("footprint_bytes")) {
+        (Some(&fa), Some(&fb)) => format!("{:.1} B per branch", (fb as f64 - fa as f64) / (N_HUGE - N_LARGE) as f64),
+        _ => "not read".to_string(),
+    };
     assert!(
         slope <= 100.0,
-        "an open keeps {slope:.1} B resident per live branch ({ra} B at {N_LARGE}, {rb} B at {N_HUGE}); budget 100 B [L4 memory ruling]"
+        "an open keeps {slope:.1} B resident per live branch ({ra} B at {N_LARGE}, {rb} B at {N_HUGE}; physical footprint {foot}); budget 100 B [L4 memory ruling]"
     );
 }
 
-/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): during an open
-/// and its background work, no single store-mutex hold, by any thread, allocates more than 64 KiB
-/// or touches more than 1,024 catalog rows, at 10^4 and at 10^5 live branches, and the largest at
-/// 10^5 is at most twice the largest at 10^4. An O(N) hold at 10^5 is ten times either bound.
+/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): the largest
+/// single store-mutex hold during an open and its background work, by any thread, does not grow
+/// with the live branches: from 10^4 to 10^5 its allocated bytes grow by at most a quarter plus 4
+/// KiB, and its catalog rows by at most a quarter plus 64. An O(N) hold grows tenfold. The size of
+/// an O(1) hold is not judged here: base10's opening thread allocated 1,029,243 B under the mutex
+/// in 9 holds at every N, so some hold is >= 114 KB at any N (a fix item, not this guard's).
+/// BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no catalog row (the
+/// D0 recovery instruction test sees that one); a catalog statement that changes many rows counts
+/// one (`Stmt::exec`).
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -1926,10 +1995,10 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
     let mut failures = String::new();
-    for (k, most) in [("max_hold_alloc_bytes", 64u64 << 10), ("max_hold_catalog_rows", 1024)] {
+    for (k, slack) in [("max_hold_alloc_bytes", 4096u64), ("max_hold_catalog_rows", 64)] {
         let (x, y) = (sa[k], sb[k]);
-        if x > most || y > most || y > 2 * x.max(1) {
-            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {most} and <= 2x the 10^4 value");
+        if y > x + x / 4 + slack {
+            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {x}/4 + {slack}");
         }
     }
     assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");

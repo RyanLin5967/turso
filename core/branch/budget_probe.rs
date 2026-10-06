@@ -92,23 +92,33 @@ fn note_alloc(bytes: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note_alloc(layout.size());
-        LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
+        }
+        p
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         note_alloc(layout.size());
-        LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
-        unsafe { System.alloc_zeroed(layout) }
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
+        }
+        p
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note_alloc(new_size);
-        LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        // A failed realloc leaves the old block allocated, unchanged.
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Relaxed);
+        }
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -344,6 +354,33 @@ pub(crate) fn instructions() -> Option<u64> {
             return None;
         }
         Some(info.ri_instructions)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
+
+/// This process's physical footprint (`ri_phys_footprint`, the kernel's own count: allocator
+/// rounding, its caches and mmap'd memory included, unlike `live_heap_bytes`), or `None` off Apple.
+/// A BSD syscall: read it only outside a measured window.
+pub(crate) fn phys_footprint() -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: zeroes are a valid `rusage_info_v4` (plain integers and a uuid array).
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a `rusage_info_v4`, the flavor asked for.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        Some(info.ri_phys_footprint)
     }
     #[cfg(not(target_vendor = "apple"))]
     {
