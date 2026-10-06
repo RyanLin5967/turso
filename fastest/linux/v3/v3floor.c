@@ -613,7 +613,7 @@ static const char *find_sys(layer *l, int k) {
 
 static const char *loop_verify(layer *l, int k) {
     char node[96];
-    unsigned maj, mnr;
+    unsigned maj = 0, mnr = 0;
     if (sscanf(l->diskdev, "%u:%u", &maj, &mnr) != 2) return whyf("layer %d: bad dev %s", k, l->diskdev);
     snprintf(node, sizeof node, "/dev/%s", l->diskname);
     struct stat sb;
@@ -770,7 +770,7 @@ static const char *nvme_vwc(const char *ctrl, int *vwc) {
     char node[64], p[PATH_MAX], dv[32];
     snprintf(node, sizeof node, "/dev/%s", ctrl);
     pathf(p, sizeof p, "/sys/class/nvme/%s/dev", ctrl);
-    unsigned maj, mnr;
+    unsigned maj = 0, mnr = 0;
     struct stat sb;
     if (read_line(p, dv, sizeof dv) != 0 || sscanf(dv, "%u:%u", &maj, &mnr) != 2 || stat(node, &sb) != 0 ||
         !S_ISCHR(sb.st_mode) || major(sb.st_rdev) != maj || minor(sb.st_rdev) != mnr)
@@ -860,7 +860,7 @@ static const char *leaf_checks(const layer *l) {
         else if (strstr(ct, "write through") || !strcmp(ct, "none")) snprintf(li->report, sizeof li->report, "write through");
         else return whyf("cannot parse the drive's cache report '%s' (%s)", ct, li->report_source);
     } else if (!strcmp(li->driver, "virtio_blk")) {
-        char ct[64];
+        char ct[32];
         pathf(li->report_source, sizeof li->report_source, "%s/cache_type", l->disk);
         if (read_line(li->report_source, ct, sizeof ct) != 0)
             return whyf("cannot read the drive's own cache report: %s", li->report_source);
@@ -870,7 +870,7 @@ static const char *leaf_checks(const layer *l) {
         if (!li->nctrl) return whyf("cannot map the leaf %s to an NVMe controller", l->diskname);
         int first = -1;
         for (int c = 0; c < li->nctrl; c++) {
-            int vwc;
+            int vwc = 0;
             const char *why = nvme_vwc(li->ctrls[c], &vwc);
             if (why) return why;
             if (first >= 0 && vwc != first) return whyf("the controllers of %s disagree on VWC", l->diskname);
