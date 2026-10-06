@@ -312,25 +312,31 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     t1m = re.search(r"^t1=(\d+\.\d+)", win, re.M)
     t1 = float(t1m.group(1)) if (attached and t1m) else None
     # An attach window's stamps are clock pairs (trace.sh clock_pair): between consecutive ones, tseize -> t0
-    # [-> tsplit] -> t1 -> tend, the CLOCK_REALTIME delta must equal the CLOCK_MONOTONIC one within 1 ms, or the
-    # realtime clock stepped somewhere in the trace's life and the cuts cannot be trusted; and every call stamp must lie
-    # inside [tseize, tend]. Comparing call stamps with each other (above) misses a step before the first call or after
-    # the last (fifth-review re-review, finding 2). A missing pair refuses the window.
+    # [-> tsplit] -> t1 -> tend, the CLOCK_REALTIME delta must equal the CLOCK_MONOTONIC one within 1 ms plus the two
+    # pairs' own read uncertainty (NAME_err), or the realtime clock stepped somewhere in the trace's life and the cuts
+    # cannot be trusted; and every call stamp must lie inside [tseize, tend]. Comparing call stamps with each other
+    # (above) misses a step before the first call or after the last (fifth-review re-review, finding 2). A missing
+    # pair refuses the window.
     clock = {}
-    for name, mono, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono)?=(\d+\.\d+)", win, re.M):
-        clock.setdefault(name + mono, float(val))
+    for name, sfx, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono|_err)?=(\d+\.\d+)", win, re.M):
+        clock.setdefault(name + sfx, float(val))
     out_clock = None
     if attached:
         chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
         absent = [k for n in chain for k in (n, n + "_mono") if k not in clock]
+        loose = [n for n in chain if clock.get(n + "_err", 0.0) > 0.0005]
         if absent:
             problems.append(f"attach window without its clock pair(s) {absent}: a clock step could not be seen")
+        elif loose:
+            problems.append(f"clock pair(s) {loose} read with more than 0.5 ms between their monotonic reads in 50 "
+                            "tries: a step that size could not be told from the read")
         else:
             steps = []
             for a, b in zip(chain, chain[1:]):
                 dr, dm = clock[b] - clock[a], clock[b + "_mono"] - clock[a + "_mono"]
+                tol = 0.001 + clock.get(a + "_err", 0.0) + clock.get(b + "_err", 0.0)
                 steps.append([a, b, round(dr - dm, 6)])
-                if dm < 0 or abs(dr - dm) > 0.001:
+                if dm < 0 or abs(dr - dm) > tol:
                     problems.append(f"CLOCK_REALTIME stepped {dr - dm:+.6f} s between {a} and {b} (realtime {dr:.6f} s "
                                     f"against monotonic {dm:.6f} s): the window cuts cannot be trusted")
             if first_ts is not None and (first_ts < clock["tseize"] - 0.001 or last_ts > clock["tend"] + 0.001):

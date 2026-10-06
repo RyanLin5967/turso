@@ -32,13 +32,46 @@ TRACESET=$TRACESET,clone,clone3
 STRACE_OPTS=(-f -C -y -ttt -qq -s 160 -e signal=none -e "trace=$TRACESET")
 ST_PID=
 
-# clock_pair NAME -> "NAME=<CLOCK_REALTIME> NAME_mono=<CLOCK_MONOTONIC>", both read back to back in one process. The
-# window's cuts and strace's -ttt stamps read CLOCK_REALTIME, which a step (NTP, settimeofday) moves; MONOTONIC is
-# never stepped and runs at the same rate, so between two pairs the realtime and monotonic deltas differ only by a
-# step. stracecount compares them over the attach's whole life, tseize -> t0 [-> tsplit] -> t1 -> tend, and refuses
-# the window on a difference over 1 ms (fifth-review re-review, finding 2: comparing call stamps with each other
-# cannot see a step before the first call or after the last). No pair (python3 failed) is a refused window.
-clock_pair() { python3 -B -c 'import sys, time; r = time.time(); m = time.monotonic(); print("%s=%.9f %s_mono=%.9f" % (sys.argv[1], r, sys.argv[1], m))' "$1"; }
+# clock_pair NAME -> "NAME=<CLOCK_REALTIME> NAME_mono=<CLOCK_MONOTONIC> NAME_err=<s>". The window's cuts and strace's
+# -ttt stamps read CLOCK_REALTIME, which a step (NTP, settimeofday) moves; MONOTONIC is never stepped and runs at the
+# same rate, so between two pairs the realtime and monotonic deltas differ only by a step. stracecount compares them
+# over the attach's whole life, tseize -> t0 [-> tsplit] -> t1 -> tend, and refuses the window on a difference over
+# 1 ms plus both pairs' err (fifth-review re-review, finding 2: comparing call stamps with each other cannot see a step
+# before the first call or after the last). No pair is a refused window.
+# Each pair is read as monotonic, realtime, monotonic, best of up to 50 reads (until the two monotonic reads are
+# under 100 us apart); NAME_mono is their midpoint and NAME_err half their gap, so a preemption between the reads
+# widens the tolerance instead of refusing a correct window (second re-review, finding 3). The reads are served by
+# ONE long-lived python3 per shell (the STAMPER coproc), so a stamp costs a pipe round-trip, not an interpreter start
+# inside the window's boundary (second re-review, finding 4); a one-shot python3 is the fallback.
+STAMP_PY='
+import sys, time
+for name in sys.stdin:
+    name = name.strip()
+    best = None
+    for _ in range(50):
+        m1 = time.monotonic(); r = time.time(); m2 = time.monotonic()
+        if best is None or m2 - m1 < best[2] - best[0]:
+            best = (m1, r, m2)
+        if m2 - m1 < 1e-4:
+            break
+    m1, r, m2 = best
+    print("%s=%.9f %s_mono=%.9f %s_err=%.9f" % (name, r, name, (m1 + m2) / 2, name, (m2 - m1) / 2), flush=True)
+'
+coproc STAMPER { exec python3 -B -I -u -c "$STAMP_PY"; }
+clock_pair() {
+  local line=""
+  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null; then
+    # In a command substitution, so a stamper that died between the check and the write costs that subshell its
+    # SIGPIPE, not the caller; a reply that does not answer THIS name (a desync) retires the stamper.
+    line=$( { printf '%s\n' "$1" >&"${STAMPER[1]}" && IFS= read -r -t 5 l <&"${STAMPER[0]}" && printf '%s' "$l"; } 2>/dev/null )
+    case $line in
+      "$1="*) ;;
+      *) kill "$STAMPER_PID" 2>/dev/null; STAMPER_PID=; line="" ;;
+    esac
+  fi
+  [ -n "$line" ] || line=$(printf '%s\n' "$1" | python3 -B -I -c "$STAMP_PY")
+  printf '%s\n' "$line"
+}
 
 descendants() { # descendants PID -> every live, non-zombie descendant pid of PID, one per line (children of children too)
   local c

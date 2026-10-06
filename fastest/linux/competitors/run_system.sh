@@ -206,7 +206,8 @@ run_server_cell() { # run_server_cell SPEC C
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
   # Nothing but a stat between the ops and the window's end (tsplit for PG, the detach otherwise): fsused's
-  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it.
+  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it. The
+  # end stamp itself is a pipe round-trip to trace.sh's stamper, not an interpreter start (clock_pair).
   log1=$(stat -c %s "$DATA.log")
   local defer=() tw=()
   if [ "$KIND" = pg ]; then
