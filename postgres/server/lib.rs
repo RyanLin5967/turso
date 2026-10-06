@@ -119,7 +119,17 @@ struct Shared {
     /// use), and a switch while the branch is being deleted. One hash operation under the lock per
     /// switch, per leave and two per delete; no engine call is made under it.
     in_use: Mutex<std::collections::HashMap<String, BranchUse>>,
+    /// Signalled when an entry leaves `in_use`, for a delete waiting on a session that is closing.
+    in_use_freed: std::sync::Condvar,
+    /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
+    /// uncontended switch or delete wakes nobody.
+    in_use_waiters: AtomicUsize,
 }
+
+/// How long a delete waits for the session on its branch to go, and a switch for a delete of its
+/// branch to end: PostgreSQL's DROP DATABASE waits 5 s for exiting backends (CountOtherDBBackends,
+/// 50 x 100 ms).
+const IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchUse {
@@ -128,13 +138,63 @@ enum BranchUse {
 }
 
 impl Shared {
+    fn new(
+        db: Arc<Database>,
+        db_file: String,
+        max_connections: usize,
+        lock_wait: std::time::Duration,
+    ) -> Self {
+        Self {
+            db,
+            db_file,
+            max_connections,
+            lock_wait,
+            live: AtomicUsize::new(0),
+            in_use: Mutex::new(std::collections::HashMap::new()),
+            in_use_freed: std::sync::Condvar::new(),
+            in_use_waiters: AtomicUsize::new(0),
+        }
+    }
+
     fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<String, BranchUse>> {
         self.in_use.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Claim `name` for a session about to connect to it.
+    /// The map once `name` is in none of `states` there, or at IN_USE_WAIT: what a closing session
+    /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
+    fn wait_while<'a>(
+        &'a self,
+        mut uses: MutexGuard<'a, std::collections::HashMap<String, BranchUse>>,
+        name: &str,
+        states: &[BranchUse],
+    ) -> MutexGuard<'a, std::collections::HashMap<String, BranchUse>> {
+        let held = |uses: &std::collections::HashMap<String, BranchUse>| {
+            uses.get(name).is_some_and(|u| states.contains(u))
+        };
+        if !held(&uses) {
+            return uses;
+        }
+        self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + IN_USE_WAIT;
+        while held(&uses) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            uses = self
+                .in_use_freed
+                .wait_timeout(uses, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        self.in_use_waiters.fetch_sub(1, Ordering::SeqCst);
+        uses
+    }
+
+    /// Claim `name` for a session about to connect to it. A branch another session is on is
+    /// refused at once (one session per branch); one being deleted is waited for.
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        let mut uses = self.uses();
+        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Deleting]);
         if let Some(u) = uses.get(name) {
             let mut e = in_use_error(name, *u);
             e.severity = severity.to_string();
@@ -147,11 +207,15 @@ impl Shared {
     /// A session left `name`, or never reached it, or a delete of it ended.
     fn release(&self, name: &str) {
         self.uses().remove(name);
+        if self.in_use_waiters.load(Ordering::SeqCst) > 0 {
+            self.in_use_freed.notify_all();
+        }
     }
 
-    /// Mark `name` as being deleted: refused while a session is on it.
+    /// Mark `name` as being deleted. A session on it is waited for (up to IN_USE_WAIT: one that is
+    /// closing releases it within that), then refused with 55006.
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
-        let mut uses = self.uses();
+        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
         if let Some(u) = uses.get(name) {
             return Err(in_use_error(name, *u));
         }
@@ -181,14 +245,7 @@ impl TursoPgServer {
     ) -> Self {
         Self {
             address,
-            shared: Arc::new(Shared {
-                db,
-                db_file,
-                max_connections,
-                lock_wait,
-                live: AtomicUsize::new(0),
-                in_use: Mutex::new(std::collections::HashMap::new()),
-            }),
+            shared: Arc::new(Shared::new(db, db_file, max_connections, lock_wait)),
             interrupt_count,
         }
     }
@@ -771,7 +828,12 @@ impl Session {
             _ => {}
         }
         let result = match call {
-            Some(call) => self.branch(&mut st, &conn, &call, portal, format),
+            Some(call) => {
+                // A statement a Describe kept holds its connection open: a switch away, or a
+                // delete of the branch it is on, must not find that connection still alive.
+                st.described = None;
+                self.branch(&mut st, &conn, &call, portal, format)
+            }
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
             None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
                 Err(error(
@@ -2783,14 +2845,12 @@ mod tests {
         });
         let (_io, db) =
             turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts).unwrap();
-        Session::new(Arc::new(Shared {
+        Session::new(Arc::new(Shared::new(
             db,
-            db_file: path,
-            max_connections: 1,
-            lock_wait: std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
-            live: AtomicUsize::new(0),
-            in_use: Mutex::new(std::collections::HashMap::new()),
-        }))
+            path,
+            1,
+            std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+        )))
     }
 
     fn ok(session: &Session, sql: &str) {
