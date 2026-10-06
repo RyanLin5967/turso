@@ -3343,3 +3343,55 @@ fn having_without_group_by_filters_the_aggregate_row() {
         vec![vec![Some("4".to_string())]]
     );
 }
+
+/// A FATAL error ends the session: after a startup refused FATAL (a branch that does not exist),
+/// a query sent on the same socket is never run, and the socket closes. pgwire answered the FATAL,
+/// shut its write half only and went on reading, so the query ran on the trunk unseen (wire review
+/// 5 item 4).
+#[test]
+fn a_fatal_startup_error_ends_the_session() {
+    let dir = Scratch::new("fatalend");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut w = Wire { s };
+    let mut body = Vec::new();
+    body.extend_from_slice(&196608i32.to_be_bytes());
+    for (k, v) in [("user", "postgres"), ("database", "postgres/nosuch")] {
+        body.extend_from_slice(k.as_bytes());
+        body.push(0);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    w.s.write_all(&((body.len() + 4) as i32).to_be_bytes())
+        .unwrap();
+    w.s.write_all(&body).unwrap();
+    let r = w.read_reply();
+    assert_eq!(
+        r.err("startup on a branch that does not exist").code,
+        "3D000"
+    );
+    // The query goes out whatever the server did; whether the write is refused does not matter.
+    let mut q = b"INSERT INTO t VALUES (7, 'after fatal')".to_vec();
+    q.push(0);
+    let mut m = vec![b'Q'];
+    m.extend_from_slice(&((q.len() + 4) as i32).to_be_bytes());
+    m.extend_from_slice(&q);
+    let _ = w.s.write_all(&m);
+    let r = w.read_reply();
+    assert!(
+        r.error.is_none() && r.status == 0 && r.tags.is_empty(),
+        "the session answered after its FATAL: {:?} {:?}",
+        r.tags,
+        r.error
+    );
+    // Give a query that did reach the session the time to run before looking.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 7").single("rows"),
+        "0",
+        "a query after the FATAL ran"
+    );
+}
