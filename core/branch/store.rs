@@ -487,12 +487,15 @@ impl Group {
 
     /// Record a flight's outcome and wake every waiter: on success every byte below `end` is
     /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) replaces
-    /// the last one for the confirmation writer.
-    fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) {
+    /// the last one for the confirmation writer. Returns whether the landing was accepted: a flight
+    /// that succeeded on a store fail-stopped meanwhile is refused, and its owner must say so
+    /// (engine review 9 #3).
+    fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
         let mut g = self.lock();
         g.flushing = false;
         let mut replaced = None;
-        if ok && self.accepts() {
+        let accepted = ok && self.accepts();
+        if accepted {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
             }
@@ -512,6 +515,7 @@ impl Group {
         drop(g);
         // The replaced confirmation's descriptor is closed holding no lock.
         drop(replaced);
+        accepted
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -3646,8 +3650,14 @@ impl BranchStore {
                 journal.poison();
             }
         }
-        self.group.land(end, class, written.is_ok(), confirm);
+        let accepted = self.group.land(end, class, written.is_ok(), confirm);
         written?;
+        // Refused: the store fail-stopped while the flight was in the air, so nothing it carried
+        // is durable in this process, and the caller must not act as if it were (engine review 9
+        // #3). Mutant `locked_flush_ignores_refusal` (test builds only): Ok, as before.
+        if !accepted && !fe_mutant("locked_flush_ignores_refusal") {
+            return Err(group_poisoned());
+        }
         self.mature(inner);
         Ok(())
     }
