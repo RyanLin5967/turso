@@ -286,10 +286,23 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
            "orphan_resumed": orphan_resumed, "attached_proven": attached, "empty_window": empty_window,
            "strace_stderr": stray[:20]}
 
+    # An attach window's counts start at its t0, the moment load_s and idle_s start: the calls between the seize and
+    # t0 (the attach proof, the fd scan, the roster) are left out (fourth review, finding 9: F10d had 18-32 child
+    # fsyncs there). A window whose calls are unstamped cannot be cut and is counted from the seize, as before.
+    t0m = re.search(r"\bt0=(\d+\.\d+)", win)
+    t0 = float(t0m.group(1)) if (attached and t0m) else None
+    before_t0 = 0
+
     def selected(ts):
+        nonlocal before_t0
+        if t0 is not None and ts is not None and ts < t0:
+            before_t0 += 1
+            return False
         if tsplit is None or ts is None:
             return part is None
         return ts < tsplit if part == "pre" else ts >= tsplit
+
+    BLIND_NAMES = OPENS + ("fcntl", "pwritev2", "io_submit", "io_uring_setup", "io_uring_enter", "io_uring_register")
 
     flush = {k: 0 for k in FLUSH}
     flush["msync_sync"] = 0
@@ -307,7 +320,9 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
             if done and ret.isdigit() and int(ret) > 0:
                 spawned.append((tid, ret, name.startswith("clone") and "CLONE_THREAD" in rest))
             continue
-        if not selected(ts):
+        # Blind spots are searched in EVERY call of the trace, whatever its part or time: an fd opened O_DSYNC before
+        # t0 or before tsplit still makes later writes flushes.
+        if name not in BLIND_NAMES and not selected(ts):
             continue
         if not done and (name in FLUSH or name in ("msync", "sync_file_range", "copy_file_range", "ioctl")):
             continue
@@ -360,6 +375,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         elif name == "io_submit":
             other["io_submit"] += 1
     out["flush_by_syscall"] = flush
+    out["t0"], out["calls_before_t0"] = t0, before_t0
     out["flushes"] = sum(flush.values())
     out.update(other)
     out["by_class"] = by_class
