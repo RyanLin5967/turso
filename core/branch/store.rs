@@ -1128,6 +1128,22 @@ fn pause_name_scan() {
 /// thread that drives it).
 const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
 
+/// Test builds: `PENDING_FULL_WAIT` in milliseconds when set (0: the constant), so a test can make
+/// a stall on `pending_full` unmistakable instead of timing a 100 ms one (review 3 #9).
+#[cfg(test)]
+pub(crate) static PENDING_FULL_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn pending_full_wait() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = PENDING_FULL_WAIT_MS.load(Ordering::Acquire);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    PENDING_FULL_WAIT
+}
+
 /// `files_dev` before the branch files are open, or when their device could not be read.
 const NO_DEVICE: u64 = u64::MAX;
 
@@ -3457,7 +3473,7 @@ impl BranchStore {
                         first = false;
                         let (woken, timeout) = group
                             .cv
-                            .wait_timeout(g, PENDING_FULL_WAIT)
+                            .wait_timeout(g, pending_full_wait())
                             .unwrap_or_else(|e| e.into_inner());
                         g = woken;
                         if timeout.timed_out()
@@ -8882,6 +8898,44 @@ mod sota_tree_tests {
     use super::*;
 
     const PAGES: u32 = 6;
+
+    /// Review 3 #9: a trunk commit whose WAL will NOT be F_FULLFSYNCed (synchronous=NORMAL: its
+    /// class is Off) under a D2 store does not take the ordered path: ordering its records ahead of
+    /// a WAL flush that never comes left `pending_full` set, and a waiter its flight covered then
+    /// stalled for the pending-full wait before leading its own flush. Here that wait is 60 s, so a
+    /// stall cannot pass for a slow sync.
+    #[test]
+    fn a_commit_whose_wal_is_not_full_fsynced_orders_nothing() {
+        use std::sync::atomic::Ordering as O;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PENDING_FULL_WAIT_MS.store(0, O::Release);
+            }
+        }
+        let _restore = Restore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: SyncClass::FullFsync }, None, path).unwrap();
+        let _x = store.fork_trunk_locked(Arc::new(Schema::default()), PAGE).unwrap();
+        // The trunk's WAL on the branch files' device, as an F_FULLFSYNC-capable file reports it.
+        store.note_trunk_wal(Some(store.files_dev.load(O::Acquire)));
+        let lsn = {
+            let mut inner = store.inner.lock();
+            store.buffer_records(&mut inner, &[Record::Clock { now_ms: 7 }]).unwrap()
+        };
+        // The barrier of a commit at synchronous=NORMAL (`SyncClass::of_trunk` gives Off).
+        store.durability_barrier_to(SyncClass::Off, lsn).unwrap();
+        PENDING_FULL_WAIT_MS.store(60_000, O::Release);
+        let t = Instant::now();
+        store.wait_durable(lsn, SyncClass::FullFsync).unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "a waiter stalled on a WAL flush that a NORMAL trunk commit never makes ({:?})",
+            t.elapsed()
+        );
+    }
 
     /// Review 5 #18, the D1/D2 half: a free matures only once the Release that frees it is durable
     /// in the store's class. A Release that rode an ORDERED flight (written and barriered, durable
