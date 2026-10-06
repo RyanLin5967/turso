@@ -7969,4 +7969,36 @@ mod tests {
             assert_eq!(call(not_a_call), None, "{not_a_call}");
         }
     }
+
+    /// One statement translated by a fresh translator, as SQLite text.
+    fn translated_sql(sql: &str) -> Result<String, ParseError> {
+        let parsed = crate::parse(sql).unwrap();
+        PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .map(|stmt| stmt.to_string())
+    }
+
+    /// LATERAL is inlined only as CROSS JOIN LATERAL of a subselect of expressions. A LATERAL join
+    /// with a condition of its own (USING, NATURAL, ON, LEFT) and a comma LATERAL are refused,
+    /// never inlined with the condition dropped: USING and NATURAL were inlined, and every outer
+    /// row came back (wire review 2 item 4).
+    #[test]
+    fn a_lateral_join_with_a_condition_of_its_own_is_refused() {
+        for sql in [
+            "SELECT t.x FROM t JOIN LATERAL (SELECT t.x AS x) AS o USING (x)",
+            "SELECT t.x FROM t JOIN LATERAL (SELECT t.x AS x) AS o USING (x) AS j",
+            "SELECT t.x FROM t NATURAL JOIN LATERAL (SELECT t.x AS x) AS o",
+            "SELECT t.x FROM t LEFT JOIN LATERAL (SELECT t.x) AS o(y) ON true",
+            "SELECT t.x FROM t JOIN LATERAL (SELECT t.x) AS o(y) ON true",
+            "SELECT t.x FROM t, LATERAL (SELECT t.x) AS o(y)",
+        ] {
+            let r = translated_sql(sql);
+            assert!(r.is_err(), "{sql} was translated: {r:?}");
+        }
+        // The supported shape still is.
+        let out =
+            translated_sql("SELECT t.x, o.y FROM t CROSS JOIN LATERAL (SELECT t.x * 2) AS o(y)")
+                .unwrap();
+        assert!(out.contains("(t.x * 2)"), "{out}");
+    }
 }
