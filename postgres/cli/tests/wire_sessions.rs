@@ -1417,3 +1417,25 @@ fn pgbench_table_probe_runs() {
         ]
     );
 }
+
+/// DDL completes with PostgreSQL's command tag for its object (the E2 suite's CREATE SEQUENCE read
+/// CREATE TABLE): the verb and the object, whatever modifiers come between.
+#[test]
+fn ddl_statements_report_their_command_tags() {
+    let dir = Scratch::new("ddltags");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for (sql, tag) in [
+        ("CREATE SEQUENCE sq", "CREATE SEQUENCE"),
+        ("CREATE UNIQUE INDEX t_v_u ON t (v)", "CREATE INDEX"),
+        ("CREATE INDEX IF NOT EXISTS t_v_i ON t (v)", "CREATE INDEX"),
+        ("CREATE VIEW tv AS SELECT id FROM t", "CREATE VIEW"),
+        ("CREATE TABLE IF NOT EXISTS t2 (a INT)", "CREATE TABLE"),
+        ("DROP INDEX t_v_u", "DROP INDEX"),
+        ("DROP VIEW tv", "DROP VIEW"),
+        ("DROP SEQUENCE sq", "DROP SEQUENCE"),
+        ("DROP TABLE IF EXISTS t2", "DROP TABLE"),
+    ] {
+        assert_eq!(a.q(sql).ok(sql).tags, vec![tag.to_string()], "{sql}");
+    }
+}
