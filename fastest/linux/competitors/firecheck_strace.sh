@@ -741,14 +741,30 @@ s3=$(clock_pair f14c); s4=$(clock_pair f14d)
 # written into the decoy (fifth re-review, finding 1: no case made that half refuse). Linux /proc is required.
 decoy="$OUT/f14.decoy"; : >"$decoy"
 s5=$( ( eval "exec ${STAMPER[1]}>\"\$decoy\" ${STAMPER[0]}</dev/null"; clock_pair f14e ) 2>/dev/null )
-dsz=$(wc -c <"$decoy" | tr -d ' ')
+# Each fd alone, with the other one the REAL pipe, so an inode check covering only one of the two is caught (sixth
+# re-review, finding 2): the write fd onto a second decoy (must stay empty), then the read fd onto /dev/null (no
+# request may reach the real stamper: nothing may wait in its pipe afterwards). Done in ( ) subshells handed the real
+# pipes through duplicates made here: bash closes the coproc's own fds in ( ), and an `exec` onto a coproc fd number
+# inside a command substitution did not take effect at all on bash 5.3 (measured on the Mac: the fd stayed the pipe).
+exec {kr}<&"${STAMPER[0]}" {kw}>&"${STAMPER[1]}"
+decoy2="$OUT/f14.decoy2"; : >"$decoy2"
+s6=$( ( eval "exec ${STAMPER[0]}<&$kr ${STAMPER[1]}>\"\$decoy2\""; clock_pair f14f ) 2>/dev/null )
+s7=$( ( eval "exec ${STAMPER[0]}</dev/null ${STAMPER[1]}>&$kw"; clock_pair f14g ) 2>/dev/null )
+exec {kr}<&- {kw}>&-
+stray=""; [ -n "${STAMPER_PID:-}" ] && IFS= read -r -t 1 stray <&"${STAMPER[0]}" 2>/dev/null
+dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
+# The stamper lived throughout, so the decoy cases were refused by the fd check, not by a dead stamper (sixth
+# re-review, finding 3).
+alive2=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive2=1
 haveproc=0; [ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
 if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
   $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
-  $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds refused (0 bytes written): [$s3]"
+  $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 &&
+  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" && -z $stray &&
+  $alive2 = 1 ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds refused together and one at a time (0 bytes written, no stray reply): [$s3]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes"
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] stray=[$stray]"
   fails=$((fails + 1))
 fi
 
