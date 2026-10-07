@@ -622,6 +622,11 @@ pub(crate) struct Recovered {
     pub(crate) snapshot: Option<SnapshotState>,
     pub(crate) records: Vec<Record>,
     pub(crate) journal: Journal,
+    /// The kept log ends at its last whole flight, nothing was cut, and the open just synced it in
+    /// a class that proves stable storage (engine review 7 #4): once the store has read that
+    /// flight's slots back and the arena holds no unsynced write, the flight may be confirmed
+    /// (`Journal::confirm_at_open`), so the next open does not check it again.
+    pub(crate) confirmable: bool,
 }
 
 /// What a recovery scan read, before anything in the files was changed (review 5 #1, #2): the
@@ -798,6 +803,9 @@ impl Scanned {
         let from = self.from();
         let journal = &mut self.journal;
         let generation = journal.generation;
+        // The kept log ends at its last whole flight and was just synced in a class that proves
+        // stable storage (engine review 7 #4): see `Recovered::confirmable`.
+        let mut confirmable = false;
         match self.end {
             End::Keep { len, whole, log_gen, synced_end, .. } => {
                 journal.len = whole as u64;
@@ -866,6 +874,7 @@ impl Scanned {
                     // may have been written and never synced by the process that died, and a
                     // later flight's frames will prove it was.
                     fsync_file(&journal.file, class)?;
+                    confirmable = proves_stable(class);
                 }
             }
             End::Reset => journal.reset_log(generation)?,
@@ -876,6 +885,7 @@ impl Scanned {
             snapshot: self.snapshot,
             records: self.records,
             journal: self.journal,
+            confirmable,
         })
     }
 }
@@ -1641,10 +1651,7 @@ impl Journal {
                 // Synced with the rest below: the kept last flight is confirmed, when that sync
                 // proves stable storage (review 6 #1) and no kept flight was written unsynced
                 // (engine review 7 #1).
-                if cut_confirms(class) && all_synced {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&f, class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if class.syncs() {
                 sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
@@ -1665,7 +1672,11 @@ impl Journal {
         // From here the new file is the log.
         self.file = f;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A rewrite ends any back-off. Mutant `no_backoff_reset` (test builds only; engine review 8
+        // #3): it keeps it, measured in the old log's length.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
@@ -1731,10 +1742,7 @@ impl Journal {
             write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
-                if cut_confirms(src.class) && all_synced {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&f, src.class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if src.class.syncs() {
                 sync_replacement(&f, src.class, src.fail_sync, &src.poisoned)?;
@@ -1794,10 +1802,7 @@ impl Journal {
             let (frames, last_crc, delta_synced) = reframe_tagged(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
-                if cut_confirms(class) && prep.all_synced && delta_synced {
-                    let end = len + frames.len() as u64;
-                    write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&prep.file, class, prep.all_synced && delta_synced, last_crc, len + frames.len() as u64)?;
                 if class.syncs() {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
@@ -1812,7 +1817,10 @@ impl Journal {
         // From here the new file is the log.
         self.file = prep.file;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = prep.nonce;
         self.len = len;
@@ -2060,14 +2068,6 @@ impl Journal {
         let fail_confirm = std::mem::take(&mut self.fail_next_confirm);
         self.check_live()?;
         let class = self.flight_class(class);
-        // A raised flight in a D0 store makes its records durable where D0's never are: the slots
-        // they name are marked, so a later D0 free of one waits for a sync (review 5 #18). Marked at
-        // the take, whether or not the flight then succeeds: holding a free longer is safe.
-        if !self.sync.syncs() && class.syncs() {
-            for &slot in &self.pending_slots {
-                arena.mark_synced_named(slot);
-            }
-        }
         let end_lsn = self.lsn;
         if self.pending.is_empty() && !upgrade {
             return Ok(Flight {
@@ -2183,7 +2183,13 @@ impl Journal {
     /// A checkpoint or compaction failed: the next is wanted only once another threshold's worth of
     /// log has been written (`compact_after`).
     pub(crate) fn defer_compaction(&mut self) {
-        self.compact_after = self.len + compact_min_log_bytes();
+        // Mutant `backoff_never_resumes` (test builds only; engine review 8 #3): the back-off never
+        // ends (half of u64::MAX, so the hard limit's sum cannot overflow).
+        self.compact_after = if super::store::fe_mutant("backoff_never_resumes") {
+            u64::MAX / 2
+        } else {
+            self.len + compact_min_log_bytes()
+        };
     }
 
     /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that
@@ -2392,6 +2398,20 @@ fn cut_confirms(class: SyncClass) -> bool {
     proves_stable(class) || super::store::fe_mutant("cut_confirms_unsynced")
 }
 
+/// Write a cut's confirmation of the flight it keeps last (checksum `last_crc`, ending at `end`)
+/// into `file`'s header, when it may: the cut's own sync proves stable storage (`cut_confirms`),
+/// and every flight it keeps was written synced (`all_synced`, engine review 7 #1). A raised D0
+/// log's rewrite class syncs, yet a D0 flight it keeps named slots no sync covered: by the class
+/// alone the cut confirmed it, and recovery then refused a lost slot of it as damage instead of
+/// dropping the flight (engine review 8 #4). The one copy of the rule, for the three cuts.
+/// Mutant `cut_confirms_by_class` (test builds only): the class alone.
+fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32, end: u64) -> Result<()> {
+    if cut_confirms(class) && (all_synced || super::store::fe_mutant("cut_confirms_by_class")) {
+        write_at(file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+    }
+    Ok(())
+}
+
 /// A landed flight's confirmation (review 6 #1): the word for the log's header and the log it goes
 /// to, handed to the store's confirmation writer instead of being written inside the flight's
 /// acknowledgement window. The log may since have been replaced by a cut: the word then goes to
@@ -2406,7 +2426,35 @@ pub(crate) struct Confirm {
     fail: bool,
 }
 
+impl Journal {
+    /// Confirm the log's last flight at an open (engine review 7 #4; `Recovered::confirmable`):
+    /// its slots read back whole, the arena held no unsynced write, and the open's own sync of the
+    /// log proved stable storage, which drained the device the arena is on as well. The word is
+    /// bound to that flight's end frame and to where it ends, as a flight's own is (review 6 #1),
+    /// and written unsynced: its absence proves nothing.
+    pub(crate) fn confirm_at_open(&self) -> Result<()> {
+        if self.len < LOG_HEADER_LEN as u64 + 4 {
+            return Ok(());
+        }
+        let mut crc = [0u8; 4];
+        read_at(&self.file, &mut crc, self.len - 4)?;
+        write_at(&self.file, &confirm_word(u32::from_le_bytes(crc), self.len).to_le_bytes(), HEADER_CONFIRM_AT)
+    }
+}
+
 impl Confirm {
+    /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
+    /// the group, engine review 8 #9).
+    #[cfg(test)]
+    pub(crate) fn for_test(log: File, proved: bool) -> Self {
+        Self {
+            log,
+            word: 0,
+            proved,
+            fail: false,
+        }
+    }
+
     /// Whether the word may be written as is (`proved`).
     pub(crate) fn proved(&self) -> bool {
         self.proved
@@ -2840,7 +2888,8 @@ fn synced_flight_over(
 /// so AND the rewrite syncs (engine review 7 #1): a flight written unsynced named slots no sync
 /// covered, and its tag is what tells a later open the arena may hold such writes (review 5 #10).
 /// Mutant `reframe_retags_by_class` (test builds only): every flight tagged by the rewrite's class
-/// alone, as before.
+/// alone, as before. Test builds only: every production rewrite calls `reframe_tagged`.
+#[cfg(test)]
 fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
     reframe_tagged(kept, old, new, synced).map(|(out, last_crc, _)| (out, last_crc))
 }
@@ -2978,10 +3027,19 @@ pub(crate) static OPEN_LOCK_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomi
 #[cfg(test)]
 static OPEN_LOCK_HOLD_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Test builds: opens of a log that found its path renamed to another file once locked, and were
-/// made again (`open_log_locked`): engine review 7 #13 asks that the rename race be shown to happen.
+/// Test builds: opens of a log that found its path naming another file once locked
+/// (`open_log_locked`), per log path: engine review 7 #13 asks that the rename race be shown to
+/// happen. Counted before the lock is accepted or the open made again, so a mutant that accepts
+/// the stale lock still shows the race happened (its judge: it must die on its claim, not on this).
 #[cfg(test)]
-pub(crate) static LOCK_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOCK_RENAMED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: how many opens of the log at `path` found it renamed under their lock.
+#[cfg(test)]
+pub(crate) fn lock_renamed(path: &Path) -> u64 {
+    let seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+    seen.iter().find(|(p, _)| p.as_path() == path).map_or(0, |&(_, n)| n)
+}
 
 /// Test builds: `OPEN_LOCK_HOLD` armed for one log path while this lives; dropped, it releases and
 /// disarms the hold whatever the test did (a panic while armed no longer hangs later opens).
@@ -3038,12 +3096,19 @@ fn open_log_locked(path: &Path, open: impl Fn(&Path) -> Result<Option<File>>) ->
         };
         pause_before_lock(path);
         lock_exclusive(&file, path)?;
+        let names = still_names(&file, path)?;
+        #[cfg(test)]
+        if !names {
+            let mut seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+            match seen.iter_mut().find(|(p, _)| p.as_path() == path) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((path.to_path_buf(), 1)),
+            }
+        }
         // Mutant `lock_any_inode` (test builds only): the lock is taken on whatever was opened.
-        if still_names(&file, path)? || super::store::fe_mutant("lock_any_inode") {
+        if names || super::store::fe_mutant("lock_any_inode") {
             return Ok(Some(file));
         }
-        #[cfg(test)]
-        LOCK_RETRIES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     Err(LimboError::LockingError(format!(
         "branch log {} was replaced {LOCK_ATTEMPTS} times while this store opened it: another branch \
@@ -3116,6 +3181,14 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = (file, path);
     Ok(())
+}
+
+/// The snapshot state `scan_as` took, read again from its file (engine review 7 #4): a snapshot
+/// store's open replays a second time only when its last flight's check fails, and reads the
+/// snapshot again for that instead of copying it before every replay. The open holds the log's
+/// lock, so the file is the one the scan read.
+pub(crate) fn reread_snapshot(files: &BranchFiles, format: u32) -> Result<SnapshotState> {
+    read_snapshot(&files.snap, format).map(|(_, _, state, _)| state)
 }
 
 /// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
@@ -3424,10 +3497,10 @@ fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
-/// durable once before the next acknowledgement, never once per flight).
 #[cfg(test)]
 thread_local! {
+    /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
+    /// durable once before the next acknowledgement, never once per flight).
     pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -3610,6 +3683,12 @@ fn darwin_major() -> u32 {
             return forced;
         }
     }
+    running_darwin_major()
+}
+
+/// `darwin_major` with no test override: the running kernel's, from `uname`, read once.
+#[cfg(target_vendor = "apple")]
+fn running_darwin_major() -> u32 {
     static MAJOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MAJOR.get_or_init(|| {
         // SAFETY: `uname` fills the struct it is given; a zeroed `utsname` is a valid value.
@@ -3619,19 +3698,40 @@ fn darwin_major() -> u32 {
         }
         // SAFETY: `uname` NUL-terminates `release` within the array.
         let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
-        release
-            .to_str()
-            .ok()
-            .and_then(|r| r.split('.').next())
-            .and_then(|major| major.parse().ok())
-            .unwrap_or(u32::MAX)
+        release.to_str().map_or(u32::MAX, parse_darwin_major)
     })
+}
+
+/// A Darwin release string's major version ("25.6.0" -> 25, "23" -> 23); u32::MAX when it has
+/// none (engine review 9 #11). Mutants (test builds only): `darwin_major_parses_minor` (the
+/// second field: "25.6.0" -> 6) and `darwin_major_unreadable_old` (0 when unreadable, an old
+/// kernel: the userland barrier retry review 6 #6 removed from macOS 14 on).
+#[cfg(target_vendor = "apple")]
+fn parse_darwin_major(release: &str) -> u32 {
+    let field = if super::store::fe_mutant("darwin_major_parses_minor") { 1 } else { 0 };
+    let unreadable = if super::store::fe_mutant("darwin_major_unreadable_old") {
+        0
+    } else {
+        u32::MAX
+    };
+    release
+        .split('.')
+        .nth(field)
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(unreadable)
 }
 
 /// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
 #[cfg(test)]
 pub(crate) fn fail_next_barrier(errno: i32) {
     BARRIER_ERRNO.store(errno, std::sync::atomic::Ordering::Release);
+}
+
+/// Test builds: the errno `fail_next_barrier` armed and no barrier has taken yet (0: none), so a
+/// test can assert its injection reached a barrier (engine review 9 #19).
+#[cfg(test)]
+pub(crate) fn barrier_errno_pending() -> i32 {
+    BARRIER_ERRNO.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
@@ -3655,6 +3755,49 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine review 9 #11: a Darwin release's major version is its FIRST field, and a release
+    /// with none reads as a new kernel (u32::MAX), never an old one: an old one would retry a
+    /// failed barrier as a full sync (review 6 #6). The tests that force the version skip this.
+    /// Mutants `darwin_major_parses_minor`, `darwin_major_unreadable_old`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_darwin_release_reads_as_its_major_version() {
+        for (release, major) in [
+            ("25.6.0", 25),
+            ("22.6.0", 22),
+            ("23", 23),
+            ("", u32::MAX),
+            ("x.1", u32::MAX),
+        ] {
+            assert_eq!(
+                parse_darwin_major(release),
+                major,
+                "the major version was misread from Darwin release {release:?}"
+            );
+        }
+    }
+
+    /// Engine review 9 #11: unforced, the store takes the running kernel for the major version
+    /// that `sysctl -n kern.osrelease` reports, a reader other than the subject's `uname`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_running_kernels_darwin_major_is_the_one_sysctl_reports() {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.osrelease"])
+            .output()
+            .expect("premise: sysctl ran");
+        assert!(out.status.success(), "premise: sysctl kern.osrelease succeeded");
+        let release = String::from_utf8(out.stdout).expect("premise: sysctl printed UTF-8");
+        let digits: String = release.trim().chars().take_while(char::is_ascii_digit).collect();
+        let expected: u32 =
+            digits.parse().expect("premise: the release starts with its major version");
+        assert_eq!(
+            running_darwin_major(),
+            expected,
+            "the store reads kernel release {release:?} as another major version"
+        );
+    }
 
     /// The nonce in the header of the log at `path` (format 11).
     pub(super) fn log_nonce(path: &Path) -> u32 {
@@ -4771,12 +4914,15 @@ mod format_tests {
     /// FLAGGED TEST EDIT (engine review 7 #13): the hook is armed for this test's log path only and
     /// disarmed by a guard (a panic while armed hung every later log open in the binary), and the
     /// race is shown to have happened: the second open found the path renamed once it was locked.
+    /// FLAGGED TEST EDIT (its judge, 2026-10-06T14:45:43Z): that premise is counted per log path
+    /// (`lock_renamed`) and before the lock is accepted, so mutant `lock_any_inode` passes it and
+    /// dies on the claim below, not on the premise.
     #[test]
     fn a_lock_taken_across_a_rename_of_the_log_is_refused() {
         use std::sync::atomic::Ordering as O;
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        let retries = LOCK_RETRIES.load(O::Acquire);
+        let retries = lock_renamed(&files.log);
         let _hold = OpenLockHold::arm(&files.log);
         let second = {
             let files = files.clone();
@@ -4792,8 +4938,8 @@ mod format_tests {
         OPEN_LOCK_HOLD.store(0, O::Release);
         let got = second.join().unwrap();
         assert!(
-            LOCK_RETRIES.load(O::Acquire) > retries,
-            "premise: the second open found the log renamed under its lock and opened it again"
+            lock_renamed(&files.log) > retries,
+            "premise: the second open found the log renamed under its lock"
         );
         assert!(got.is_err(), "a second store took the lock of the log's old inode");
         drop(first);

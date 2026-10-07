@@ -503,6 +503,10 @@ pub enum BranchFailpoint {
     /// The next sync of a temp file that is to replace a branch file (a cut's or rewrite's new
     /// log, a reset log, a compaction's snapshot) fails as an I/O error would (review 6 #2).
     ReplacementSyncFails,
+    /// The next capture that takes a handle on the arena file to sync it (a sharp catalog
+    /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
+    /// #3: the capture's other fallible step, beside its read snapshot).
+    ArenaHandleFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -615,6 +619,12 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+    /// Snapshot stores (engine review 7 #4): copies of the recovered snapshot state made at the
+    /// open, and replays of snapshot and log (a second one when the last flight's check failed),
+    /// and the slots the last flight's check read.
+    pub snapshot_copies: u64,
+    pub replays: u64,
+    pub checked_slots: u64,
 }
 
 /// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an
@@ -1338,25 +1348,31 @@ impl Database {
     }
 
     /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch already has a connection.
     pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         self.connect_branch(id)
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch has an open connection (fastest-wire: a server
+    /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
+    /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
         // branch is never touched (its id differs).
-        self.branches.release_handle(id)
+        self.branches.release_named(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
@@ -1415,6 +1431,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
         self.branches.checkpoint_counters()
+    }
+
+    /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
+    /// observing only).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_start_failures(&self) -> u64 {
+        self.branches.checkpoint_start_failures()
     }
 
     /// Confirmation words written into the branch log's header, and those whose write failed
@@ -1514,13 +1537,15 @@ impl Database {
 /// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
 /// window fails. In a process that runs one test there is no neighbour.
 ///
-/// GATE: `cfg(unix)`, and nothing narrower is needed. The tests close no descriptors (the fresh
-/// process has no neighbour whose lock a child could hold), so `getdtablesize`, which Android's
-/// libc lacks, is no longer called anywhere. Every libc call they make — `fork`, `waitpid`,
-/// `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix target in libc 0.2.186,
-/// Android included (READ: `src/unix/mod.rs`'s unconditional `extern` block, and
-/// `src/unix/linux_like/mod.rs`).
-#[cfg(all(test, unix))]
+/// GATE: `alone` and `finished` need only `std::process`, so every test build has them: a test that
+/// runs alone for a process-wide hook (`R11_CKPT`, `CUT_PANICS`) runs on every target (engine
+/// review 7 #13's judge). `exit_code` is `cfg(unix)`, and nothing narrower is needed. The tests
+/// close no descriptors (the fresh process has no neighbour whose lock a child could hold), so
+/// `getdtablesize`, which Android's libc lacks, is no longer called anywhere. Every libc call they
+/// make — `fork`, `waitpid`, `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix
+/// target in libc 0.2.186, Android included (READ: `src/unix/mod.rs`'s unconditional `extern`
+/// block, and `src/unix/linux_like/mod.rs`).
+#[cfg(test)]
 pub(crate) mod fork_driver {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1567,6 +1592,7 @@ pub(crate) mod fork_driver {
 
     /// The exit code of a forked child. Waits at most 60 s; on the deadline it SIGKILLs and reaps
     /// the child and fails.
+    #[cfg(unix)]
     pub(crate) fn exit_code(pid: libc::pid_t) -> i32 {
         let mut status = 0;
         let deadline = Instant::now() + Duration::from_secs(60);

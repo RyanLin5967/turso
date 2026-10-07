@@ -43,10 +43,6 @@ enum Backing {
 #[cfg(test)]
 pub(crate) static ARENA_ON_OTHER_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Test builds: `forget_listed` calls (engine review 7 #7: a test must show the install reached it).
-#[cfg(test)]
-pub(crate) static FORGET_LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub(crate) struct Arena {
     page_size: usize,
     backing: Backing,
@@ -60,10 +56,10 @@ pub(crate) struct Arena {
     /// Slots handed out and not released. Equal to `high_water - free.len()` except in a catalog
     /// store, whose free slots are mostly in the catalog's free table, not in `free`.
     in_use: usize,
-    /// D0 only (review 5 #18): slots a SYNCED record names, written by a raised flight in a store
-    /// whose own flights never sync. A free of one waits until a sync covers its Release. Cleared
-    /// when the slot is handed out again.
-    synced_named: std::collections::HashSet<Slot>,
+    /// Test builds: `forget_listed` calls on this arena (engine review 7 #7: a test must show the
+    /// install reached it; per arena, so another test's store cannot move it).
+    #[cfg(test)]
+    pub(crate) forget_listed: u64,
 }
 
 impl Arena {
@@ -75,7 +71,8 @@ impl Arena {
             free: Vec::new(),
             free_bits: Vec::new(),
             in_use: 0,
-            synced_named: std::collections::HashSet::new(),
+            #[cfg(test)]
+            forget_listed: 0,
         }
     }
 
@@ -129,7 +126,8 @@ impl Arena {
             backing: Backing::File { file, dirty: false },
             high_water,
             in_use: high_water as usize - free.len(),
-            synced_named: std::collections::HashSet::new(),
+            #[cfg(test)]
+            forget_listed: 0,
             free,
             free_bits,
         })
@@ -154,7 +152,8 @@ impl Arena {
             free: Vec::with_capacity(free.len()),
             free_bits: vec![0; (high_water as usize).div_ceil(64)],
             in_use: in_use as usize,
-            synced_named: std::collections::HashSet::new(),
+            #[cfg(test)]
+            forget_listed: 0,
         };
         for slot in free {
             arena.add_free(slot);
@@ -195,9 +194,6 @@ impl Arena {
         self.in_use += 1;
         if let Some(slot) = self.free.pop() {
             self.set_free_bit(slot, false);
-            if !self.synced_named.is_empty() {
-                self.synced_named.remove(&slot);
-            }
             if trace_slots() {
                 eprintln!("R11SLOT alloc {slot} (free list)");
             }
@@ -325,18 +321,6 @@ impl Arena {
         }
     }
 
-    /// A synced record names `slot` (see `synced_named`).
-    pub(crate) fn mark_synced_named(&mut self, slot: Slot) {
-        self.synced_named.insert(slot);
-    }
-
-    pub(crate) fn is_synced_named(&self, slot: Slot) -> bool {
-        // Mutant `free_ignores_synced_name` (test builds only).
-        !self.synced_named.is_empty()
-            && self.synced_named.contains(&slot)
-            && !super::store::fe_mutant("free_ignores_synced_name")
-    }
-
     pub(crate) fn is_dirty(&self) -> bool {
         matches!(self.backing, Backing::File { dirty: true, .. })
     }
@@ -360,7 +344,9 @@ impl Arena {
         turso_assert!(slot < self.high_water, "a listed slot past the high-water mark");
         turso_assert!(!self.is_free(slot), "a deferred slot was already free");
         #[cfg(test)]
-        FORGET_LISTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        {
+            self.forget_listed += 1;
+        }
         // fastest-engine mutant `forget_listed_kept_in_use` (test builds only).
         if !super::store::fe_mutant("forget_listed_kept_in_use") {
             self.in_use -= 1;

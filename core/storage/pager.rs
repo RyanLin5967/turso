@@ -3932,8 +3932,11 @@ impl Pager {
     /// commit's frames are published, or when the write lock is released after a failed commit.
     pub(crate) fn close_trunk_gate(&self) {
         // A trunk file's sync that failed after it yielded, which the statement reported without
-        // coming back to the commit: seen here, before the verdicts below are cleared.
-        self.check_noted_syncs();
+        // coming back to the commit: seen here, before the verdicts below are cleared. Mutant
+        // `wal_fail_stop_not_at_close` (test builds only; engine review 9 #10): not seen here.
+        if !crate::branch::store::fe_mutant("wal_fail_stop_not_at_close") {
+            self.check_noted_syncs();
+        }
         self.trunk_sync_frontier.store(0, Ordering::Release);
         let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
@@ -5032,7 +5035,11 @@ impl Pager {
                             // store acknowledging over the failed drain (review 6 #2). Acted on
                             // here, so the noted copy is dropped (engine review 9 #10: once).
                             self.trunk_wal_sync.lock().take();
-                            self.trunk_wal_sync_failed();
+                            // Mutant `wal_fail_stop_not_inline` (test builds only): dropped, not
+                            // acted on.
+                            if !crate::branch::store::fe_mutant("wal_fail_stop_not_inline") {
+                                self.trunk_wal_sync_failed();
+                            }
 
                             if !data_sync_retry {
                                 panic!(
