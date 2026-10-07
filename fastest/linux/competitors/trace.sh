@@ -59,7 +59,10 @@ import sys, time
 def mono():
     return time.clock_gettime(time.CLOCK_MONOTONIC)
 for req in sys.stdin:
-    nonce, name = req.split()
+    try:  # a malformed line is skipped, not a crash that leaves every later stamp to the one-shot path
+        nonce, name = req.split()
+    except ValueError:
+        continue
     best = None
     for _ in range(50):
         m1 = mono(); r = time.time(); m2 = mono()
@@ -96,11 +99,13 @@ clock_pair() {
     line=$( {
       printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
       # The whole reply must have the stamper's exact shape, not just this call's nonce: bash reads a pipe a byte at a
-      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; a
-      # spliced line fails the shape and the call falls back to one-shot (fifth re-review, finding 3). Callers must
-      # not stamp concurrently in any case.
+      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; most
+      # spliced lines fail the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a
+      # digit of the monotonic integer part is refused downstream by the realtime-vs-monotonic check (sixth re-review,
+      # finding 1). The realtime field has exactly 10 integer digits (until 2286). Callers must not stamp
+      # concurrently in any case.
       d='[0-9]+\.[0-9]{9}'
-      want="^$nonce $name=$d ${name}_mono=$d ${name}_err=$d\$"
+      want="^$nonce $name=[0-9]{10}\.[0-9]{9} ${name}_mono=$d ${name}_err=$d\$"
       for ((k = 0; k < 8; k++)); do
         IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
         case $l in "$nonce "*) [[ $l =~ $want ]] && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
