@@ -1395,21 +1395,16 @@ impl Session {
     /// ([`LimboError::Busy`], or a snapshot a concurrent commit outdated), sleeping on SQLite's
     /// default busy schedule (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) for up to
     /// the server's lock wait. Only this session's thread sleeps.
-    fn waiting<T>(&self, mut f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+    fn waiting<T>(&self, f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
         // A schema change committed under the call (SchemaUpdated, which the engine leaves to the
-        // caller to retry: fork_trunk_registered) is retried at once, a bounded number of times as
-        // the engine bounds its own reprepare (wire review 1 item 11).
-        let once = move || {
-            for _ in 0..50 {
-                match f() {
-                    Err(LimboError::SchemaUpdated) => continue,
-                    r => return r,
-                }
-            }
-            f()
-        };
-        self.retrying(once, |e| {
-            matches!(e, LimboError::Busy | LimboError::BusySnapshot)
+        // caller to retry: fork_trunk_registered; wire review 1 item 11) is waited out on the same
+        // schedule and bound: retried 50 times back to back it outran nothing, and the next one
+        // escaped as XX000 (wire review 5 item 9).
+        self.retrying(f, |e| {
+            matches!(
+                e,
+                LimboError::Busy | LimboError::BusySnapshot | LimboError::SchemaUpdated
+            )
         })
     }
 
