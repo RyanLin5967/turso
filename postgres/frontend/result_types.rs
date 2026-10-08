@@ -174,11 +174,18 @@ const TEXT: u32 = 25;
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
     pub columns: Vec<Option<u32>>,
-    /// $(i+1)'s type OID where its context gives one; `None` where it does not, or past the end
-    /// (text, as PostgreSQL resolves a parameter nothing types). Which $n the statement uses is
-    /// the prepared statement's to say (`Statement::parameters`).
-    pub params: Vec<Option<u32>>,
+    /// The type OID of each $n its context types, by n; one missing is untyped (text, as
+    /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
+    /// nothing (wire review 8 item 3).
+    pub params: std::collections::BTreeMap<u32, u32>,
+    /// Every $n the statement's parse tree holds, sorted, each in 1..=MAX_PARAMETER (see
+    /// turso_pg_parser::param_numbers): the parameter count and the gaps are read from this, not
+    /// from the engine's slots, which a clause it folds away does not get (wire review 8 item 5).
+    pub used: Vec<u32>,
 }
+
+/// The highest parameter number a statement may hold: Bind counts parameters in 16 bits.
+pub const MAX_PARAMETER: u32 = 65535;
 
 /// The type PostgreSQL infers for each parameter the client did not declare, from its context
 /// (docs, "Prepared statements": the parameter's type is inferred from where it is used): the
@@ -187,10 +194,13 @@ pub struct StatementTypes {
 /// OFFSET's bigint; text for LIKE. The first context that types a parameter wins. Bind guessed
 /// from the value instead (an integer, a float, a boolean), and Describe called every one text
 /// (wire review 4 item 3).
-pub fn parameter_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>> {
+pub fn parameter_types(
+    parse: &ParseResult,
+    schema: &Schema,
+) -> std::collections::BTreeMap<u32, u32> {
     let mut infer = Infer {
         schema,
-        types: Vec::new(),
+        types: std::collections::BTreeMap::new(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -202,7 +212,7 @@ pub fn parameter_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>>
 
 struct Infer<'a> {
     schema: &'a Schema,
-    types: Vec<Option<u32>>,
+    types: std::collections::BTreeMap<u32, u32>,
 }
 
 impl Infer<'_> {
@@ -211,16 +221,10 @@ impl Infer<'_> {
         let (Some(Node::ParamRef(p)), Some(ty)) = (node.node.as_ref(), ty) else {
             return;
         };
-        let Some(i) = usize::try_from(p.number)
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-        else {
+        let Ok(n) = u32::try_from(p.number) else {
             return;
         };
-        if self.types.len() <= i {
-            self.types.resize(i + 1, None);
-        }
-        self.types[i].get_or_insert(ty);
+        self.types.entry(n).or_insert(ty);
     }
 
     fn statement(&mut self, stmt: &PgNode) {
@@ -469,10 +473,9 @@ impl Infer<'_> {
                 _ => None,
             },
             Node::TypeCast(c) => cast_type(c),
-            Node::ParamRef(p) => usize::try_from(p.number)
+            Node::ParamRef(p) => u32::try_from(p.number)
                 .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|i| self.types.get(i).copied().flatten()),
+                .and_then(|n| self.types.get(&n).copied()),
             // Arithmetic: the type of an operand that has one.
             Node::AExpr(e) => e
                 .lexpr

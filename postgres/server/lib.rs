@@ -1157,7 +1157,7 @@ impl Session {
     fn described_parameters(&self, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
         let st = self.state();
         match st.described.as_ref() {
-            Some(d) => parameter_types(&d.stmt, &d.types.params, declared),
+            Some(d) => parameter_types(&d.types, declared),
             None => Ok(declared
                 .iter()
                 .map(|t| t.clone().unwrap_or(Type::TEXT))
@@ -1253,7 +1253,7 @@ impl Session {
         };
         self.shared.cleanup_dropped_schema_file(sql);
         if let Some(portal) = portal {
-            bind_portal_parameters(&mut stmt, portal, &types.params)
+            bind_portal_parameters(&mut stmt, portal, &types)
                 .map_err(|e| unprepared(wire_info(e)))?;
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
@@ -1873,6 +1873,7 @@ fn sqlstate(e: &LimboError) -> &'static str {
             "42P01"
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
+        LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
         LimboError::ParseError(m)
             if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
         {
@@ -2738,35 +2739,33 @@ fn execute_non_query(
     Ok(Response::Execution(tag))
 }
 
-/// The type of each parameter, $1 up to the highest the statement uses or the client declared:
-/// the declared one, else the one its context gives (`inferred`, see
-/// [`StatementTypes::params`]), else text, as PostgreSQL resolves a parameter nothing types. One
-/// below the highest that the statement does not use and the client did not declare cannot be
-/// typed: 42P18, as PostgreSQL refuses it (wire review 4 item 3). Describe and Bind read the
-/// same list.
-fn parameter_types(
-    stmt: &turso_core::Statement,
-    inferred: &[Option<u32>],
-    declared: &[Option<Type>],
-) -> SqlResult<Vec<Type>> {
-    let params = stmt.parameters();
-    (1..=params.count().max(declared.len()))
+/// The type of each parameter, $1 up to the highest the statement holds or the client declared:
+/// the declared one, else the one its context gives (see [`StatementTypes::params`]), else text, as
+/// PostgreSQL resolves a parameter nothing types. One below the highest that the statement does
+/// not hold and the client did not declare cannot be typed: 42P18, as PostgreSQL refuses it (wire
+/// review 4 item 3). Which $n the statement holds is read from its whole parse tree
+/// ([`StatementTypes::used`]), not from the engine's slots, which a clause it folds away does not
+/// get (`HAVING count(*) > $1` was 42P18, `WHERE false AND id = $1` 08P01; wire review 8 item 5).
+/// Describe and Bind read the same list.
+fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
+    let highest = types.used.last().map_or(0, |n| *n as usize);
+    (1..=highest.max(declared.len()))
         .map(|n| {
             if let Some(Some(t)) = declared.get(n - 1) {
                 if *t != Type::UNKNOWN {
                     return Ok(t.clone());
                 }
             }
-            if !params.has_index(NonZero::new(n).expect("n >= 1")) {
+            if types.used.binary_search(&(n as u32)).is_err() {
                 return Err(error(
                     "42P18",
                     format!("could not determine data type of parameter ${n}"),
                 ));
             }
-            Ok(inferred
-                .get(n - 1)
+            Ok(types
+                .params
+                .get(&(n as u32))
                 .copied()
-                .flatten()
                 .and_then(Type::from_oid)
                 .unwrap_or(Type::TEXT))
         })
@@ -2782,9 +2781,9 @@ fn parameter_types(
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
     portal: &Portal<String>,
-    inferred: &[Option<u32>],
+    statement_types: &StatementTypes,
 ) -> PgWireResult<()> {
-    let types = parameter_types(stmt, inferred, &portal.statement.parameter_types)
+    let types = parameter_types(statement_types, &portal.statement.parameter_types)
         .map_err(PgWireError::UserError)?;
     if portal.parameter_len() != types.len() {
         return Err(PgWireError::UserError(error(
@@ -2803,7 +2802,8 @@ fn bind_portal_parameters(
             Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
         };
         let index = NonZero::new(i + 1).expect("i + 1 >= 1");
-        // A declared parameter the statement does not use binds nothing.
+        // A parameter with no engine slot (declared but unused, or in a clause the engine folds
+        // away) binds nothing.
         if stmt.parameters().has_index(index) {
             stmt.bind_at(index, value)
                 .map_err(|e| PgWireError::UserError(engine_info(&e)))?;

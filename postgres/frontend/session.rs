@@ -451,6 +451,24 @@ fn prepare_statement_inner(
     // One parse serves both the special forms and the translation (it was two).
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // Every $n of the whole tree, before anything is sized by one: a number past
+    // MAX_PARAMETER (Bind counts in 16 bits) or below 1 names no parameter (42P02, PostgreSQL's
+    // "there is no parameter"); `SELECT 1 LIMIT $2147483647` sized a 16 GiB list (wire review 8
+    // item 3). Only a statement whose text holds a '$' pays the walk.
+    let used: Vec<u32> = if sql.contains('$') {
+        let numbers = turso_pg_parser::param_numbers(&parse_result);
+        if let Some(n) = numbers
+            .iter()
+            .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
+        {
+            return Err(LimboError::ParseError(format!(
+                "there is no parameter ${n}"
+            )));
+        }
+        numbers.into_iter().map(|n| n as u32).collect()
+    } else {
+        Vec::new()
+    };
     if describe && performs_at_prepare(&parse_result) {
         return Ok(None);
     }
@@ -460,10 +478,10 @@ fn prepare_statement_inner(
     if let Some(types) = types {
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
-        // Only a statement that can hold a $n pays the walk (a dollar quote reaches it too).
-        if sql.contains('$') {
+        if !used.is_empty() {
             types.params = crate::result_types::parameter_types(&parse_result, &schema);
         }
+        types.used = used;
     }
 
     let translator = PostgreSQLTranslator::new();
