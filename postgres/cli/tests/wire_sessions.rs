@@ -4028,6 +4028,76 @@ fn a_message_body_shorter_than_it_says_is_refused_in_step() {
     assert_eq!(b.q("SELECT 1").single("after the bad frame"), "1");
 }
 
+/// An empty statement over the extended protocol is no error: Describe of its portal answers NoData,
+/// Execute answers EmptyQueryResponse (whatever result formats the Bind named), and a pipeline it
+/// sits in commits at Sync, as in PostgreSQL. It failed at Describe and Execute with "contains no
+/// statements", and Execute had already joined the implicit block, so the pipeline's INSERT was
+/// rolled back (wire review 12 item 4).
+#[test]
+fn an_empty_extended_statement_is_an_empty_query() {
+    let dir = Scratch::new("emptyext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut out = Vec::new();
+    let mut put = |tag: u8, body: &[u8]| {
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+    };
+    let insert = b"INSERT INTO t VALUES (5, 'five')";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(insert);
+    parse.extend_from_slice(&[0, 0, 0]);
+    put(b'P', &parse);
+    put(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+    put(b'E', &[0, 0, 0, 0, 0]);
+    for sql in [&b""[..], &b" ;"[..]] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql);
+        parse.extend_from_slice(&[0, 0, 0]);
+        put(b'P', &parse);
+        // Two result formats for a statement of no columns: ignored.
+        put(b'B', &[0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0]);
+        put(b'D', b"P\0");
+        put(b'E', &[0, 0, 0, 0, 0]);
+    }
+    put(b'S', &[]);
+    a.s.write_all(&out).unwrap();
+    let mut tags = Vec::new();
+    let mut error = None;
+    loop {
+        let mut head = [0u8; 5];
+        a.s.read_exact(&mut head).unwrap();
+        let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        a.s.read_exact(&mut body).unwrap();
+        if head[0] == b'E' && error.is_none() {
+            error = Some(error_fields(&body));
+        }
+        tags.push(head[0]);
+        if head[0] == b'Z' {
+            assert_eq!(body, vec![b'I'], "idle after Sync");
+            break;
+        }
+    }
+    assert!(error.is_none(), "an error: {error:?}");
+    assert_eq!(
+        tags.iter().filter(|t| **t == b'I').count(),
+        2,
+        "one EmptyQueryResponse per empty statement: {tags:?}"
+    );
+    assert_eq!(
+        tags.iter().filter(|t| **t == b'n').count(),
+        2,
+        "NoData for each empty portal: {tags:?}"
+    );
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 5")
+            .single("the pipeline committed"),
+        "five"
+    );
+}
+
 /// A wrong-length result-format list is refused BEFORE a statement with a side effect runs: a branch
 /// create, switch or delete changes nothing, and an `INSERT ... RETURNING` writes no row; the
 /// refusals are worded as PostgreSQL words them. No test pinned the order: the earlier rows change
