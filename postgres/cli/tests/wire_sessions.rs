@@ -3726,3 +3726,42 @@ fn set_operations_keep_their_grouping_and_clauses() {
         assert_eq!(sorted(&mut a, sql), want, "{sql}");
     }
 }
+
+/// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
+/// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
+/// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
+/// review 7 item 18). Expected values: PostgreSQL's by these fixtures' semantics.
+#[test]
+fn delete_using_deletes_only_the_joined_rows() {
+    let dir = Scratch::new("deleteusing");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .ok("d rows");
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true), (3, false)")
+        .ok("k rows");
+    let left = |a: &mut Wire| -> Vec<String> {
+        a.q("SELECT id FROM d ORDER BY id")
+            .ok("d")
+            .rows
+            .iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect()
+    };
+    let r = a
+        .q("DELETE FROM d USING k WHERE d.id = k.id AND k.flag")
+        .ok("delete using");
+    assert_eq!(r.tags, vec!["DELETE 1".to_string()]);
+    assert_eq!(left(&mut a), vec!["1", "3", "4"]);
+    let r = a
+        .q("DELETE FROM d USING k WHERE d.id = k.id RETURNING d.v")
+        .ok("delete using, returning");
+    assert_eq!(r.rows, vec![vec![Some("c".to_string())]]);
+    assert_eq!(left(&mut a), vec!["1", "4"]);
+    a.q("DELETE FROM k").ok("empty k");
+    a.q("DELETE FROM d USING k")
+        .ok("delete using an empty table");
+    assert_eq!(left(&mut a), vec!["1", "4"], "nothing joins an empty table");
+}
