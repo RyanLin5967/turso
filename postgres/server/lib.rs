@@ -1183,8 +1183,8 @@ impl Session {
     }
 
     /// The result columns of the statement [`Session::describe_prepare`] kept.
-    fn described_fields(&self, format: &Format) -> Vec<FieldInfo> {
-        self.state().described.as_ref().map_or_else(Vec::new, |d| {
+    fn described_fields(&self, format: &Format) -> SqlResult<Vec<FieldInfo>> {
+        self.state().described.as_ref().map_or(Ok(Vec::new()), |d| {
             result_fields(&d.stmt, &d.types.columns, format)
         })
     }
@@ -1327,11 +1327,11 @@ impl Session {
         if f == "turso_branch_current" {
             arity(call, 0)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
-            return Ok(one_text(f, name, format));
+            return one_text(f, name, format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
-            return Ok(stats_row(format));
+            return stats_row(format);
         }
         if !matches!(
             f,
@@ -1343,6 +1343,9 @@ impl Session {
             ));
         }
         arity(call, 1)?;
+        // The result-format list is checked before the call changes anything: a create refused
+        // after it ran would leave its branch behind (wire review 9 item 2).
+        result_format(format, 0, 1)?;
         let name = text_arg(&call.args[0], portal)?;
         // As PostgreSQL refuses CREATE DATABASE and DROP DATABASE in a transaction block. The
         // engine refuses a fork there too; a switch would abandon the transaction.
@@ -1361,7 +1364,7 @@ impl Session {
                     ));
                 }
                 match self.waiting(|| conn.inner().create_branch(&name)) {
-                    Ok(id) => Ok(one_int8(f, id.0 as i64, format)),
+                    Ok(id) => one_int8(f, id.0 as i64, format),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
             }
@@ -1382,7 +1385,7 @@ impl Session {
                         next.adopt_session_of(conn);
                         st.branch = Some((name.clone(), next));
                     }
-                    return Ok(one_text(f, &name, format));
+                    return one_text(f, &name, format);
                 }
                 let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
@@ -1412,7 +1415,7 @@ impl Session {
                     drop(left_conn);
                     st.left = Some(left);
                 }
-                Ok(one_text(f, &name, format))
+                one_text(f, &name, format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
                 "55006",
@@ -1426,7 +1429,7 @@ impl Session {
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
-                    Ok(_) => Ok(one_text(f, &name, format)),
+                    Ok(_) => one_text(f, &name, format),
                     Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
                 }
             }
@@ -1966,24 +1969,27 @@ fn one_row(
     pg_type: Type,
     format: &Format,
     encode: impl FnOnce(&mut DataRowEncoder) -> PgWireResult<()>,
-) -> Response {
+) -> SqlResult<Response> {
     let header = Arc::new(vec![FieldInfo::new(
         f.to_string(),
         None,
         None,
         pg_type,
-        format.format_for(0),
+        result_format(format, 0, 1)?,
     )]);
     let mut encoder = DataRowEncoder::new(header.clone());
     let row = encode(&mut encoder).and_then(|()| encoder.finish());
-    Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
+    Ok(Response::Query(QueryResponse::new(
+        header,
+        stream::iter(vec![row]),
+    )))
 }
 
-fn one_text(f: &str, value: &str, format: &Format) -> Response {
+fn one_text(f: &str, value: &str, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::TEXT, format, |e| e.encode_field(&value))
 }
 
-fn one_int8(f: &str, value: i64, format: &Format) -> Response {
+fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
@@ -1998,8 +2004,8 @@ const STATS_COLUMNS: [&str; 5] = [
 /// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
 /// the call runs, NULLs where the platform does not count them; then the server's own count of
 /// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]).
-fn stats_row(format: &Format) -> Response {
-    let header = Arc::new(stats_fields(format));
+fn stats_row(format: &Format) -> SqlResult<Response> {
+    let header = Arc::new(stats_fields(format)?);
     let mut encoder = DataRowEncoder::new(header.clone());
     let values = counters::process_counters()
         .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
@@ -2008,23 +2014,51 @@ fn stats_row(format: &Format) -> Response {
         .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
         .and_then(|()| encoder.encode_field(&skipped))
         .and_then(|()| encoder.finish());
-    Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
+    Ok(Response::Query(QueryResponse::new(
+        header,
+        stream::iter(vec![row]),
+    )))
 }
 
-fn stats_fields(format: &Format) -> Vec<FieldInfo> {
+fn stats_fields(format: &Format) -> SqlResult<Vec<FieldInfo>> {
     STATS_COLUMNS
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            FieldInfo::new(
+            Ok(FieldInfo::new(
                 name.to_string(),
                 None,
                 None,
                 Type::INT8,
-                format.format_for(i),
-            )
+                result_format(format, i, STATS_COLUMNS.len())?,
+            ))
         })
         .collect()
+}
+
+/// The format of result column `i` of `columns` under a Bind's result-format codes: none (every
+/// column text), one (for every column), or one per column. Any other count is a protocol
+/// violation, refused in PostgreSQL's words (its PortalSetResultFormat), where pgwire's
+/// `Format::format_for` indexed the list unchecked: two codes for three columns panicked the
+/// session, and under the release build's panic=abort ended every session (wire review 9 item 2,
+/// review 10 item 1). PostgreSQL refuses at Bind; here the check is made where the column count is
+/// first known, at Describe of the portal or at Execute, since an engine statement's columns are
+/// known only once it is prepared. A statement returning no rows builds no columns and ignores the
+/// list, as in PostgreSQL.
+fn result_format(format: &Format, i: usize, columns: usize) -> SqlResult<FieldFormat> {
+    match format {
+        Format::Individual(codes) => match codes.get(i) {
+            Some(code) if codes.len() == columns => Ok(FieldFormat::from(*code)),
+            _ => Err(error(
+                "08P01",
+                format!(
+                    "bind message has {} result formats but query has {columns} columns",
+                    codes.len()
+                ),
+            )),
+        },
+        unified => Ok(unified.format_for(i)),
+    }
 }
 
 /// A branch call's parameters as a parse types them: each `$n` it holds is text (a branch name),
@@ -2051,7 +2085,7 @@ fn branch_call_types(call: &PgBranchCall) -> StatementTypes {
 }
 
 /// The row a branch call returns, for Describe.
-fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
+fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<FieldInfo>> {
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
     }
@@ -2060,13 +2094,13 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
     } else {
         Type::TEXT
     };
-    vec![FieldInfo::new(
+    Ok(vec![FieldInfo::new(
         call.function.clone(),
         None,
         None,
         pg_type,
-        format.format_for(0),
-    )]
+        result_format(format, 0, 1)?,
+    )])
 }
 
 /// A statement's failure, boxed: an `ErrorInfo` is ~280 bytes and failure is the rare path.
@@ -2519,7 +2553,8 @@ impl ExtendedQueryHandler for Session {
     {
         self.refuse_describe_if_aborted(&target.statement)?;
         if let Some(call) = branch_call(&target.statement) {
-            let fields = branch_call_fields(&call, &Format::UnifiedText);
+            let fields =
+                branch_call_fields(&call, &Format::UnifiedText).map_err(PgWireError::UserError)?;
             let params = parameter_types(&branch_call_types(&call), &target.parameter_types)
                 .map_err(PgWireError::UserError)?;
             return Ok(DescribeStatementResponse::new(params, fields));
@@ -2538,7 +2573,9 @@ impl ExtendedQueryHandler for Session {
             return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
         self.describe_prepare(&target.statement)?;
-        let fields = self.described_fields(&Format::UnifiedText);
+        let fields = self
+            .described_fields(&Format::UnifiedText)
+            .map_err(PgWireError::UserError)?;
         let params = self
             .described_parameters(&target.parameter_types)
             .map_err(PgWireError::UserError)?;
@@ -2555,14 +2592,17 @@ impl ExtendedQueryHandler for Session {
     {
         self.refuse_describe_if_aborted(&portal.statement.statement)?;
         if let Some(call) = branch_call(&portal.statement.statement) {
-            let fields = branch_call_fields(&call, &portal.result_column_format);
+            let fields = branch_call_fields(&call, &portal.result_column_format)
+                .map_err(PgWireError::UserError)?;
             return Ok(DescribePortalResponse::new(fields));
         }
         if is_pg_non_query(&portal.statement.statement) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
         self.describe_prepare(&portal.statement.statement)?;
-        let fields = self.described_fields(&portal.result_column_format);
+        let fields = self
+            .described_fields(&portal.result_column_format)
+            .map_err(PgWireError::UserError)?;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -2649,7 +2689,7 @@ fn result_fields(
     stmt: &turso_core::Statement,
     types: &[Option<u32>],
     format: &Format,
-) -> Vec<FieldInfo> {
+) -> SqlResult<Vec<FieldInfo>> {
     field_info(stmt, format, |i| column_type(stmt, types, i))
 }
 
@@ -2669,11 +2709,13 @@ fn field_info(
     stmt: &turso_core::Statement,
     format: &Format,
     pg_type: impl Fn(usize) -> Type,
-) -> Vec<FieldInfo> {
-    (0..stmt.num_columns())
+) -> SqlResult<Vec<FieldInfo>> {
+    let columns = stmt.num_columns();
+    (0..columns)
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
-            FieldInfo::new(name, None, None, pg_type(i), format.format_for(i))
+            let format = result_format(format, i, columns)?;
+            Ok(FieldInfo::new(name, None, None, pg_type(i), format))
         })
         .collect()
 }
@@ -2774,7 +2816,7 @@ fn execute_query(
     schema: &turso_core::schema::Schema,
     backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
-    let header = Arc::new(result_fields(stmt, types, format));
+    let header = Arc::new(result_fields(stmt, types, format).map_err(PgWireError::UserError)?);
     // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
     // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
     // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
