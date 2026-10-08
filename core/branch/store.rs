@@ -592,9 +592,10 @@ impl Group {
         drop(stale);
     }
 
-    /// Every byte below `end` is durable in `class` and every weaker one, by a rewrite of the log
-    /// made under the store mutex with no flight in the air (a compaction's snapshot, a checkpoint's
-    /// catalog commit and cut log), and waiters are woken.
+    /// Every byte below `end` is durable in `class` and every weaker one: by a rewrite of the log (a
+    /// compaction's snapshot, a sharp checkpoint's catalog commit and cut log), or, at a fuzzy
+    /// install, by the flights that wrote it after the capture, in their own class. Marked holding
+    /// the store mutex once the group is quiesced, and waiters are woken.
     fn mark_durable(&self, end: u64, class: SyncClass) {
         let mut g = self.lock();
         if self.accepts() {
@@ -2685,13 +2686,28 @@ fn run_flight(
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
+        let (deferred_lsn, committed) = (cap.deferred_lsn, written.is_ok());
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
-        // The cut synced what it kept in the rewrite class: a raised D0 store's held frees mature on
-        // it, with no raised operation (engine review 11 MED 1). Mutant
-        // `settle_arena_marks_no_durable` (test builds only): this site marks nothing.
-        if installed.is_ok() && !fe_mutant("settle_arena_marks_no_durable") {
-            if let Some(journal) = guard.journal.as_ref() {
-                group.mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
+        if let Some(journal) = guard.journal.as_ref() {
+            // The catalog's commit made everything the capture covers durable in the rewrite
+            // class, even if the cut failed after it, as at the sharp path (`compact`): a raised D0
+            // store's held frees up to the capture mature on it with no raised operation (engine
+            // review 11 MED 1). Mutant `settle_arena_marks_no_durable` (test builds only): not
+            // marked.
+            if committed && !fe_mutant("settle_arena_marks_no_durable") {
+                group.mark_committed(deferred_lsn, journal.rewrite_class());
+            }
+            // What the flights after the capture wrote is durable only in their own class: the
+            // arena was settled before them and the cut's rename waits for the next flight's
+            // directory sync (engine review 13 HIGH 1). Mutant `fuzzy_install_marks_rewrite_class`
+            // (test builds only): the rewrite class, as in d7600ed20.
+            if installed.is_ok() {
+                let class = if fe_mutant("fuzzy_install_marks_rewrite_class") {
+                    rewritten_class(journal)
+                } else {
+                    journal.sync_class()
+                };
+                group.mark_durable(journal.lsn() - journal.pending_len(), class);
             }
         }
         let hold_ns = ns(t);
