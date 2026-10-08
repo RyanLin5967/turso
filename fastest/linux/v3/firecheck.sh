@@ -711,6 +711,24 @@ if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
   pv prev_L9_verdictswap python3 -B "$HERE/postplant.py" "$OUT/F3" "$R2/prev_L9_verdictswap" "$CELL" "$SHA" verdictswap "$V3_PREV/batchgate.py"
 fi
 
+# mkfixtures.sh's two per-block modes for t3run (fastest-linux), last, after every plant on n3/n4: tear the chain
+# down, prove nothing of it is left, rebuild it with V3_FIXTURES=nest on the same directory, and run P_nest3's probe
+# on the rebuilt n3 (P_nest_modes)
+NM=$OUT/F4/P_nest_modes
+mkdir -p "$NM"
+if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
+  nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
+  echo "$nd" > "$NM/nest_dir"
+  timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
+  { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
+    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; } > "$NM/after_teardown.txt"
+  timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$nd" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
+  { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && [ -f "$FX/n$k.ok" ] && echo "n$k mounted ok"; done; } > "$NM/after_rebuild.txt"
+  timeout 300 "$V3" --dir "$FX/n3/w" --out "$NM/probe.out" --n 5 --arms append25,nosync25 > "$NM/probe.txt" 2>&1; echo $? > "$NM/probe.rc"
+else
+  echo "no proved nest chain to tear down (n1.ok absent or n1 not mounted)" > "$NM/na.txt"
+fi
+
 sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null
 [ "$LEAFW" != "$ROOTW" ] && rm -rf "$LEAFW"
 ls -A "$W" > "$OUT/work-leftover.txt"

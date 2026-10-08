@@ -321,6 +321,7 @@ def plan(cell, arch, leaf, box):
     for t in REFUSALS:
         ids.append("F4:" + t)
     ids.append("F4:P_nest3")
+    ids.append("F4:P_nest_modes")
     ids.append("F4:R_ficlone_accept" if k == "ext4" else "F4:X_allclones")
     ids.append("F4:R_leftover")
     if box.get("flip") == "yes":
@@ -1727,6 +1728,19 @@ def main(argv):
         refusal(tag, want)
     rc = rc_of(os.path.join(OUT, "F4", "P_nest3.rc"))
     nj = rj(os.path.join(OUT, "F4", "P_nest3.out", "summary.json")) or {}
+    nm = os.path.join(OUT, "F4", "P_nest_modes")
+    pj = rj(os.path.join(nm, "probe.out", "summary.json")) or {}
+    at = rd(os.path.join(nm, "after_teardown.txt"))
+    ar = rd(os.path.join(nm, "after_rebuild.txt"))
+    check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
+          and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
+          and sorted(ar.split("\n")[:-1]) == ["n%d mounted ok" % k for k in (1, 2, 3, 4)]
+          and rc_of(os.path.join(nm, "probe.rc")) in (0, 3) and pj.get("layers") == 4 and pj.get("loop_layers") == 3,
+          {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
+           "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
+           "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
+          "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
+          "rebuilds all four on the same directory; the probe accepts the rebuilt n3 (4 layers)")
     check("F4:P_nest3", rc in (0, 3) and nj.get("layers") == 4 and nj.get("loop_layers") == 3,
           {"rc": rc, "layers": nj.get("layers"), "text": (rd(os.path.join(OUT, "F4", "P_nest3.txt")) or "")[-300:]},
           "3 nested loops (4 layers) are followed to the leaf and accepted")

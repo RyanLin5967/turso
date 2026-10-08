@@ -28,8 +28,28 @@
 #   sdbg  ext4 on a scsi_debug disk (RAM posing as a SCSI drive; its caching page says WCE=1, so sd reads write
 #         back): the MODE SENSE WCE=1 branch                                            P_sdbg_wb, R_sdbg_flip, R_sdbg_noenv (M2)
 # Exit 0 when every fixture proved itself, 1 otherwise (the workflow records it and runs the fire-check anyway).
+#
+# Two modes for t3run's per-block runs (fastest-linux; the nest chain must start on the block's own filesystem, which
+# exists only inside the block, while scsi_debug, /dev/ram1 and v3fx-dm stay in use from the first run):
+#   V3_FIXTURES=nest V3_NEST_DIR=DIR mkfixtures.sh BASE   makes n1..n4 only, the first image on DIR (required: no
+#                                                        default to /); an n4..n1 chain already under BASE is torn
+#                                                        down first. Exit 0 iff n1..n4 all proved themselves.
+#   mkfixtures.sh --teardown-nest BASE                   unmounts n4..n1 under BASE, detaches their loops, deletes
+#                                                        n1's image and the n*.ok files, so the block's own
+#                                                        filesystem can be unmounted. Exit 0 iff afterwards none of
+#                                                        n1..n4 is mounted and every loop it detached is gone (a BASE
+#                                                        with no chain is already in that state: exit 0, said so).
+# V3_FIXTURES is all (the default) or nest; anything else refuses (exit 2).
 set -u
-base=${1:?usage: mkfixtures.sh BASE}
+if [ "${1:-}" = --teardown-nest ]; then MODE=teardown; base=${2:?usage: mkfixtures.sh --teardown-nest BASE}
+else MODE=${V3_FIXTURES:-all}; base=${1:?usage: mkfixtures.sh BASE}; fi
+case $MODE in
+  teardown) [ "${1:-}" = --teardown-nest ] || { echo "mkfixtures: REFUSED: V3_FIXTURES='teardown' is not all or nest" >&2; exit 2; } ;;
+  all) ;;
+  nest) [ -n "${V3_NEST_DIR:-}" ] && [ -d "$V3_NEST_DIR" ] \
+          || { echo "mkfixtures: REFUSED: V3_FIXTURES=nest needs V3_NEST_DIR, a directory on the block's filesystem (got '${V3_NEST_DIR:-}')" >&2; exit 2; } ;;
+  *) echo "mkfixtures: REFUSED: V3_FIXTURES='$MODE' is not all or nest" >&2; exit 2 ;;
+esac
 me="$(id -u):$(id -g)"
 # every fixture ext4 is made whole now (no lazyinit thread writing and committing later, which would put foreign
 # flush requests on the loop devices during the fire-check)
@@ -118,6 +138,34 @@ f_nest() {
     size=$(( ${size%M} * 2 / 3 ))M
     ok "n$k" "$d on $(losetup -n -O BACK-FILE "$d" | xargs)"
   done
+}
+# the nest chain's teardown (t3run per block): n4 first, each level's loop detached after its unmount
+teardown_nest() {
+  local k mp dev back gone rc=0 found=0
+  for k in 4 3 2 1; do
+    mp="$base/n$k"
+    sudo rm -f "$base/n$k.ok"
+    mountpoint -q "$mp" 2>/dev/null || continue
+    found=1
+    dev=$(findmnt -n -o SOURCE "$mp" | tail -1)
+    back=$(losetup -n -O BACK-FILE "$dev" 2>/dev/null | xargs)
+    sudo umount "$mp" || { echo "teardown n$k: umount $mp FAILED"; rc=1; continue; }
+    case $dev in
+      /dev/loop*)
+        sudo losetup -d "$dev" || { echo "teardown n$k: losetup -d $dev FAILED"; rc=1; }
+        gone=0
+        for _ in $(seq 1 20); do [ -e "/sys/block/${dev##*/}/loop/backing_file" ] || { gone=1; break; }; sleep 0.5; done
+        [ "$gone" = 1 ] || { echo "teardown n$k: $dev still has a backing file"; rc=1; } ;;
+      *) echo "teardown n$k: $mp was on $dev, not a loop device"; rc=1 ;;
+    esac
+    [ "$k" = 1 ] && [ -n "$back" ] && sudo rm -f "$back"
+    echo "teardown n$k: unmounted $mp, detached $dev (backing $back)"
+  done
+  for k in 1 2 3 4; do
+    mountpoint -q "$base/n$k" 2>/dev/null && { echo "teardown: $base/n$k is still mounted"; rc=1; }
+  done
+  [ "$found" = 1 ] || echo "teardown: no nest chain under $base"
+  return $rc
 }
 f_ds() {
   local d
@@ -208,6 +256,18 @@ f_sdbg() {
   sudo setfacl -m "u:$(id -un):r" "/dev/$d" 2>/dev/null || sudo chmod o+r "/dev/$d"
   ok sdbg "/dev/$d cache_type '$ct' write_cache '$(cat /sys/block/"$d"/queue/write_cache)' hosts $(cat /sys/class/scsi_host/host*/proc_name 2>/dev/null | xargs) path $(readlink -f "/sys/block/$d/device")"
 }
+if [ "$MODE" = teardown ]; then
+  teardown_nest; trc=$?
+  echo "mkfixtures --teardown-nest: rc=$trc"
+  exit $trc
+fi
+if [ "$MODE" = nest ]; then
+  teardown_nest || { echo "mkfixtures: the existing nest chain under $base could not be torn down"; exit 1; }
+  f_nest || bad nest "a step failed"
+  for k in 1 2 3 4; do [ -f "$base/n$k.ok" ] || { echo "fixture n$k: not proved"; fail=1; }; done
+  echo "mkfixtures (nest only, first image on $V3_NEST_DIR): fail=$fail"
+  exit $fail
+fi
 for f in nb ht hn lz del nest ds ld ej md wt brd dm root dj sdbg; do
   "f_$f" || bad "$f" "a step failed"
 done
