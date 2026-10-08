@@ -236,8 +236,9 @@ pub fn parameter_types(
 }
 
 /// A relation a column reference can name, by the name references qualify it by: a table (its
-/// columns read from the schema), or a derived table or CTE (its columns' types as its query gives
-/// them).
+/// columns read from the schema), a derived table, CTE or view (its columns' types as its query
+/// gives them; an alias-less subquery's name is empty), or one the walk cannot open (a relation of
+/// another schema, one it cannot find or parse, a `*` it cannot expand), whose columns are unknown.
 #[derive(Clone)]
 enum Rel {
     Table {
@@ -248,15 +249,32 @@ enum Rel {
         name: String,
         columns: Vec<(String, Option<u32>)>,
     },
+    Unknown {
+        name: String,
+    },
 }
 
 impl Rel {
     fn name(&self) -> &str {
         match self {
-            Rel::Table { name, .. } | Rel::Derived { name, .. } => name,
+            Rel::Table { name, .. } | Rel::Derived { name, .. } | Rel::Unknown { name } => name,
+        }
+    }
+
+    /// A derived relation of these columns, or one the walk cannot open if a `*` among them could
+    /// not be expanded ([`STAR`]).
+    fn derived(name: String, columns: Vec<(String, Option<u32>)>) -> Rel {
+        if columns.iter().any(|(n, _)| n == STAR) {
+            Rel::Unknown { name }
+        } else {
+            Rel::Derived { name, columns }
         }
     }
 }
+
+/// The name a target-list `*` keeps when the walk cannot expand it (a relation it cannot open):
+/// the columns of whatever derives from that list are then unknown ([`Rel::derived`]).
+const STAR: &str = "*";
 
 /// The relations visible at a point of the walk, one level per enclosing SELECT, innermost last: a
 /// column reference resolves innermost first, as PostgreSQL resolves a correlated reference.
@@ -489,25 +507,65 @@ impl Infer<'_> {
         depth
     }
 
-    /// A target relation, or a FROM table: a CTE of its name when one is in scope, else the table.
+    /// A target relation, or a FROM table: a CTE of its name when one is in scope, else the table,
+    /// else a view (walked from its query), else a relation the walk cannot open. The schemas a
+    /// relation here can live in are public (the default) and pg_catalog, whose relations keep
+    /// their own names, and information_schema, whose views are information_schema_<view>; a
+    /// relation of any other schema is not one this walk can open. The schema was dropped, so `s.t`
+    /// was typed as public's t (wire review 11 item 3).
     fn range_var(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Rel {
         let name = rv
             .alias
             .as_ref()
             .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
-        if rv.schemaname.is_empty() {
-            if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
-                let columns = match &rv.alias {
-                    Some(a) => rename(columns.clone(), &a.colnames),
-                    None => columns.clone(),
-                };
-                return Rel::Derived { name, columns };
+        let aliased = |columns: Vec<(String, Option<u32>)>| match &rv.alias {
+            Some(a) => rename(columns, &a.colnames),
+            None => columns,
+        };
+        let relname = match rv.schemaname.to_lowercase().as_str() {
+            "" => {
+                if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
+                    return Rel::derived(name, aliased(columns.clone()));
+                }
+                rv.relname.clone()
             }
+            "public" | "pg_catalog" => rv.relname.clone(),
+            "information_schema" => format!("information_schema_{}", rv.relname.to_lowercase()),
+            _ => return Rel::Unknown { name },
+        };
+        if self.schema.get_table(&relname).is_some() {
+            return Rel::Table { name, relname };
         }
-        Rel::Table {
-            name,
-            relname: rv.relname.clone(),
+        match self.view_columns(&relname) {
+            Some(columns) => Rel::derived(name, aliased(columns)),
+            None => Rel::Unknown { name },
         }
+    }
+
+    /// A view's columns, typed by walking its query (stored as SQL text) as a statement of its own:
+    /// the query sees no enclosing scope and none of this statement's CTEs. None for no view of
+    /// that name, or one whose text does not parse as a view. A view was not opened at all, so a
+    /// parameter compared with its count(*) column fell to the text fallback, and rows went missing
+    /// (wire review 11 item 3).
+    fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
+        let view = self.schema.get_view(relname)?;
+        let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
+        let parsed = turso_pg_parser::parse(sql).ok()?;
+        let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?;
+        let Some(Node::ViewStmt(v)) = stmt.node.as_ref() else {
+            return None;
+        };
+        let Some(Node::SelectStmt(query)) = v.query.as_deref().and_then(|q| q.node.as_ref()) else {
+            return None;
+        };
+        let mut walk = Infer {
+            schema: self.schema,
+            types: std::collections::BTreeMap::new(),
+            compared_untyped: std::collections::BTreeSet::new(),
+            ctes: Vec::new(),
+        };
+        let columns = walk.select(query, &Vec::new());
+        Some(rename(columns, &v.aliases))
     }
 
     /// The relations a list of FROM items brings into scope, walking the subqueries, functions and
@@ -536,12 +594,13 @@ impl Infer<'_> {
                     Some(Node::SelectStmt(s)) => self.select(s, scope),
                     _ => Vec::new(),
                 };
-                if let Some(a) = &r.alias {
-                    level.push(Rel::Derived {
-                        name: a.aliasname.clone(),
-                        columns: rename(columns, &a.colnames),
-                    });
-                }
+                // An alias-less subquery (PostgreSQL 16 and later) is nameless: its columns are
+                // still in scope for a bare reference. It was dropped, so its columns fell to the
+                // text fallback (wire review 11 item 3).
+                level.push(match &r.alias {
+                    Some(a) => Rel::derived(a.aliasname.clone(), rename(columns, &a.colnames)),
+                    None => Rel::derived(String::new(), columns),
+                });
             }
             Some(Node::RangeFunction(f)) => {
                 for item in &f.functions {
@@ -727,6 +786,12 @@ impl Infer<'_> {
         for target in targets {
             if let Some(Node::ResTarget(t)) = target.node.as_ref() {
                 if let Some(val) = t.val.as_deref() {
+                    // `*` and `t.*` are the columns of the current FROM level's relations, in
+                    // order; each was one `?column?` (wire review 11 item 3).
+                    if let Some(expanded) = self.star(val, scope) {
+                        columns.extend(expanded);
+                        continue;
+                    }
                     self.expr(val, scope);
                     let name = if t.name.is_empty() {
                         target_name(val)
@@ -738,6 +803,56 @@ impl Infer<'_> {
             }
         }
         columns
+    }
+
+    /// A target-list `*` or `t.*`, expanded to the current FROM level's columns (those of `t`
+    /// alone); a relation the walk cannot open, or a `t` the level does not have, gives [`STAR`].
+    /// None for any other target.
+    fn star(&self, val: &PgNode, scope: &Scope) -> Option<Vec<(String, Option<u32>)>> {
+        let Some(Node::ColumnRef(c)) = val.node.as_ref() else {
+            return None;
+        };
+        if !matches!(
+            c.fields.last().and_then(|f| f.node.as_ref()),
+            Some(Node::AStar(_))
+        ) {
+            return None;
+        }
+        let qualifier = match c.fields.as_slice() {
+            [_] => None,
+            [q, _] => match q.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => return Some(vec![(STAR.to_string(), None)]),
+            },
+            _ => return Some(vec![(STAR.to_string(), None)]),
+        };
+        let level = scope.last().map_or(&[][..], |l| l.as_slice());
+        let mut columns = Vec::new();
+        let mut any = false;
+        for rel in level
+            .iter()
+            .filter(|r| qualifier.is_none_or(|q| r.name() == q))
+        {
+            any = true;
+            match rel {
+                Rel::Table { relname, .. } => match self.schema.get_table(relname) {
+                    Some(table) => columns.extend(
+                        table
+                            .columns()
+                            .iter()
+                            .filter(|col| !col.hidden())
+                            .map(|col| (col.name.clone().unwrap_or_default(), column_oid(col))),
+                    ),
+                    None => columns.push((STAR.to_string(), None)),
+                },
+                Rel::Derived { columns: c, .. } => columns.extend(c.iter().cloned()),
+                Rel::Unknown { .. } => columns.push((STAR.to_string(), None)),
+            }
+        }
+        if !any {
+            columns.push((STAR.to_string(), None));
+        }
+        Some(columns)
     }
 
     fn exprs(&mut self, node: Option<&PgNode>, scope: &Scope) {
@@ -929,11 +1044,19 @@ impl Infer<'_> {
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(column))
                     .map(|(_, t)| *t),
+                // Whatever it has is unknown: found, with no type the walk knows.
+                Rel::Unknown { .. } => Some(None),
             }
         };
         match names.as_slice() {
             [column] => {
                 for level in scope.iter().rev() {
+                    // A level with a relation the walk cannot open may hold the column: the search
+                    // stops there, untyped, rather than bind it to an outer relation's column of
+                    // that name or to text (wire review 11 item 3).
+                    if level.iter().any(|rel| matches!(rel, Rel::Unknown { .. })) {
+                        return Some(None);
+                    }
                     let mut found = level.iter().filter_map(|rel| of(rel, column));
                     if let Some(ty) = found.next() {
                         return found.next().is_none().then_some(ty);
