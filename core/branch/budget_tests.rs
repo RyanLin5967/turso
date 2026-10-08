@@ -604,6 +604,7 @@ fn shared_rounds(c: u64) -> u64 {
 /// largest single store-mutex hold meanwhile (allocated bytes, catalog rows), by any thread.
 fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let base = probe::threads();
+    probe::mark_foreground(true);
     let _ = probe::take_hold_maxima();
     let foot0 = probe::phys_footprint();
     let before = probe::live_heap_bytes();
@@ -613,7 +614,9 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     db.branch_wait_name_filter();
     let settled = quiesce(&db, base);
     let after = probe::live_heap_bytes();
+    let (bg_bytes, bg_rows) = probe::take_background_hold_maxima();
     let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    probe::mark_foreground(false);
     let foot1 = probe::phys_footprint();
     let mut s = Sample::new();
     // A negative delta (the open freed more than it kept) is recorded as such, never clamped: the
@@ -628,6 +631,8 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     }
     s.insert("max_hold_alloc_bytes", hold_bytes);
     s.insert("max_hold_catalog_rows", hold_rows);
+    s.insert("max_bg_hold_alloc_bytes", bg_bytes);
+    s.insert("max_bg_hold_catalog_rows", bg_rows);
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
 }
@@ -750,6 +755,23 @@ fn run_instruments(cell: &str) -> String {
     let (hold_bytes, hold_rows) = probe::take_hold_maxima();
     s.insert("max_hold_alloc_bytes", hold_bytes);
     s.insert("max_hold_catalog_rows", hold_rows);
+    // A hold on a foreground-marked thread is not a background hold; one on another thread is.
+    probe::mark_foreground(true);
+    probe::store_locked();
+    std::hint::black_box(Box::new([0u64; 8]));
+    probe::store_unlocked();
+    std::thread::spawn(|| {
+        probe::store_locked();
+        std::hint::black_box(Box::new([0u64; 2]));
+        probe::store_unlocked();
+    })
+    .join()
+    .unwrap();
+    probe::mark_foreground(false);
+    let (bg_bytes, _) = probe::take_background_hold_maxima();
+    let (all_bytes, _) = probe::take_hold_maxima();
+    s.insert("bg_hold_alloc_bytes", bg_bytes);
+    s.insert("all_hold_alloc_bytes", all_bytes);
     put("fc_live_and_hold", &s);
     // The thread count sees a thread that is alive, and stops seeing it once it has exited.
     let base = probe::threads();
@@ -1280,6 +1302,8 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "live_zeroed"), 4096, "a zeroed 4 KiB buffer");
     assert_eq!(get("fc_live_and_hold", "max_hold_alloc_bytes"), 24, "the largest of two holds (3 boxes of a u64; then a nested hold of 2)");
     assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
+    assert_eq!(get("fc_live_and_hold", "bg_hold_alloc_bytes"), 16, "the background maximum: the spawned thread's 16 B hold, not the foreground's 64 B");
+    assert_eq!(get("fc_live_and_hold", "all_hold_alloc_bytes"), 64, "the all-threads maximum: the foreground's 64 B hold");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
@@ -2106,14 +2130,16 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 }
 
 /// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): the largest
-/// single store-mutex hold during an open and its background work, by any thread, does not grow
-/// with the live branches: from 10^4 to 10^5 its allocated bytes grow by at most a quarter plus 4
-/// KiB, and its catalog rows by at most a quarter plus 64. An O(N) hold grows tenfold. The size of
-/// an O(1) hold is not judged here: base10's opening thread allocated 1,029,243 B under the mutex
-/// in 9 holds at every N, so some hold is >= 114 KB at any N (a fix item, not this guard's).
-/// BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no catalog row (the
-/// D0 recovery instruction test sees that one); a catalog statement that changes many rows counts
-/// one (`Stmt::exec`).
+/// single store-mutex hold made by the store's BACKGROUND threads during an open and its background
+/// work (the name filter's build; under L4, the name map's) does not grow with the live branches:
+/// from 10^4 to 10^5 its allocated bytes grow by at most a quarter plus 4 KiB, its catalog rows by
+/// at most a quarter plus 64. An O(N) hold grows tenfold. The opening thread's own holds are judged
+/// apart (the same bound on the all-threads maximum), because its fixed ~1 MiB hold (base10:
+/// 1,029,243 B in 9 holds at every N) masked the filter's O(N) install in the all-threads maximum
+/// at 10^4 (base13: 1,029,291 B at 10^4, 1,179,656 B at 10^5 = a 131,072-bucket set of u64 — read
+/// green). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no catalog
+/// row (the D0 recovery instruction test sees that one); a catalog statement that changes many rows
+/// counts one (`Stmt::exec`).
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -2122,7 +2148,12 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
     let mut failures = String::new();
-    for (k, slack) in [("max_hold_alloc_bytes", 4096u64), ("max_hold_catalog_rows", 64)] {
+    for (k, slack) in [
+        ("max_bg_hold_alloc_bytes", 4096u64),
+        ("max_bg_hold_catalog_rows", 64),
+        ("max_hold_alloc_bytes", 4096),
+        ("max_hold_catalog_rows", 64),
+    ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + x / 4 + slack {
             let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {x}/4 + {slack}");
@@ -2135,8 +2166,10 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
 /// writer, which writes it with ONE unsynced pwrite once the group is idle, under no store mutex.
 /// An idle-tail create whose word is written costs, beyond the same create with the word held, at
 /// most two syscalls (the pwrite, and the writer's one wait to park again) and no sync, no
-/// store-mutex acquisition and no syscall under it, on any thread. (A word that owns a descriptor
-/// of its own adds its close; review 1 #14 / review 2 #6 share the log's.)
+/// store-mutex acquisition and no syscall under it, on any thread. A word that owns a duplicated
+/// descriptor adds its close (and std's debug-build F_GETFD at that close): base13 read +4, and an
+/// lldb trace of the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`;
+/// review 1 #14 / review 2 #6 (one shared descriptor, no dup per flight) remove the close.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {

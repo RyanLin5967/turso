@@ -48,6 +48,11 @@ static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 /// lock to unlock, any thread) since `take_hold_maxima`.
 static MAX_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
+/// The same, over holds by threads not marked foreground (`mark_foreground`): a store's background
+/// work (the name filter's build), whose O(N) hold a larger fixed hold of the foreground thread
+/// would otherwise mask in the all-threads maximum.
+static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -61,6 +66,8 @@ thread_local! {
     static T_CAT_ROWS: Cell<u64> = const { Cell::new(0) };
     /// `(held allocation bytes, catalog rows)` of this thread when it took its outermost store mutex.
     static HOLD_START: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// Whether this thread is the measuring (foreground) thread (`mark_foreground`).
+    static FOREGROUND: Cell<bool> = const { Cell::new(false) };
     static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -157,8 +164,13 @@ pub(crate) fn store_unlocked() {
     if depth == 0 {
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         let (bytes0, rows0) = HOLD_START.with(|h| h.get());
-        MAX_HOLD_ALLOC_BYTES.fetch_max(get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), Relaxed);
-        MAX_HOLD_CAT_ROWS.fetch_max(get(&T_CAT_ROWS).wrapping_sub(rows0), Relaxed);
+        let (bytes, rows) = (get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), get(&T_CAT_ROWS).wrapping_sub(rows0));
+        MAX_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
+        MAX_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+        if !FOREGROUND.with(|f| f.get()) {
+            MAX_BG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
+            MAX_BG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+        }
         if let (Some(since), Some(now)) = (HELD_SINCE.with(|s| s.take()), unix_syscalls()) {
             let held = now.wrapping_sub(since) & u64::from(u32::MAX);
             HELD_SYSCALLS.fetch_add(held, Relaxed);
@@ -192,7 +204,19 @@ pub(crate) fn live_heap_bytes() -> i64 {
 /// `(bytes allocated, catalog rows touched)` in the largest single store-mutex hold since the last
 /// call, by any thread, and start again from zero.
 pub(crate) fn take_hold_maxima() -> (u64, u64) {
+    let _ = take_background_hold_maxima();
     (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed))
+}
+
+/// The same over holds by threads not marked foreground, and start again from zero. Reset by
+/// `take_hold_maxima` too.
+pub(crate) fn take_background_hold_maxima() -> (u64, u64) {
+    (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed))
+}
+
+/// Mark the calling thread as the foreground (measuring) thread, or unmark it.
+pub(crate) fn mark_foreground(on: bool) {
+    FOREGROUND.with(|f| f.set(on));
 }
 
 /// Sample the syscall count around store-mutex holds from now on (off by default: two Mach traps
