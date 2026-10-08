@@ -15,11 +15,15 @@ What SHOULD be there is never taken from what is there (review finding 11):
     workflow is a MISSING row (third review, finding 6).
 A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
-  JOBS   artifact, firecheck verdict, functional verdict, failed functional lines
-  CELLS  artifact, cell, then stracecount.py's table columns (TABLE_COLS)
+  JOBS     artifact, firecheck verdict, functional verdict, failed functional lines
+  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok)
+  FIXTURE  one line: the run's one parent fixture, or why the jobs' fixtures differ
+  DRIVES   artifact, drive class (drive.py: write-through | write-back+fua | write-back-no-fua), disks, device chain
+  CELLS    artifact, cell, then stracecount.py's table columns (TABLE_COLS)
 Exit 0 only if every expected job and cell is present and readable, every fire-check passed each PINNED_FIRECHECK
 check (one PASS line each, no FAIL line, one "VERDICT PASS n/n" with n the pinned count), every functional verdict is
-a PASS and every cell verdict is ok; 1 otherwise (after printing everything); 2 if the expectation itself cannot be
+a PASS, every cell verdict and timed verdict is ok, the fixtures agree and every present job has its drive class;
+1 otherwise (after printing everything); 2 if the expectation itself cannot be
 determined.
 """
 import glob
@@ -218,6 +222,20 @@ def main(argv):
     print("FIXTURE\tall jobs\t" + ("one parent: " + json.dumps({k: fxs[0].get(k) for k in fixture.KEYS})
                                    if not fwhy else "REFUSED: " + "; ".join(fwhy)))
     bad += 1 if fwhy else 0
+    # The drive class each job ran on (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3): run/drive.json from
+    # drive.py, which run_system.sh writes before any cell; a present job without a readable one is not a pass.
+    print("DRIVES\tartifact\tdrive_class\tdisks\tchain")
+    for name in names:
+        if name not in present:
+            continue
+        try:
+            dj = json.load(open(os.path.join(d, name, "run", "drive.json")))
+            row = [dj["drive_class"], ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__})")
+            bad += 1
+            continue
+        print("DRIVES\t" + "\t".join([name] + row))
     print("CELLS\tartifact\tcell\t" + "\t".join(stracecount.TABLE_COLS))
     for name, cell, c in cells:
         if c is None:

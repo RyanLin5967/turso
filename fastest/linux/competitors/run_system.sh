@@ -133,6 +133,11 @@ if [ -z "$FC_N" ] || [ "$FC_LAST" != "VERDICT PASS $FC_N/$FC_N" ] || [ "$FC_PASS
   echo "REFUSED: the flush counter's fire-check did not pass all $FC_N checks: $FC ends [$FC_LAST], $FC_PASSL PASS line(s), $FC_PASS distinct, $FC_FAIL FAIL line(s)" | tee "$FUN"
   exit 1
 fi
+# The drive class under MNT (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3: GitHub jobs land on a
+# write-through virtual disk or a write-back NVMe with FUA): drive.py follows MNT's device through the loop to its
+# backing file's disk and records RAW/drive.json; a class it cannot determine refuses the run.
+DRIVE=$(python3 -B "$HERE/drive.py" record "$MNT" "$RAW/drive.json") ||
+  { echo "REFUSED: the drive class under $MNT: [$DRIVE] (drive.py)" | tee "$FUN"; exit 2; }
 # Every cell this run must produce, written BEFORE any runs: reduce.py reports a listed cell without a cell.json as
 # MISSING, so a cell that returns early cannot simply disappear (review finding 11).
 for spec in $SPECLIST; do
@@ -142,6 +147,7 @@ for spec in $SPECLIST; do
 done >"$RAW/expected-cells.txt"
 { echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
   [ "$KIND" = pg ] && echo "pg_systems=pg18-d2 (with pg18-create-copy) pg18-defaults=DROPPED on Linux (lead ruling artie 6b0bef481b)"
+  echo "$DRIVE"
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 

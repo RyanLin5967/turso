@@ -20,6 +20,7 @@ class is guessed.
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -66,8 +67,7 @@ def dev_of(path):
         sst = os.stat(src)
     except OSError as e:
         raise Undetermined(f"{path} is on anonymous device 0:{os.minor(st.st_dev)} and its source {src!r}: {e}")
-    import stat as stat_
-    if not stat_.S_ISBLK(sst.st_mode):
+    if not stat.S_ISBLK(sst.st_mode):
         raise Undetermined(f"{path}'s mount source {src!r} is not a block device")
     return f"{os.major(sst.st_rdev)}:{os.minor(sst.st_rdev)}"
 
@@ -124,7 +124,6 @@ def leaves(sysfs, majmin, devof, chain, depth=0):
 
 
 def resolve(mnt, sysfs="/sys", devof=dev_of):
-    return {"mnt": mnt, "chain": [], "disks": [], "drive_class": "write-through"}  # RED stub: one class for all
     chain = []
     disks = leaves(sysfs, devof(mnt), devof, chain)
     classes = sorted({x["class"] for x in disks})
