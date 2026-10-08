@@ -325,8 +325,15 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     # a verdict: a one-shot stamp is as correct, it only costs an interpreter start at the window's edge.
     out_src = dict(re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)_src=(\w+)", win, re.M))
     out_clock = None
-    if attached:
-        chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
+    # A launch window (strace_run: one command traced from exec) is stamped t0 before strace starts and t1 after it
+    # exits, as clock pairs too, so the same checks cover it with [t0, t1] as its life (SMOKE.md erratum E4: its
+    # stamps were `date`, with no pair, and only the call-stamp back-step check saw a clock step).
+    life = ("tseize", "tend") if attached else ("t0", "t1")
+    if attached or launched:
+        if attached:
+            chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
+        else:
+            chain = ["t0", "t1"]
         absent = [k for n in chain for k in (n, n + "_mono") if k not in clock]
         loose = [n for n in chain if clock.get(n + "_err", 0.0) > 0.0005]
         # One stamp of each, in the order the attach writes them: t1 (the detach request) before strace's exit status,
@@ -338,13 +345,16 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         wlines = win.splitlines()
         pos = {k: next((i for i, ln in enumerate(wlines) if re.match(rf"{k}=", ln)), None)
                for k in ("t1", "strace_rc", "tend")}
+        kind = "attach" if attached else "launch"
         if twice:
-            problems.append(f"attach window with repeated stamp(s) {twice}: which one is the window's cannot be told")
-        if None not in pos.values() and not pos["t1"] < pos["strace_rc"] < pos["tend"]:
+            problems.append(f"{kind} window with repeated stamp(s) {twice}: which one is the window's cannot be told")
+        if attached and None not in pos.values() and not pos["t1"] < pos["strace_rc"] < pos["tend"]:
             problems.append(f"attach window's t1, strace_rc and tend lines out of order {pos}: t1 must be stamped "
                             "before the detach's wait, tend after it")
+        if launched and pos["t1"] is not None and pos["strace_rc"] is not None and not pos["t1"] < pos["strace_rc"]:
+            problems.append(f"launch window's t1 after its strace_rc {pos}: t1 must be stamped when strace exits")
         if absent:
-            problems.append(f"attach window without its clock pair(s) {absent}: a clock step could not be seen")
+            problems.append(f"{kind} window without its clock pair(s) {absent}: a clock step could not be seen")
         elif loose:
             problems.append(f"clock pair(s) {loose} read with more than 0.5 ms between their monotonic reads in 50 "
                             "tries: a step that size could not be told from the read")
@@ -357,9 +367,10 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
                 if dm < 0 or abs(dr - dm) > tol:
                     problems.append(f"CLOCK_REALTIME stepped {dr - dm:+.6f} s between {a} and {b} (realtime {dr:.6f} s "
                                     f"against monotonic {dm:.6f} s): the window cuts cannot be trusted")
-            if first_ts is not None and (first_ts < clock["tseize"] - 0.001 or last_ts > clock["tend"] + 0.001):
+            lo, hi = clock[life[0]], clock[life[1]]
+            if first_ts is not None and (first_ts < lo - 0.001 or last_ts > hi + 0.001):
                 problems.append(f"call stamps {first_ts:.6f}..{last_ts:.6f} outside the window's life "
-                                f"[{clock['tseize']:.6f}, {clock['tend']:.6f}]: the clock or the stamps are wrong")
+                                f"[{lo:.6f}, {hi:.6f}]: the clock or the stamps are wrong")
             out_clock = steps
     before_t0, after_t1 = 0, 0
 

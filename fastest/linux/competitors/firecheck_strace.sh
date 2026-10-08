@@ -318,7 +318,7 @@ if strace_attach "$OUT/f3" "$PP"; then
   # had no table and no call lines) is part of the check: an untested F3b fails. The window given is a well-formed
   # LAUNCH record (strace_rc 0), so the only thing missing is the attach proof, and the refusal must be the missing
   # table, not a malformed record (third review, finding 7: without any window it was refused for the record alone).
-  printf 'cmd=f3b-control t0=%s\nt1=%s\nstrace_rc=0\n' "$(date +%s.%N)" "$(date +%s.%N)" >"$OUT/f3b.window"
+  { echo "cmd=f3b-control"; clock_pair t0; clock_pair t1; echo "strace_rc=0"; } >"$OUT/f3b.window"  # as strace_run writes it
   python3 "$SC" count "$OUT/f3.strace" --extra "$OUT/f3.strace.err" --root "$DIR" --window "$OUT/f3b.window" >"$OUT/f3b.json"
   check F3b-unproven-empty-refused "$OUT/f3b.json" \
     'not r["lines"] and not r["summary"] and r["problems"]==["no -c summary table found"]'
@@ -701,11 +701,19 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
   awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
-  for k in a b c d e f g h i j k l m n; do count "f13$k"; done
+  # Launch windows (strace_run) carry clock pairs too (SMOKE.md erratum E4), on copies of F1's: (p) unmodified, ok
+  # with F1's 10 flushes and t0/t1 from the stamper; (q) t1's realtime +0.1 s, refused for the step; (r) the t0 pair
+  # line removed, refused for the missing pair.
+  for k in p q r; do
+    for x in strace strace.err window cmd.err; do cp "$OUT/f1.$x" "$OUT/f13$k.$x" 2>/dev/null; done
+  done
+  awk '/^t1=/ { split($1, a, "="); $1 = sprintf("t1=%.9f", a[2] + 0.1) } { print }' "$OUT/f1.window" >"$OUT/f13q.window"
+  awk '!/^t0=/ { print }' "$OUT/f1.window" >"$OUT/f13r.window"
+  for k in a b c d e f g h i j k l m n p q r; do count "f13$k"; done
   if python3 -c "
 import json, sys
 o = sys.argv[1]
-J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmn'}
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqr'}
 v = {k: r['verdict'] for k, r in J.items()}
 src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
@@ -717,9 +725,12 @@ ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
       refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and refused('n', 'zero call lines') and
       v['l'] == 'ok' and J['l']['flushes'] == 10 and v['m'] == 'ok' and J['m']['flushes'] == 10 and
       v['c'] == 'ok' and J['c']['flushes'] == 10 and
-      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'})
-print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijkn'), '| (l)', v['l'][:20], J['l']['flushes'],
-      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src)
+      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'} and
+      v['p'] == 'ok' and J['p']['flushes'] == 10 and J['p'].get('clock_src') == {'t0': 'coproc', 't1': 'coproc'} and
+      refused('q', STEP) and refused('r', 'without its clock pair'))
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqr'), '| (l)', v['l'][:20], J['l']['flushes'],
+      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src,
+      '| (p)', v['p'][:20], J['p']['flushes'], J['p'].get('clock_src'))
 sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
     log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
   else

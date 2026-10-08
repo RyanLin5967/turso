@@ -380,12 +380,14 @@ strace_detach() {
 strace_run() {
   local out=$1 rc=0
   shift
-  echo "cmd=$* t0=$(date +%s.%N)" >"$out.window"
+  # t0 and t1 are clock pairs, as in an attach window, so stracecount's clock-step checks cover launch windows too
+  # (SMOKE.md erratum E4: they were `date` stamps with no pair).
+  { echo "cmd=$*"; clock_pair t0; } >"$out.window"
   # The traced command's own stderr goes to OUT.cmd.err (an sh that redirects fd 2 and execs it, traced from the
   # start), so OUT.strace.err holds strace's messages only: a Python DeprecationWarning from the fire-check's F1
   # probe sat in strace.err in 2 of 20 jobs of run 37244177784 and would now refuse the window (third review, 3).
   strace "${STRACE_OPTS[@]}" -o "$out.strace" /bin/sh -c 'exec "$@" 2>"$0"' "$out.cmd.err" "$@" 2>"$out.strace.err" || rc=$?
-  { echo "t1=$(date +%s.%N)"; echo "strace_rc=$rc"; } >>"$out.window"
+  { clock_pair t1; echo "strace_rc=$rc"; } >>"$out.window"
   return $rc
 }
 
