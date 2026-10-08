@@ -65,6 +65,13 @@ impl Server {
                 .args(extra)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
+            // (`-t`), so a session the server ends without a word says why (lead: find the cause
+            // of "closed the connection during startup").
+            if let Some(trace_dir) = std::env::var_os("WIRE_SERVER_TRACE_DIR") {
+                cmd.arg("-t")
+                    .arg(std::path::Path::new(&trace_dir).join(format!("server-{port}.log")));
+            }
             // The server starts at macOS's default open-file soft limit (256) whatever this test
             // process raised its own to, so a server that serves C + 16 sessions must raise it.
             unsafe {
