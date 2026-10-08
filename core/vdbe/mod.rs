@@ -454,6 +454,29 @@ pub struct Row {
     count: usize,
 }
 
+/// Whether `err` ends an explicit transaction even when the failing statement wrote nothing. The
+/// engine's own state may be damaged after these: an I/O error, out of memory, a full database or
+/// page cache (SQLite's sqlite3VdbeHalt rolls a read-only statement's transaction back for
+/// SQLITE_IOERR, SQLITE_NOMEM and SQLITE_FULL only), corruption or an internal error, and an MVCC
+/// transaction the store has already ended. Every other error (a SQL evaluation error such as an
+/// integer overflow, a constraint, an interrupt) ends only a statement that wrote nothing
+/// (fastest-engine 4b).
+fn error_ends_the_transaction(err: &LimboError) -> bool {
+    matches!(
+        err,
+        LimboError::CompletionError(_)
+            | LimboError::OutOfMemory
+            | LimboError::DatabaseFull(_)
+            | LimboError::CacheError(_)
+            | LimboError::Corrupt(_)
+            | LimboError::NotADB
+            | LimboError::InternalError(_)
+            | LimboError::TxTerminated
+            | LimboError::CommitDependencyAborted
+            | LimboError::NoSuchTransactionID(_)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
     None,
@@ -3137,8 +3160,22 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
+                        // Inside an explicit transaction a statement with no statement
+                        // savepoint cannot be undone alone, so its error rolls back the
+                        // transaction, unless the statement never began writing (a read, or a
+                        // writer refused before its first write): it changed nothing, so its
+                        // error ends only itself, as PostgreSQL's statement does and SQLite's
+                        // read-only one does (fastest-engine 4b). Errors that may have damaged
+                        // the engine's own state still roll back
+                        // (`error_ends_the_transaction`). Mutant `read_error_rolls_back_txn`
+                        // (test builds only): every error rolls back, as before.
+                        let ends_only_the_statement = !unfinished_writer
+                            && err.is_some_and(|err| !error_ends_the_transaction(err))
+                            && !crate::branch::store::fe_mutant("read_error_rolls_back_txn");
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (!self.connection.get_auto_commit()
+                                && err.is_some()
+                                && !ends_only_the_statement)
                         {
                             self.rollback_current_txn(pager);
                         }
