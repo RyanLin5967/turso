@@ -3581,6 +3581,108 @@ fn bind_reads_each_parameter_in_its_format() {
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
 }
 
+/// A Bind whose result-format list is neither empty, one code, nor one code per result column is a
+/// protocol violation (08P01, PostgreSQL's "bind message has N result formats but query has M
+/// columns"), at Describe of the portal and at Execute, and the session and a second connection are
+/// served; the same for a parameter-format list that is neither 0, 1 nor one per parameter. pgwire
+/// reads the result list unchecked (`fv[idx]`), so two codes for three columns indexed past it and
+/// panicked the session, and under the release build's panic=abort ended every session (wire
+/// review 9 item 2). A statement that returns no rows ignores the result list, as PostgreSQL does.
+#[test]
+fn a_bind_format_list_of_the_wrong_length_is_a_protocol_violation() {
+    let dir = Scratch::new("bindformats");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (no declared types), Bind with the given parameter codes, values and result codes,
+    // optionally Describe the portal, Execute, Sync.
+    fn round(
+        w: &mut Wire,
+        sql: &str,
+        pcodes: &[i16],
+        values: &[&[u8]],
+        rcodes: &[i16],
+        describe: bool,
+    ) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        w.send(b'B', &bind);
+        if describe {
+            w.send(b'D', b"P\0");
+        }
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    for describe in [true, false] {
+        for (sql, rcodes) in [
+            ("SELECT 1, 2, 3", &[0i16, 0][..]),
+            ("SELECT 1, 2, 3", &[0, 0, 0, 0][..]),
+            ("SELECT turso_branch_stats()", &[0, 1][..]),
+            ("SELECT turso_branch_current()", &[0, 0][..]),
+        ] {
+            let what = format!(
+                "{sql} with {} result formats, describe {describe}",
+                rcodes.len()
+            );
+            let r = round(&mut a, sql, &[], &[], rcodes, describe);
+            assert_eq!(r.err(&what).code, "08P01", "{what}");
+            assert_eq!(r.status, b'I', "{what}");
+            assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+            let mut b = server.connect();
+            assert_eq!(b.q("SELECT 1").single("a second session is served"), "1");
+        }
+    }
+    // Two parameter codes for three parameters.
+    let r = round(
+        &mut a,
+        "SELECT $1::int4 + $2::int4 + $3::int4",
+        &[0, 0],
+        &[b"1", b"2", b"3"],
+        &[],
+        false,
+    );
+    assert_eq!(
+        r.err("two parameter formats, three parameters").code,
+        "08P01"
+    );
+    assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    // One code per column, and a write with no rows, which ignores the list.
+    let r = round(&mut a, "SELECT 1, 2, 3", &[], &[], &[0, 0, 0], true);
+    assert_eq!(
+        r.ok("three formats, three columns").rows,
+        vec![vec![Some("1".into()), Some("2".into()), Some("3".into())]]
+    );
+    round(
+        &mut a,
+        "INSERT INTO t VALUES (7, 'x')",
+        &[],
+        &[],
+        &[0, 0],
+        false,
+    )
+    .ok("no rows, two formats");
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 7").single("the write ran"),
+        "x"
+    );
+}
+
 /// `col = ANY($1)` and `col <> ALL($1)` give an undeclared $1 the ARRAY of the column's type, as
 /// PostgreSQL does (int4[], 1007), so a client sends '{1,2}' and gets rows 1 and 2. It was given
 /// the element type (int4), so '{1,2}' failed at Bind (wire review 8 item 6).
