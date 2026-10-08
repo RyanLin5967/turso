@@ -77,6 +77,9 @@ esac
 for spec in $SPECLIST; do  # a missing spec file is a harness defect, found before anything runs
   [ "$KIND" = b1 ] || [ -f "$SPECS/$spec.spec" ] || { echo "REFUSED: no spec $SPECS/$spec.spec" >&2; exit 2; }
 done
+# FDSYNC_SCAN_HOOK is the fire-check's fault injector (F6d/F6e make the pre-attach fd scan lose its task): a run
+# with it set would count windows whose scans were sabotaged (third re-review, finding 4).
+[ -z "${FDSYNC_SCAN_HOOK:-}" ] || { echo "REFUSED: FDSYNC_SCAN_HOOK is set ($FDSYNC_SCAN_HOOK); it is for firecheck_strace.sh only" >&2; exit 2; }
 # The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
 FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
 # ALL of this tree's fire-check passed, not a verdict that merely starts with PASS (fifth review, finding 4): the last
@@ -206,7 +209,8 @@ run_server_cell() { # run_server_cell SPEC C
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
   # Nothing but a stat between the ops and the window's end (tsplit for PG, the detach otherwise): fsused's
-  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it.
+  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it. The
+  # end stamp itself is a pipe round-trip to trace.sh's stamper, not an interpreter start (clock_pair).
   log1=$(stat -c %s "$DATA.log")
   local defer=() tw=()
   if [ "$KIND" = pg ]; then

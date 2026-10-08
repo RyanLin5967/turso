@@ -19,6 +19,12 @@
 #      not in the trace, so only the pre-attach fd scan can see it. Expect INCOMPLETE with one O_DSYNC fd at attach.
 #   F6b the same with the O_DSYNC fd held by a CHILD of the attached pid: expect INCOMPLETE, the one fd at attach in
 #      the child, and every roster process scanned.
+#   F6c the fd scan alone on a process whose leader called pthread_exit (workers hold the fds): the O_DSYNC fd is
+#      found through a live worker, "scanned" with >= 200 fds.
+#   F6e the same scan with the task it reads through made to exit after its first fd on the first try only: the
+#      rescan succeeds ("scanned", >= 200 fds, the hit), two hook calls.
+#   F6d the same scan with every task it reads through made to exit after its first fd: three tries, then
+#      "unscanned", never "scanned".
 #   F7 threads that exist BEFORE the attach: a probe starts a thread, is attached, then the thread fsyncs x3 and the
 #      main thread x2. Expect exactly 5 fsyncs, verdict ok.
 #   F8 blind spot: pwritev2 with RWF_DSYNC (launch mode). Expect INCOMPLETE (rwf_sync_writes >= 1).
@@ -39,8 +45,13 @@
 #   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
 #   F12 the t1 cut: the split probe with t1 stamped between its fsync x2 and fsync x3 -> counts 2, and >= 3 calls
 #      after t1 left out.
-#   F13 the clock-step refusals forced to fire on copies of F2's window: a call stamp 2 s back in the trace, and
-#      t1_mono 2 s off in the window record, are each REFUSED; the unmodified copy counts F2's 10.
+#   F13 the clock refusals forced to fire, each alone, on copies of F2's window: a call stamp 2 s back in the trace;
+#      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late; the t1 line repeated;
+#      the t1 line after strace_rc; the fsync table row removed or bumped; a loose pair; a 1.2 ms step with and without
+#      err widening; a table with no call lines. Each is REFUSED for its own reason, or ok where the err widens the
+#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
+#   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
+#      reply in its pipe is skipped; the next top-level calls are served by the coproc.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -48,7 +59,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=19
+NCHECK=23
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -130,10 +141,16 @@ if mode == "forkstorm":
     # The parent fsyncs and logs too, once per round: it is traced from the seize, so its fsyncs between the thaw and
     # t0 sit in the kept trace BEFORE t0 and must be cut, and its later ones counted -- the edge of the t0 cut, which
     # F10d otherwise never reaches now that no child flushes before t0 (fifth review, finding 2).
+    # The parent also logs each fork as "child tracer-before tracer-after" (forkstorm.forks): a child forked while the
+    # parent was traced by the kept strace (both reads) was born in the window, one forked while it was not (both
+    # reads) was alive at the seize, so F10d classes each child from the probe's own record, not from the trace's
+    # clone lines it is checking (second re-review, finding 7).
     fd = os.open(f"{d}/forkstorm.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.write(fd, b"x" * 4096)
+    def tracer():
+        return [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
     def flush_and_log():
-        tp = [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
+        tp = tracer()
         t0c = time.time()
         os.fsync(fd)
         t = time.time()
@@ -142,12 +159,17 @@ if mode == "forkstorm":
     stop = trig + ".stop"
     ready()
     while not os.path.exists(stop):
-        if os.fork() == 0:
+        tpb = tracer()
+        child = os.fork()
+        if child == 0:
             try:  # a child never returns into the parent's loop, whatever flush_and_log raises
                 time.sleep(2.0)
                 flush_and_log()
             finally:
                 os._exit(0)
+        tpa = tracer()
+        with open(f"{d}/forkstorm.forks", "a") as f:
+            f.write(f"{child} {tpb} {tpa}\n")
         flush_and_log()
         try:
             while os.waitpid(-1, os.WNOHANG)[0]:
@@ -189,6 +211,24 @@ if mode == "dsync-child-pre":
     ready(); wait()
     os.waitpid(pid, 0)
     done_and_stay()
+if mode == "leader-exit":
+    # The leader calls pthread_exit (a zombie in /proc/PID/task/PID, its fdinfo empty) while five worker threads keep
+    # the process and its fds: an O_DSYNC fd plus 200 others, so a scan is long enough to lose its task mid-way. Each
+    # worker logs its tid and exits when DIR/leader-exit.exit.<tid> appears (F6c, F6d).
+    import ctypes
+    fd = os.open(f"{d}/leader-exit.dat", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DSYNC, 0o644)
+    extra = [os.open("/dev/null", os.O_RDONLY) for _ in range(200)]
+    def worker():
+        tid = threading.get_native_id()
+        open(f"{d}/{mode}.tid.{tid}", "w").close()
+        while not os.path.exists(f"{d}/{mode}.exit.{tid}"):
+            time.sleep(0.005)
+    for _ in range(5):
+        threading.Thread(target=worker).start()
+    while len([f for f in os.listdir(d) if f.startswith(f"{mode}.tid.")]) < 5:
+        time.sleep(0.01)
+    ready()
+    ctypes.CDLL(None).pthread_exit(None)
 if mode == "thread-pre":
     fd = os.open(f"{d}/thread-pre.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.write(fd, b"x" * 4096)
@@ -324,6 +364,62 @@ else
 fi
 stop_probe2 dsync-child-pre
 
+# F6c and F6d: the pre-attach fd scan itself (fdsync_scan, no strace) on a process whose LEADER called pthread_exit
+# while five worker threads hold its fds (second re-review, finding 6: neither new path had ever run).
+#   F6c: the scan must read the table through a live worker: a "hit" on the O_DSYNC file and "scanned PID n" with
+#        n >= 200, though /proc/PID/task/PID/fdinfo is empty.
+#   F6e: FDSYNC_SCAN_HOOK makes the task being read exit after its first fd on the FIRST try only: the rescan through
+#        another live worker must then succeed, "scanned PID n" with n >= 200 and the hit, the hook called exactly
+#        twice (once per try) -- the retry works, not merely refuses (third re-review, finding 4).
+#   F6d: the hook makes the task being read exit after its first fd on EVERY try: exactly three tries (three hook
+#        calls), each losing its task, with workers still live, so the process must be written "unscanned" (refused
+#        downstream), never "scanned" with the fds after the first silently skipped.
+# The hooks log each call to DIR/fc/<name>.calls. FDSYNC_SCAN_HOOK exists for these checks only: run_system.sh refuses
+# to run with it set.
+lose_task() { # lose_task FDINFO_DIR -- make the worker owning it exit, and wait until its task dir is gone
+  local task=${1%/fdinfo} j
+  touch "$DIR/fc/leader-exit.exit.${task##*/}"
+  for ((j = 0; j < 200; j++)); do [ -d "$task" ] || return 0; sleep 0.01; done
+}
+f6e_hook() { echo "$1" >>"$DIR/fc/f6e.calls"; [ "$(awk 'END {print NR}' "$DIR/fc/f6e.calls")" = 1 ] && lose_task "$1"; return 0; }
+f6d_hook() { echo "$1" >>"$DIR/fc/f6d.calls"; lose_task "$1"; }
+if start_probe2 leader-exit; then
+  for ((i = 0; i < 300; i++)); do [ "$(task_state "/proc/$PP2/task/$PP2/stat")" = Z ] && break; sleep 0.01; done
+  lz=$(task_state "/proc/$PP2/task/$PP2/stat")
+  fdsync_scan "$OUT/f6c" "$PP2"
+  if [ "$lz" = Z ] && grep -q "^hit $PP2 [0-9]* [0-7]* .*leader-exit\.dat$" "$OUT/f6c.fdsync" &&
+    awk -v p="$PP2" '$1 == "scanned" && $2 == p && $3 + 0 >= 200 { f = 1 } END { exit !f }' "$OUT/f6c.fdsync"; then
+    log "PASS F6c-dead-leader-scanned: leader state $lz; $(tr '\n' ' ' <"$OUT/f6c.fdsync" | cut -c1-240)"
+  else
+    log "FAIL F6c-dead-leader-scanned: leader state [$lz]; scan [$(tr '\n' ' ' <"$OUT/f6c.fdsync" | cut -c1-300)]"
+    fails=$((fails + 1))
+  fi
+  : >"$DIR/fc/f6e.calls"
+  FDSYNC_SCAN_HOOK=f6e_hook fdsync_scan "$OUT/f6e" "$PP2"
+  ecalls=$(awk 'END {print NR}' "$DIR/fc/f6e.calls")
+  if [ "$ecalls" = 2 ] && grep -q "^hit $PP2 [0-9]* [0-7]* .*leader-exit\.dat$" "$OUT/f6e.fdsync" &&
+    awk -v p="$PP2" '$1 == "scanned" && $2 == p && $3 + 0 >= 200 { f = 1 } END { exit !f }' "$OUT/f6e.fdsync"; then
+    log "PASS F6e-scan-task-lost-rescanned: $ecalls hook calls (one per try); $(tr '\n' ' ' <"$OUT/f6e.fdsync" | cut -c1-200)"
+  else
+    log "FAIL F6e-scan-task-lost-rescanned: $ecalls hook calls; scan [$(tr '\n' ' ' <"$OUT/f6e.fdsync" | cut -c1-300)]"
+    fails=$((fails + 1))
+  fi
+  : >"$DIR/fc/f6d.calls"
+  FDSYNC_SCAN_HOOK=f6d_hook fdsync_scan "$OUT/f6d" "$PP2"
+  dcalls=$(awk 'END {print NR}' "$DIR/fc/f6d.calls")
+  left=$(ls -d /proc/"$PP2"/task/* 2>/dev/null | awk 'END {print NR}')
+  if [ "$dcalls" = 3 ] && grep -q "^unscanned $PP2 " "$OUT/f6d.fdsync" && ! grep -q "^scanned $PP2 " "$OUT/f6d.fdsync" &&
+    ! dead_proc "$PP2"; then
+    log "PASS F6d-scan-task-lost-unscanned: $dcalls hook calls (3 tries); $(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-200); $left task(s) left"
+  else
+    log "FAIL F6d-scan-task-lost-unscanned: $dcalls hook calls; scan [$(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-300)]; $left task(s) left"
+    fails=$((fails + 1))
+  fi
+else
+  log "FAIL F6c/F6e/F6d: the leader-exit probe never became ready"; fails=$((fails + 3))
+fi
+stop_probe2 leader-exit
+
 # F7
 if start_probe2 thread-pre && run_probe2 f7 thread-pre; then
   check F7-threads-before-attach "$OUT/f7.json" \
@@ -387,28 +483,38 @@ for ln in open(sys.argv[1]):
     if mine: traced += 1
 print(miss, traced)" "$@"
 }
-# storm_verdict LOG T0 STRACEPID TRACE MAIN JSON -> 'ok ...' or 'bad ...': the kept trace's count and its attribution
-# against the probe's own truth. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies between the
-# process's clock read before the fsync (field 4) and after it (field 3), so per class of process the trace's flushes
-# after the t0 cut must lie in [fsyncs traced by STRACEPID that started after T0, those that ended after T0] (10 us of
-# slack each way for the 6-decimal stamps). The classes: MAIN (role 'main'); children whose creation the trace never
-# saw, i.e. alive at the seize (role 'process at attach: ...'); children it saw created (role 'other (born in the
-# window ...)'). Any other role, or an unmapped flush, is bad (fifth-review re-review, finding 3: one attributed
-# flush used to suffice). Also required: >= 1 pre-existing child STARTED an fsync after T0 (fifth review, finding 1)
-# and >= 1 traced fsync ended before T0, so the cut removed something (fifth review, finding 2).
+# storm_verdict LOG T0 STRACEPID TRACE MAIN JSON FORKS -> 'ok ...' or 'bad ...': the kept trace's count and its
+# attribution against the probe's own truth. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies
+# between the process's clock read before the fsync (field 4) and after it (field 3), so per class of process the
+# trace's flushes after the t0 cut must lie in [fsyncs traced by STRACEPID that started after T0, those that ended
+# after T0] (10 us of slack each way for the 6-decimal stamps). The classes come from the PROBE (FORKS: "child
+# tracer-before tracer-after" per fork, read by the parent around each fork), never from the trace being checked
+# (second re-review, finding 7): MAIN (role 'main'); a child forked while the parent was not yet traced by STRACEPID
+# was alive at the seize (role 'process at attach: ...'); one forked while it was, born in the window (role 'other
+# (born in the window ...)'); one forked across the seize (the two reads differ) may be either, so its fsyncs widen
+# both upper bounds. The trace's own clone lines must agree with that classing (born children have one, children
+# alive at the seize none). Any other role, an unmapped flush, or a traced fsync of a pid the parent never forked is
+# bad (fifth-review re-review, finding 3: one attributed flush used to suffice). Also required: >= 1 child alive at
+# the seize STARTED an fsync after T0 (fifth review, finding 1) and >= 1 traced fsync ended before T0, so the cut
+# removed something (fifth review, finding 2).
 storm_verdict() {
   python3 -c "
 import json, re, sys
-log, t0, st, trace, main, js = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+log, t0, st, trace, main, js, forks = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
 eps = 1e-5
 spawn = re.compile(r'^\d+\s+[\d.]+\s+(?:<\.\.\. )?(?:clone3?|v?fork)\b.*\)\s+=\s+(\d+)')
-born = {m.group(1) for m in (spawn.match(ln) for ln in open(trace, errors='replace')) if m}
-cls = {'main': [0, 0], 'at-attach': [0, 0], 'born': [0, 0]}
+cloned = {m.group(1) for m in (spawn.match(ln) for ln in open(trace, errors='replace')) if m}
+klass = {}
+for ln in open(forks):
+    f = ln.split()
+    if len(f) != 3: continue
+    klass[f[0]] = 'ambiguous' if f[1] != f[2] else ('born' if f[1] == st else 'at-attach')
+cls = {'main': [0, 0], 'at-attach': [0, 0], 'born': [0, 0], 'ambiguous': [0, 0], 'never-forked': [0, 0]}
 cut = 0
 for ln in open(log):
     f = ln.split(); pid, tp, end = f[0], f[1], float(f[2]); start = float(f[3]) if len(f) > 3 else end
     if tp != st: continue
-    k = 'main' if pid == main else ('born' if pid in born else 'at-attach')
+    k = 'main' if pid == main else klass.get(pid, 'never-forked')
     if start >= t0 + eps: cls[k][0] += 1
     if end >= t0 - eps: cls[k][1] += 1
     else: cut += 1
@@ -419,18 +525,26 @@ got = {'main': roles.get('main', 0), 'at-attach': sum(n for k, n in roles.items(
        'born': sum(n for k, n in roles.items() if k.startswith(BORN))}
 other = {k: n for k, n in roles.items() if k != 'main' and not k.startswith((AT, BORN))}
 lo, hi = sum(v[0] for v in cls.values()), sum(v[1] for v in cls.values())
+amb = cls['ambiguous'][1]
 why = []
 if r['verdict'] != 'ok': why.append('verdict ' + r['verdict'][:160])
 if not lo <= r['flushes'] <= hi: why.append(f\"count {r['flushes']} outside the probe's [{lo}, {hi}]\")
-for k, (a, b) in cls.items():
+for k in ('main', 'at-attach', 'born'):
+    a, b = cls[k][0], cls[k][1] + (amb if k != 'main' else 0)
     if not a <= got[k] <= b: why.append(f'{k}: the trace attributes {got[k]}, the probe bounds [{a}, {b}]')
+wrong_born = sorted(p for p, k in klass.items() if k == 'born' and p not in cloned)
+wrong_pre = sorted(p for p, k in klass.items() if k == 'at-attach' and p in cloned)
+if wrong_born: why.append(f'children forked under the trace with no clone line in it {wrong_born[:5]}')
+if wrong_pre: why.append(f'children forked before the seize with a clone line in the trace {wrong_pre[:5]}')
+if cls['never-forked'][1]: why.append(f\"{cls['never-forked'][1]} traced fsync(s) after t0 by pids the parent never forked\")
 if cls['at-attach'][0] < 1: why.append('no child alive at the seize started an fsync after t0')
 if cut < 1: why.append('the t0 cut removed no traced fsync')
 if other: why.append(f'flushes in other roles {other}')
 if r.get('unmapped_flushes', 0): why.append(f\"unmapped_flushes {r['unmapped_flushes']}\")
-print('bad' if why else 'ok', f\"count {r['flushes']} in [{lo}, {hi}]; per role trace/[probe] \" +
-      ', '.join(f'{k} {got[k]}/[{a}, {b}]' for k, (a, b) in cls.items()) +
-      f'; {cut} traced fsync(s) before t0 cut; {len(born)} pids born in the trace' + ('; ' + '; '.join(why) if why else ''))" "$@" 2>&1
+print('bad' if why else 'ok', f\"count {r['flushes']} in [{lo}, {hi}]; per class trace/[probe] \" +
+      ', '.join(f'{k} {got[k]}/[{cls[k][0]}, {cls[k][1]}]' for k in ('main', 'at-attach', 'born')) +
+      f'; {amb} fsync(s) by children forked across the seize; {cut} traced fsync(s) before t0 cut; '
+      f'{len(klass)} forks logged, {len(cloned)} clone lines' + ('; ' + '; '.join(why) if why else ''))" "$@" 2>&1
 }
 # storm_pids_match LOG TRACE STRACEPID -> exit 0 when the children that logged STRACEPID as their tracer are exactly
 # the pids with an fsync line in TRACE (fourth review, finding 4: a set check, not fsyncs >= traced).
@@ -484,7 +598,8 @@ if start_probe2 forkstorm; then
     read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$kept")
     cp "$DIR/fc/forkstorm.log" "$OUT/f10d.forkstorm.log.txt" 2>/dev/null  # the probe's own record, kept with the raw
     match=$(storm_pids_match "$DIR/fc/forkstorm.log" "$OUT/f10d.strace" "$kept"); mrc=$?
-    sv=$(storm_verdict "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2" "$OUT/f10d.json")
+    cp "$DIR/fc/forkstorm.forks" "$OUT/f10d.forkstorm.forks.txt" 2>/dev/null
+    sv=$(storm_verdict "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2" "$OUT/f10d.json" "$DIR/fc/forkstorm.forks")
     if [ "$miss" = 0 ] && [ $mrc = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" && [ "${sv%% *}" = ok ]; then
       log "PASS F10d-storm-attach-complete: 0 child fsyncs after t0 outside the kept trace, frozen=1, $traced fsyncs logged as traced by it, pids = the fsync pids in it ($match); ${sv#ok }"
     else
@@ -521,7 +636,7 @@ fi
 stop_probe2 split
 
 # F12: the t1 cut (fifth-review re-review, finding 1: no attach probe had a call after t1). One attach of the split
-# probe: fsync x2, then t1 is stamped (strace_mark OUT t1; strace_detach keeps it), then fsync x3, then the detach.
+# probe: fsync x2, then t1 is stamped (strace_mark OUT t1; strace_detach OUT keep-t1), then fsync x3, then the detach.
 # The count must end at t1: 2 fsyncs counted, the 3 after it (and the probe's later calls) in calls_after_t1.
 if start_probe2 split && strace_attach "$OUT/f12" "$PP2"; then
   touch "$DIR/fc/go-split"
@@ -531,7 +646,7 @@ if start_probe2 split && strace_attach "$OUT/f12" "$PP2"; then
   touch "$DIR/fc/go-split.2"
   for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.done" ] && break; sleep 0.05; done
   sleep 0.2
-  strace_detach "$OUT/f12"
+  strace_detach "$OUT/f12" keep-t1
   count f12
   check F12-t1-cut "$OUT/f12.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==2 and r["flushes"]==2 and r["calls_after_t1"]>=3'
 else
@@ -539,33 +654,118 @@ else
 fi
 stop_probe2 split
 
-# F13: the clock-step refusals, forced to fire on copies of F2's passing window (fifth-review re-review, finding 2):
-# (a) one call stamp moved 2 s back in the trace -> refused for the -ttt back-step; (b) t1_mono moved 2 s back in the
-# window record, so realtime and monotonic disagree between t0 and t1 and between t1 and tend -> refused for a
-# CLOCK_REALTIME step; (c) the unmodified copy -> ok with F2's exact 10 flushes, so (a) and (b) fail for their edit.
+# F13: the clock-step refusals, forced to fire on copies of F2's passing window (fifth-review re-review, finding 2;
+# second re-review, findings 1 and 2), each refusal alone:
+#   (a) one call stamp moved 2 s back in the trace -> refused for the -ttt back-step;
+#   (b) tend's REALTIME moved +0.1 s, (e) -0.1 s, its monotonic untouched: every delta stays positive, so only the
+#       realtime-vs-monotonic comparison can refuse it (moving a _mono value 2 s made a delta negative, which a second
+#       branch also refuses, so deleting the comparison went unseen);
+#   (d) every call stamp moved +5 s, uniformly (no back-step, no pair touched) -> refused only for calls outside
+#       [tseize, tend];
+#   (f) the t1 line repeated -> refused for a repeated stamp; (g) the t1 line moved after strace_rc -> refused for
+#       the stamps' order (second re-review, finding 5);
+#   (h) the fsync row removed from the -c table, (i) its count raised by one -> refused by the table-vs-lines check
+#       (third re-review, finding 1: an attach window had none that fired);
+#   (j) t1_err raised to 0.8 ms -> refused for a loose clock pair; (k) tend's realtime moved +1.2 ms -> refused, and
+#       (l) the same with tend_err 0.4 ms -> ok with 10 flushes: the tolerance is 1 ms plus both pairs' err
+#       (third re-review, finding 4); (m) the same +1.2 ms with t1_err 0.4 ms -> ok: the pair's FIRST stamp's err
+#       counts too (fourth re-review, finding 1);
+#   (n) every call line removed, the -c table kept -> refused for a table with zero call lines (fourth re-review,
+#       finding 7: the wlines fix turned that refusal back on for attach windows);
+#   (c) the unmodified copy -> ok with F2's exact 10 flushes, so the others fail for their edit;
+#   and F2's own window stamps were all served by the stamper coproc (clock_src; third re-review, finding 3).
 if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
-  for k in a b c; do
+  for k in a b c d e f g h i j k l m n; do
     for x in strace strace.err window fdsync pids; do cp "$OUT/f2.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012) }
+       /^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_err=/) $i = "t1_err=0.000400000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13m.window"
+  awk '!/^[0-9]+ +[0-9]+\.[0-9]+ / { print }' "$OUT/f2.strace" >"$OUT/f13n.strace"
+  awk '!($NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5) { print }' "$OUT/f2.strace" >"$OUT/f13h.strace"
+  awk '$NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5 { $4 = $4 + 1 } { print }' "$OUT/f2.strace" >"$OUT/f13i.strace"
+  awk '/^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_err=/) $i = "t1_err=0.000800000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13j.window"
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012) } { print }' "$OUT/f2.window" >"$OUT/f13k.window"
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012)
+                  for (i = 2; i <= NF; i++) if ($i ~ /^tend_err=/) $i = "tend_err=0.000400000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13l.window"
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { n++; if (n == 2) $2 = sprintf("%.6f", prev - 2.0); prev = $2 + 0 } { print }' \
     "$OUT/f2.strace" >"$OUT/f13a.strace"
-  awk '/^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_mono=/) { split($i, a, "="); $i = sprintf("t1_mono=%.9f", a[2] - 2.0) } } { print }' \
-    "$OUT/f2.window" >"$OUT/f13b.window"
-  for k in a b c; do count "f13$k"; done
+  awk -v D=0.1 '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + D) } { print }' "$OUT/f2.window" >"$OUT/f13b.window"
+  awk -v D=-0.1 '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + D) } { print }' "$OUT/f2.window" >"$OUT/f13e.window"
+  awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
+  awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
+  awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
+  for k in a b c d e f g h i j k l m n; do count "f13$k"; done
   if python3 -c "
 import json, sys
-a, b, c = (json.load(open(p)) for p in sys.argv[1:4])
-ok = ('stepped back' in a['verdict'] and a['verdict'].startswith('REFUSED') and
-      'CLOCK_REALTIME stepped' in b['verdict'] and b['verdict'].startswith('REFUSED') and
-      c['verdict'] == 'ok' and c['flushes'] == 10)
-print('(a)', a['verdict'][:160], '| (b)', b['verdict'][:160], '| (c)', c['verdict'][:40], c['flushes'])
-sys.exit(0 if ok else 1)" "$OUT/f13a.json" "$OUT/f13b.json" "$OUT/f13c.json" >"$OUT/f13.txt" 2>&1; then
-    log "PASS F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"
+o = sys.argv[1]
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmn'}
+v = {k: r['verdict'] for k, r in J.items()}
+src = json.load(open(f'{o}/f2.json')).get('clock_src')
+BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
+def refused(k, why, *nots):
+    return v[k].startswith('REFUSED') and why in v[k] and not any(n in v[k] for n in nots)
+ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
+      refused('d', OUTSIDE, BACK, STEP) and refused('f', 'repeated stamp') and refused('g', 'out of order') and
+      refused('h', 'fsync: summary 0 calls vs 6 completed') and refused('i', 'fsync: summary 7 calls vs 6 completed') and
+      refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and refused('n', 'zero call lines') and
+      v['l'] == 'ok' and J['l']['flushes'] == 10 and v['m'] == 'ok' and J['m']['flushes'] == 10 and
+      v['c'] == 'ok' and J['c']['flushes'] == 10 and
+      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'})
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijkn'), '| (l)', v['l'][:20], J['l']['flushes'],
+      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src)
+sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
+    log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
   else
-    log "FAIL F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"; fails=$((fails + 1))
+    log "FAIL F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"; fails=$((fails + 1))
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
+fi
+
+# F14: clock_pair stays safe outside the shell that owns the stamper (fourth re-review, finding 2: fix 2 had no CI
+# check): a call from a ( ) subshell and one from a pipeline are served one-shot and leave the stamper alive; a stale
+# reply planted in its pipe (a request no one reads) is skipped by its nonce; the next two top-level calls are served
+# by the coproc.
+s1=$( (clock_pair f14a) ); s2=$(clock_pair f14b | cat)
+alive=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive=1
+# Planted from a command substitution, and only to a live stamper: a write to a dead one's pipe would SIGPIPE this
+# whole script from a builtin (measured with df75e84bc's clock_pair, which kills it).
+[ $alive = 1 ] && : "$( { printf '%s %s\n' "stale.0.0" "f14z" >&"${STAMPER[1]}"; } 2>/dev/null )"
+sleep 0.2
+s3=$(clock_pair f14c); s4=$(clock_pair f14d)
+# ...and a ( ) subshell that reopened the stamper's fd numbers onto a decoy file and /dev/null: the fds are open but
+# are not the coproc's pipes, so the /proc inode half of stamper_fds_ok must refuse them -- one-shot, and nothing
+# written into the decoy (fifth re-review, finding 1: no case made that half refuse). Linux /proc is required.
+decoy="$OUT/f14.decoy"; : >"$decoy"
+s5=$( ( eval "exec ${STAMPER[1]}>\"\$decoy\" ${STAMPER[0]}</dev/null"; clock_pair f14e ) 2>/dev/null )
+# Each fd alone, with the other one the REAL pipe, so an inode check covering only one of the two is caught (sixth
+# re-review, finding 2): the write fd onto a second decoy (must stay empty), then the read fd onto /dev/null (no
+# request may reach the real stamper: nothing may wait in its pipe afterwards). Done in ( ) subshells handed the real
+# pipes through duplicates made here: bash closes the coproc's own fds in ( ), and an `exec` onto a coproc fd number
+# inside a command substitution did not take effect at all on bash 5.3 (measured on the Mac: the fd stayed the pipe).
+exec {kr}<&"${STAMPER[0]}" {kw}>&"${STAMPER[1]}"
+decoy2="$OUT/f14.decoy2"; : >"$decoy2"
+s6=$( ( eval "exec ${STAMPER[0]}<&$kr ${STAMPER[1]}>\"\$decoy2\""; clock_pair f14f ) 2>/dev/null )
+s7=$( ( eval "exec ${STAMPER[0]}</dev/null ${STAMPER[1]}>&$kw"; clock_pair f14g ) 2>/dev/null )
+exec {kr}<&- {kw}>&-
+stray=""; [ -n "${STAMPER_PID:-}" ] && IFS= read -r -t 1 stray <&"${STAMPER[0]}" 2>/dev/null
+dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
+# The stamper lived throughout, so the decoy cases were refused by the fd check, not by a dead stamper (sixth
+# re-review, finding 3).
+alive2=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive2=1
+haveproc=0; [ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
+if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
+  $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
+  $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 &&
+  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" && -z $stray &&
+  $alive2 = 1 ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds refused together and one at a time (0 bytes written, no stray reply): [$s3]"
+else
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] stray=[$stray]"
+  fails=$((fails + 1))
 fi
 
 rm -rf "$DIR/fc"

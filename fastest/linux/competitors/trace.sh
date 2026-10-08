@@ -10,7 +10,8 @@
 #                              if it never completes (review finding 4). MAIN is SIGSTOPped from before the enumeration
 #                              until the seize is proven (freeze/thaw; window field frozen=1), so it cannot fork into
 #                              that gap at all (second review, finding 3).
-#   strace_detach OUT          SIGINT to that strace (it detaches and writes the -c table), wait for it to exit.
+#   strace_detach OUT [keep-t1]  stamp t1 (unless keep-t1: a t1 already marked), SIGINT to that strace (it detaches
+#                              and writes the -c table), wait for it to exit, stamp tend.
 #                              Records whether the strace and MAIN were still alive when the detach was requested:
 #                              stracecount refuses the window if either was not (review finding 5).
 #   strace_mark OUT NAME       stamp NAME=<CLOCK_REALTIME now> (with NAME_mono, clock_pair) into OUT.window inside an
@@ -32,13 +33,93 @@ TRACESET=$TRACESET,clone,clone3
 STRACE_OPTS=(-f -C -y -ttt -qq -s 160 -e signal=none -e "trace=$TRACESET")
 ST_PID=
 
-# clock_pair NAME -> "NAME=<CLOCK_REALTIME> NAME_mono=<CLOCK_MONOTONIC>", both read back to back in one process. The
-# window's cuts and strace's -ttt stamps read CLOCK_REALTIME, which a step (NTP, settimeofday) moves; MONOTONIC is
-# never stepped and runs at the same rate, so between two pairs the realtime and monotonic deltas differ only by a
-# step. stracecount compares them over the attach's whole life, tseize -> t0 [-> tsplit] -> t1 -> tend, and refuses
-# the window on a difference over 1 ms (fifth-review re-review, finding 2: comparing call stamps with each other
-# cannot see a step before the first call or after the last). No pair (python3 failed) is a refused window.
-clock_pair() { python3 -B -c 'import sys, time; r = time.time(); m = time.monotonic(); print("%s=%.9f %s_mono=%.9f" % (sys.argv[1], r, sys.argv[1], m))' "$1"; }
+# clock_pair NAME -> "NAME=<CLOCK_REALTIME> NAME_mono=<CLOCK_MONOTONIC> NAME_err=<s>". The window's cuts and strace's
+# -ttt stamps read CLOCK_REALTIME, which a step (NTP, settimeofday) moves; MONOTONIC is never stepped and runs at the
+# same rate, so between two pairs the realtime and monotonic deltas differ only by a step. stracecount compares them
+# over the attach's whole life, tseize -> t0 [-> tsplit] -> t1 -> tend, and refuses the window on a difference over
+# 1 ms plus both pairs' err (fifth-review re-review, finding 2: comparing call stamps with each other cannot see a step
+# before the first call or after the last). No pair is a refused window.
+# Each pair is read as monotonic, realtime, monotonic, best of up to 50 reads (until the two monotonic reads are
+# under 100 us apart); NAME_mono is their midpoint and NAME_err half their gap, so a preemption between the reads
+# widens the tolerance instead of refusing a correct window (second re-review, finding 3). The reads are served by
+# ONE long-lived python3 per shell (the STAMPER coproc), so a stamp costs a pipe round-trip, not an interpreter start
+# inside the window's boundary (second re-review, finding 4); a one-shot python3 is the fallback. Each stamp also
+# records NAME_src=coproc|oneshot, so the raw says which path served it (third re-review, finding 3).
+# Requests are "NONCE NAME" and replies "NONCE NAME=...": a reply left in the pipe by an earlier call that timed out is
+# skipped by its nonce instead of being taken as this call's. A shell whose coproc fds are not open (bash closes them
+# in ( ), & and pipeline subshells; command and process substitutions keep them), or whose fds of those numbers are
+# not the coproc's pipes (on Linux: the same inodes as in the shell that started it), uses the one-shot path and never
+# touches the stamper: the old desync rule killed the shared, healthy stamper from such a subshell (third re-review,
+# finding 2; fourth re-review, findings 4 and 5). A reply waits at most 2 s, so a stuck stamper costs 2 s per stamp,
+# each still the moment it was taken (fourth re-review, finding 3).
+STAMP_PY='
+import sys, time
+# CLOCK_MONOTONIC itself, system-wide, so the coproc and a fallback process read the same clock: time.monotonic() has
+# an undefined reference point and on macOS CPython it starts near zero in each process (measured on the Mac).
+def mono():
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+for req in sys.stdin:
+    try:  # a malformed line is skipped, not a crash that leaves every later stamp to the one-shot path
+        nonce, name = req.split()
+    except ValueError:
+        continue
+    best = None
+    for _ in range(50):
+        m1 = mono(); r = time.time(); m2 = mono()
+        if best is None or m2 - m1 < best[2] - best[0]:
+            best = (m1, r, m2)
+        if m2 - m1 < 1e-4:
+            break
+    m1, r, m2 = best
+    print("%s %s=%.9f %s_mono=%.9f %s_err=%.9f" % (nonce, name, r, name, (m1 + m2) / 2, name, (m2 - m1) / 2),
+          flush=True)
+'
+coproc STAMPER { exec python3 -B -I -u -c "$STAMP_PY"; }
+STAMPER_SHELL=$BASHPID
+STAMP_SEQ=0
+stamper_fds_ok() { # the coproc's two fds are open in THIS shell and, where /proc says so, are the coproc's own pipes
+  local f
+  for f in "${STAMPER[0]:-}" "${STAMPER[1]:-}"; do
+    # A number first: `>&word` with a non-numeric word (bash sets a closed coproc fd to -1) is `&>word`, which would
+    # create a file named after it (fifth re-review, finding 2).
+    [[ $f =~ ^[0-9]+$ ]] || return 1
+    { true >&"$f"; } 2>/dev/null || { true <&"$f"; } 2>/dev/null || return 1
+    if [ -d "/proc/$STAMPER_SHELL/fd" ]; then [ "/proc/$BASHPID/fd/$f" -ef "/proc/$STAMPER_SHELL/fd/$f" ] || return 1; fi
+  done
+}
+clock_pair() {
+  local name=$1 line="" src=oneshot nonce
+  STAMP_SEQ=$((STAMP_SEQ + 1))
+  nonce="$BASHPID.$STAMP_SEQ.$RANDOM"
+  # The coproc only from a shell that still holds its fds (an fd test, not a pid test: a command substitution keeps
+  # them, a ( ) subshell does not), and only while it lives.
+  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && stamper_fds_ok; then
+    # In a command substitution: a stamper that died between the check and the write costs that subshell its
+    # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
+    line=$( {
+      printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
+      # The whole reply must have the stamper's exact shape, not just this call's nonce: bash reads a pipe a byte at a
+      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; most
+      # spliced lines fail the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a
+      # digit of the monotonic integer part is refused downstream by the realtime-vs-monotonic check (sixth re-review,
+      # finding 1). The realtime field has exactly 10 integer digits (until 2286). Callers must not stamp
+      # concurrently in any case.
+      d='[0-9]+\.[0-9]{9}'
+      want="^$nonce $name=[0-9]{10}\.[0-9]{9} ${name}_mono=$d ${name}_err=$d\$"
+      for ((k = 0; k < 8; k++)); do
+        IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
+        case $l in "$nonce "*) [[ $l =~ $want ]] && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
+      done
+      exit 1
+    } 2>/dev/null )
+    [ -n "$line" ] && src=coproc
+  fi
+  if [ -z "$line" ]; then
+    line=$(printf '%s %s\n' "$nonce" "$name" | python3 -B -I -c "$STAMP_PY")
+    line=${line#"$nonce "}
+  fi
+  printf '%s %s_src=%s\n' "$line" "$name" "$src"
+}
 
 descendants() { # descendants PID -> every live, non-zombie descendant pid of PID, one per line (children of children too)
   local c
@@ -136,6 +217,9 @@ fdsync_scan() {
         { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
         [ -n "$fl" ] || continue
         n=$((n + 1))
+        # FDSYNC_SCAN_HOOK (the fire-check's F6d and F6e only; run_system.sh refuses it) runs once per try after its first fd,
+        # with the fdinfo dir being read: F6d makes that task exit there to force the rescan and "unscanned" paths.
+        if [ "$n" = 1 ] && [ -n "${FDSYNC_SCAN_HOOK:-}" ]; then "$FDSYNC_SCAN_HOOK" "$fdd"; fi
         if (((8#$fl & 8#04010000) != 0)); then
           hits+="hit $p ${f##*/} $fl $(readlink "${fdd%/fdinfo}/fd/${f##*/}" 2>/dev/null)"$'\n'
         fi
@@ -257,10 +341,11 @@ strace_attach() {
 }
 
 strace_detach() {
-  local out=$1 rc=0 sa=1 ma=1 main
-  # t1 is the detach request, unless the window already holds one (only the fire-check's F12 stamps it earlier, with
-  # strace_mark OUT t1, so that calls exist after it and the t1 cut is exercised).
-  grep -q '^t1=' "$out.window" || clock_pair t1 >>"$out.window"
+  local out=$1 keep=${2:-} rc=0 sa=1 ma=1 main
+  # t1 is the detach request. Only `strace_detach OUT keep-t1` keeps a t1 stamped earlier with strace_mark OUT t1 (the
+  # fire-check's F12, so that calls exist after it); without it a stray t1 mark leaves two t1 stamps, which
+  # stracecount refuses, instead of silently moving the window's end (second re-review, finding 5).
+  [ "$keep" = keep-t1 ] || clock_pair t1 >>"$out.window"
   main=$(sed -n 's/^main=\([0-9][0-9]*\) .*/\1/p' "$out.window" | head -1)
   kill -0 "$ST_PID" 2>/dev/null || sa=0
   { [ -n "$main" ] && kill -0 "$main" 2>/dev/null; } || ma=0

@@ -312,25 +312,49 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     t1m = re.search(r"^t1=(\d+\.\d+)", win, re.M)
     t1 = float(t1m.group(1)) if (attached and t1m) else None
     # An attach window's stamps are clock pairs (trace.sh clock_pair): between consecutive ones, tseize -> t0
-    # [-> tsplit] -> t1 -> tend, the CLOCK_REALTIME delta must equal the CLOCK_MONOTONIC one within 1 ms, or the
-    # realtime clock stepped somewhere in the trace's life and the cuts cannot be trusted; and every call stamp must lie
-    # inside [tseize, tend]. Comparing call stamps with each other (above) misses a step before the first call or after
-    # the last (fifth-review re-review, finding 2). A missing pair refuses the window.
-    clock = {}
-    for name, mono, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono)?=(\d+\.\d+)", win, re.M):
-        clock.setdefault(name + mono, float(val))
+    # [-> tsplit] -> t1 -> tend, the CLOCK_REALTIME delta must equal the CLOCK_MONOTONIC one within 1 ms plus the two
+    # pairs' own read uncertainty (NAME_err), or the realtime clock stepped somewhere in the trace's life and the cuts
+    # cannot be trusted; and every call stamp must lie inside [tseize, tend]. Comparing call stamps with each other
+    # (above) misses a step before the first call or after the last (fifth-review re-review, finding 2). A missing
+    # pair refuses the window.
+    clock, seen = {}, {}
+    for name, sfx, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono|_err)?=(\d+\.\d+)", win, re.M):
+        clock.setdefault(name + sfx, float(val))
+        seen[name + sfx] = seen.get(name + sfx, 0) + 1
+    # Which path served each stamp (trace.sh clock_pair: the long-lived coproc, or a one-shot python3), recorded, never
+    # a verdict: a one-shot stamp is as correct, it only costs an interpreter start at the window's edge.
+    out_src = dict(re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)_src=(\w+)", win, re.M))
     out_clock = None
     if attached:
         chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
         absent = [k for n in chain for k in (n, n + "_mono") if k not in clock]
+        loose = [n for n in chain if clock.get(n + "_err", 0.0) > 0.0005]
+        # One stamp of each, in the order the attach writes them: t1 (the detach request) before strace's exit status,
+        # tend after it. A second t1 (a stray strace_mark OUT t1) or a t1 stamped after the wait would otherwise move
+        # the window's end without a trace (second re-review, finding 5).
+        twice = sorted(k for k, n in seen.items() if n > 1)
+        # NOT `lines`: that name holds the per-syscall call-line counts the table check reads below; reusing it switched
+        # that check off for every attach window (third re-review, finding 1).
+        wlines = win.splitlines()
+        pos = {k: next((i for i, ln in enumerate(wlines) if re.match(rf"{k}=", ln)), None)
+               for k in ("t1", "strace_rc", "tend")}
+        if twice:
+            problems.append(f"attach window with repeated stamp(s) {twice}: which one is the window's cannot be told")
+        if None not in pos.values() and not pos["t1"] < pos["strace_rc"] < pos["tend"]:
+            problems.append(f"attach window's t1, strace_rc and tend lines out of order {pos}: t1 must be stamped "
+                            "before the detach's wait, tend after it")
         if absent:
             problems.append(f"attach window without its clock pair(s) {absent}: a clock step could not be seen")
+        elif loose:
+            problems.append(f"clock pair(s) {loose} read with more than 0.5 ms between their monotonic reads in 50 "
+                            "tries: a step that size could not be told from the read")
         else:
             steps = []
             for a, b in zip(chain, chain[1:]):
                 dr, dm = clock[b] - clock[a], clock[b + "_mono"] - clock[a + "_mono"]
+                tol = 0.001 + clock.get(a + "_err", 0.0) + clock.get(b + "_err", 0.0)
                 steps.append([a, b, round(dr - dm, 6)])
-                if dm < 0 or abs(dr - dm) > 0.001:
+                if dm < 0 or abs(dr - dm) > tol:
                     problems.append(f"CLOCK_REALTIME stepped {dr - dm:+.6f} s between {a} and {b} (realtime {dr:.6f} s "
                                     f"against monotonic {dm:.6f} s): the window cuts cannot be trusted")
             if first_ts is not None and (first_ts < clock["tseize"] - 0.001 or last_ts > clock["tend"] + 0.001):
@@ -427,6 +451,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     out["t0"], out["calls_before_t0"], out["t1"], out["calls_after_t1"] = t0, before_t0, t1, after_t1
     out["clock_back_steps"], out["clock_max_back_s"] = back_steps, round(max_back, 6)
     out["clock_pairs"] = out_clock  # [from, to, realtime minus monotonic delta in s] per consecutive pair (attach)
+    out["clock_src"] = out_src  # stamp name -> coproc | oneshot
     # A launch window's command stderr (strace_run's OUT.cmd.err): recorded, never a verdict -- a command may warn and
     # still succeed, and its exit status is checked through strace_rc (fourth review, finding 6: it was looked at by
     # nothing).
