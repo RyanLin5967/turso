@@ -2411,25 +2411,28 @@ impl ExtendedQueryHandler for Session {
             return Err(PgWireError::StatementNotFound(name.to_owned()));
         };
         check_bind(&message).map_err(PgWireError::UserError)?;
-        // A branch call's parameter count is known from its text: checked here, as PostgreSQL
-        // checks every statement's at Bind. It was never checked, so two values for
-        // turso_branch_create($1) created the branch (wire review 10 item 5). An engine statement's
-        // count is known once it is prepared, and is checked at Execute (E5-QUEUE R2).
-        if let Some(call) = branch_call(&statement.statement) {
-            let types = parameter_types(&branch_call_types(&call), &statement.parameter_types)
+        // A statement's parameter count, where it is known from the text, is checked here, as
+        // PostgreSQL checks every statement's at Bind: a branch call's (its $n), and that of a
+        // statement the server answers without the engine (CHECKPOINT, a transaction verb), which
+        // has none but those Parse declared. Neither was checked, so two values for
+        // turso_branch_create($1) created the branch (wire review 10 item 5) and a value for
+        // CHECKPOINT or BEGIN ran it (wire review 12 item 2). An engine statement's count is known
+        // once it is prepared, and is checked at Execute (E5-QUEUE R2).
+        let sql = &statement.statement;
+        let required = if let Some(call) = branch_call(sql) {
+            Some(
+                parameter_types(&branch_call_types(&call), &statement.parameter_types)
+                    .map_err(PgWireError::UserError)?
+                    .len(),
+            )
+        } else if TxVerb::of(sql) != TxVerb::Other || is_checkpoint(sql) {
+            Some(statement.parameter_types.len())
+        } else {
+            None
+        };
+        if let Some(required) = required {
+            check_bind_arity(message.parameters.len(), &statement.id, required)
                 .map_err(PgWireError::UserError)?;
-            if message.parameters.len() != types.len() {
-                return Err(PgWireError::UserError(error(
-                    "08P01",
-                    format!(
-                        "bind message supplies {} parameters, but prepared statement \"{}\" \
-                         requires {}",
-                        message.parameters.len(),
-                        statement.id,
-                        types.len()
-                    ),
-                )));
-            }
         }
         let portal = Portal::try_new(&message, statement)?;
         client.portal_store().put_portal(Arc::new(portal));
@@ -3135,17 +3138,8 @@ fn bind_portal_parameters(
 ) -> PgWireResult<()> {
     let types = parameter_types(statement_types, &portal.statement.parameter_types)
         .map_err(PgWireError::UserError)?;
-    if portal.parameter_len() != types.len() {
-        return Err(PgWireError::UserError(error(
-            "08P01",
-            format!(
-                "bind message supplies {} parameters, but prepared statement \"{}\" requires {}",
-                portal.parameter_len(),
-                portal.statement.id,
-                types.len()
-            ),
-        )));
-    }
+    check_bind_arity(portal.parameter_len(), &portal.statement.id, types.len())
+        .map_err(PgWireError::UserError)?;
     // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value, and
     // the values are as many as the statement's parameters (just above).
     for (i, pg_type) in types.iter().enumerate() {
@@ -3191,6 +3185,26 @@ fn check_bind(bind: &Bind) -> SqlResult<()> {
         ));
     }
     Ok(())
+}
+
+/// A Bind's value count against its statement's parameters, in PostgreSQL's words (08P01), the
+/// unnamed statement named "" as PostgreSQL names it (pgwire stores it as DEFAULT_NAME).
+fn check_bind_arity(values: usize, statement: &str, required: usize) -> SqlResult<()> {
+    if values == required {
+        return Ok(());
+    }
+    let name = if statement == DEFAULT_NAME {
+        ""
+    } else {
+        statement
+    };
+    Err(error(
+        "08P01",
+        format!(
+            "bind message supplies {values} parameters, but prepared statement \"{name}\" \
+             requires {required}"
+        ),
+    ))
 }
 
 /// A parameter sent in binary format, read as PostgreSQL's binary receive function for its type
