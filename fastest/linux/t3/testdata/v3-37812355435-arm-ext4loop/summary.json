@@ -1,0 +1,496 @@
+{
+ "app_syncs_per_op": {
+  "append25": 1.0,
+  "append64": 1.0,
+  "cfr2b": 1.84,
+  "clean": 0.425,
+  "fdatasync4k": 1.0,
+  "nosync25": 0.0,
+  "ow1m": 1.0,
+  "ow4k": 1.0,
+  "ow64k": 1.0
+ },
+ "arms": {
+  "append25": {
+   "max_us": 724.2,
+   "mean_us": 309.1,
+   "min_us": 192.6,
+   "p10_us": 206.4,
+   "p1_us": 194.5,
+   "p50_q1_us": 306.2,
+   "p50_q4_us": 318.3,
+   "p50_us": 291.6,
+   "p90_us": 442.2,
+   "p99_us": 640.9
+  },
+  "append64": {
+   "max_us": 4045.7,
+   "mean_us": 370.6,
+   "min_us": 193.5,
+   "p10_us": 208.4,
+   "p1_us": 195.7,
+   "p50_q1_us": 320.1,
+   "p50_q4_us": 334.1,
+   "p50_us": 302.2,
+   "p90_us": 475.6,
+   "p99_us": 3218.5
+  },
+  "cfr2b": {
+   "max_us": 7379.8,
+   "mean_us": 2680.2,
+   "min_us": 1097.6,
+   "p10_us": 1227.7,
+   "p1_us": 1124.5,
+   "p50_q1_us": 1449.6,
+   "p50_q4_us": 1461.2,
+   "p50_us": 1442.2,
+   "p90_us": 6197.0,
+   "p99_us": 7312.8
+  },
+  "clean": {
+   "max_us": 28.5,
+   "mean_us": 21.7,
+   "min_us": 15.8,
+   "p10_us": 18.2,
+   "p1_us": 17.0,
+   "p50_q1_us": 21.7,
+   "p50_q4_us": 22.3,
+   "p50_us": 22.2,
+   "p90_us": 24.7,
+   "p99_us": 28.0
+  },
+  "fdatasync4k": {
+   "max_us": 869.3,
+   "mean_us": 196.2,
+   "min_us": 103.9,
+   "p10_us": 128.0,
+   "p1_us": 108.0,
+   "p50_q1_us": 186.3,
+   "p50_q4_us": 192.5,
+   "p50_us": 177.7,
+   "p90_us": 312.3,
+   "p99_us": 548.0
+  },
+  "nosync25": {
+   "max_us": 20.8,
+   "mean_us": 4.6,
+   "min_us": 0.5,
+   "p10_us": 2.4,
+   "p1_us": 0.9,
+   "p50_q1_us": 4.0,
+   "p50_q4_us": 4.0,
+   "p50_us": 3.7,
+   "p90_us": 8.2,
+   "p99_us": 15.0
+  },
+  "ow1m": {
+   "max_us": 8989.5,
+   "mean_us": 2199.1,
+   "min_us": 577.9,
+   "p10_us": 685.6,
+   "p1_us": 611.3,
+   "p50_q1_us": 916.8,
+   "p50_q4_us": 876.3,
+   "p50_us": 876.7,
+   "p90_us": 5719.2,
+   "p99_us": 6613.9
+  },
+  "ow4k": {
+   "max_us": 3283.9,
+   "mean_us": 355.1,
+   "min_us": 103.6,
+   "p10_us": 238.0,
+   "p1_us": 114.4,
+   "p50_q1_us": 326.4,
+   "p50_q4_us": 327.0,
+   "p50_us": 319.3,
+   "p90_us": 456.3,
+   "p99_us": 3068.2
+  },
+  "ow64k": {
+   "max_us": 5264.0,
+   "mean_us": 510.2,
+   "min_us": 135.6,
+   "p10_us": 270.4,
+   "p1_us": 149.1,
+   "p50_q1_us": 400.3,
+   "p50_q4_us": 339.6,
+   "p50_us": 360.2,
+   "p90_us": 576.4,
+   "p99_us": 4472.8
+  }
+ },
+ "arms_gated": [
+  "append25",
+  "append64",
+  "ow4k",
+  "ow64k",
+  "ow1m",
+  "clone2b",
+  "cfr2b",
+  "fdatasync4k"
+ ],
+ "arms_gated_run": [
+  "append25",
+  "append64",
+  "ow4k",
+  "ow64k",
+  "ow1m",
+  "cfr2b"
+ ],
+ "arms_report_only": {
+  "clean": "the dirty/clean control, never mutated",
+  "clone1b": "report-only: on Linux a directory fsync does not guarantee a FICLONE durable (PREREG crash model; review 2 item 3; crash.sh loses it on btrfs and on XFS-aimed); clone2b is the clone arm that survived every crash case",
+  "fdatasync4k": "report-only extra: ow4k with fdatasync in place of fsync"
+ },
+ "arms_requested": "append25,append64,ow4k,ow64k,ow1m,clone1b,clone2b,cfr2b,clean,fdatasync4k,nosync25",
+ "barrier": "fsync(2)",
+ "clean_fast_frac": 1.0,
+ "clock": "CLOCK_MONOTONIC_RAW",
+ "clocksource": "arch_sys_counter",
+ "copy_extents": {
+  "cfr2b": "not shared (a byte copy)"
+ },
+ "d0_control": "pass (nosync25 p50 3.7 us < 50 us)",
+ "d0_threshold": 10.0,
+ "d0_threshold_key": "d0_threshold/ext4/wt/vm",
+ "d0_threshold_ref": null,
+ "d0_threshold_source": "provisional 10: no registered entry for this key",
+ "dev": "7:0",
+ "device_flushes": {
+  "ambiguous": 0,
+  "devices": {
+   "loop0": {
+    "by_kind": {
+     "flush": 2806,
+     "fua": 0,
+     "other": 0,
+     "preflush": 0,
+     "preflush+fua": 0
+    },
+    "comms": {
+     "kworker/0:1H": 978,
+     "kworker/1:1H": 744,
+     "kworker/2:1H": 481,
+     "kworker/3:1H": 603
+    },
+    "total": 2806
+   },
+   "loop2": {
+    "by_kind": {
+     "flush": 2,
+     "fua": 0,
+     "other": 0,
+     "preflush": 0,
+     "preflush+fua": 0
+    },
+    "comms": {
+     "kworker/0:1H": 1,
+     "kworker/2:1H": 1
+    },
+    "total": 2
+   }
+  },
+  "instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",
+  "leaf_devices": [
+   "sda"
+  ],
+  "outside": 22,
+  "outside_by_device": {
+   "loop0": 22
+  },
+  "proves": "flush requests and FUA writes ISSUED to each device's driver (tracefs block:block_rq_issue), never persistence; on a device reporting write-through the block layer strips flushes before issue, so 0 there by construction; other processes' requests inside a window are counted too, and a request an op causes after its window closes is not, so a window's count is neither a strict upper nor lower bound on the op's own; a zero is exact only for windows longer than 1 us (the trace prints microseconds)"
+ },
+ "device_flushes_per_op": {
+  "append25": 0.0,
+  "append64": 0.0,
+  "cfr2b": 0.0,
+  "clean": 0.0,
+  "fdatasync4k": 0.0,
+  "nosync25": 0.0,
+  "ow1m": 0.0,
+  "ow4k": 0.0,
+  "ow64k": 0.0
+ },
+ "dir": "/mnt/fastest-v3-ext4loop/work",
+ "dir_flags": "0x80000",
+ "dirty_clean_m0": "met",
+ "dirty_clean_p50_ratio": 13.1,
+ "durability": {
+  "cfr2b": "device durability unverified on Linux by this probe; the fire-check's crash.sh shows it surviving a filesystem-level crash on loops, which cannot see a missing device flush",
+  "clone1b": "not guaranteed on Linux (report-only): crash.sh loses it on btrfs and on XFS when the log was forced between the create and the FICLONE; it survived plain XFS by checkpoint batching",
+  "clone2b": "device durability unverified on Linux by this probe; the fire-check's crash.sh shows it surviving a filesystem-level crash on loops, which cannot see a missing device flush"
+ },
+ "exe_sha256": "3b29ee069663bef112ae3956e6c6d9364885bcbb7bf0251dec9ed0463ec37921",
+ "floor_claim": "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor 'above a same-batch drive flush' may be written; on a virtual drive: reach to media unknown",
+ "floor_claim_from_counts": "no drive flush: the leaf reports write-through and receives no flush (a virtual drive: the host's caching is unknown)",
+ "floor_frame_variant": "no frame arm registered",
+ "floor_kind": "no volatile cache (a virtual drive's report): no drive flush, host caching unknown",
+ "floor_reference": {
+  "arm": "fdatasync4k",
+  "barrier": "fdatasync",
+  "p50_us": 177.7,
+  "rule": "annex A18: min p50 over append25 (fsync), fdatasync4k (ow4k + fdatasync) and the registered frame arm, among the arms run"
+ },
+ "flush_control": "not applicable: no volatile cache",
+ "flush_control_arms": {
+  "append25": {
+   "gated": true,
+   "pass": true,
+   "ratio": 78.9,
+   "timing_gated": true
+  },
+  "append64": {
+   "gated": true,
+   "pass": true,
+   "ratio": 81.8,
+   "timing_gated": false
+  },
+  "cfr2b": {
+   "gated": true,
+   "pass": true,
+   "ratio": 390.2,
+   "timing_gated": false
+  },
+  "clean": {
+   "gated": false,
+   "pass": false,
+   "ratio": 6.0,
+   "timing_gated": false
+  },
+  "fdatasync4k": {
+   "gated": true,
+   "pass": true,
+   "ratio": 48.1,
+   "timing_gated": false
+  },
+  "ow1m": {
+   "gated": true,
+   "pass": true,
+   "ratio": 237.2,
+   "timing_gated": false
+  },
+  "ow4k": {
+   "gated": true,
+   "pass": true,
+   "ratio": 86.4,
+   "timing_gated": false
+  },
+  "ow64k": {
+   "gated": true,
+   "pass": true,
+   "ratio": 97.5,
+   "timing_gated": false
+  }
+ },
+ "flush_d0_p50_ratio": 78.9,
+ "flush_gate": {
+  "blkflush_leaf_gate": {
+   "arms": {
+    "append25": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    },
+    "append64": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    },
+    "cfr2b": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    },
+    "ow1m": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    },
+    "ow4k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    },
+    "ow64k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0
+     }
+    }
+   },
+   "outcome": "pass"
+  },
+  "gated_arms_run": [
+   "append25",
+   "append64",
+   "cfr2b",
+   "ow1m",
+   "ow4k",
+   "ow64k"
+  ],
+  "instrument": "/proc/diskstats fields 19-20 (flush requests completed), stamp_end - stamp_start; a lower bound (other processes' flushes pad it)",
+  "leaf": "sda",
+  "leaf_class": "wt",
+  "leaf_flushes_completed": 0,
+  "n": 200,
+  "outcome": "not applicable: no volatile cache: no drive flush",
+  "required_flushes": 1200,
+  "voids": []
+ },
+ "flush_path": [
+  {
+   "device": "loop0",
+   "disk": "loop0",
+   "disk_dev": "7:0",
+   "ext4": {
+    "commit_s": "5",
+    "data": "ordered",
+    "journal": "loop0-8",
+    "journal_async_commit": false,
+    "label": "data=ordered, commit=5"
+   },
+   "fstype": "ext4",
+   "fua": "0",
+   "loop_backing": "/fastest-loop-ext4loop.img",
+   "loop_backing_dev_ino": "801:6172 (LOOP_GET_STATUS64 == stat)",
+   "loop_dio": "0",
+   "mount": "/mnt/fastest-v3-ext4loop",
+   "mount_id": 98,
+   "options": "rw,relatime",
+   "path": "/mnt/fastest-v3-ext4loop/work",
+   "source": "/dev/loop0",
+   "super_options": "rw,noinit_itable",
+   "sys": "/sys/devices/virtual/block/loop0",
+   "write_cache": "write back"
+  },
+  {
+   "device": "sda1",
+   "disk": "sda",
+   "disk_dev": "8:0",
+   "ext4": {
+    "commit_s": "30",
+    "data": "writeback",
+    "journal": "sda1-8",
+    "journal_async_commit": true,
+    "label": "data=writeback, async commit, commit=30"
+   },
+   "fstype": "ext4",
+   "fua": "0",
+   "loop_backing": "",
+   "mount": "/",
+   "mount_id": 29,
+   "options": "rw,relatime",
+   "path": "/fastest-loop-ext4loop.img",
+   "source": "/dev/root",
+   "super_options": "rw,discard,journal_async_commit,errors=remount-ro,commit=30,data=writeback",
+   "sys": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/f8b3781a-1e82-4818-a1c3-63d806ec15bb/host0/target0:0:0/0:0:0:0/block/sda",
+   "write_cache": "write through"
+  }
+ ],
+ "flush_sent_to_device": "no: the (virtual) leaf reports write-through and its device report agrees, so the block layer sends it no flush; the host's own caching is unknown",
+ "frame_arm": null,
+ "frame_arm_ref": null,
+ "frame_candidate": "ow4k (a named create's flight is about 56-60 B, unverified: the smallest registered M0 arm at or above it); append64 is descriptive until registered",
+ "frame_rule": "PREREG section 4: among the M0 append and overwrite arms, the smallest bytes per flush >= the M1 build's median create frame, fixed in the Registration annex",
+ "fsid": "f0aca534982b3c89",
+ "fstype": "ext4",
+ "ioprio_class": 0,
+ "ioprio_level": 0,
+ "layer_device_flushes_per_op": {
+  "loop0": {
+   "append25": 2.0,
+   "append64": 2.0,
+   "cfr2b": 2.0,
+   "clean": 1.0,
+   "fdatasync4k": 1.01,
+   "nosync25": 0.0,
+   "ow1m": 2.0,
+   "ow4k": 1.95,
+   "ow64k": 1.96
+  },
+  "sda": {
+   "append25": 0.0,
+   "append64": 0.0,
+   "cfr2b": 0.0,
+   "clean": 0.0,
+   "fdatasync4k": 0.0,
+   "nosync25": 0.0,
+   "ow1m": 0.0,
+   "ow4k": 0.0,
+   "ow64k": 0.0
+  }
+ },
+ "layers": 2,
+ "ld_env": "none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)",
+ "leaf": {
+  "creditable": true,
+  "dev": "8:0",
+  "device_path": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/f8b3781a-1e82-4818-a1c3-63d806ec15bb/host0/target0:0:0/0:0:0:0",
+  "disk": "sda",
+  "drive_report_source": "SCSI MODE SENSE(10) caching page WCE=0 via SG_IO on /dev/sda (reply header 00 12 00 10 00 00 00 00; page at 8 08 0a 00 00 00 00 00 00 00 00 00 00; sd's cache_type, the kernel's copy, reads 'write through')",
+  "drive_reports": "write through",
+  "driver": "sd",
+  "fua": "0",
+  "kind": "drive",
+  "model": "Virtual Disk",
+  "multipath": [],
+  "nvme_controllers": [],
+  "nvme_transport": [],
+  "sd_cache_type": "write through",
+  "sd_host": "storvsc_host",
+  "write_cache": "write through"
+ },
+ "leaf_fua": "0",
+ "leaf_write_cache": "write through",
+ "linkage": "static",
+ "loop_layers": 1,
+ "mapped_files": [
+  "/home/runner/work/turso/turso/dist/v3floor"
+ ],
+ "mount_id": 98,
+ "mount_opts": "rw,relatime",
+ "mount_point": "/mnt/fastest-v3-ext4loop",
+ "mount_source": "/dev/loop0",
+ "mutant_nosync": 0,
+ "n": 200,
+ "nice": 0,
+ "pid": 11946,
+ "plp": "no",
+ "probe": "v3floor-linux",
+ "probe_rev": "review2",
+ "realpath": "/mnt/fastest-v3-ext4loop/work",
+ "refused_arms": {
+  "clone1b": "ext4 at /mnt/fastest-v3-ext4loop has no reflink: a trial ioctl(FICLONE) returned EOPNOTSUPP (Operation not supported); FICLONE arms run on xfs and btrfs only",
+  "clone2b": "ext4 at /mnt/fastest-v3-ext4loop has no reflink: a trial ioctl(FICLONE) returned EOPNOTSUPP (Operation not supported); FICLONE arms run on xfs and btrfs only"
+ },
+ "registered_file": "/home/runner/work/turso/turso/fastest/linux/v3/REGISTERED.tsv",
+ "sched_policy": 0,
+ "seed": 11,
+ "seed_arg": 11,
+ "statfs_magic": "0xef53",
+ "super_opts": "rw,noinit_itable",
+ "timing_control": "not applicable: no volatile cache",
+ "timing_gated_arms": [
+  "append25"
+ ],
+ "trace_clock": 0,
+ "traced": false,
+ "uname": "Linux 6.17.0-1022-azure aarch64",
+ "virtualization": {
+  "basis": "4 piece(s) of VM evidence",
+  "blind_spot": "a hypervisor that hides the CPUID bit and presents non-virtual DMI and drive identities",
+  "cpuinfo_flags_line": false,
+  "cpuinfo_hypervisor_flag": false,
+  "devicetree_hypervisor": false,
+  "dmi_product_name": "Virtual Machine",
+  "dmi_sys_vendor": "Microsoft Corporation",
+  "evidence": [
+   "DMI: product_name 'Virtual Machine' names 'Virtual'",
+   "leaf: drive model 'Virtual Disk' names 'Virtual'",
+   "leaf: SCSI host 'storvsc_host' (paravirtual)",
+   "leaf: device path /sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/f8b3781a-1e82-4818-a1c3-63d806ec15bb/host0/target0:0:0/0:0:0:0 has 'MSFT1000'"
+  ],
+  "sys_hypervisor_type": "",
+  "virtualized": true
+ }
+}

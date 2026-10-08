@@ -1470,6 +1470,26 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 #[cfg(test)]
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Test builds: while it holds 1, a DDL commit on the trunk waits after publishing its pages and
+/// before publishing its schema (`Pager::commit_tx`), having marked its arrival (`| HOLD_ARRIVED`);
+/// stored 0 to release it (engine 2b: a trunk fork in that window). Process-wide.
+#[cfg(test)]
+pub(crate) static SCHEMA_PUBLISH_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// A DDL commit waits at `SCHEMA_PUBLISH_HOLD` (test builds only).
+pub(crate) fn pause_schema_publish() {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering as O;
+        let arrived = 1 | HOLD_ARRIVED;
+        if SCHEMA_PUBLISH_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+            while SCHEMA_PUBLISH_HOLD.load(O::Acquire) == arrived {
+                crate::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
     #[cfg(test)]
@@ -5698,14 +5718,12 @@ impl BranchStore {
     /// may be lost, and a later successful flush would report it durable. So the store fail-stops,
     /// as after a failed flight — every waiter, the riders the flush would have made durable among
     /// them, gets the error — exactly when it holds records the drain could have lost: written and
-    /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
-    /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
-    /// (`pending_full`), or a flight in the air, a fuzzy checkpoint's arena sync included (engine
-    /// review 9 #8: the flight it replaced counted here). Undrained records count in a store whose
-    /// class syncs, and in a D0 store too once a Release is undrained: its trunk barrier relies on
-    /// that Release being durable, and it is at best plain-fsynced (engine review 10 #6; mutant
-    /// `drain_risk_by_store_class`: only the store's class, as before). With nothing at risk (a D2
-    /// store whose every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only):
+    /// not yet drained by a full flush (on Apple fsync(2) drains nothing, elsewhere it does), in
+    /// any store class (engine review 10 #6 and review 15 HIGH 1: a D0 store's trunk barrier relies
+    /// on its records being durable, and a lost one is a hole in the log's prefix), an ordered
+    /// flight, one waiting for this very flush (`pending_full`), or a flight in the air, a fuzzy
+    /// checkpoint's arena sync included (engine review 9 #8: the flight it replaced counted here).
+    /// With nothing at risk (every record drained by a full flush), it goes on. Mutants (test builds only):
     /// `no_wal_fail_stop` (it never stops, as before review 6 #2) and `drain_failure_ignores_risk`
     /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
@@ -5719,9 +5737,25 @@ impl BranchStore {
         } else {
             g.durable[class_index(SyncClass::Fsync)].max(full)
         };
-        let release_undrained = self.last_release_lsn.load(Ordering::Acquire) > drained
-            && !fe_mutant("drain_risk_by_store_class");
-        let at_risk = (g.durable[0] > drained && (self.class.syncs() || release_undrained))
+        // Any record written and not drained is at risk, whatever it is (engine review 15 HIGH 1):
+        // recovery replays the log as a prefix and stops at the first damaged frame, so a lost
+        // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
+        // Mutants (test builds only): `drain_risk_by_store_class` (only in a store whose class
+        // syncs, as before engine review 10 #6), `drain_risk_release_only` (or when the newest
+        // Release is undrained, as before this) and `drain_risk_barrier_floor_only` (or the newest
+        // Release or TrunkRetain).
+        let release = self.last_release_lsn.load(Ordering::Acquire);
+        let retain = self.retain_floor.load(Ordering::Acquire);
+        let undrained_counts = if fe_mutant("drain_risk_by_store_class") {
+            self.class.syncs()
+        } else if fe_mutant("drain_risk_release_only") {
+            self.class.syncs() || release > drained
+        } else if fe_mutant("drain_risk_barrier_floor_only") {
+            self.class.syncs() || release.max(retain) > drained
+        } else {
+            true
+        };
+        let at_risk = (g.durable[0] > drained && undrained_counts)
             || g.ordered > full
             || g.pending_full.is_some()
             || g.flushing
@@ -6494,6 +6528,12 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn rewrite_class_for_test(&self) -> SyncClass {
         self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::rewrite_class)
+    }
+
+    /// Test builds: how far the log is durable in `class` (the group's lock-free mark).
+    #[cfg(test)]
+    pub(crate) fn durable_for_test(&self, class: SyncClass) -> u64 {
+        self.group.durable(class)
     }
 
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
