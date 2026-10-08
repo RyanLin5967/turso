@@ -37,9 +37,11 @@ import fixture  # noqa: E402  (one parent fixture for every system)
 WORKFLOW = ".github/workflows/fastest-competitors.yml"
 _PG = ["pg18-select1", "pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal"]
 _DV = ["create", "a-m1c", "a-m1", "b-m1c", "b-m1", "c-m1c", "c-m1"]
+# pg18-defaults is DROPPED on Linux (lead ruling, artie DECISIONS 6b0bef481b: on Linux it configures pg18-d2's server,
+# and PREREG-CORE v2's OUT list excludes PG18 at its defaults); pg18-d2 runs the clone proof's copy control. A workflow
+# that lists pg18-defaults again gets MISSING rows (no pinned expectation), and run_system.sh refuses the system.
 PINNED_SPECS = {
-    "pg18-d2": _PG,
-    "pg18-defaults": _PG + ["pg18-create-copy"],
+    "pg18-d2": _PG + ["pg18-create-copy"],
     "dolt": ["dolt-select1"] + [f"dolt-{v}" for v in _DV],
     "doltgres": ["doltgres-select1"] + [f"doltgres-{v}" for v in _DV],
     "b1": [f"b1-{s}" for s in ("m1c-d2", "m1-d2", "m1c-d0", "m1-d0")],

@@ -1,6 +1,8 @@
 name: fastest-competitors
 # Lane fastest-linux-comp: the FASTEST competitors on Linux -- PostgreSQL 18 (PGDG; STRATEGY=FILE_COPY with
-# file_copy_method=clone and STRATEGY=WAL_LOG, each at D2 = pg18-d2 and at defaults = pg18-defaults, amendment 14),
+# file_copy_method=clone and STRATEGY=WAL_LOG at D2 = pg18-d2, amendment 14, plus the clone proof's copy control
+# pg18-create-copy; pg18-defaults is DROPPED on Linux by the lead's ruling, artie DECISIONS 6b0bef481b: on Linux it
+# configures the same server as pg18-d2, and PREREG-CORE v2's OUT list excludes PG18 at its defaults),
 # Dolt and Doltgres at the registered versions of versions.tsv (2.4.1, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
 # variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
 # and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
@@ -99,7 +101,8 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
         fs: [xfs, btrfs]
-        system: [pg18-d2, pg18-defaults, dolt, doltgres, b1]
+        # pg18-defaults is dropped on Linux (lead ruling, artie 6b0bef481b); reduce.py pins these systems
+        system: [pg18-d2, dolt, doltgres, b1]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     env:
@@ -152,6 +155,7 @@ jobs:
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP age=$FT_AGE prebranch=$FT_PREBRANCH";
+            echo "systems=pg18-d2,dolt,doltgres,b1 pg18-defaults=DROPPED (lead ruling artie 6b0bef481b: on Linux it is pg18-d2's server; pg18-d2 runs the copy control pg18-create-copy)";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries

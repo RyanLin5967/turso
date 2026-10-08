@@ -2,7 +2,7 @@
 # run_system.sh SYSTEM MNT RAW -- one competitor on one filesystem (lane fastest-linux-comp). SMOKE ONLY: no
 # latency here is credited or quoted before the lead registers the PREREG.
 #
-#   SYSTEM  pg18-d2 | pg18-defaults | dolt | doltgres | b1
+#   SYSTEM  pg18-d2 | dolt | doltgres | b1   (pg18-defaults is refused: dropped on Linux, lead ruling artie 6b0bef481b)
 #   MNT     the filesystem under test (fs/mkloop.sh made it); everything this run writes lives in MNT/SYSTEM.noindex
 #   RAW     the output tree (uploaded as the job's artifact)
 #
@@ -82,18 +82,20 @@ nops() { python3 "$HERE/timedrun.py" ops "$1" "$N1" "$N4" "${FT_OPS_TOTAL:-}"; }
 OUTER_S=$((${CAP_S%.*} + 600))
 fsused() { sync -f "$MNT"; df -B1 --output=used "$MNT" | tail -1 | tr -d ' '; }
 
-# Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG, each
-# at D2 (pg18-d2) and at defaults (pg18-defaults: PG's defaults plus file_copy_method=clone, pg18.sh MODE d1clone),
-# in the forms M1c-create (CREATE alone), M1c-connect (pg18-m1c*: CREATE, a new connection, SELECT 1) and M1 (CREATE,
-# connect, first write); pg18-defaults adds the clone proof's negative control (FILE_COPY with this session's
-# file_copy_method = copy). Dolt sql-server and Doltgres: variants (a) checkout(parent) + checkout('-b', name),
+# Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG at D2
+# (pg18-d2), in the forms M1c-create (CREATE alone), M1c-connect (pg18-m1c*: CREATE, a new connection, SELECT 1) and
+# M1 (CREATE, connect, first write), plus the clone proof's negative control pg18-create-copy (FILE_COPY with this
+# session's file_copy_method = copy). The at-defaults system pg18-defaults (pg18.sh MODE d1clone) is DROPPED on Linux
+# by the lead's ruling (artie DECISIONS 6b0bef481b): on Linux it configures the same server as pg18-d2 (pg18.sh's
+# header), and PREREG-CORE v2's OUT list excludes PG18 at its defaults; it is refused below, not run.
+# Dolt sql-server and Doltgres: variants (a) checkout(parent) + checkout('-b', name),
 # (b) dolt_branch(name, parent) + checkout(name), (c) dolt_branch(name, parent) + a new connection to db/name +
 # SELECT 1, each also as M1 (+ first write), and dolt_branch alone (M1c-create of (b) and (c)).
 PG_SPECS="pg18-select1 pg18-create pg18-m1c pg18-m1 pg18-create-wal pg18-m1c-wal pg18-m1-wal"
 DOLT_V="create a-m1c a-m1 b-m1c b-m1 c-m1c c-m1"
 case $SYSTEM in
-  pg18-d2) KIND=pg MODE=d2 PORT=55432 SPECLIST="$PG_SPECS" ;;
-  pg18-defaults) KIND=pg MODE=d1clone PORT=55432 SPECLIST="$PG_SPECS pg18-create-copy" ;;
+  pg18-d2) KIND=pg MODE=d2 PORT=55432 SPECLIST="$PG_SPECS pg18-create-copy" ;;
+  pg18-defaults) echo "REFUSED: pg18-defaults is dropped on Linux (lead ruling, artie DECISIONS 6b0bef481b); run pg18-d2, which carries pg18-create-copy" >&2; exit 2 ;;
   dolt) KIND=dolt PORT=53306 SPECLIST="dolt-select1$(for v in $DOLT_V; do printf ' dolt-%s' "$v"; done)" ;;
   doltgres) KIND=doltgres PORT=55433 SPECLIST="doltgres-select1$(for v in $DOLT_V; do printf ' doltgres-%s' "$v"; done)" ;;
   b1) KIND=b1 SPECLIST="m1c-d2 m1-d2 m1c-d0 m1-d0" ;;
@@ -127,6 +129,7 @@ for spec in $SPECLIST; do
   done
 done >"$RAW/expected-cells.txt"
 { echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
+  [ "$KIND" = pg ] && echo "pg_systems=pg18-d2 (with pg18-create-copy) pg18-defaults=DROPPED on Linux (lead ruling artie 6b0bef481b)"
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 
@@ -462,7 +465,7 @@ server_main() {
 pg_clone_proof() {
   # The template's table file vs. a FILE_COPY branch's: same physical blocks (and flagged shared) under
   # file_copy_method=clone; disjoint under copy. The strace half: copy_file_range calls in the create window. The
-  # server runs clone (both PG systems); pg18-create-copy (pg18-defaults only) is the negative control, its session
+  # server runs clone (pg18-d2); pg18-create-copy is the negative control, its session
   # SET to copy: the same two instruments must read "copy" and 0 there, or the proof could not tell them apart.
   local cell want br tfile bfile cfr ncell=0
   tfile="$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")"

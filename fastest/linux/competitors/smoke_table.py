@@ -38,14 +38,10 @@ def run_version(rundir, system):
 ROWS = [
     ("PostgreSQL 18", "FILE_COPY, file_copy_method=clone, D2 (M1c-create / M1)", "pg18-d2", "pg18-create", "pg18-m1"),
     ("PostgreSQL 18", "FILE_COPY clone, D2, M1c-connect (+ connect + SELECT 1)", "pg18-d2", "pg18-m1c", None),
-    ("PostgreSQL 18", "FILE_COPY clone, at defaults (M1c-create / M1)", "pg18-defaults", "pg18-create", "pg18-m1"),
-    ("PostgreSQL 18", "FILE_COPY clone, at defaults, M1c-connect", "pg18-defaults", "pg18-m1c", None),
     ("PostgreSQL 18", "WAL_LOG, D2 (M1c-create / M1)", "pg18-d2", "pg18-create-wal", "pg18-m1-wal"),
     ("PostgreSQL 18", "WAL_LOG, D2, M1c-connect", "pg18-d2", "pg18-m1c-wal", None),
-    ("PostgreSQL 18", "WAL_LOG, at defaults (M1c-create / M1)", "pg18-defaults", "pg18-create-wal", "pg18-m1-wal"),
-    ("PostgreSQL 18", "WAL_LOG, at defaults, M1c-connect", "pg18-defaults", "pg18-m1c-wal", None),
-    ("PostgreSQL 18", "FILE_COPY, file_copy_method=copy (clone-proof control)", "pg18-defaults", "pg18-create-copy",
-     None),
+    # pg18-defaults is dropped on Linux (lead ruling, artie 6b0bef481b); its copy control runs on pg18-d2
+    ("PostgreSQL 18", "FILE_COPY, file_copy_method=copy (clone-proof control)", "pg18-d2", "pg18-create-copy", None),
     ("PostgreSQL 18", "SELECT 1 floor", "pg18-d2", "pg18-select1", None),
     (DOLT, "(a) DOLT_CHECKOUT(main) + DOLT_CHECKOUT('-b', b)", "dolt", "dolt-a-m1c", "dolt-a-m1"),
     (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
@@ -121,7 +117,7 @@ def main(rundir, c):
     print(f"\n#### PostgreSQL 18 deferred flushes per op at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
     print("| Job | Spec | " + " | ".join(h for _, _, h in COLS) + " |")
     print("|---|---|" + "---|" * len(COLS))
-    for system in ("pg18-d2", "pg18-defaults"):
+    for system in ("pg18-d2",):
         for spec in ("pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal",
                      "pg18-create-copy", "pg18-select1"):
             vals = []
