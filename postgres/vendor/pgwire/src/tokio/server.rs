@@ -182,11 +182,11 @@ where
     // 10 item 2): discarded while awaiting Sync, as PostgreSQL discards every message up to it;
     // otherwise answered with its ERROR, after which the caller's process_error skips to Sync in
     // the extended protocol.
-    if let PgWireFrontendMessage::Malformed(_, fault) = message {
+    if let PgWireFrontendMessage::Malformed(_, code, message) = message {
         if matches!(socket.state(), PgWireConnectionState::AwaitingSync) {
             return Ok(());
         }
-        return Err(PgWireError::MalformedMessage(fault));
+        return Err(PgWireError::MalformedMessage { code, message });
     }
 
     match socket.state() {

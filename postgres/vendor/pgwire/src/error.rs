@@ -19,10 +19,11 @@ pub enum PgWireError {
     /// A frame length below 4, which cannot hold the length itself (vendored change).
     #[error("invalid message length {0}")]
     InvalidMessageLength(usize),
-    /// A frontend message read whole whose body does not hold what it says, in PostgreSQL's
-    /// words (vendored change, wire review 10 item 2).
-    #[error("{0}")]
-    MalformedMessage(&'static str),
+    /// A frontend message read whole whose body does not hold what it says, or holds a string
+    /// that is not valid UTF-8: its SQLSTATE (08P01, or 22021) and PostgreSQL's words (vendored
+    /// change, wire review 10 item 2, review 12 item 8).
+    #[error("{message}")]
+    MalformedMessage { code: &'static str, message: String },
     #[error("Invalid target type, received {0}")]
     InvalidTargetType(u8),
     #[error("Invalid transaction status, received {0}")]
@@ -267,8 +268,8 @@ impl From<PgWireError> for ErrorInfo {
             }
             // An ERROR: the frame was read whole, so the stream is in step and the session goes
             // on (to the next Sync in the extended protocol), as PostgreSQL's does.
-            PgWireError::MalformedMessage(_) => {
-                ErrorInfo::new("ERROR".to_owned(), "08P01".to_owned(), error.to_string())
+            PgWireError::MalformedMessage { code, message } => {
+                ErrorInfo::new("ERROR".to_owned(), code.to_owned(), message)
             }
             PgWireError::InvalidTransactionStatus(_) => {
                 ErrorInfo::new("FATAL".to_owned(), "08P01".to_owned(), error.to_string())

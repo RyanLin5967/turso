@@ -183,7 +183,7 @@ pub enum PgWireFrontendMessage {
     /// PostgreSQL does; the stream stays in step. An error from the decoder instead would end
     /// the stream (tokio-util's Framed returns None after one), so it is a message (vendored
     /// change, wire review 10 item 2).
-    Malformed(u8, &'static str),
+    Malformed(u8, &'static str, String),
 }
 
 impl PgWireFrontendMessage {
@@ -198,7 +198,7 @@ impl PgWireFrontendMessage {
                 | Self::PortalSuspended(_)
                 | Self::Flush(_)
                 | Self::Sync(_)
-        ) || matches!(self, Self::Malformed(t, _) if b"PBCDEH".contains(t))
+        ) || matches!(self, Self::Malformed(t, ..) if b"PBCDEH".contains(t))
     }
 
     pub fn encode(&self, buf: &mut BytesMut) -> PgWireResult<()> {
@@ -338,8 +338,8 @@ impl PgWireFrontendMessage {
             // A body fault is raised only after decode_packet consumed the frame (vendored
             // change): the message is read, and answered as malformed.
             match decoded {
-                Err(PgWireError::MalformedMessage(fault)) => {
-                    Ok(Some(Self::Malformed(first_byte, fault)))
+                Err(PgWireError::MalformedMessage { code, message }) => {
+                    Ok(Some(Self::Malformed(first_byte, code, message)))
                 }
                 decoded => decoded,
             }

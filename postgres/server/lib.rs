@@ -556,11 +556,14 @@ async fn serve_session(
         // Query's error never reached the session's block, so COMMIT committed (wire review 12
         // items 6 and 7). A malformed CopyFail outside COPY is ignored, as PostgreSQL ignores a
         // stray CopyFail.
-        if let PgWireFrontendMessage::Malformed(kind, fault) = msg {
+        if let PgWireFrontendMessage::Malformed(kind, code, ref message) = msg {
             let copying = matches!(socket.state(), PgWireConnectionState::CopyInProgress(_));
             if matches!(kind, b'S' | b'Q') && !copying {
                 session.fail_block();
-                let info = ErrorInfo::from(PgWireError::MalformedMessage(fault));
+                let info = ErrorInfo::from(PgWireError::MalformedMessage {
+                    code,
+                    message: message.clone(),
+                });
                 socket.set_state(PgWireConnectionState::ReadyForQuery);
                 let status = session.transaction_status();
                 let sent = async {

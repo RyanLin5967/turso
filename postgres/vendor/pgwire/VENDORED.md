@@ -39,3 +39,6 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
 2. A malformed Sync is not an extended message (`is_extended_query` covers P, B, C, D, E, H):
    PostgreSQL ends a skip at any Sync before it reads the body, so the server answers it (and a
    malformed simple Query) itself, with ReadyForQuery (wire review 12 items 6 and 7).
+3. `read_cstring` decodes strictly: invalid UTF-8 is 22021 "invalid byte sequence for encoding
+   \"UTF8\": 0x.." (it was read lossily), in one scan for the terminator. `MalformedMessage` and
+   `PgWireFrontendMessage::Malformed` carry the SQLSTATE and the message (wire review 12 item 8).
