@@ -13,7 +13,7 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{sync_database_file_paths, DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -348,6 +348,16 @@ impl SyncEngine {
             protocol: Some(Arc::new(JsProtocolIo::default())),
             #[allow(clippy::arc_with_non_send_sync)]
             db,
+        })
+    }
+
+    #[napi]
+    pub fn file_paths(&self) -> napi::Result<Vec<String>> {
+        sync_database_file_paths(&self.opts.path).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("failed to name the database files: {e}"),
+            )
         })
     }
 
