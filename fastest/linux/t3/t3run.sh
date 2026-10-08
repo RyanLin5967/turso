@@ -291,6 +291,22 @@ hwid() { bash "$L/t3/hwid.sh" "$OUT/hwid" /; }
 # The V3 fire-check's refusal fixtures (scratch loops on the root disk, never the target device), made
 # once for every filesystem block.
 V3FX=/mnt/t3-v3fx
+# ONE environment for the V3 tools (T3 runner review HIGH 1: 2d42982a0 gave V3_PLP to run.sh only, so firecheck.sh
+# refused every block): the fire-check gets all of it, run.sh its V3_PLP from the same array, and the selftests stage
+# runs firecheck.sh's own environment checks with it before any block (fcenv_check).
+V3ENV=(V3_PLP="$PLP" V3_FX="$V3FX" V3_SHIM="$DIST/statfs_shim.so" V3_DYN="$DIST/v3floor.dyn" V3_NOOP="$DIST/noop_shim.so")
+# firecheck.sh checks its arguments, then every required variable, then refuses an OUT that exists (exit 2, "exists"):
+# so with an existing OUT, reaching that refusal proves the environment passed, and any other exit-2 message names
+# the variable it lacks.
+fcenv_check() {
+  local o=$OUT/fcenv-check rc
+  mkdir -p "$o"
+  env "${V3ENV[@]}" bash "$L/v3/firecheck.sh" "$DIST/v3floor" ext4loop "$o/w" "$o" > "$o.txt" 2>&1
+  rc=$?
+  [ $rc = 2 ] && grep -qx "firecheck: $o exists" "$o.txt" ||
+    { echo "fire-check environment refused (rc $rc): $(cat "$o.txt")"; return 1; }
+  rmdir "$o"
+}
 # The nest fixture (P_nest3) must start on the filesystem that holds the cell's leaf (V3 eighth review M5, ninth
 # review HIGH), or an md/LVM root makes the probe refuse it. A loop block's leaf is the drive under its backing file,
 # so the backing directory is chosen ONCE here (mkloop.sh's own rule: / or /mnt, whichever has more free space) and
@@ -315,7 +331,7 @@ v3fixtures() {
 # copies of its real record and its batch directory (blockgate.py plants): every one must be decided as planted.
 v3batch() { # v3batch before|after DIR
   local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc frame arms
-  local -a env=(V3_CELL="$V3CELL" V3_PLP="$PLP")
+  local -a env=(V3_CELL="$V3CELL" "${V3ENV[0]}")  # V3ENV[0] is V3_PLP
   # the registered V3 shape (PREREG section 4; V3 gate-6 MED 6; run.sh refuses a bound batch of any other):
   # N = 10000 and arms append25, fdatasync4k, nosync25 plus the registered frame arm, if one is registered
   frame=$(awk -F '\t' '$1 == "frame_arm" { v = $2 } END { print v }' "$L/v3/REGISTERED.tsv")
@@ -415,9 +431,7 @@ fs_block() {
     echo "REFUSED: $mnt has a nobarrier layer on its flush path"; return 1
   fi
   bash "$L/hw/record.sh" "$o/hw" "$mnt/hw" 15 > "$o/hw.stdout" 2>&1 || return 1
-  # V3_PLP reaches the fire-check too (ninth V3 review HIGH: firecheck.sh refuses without it, so every block failed)
-  V3_PLP=$PLP V3_FX=$V3FX V3_SHIM=$DIST/statfs_shim.so V3_DYN=$DIST/v3floor.dyn V3_NOOP=$DIST/noop_shim.so \
-    timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
+  env "${V3ENV[@]}" timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
   v3batch before "$mnt/v3b" || return 1
@@ -563,7 +577,7 @@ selftests() {
   if sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$rd" > "$OUT/devguard-root.txt" 2>&1; then
     echo "devguard ALLOWED the root disk /dev/$rd"; return 1
   fi
-  return 0
+  fcenv_check
 }
 stage selftests selftests
 if [ $DRY = 1 ]; then
