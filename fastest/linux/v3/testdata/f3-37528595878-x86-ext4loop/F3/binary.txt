@@ -1,0 +1,10 @@
+v3floor_sha256=46c69cba520997d23392b67e2f9422a08cb31768504e026289f843dec4b7ecfa
+fstype=ext4
+arch=x86_64
+cell=ext4loop
+bound=smoke: V3_SMOKE=1, not bound to a fire-check, never credited
+verdict_sha256=
+verdict_run_id=
+verdict_leaf_class=
+plp=no
+shape=smoke: N=200 arms --arms append25,append64,ow4k,ow64k,ow1m,clone1b,clone2b,cfr2b,clean,fdatasync4k,nosync25 --seed 11

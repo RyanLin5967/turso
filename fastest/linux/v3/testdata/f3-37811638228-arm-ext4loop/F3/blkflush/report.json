@@ -1,0 +1,315 @@
+{
+ "device_filter": null,
+ "devices": {
+  "loop0": {
+   "by_kind": {
+    "flush": 2814,
+    "fua": 0,
+    "other": 0,
+    "preflush": 0,
+    "preflush+fua": 0
+   },
+   "comms": {
+    "kworker/0:1H": 731,
+    "kworker/1:1H": 544,
+    "kworker/2:1H": 935,
+    "kworker/3:1H": 604
+   },
+   "total": 2814
+  }
+ },
+ "events": 2814,
+ "filter": "rwbs ~ \"*F*\"",
+ "instance": "v3blk_11893_180432000",
+ "proves": "flush requests and FUA writes ISSUED to each device's driver (tracefs block:block_rq_issue), never persistence; on a device reporting write-through the block layer strips flushes before issue, so 0 there by construction; other processes' requests inside a window are counted too, and a request an op causes after its window closes is not, so a window's count is neither a strict upper nor lower bound on the op's own; a zero is exact only for windows longer than 1 us (the trace prints microseconds)",
+ "syscalls": {
+  "arms": {
+   "append25": {
+    "ambiguous": 9,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "append64": {
+    "ambiguous": 18,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "cfr2b": {
+    "ambiguous": 35,
+    "ops": 200,
+    "syncs": 379,
+    "windows_without_a_sync": 0
+   },
+   "clean": {
+    "ambiguous": 105,
+    "ops": 200,
+    "syncs": 98,
+    "windows_without_a_sync": 102
+   },
+   "fdatasync4k": {
+    "ambiguous": 8,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "nosync25": {
+    "ambiguous": 16,
+    "ops": 200,
+    "syncs": 0,
+    "windows_without_a_sync": 200
+   },
+   "ow1m": {
+    "ambiguous": 7,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "ow4k": {
+    "ambiguous": 16,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "ow64k": {
+    "ambiguous": 9,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   }
+  },
+  "by_pid": {
+   "11936": 1811
+  },
+  "events": 1811,
+  "pid": 11936,
+  "traced": [
+   "sys_enter_fsync",
+   "sys_enter_fdatasync"
+  ]
+ },
+ "tool": "blkflush.py",
+ "trace_clock": "mono_raw",
+ "window_s": 2.315703584,
+ "windows": {
+  "ambiguous": 0,
+  "ambiguous_by_device": {},
+  "ambiguous_sample": [],
+  "arms": {
+   "append25": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 400,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 400,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 2.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 2.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "append64": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 400,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 400,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 2.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 2.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "cfr2b": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 400,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 400,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 2.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 2.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "clean": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 200,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 200,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 1.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 1,
+      "per_op": 1.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "fdatasync4k": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 200,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 200,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 1.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 1,
+      "per_op": 1.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "nosync25": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {},
+    "ops": 200,
+    "windows_under_1us": 6
+   },
+   "ow1m": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 400,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 400,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 2.0,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 2.0,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "ow4k": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 395,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 395,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 1.975,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 1.975,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   },
+   "ow64k": {
+    "ambiguous": 0,
+    "ambiguous_by_device": {},
+    "devices": {
+     "loop0": {
+      "bare_flush_zero_windows": 0,
+      "by_kind": {
+       "flush": 397,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 397,
+      "flush_carrying_zero_windows": 0,
+      "flush_per_op": 1.985,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 1.985,
+      "zero_windows": 0
+     }
+    },
+    "ops": 200,
+    "windows_under_1us": 0
+   }
+  },
+  "n_windows": 1800,
+  "outside": 22,
+  "outside_by_device": {
+   "loop0": 22
+  },
+  "source": "/home/runner/work/turso/turso/v3-raw/firecheck/F3/raw.tsv"
+ }
+}
