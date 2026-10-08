@@ -7,7 +7,7 @@ use crate::branch::store::{BranchStore, TrunkPending};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
+use crate::storage::wal::{CheckpointLockSource, PreparedFrames, TrunkSyncWatch};
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -1550,7 +1550,7 @@ pub struct Pager {
     /// The WAL sync this trunk commit issued last (its header's, or its frames'), when a branch
     /// store is attached: a failure the statement reports without coming back here (a completion
     /// that fails after it yielded) is seen when the commit ends (`close_trunk_gate`; review 6 #2).
-    trunk_wal_sync: Mutex<Option<Completion>>,
+    trunk_wal_sync: Arc<TrunkSyncWatch>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1846,12 +1846,16 @@ impl Pager {
             trunk_sync_frontier: AtomicU64::new(0),
             trunk_required: AtomicU64::new(0),
             trunk_ordered: AtomicBool::new(false),
-            trunk_wal_sync: Mutex::new(None),
+            trunk_wal_sync: Arc::new(TrunkSyncWatch::default()),
         })
     }
 
     pub(crate) fn set_branch_store(&self, store: Arc<BranchStore>) {
         let _ = self.branch_store.set(store);
+        // The WAL's own syncs are watched too (engine review 10 #5).
+        if let Some(wal) = self.wal.as_ref() {
+            wal.watch_syncs(self.trunk_wal_sync.clone());
+        }
     }
 
     /// Bind this pager to a branch. Once, before the pager serves anything: a pager that had
@@ -2549,6 +2553,9 @@ impl Pager {
 
     pub fn set_wal(&mut self, wal: Arc<dyn Wal>) {
         wal.set_io_context(self.io_ctx.read().clone());
+        if self.branch_store.get().is_some() {
+            wal.watch_syncs(self.trunk_wal_sync.clone());
+        }
         self.wal = Some(wal);
     }
 
@@ -3365,6 +3372,7 @@ impl Pager {
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
+                        crate::branch::store::pause_schema_publish();
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
@@ -3961,27 +3969,18 @@ impl Pager {
     /// coming back here (review 6 #2, engine review 9 #2). Only with a branch store. A noted sync
     /// that already failed is acted on before it is replaced.
     fn note_trunk_wal_sync(&self, c: &Completion) {
-        if self.branch_store.get().is_some() {
-            let previous = self.trunk_wal_sync.lock().replace(c.clone());
-            if previous.is_some_and(|p| p.finished() && !p.succeeded()) {
-                self.trunk_wal_sync_failed();
-            }
+        if self.branch_store.get().is_some() && self.trunk_wal_sync.issued(c) {
+            self.trunk_wal_sync_failed();
         }
     }
 
-    /// Act on the noted sync if it finished and failed (`trunk_wal_sync_failed`); one still in
-    /// flight stays noted. Where the next trunk commit begins (before anything it does could
-    /// promote branch records over the failed drain), where every trunk write ends, and after a
-    /// failed checkpoint.
+    /// Act on a noted sync that failed (`trunk_wal_sync_failed`): the pager's own once it finished
+    /// failed, and any the WAL issued itself that failed at issue or after it yielded (engine
+    /// review 10 #5, `TrunkSyncWatch`); one still in flight stays noted. Where the next trunk
+    /// commit begins (before anything it does could promote branch records over the failed
+    /// drain), where every trunk write ends, and after a failed checkpoint.
     fn check_noted_syncs(&self) {
-        let failed = {
-            let mut noted = self.trunk_wal_sync.lock();
-            match noted.as_ref() {
-                Some(c) if c.finished() => noted.take().is_some_and(|c| !c.succeeded()),
-                _ => false,
-            }
-        };
-        if failed {
+        if self.trunk_wal_sync.take_failure() {
             self.trunk_wal_sync_failed();
         }
     }
@@ -5040,7 +5039,7 @@ impl Pager {
                             // Before the panic below too: a caught panic must not leave the branch
                             // store acknowledging over the failed drain (review 6 #2). Acted on
                             // here, so the noted copy is dropped (engine review 9 #10: once).
-                            self.trunk_wal_sync.lock().take();
+                            self.trunk_wal_sync.forget();
                             // Mutant `wal_fail_stop_not_inline` (test builds only): dropped, not
                             // acted on.
                             if !crate::branch::store::fe_mutant("wal_fail_stop_not_inline") {
@@ -5579,12 +5578,25 @@ impl Pager {
                         super::wal::database_identity_from_header_bytes(
                             &read.header_buf.as_slice()[..DatabaseHeader::SIZE],
                         )?;
-                    if let Some(c) = wal.install_durable_backfill_proof(
-                        read.max_frame,
-                        db_size_pages,
-                        db_header_crc32c,
-                        self.get_sync_type(),
-                    )? {
+                    // The proof's sync of the -tshm file is noted like the trunk's other syncs
+                    // (engine review 10 #5). Unreachable with a branch store today: a store refuses
+                    // a multi-process WAL, the only kind that writes the proof; no test reaches it.
+                    let proof = wal
+                        .install_durable_backfill_proof(
+                            read.max_frame,
+                            db_size_pages,
+                            db_header_crc32c,
+                            self.get_sync_type(),
+                        )
+                        .inspect_err(|_| {
+                            if self.branch_store.get().is_some() {
+                                self.trunk_wal_sync_failed();
+                            }
+                        })?;
+                    if let Some(c) = &proof {
+                        self.note_trunk_wal_sync(c);
+                    }
+                    if let Some(c) = proof {
                         self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
                             clear_page_cache,
                             max_frame: read.max_frame,
@@ -5795,8 +5807,16 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync(self.get_sync_type())?;
-            self.io.wait_for_completion(c)?;
+            super::wal::wal_sync_site("shutdown");
+            // A failure is a failed drain of the trunk's device, acted on at once (engine review
+            // 10 #5). Mutant `shutdown_sync_unwatched` (test builds only): not acted on, as before.
+            let acted = |_: &LimboError| {
+                if !crate::branch::store::fe_mutant("shutdown_sync_unwatched") {
+                    self.trunk_wal_sync_failed();
+                }
+            };
+            let c = wal.sync(self.get_sync_type()).inspect_err(acted)?;
+            self.io.wait_for_completion(c).inspect_err(acted)?;
         }
         if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
