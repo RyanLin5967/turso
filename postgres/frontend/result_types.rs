@@ -1122,12 +1122,3 @@ fn declared_type(schema: &Schema, relname: &str, column: &str) -> Option<u32> {
     let (_, col) = table.get_column(column)?;
     u32::try_from(sqlite_type_to_pg_oid(&col.ty_str)).ok()
 }
-
-/// A statement's target relation as (the name column references qualify it by, relation name).
-fn relation_name(rel: &turso_pg_parser::pg_query::protobuf::RangeVar) -> (String, String) {
-    let name = rel
-        .alias
-        .as_ref()
-        .map_or_else(|| rel.relname.clone(), |a| a.aliasname.clone());
-    (name, rel.relname.clone())
-}
