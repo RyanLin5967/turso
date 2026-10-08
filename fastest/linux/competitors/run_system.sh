@@ -73,7 +73,13 @@ fail() { fun "FAIL $*"; nfail=$((nfail + 1)); }
 expect() { # expect NAME GOT WANT
   if [ "$2" = "$3" ]; then pass "$1: $2"; else fail "$1: got [$2] want [$3]"; fi
 }
-nops() { [ "$1" = 1 ] && echo "$N1" || echo "$N4"; }
+# nops C -> the run's ops TOTAL (all clients together): FT_OPS_TOTAL for every C and system when set, else N1 at C=1
+# and N4 otherwise (gate-6 review, t3run item 12); timedrun.py check refuses a run that measured another total.
+nops() { python3 "$HERE/timedrun.py" ops "$1" "$N1" "$N4" "${FT_OPS_TOTAL:-}"; }
+# The registered per-run cap bounds every measured window (bbload/clonebench --max-window-s CAP_S: a run it ends with
+# >= 1000 ok ops is complete with reduced n), and one outer timeout above it, the same for every system, bounds each
+# invocation (gate-6 review, t3run item 16).
+OUTER_S=$((${CAP_S%.*} + 600))
 fsused() { sync -f "$MNT"; df -B1 --output=used "$MNT" | tail -1 | tr -d ' '; }
 
 # Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG, each
@@ -178,7 +184,8 @@ count_branches() {
 bb_args() { # bb_args SPEC C N OUT [nowarm] -> BBA: the one bbload command line, so the labelling and timed runs are
   # identical; both warm up by WARMUP (gate-6 review, t3run item 3). nowarm: the untimed conncheck.
   BBA=("$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS"
-    --stall-s 600 --max-window-s 3600)
+    --stall-s 600 --max-window-s "$CAP_S")
+  BBA=(timeout "$OUTER_S" "${BBA[@]}")
   [ "${5:-}" = nowarm ] || BBA+=(--warmup "$WARMUP")
 }
 bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
@@ -199,12 +206,14 @@ timed_run() {
   shift 3
   "$@" >"$out.txt" 2>&1 &
   pid=$!
-  { tracer_sample start "$pid"; tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
-  # CMD's latest sample, every 0.5 s while it runs: builtins and a redirection only (one `sleep` fork per sample),
-  # so the sampler adds no measurable load beside the timed run.
+  sleep 0.2  # let CMD's own process (under its `timeout` wrapper) start, so the start sample sees it
+  { tracer_sample start $(server_tree "$pid"); tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
+  # CMD's process tree's latest sample, every 0.5 s while it runs (CMD runs under `timeout`, so the tree is the
+  # wrapper and the driver): builtins for the reads, one `ps` and one `sleep` per sample, so the sampler adds no
+  # measurable load beside the timed run.
   : >"$out.tracer.last"
   while kill -0 "$pid" 2>/dev/null; do
-    tracer_sample end "$pid" >"$out.tracer.last.new" && mv -f "$out.tracer.last.new" "$out.tracer.last"
+    tracer_sample end $(server_tree "$pid") >"$out.tracer.last.new" && mv -f "$out.tracer.last.new" "$out.tracer.last"
     sleep 0.5
   done
   wait "$pid" || rc=$?
@@ -494,8 +503,9 @@ b1_main() {
       mkdir -p "$d" "$bdir"
       echo "=== b1 $spec C=$c N=$n"
       rc=0
-      strace_run "$d/load" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$bdir" \
-        --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
+      strace_run "$d/load" timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
+        --dir "$bdir" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
+        --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
       count "$d/load"
@@ -510,8 +520,9 @@ b1_main() {
       # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
       # t3run item 2): the only latency file of the cell is timed/raw.tsv.
       mkdir -p "$bdir.timed"
-      timed_run "$d/timed" "" -- "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
-        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --out "$d/timed" >/dev/null || true
+      timed_run "$d/timed" "" -- timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
+        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
+        --out "$d/timed" >/dev/null || true
       timedrun_check "$d" "$n" "b1-$spec-c$c"
       expect "b1-$spec-c$c timed run branch files (every created branch exists)" \
         "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$(cut -d' ' -f3 "$d/timed.ops.txt")"

@@ -12,6 +12,10 @@ into CELLDIR/timed.tracer.tsv ("phase pid tid tracerpid"), and writes the run's 
                                 exactly N ops like the labelling run, every sampled task, at start and at end, had
                                 TracerPid 0 (no sample at either end is not a pass), and both runs recorded the
                                 warm-up RULE
+  timedrun.py ops C N1 N4 [TOTAL]
+                                the run's ops total: TOTAL (FT_OPS_TOTAL) for every C when given, else N1 at C=1 and
+                                N4 otherwise (gate-6 review, t3run item 12). A run capped by the registered window
+                                with >= 1000 measured ok ops is complete with reduced n (item 16)
   timedrun.py rule CAP_S        PREREG :210's warm-up for a run capped at CAP_S seconds, as bbload/clonebench
                                 --warmup OPS:S:MAX_S: min(max(1000 ops, 10 s), 10% of the cap)
   timedrun.py selftest          known-answer fixtures for check; exit 0 only if every verdict is as expected
@@ -54,8 +58,11 @@ def rule(cap_s):
 
 
 def ops(c, n1, n4, total=""):
-    """STUB (red)."""
-    return n1
+    """The run's ops TOTAL (all clients together, as bbload/clonebench --max-ops count them): FT_OPS_TOTAL when set
+    (one number for every C and every system), else N1 at C=1 and N4 otherwise; None for a non-count."""
+    if total not in ("", None):
+        return int(total) if str(total).isdigit() and int(total) > 0 else None
+    return int(n1) if int(c) == 1 else int(n4)
 
 
 CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 measured ops is complete, reduced n
@@ -65,16 +72,27 @@ def check(celldir, n, warm_rule=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
     lab = load(os.path.join(celldir, "bb", "summary.json"))
-    if not lab or lab.get("measured_ops") != n:
-        why.append(f"labelling run measured {lab.get('measured_ops') if lab else 'nothing'}, not N={n}")
+
+    def short(sm):  # measured fewer than N: complete only when the registered cap ended it with >= CAPPED_MIN ok ops
+        got = (sm or {}).get("measured_ops")
+        if got == n:
+            return None
+        if (sm or {}).get("capped") is True and isinstance(got, int) and (sm or {}).get("measured_ok", 0) >= CAPPED_MIN:
+            return None
+        return f"measured {got} ops, not N={n}" + (" (capped with fewer than %d ok)" % CAPPED_MIN
+                                                   if (sm or {}).get("capped") else "")
+    if not lab:
+        why.append("no labelling run summary")
+    elif short(lab):
+        why.append("labelling run " + short(lab))
     t = load(os.path.join(celldir, "timed", "summary.json"))
     if t is None or not os.path.exists(os.path.join(celldir, "timed", "raw.tsv")):
         why.append("no timed run (timed/summary.json and timed/raw.tsv): only the traced labelling run's latency")
     else:
         if t.get("verdict") != "ok" or t.get("rc") != 0:
             why.append(f"timed run verdict {t.get('verdict')} rc {t.get('rc')}")
-        if t.get("measured_ops") != n:
-            why.append(f"timed run measured {t.get('measured_ops')} ops, not N={n} (not the identical command)")
+        if short(t):
+            why.append("timed run " + short(t))
     try:
         rc = open(os.path.join(celldir, "timed.rc")).read().strip()
     except OSError:
@@ -100,8 +118,12 @@ def check(celldir, n, warm_rule=None):
 
 
 def write_verdict(celldir, n, why):
+    lab = load(os.path.join(celldir, "bb", "summary.json")) or {}
+    t = load(os.path.join(celldir, "timed", "summary.json")) or {}
     out = {"verdict": "ok" if not why else "REFUSED: " + "; ".join(why), "latency_file": "timed/raw.tsv",
-           "labelling_dir": "bb", "ops": n}
+           "labelling_dir": "bb", "ops_total": n,
+           "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
+           "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)}}
     with open(os.path.join(celldir, "timed.json"), "w") as f:
         json.dump(out, f)
     return out
@@ -188,6 +210,12 @@ if __name__ == "__main__":
         why = check(sys.argv[2], n, sys.argv[4])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
+    if len(sys.argv) in (5, 6) and sys.argv[1] == "ops":
+        v = ops(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else "")
+        if v is None:
+            sys.exit("timedrun.py ops: FT_OPS_TOTAL is not a positive count")
+        print(v)
+        sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == "rule":
         print(rule(sys.argv[2]))
         sys.exit(0)

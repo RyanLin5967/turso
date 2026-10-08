@@ -25,8 +25,11 @@ on:
         description: "seconds of the idle control per cell"
         default: "30"
       cap_s:
-        description: "per-run cap in seconds; the warm-up is PREREG :210's min(max(1000 ops, 10 s), 10% of the cap)"
-        default: "20"
+        description: "per-run cap in seconds: the measured window's bound (registered: 1800)"
+        default: "1800"
+      warmup:
+        description: "warm-up OPS:S:MAX_S; empty = PREREG :210's rule at cap_s (1000:10:180 at 1800 s)"
+        default: "1000:10:2"
       age:
         description: "aging UPDATEs applied to the parent (PREREG §7: 1e5; 0 = fresh)"
         default: "200"
@@ -106,9 +109,12 @@ jobs:
       FT_N4: ${{ inputs.n4 || '200' }}
       FT_ROWS: ${{ inputs.rows || '10000' }}
       FT_IDLE_S: ${{ inputs.idle_s || '30' }}
-      # SMOKE: a 20 s cap, so the registered warm-up rule ends each run's warm-up within 2 s (10% of the cap); the
-      # registered T3 cap is 1800 s (1000 ops and 10 s, at most 180 s). Every run records the rule it used.
-      FT_CAP_S: ${{ inputs.cap_s || '20' }}
+      # The registered 1800 s cap bounds every measured window (gate-6 item 16). SMOKE overrides only the warm-up's
+      # MAX_S: 1000:10:2 is PREREG :210's OPS and S with at most 2 s of warm-up (a full 1000-op warm-up per run would
+      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used, and FT_WARMUP empty gives
+      # the registered 1000:10:180.
+      FT_CAP_S: ${{ inputs.cap_s || '1800' }}
+      FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
       # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
       # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
       FT_AGE: ${{ inputs.age || '200' }}
@@ -141,7 +147,7 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S age=$FT_AGE prebranch=$FT_PREBRANCH";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP age=$FT_AGE prebranch=$FT_PREBRANCH";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries
