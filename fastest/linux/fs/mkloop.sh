@@ -6,7 +6,8 @@
 #   ext4loop  ext4 on a loop device (same device path as xfs and btrfs, for a like-for-like cell)
 #   xfs       XFS on a loop device, mkfs -m reflink=1
 #   btrfs     btrfs on a loop device
-# The loop's backing file sits on whichever of / and /mnt has more free space. A loop device turns
+# The loop's backing file sits on whichever of / and /mnt has more free space, or in LOOP_BACKING_DIR when the
+# caller names one (t3run: the V3 fire-check's nest fixture must start on the same filesystem). A loop device turns
 # a flush into an fsync of its backing file, so a sync on the loop filesystem still reaches the
 # runner's disk; the loop's write-cache and direct-io modes are printed so the record shows it.
 #
@@ -26,7 +27,8 @@ case $fs in
     sudo chown "$me" "$mnt"
     want=ext4 ;;
   ext4loop|xfs|btrfs)
-    best=$(df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')
+    best=${LOOP_BACKING_DIR:-$(df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')}
+    [ -d "$best" ] || { echo "mkloop: backing directory '$best' does not exist" >&2; exit 2; }
     back="${best%/}/fastest-loop-$fs.img"
     sudo rm -f "$back"
     sudo truncate -s "$size" "$back"

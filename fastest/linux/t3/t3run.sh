@@ -20,9 +20,11 @@
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, V3L BEFORE, every manifest cell for
 #              that fs in a seeded shuffle (each with the foreign-CPU sampler and its void decision made before
 #              any result of the cell is read; a void run is replaced once, at most twice per cell), V3L AFTER,
-#              a V3 batch AFTER. Each batch is judged by blockgate.py (review 2 item 5, ruling A14), and the A14
-#              plants run on copies of the BEFORE batch's real record; a batch blockgate fails, a plant that does
-#              not fire, or a V3L that is not VALID (v3l.py) fails the block's stage (items 5 and 6). A failed block
+#              a V3 batch AFTER, then the batches' drift (batchgate.py drift: published, not a gate on T3; a REFUSED
+#              drift fails). Each batch is judged by blockgate.py (review 2 item 5, rulings A14 and A16: every VOID
+#              fails), and the A16 plants run on copies of the BEFORE batch's real record; a batch blockgate fails, a
+#              plant that does not fire, or a V3L that is not VALID (v3l.py) fails the block's stage (items 5 and 6).
+#              After each run's teardown, settle() waits for its filesystem's device to go quiet. A failed block
 #              is recorded, its filesystem torn down, and the NEXT block runs (gate-6 review H1: one block's void
 #              must not lose the rest of a rental); the run exits 1 at the end.
 #   package    <out>.tar.gz + SHA256SUMS + summary.json (stages, blocks with their V3/V3L records, cells,
@@ -37,7 +39,9 @@
 #                                     V3_REQUIRE_T3=1 (the governor is set to performance in deps, and the T3
 #                                     preconditions are checked there, before the build is paid for: review L1);
 #                                     --plp yes|no is required: the operator's declaration of power-loss protection
-#                                     (a fact of the rental), which puts the drive in A14's "no volatile cache" class
+#                                     (a fact of the rental: --plp yes takes a write-back drive out of A14's timing
+#                                     control, and needs the drive's model and firmware in t3/PLP-DRIVES); preflight
+#                                     checks the registered frame arm and D0 thresholds (A17) before anything is paid
 # Modes. --dry-run: smoke manifest allowed, loop or brd filesystems, the root remounted with barrier, results
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
@@ -52,7 +56,8 @@
 # name the same device and devguard.py allows it (an allowlist: a whole NVMe/SCSI/virtio disk, not the root disk,
 # nothing mounted or held; review M4), --plp is given, --fs is not (the manifest names the blocks; review M5), and
 # every target mounts with barriers.
-# Every file the run calls must be in the commit (preflight lists them; review 2 item 18).
+# Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
+# system (competitors/timedrun.py rule at the 1800 s cap, OPS:S:MAX_S) goes to fastest_profile and run_system.sh alike.
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
@@ -157,11 +162,11 @@ finish() {
 
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
-NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES
+NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
-  competitors/fthelp.py competitors/gen_seed.py competitors/reduce.py competitors/trace.sh
+  competitors/fthelp.py competitors/gen_seed.py competitors/reduce.py competitors/trace.sh competitors/timedrun.py
   v3/v3floor.c v3/statfs_shim.c v3/noop_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
   v3/batchgate.py v3/blkflush.py v3/stamp.py v3/crash.sh v3/nsfake.sh v3/postplant.py v3/red.py v3/build.sh
   v3/REGISTERED.tsv v3/testdata"
@@ -178,6 +183,12 @@ preflight() {
   [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head: $(echo "$dirty" | head -5)"; return 2; }
   grep -q 'Ubuntu 24' /etc/os-release || { echo "not Ubuntu 24.04"; return 2; }
   sudo -n true || { echo "needs passwordless sudo"; return 2; }
+  # one warm-up rule for every system, from the competitors' own implementation (gate-6 review 3: PREREG :210's
+  # min(max(1000 ops, 10 s), 10% of the cap) as OPS:S:MAX_S), passed verbatim to fastest_profile and run_system.sh
+  WARMUP=$(python3 -B "$L/competitors/timedrun.py" rule "$RUN_CAP_S") &&
+    [[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] ||
+    { echo "REFUSED: competitors/timedrun.py rule $RUN_CAP_S gave '$WARMUP', not OPS:S:MAX_S"; return 2; }
+  echo "warm-up rule $WARMUP (cap ${RUN_CAP_S}s)" | tee "$OUT/warmup.txt"
   local msha; msha=$(sha256sum "$MAN" | cut -c1-64)
   echo "manifest $MANIFEST sha256=$msha"
   echo "$msha" > "$OUT/manifest.sha256"
@@ -196,10 +207,30 @@ preflight() {
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
     if [ "$PLP" = yes ]; then
       local dn model fw; dn=$(basename "$(readlink -f "$DEVICE")")
-      model=$(xargs < "/sys/block/$dn/device/model" 2>/dev/null) fw=$(xargs < "/sys/block/$dn/device/firmware_rev" 2>/dev/null)
+      # NVMe exposes device/firmware_rev, SCSI/SATA sd device/rev (third lane review LOW 9)
+      model=$(xargs < "/sys/block/$dn/device/model" 2>/dev/null)
+      fw=$(xargs < "/sys/block/$dn/device/firmware_rev" 2>/dev/null || xargs < "/sys/block/$dn/device/rev" 2>/dev/null)
       grep -qxF "$(printf '%s\t%s' "$model" "$fw")" "$L/t3/PLP-DRIVES" ||
         { echo "REFUSED: --plp yes but '$model' firmware '$fw' is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
     fi
+    # the registered values a bound batch in rental mode refuses without (A17; third lane review LOW 10), checked
+    # before deps, build and fire-checks are paid for: the frame arm, and on a write-back drive without PLP the D0
+    # threshold of every filesystem block (key d0_threshold/<fstype>/wb/bare; write-through and PLP need none, A14)
+    local reg=$L/v3/REGISTERED.tsv wc f fsl; wc=$(cat "/sys/block/$(basename "$(readlink -f "$DEVICE")")/queue/write_cache" 2>/dev/null)
+    awk -F '\t' '$1 == "frame_arm" && $2 != "" { ok = 1 } END { exit !ok }' "$reg" ||
+      { echo "REFUSED: $reg registers no frame_arm (PREREG section 4: fixed in the Registration annex)"; return 2; }
+    case $wc in "write back"|"write through") ;; *) echo "REFUSED: cannot read $DEVICE's queue/write_cache ('$wc')"; return 2 ;; esac
+    if [ "$wc" = "write back" ] && [ "$PLP" != yes ]; then
+      fsl=${FSLIST:-$(python3 -B "$L/t3/cells.py" fslist "$MAN")}
+      for f in $fsl; do
+        awk -F '\t' -v k="d0_threshold/$f/wb/bare" '$1 == k && $2 != "" { ok = 1 } END { exit !ok }' "$reg" ||
+          { echo "REFUSED: $reg registers no d0_threshold/$f/wb/bare (A17: rental mode refuses a provisional one)"; return 2; }
+      done
+    fi
+    # P_nest3 must start on --device's own filesystem, which exists only per block (V3 ninth review HIGH)
+    echo "REFUSED: a real run's V3 nest fixture cannot be placed on $DEVICE yet (needs mkfixtures.sh's per-block nest"
+    echo "  and teardown modes from the V3 lane); on an md or LVM root the fire-check's P_nest3 would fail every block"
+    return 2
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -260,11 +291,28 @@ hwid() { bash "$L/t3/hwid.sh" "$OUT/hwid" /; }
 # The V3 fire-check's refusal fixtures (scratch loops on the root disk, never the target device), made
 # once for every filesystem block.
 V3FX=/mnt/t3-v3fx
-v3fixtures() { bash "$L/v3/mkfixtures.sh" "$V3FX" > "$OUT/v3fixtures.txt" 2>&1; }
+# The nest fixture (P_nest3) must start on the filesystem that holds the cell's leaf (V3 eighth review M5, ninth
+# review HIGH), or an md/LVM root makes the probe refuse it. A loop block's leaf is the drive under its backing file,
+# so the backing directory is chosen ONCE here (mkloop.sh's own rule: / or /mnt, whichever has more free space) and
+# passed to both: mkfixtures.sh as V3_NEST_DIR and every mkloop.sh as LOOP_BACKING_DIR. A brd block keeps the default
+# (the root fs; brd is fire-check only). A real run's leaf is --device, whose filesystem exists only inside its
+# block, so its nest chain has to be made per block and torn down before the block's umount; mkfixtures.sh has no
+# nest-only or teardown mode yet (asked of the V3 lane), so preflight REFUSES a real run until it does.
+LOOPDIR=""
+v3fixtures() {
+  local nest=""
+  if [ "$BLOCK" = loop ]; then
+    LOOPDIR=$(df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')
+    [ -d "$LOOPDIR" ] || { echo "v3fixtures: no backing directory for the loop blocks ('$LOOPDIR')"; return 1; }
+    nest=$LOOPDIR
+  fi
+  echo "nest dir: ${nest:-/ (default)}; loop backing dir: ${LOOPDIR:-n/a}" | tee "$OUT/v3nest.txt"
+  ${nest:+env V3_NEST_DIR="$nest"} bash "$L/v3/mkfixtures.sh" "$V3FX" > "$OUT/v3fixtures.txt" 2>&1
+}
 
 # One V3 batch of a block, judged by blockgate.py (review 2 item 5, ruling A14). The rc goes to v3.rc whatever happens,
-# so summarize.py re-judges every batch, including a refused one. After the BEFORE batch the A14 plants run on
-# copies of its real record (blockgate.py plants): each of (a) and (b) must be decided as planted.
+# so summarize.py re-judges every batch, including a refused one. After the BEFORE batch the A16 plants run on
+# copies of its real record and its batch directory (blockgate.py plants): every one must be decided as planted.
 v3batch() { # v3batch before|after DIR
   local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc frame arms
   local -a env=(V3_CELL="$V3CELL" V3_PLP="$PLP")
@@ -346,7 +394,8 @@ fs_block() {
   printf 'cell=%s\nblock=%s\n' "$V3CELL" "$BLOCK" > "$o/block.txt"
   case $BLOCK in
     loop)
-      bash "$L/fs/mkloop.sh" "$([ "$fs" = ext4 ] && echo ext4loop || echo "$fs")" "$mnt" 60G > "$o/mkfs.txt" 2>&1 || return 1
+      LOOP_BACKING_DIR=$LOOPDIR bash "$L/fs/mkloop.sh" "$([ "$fs" = ext4 ] && echo ext4loop || echo "$fs")" "$mnt" 60G \
+        > "$o/mkfs.txt" 2>&1 || return 1
       # a fresh ext4's lazyinit thread writes and commits in the background, inside the probe's windows
       [ "$fs" = ext4 ] && { sudo mount -o remount,noinit_itable "$mnt" || return 1; } ;;
     brd)
@@ -366,7 +415,8 @@ fs_block() {
     echo "REFUSED: $mnt has a nobarrier layer on its flush path"; return 1
   fi
   bash "$L/hw/record.sh" "$o/hw" "$mnt/hw" 15 > "$o/hw.stdout" 2>&1 || return 1
-  V3_FX=$V3FX V3_SHIM=$DIST/statfs_shim.so V3_DYN=$DIST/v3floor.dyn V3_NOOP=$DIST/noop_shim.so \
+  # V3_PLP reaches the fire-check too (ninth V3 review HIGH: firecheck.sh refuses without it, so every block failed)
+  V3_PLP=$PLP V3_FX=$V3FX V3_SHIM=$DIST/statfs_shim.so V3_DYN=$DIST/v3floor.dyn V3_NOOP=$DIST/noop_shim.so \
     timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
@@ -385,6 +435,15 @@ fs_block() {
   done 3< "$o/plan.tsv"
   v3l "b$cur" "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
+  # The batches' start-to-end drift (batchgate.py drift; third lane review MED 2): PUBLISHED, not a gate on T3
+  # (PREREG :180 and departure 3 :553 make T3's drift descriptive; V3 review 2 item 6 keeps the T1 60 us void off
+  # T3), so a VOID (rc 3) is recorded and the block goes on. A REFUSED drift (rc 2: the two batches are not the same
+  # kind of batch, or one failed its own gate) fails the block.
+  python3 -B "$L/v3/batchgate.py" drift "$o/v3-before" "$o/v3-after" > "$o/v3-drift.json" 2> "$o/v3-drift.err"
+  local drc=$?
+  echo "$drc" > "$o/v3-drift.rc"
+  echo "V3 drift on $V3CELL: rc $drc $(cat "$o/v3-drift.json")"
+  [ $drc = 2 ] && { echo "V3 drift REFUSED on $V3CELL: the before and after batches cannot be compared"; return 1; }
   return 0
 }
 
@@ -405,26 +464,39 @@ block_cleanup() {
   return 0
 }
 
-# After a run's teardown, before the next run starts (gate-6 review 11): sync the test filesystem, then wait until the
-# block's leaf drive has no request in flight and the page cache holds under 1 MiB dirty, for 2 s running (10 polls of
-# 0.2 s), at most 60 s. The settle time and whether it went quiet are recorded per run (settle.txt), never hidden.
+# After a run's teardown, before the next run starts (gate-6 review 11; third lane review MED 5): sync the test
+# filesystem, then wait until the filesystem's own block device (the device itself, the loop of a loop block, the
+# ram disk of a brd block) has no request in flight, the page cache holds under 1 MiB dirty, AND that device's
+# completed write, discard and flush counters (stat fields 5, 12 and 16) have not moved, for 2 s running (11 polls
+# 0.2 s apart, every one equal to the first), at most 60 s. (Its own device, not the leaf: a loop block's leaf is
+# the runner's root disk, whose own traffic is not this run's.) A burst between polls
+# (btrfs async discard after the rm, a late writeback) moves a counter and restarts the window, where an instantaneous
+# in-flight sample could miss it. The settle time, whether it went quiet, and the counters are recorded per run
+# (settle.txt); summarize lists every run that did not go quiet.
 settle() { # settle MNT RUNDIR
-  local mnt=$1 d=$2 t0 q=0 n=0 inflight dirty leaf
-  leaf=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' \
-    "$OUT/fs-$FS_NOW/v3-before/summary.json" 2>/dev/null)
+  local mnt=$1 d=$2 t0 q=0 n=0 inflight dirty dev st c c0=""
+  dev=$(findmnt -n -o SOURCE -T "$mnt" | sed 's/\[.*//')
+  dev=$(basename "$(readlink -f "$dev")")
   sync -f "$mnt" 2>/dev/null || sync
   t0=$(date +%s%N)
   while [ $n -lt 300 ]; do
-    inflight=$(awk '{print $9}' "/sys/block/$leaf/stat" 2>/dev/null)
+    st=$(cat "/sys/class/block/$dev/stat" 2>/dev/null)
+    inflight=$(echo "$st" | awk '{print $9}')
+    c=$(echo "$st" | awk 'NF >= 16 {print $5 "/" $12 "/" $16}')
     dirty=$(awk '/^Dirty:/ {print $2}' /proc/meminfo)
-    if [ "${inflight:-1}" = 0 ] && [ "${dirty:-999999}" -lt 1024 ]; then q=$((q + 1)); else q=0; fi
-    [ $q -ge 10 ] && break
+    if [ "${inflight:-1}" = 0 ] && [ "${dirty:-999999}" -lt 1024 ] && [ -n "$c" ] && { [ $q = 0 ] || [ "$c" = "$c0" ]; }; then
+      [ $q = 0 ] && c0=$c
+      q=$((q + 1))
+    else
+      q=0
+    fi
+    [ $q -ge 11 ] && break
     sleep 0.2
     n=$((n + 1))
   done
-  printf 'leaf=%s settle_s=%s quiet=%s inflight=%s dirty_kb=%s\n' "$leaf" \
+  printf 'dev=%s settle_s=%s quiet=%s inflight=%s dirty_kb=%s writes/discards/flushes=%s\n' "$dev" \
     "$(awk -v a="$t0" -v b="$(date +%s%N)" 'BEGIN { printf "%.2f", (b - a) / 1e9 }')" \
-    "$([ $q -ge 10 ] && echo yes || echo no)" "$inflight" "$dirty" > "$d/settle.txt"
+    "$([ $q -ge 11 ] && echo yes || echo no)" "$inflight" "$dirty" "${c:-unreadable}" > "$d/settle.txt"
 }
 
 # One cell run (the plan already holds one row per run): the sampler runs around the adapter, and the
@@ -444,12 +516,13 @@ run_cell() {
       ours)
         # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
         timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
-          --ops-total "$ops" --warmup "prereg:$RUN_CAP_S" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
+          --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|pg18-defaults|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
         mkdir -p "$mnt/work-$id"
-        FT_CLIENTS=$clients FT_N1=$ops FT_N4=$ops FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
+        FT_CLIENTS=$clients FT_N1=$ops FT_N4=$ops FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
+          FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
           FT_SQLITE3=$DIST/sqlite3 FT_FIRECHECK=$o/strace-firecheck/firecheck.txt FT_BIN=$DIST/dolt-bin \
           timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt/work-$id" "$d/result" > "$d/adapter.txt" 2>&1 ;;
       *) echo "unknown system $system" > "$d/adapter.txt"; false ;;

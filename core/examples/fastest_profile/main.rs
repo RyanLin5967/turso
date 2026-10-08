@@ -4,7 +4,7 @@
 //! the T3 runner. Nothing it prints is credited: it is the subject the instruments measure.
 //!
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
-//!       [--ops N | --ops-total T] [--warmup W | --warmup prereg:CAP_S] [--rows R] [--mode phases|cycle] [--out DIR]
+//!       [--ops N | --ops-total T] [--warmup W | --warmup OPS:S:MAX_S] [--rows R] [--mode phases|cycle] [--out DIR]
 //!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark] [--phases K]
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
@@ -16,11 +16,15 @@
 //!   whole process that an outside instrument can count over. Its connections live from the
 //!   connect phase to the delete phase (C x N of them at once).
 //! * `--mode cycle`: every client loops whole cycles; one window for the four phases together.
-//! * `--ops-total T`: T ops for the whole run, ceil(T / C) per client; the measured total is recorded (gate-6
-//!   review 12: ops means a run total for every system).
-//! * `--warmup prereg:CAP_S`: PREREG's warm-up rule, the same for every system (gate-6 review 3): cycles run until
-//!   at least 1,000 warm-up ops across all clients AND 10 s have passed, or until 10% of the run's cap CAP_S, whichever
-//!   comes first; the ops and seconds it took are recorded. `--warmup W` (default 20) is W cycles per client.
+//! * `--ops-total T`: exactly T ops for the whole run: T / C per client, plus one for each client whose id is below
+//!   T % C; the measured total is recorded beside the asked one (gate-6 review 12: ops means a run total for every
+//!   system; third lane review MED 3: ceil(T / C) per client ran up to C - 1 extra).
+//! * `--warmup OPS:S:MAX_S`: the warm-up rule in bbload's and clonebench's own form, so one value is passed to every
+//!   system (gate-6 review 3; PREREG :210's min(max(1,000 ops, 10 s), 10% of the cap) is 1000:10:180 at the 1800 s
+//!   cap, from competitors/timedrun.py rule): cycles run until OPS warm-up ops across all clients AND S seconds have
+//!   passed, or until MAX_S, whichever comes first. Recorded verbatim as `warmup_rule`, with the stop (when the main
+//!   thread told the clients to stop) and the drain (until every client finished its cycle in flight) apart, and the
+//!   ops over the whole warm-up (third lane review MED 4). `--warmup W` (default 20) is W cycles per client.
 //! * `--phases K` (phases mode, 1-4, default 4): only the first K phases, so an instruction counter can
 //!   take a phase's cost as the difference between runs (callgrind's per-function inclusive cost is not
 //!   trustworthy where it reports false recursion: arm64, run 37255309860). With K < 4 the branches are
@@ -74,9 +78,11 @@ struct Args {
     catalog: bool,
     clients: usize,
     ops: usize,
+    /// the measured ops of each client: `ops` each, or `--ops-total`'s exact split
+    ops_of: Vec<usize>,
     warmup: usize,
-    /// `--warmup prereg:CAP_S`: the run's cap in seconds; None for a fixed W cycles per client.
-    warmup_cap_s: Option<f64>,
+    /// `--warmup OPS:S:MAX_S`: (ops, seconds, max seconds, the text as given); None for W cycles per client.
+    warm_rule: Option<(usize, f64, f64, String)>,
     ops_total: Option<usize>,
     rows: i64,
     mode: Mode,
@@ -100,8 +106,9 @@ fn parse_args() -> Args {
         catalog: false,
         clients: 1,
         ops: 200,
+        ops_of: Vec::new(),
         warmup: 20,
-        warmup_cap_s: None,
+        warm_rule: None,
         ops_total: None,
         rows: 1000,
         mode: Mode::Phases,
@@ -145,15 +152,20 @@ fn parse_args() -> Args {
             "--ops-total" => a.ops_total = Some(num(val(&mut i), "--ops-total")),
             "--warmup" => {
                 let v = val(&mut i);
-                match v.strip_prefix("prereg:") {
-                    Some(cap) => {
-                        let c: f64 = cap.parse().unwrap_or_else(|_| not_a_result(&format!("--warmup prereg:CAP_S: {cap}")));
-                        if !(c > 0.0) {
-                            not_a_result("--warmup prereg:CAP_S needs a positive cap");
+                let f: Vec<&str> = v.split(':').collect();
+                match f.as_slice() {
+                    [o, s, m] => {
+                        let bad = || not_a_result(&format!("--warmup OPS:S:MAX_S: {v}"));
+                        let o: usize = o.parse().unwrap_or_else(|_| bad());
+                        let s: f64 = s.parse().unwrap_or_else(|_| bad());
+                        let m: f64 = m.parse().unwrap_or_else(|_| bad());
+                        if !(s >= 0.0 && m > 0.0) {
+                            bad();
                         }
-                        a.warmup_cap_s = Some(c);
+                        a.warm_rule = Some((o, s, m, v.clone()));
                     }
-                    None => a.warmup = num(v, "--warmup"),
+                    [_] => a.warmup = num(v.clone(), "--warmup"),
+                    _ => not_a_result(&format!("--warmup W or OPS:S:MAX_S: {v}")),
                 }
             }
             "--rows" => a.rows = num(val(&mut i), "--rows") as i64,
@@ -195,8 +207,12 @@ fn parse_args() -> Args {
     if a.clients == 0 || a.ops == 0 || a.rows < 1 || a.ops_total == Some(0) {
         not_a_result("--clients, --ops, --ops-total and --rows must be at least 1");
     }
-    if let Some(t) = a.ops_total {
-        a.ops = t.div_ceil(a.clients);
+    a.ops_of = match a.ops_total {
+        Some(t) => (0..a.clients).map(|id| t / a.clients + usize::from(id < t % a.clients)).collect(),
+        None => vec![a.ops; a.clients],
+    };
+    if a.ops_of.contains(&0) {
+        not_a_result("--ops-total below --clients leaves a client with no op");
     }
     a
 }
@@ -293,7 +309,7 @@ impl Rng {
 /// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
 /// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
 /// operation's latency), and gives up at 30 s (PREREG: a failed operation).
-/// PREREG warm-up (`--warmup prereg:CAP_S`): cycles done by every client, and the main thread's stop.
+/// The warm-up rule (`--warmup OPS:S:MAX_S`): cycles done by every client, and the main thread's stop.
 static WARM_OPS: AtomicUsize = AtomicUsize::new(0);
 static WARM_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -416,8 +432,9 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
             }
         }
     };
+    let n = a.ops_of[id];
     gate.wait(); // ready
-    if a.warmup_cap_s.is_some() {
+    if a.warm_rule.is_some() {
         let mut k = 0usize;
         while !WARM_STOP.load(Ordering::Acquire) {
             cycles(&format!("warm{k}"), 1, None);
@@ -431,14 +448,14 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
     match a.mode {
         Mode::Cycle => {
             gate.wait();
-            cycles("m", a.ops, Some(&mut ns));
+            cycles("m", n, Some(&mut ns));
             gate.wait();
         }
         Mode::Phases => {
-            let mut conns: Vec<Arc<Connection>> = Vec::with_capacity(a.ops);
+            let mut conns: Vec<Arc<Connection>> = Vec::with_capacity(n);
             for p in 0..a.phases {
                 gate.wait();
-                for i in 0..a.ops {
+                for i in 0..n {
                     let name = name("m", i);
                     let t = Instant::now();
                     match p {
@@ -451,7 +468,7 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
                         _ => fastest_phase_delete(&db, &name),
                     }
                     ns[p].push(t.elapsed().as_nanos() as u64);
-                    if p == 2 && i + 1 == a.ops {
+                    if p == 2 && i + 1 == n {
                         // Every branch connection closes before the delete window opens.
                         conns.clear();
                     }
@@ -525,7 +542,8 @@ fn main() {
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
-    let warm_secs = std::sync::Mutex::new(0.0f64);
+    // the warm-up's record: (ops when told to stop, seconds to the stop, seconds to every client done)
+    let mut warm_times = (0usize, 0.0f64, 0.0f64);
     // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
     let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
@@ -538,20 +556,21 @@ fn main() {
             .collect();
         gate.wait(); // ready
         fence.marker("FASTEST_PHASE warmup begin");
-        if let Some(cap) = a.warmup_cap_s {
-            // min(max(1,000 ops, 10 s), 10% of the cap): both minimums, unless the cap's share ends it first
-            let t = Instant::now();
+        let t = Instant::now();
+        if let Some((ops, min_s, max_s, _)) = &a.warm_rule {
+            // min(max(OPS ops, S s), MAX_S): both minimums, unless MAX_S ends it first
             loop {
                 let secs = t.elapsed().as_secs_f64();
-                if (WARM_OPS.load(Ordering::Acquire) >= 1000 && secs >= 10.0) || secs >= 0.1 * cap {
+                if (WARM_OPS.load(Ordering::Acquire) >= *ops && secs >= *min_s) || secs >= *max_s {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             WARM_STOP.store(true, Ordering::Release);
-            *warm_secs.lock().unwrap() = t.elapsed().as_secs_f64();
+            warm_times = (WARM_OPS.load(Ordering::Acquire), t.elapsed().as_secs_f64(), 0.0);
         }
         gate.wait(); // warm-up done
+        warm_times.2 = t.elapsed().as_secs_f64();
         fence.marker("FASTEST_PHASE warmup end");
         for w in &windows_wanted {
             let s0 = engine_syncs();
@@ -590,23 +609,41 @@ fn main() {
         not_a_result("the trunk changed: a branch's write reached it, or rows were lost");
     }
 
-    let ops_total = a.clients * a.ops;
-    let warm_rule = match a.warmup_cap_s {
-        Some(cap) => format!(
-            "{{\"rule\":\"prereg\",\"cap_s\":{cap},\"ops\":{},\"secs\":{:.3}}}",
-            WARM_OPS.load(Ordering::Acquire),
-            *warm_secs.lock().unwrap()
+    let ops_total: usize = a.ops_of.iter().sum();
+    let (rule_text, warm_rule) = match &a.warm_rule {
+        // ops over the whole warm-up (read after every client finished), the stop and the drain apart
+        Some((_, _, _, text)) => (
+            text.clone(),
+            format!(
+                "{{\"rule\":\"{text}\",\"ops_at_stop\":{},\"ops\":{},\"stop_secs\":{:.3},\"drain_secs\":{:.3},\"secs\":{:.3}}}",
+                warm_times.0,
+                WARM_OPS.load(Ordering::Acquire),
+                warm_times.1,
+                warm_times.2 - warm_times.1,
+                warm_times.2
+            ),
         ),
-        None => format!("{{\"rule\":\"cycles_per_client\",\"ops\":{}}}", a.clients * a.warmup),
+        None => (
+            format!("cycles_per_client:{}", a.warmup),
+            format!(
+                "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3}}}",
+                a.warmup,
+                a.clients * a.warmup,
+                warm_times.2
+            ),
+        ),
     };
+    let even = a.ops_of.iter().all(|&n| n == a.ops_of[0]);
+    let by_client: Vec<String> = a.ops_of.iter().map(|n| n.to_string()).collect();
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
-        a.ops,
+        if even { a.ops_of[0].to_string() } else { "null".into() },
+        by_client.join(","),
         a.ops_total.map(|t| t.to_string()).unwrap_or_else(|| "null".into()),
-        a.warmup,
+        if a.warm_rule.is_some() { "null".into() } else { a.warmup.to_string() },
         a.rows,
         a.phases,
         if a.mode == Mode::Phases { "phases" } else { "cycle" }
