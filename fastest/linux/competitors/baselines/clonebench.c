@@ -9,6 +9,7 @@
  *   clonebench extents FILE
  *   clonebench run --mode b1|b0 --op m1c|m1 --parent DB --dir BRANCHDIR --clients C --out OUT
  *       [--max-ops N | --duration-s S [--min-ops N]] [--warmup-ops W] [--hold-us U] [--sync d2|d0] [--rows R]
+ *       [--warmup OPS:S:MAX_S]
  *       [--drop] [--seed S] [--v1-run NAME [--v1-mark-base B]] [--mutant-early-ack]
  *   clonebench par --src FILE --dir D --procs P --n N --out OUT
  *       D0 clonefile throughput with P processes (M0 exit 3; the decider's clone_par.py, compiled).
@@ -320,6 +321,10 @@ static const char *PARENT, *BDIR;
 static long ROWS;
 static uint64_t MAX_OPS, MIN_OPS, WARM_OPS, HOLD_US = 300, MARKB, SEED = 1;
 static double DUR_S;
+/* --warmup OPS:S:MAX_S (gate-6 review, t3run item 3, as bbload): warm-up ends once OPS warm-up ops AND S seconds
+ * have passed, or at MAX_S seconds at the latest (0: no limit). PREREG :210 = 1000:10:<10% of the cap>. */
+static double WARM_S, WARM_MAX_S;
+static char WARM_RULE[64];
 static int g_dirfd;
 static sqlite3 *g_parent;
 static char g_parent_wal[2100];
@@ -521,6 +526,15 @@ static int cmd_run(int argc, char **argv) {
         else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
         else if (!strcmp(a, "--warmup-ops") && v) WARM_OPS = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warmup") && v) {
+            unsigned long long wo; double ws, wm; char extra;
+            if (sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || ws < 0 || wm < 0) {
+                fprintf(stderr, "clonebench run: --warmup OPS:S:MAX_S (got %s)\n", v); return 2;
+            }
+            WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
+            snprintf(WARM_RULE, sizeof WARM_RULE, "%s", v);
+            i++;
+        }
         else if (!strcmp(a, "--hold-us") && v) HOLD_US = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--rows") && v) ROWS = atol(argv[++i]);
         else if (!strcmp(a, "--seed") && v) SEED = strtoull(argv[++i], NULL, 10);
@@ -598,7 +612,8 @@ static int cmd_run(int argc, char **argv) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
         uint64_t n = now_ns();
-        if (g_phase == PH_WARM && g_warm >= WARM_OPS) {
+        double wel = (n - t_start) / 1e9;
+        if (g_phase == PH_WARM && ((g_warm >= WARM_OPS && wel >= WARM_S) || (WARM_MAX_S > 0 && wel >= WARM_MAX_S))) {
             getrusage(RUSAGE_SELF, &ru0);
             pthread_mutex_lock(&f_mu); fl0 = f_nflights; pthread_mutex_unlock(&f_mu);
             tm0 = n;
@@ -680,6 +695,9 @@ static int cmd_run(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"clock\":\"%s\",\"b1_barrier\":\"%s\",", BB_CLOCK_NAME, SYNC_D0 ? "none" : B1_BARRIER); /* Linux port */
+    if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:0:0", (unsigned long long)WARM_OPS);
+    fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_ops\":%llu,\"warmup_s\":%.6f,", WARM_RULE, (unsigned long long)g_warm,
+            tm0 > t_start ? (tm0 - t_start) / 1e9 : 0.0);
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"

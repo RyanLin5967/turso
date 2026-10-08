@@ -43,6 +43,13 @@ N4=${FT_N4:-200}
 ROWS=${FT_ROWS:-10000}
 IDLE_S=${FT_IDLE_S:-30}
 CLIENTS=${FT_CLIENTS:-1 4}
+# The warm-up of every timed and labelling run (gate-6 review, t3run item 3): PREREG :210's one rule,
+# min(max(1000 ops, 10 s), 10% of the cap), as bbload/clonebench --warmup OPS:S:MAX_S; FT_WARMUP overrides it only
+# with the same OPS:S:MAX_S form (the T3 driver passes the value it gives fastest_profile). FT_CAP_S is the
+# registered per-run cap (default 1800 s). Recorded in run-info.txt and in every run's summary.json warmup_rule.
+CAP_S=${FT_CAP_S:-1800}
+WARMUP=${FT_WARMUP:-$(python3 "$HERE/timedrun.py" rule "$CAP_S")}
+[[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
 SC="$HERE/stracecount.py"
 FH="$HERE/fthelp.py"
 SPECS="$HERE/loadgen/specs"
@@ -105,7 +112,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS]";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP";
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 
@@ -160,11 +167,13 @@ count_branches() {
   esac
 }
 
-bb_args() { # bb_args SPEC C N OUT -> BBA: the one bbload command line, so the labelling and timed runs are identical
+bb_args() { # bb_args SPEC C N OUT [nowarm] -> BBA: the one bbload command line, so the labelling and timed runs are
+  # identical; both warm up by WARMUP (gate-6 review, t3run item 3). nowarm: the untimed conncheck.
   BBA=("$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS"
     --stall-s 600 --max-window-s 3600)
+  [ "${5:-}" = nowarm ] || BBA+=(--warmup "$WARMUP")
 }
-bbload() { # bbload SPEC C N OUT -> bbload's rc
+bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
   local rc=0
   bb_args "$@"
   "${BBA[@]}" >"$4.txt" 2>&1 || rc=$?
@@ -217,7 +226,7 @@ ops_of() {
 timedrun_check() {
   local k=1
   case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
-  python3 "$HERE/timedrun.py" check "$1" "$2" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
     fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
   fi
@@ -236,7 +245,7 @@ run_server_cell() { # run_server_cell SPEC C
   d="$RAW/cells/$spec-c$c"
   mkdir -p "$d"
   echo "=== $SYSTEM $spec C=$c N=$n"
-  bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" >/dev/null ||
+  bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" nowarm >/dev/null ||
     fail "$spec-c$c conncheck: C+16=$((c + 16)) connections (rc $?, $(tail -1 "$d/conncheck.txt"))"
   strace_attach "$d/idle" "$(server_pid)" || { fail "$spec-c$c idle attach"; return; }
   sleep "$IDLE_S"
@@ -417,7 +426,7 @@ b1_main() {
       echo "=== b1 $spec C=$c N=$n"
       rc=0
       strace_run "$d/load" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$bdir" \
-        --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
+        --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
       count "$d/load"
@@ -433,7 +442,7 @@ b1_main() {
       # t3run item 2): the only latency file of the cell is timed/raw.tsv.
       mkdir -p "$bdir.timed"
       timed_run "$d/timed" "" -- "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
-        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/timed" >/dev/null || true
+        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --out "$d/timed" >/dev/null || true
       timedrun_check "$d" "$n" "b1-$spec-c$c"
       expect "b1-$spec-c$c timed run branch files (every created branch exists)" \
         "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$(cut -d' ' -f3 "$d/timed.ops.txt")"

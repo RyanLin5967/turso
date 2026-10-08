@@ -24,6 +24,9 @@ on:
       idle_s:
         description: "seconds of the idle control per cell"
         default: "30"
+      cap_s:
+        description: "per-run cap in seconds; the warm-up is PREREG :210's min(max(1000 ops, 10 s), 10% of the cap)"
+        default: "20"
   push:
     branches: [fastest-branching, fastest-linux-comp]
     paths:
@@ -97,6 +100,9 @@ jobs:
       FT_N4: ${{ inputs.n4 || '200' }}
       FT_ROWS: ${{ inputs.rows || '10000' }}
       FT_IDLE_S: ${{ inputs.idle_s || '30' }}
+      # SMOKE: a 20 s cap, so the registered warm-up rule ends each run's warm-up within 2 s (10% of the cap); the
+      # registered T3 cap is 1800 s (1000 ops and 10 s, at most 180 s). Every run records the rule it used.
+      FT_CAP_S: ${{ inputs.cap_s || '20' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -125,7 +131,7 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries
@@ -133,8 +139,10 @@ jobs:
         run: bash fastest/linux/competitors/fetch_dolt.sh "$HOME/fastest-bin" "$RAW/dolt-fetch.txt"
       - name: Filesystem under test
         id: fs
-        # 40G sparse: 200 ops x ~16 cells, WAL_LOG and the copy control writing ~9 MB per created database
-        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 40G 2>&1 | tee "$RAW/mkloop.txt"
+        # 80G sparse: each cell now runs twice (a traced labelling run and an untraced timed run, gate-6 item 2) plus
+        # warm-ups, WAL_LOG and the copy control writing ~9 MB per created database; run 37551016447's pg18-defaults
+        # XFS job peaked at 17.9 GB used with one run per cell. / has ~91 GB free on these runners.
+        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 80G 2>&1 | tee "$RAW/mkloop.txt"
       - name: Hardware record (fio on the filesystem under test)
         run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
       - name: Allow strace to attach to the servers (ptrace_scope 0)

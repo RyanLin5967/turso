@@ -48,8 +48,9 @@ def tracer_rows(path):
 
 
 def rule(cap_s):
-    """STUB (red)."""
-    return ""
+    """PREREG :210: warm-up = min(max(1000 ops, 10 s), 10% of the cap), as "OPS:S:MAX_S" for --warmup."""
+    m = float(cap_s) / 10
+    return "1000:10:%s" % (("%d" % m) if m == int(m) else ("%.3f" % m))
 
 
 def check(celldir, n, warm_rule=None):
@@ -72,6 +73,11 @@ def check(celldir, n, warm_rule=None):
         rc = "missing"
     if rc != "0":
         why.append(f"timed run exit status {rc}")
+    if warm_rule is not None:  # gate-6 review, t3run item 3: the registered rule, the same for both runs
+        for nm, sm in (("labelling", lab), ("timed", t)):
+            got = (sm or {}).get("warmup_rule")
+            if got != warm_rule:
+                why.append(f"{nm} run warm-up rule {got!r}, not the registered {warm_rule!r}")
     rows = tracer_rows(os.path.join(celldir, "timed.tracer.tsv"))
     if rows is None:
         why.append("tracer record timed.tracer.tsv missing or unreadable")
@@ -158,6 +164,9 @@ if __name__ == "__main__":
         why = check(sys.argv[2], n, sys.argv[4])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
+    if len(sys.argv) == 3 and sys.argv[1] == "rule":
+        print(rule(sys.argv[2]))
+        sys.exit(0)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(selftest())
     sys.exit(__doc__)
