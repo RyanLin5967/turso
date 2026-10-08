@@ -2033,7 +2033,131 @@ fn op_column_impl(
                     // re-enters this arm.
                     return Ok(result);
                 }
+<<<<<<< HEAD
                 break 'outer;
+=======
+
+                let (_, cursor_type) = program
+                    .cursor_ref
+                    .get(active_cursor_id)
+                    .expect("cursor_id should exist in cursor_ref");
+                match cursor_type {
+                    CursorType::BTreeTable(_)
+                    | CursorType::BTreeIndex(_)
+                    | CursorType::MaterializedView(_, _) => {
+                        {
+                            let cursor_ref = must_be_btree_cursor!(
+                                active_cursor_id,
+                                program.cursor_ref,
+                                state,
+                                "Column"
+                            );
+                            let cursor = cursor_ref.as_btree_mut();
+
+                            if cursor.get_null_flag() {
+                                tracing::trace!("op_column(null_flag)");
+                                state.registers[*dest].set_null();
+                                break 'outer;
+                            }
+
+                            let record_result = return_if_io!(cursor.record());
+                            let Some(record) = record_result else {
+                                // Cursor is not positioned on a valid row (e.g., empty table).
+                                // Return NULL, not the column's default value.
+                                // DEFAULT handling below is for when record exists
+                                // but has fewer columns than expected.
+                                state.registers[*dest].set_null();
+                                break 'outer;
+                            };
+
+                            let mut payload_iterator = record.iter()?;
+
+                            // Parse the header for serial types incrementally until we have the target column
+                            // Use nth_into_register to write directly to the register without
+                            // creating intermediate ValueRef allocations
+
+                            match payload_iterator
+                                .nth_into_register(*column, &mut state.registers[*dest])
+                            {
+                                Some(result) => {
+                                    result?;
+                                    break 'outer;
+                                }
+                                None => {
+                                    branches::mark_unlikely();
+                                    // record has fewer columns than expected
+                                }
+                            };
+
+                            //break;
+                        };
+
+                        // DEFAULT handling
+                        let Some(ref default) = default else {
+                            state.registers[*dest].set_null();
+                            break;
+                        };
+                        match (default, &mut state.registers[*dest]) {
+                            (
+                                Value::Text(new_text),
+                                Register::Value(Value::Text(existing_text)),
+                            ) => {
+                                existing_text.do_extend(new_text)?;
+                            }
+                            (
+                                Value::Blob(new_blob),
+                                Register::Value(Value::Blob(existing_blob)),
+                            ) => {
+                                existing_blob.do_extend(new_blob)?;
+                            }
+                            _ => {
+                                state.registers[*dest].set_value(default.clone());
+                            }
+                        }
+                        break;
+                    }
+                    CursorType::Sorter => {
+                        let record = {
+                            let cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_sorter_mut();
+                            cursor.record().cloned()
+                        };
+                        if let Some(record) = record {
+                            state.registers[*dest].set_value(match record.get_value_opt(*column) {
+                                Some(val) => val.to_owned(),
+                                None => default.clone().unwrap_or(Value::Null),
+                            });
+                        } else {
+                            state.registers[*dest].set_null();
+                        }
+                    }
+                    CursorType::Pseudo(_) => {
+                        let value = {
+                            let cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_pseudo_mut();
+                            cursor.get_value(*column)?
+                        };
+                        state.registers[*dest].set_value(value);
+                    }
+                    CursorType::IndexMethod(..) => {
+                        let cursor = state.cursors[*cursor_id]
+                            .as_mut()
+                            .expect("cursor should exist");
+                        let cursor = cursor.as_index_method_mut();
+                        // In an outer join, a NullRow'd cursor returns NULL for every column.
+                        if cursor.get_null_flag() {
+                            state.registers[*dest].set_null();
+                        } else {
+                            let value = return_if_io!(cursor.query_column(*column));
+                            state.registers[*dest].set_value(value);
+                        }
+                    }
+                    CursorType::VirtualTable(_) => {
+                        panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+                    }
+                }
+                break;
+>>>>>>> fork/fix/7531-fts-left-join-null-extension
             }
         }
     }
@@ -3399,8 +3523,15 @@ pub fn op_next(
             }
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
-                let has_more = return_if_io!(cursor.query_next());
-                !has_more
+                // A NullRow'd cursor (outer join with no match) has no real row to advance to;
+                // report exhaustion and clear the flag, mirroring the BTree branch above.
+                if cursor.get_null_flag() {
+                    cursor.set_null_flag(false);
+                    true // is_empty = true
+                } else {
+                    let has_more = return_if_io!(cursor.query_next());
+                    !has_more
+                }
             }
             _ => panic!("Next on non-btree/materialized-view cursor"),
         }
@@ -5893,7 +6024,9 @@ pub fn op_row_id(
                     .get_mut(*cursor_id)
                     .expect("cursor_id should be valid")
                 {
-                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
+                    if cursor.get_null_flag() {
+                        state.registers[*dest].set_null();
+                    } else if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest].set_null();
@@ -5931,6 +6064,9 @@ pub fn op_idx_row_id(
 
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+        // In an outer join, a NullRow'd index-method cursor must report a NULL rowid
+        // rather than the (stale) rowid of whatever row it last pointed at.
+        Cursor::IndexMethod(cursor) if cursor.get_null_flag() => None,
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
@@ -13460,6 +13596,9 @@ pub fn op_index_method_query(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
+    // Repositioning the cursor clears any outer-join null-row flag left over from a previous
+    // outer row that had no match (mirrors BTree clearing its null flag on seek/rewind).
+    cursor.set_null_flag(false);
     let has_rows =
         return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
     if !has_rows {

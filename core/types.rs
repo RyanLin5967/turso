@@ -3370,6 +3370,7 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+<<<<<<< HEAD
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
             // column reads untouched: nullRow is the steady state for pseudo
@@ -3382,6 +3383,9 @@ impl Cursor {
             // the index-method cursor, so there is no column state to null
             // out here.
             Self::IndexMethod(_) => {}
+=======
+            Self::IndexMethod(cursor) => cursor.set_null_flag(flag),
+>>>>>>> fork/fix/7531-fts-left-join-null-extension
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
