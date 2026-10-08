@@ -3646,9 +3646,12 @@ fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
 }
 
 /// A Bind PostgreSQL refuses is refused AT the Bind, before BindComplete, so the Execute after it
-/// runs nothing: a format code other than 0 or 1 (22023 "unsupported format code: 2", even for a
-/// NULL value, and among the result codes), a parameter-format list that is neither 0, 1 nor one
-/// per parameter (08P01), and, for a branch call, a parameter count other than the call's (08P01).
+/// runs nothing: a parameter format code other than 0 or 1 (22023 "unsupported format code: 2",
+/// even for a NULL value), a parameter-format list that is neither 0, 1 nor one per parameter
+/// (08P01), and, for a branch call, a parameter count other than the call's (08P01). A result
+/// format code other than 0 or 1 is refused here too (22023), where PostgreSQL refuses it at
+/// Execute as it formats the first row: pgwire folds a single code into text, so only the Bind
+/// shows it (E5-QUEUE R2).
 /// These were checked at Execute, or for a branch call not at all: `SELECT turso_branch_create($1)`
 /// bound with three format codes, with two values or with code 2 created the branch durably and
 /// acknowledged it (wire review 10 item 5).
