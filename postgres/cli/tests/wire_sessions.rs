@@ -3515,6 +3515,32 @@ fn a_branch_call_parameter_past_the_limit_is_refused() {
     }
 }
 
+/// A `$n` above i32::MAX is 42601 "parameter number too large", as PostgreSQL 18's scanner refuses
+/// it, before anything runs: libpg_query reads the number into a 32-bit int (PostgreSQL 17), so
+/// `turso_branch_create($4294967297)` was a call of $1, and Bind 'x' then Execute created branch x
+/// (wire review 12 item 1). The same over the simple protocol and for an ordinary statement.
+#[test]
+fn a_parameter_number_the_scanner_would_wrap_is_refused() {
+    let dir = Scratch::new("paramwrap");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let r = a.x("SELECT turso_branch_create($4294967297)", &["x"]);
+    assert_eq!(r.err("a wrapped branch-call parameter").code, "42601");
+    let r = a.q("SELECT turso_branch_switch('x')");
+    assert_eq!(r.err("branch x must not exist").code, "3D000");
+    for sql in [
+        "SELECT v FROM t WHERE id = $4294967297",
+        "SELECT 1 LIMIT $2147483648",
+        "SELECT turso_branch_create($4295032831)",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42601", "{sql}");
+        let r = a.x(sql, &["1"]);
+        assert_eq!(r.err(sql).code, "42601", "{sql}, extended");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    }
+}
+
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
 /// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
 /// described and is bound, as in PostgreSQL. They were read from the engine's slots, so

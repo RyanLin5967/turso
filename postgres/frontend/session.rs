@@ -1487,6 +1487,15 @@ mod tests {
             assert_eq!(slow(&sql), None, "libpg_query, {sql:?}");
             assert_eq!(branch_call(&sql), None, "branch_call, {sql:?}");
         }
+        // libpg_query reads a $n with atol into a 32-bit int (PostgreSQL 17's scanner), so these
+        // wrap to $1, $65535 and $0 in its tree: a call of them would bind the wrong parameter.
+        // PostgreSQL 18 refuses a number above i32::MAX (42601), so no call holds one (wire review
+        // 12 item 1).
+        for n in ["4294967297", "4295032831", "4294967296", "2147483648"] {
+            let sql = format!("SELECT turso_branch_create(${n})");
+            assert_eq!(fast_branch_call(&sql), None, "fast path, {sql:?}");
+            assert_eq!(branch_call(&sql), None, "branch_call, {sql:?}");
+        }
         for (sql, n) in [
             ("SELECT turso_branch_create($65535)", 65535),
             ("SELECT turso_branch_create($0001)", 1),
