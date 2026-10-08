@@ -3927,3 +3927,56 @@ fn a_missing_savepoint_is_3b001_and_outside_a_block_25p01() {
         assert_eq!(r.status, b'I', "{sql} opened a block");
     }
 }
+
+/// A transaction verb is read by its whole grammar: `COMMIT garbage`, `END x`, `ROLLBACK foo`,
+/// `ABORT x` and `BEGIN garbage` are syntax errors (42601) as in PostgreSQL, wherever they are sent:
+/// they fail a block, and outside one change nothing. The classifier read at most two words, so
+/// they were answered as the verb (a success tag, or the end of a failed block). And a verb behind
+/// a comment is still the verb: `/* c */ ROLLBACK` ends a failed block (wire review 6 item 4).
+#[test]
+fn a_transaction_verb_is_read_by_its_whole_grammar() {
+    let dir = Scratch::new("txgrammar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for bad in [
+        "COMMIT garbage",
+        "END x",
+        "ROLLBACK foo",
+        "ABORT x",
+        "BEGIN garbage",
+    ] {
+        // Outside a block: a syntax error, the session idle.
+        let r = a.q(bad);
+        assert_eq!(r.err(bad).code, "42601", "{bad} outside a block");
+        assert_eq!(r.status, b'I', "{bad} outside a block");
+        // Inside one: a syntax error that fails it; its end answers ROLLBACK.
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'two')").ok("insert");
+        let r = a.q(bad);
+        assert_eq!(r.err(bad).code, "42601", "{bad} inside a block");
+        assert_eq!(r.status, b'E', "{bad} did not fail the block");
+        let r = a.q("COMMIT").ok("end");
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "after {bad}");
+        // In a failed block: still a syntax error, the block still failed.
+        a.q("BEGIN").ok("begin");
+        a.q("SELECT 1/0").err("fail the block");
+        let r = a.q(bad);
+        assert_eq!(r.status, b'E', "{bad} ended a failed block");
+        a.q("ROLLBACK").ok("end");
+    }
+    // Good spellings still work.
+    for good in [
+        "BEGIN TRANSACTION",
+        "COMMIT WORK",
+        "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "ROLLBACK AND NO CHAIN",
+    ] {
+        a.q(good).ok(good);
+    }
+    // A verb behind a comment ends a failed block.
+    a.q("BEGIN").ok("begin");
+    a.q("SELECT 1/0").err("fail the block");
+    let r = a.q("/* c */ ROLLBACK").ok("commented ROLLBACK");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+}
