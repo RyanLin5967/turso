@@ -3804,6 +3804,50 @@ fn a_raised_d0_fuzzy_checkpoint_returns_held_frees_with_no_raised_op() {
     );
 }
 
+/// Engine review 13 HIGH 1: a raised D0 store's fuzzy install marked everything written durable in
+/// the rewrite class. But what the D0 flights after the capture wrote was synced by nothing: the
+/// arena was settled before them, and the cut syncs its temp log and renames it without syncing
+/// the directory (`finish_cut` leaves that to the next flight). So (A) a held free whose Release
+/// followed the capture matured, and its slot was reused, where a power cut can bring the released
+/// branch back over it; (B) the next FULL trunk commit, whose barrier covers that Release, took the
+/// fast path: no flight, so no directory or arena sync before its WAL flush. Mutant
+/// `fuzzy_install_marks_rewrite_class`.
+#[test]
+fn a_raised_d0_fuzzy_install_claims_no_durability_its_cut_lacks() {
+    let _s = serial();
+    for arm in ['A', 'B'] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("fuzzy-claim.db"), true, false);
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "({arm}) premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "({arm}) the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The Release follows the capture: its D0 flight syncs nothing.
+        x.reap().unwrap();
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        assert!(db.branches.rewrite_class_for_test().syncs(), "({arm}) premise: the log is still raised");
+        if arm == 'A' {
+            let took = reused_by_a_new_branch(&trunk, &slots);
+            assert!(
+                took.is_empty(),
+                "(A) slots {took:?} were reused although nothing synced the Release that freed them"
+            );
+        } else {
+            let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+            let before = dirs();
+            write_v(&trunk, 9, "after");
+            assert!(
+                dirs() > before,
+                "(B) a FULL trunk commit took the fast path over a Release that nothing synced (no directory sync)"
+            );
+        }
+    }
+}
+
 /// Sets `store::HOLD_BOUND_FORCED` for one test, and clears it when dropped.
 struct HoldBound;
 
