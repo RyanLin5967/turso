@@ -4837,6 +4837,13 @@ pub fn op_auto_commit(
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
+        // The commit finished, or failed for good: a later step is not its re-entry.
+        if !matches!(
+            res,
+            Ok(InsnFunctionStepResult::IO(_)) | Err(LimboError::Busy)
+        ) {
+            state.commit_started = false;
+        }
         // Only clear after a final, successful non-rollback COMMIT.
         if fk_on
             && !*rollback
@@ -4882,6 +4889,17 @@ pub fn op_auto_commit(
             ));
         }
     };
+
+    // A COMMIT stepped again after its `commit_txn` returned Busy before recording any
+    // `commit_state` (a trunk commit's refused copy-decision pass) made its transition on the
+    // first step: `auto_commit` is still true from it, so it only drives `commit_txn` again (wire
+    // review 7 HIGH 3). Had a BEGIN on this connection cleared `auto_commit` in between, the
+    // COMMIT is an ordinary one again and makes the transition anew. Mutant
+    // `commit_restarts_after_busy` (test builds only): the re-entry is judged as a new COMMIT, as
+    // before, and reads "no transaction is active".
+    let resuming_commit = state.commit_started
+        && had_autocommit
+        && !crate::branch::store::fe_mutant("commit_restarts_after_busy");
 
     // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
     // or COMMIT/ROLLBACK without one) is invalid.
@@ -4935,6 +4953,7 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                state.commit_started = true;
             }
             TxOp::Begin => {
                 turso_assert!(
@@ -4945,7 +4964,7 @@ pub fn op_auto_commit(
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
-    } else {
+    } else if !resuming_commit {
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
@@ -4975,11 +4994,19 @@ pub fn op_auto_commit(
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
-        .map(Into::<InsnFunctionStepResult>::into)?
+        .map(Into::<InsnFunctionStepResult>::into)
     {
-        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
-        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+        Ok(res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step)) => res,
+        // An IO yield records its `commit_state`, whose re-entry is driven above.
+        Ok(res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row)) => return Ok(res),
+        // Retried at this pc: a COMMIT keeps `commit_started` and resumes.
+        Err(LimboError::Busy) => return Err(LimboError::Busy),
+        Err(err) => {
+            state.commit_started = false;
+            return Err(err);
+        }
     };
+    state.commit_started = false;
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;
