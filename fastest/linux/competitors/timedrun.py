@@ -73,30 +73,17 @@ CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 
 REGISTERED_CAP_S = 1800  # PREREG's per-run cap (30 min; t3run.sh RUN_CAP_S)
 
 
-def parse_warmup(w):
-    """(OPS, S, MAX_S) of an OPS:S:MAX_S warm-up, or None when it is not exactly that (bbload's own grammar)."""
-    p = str(w).split(":")
-    if len(p) != 3:
-        return None
-    try:
-        return int(p[0]), float(p[1]), float(p[2])
-    except ValueError:
-        return None
-
-
 def real_problem(cap_s, warmup):
     """Why a REAL run (run_system.sh FT_DRY=0; the T3 runner) may not use CAP_S and WARMUP; None when it may. The lead's
     ruling (artie DECISIONS 6b0bef481b) accepts the CI smoke warm-up cap for smoke runs only: a real run takes the
-    registered cap and PREREG :210's rule at it. A cap equal to its own rule is not enough (rule(20) = 1000:10:2)."""
+    registered cap and PREREG :210's rule at it. A cap equal to its own rule is not enough (rule(20) = 1000:10:2).
+    Both compare as EXACT strings: every consumer downstream (run_system.sh's integer OUTER_S, the warmup_rule each run
+    records, timedrun.py check) reads the text, so "1.8e3" or "1000:10:180.0" must not pass as equal."""
     why = []
-    try:
-        cap = float(cap_s)
-    except ValueError:
-        cap = None
-    if cap != REGISTERED_CAP_S:  # NaN and inf are unequal too
-        why.append(f"cap {cap_s!r} s is not the registered {REGISTERED_CAP_S} s")
+    if cap_s != str(REGISTERED_CAP_S):
+        why.append(f"cap {cap_s!r} s is not the registered {str(REGISTERED_CAP_S)!r} s")
     want = rule(REGISTERED_CAP_S)
-    if parse_warmup(warmup) is None or parse_warmup(warmup) != parse_warmup(want):
+    if warmup != want:
         why.append(f"warm-up {warmup!r} is not PREREG :210's rule at the registered cap, {want!r}")
     return "; ".join(why) or None
 

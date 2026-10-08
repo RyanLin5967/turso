@@ -48,6 +48,9 @@ CLIENTS=${FT_CLIENTS:-1 4}
 # with the same OPS:S:MAX_S form (the T3 driver passes the value it gives fastest_profile). FT_CAP_S is the
 # registered per-run cap (default 1800 s). Recorded in run-info.txt and in every run's summary.json warmup_rule.
 CAP_S=${FT_CAP_S:-1800}
+# A number of seconds on every run: OUTER_S below is integer shell arithmetic on it (review of e11a3c993, finding 5:
+# 1.8e3 gave a 601 s outer timeout, 1_800 an arithmetic error).
+[[ $CAP_S =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: FT_CAP_S [$CAP_S] is not a number of seconds" >&2; exit 2; }
 WARMUP=${FT_WARMUP:-$(python3 "$HERE/timedrun.py" rule "$CAP_S")}
 # One parent fixture for every system (gate-6 review, t3run item 4): gen_seed.py's t at ROWS rows, aged by AGE
 # committed single-row UPDATEs (0 = fresh; PREREG §7 ages with 1e5) and the system's documented maintenance, with
@@ -60,14 +63,27 @@ PSUM=$(python3 "$HERE/gen_seed.py" sum --rows "$ROWS" --updates "$AGE")  # the p
 [[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
 # Real or smoke (lead ruling, artie DECISIONS 6b0bef481b): the CI smoke warm-up cap (FT_WARMUP=1000:10:2) is accepted
 # for SMOKE runs only, which say so with FT_DRY=1 and are never credited. Every other run is REAL (FT_DRY=0, also the
-# default: a run that does not declare itself smoke is held to the registration) and refuses, before anything runs, any
-# cap but the registered 1800 s and any warm-up but PREREG :210's rule at it (timedrun.py real). The T3 runner passes
-# FT_DRY=1 only on --dry-run.
+# default when FT_DRY is unset) and refuses, before anything runs:
+#   - any cap but the registered "1800" and any warm-up but PREREG :210's rule at it, "1000:10:180", compared as exact
+#     strings (timedrun.py real);
+#   - a fixture or ops total left to this script's smoke defaults: FT_AGE, FT_PREBRANCH and either FT_OPS_TOTAL or both
+#     FT_N1 and FT_N4 must be given (review of e11a3c993, finding 4: AGE=0, PREBRANCH=0 and N=200 passed as real).
+#     Their VALUES come from the caller's manifest (PREREG §7, amendment 52); this checks they were chosen, not what.
+# The T3 runner must pass FT_DRY=1 on --dry-run and these variables on every run. At fork/fastest-linux-t3 37d91390a it
+# passes none of FT_DRY, FT_AGE and FT_PREBRANCH (fastest-linux told 2026-10-08T21:10Z), so its runs are refused here.
 DRY=${FT_DRY:-0}
 case $DRY in
   1) ;;
-  0) why=$(python3 -B "$HERE/timedrun.py" real "$CAP_S" "$WARMUP") ||
-       { echo "REFUSED: a real run (FT_DRY=0) takes only the registered cap and warm-up: [${why#REFUSED: }] (timedrun.py real)" >&2; exit 2; } ;;
+  0) rwhy=()
+     tr=$(python3 -B "$HERE/timedrun.py" real "$CAP_S" "$WARMUP") || rwhy+=("${tr#REFUSED: }")  # empty if it crashed
+     [ -n "${FT_AGE:-}" ] || rwhy+=("FT_AGE unset (the smoke default is 0)")
+     [ -n "${FT_PREBRANCH:-}" ] || rwhy+=("FT_PREBRANCH unset (the smoke default is 0)")
+     [ -n "${FT_OPS_TOTAL:-}" ] || { [ -n "${FT_N1:-}" ] && [ -n "${FT_N4:-}" ]; } ||
+       rwhy+=("no ops total: FT_OPS_TOTAL, or both FT_N1 and FT_N4, unset (the smoke default is 200)")
+     if [ ${#rwhy[@]} -gt 0 ]; then
+       echo "REFUSED: a real run (FT_DRY=0) takes only the registered cap and warm-up and an explicit fixture and ops total: $(printf '[%s] ' "${rwhy[@]}")" >&2
+       exit 2
+     fi ;;
   *) echo "REFUSED: FT_DRY [$DRY] is neither 0 (a real run) nor 1 (smoke, uncredited)" >&2; exit 2 ;;
 esac
 SC="$HERE/stracecount.py"
