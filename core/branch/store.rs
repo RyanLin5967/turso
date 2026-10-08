@@ -1320,6 +1320,12 @@ struct CatState {
     tva_probes: u64,
     tva_rows: u64,
     tva_reads: u64,
+    /// r12-lakehouse A8 (observation only): free rows the installed checkpoints upserted, and the
+    /// row the catalog's last `wal_checkpoint(TRUNCATE)` returned (busy, log, checkpointed;
+    /// `[-1, -1, -1]` when it failed). Checkpoints installed are `ckpt.count`. The row is shared
+    /// with the fuzzy path's phase 4, which truncates holding only the writer, never the store mutex.
+    free_puts: u64,
+    last_truncate: Arc<Mutex<Vec<i64>>>,
 }
 
 /// Catalog checkpoints and C-R settle batches, as counted (r11-restart-r2 instrument, observing
@@ -1568,6 +1574,8 @@ impl CatState {
             tva_probes: 0,
             tva_rows: 0,
             tva_reads: 0,
+            free_puts: 0,
+            last_truncate: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -2022,6 +2030,10 @@ struct ChildIndex {
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// r12-lakehouse A9.1 (observation only): `resolve` calls, and removal links they followed. The
+    /// links are never path-compressed, so one lookup can walk every removal since the last checkpoint.
+    resolves: std::cell::Cell<u64>,
+    link_hops: std::cell::Cell<u64>,
 }
 
 impl ChildIndex {
@@ -2057,10 +2069,14 @@ impl ChildIndex {
 
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
+        self.resolves.set(self.resolves.get() + 1);
         while let Some(x) = e {
             match self.removed.get(&(p, x)) {
                 None => return Some(x),
-                Some(&(lo, hi)) => e = if down { lo } else { hi },
+                Some(&(lo, hi)) => {
+                    self.link_hops.set(self.link_hops.get() + 1);
+                    e = if down { lo } else { hi };
+                }
             }
         }
         None
@@ -2555,6 +2571,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &slot in cap.free_list.iter().chain(cap.reserved.iter()).chain(cap.deferred.iter()) {
             catalog.free_put(slot)?;
         }
+        // (r12-lakehouse A8 counts these rows in `checkpoint_install`, from the same three lists.)
         catalog.put_meta(&cap.meta)
     })()
     .and_then(|()| {
@@ -2579,17 +2596,24 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
 /// PASSIVE backfill first, which waits for no reader, then a TRUNCATE attempt. The checkpoint is
 /// already durable, so a failure costs only WAL length: it is logged, not returned.
-fn truncate_catalog_wal(catalog: &mut Catalog) {
+/// The TRUNCATE row (or `[-1, -1, -1]` when it failed) goes to `last` (r12-lakehouse A8).
+fn truncate_catalog_wal(catalog: &mut Catalog, last: &Mutex<Vec<i64>>) {
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
-    match catalog.truncate_wal() {
-        Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
-            tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
+    let row = match catalog.truncate_wal() {
+        Ok(r) => {
+            if r.first().copied().unwrap_or(0) != 0 {
+                tracing::warn!("branch catalog WAL truncation was busy: {r:?}");
+            }
+            r
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
-    }
+        Err(e) => {
+            tracing::warn!("branch catalog WAL truncation failed: {e}");
+            vec![-1, -1, -1]
+        }
+    };
+    *last.lock() = row;
 }
 
 /// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
@@ -2606,6 +2630,7 @@ fn run_flight(
     over_hard: Arc<AtomicBool>,
     truncating: Arc<AtomicBool>,
     installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    last_truncate: Arc<Mutex<Vec<i64>>>,
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
@@ -2735,7 +2760,7 @@ fn run_flight(
         Ok(()) => {
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                truncate_catalog_wal(&mut writer.lock())
+                truncate_catalog_wal(&mut writer.lock(), &last_truncate)
             }));
             truncating.store(false, Ordering::Release);
             if truncated.is_err() {
@@ -4605,6 +4630,7 @@ impl BranchStore {
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         let writer = cat.writer.clone();
+        let last_truncate = cat.last_truncate.clone();
         let dirty = cap.dirty.clone();
         let shared = self.inner.clone();
         let group = self.group.clone();
@@ -4624,7 +4650,17 @@ impl BranchStore {
             crate::thread::Builder::new()
                 .name("branch-checkpoint".to_string())
                 .spawn(move || {
-                    run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+                    run_flight(
+                        shared,
+                        group,
+                        writer,
+                        cap,
+                        hold,
+                        over_hard,
+                        truncating,
+                        installs,
+                        last_truncate,
+                    )
                 })
         };
         match spawned {
@@ -6572,6 +6608,33 @@ impl BranchStore {
         })
     }
 
+    /// `(trunk-version probes, trunk-version rows returned)` by the catalog since open: C-P's
+    /// cumulative counters (`trunk_written_known`, `trunk_version_at`, `trunk_catalog_garbage`);
+    /// zeros for a store that is not a catalog store. Observation only (r12-lakehouse instrument).
+    pub(crate) fn catalog_trunk_counters(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        inner
+            .cat
+            .as_ref()
+            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows))
+    }
+
+    /// r12-lakehouse A8/A9.1 (observation only): `(catalog checkpoints, free rows they upserted,
+    /// the last checkpoint's TRUNCATE row, resolve calls, removal links followed)`.
+    pub(crate) fn mass_expiry_counters(&self) -> (u64, u64, Vec<i64>, u64, u64) {
+        let inner = self.inner.lock();
+        let (checkpoints, free_puts, last) = inner.cat.as_ref().map_or((0, 0, Vec::new()), |c| {
+            (c.ckpt.count, c.free_puts, c.last_truncate.lock().clone())
+        });
+        (
+            checkpoints,
+            free_puts,
+            last,
+            inner.children.resolves.get(),
+            inner.children.link_hops.get(),
+        )
+    }
+
     pub(crate) fn read_counters(&self) -> (u64, u64) {
         (
             self.resolve_calls.load(Ordering::Relaxed),
@@ -7929,6 +7992,7 @@ impl StoreInner {
         }
         let t = Instant::now();
         let writer = cat.writer.clone();
+        let last_truncate = cat.last_truncate.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
         if fresh_arena && !fe_mutant("restart_keeps_free_table") {
@@ -7952,7 +8016,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w);
+            truncate_catalog_wal(&mut w, &last_truncate);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {
@@ -8280,6 +8344,7 @@ impl StoreInner {
         }
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
+        cat.free_puts += (cap.free_list.len() + cap.reserved.len() + cap.deferred.len()) as u64;
         // The catalog holds the captured names now: drop each entry no release or create since
         // has moved (see `NameIndex`).
         for (name, release) in &cap.names_gone {
