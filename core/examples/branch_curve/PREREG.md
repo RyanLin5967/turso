@@ -678,6 +678,42 @@ Decision rule (a step = trunk_write p50 at x=10^4 ≥ 5× its value at x=10^2):
 - e1 flat and e2 steps → branching, not the checkpoint; e3 names frames.
 Whatever e3 shows is labelled a candidate unless e1/e2 isolate it.
 
+### Amendment 3 — 2026-09-25T00:02Z: verify the checkpoint candidate for a2's step; a2 under working checkpoints; b's fork re-run; a locality check on c1's reap
+
+Recorded after reading e1 (`683f8c7`), e2 (`a173398`), e3 (`dcc2336`), b_chain_r2 (`08ad2b0`), d_w_r2 (`0a90403`),
+c1_churn_r2 (`c7f2a37`), a2_spread_r2 (`af908ac`), before any run below.
+
+**Amendment 2's decision rule has fired:** e1 (no branches) steps (10.71 → 375.50 µs), e2 (auto-checkpoint off) is flat
+→ a2's trunk_write step is Turso's auto-checkpoint path, independent of branching. e3: 3,335 of 3,452 samples in `main`
+are in `WalFile::checkpoint_inner` under `Pager::commit_tx`'s auto-checkpoint; 5 in `first_write_trunk`.
+
+**Candidate, read from source, NOT yet checked:** under `synchronous=OFF` (the harness's own choice, amendment 1),
+`Pager::checkpoint_inner` jumps from the WAL checkpoint straight to `Finalize` (`pager.rs`, `res.wal_checkpoint_backfilled
+== 0 || sync_mode == SyncMode::Off`), skipping SyncDbFile → ReadDbIdentity → PublishBackfill, the only path that calls
+`wal.publish_backfill`. So nbackfills never advances; `should_checkpoint()` (`max_frame > 1000 + nbackfills`) stays true
+after the 1000th frame; every commit re-backfills the latest frame of every page in [1, max_frame] (~545 distinct pages
+in a2, 1 in a1); and the WAL never restarts (e1: 42,024,032 bytes = 10,200 frames after 10,200 commits; a2_r2: 4.14 GB
+at 10^6).
+
+Runs:
+- **e4** `--arm spread_trunk --synchronous normal --checkpoints 100,1000,10000`. Prediction if the candidate holds:
+  NO step (trunk_write p50 at 10^4 < 5× its 10^2 value) and a bounded WAL (wal_bytes ≤ 8,000,000 at every checkpoint).
+  A step, or an unbounded WAL, refutes the candidate.
+- **e5** `--arm spread --synchronous normal --checkpoints 100,1000,10000,100000,1000000 --samples 200`: a2 with
+  working checkpoints. Prediction: trunk_write |slope| < 0.10, wal_bytes ≤ 8,000,000 at every checkpoint; every other
+  a2 prediction of amendment 1 unchanged.
+- **b_chain_r3** `--arm chain --checkpoints 1,3,10,32,100,316,1000 --samples 1000`: b_chain_r2's `fork` (+0.191, at
+  1–4 ticks of the 41 ns clock) is in the inconclusive band; amendment 1's rule re-runs it at K=1000 and this is the reading.
+- **c1v** `--arm churn --victim newest --checkpoints 100,1000,10000,100000,1000000 --cycles 2000000 --windows 10`:
+  c1's `reap` (+0.214, re-read +0.202) against its flat prediction. Candidate: a uniformly random victim's BranchState,
+  children-map path and arena free bit are cold in cache at large N; the base curve's reap (the newest branches) stayed
+  at 0.38 µs at 10^6 against churn's 1.12 µs. `--victim newest` reaps the branch forked one cycle earlier and nothing
+  else changes. Prediction if locality is the mechanism: reap |slope| < 0.10. Reap slope ≥ 0.10 refutes it.
+
+`--synchronous` and `--victim` default to the values every earlier run used (off, random).
+
+*(Merge note, `resolve-vol-base`: the amendment above is the turso_curve lane's own amendment 3 (turso `48a2b97a3`, branch `inv-curve-noindex`), appended at 00:02Z after amendment 2 on a line that forked from this file there. The volatile-store series below continued from amendment 2 without it, numbering its own `Amendment 3` at 00:21Z, and cites its runs (e4, e5) from amendment 5 on. Both are kept verbatim and in full; two amendments carry the number 3 and are told apart by their timestamps.)*
+
 ### Amendment 3 — 2026-09-25T00:21Z: FIFO victims and a `churn_spread` arm, run on the UNFIXED store first
 
 Recorded by lane `turso_sota` (artie-research `frontier/round10/turso_sota/`), which builds the published fixes for

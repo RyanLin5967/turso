@@ -21,9 +21,10 @@
 //! `--synchronous off|normal|full` sets the trunk's sync mode (default off, as amendments 1-2).
 //! Ported verbatim from the turso_curve lane's amendment 3 (`48a2b97a3`); this lane's amendment 5.
 //!
-//! `--victim oldest|random` (churn arms only; default random) picks each cycle's reap victim: a
-//! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
-//! reaps in (amendment 3).
+//! `--victim oldest|random|newest` (churn arms only; default random) picks each cycle's reap victim:
+//! a uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
+//! reaps in (amendment 3), or the newest one, forked one cycle earlier and hot in cache (the
+//! turso_curve lane's amendment 3, `48a2b97a3`: its locality check `c1v`).
 //!
 //! `--durability volatile|durable|durable-nosync` (default volatile) opens the database with that branch
 //! durability. This copy runs on the DURABLE store's line (turso `ec168128b` + the sota-durable port; round 11
@@ -76,6 +77,8 @@ enum Arm {
 enum Victim {
     Random,
     Oldest,
+    /// The newest live branch, forked one cycle earlier (the turso_curve lane's amendment 3).
+    Newest,
 }
 
 struct Args {
@@ -168,6 +171,7 @@ fn parse_args() -> Args {
                 args.victim = match val().as_str() {
                     "random" => Victim::Random,
                     "oldest" => Victim::Oldest,
+                    "newest" => Victim::Newest,
                     other => die(&format!("unknown victim policy {other}")),
                 }
             }
@@ -513,7 +517,8 @@ fn main() {
     }
     // Amendment 1: trunk commits do not fsync. The fsync is not the mechanism under test, and the
     // `hot`/`spread`/`churn_hot` arms commit on the trunk once per fork, up to 10^6 times.
-    // Amendment 5: `--synchronous` overrides the mode; the default stays OFF.
+    // Amendment 5 (the turso_curve lane's amendment 3, `48a2b97a3`): `--synchronous` overrides the
+    // mode; the default stays OFF.
     trunk
         .execute(format!("PRAGMA synchronous = {}", args.synchronous))
         .unwrap();
@@ -541,7 +546,8 @@ fn main() {
     println!(
         "# arm={:?} victim={:?} durability={:?} splice={} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
-         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
+         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={} \
+         newest_victim={}",
         args.arm,
         args.victim,
         args.durability,
@@ -552,7 +558,8 @@ fn main() {
         args.cycles,
         args.windows,
         args.w_list,
-        args.no_autocheckpoint
+        args.no_autocheckpoint,
+        args.victim == Victim::Newest
     );
     println!(
         "# clock tick {:.0} ns (Instant); times are microseconds per operation; work columns are \
@@ -883,7 +890,8 @@ fn arm_chain(b: &mut Bench, args: &Args) {
 
 /// Arms (c) `churn`, `churn_hot` and `churn_spread`: steady N. Each cycle forks and writes one
 /// branch (plus one trunk write in `churn_hot` and `churn_spread`) and reaps one older live branch:
-/// a uniformly random one, or with `--victim oldest` the oldest (amendment 3).
+/// a uniformly random one, or with `--victim oldest` the oldest (amendment 3), or with
+/// `--victim newest` the newest (the turso_curve lane's amendment 3, `48a2b97a3`).
 fn arm_churn(b: &mut Bench, args: &Args) {
     println!("{HEADER}");
     let hot = args.arm == Arm::ChurnHot;
@@ -946,10 +954,12 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     retained_expected += 1;
                 }
                 // `swap_remove_back` is `Vec::swap_remove`: the random policy draws and removes
-                // exactly as amendment 1's harness did.
+                // exactly as amendment 1's harness did. `newest` reaps the branch forked one cycle
+                // ago (hot in cache), as the turso_curve lane's `live.pop()` did before its push.
                 let victim = match args.victim {
                     Victim::Random => live.swap_remove_back(b.rng.below(live.len())).unwrap(),
                     Victim::Oldest => live.pop_front().unwrap(),
+                    Victim::Newest => live.pop_back().unwrap(),
                 };
                 live.push_back(Live {
                     branch,
