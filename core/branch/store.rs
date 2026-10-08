@@ -323,6 +323,10 @@ pub(crate) struct BranchStore {
     /// every trunk commit's barrier covers it, since a commit retains nothing for a child released
     /// before its decisions (gc3's N1; lead review 1 item 10; skill review 2 #3).
     last_release_lsn: AtomicU64,
+    /// An upgrade flight a raised D0 store owes its held frees (engine review 8 #5's bound): the log
+    /// sequence number to make durable and the class to make it durable in, as `due_word` packs
+    /// them (0: none). Set by `mature` under the store mutex; led by the next `wait_durable`.
+    upgrade_due: AtomicU64,
     /// The log sequence number that makes the newest TrunkRetain durable: every trunk commit's
     /// barrier covers it too, since a pre-image kept by a decision pass that was then refused (or
     /// rolled back) is not decided again by the retry — the page's written epoch already is the
@@ -377,7 +381,19 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// Observation only (review 6 #1): confirmation words written into the log's header, and those
+    /// whose write failed; counted without the group's lock (engine review 8 #11).
+    confirms_written: AtomicU64,
+    confirm_failures: AtomicU64,
+    /// Test hook (engine review 8 #11): while it holds `HOLD_CONFIRM_WRITE`, the confirmation
+    /// writer waits once it has taken a word to write and before it writes it. Per store.
+    #[cfg(test)]
+    confirm_hold: AtomicU8,
 }
+
+/// Test hook stage (`Group::confirm_hold`): the confirmation writer has taken a word to write.
+#[cfg(test)]
+pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
 
 #[derive(Default)]
 struct GroupState {
@@ -398,6 +414,12 @@ struct GroupState {
     /// group flight starts until its install, so the bytes it copies stay the log's last ones.
     /// (A synchronous flush under the store mutex still may: the install copies what it wrote.)
     cutting: bool,
+    /// A fuzzy checkpoint of a D0 store whose log rewrites sync is syncing the arena, outside any
+    /// flight (`BranchStore::settle_arena`; engine review 9 #8): it cleared the arena's dirty mark,
+    /// so no flight that syncs may be taken until it lands — such a flight would find the arena
+    /// clean and land its records durable over slots not yet synced. Flights that only write (D0's
+    /// own) go on; so does the confirmation writer.
+    arena_syncing: bool,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
     /// the waits each flight released.
@@ -407,15 +429,20 @@ struct GroupState {
     already_durable: u64,
     upgrades: u64,
     riders: u64,
-    /// Observation only (review 6 #1): confirmation words written into the log's header, and those
-    /// whose write failed.
-    confirms_written: u64,
-    confirm_failures: u64,
     /// The confirmation of the last flight that landed, and when it landed (review 6 #1): written
     /// by the confirmation writer once no flight has landed for `confirm_quiet()`, or at close.
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
+    /// settling its capture, from the start of its wait for what the capture covers to the end of
+    /// that step (`run_flight`).
+    #[cfg(test)]
+    settle_syncs: u64,
+    /// Test builds (engine review 8 #10): times the confirmation writer woke from a wait with a
+    /// proved confirmation pending and went back to waiting.
+    #[cfg(test)]
+    confirm_wakeups: u64,
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -437,6 +464,10 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
+            confirms_written: AtomicU64::new(0),
+            confirm_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            confirm_hold: AtomicU8::new(0),
         }
     }
 
@@ -452,6 +483,15 @@ impl Group {
         self.failed.load(Ordering::Acquire)
     }
 
+    /// Whether a landing or a mark may make bytes durable: not once the store is fail-stopped,
+    /// however and wherever that was raised (review 6 #3 (a)) — a flight in the air when another
+    /// path raised it may have synced over the loss that path saw. Read holding the group's lock,
+    /// which every fail-stop raised through the group takes too. Mutant `land_ignores_failed` (test
+    /// builds only): as before, it lands durable.
+    fn accepts(&self) -> bool {
+        !self.poisoned() || fe_mutant("land_ignores_failed")
+    }
+
     /// Fail-stop the store and wake every waiter (called holding the group's lock, `_g`).
     fn fail(&self, _g: &mut GroupState) {
         self.failed.store(true, Ordering::Release);
@@ -463,14 +503,23 @@ impl Group {
     }
 
     fn wait<'a>(&self, g: std::sync::MutexGuard<'a, GroupState>) -> std::sync::MutexGuard<'a, GroupState> {
+        #[cfg(test)]
+        note_wait();
         self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wait until no flight is in the air. Called under the store mutex (so none can start); a
-    /// flight's leader needs only this group's lock to land, so this cannot deadlock.
+    /// Wait until no flight is in the air, nor a checkpoint's arena sync (`arena_syncing`). Called
+    /// under the store mutex (so none can start); a flight's leader, and that sync, need only this
+    /// group's lock to land, so this cannot deadlock.
     fn quiesce(&self) -> std::sync::MutexGuard<'_, GroupState> {
+        self.quiesce_for(true)
+    }
+
+    /// `quiesce`, for a flush under the store mutex whose flight `syncs` or not: one that only
+    /// writes does not wait for a checkpoint's arena sync (engine review 9 #8).
+    fn quiesce_for(&self, syncs: bool) -> std::sync::MutexGuard<'_, GroupState> {
         let mut g = self.lock();
-        while g.flushing {
+        while g.flushing || (syncs && g.arena_syncing) {
             g = self.wait(g);
         }
         g
@@ -478,12 +527,15 @@ impl Group {
 
     /// Record a flight's outcome and wake every waiter: on success every byte below `end` is
     /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) replaces
-    /// the last one for the confirmation writer.
-    fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) {
+    /// the last one for the confirmation writer. Returns whether the landing was accepted: a flight
+    /// that succeeded on a store fail-stopped meanwhile is refused, and its owner must say so
+    /// (engine review 9 #3).
+    fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
         let mut g = self.lock();
         g.flushing = false;
         let mut replaced = None;
-        if ok {
+        let accepted = ok && self.accepts();
+        if accepted {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
             }
@@ -503,6 +555,7 @@ impl Group {
         drop(g);
         // The replaced confirmation's descriptor is closed holding no lock.
         drop(replaced);
+        accepted
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -510,18 +563,28 @@ impl Group {
     }
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
-    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so.
+    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. The log's
+    /// last flight is now this one, which has no confirmation (barriered, not synced), so the
+    /// earlier flight's queued word is dropped: it could never match (engine review 8 #9). Mutant
+    /// `ordered_keeps_confirm` (test builds only): kept, as before.
     fn land_ordered(&self, end: u64, ok: bool) {
         let mut g = self.lock();
         g.flushing = false;
-        if ok {
+        let mut stale = None;
+        if ok && self.accepts() {
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
+            if !fe_mutant("ordered_keeps_confirm") {
+                stale = g.confirm.take();
+            }
         } else {
             self.failed.store(true, Ordering::Release);
             g.pending_full = None;
         }
         self.cv.notify_all();
+        drop(g);
+        // The dropped confirmation's descriptor is closed holding no lock.
+        drop(stale);
     }
 
     /// Every byte below `end` is durable in `class` and every weaker one, by a rewrite of the log
@@ -529,8 +592,10 @@ impl Group {
     /// catalog commit and cut log), and waiters are woken.
     fn mark_durable(&self, end: u64, class: SyncClass) {
         let mut g = self.lock();
-        for c in 0..=class_index(class) {
-            self.set_durable(&mut g, c, end);
+        if self.accepts() {
+            for c in 0..=class_index(class) {
+                self.set_durable(&mut g, c, end);
+            }
         }
         // The rewrite replaced the log, and confirmed what it kept itself (`Journal::rewrite_from`):
         // a confirmation of a flight before it names the old file.
@@ -540,11 +605,26 @@ impl Group {
         drop(stale);
     }
 
+    /// Every byte below `end` was made durable in `class` (and every weaker one) by a catalog
+    /// commit that returned before anything it waited on was refused (engine review 9 #6: the
+    /// checkpoint refuses to commit on a store already fail-stopped). Marked even when the store
+    /// fail-stopped since, by the cut that followed the commit: that durability was established
+    /// before the fail-stop, unlike a landing after it (`accepts`).
+    fn mark_committed(&self, end: u64, class: SyncClass) {
+        let mut g = self.lock();
+        for c in 0..=class_index(class) {
+            self.set_durable(&mut g, c, end);
+        }
+        self.cv.notify_all();
+    }
+
     /// Stop the confirmation writer and return the confirmation it left (the store's close).
     fn stop_confirms(&self) -> Option<Confirm> {
         let mut g = self.lock();
         g.confirm_stop = true;
         self.confirm_cv.notify_all();
+        // The writer may be waiting for a flight on the group's condition variable.
+        self.cv.notify_all();
         g.confirm.take().map(|(_, c)| c)
     }
 
@@ -552,18 +632,67 @@ impl Group {
     /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
-        let mut g = self.lock();
+        // Counted without the group's lock (engine review 8 #11).
         match written {
-            Ok(()) => g.confirms_written += 1,
+            Ok(()) => {
+                self.confirms_written.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) => {
-                g.confirm_failures += 1;
+                self.confirm_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
                 if fe_mutant("confirm_error_fails_flight") {
+                    let mut g = self.lock();
                     self.fail(&mut g);
                 }
             }
         }
     }
+}
+
+/// Engine review 8 #5: the most slots a raised D0 store holds for a sync before the next
+/// operation leads an upgrade flight in the free class (`BranchStore::upgrade_if_due`).
+const HOLD_BOUND: usize = 4096;
+
+/// Test builds: `HOLD_BOUND` for one test (0: the constant).
+#[cfg(test)]
+pub(crate) static HOLD_BOUND_FORCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn hold_bound() -> usize {
+    #[cfg(test)]
+    {
+        let forced = HOLD_BOUND_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    HOLD_BOUND
+}
+
+/// The class a rewrite of the log (a compaction's snapshot, a checkpoint's catalog commit and cut,
+/// a page-size restart's empty state) made everything it kept durable in: the log's rewrite class,
+/// in which it syncs (engine review 8 #6: the store's own class understated it in a raised D0
+/// store, so no held free ever matured on a rewrite). Mutant `rewrite_marks_store_class` (test
+/// builds only): the store's class, as before.
+fn rewritten_class(journal: &Journal) -> SyncClass {
+    if fe_mutant("rewrite_marks_store_class") {
+        journal.sync_class()
+    } else {
+        journal.rewrite_class()
+    }
+}
+
+/// An owed upgrade flight (`BranchStore::upgrade_due`): `lsn` above, the class's index below.
+fn due_word(lsn: u64, class: SyncClass) -> u64 {
+    (lsn << 2) | class_index(class) as u64
+}
+
+fn from_due_word(word: u64) -> (u64, SyncClass) {
+    let class = match word & 3 {
+        0 => SyncClass::Off,
+        1 => SyncClass::Fsync,
+        _ => SyncClass::FullFsync,
+    };
+    (word >> 2, class)
 }
 
 /// How long the group must stay idle (no flight landed) before the confirmation writer writes the
@@ -584,9 +713,9 @@ fn confirm_quiet() -> Duration {
 
 /// The confirmation writer, one thread per durable store (review 6 #1; listed in the PREREG annex
 /// as background work). It writes the last landed flight's confirmation word into the log's
-/// header once no flight has landed for `confirm_quiet()` and none is in the air — holding the
-/// group's flight slot (`flushing`) for its one unsynced pwrite, so the word never sits inside an
-/// acknowledgement window and no flight's sync is taken while it is written. A flight whose sync
+/// header once no flight has landed for `confirm_quiet()` and none is in the air, so the word is
+/// never written inside an acknowledgement window; its one unsynced pwrite takes no flight slot
+/// on unix (engine review 8 #11), and off unix it holds the slot (`SlotRelease`). A flight whose sync
 /// did not prove stable storage (`Confirm::proved`) waits for the close. Nothing is written once
 /// the store is fail-stopped.
 fn run_confirm_writer(group: Arc<Group>) {
@@ -603,21 +732,59 @@ fn run_confirm_writer(group: Arc<Group>) {
             }
         };
         let idle = landed.elapsed();
+        // A flight or a cut in the air: wait for it on the group's condition variable, which its
+        // landing (or the cut's gate, or a failure, or the close) signals, rather than re-taking
+        // the lock its leader and riders need (engine review 8 #10). Mutant `confirm_poll_100us`
+        // (test builds only): every 100 us, as before.
+        if (g.flushing || g.cutting) && !fe_mutant("confirm_poll_100us") {
+            g = group.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            {
+                g.confirm_wakeups += 1;
+            }
+            continue;
+        }
         if idle < confirm_quiet() || g.flushing || g.cutting {
             let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
+            #[cfg(test)]
+            {
+                g.confirm_wakeups += 1;
+            }
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
-        g.flushing = true;
+        // The word names a flight whose sync has returned, and on unix every replacement of the
+        // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
+        // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
+        // (engine review 8 #11). Off unix a log can be rewritten in place, through a shared file
+        // cursor, so there the word is written holding the slot, released by a guard even if the
+        // write panics. Mutant `confirm_holds_slot` (test builds only): held on unix too.
+        let hold = !cfg!(unix) || fe_mutant("confirm_holds_slot");
+        if hold {
+            g.flushing = true;
+        }
         drop(g);
-        group.write_confirm(&confirm, false);
-        g = group.lock();
-        g.flushing = false;
-        group.cv.notify_all();
-        drop(g);
+        {
+            let _slot = hold.then(|| SlotRelease(&group));
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
+            group.write_confirm(&confirm, false);
+        }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// The confirmation writer's hold of the flight slot, off unix (`run_confirm_writer`): released,
+/// and the group woken, when dropped, a panic in the write included.
+struct SlotRelease<'a>(&'a Group);
+
+impl Drop for SlotRelease<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.flushing = false;
+        self.0.cv.notify_all();
     }
 }
 
@@ -724,6 +891,9 @@ impl StoreMutex {
         let guard = self.0.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
+        // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
+        #[cfg(test)]
+        super::budget_probe::store_locked();
         StoreGuard(guard)
     }
 }
@@ -747,6 +917,7 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
+        super::budget_probe::store_unlocked();
     }
 }
 
@@ -761,12 +932,45 @@ thread_local! {
 #[cfg(test)]
 static SYNCS_UNDER_STORE_MUTEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A sync was issued: counted if this thread holds a store mutex (test builds).
+/// A sync was issued: counted for this thread, and if it holds a store mutex (test builds).
 #[cfg(test)]
 pub(crate) fn note_sync() {
+    THREAD_SYNCS.with(|n| n.set(n.get() + 1));
     if STORE_HELD.with(|held| held.get()) > 0 {
         SYNCS_UNDER_STORE_MUTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Syncs of any file this thread issued (test builds; engine review 9 #8).
+    static THREAD_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// See `THREAD_SYNCS`.
+#[cfg(test)]
+fn thread_syncs() -> u64 {
+    THREAD_SYNCS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Condition-variable waits this thread made inside the store: for a flight, for a trunk
+    /// commit's WAL flush, for a checkpoint's install, for a trunk commit's publication (test
+    /// builds; review 7 #7 as the flagged-edit judge asked: a wait is counted, not timed).
+    static THREAD_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One wait (`THREAD_WAITS`).
+#[cfg(test)]
+fn note_wait() {
+    THREAD_WAITS.with(|n| n.set(n.get() + 1));
+}
+
+/// See `THREAD_WAITS`.
+#[cfg(test)]
+pub(crate) fn thread_waits() -> u64 {
+    THREAD_WAITS.with(std::cell::Cell::get)
 }
 
 /// See `SYNCS_UNDER_STORE_MUTEX`.
@@ -887,13 +1091,16 @@ struct StoreInner {
     stamps: RowStamps,
     /// The Merger's work since open (observing only).
     merge_work: super::BranchMergeWork,
-    /// Slots freed by an early-released operation whose records are not yet durable, under the log
-    /// sequence number that makes them free (see [`Group`], rule 2).
+    /// Slots freed by an early-released operation whose records are not yet durable in the free
+    /// class (`free_class`), under the log sequence number that makes them free (see [`Group`],
+    /// rule 2).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
-    /// D0 only (review 5 #18): frees whose Release was only written, of slots a synced record names
-    /// (`Arena::is_synced_named`), waiting for a sync to cover the Release, with its sequence
-    /// number.
-    held_synced_free: VecDeque<(u64, Vec<Slot>)>,
+    /// The slots in `pending_free` (engine review 8 #5: the bound on a raised D0 store's hold).
+    pending_free_slots: usize,
+    /// Early-released Releases applied in memory and not yet durable in the store's class, in log
+    /// order (engine review 7 #3): a fail-stopped store still lists and finds these branches, as a
+    /// reopen would. Pruned by `mature`. `u64::MAX`: never buffered (the buffer failed).
+    releases_in_air: VecDeque<ReleaseInAir>,
     /// Named server branches' names (fastest-engine M1 item 4).
     names: NameIndex,
     /// The trunk's epoch at the copy decisions of the trunk commit in flight (or the last one): the
@@ -1120,6 +1327,9 @@ struct CkptCounters {
     fuzzy_refused_splice: u64,
     /// Fuzzy checkpoints started (a thread spawned).
     flights: u64,
+    /// Fuzzy checkpoint starts that failed (settle, capture or spawn) and backed off (engine
+    /// review 8 #3: a failed start was counted nowhere). Not in `as_array`, whose shape callers fix.
+    start_failures: u64,
     /// Store-mutex hold inside checkpoints: capture + install (+ the write, on the sharp path).
     hold_ns: u64,
     hold_max_ns: u64,
@@ -1205,7 +1415,8 @@ pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 
 /// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a group flight's leader
 /// waits here, its flight taken from the buffer and not yet written, so a test can act while an
-/// operation's records are in the air.
+/// operation's records are in the air. On a fuzzy checkpoint's hook (`checkpoint_hold`): the flight
+/// its thread leads to settle its capture (engine review 9 #8).
 #[cfg(test)]
 pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 
@@ -1218,6 +1429,18 @@ pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a flush made under
+/// the store mutex (`flush_locked`) waits here, its flight taken and in the air, before it writes
+/// (engine review 9 #3).
+#[cfg(test)]
+pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a release waits here,
+/// its Release buffered and applied, the store mutex released, before it waits for its flight
+/// (engine review 8 #14: a trunk commit's barrier then orders the Release).
+#[cfg(test)]
+pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -2111,6 +2334,46 @@ impl Lineage {
     }
 }
 
+/// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
+/// resident branch's row, current page map and retained versions, with what changed in it.
+fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+    let rows: Vec<(CatBranch, u8)> = dirty
+        .iter()
+        .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
+        .map(|(&id, st, what)| (CatBranch {
+            id: id.0,
+            parent: st.parent.0,
+            fork_epoch: st.fork_epoch,
+            epoch: st.lineage.epoch,
+            released: st.handle == Handle::Released,
+            held_open: st.handle == Handle::Released && st.open,
+            lease: if st.handle == Handle::Released { None } else { st.lease },
+            n_children: st.lineage.n_children,
+            current: st
+                .current
+                .iter()
+                .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+                .collect(),
+            retained: st.lineage.retained_list(),
+            name: None,
+        }, what))
+        .collect();
+    #[cfg(test)]
+    CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
+    rows
+}
+
+/// A Release applied in memory whose record is not yet durable (`StoreInner::releases_in_air`).
+struct ReleaseInAir {
+    /// What makes it durable (`u64::MAX`: it was never buffered).
+    lsn: u64,
+    id: BranchId,
+    /// The branch's fork, durable or not: a branch whose fork is not durable either would not come
+    /// back at a reopen.
+    fork_lsn: u64,
+    name: Option<Arc<str>>,
+}
+
 /// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlightStart {
@@ -2147,6 +2410,10 @@ struct Captured {
     trunk_gone: Vec<(u32, u64)>,
     free_cursor: Option<Slot>,
     taken: Vec<Slot>,
+    /// An empty store's page-size restart (`checkpoint_catalog_as`, review 6 #4): the arena is
+    /// replaced by an empty one once this commits, so the free table is cleared (every row deleted)
+    /// and none is written; `free_cursor`, `taken` and the lists are empty.
+    fresh_arena: bool,
     free_list: Vec<Slot>,
     reserved: Vec<Slot>,
     /// Slots freed by early-released operations whose records were not yet durable at the
@@ -2157,10 +2424,17 @@ struct Captured {
     deferred: Vec<Slot>,
     /// The journal's sequence number at the capture, its `Record::Checkpoint` included: every
     /// record the capture covers lies below it. A fuzzy checkpoint commits only once all of it is
-    /// durable in `log_class` (review 4 #1); the deferred frees mature at it.
+    /// durable in `settle_class` (review 4 #1, review 6 #3 (b)); the deferred frees mature at it.
     deferred_lsn: u64,
-    /// The journal's own class: what an operation the capture covers was acknowledged in.
-    log_class: SyncClass,
+    /// The class a fuzzy checkpoint waits for `deferred_lsn` in before its commit (review 6 #3 (b)):
+    /// the journal's own class, what an operation the capture covers was acknowledged in. In a D1
+    /// or D2 store the flights that made those records durable synced the slots they name.
+    settle_class: SyncClass,
+    /// A D0 store whose log rewrites sync (engine review 9 #8): its flights sync nothing, so once
+    /// what the capture covers is written the checkpoint syncs the arena itself, under group
+    /// exclusion and only if a slot was written since its last sync (`BranchStore::settle_arena`),
+    /// before the catalog commit names the slots. The log is not synced: the cut supersedes it.
+    settle_arena: bool,
     /// The store's fail-stop flag (shared with its journal and group): read just before the catalog
     /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
     fail_stop: Arc<AtomicBool>,
@@ -2264,7 +2538,9 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for (name, id) in &cap.names_fresh {
             catalog.name_put(name, id.0)?;
         }
-        if let Some(cursor) = cap.free_cursor {
+        if cap.fresh_arena {
+            catalog.free_clear()?;
+        } else if let Some(cursor) = cap.free_cursor {
             catalog.free_delete_upto(cursor)?;
         }
         for &slot in &cap.taken {
@@ -2334,10 +2610,31 @@ fn run_flight(
         // a record still buffered or in the air at the capture belongs to an operation whose
         // caller may yet be told it failed, and then the catalog must not hold it. Waited for
         // holding no lock, but the store mutex for the moment it takes to lead a flight if none
-        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once.
+        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. In a
+        // raised D0 store the arena is then synced alone (`settle_arena`; engine review 9 #8). The
+        // test hook pauses the step that syncs the slots, once taken (`HOLD_FLIGHT_TAKEN`): that
+        // arena sync, or else the flight this wait leads.
         if !fe_mutant("commit_unsettled") {
-            let settled =
-                BranchStore::wait_durable_on(&inner, &group, None, cap.deferred_lsn, cap.log_class);
+            #[cfg(test)]
+            let syncs = thread_syncs();
+            let settled = BranchStore::wait_durable_on(
+                &inner,
+                &group,
+                (!cap.settle_arena).then_some(&*hold),
+                cap.deferred_lsn,
+                cap.settle_class,
+            )
+            .and_then(|()| {
+                if cap.settle_arena {
+                    BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync)
+                } else {
+                    Ok(())
+                }
+            });
+            #[cfg(test)]
+            {
+                group.lock().settle_syncs += thread_syncs() - syncs;
+            }
             if let Err(e) = settled {
                 return (Err(e), 0);
             }
@@ -2390,7 +2687,7 @@ fn run_flight(
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         if installed.is_ok() {
             if let Some(journal) = guard.journal.as_ref() {
-                group.mark_durable(journal.lsn() - journal.pending_len(), journal.sync_class());
+                group.mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
             }
         }
         let hold_ns = ns(t);
@@ -2521,6 +2818,8 @@ impl Drop for Backpressure<'_> {
                 tracing::warn!("branch store back-pressure: no checkpoint install in 60 s");
                 return;
             }
+            #[cfg(test)]
+            note_wait();
             n = installed
                 .wait_timeout(n, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner())
@@ -2583,6 +2882,11 @@ thread_local! {
     /// A4.G's G-b red: captures entered on this thread (a guard that stopped before the capture
     /// leaves it unchanged).
     pub(crate) static CAPTURE_ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Review 6 #3: captures on this thread that took an arena handle of their own, to sync the
+    /// arena outside the group's flights.
+    pub(crate) static CAPTURE_ARENA_HANDLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Engine review 8 #2: catalog rows captures on this thread built.
+    pub(crate) static CAPTURE_ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
@@ -2773,6 +3077,7 @@ impl BranchStore {
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             fuzzy: false,
         }
@@ -2901,24 +3206,55 @@ impl BranchStore {
                         // means the flight was never acknowledged, and it is replayed without.
                         let check = scanned.last_flight_slots();
                         let snapshot = scanned.take_snapshot();
-                        let again = (!check.is_empty()).then(|| (inner.fresh_again(), snapshot.clone()));
+                        let had_snapshot = snapshot.is_some();
+                        // A fresh state to replay into again if the check fails. The snapshot is
+                        // not copied for it (engine review 7 #4: an O(state) copy at every such
+                        // open, though the check passes on nearly all): a failed check reads it
+                        // again. Mutant `snapshot_copied_at_open` (test builds only): copied first.
+                        let copy_first = fe_mutant("snapshot_copied_at_open");
+                        let again = (!check.is_empty()).then(|| {
+                            let copied = if copy_first { snapshot.clone() } else { None };
+                            (inner.fresh_again(), copied)
+                        });
+                        if copy_first && had_snapshot && again.is_some() {
+                            stats.snapshot_copies += 1;
+                        }
                         Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
-                        if let Some((fresh, snapshot)) = again {
-                            let referenced: HashSet<Slot> = inner.referenced_slots().into_iter().collect();
+                        // What the recovered state references, computed once: the check filters by
+                        // it, and the arena is rebuilt from it below unless the collection there
+                        // closed something (engine review 7 #4).
+                        let mut checked_refs = None;
+                        let mut check_passed = false;
+                        if let Some((fresh, copied)) = again {
+                            let refs = inner.referenced_slots();
+                            let referenced: HashSet<Slot> = refs.iter().copied().collect();
                             // Mutant `check_all_named_slots` (test builds only): every slot the
                             // flight names is read, as before review 5 #1.
                             let named: Vec<(Slot, u32)> = check
                                 .into_iter()
                                 .filter(|(slot, _)| referenced.contains(slot) || fe_mutant("check_all_named_slots"))
                                 .collect();
-                            if !super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
+                            stats.checked_slots += named.len() as u64;
+                            if super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
+                                checked_refs = Some(refs);
+                                check_passed = true;
+                            } else {
                                 scanned.drop_last_flight();
                                 inner = fresh;
+                                let snapshot = match copied {
+                                    Some(copied) => Some(copied),
+                                    None if had_snapshot => {
+                                        stats.snapshot_copies += 1;
+                                        Some(super::journal::reread_snapshot(&files, format)?)
+                                    }
+                                    None => None,
+                                };
                                 Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
                             }
                         }
                         let unsynced = scanned.arena_unsynced();
                         let mut recovered = scanned.finish()?;
+                        let confirmable = recovered.confirmable;
                         stats.records = recovered.records.len() as u64;
                         // Frees here are not acted on: the free set is derived below from what the
                         // recovered state references.
@@ -2932,7 +3268,10 @@ impl BranchStore {
                         stats.released_scanned = scanned;
                         stats.collect_ns = ns(t);
                         let t = Instant::now();
-                        let referenced = inner.referenced_slots();
+                        let referenced = match checked_refs {
+                            Some(refs) if !closed => refs,
+                            _ => inner.referenced_slots(),
+                        };
                         stats.referenced_ns = ns(t);
                         stats.referenced_slots = referenced.len() as u64;
                         let t = Instant::now();
@@ -2950,6 +3289,15 @@ impl BranchStore {
                         inner.arena = Some(arena);
                         let mut journal = recovered.journal;
                         journal.share_fail_stop(&inner.fail_stop);
+                        // The last flight checked out and nothing unsynced remains: confirmed now,
+                        // so the next open does not read its slots again (engine review 7 #4). A
+                        // failed write of the word changes nothing but that. Mutant
+                        // `open_confirms_nothing` (test builds only).
+                        if confirmable && check_passed && !unsynced && !closed && !fe_mutant("open_confirms_nothing") {
+                            if let Err(e) = journal.confirm_at_open() {
+                                tracing::warn!("branch log: the open could not confirm its last flight: {e}");
+                            }
+                        }
                         inner.journal = Some(journal);
                     }
                 }
@@ -2991,6 +3339,7 @@ impl BranchStore {
             files_dev: inner.files_dev.clone(),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
@@ -3136,19 +3485,22 @@ impl BranchStore {
         stats: &mut BranchOpenStats,
     ) -> Result<()> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        stats.replays += 1;
+        // Accumulated: a second replay (the last flight's check failed) adds to the first's time
+        // (engine review 7 #4: it overwrote it).
         let t = Instant::now();
         if let Some(snapshot) = snapshot {
             stats.snap_branches = snapshot.branches.len() as u64;
             inner.load_snapshot(snapshot)?;
         }
-        stats.load_ns = ns(t);
+        stats.load_ns += ns(t);
         let mut ignored = Vec::new();
         let t = Instant::now();
         for record in records {
             kill_point("recover.replay");
             inner.replay(record, &mut ignored)?;
         }
-        stats.replay_ns = ns(t);
+        stats.replay_ns += ns(t);
         Ok(())
     }
 
@@ -3552,7 +3904,11 @@ impl BranchStore {
     /// flight in the air goes first (its frames precede these in the log); its leader needs only
     /// the group's lock to land, never the store mutex, so waiting for it here cannot deadlock.
     fn flush_locked(&self, inner: &mut StoreInner, class: SyncClass) -> Result<()> {
-        let mut g = self.group.quiesce();
+        // A flight that only writes (D0's) need not wait for a checkpoint's arena sync, and must
+        // not: this holds the store mutex (engine review 9 #8). Mutant `arena_sync_ungated`.
+        let syncs = !fe_mutant("arena_sync_ungated")
+            && inner.journal.as_ref().is_some_and(|j| j.flight_syncs(class));
+        let mut g = self.group.quiesce_for(syncs);
         if self.group.poisoned() {
             return Err(group_poisoned());
         }
@@ -3567,6 +3923,8 @@ impl BranchStore {
         g.flushing = true;
         g.locked_flushes += 1;
         drop(g);
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_LOCKED_FLUSH);
         let (end, class) = (flight.end_lsn, flight.class);
         let (written, confirm) = split_confirm(flight.write());
         if written.is_err() {
@@ -3574,8 +3932,14 @@ impl BranchStore {
                 journal.poison();
             }
         }
-        self.group.land(end, class, written.is_ok(), confirm);
+        let accepted = self.group.land(end, class, written.is_ok(), confirm);
         written?;
+        // Refused: the store fail-stopped while the flight was in the air, so nothing it carried
+        // is durable in this process, and the caller must not act as if it were (engine review 9
+        // #3). Mutant `locked_flush_ignores_refusal` (test builds only): Ok, as before.
+        if !accepted && !fe_mutant("locked_flush_ignores_refusal") {
+            return Err(group_poisoned());
+        }
         self.mature(inner);
         Ok(())
     }
@@ -3588,7 +3952,9 @@ impl BranchStore {
         let hold = Some(&*self.trunk_commit_hold);
         #[cfg(not(test))]
         let hold = None;
-        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)
+        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)?;
+        self.upgrade_if_due();
+        Ok(())
     }
 
     /// `wait_durable` for a caller holding only the store's shared parts: a fuzzy checkpoint's
@@ -3610,6 +3976,12 @@ impl BranchStore {
         }
         let need = class_index(class);
         let mut first = true;
+        // Whether the flight this would lead syncs, so must not be taken while a checkpoint syncs
+        // the arena (`GroupState::arena_syncing`; engine review 9 #8): one in a syncing class
+        // does; one for a D0 wait does when what is buffered raised it, found at the take. Mutant
+        // `arena_sync_ungated` (test builds only): flights ignore it.
+        let ungated = fe_mutant("arena_sync_ungated");
+        let mut gated = need > 0 && !ungated;
         loop {
             {
                 let mut g = group.lock();
@@ -3626,11 +3998,14 @@ impl BranchStore {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
                     // An ordered flight carries these bytes and a trunk commit's WAL flush is
                     // about to make them durable (lead review 1 item 6): waited for, briefly,
                     // rather than led past with an upgrade flight, a second flusher.
                     if need > 0 && g.pending_full.is_some_and(|p| p >= lsn) {
                         first = false;
+                        #[cfg(test)]
+                        note_wait();
                         let (woken, timeout) = group
                             .cv
                             .wait_timeout(g, pending_full_wait())
@@ -3640,12 +4015,13 @@ impl BranchStore {
                             && g.pending_full.is_some_and(|p| p >= lsn)
                             && !g.flushing
                             && !g.cutting
+                            && !(gated && g.arena_syncing)
                         {
                             break;
                         }
                         continue;
                     }
-                    if !g.flushing && !g.cutting {
+                    if !blocked {
                         break;
                     }
                     first = false;
@@ -3667,6 +4043,13 @@ impl BranchStore {
                     return Err(group_poisoned());
                 }
                 if g.flushing || g.cutting {
+                    continue;
+                }
+                if g.arena_syncing
+                    && !ungated
+                    && inner.journal.as_ref().is_some_and(|j| j.flight_syncs(class))
+                {
+                    gated = true;
                     continue;
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
@@ -3711,26 +4094,150 @@ impl BranchStore {
         }
     }
 
+    /// A fuzzy checkpoint's arena sync in a D0 store whose log rewrites sync, once what its capture
+    /// covers is written (engine review 9 #8; `Captured::settle_arena`): the store's flights sync
+    /// nothing, so the slots those records name are made to reach the device here, before the
+    /// catalog commit names them, and the commit's flush makes them durable with it (ruling
+    /// 85a032f01: a plain fsync, as `checkpoint_write`'s). The arena alone: the log's bytes are
+    /// about to be superseded by the cut. Nothing is synced when no slot was written since the
+    /// arena's last sync. Under group exclusion: taken with no flight in the air, and while it runs
+    /// no flight that syncs is taken (`GroupState::arena_syncing`); D0's own flights, which only
+    /// write, go on. It holds the store mutex only to take the arena's dirty mark. A failed sync
+    /// fail-stops the store, as a failed flight does (review 3 #5); a descriptor that cannot be
+    /// duplicated leaves the mark set, and the checkpoint fails for a later one to retry. `hold` is
+    /// the test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`).
+    fn settle_arena(store: &StoreMutex, group: &Group, hold: &AtomicU8, fail: bool) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = hold;
+        let file = loop {
+            {
+                let mut g = group.lock();
+                while g.flushing || g.arena_syncing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let mut inner = store.lock();
+            let mut g = group.lock();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if g.flushing || g.arena_syncing {
+                continue;
+            }
+            let Some(arena) = inner.arena.as_mut() else {
+                return Ok(());
+            };
+            match arena.take_dirty_file()? {
+                Some(file) => {
+                    g.arena_syncing = true;
+                    break file;
+                }
+                None => return Ok(()),
+            }
+        };
+        #[cfg(test)]
+        pause_at(Some(hold), HOLD_FLIGHT_TAKEN);
+        let synced = if fail {
+            Err(LimboError::InternalError(
+                "failpoint: the checkpoint's arena sync failed".to_string(),
+            ))
+        } else {
+            super::journal::fsync_file(&file, SyncClass::Fsync)
+        };
+        let mut g = group.lock();
+        g.arena_syncing = false;
+        // Mutant `checkpoint_sync_error_kept` (test builds only): as before review 3 #5, the store
+        // goes on.
+        if synced.is_err() && !fe_mutant("checkpoint_sync_error_kept") {
+            group.fail(&mut g);
+        } else {
+            group.cv.notify_all();
+        }
+        drop(g);
+        drop(file);
+        synced
+    }
+
     /// Return the deferred frees a flight has covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
-        if inner.pending_free.is_empty() && inner.held_synced_free.is_empty() {
+        // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
+        if !inner.releases_in_air.is_empty() {
+            let durable = self.group.durable(self.class);
+            while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
+                inner.releases_in_air.pop_front();
+            }
+        }
+        if inner.pending_free.is_empty() {
             return;
         }
-        // Durable in the store's class (review 5 #18): an ordered landing reaches durable(Off) and
-        // is durable only when the trunk's WAL flush returns. Mutant `free_at_off` (test builds
-        // only): durable(Off), as before.
-        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { self.class };
-        inner.mature_frees(self.group.durable(class), self.group.durable(SyncClass::Fsync));
+        // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
+        // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
+        // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
+        // durable(Off), as before review 5 #18.
+        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
+        inner.mature_frees(self.group.durable(class));
+        // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
+        // its frees for ever. Past `hold_bound()` held slots the next operation leads one upgrade
+        // flight in the free class (`upgrade_if_due`): one sync per bound's worth of frees.
+        // Mutant `hold_unbounded` (test builds only).
+        if class != self.class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
+            if let Some(&(lsn, _)) = inner.pending_free.back() {
+                self.upgrade_due.fetch_max(due_word(lsn, class), Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Free what an operation that logged its Release through `log_all` freed (an expiry pass, a
+    /// due reap, a close's collection of a branch released while a connection was open): held
+    /// until its Release is durable in the free class, as an early-released Release's frees are
+    /// (engine review 8 #8). In D1 and D2 `log_all`'s flush already made it durable, and an
+    /// unraised D0 store frees what is written, so those free at once as before. Mutant
+    /// `expiry_frees_at_once` (test builds only): at once on every path.
+    fn free_after_log(&self, inner: &mut StoreInner, freed: Vec<Slot>) {
+        if fe_mutant("expiry_frees_at_once") {
+            inner.release_slots(freed);
+            return;
+        }
+        let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
+        inner.defer_frees(lsn, freed);
+        self.mature(inner);
+    }
+
+    /// Lead the upgrade flight `mature` found due (`upgrade_due`), if one is: called by an
+    /// operation holding no lock, after its own wait (engine review 8 #5's bound). Its outcome is
+    /// not the operation's, which is durable already: a failed upgrade fail-stops the store as any
+    /// failed flight does, and is only logged here.
+    fn upgrade_if_due(&self) {
+        let due = self.upgrade_due.load(Ordering::Acquire);
+        if due == 0
+            || self
+                .upgrade_due
+                .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let (lsn, class) = from_due_word(due);
+        if let Err(e) = Self::wait_durable_on(&self.inner, &self.group, None, lsn, class) {
+            tracing::warn!("branch store: the upgrade flight for held frees failed: {e}");
+        }
     }
 
     /// Make everything buffered durable and every deferred free mature, under the store mutex:
     /// before a catalog checkpoint's capture, so the free table it writes lists every slot the
-    /// state no longer names (catalog mode has no reachability sweep at open).
+    /// state no longer names (catalog mode has no reachability sweep at open). Reachable only under
+    /// mutant `settle_at_capture`. A raised D0 store's frees wait for a sync this flush does not
+    /// make; the capture lists them as deferred (engine review 8 #7), so they may remain.
     fn settle_durable(&self, inner: &mut StoreInner) -> Result<()> {
         self.flush_locked(inner, SyncClass::Off)?;
-        inner.mature_frees(self.group.durable(self.class), self.group.durable(SyncClass::Fsync));
+        inner.mature_frees(self.group.durable(inner.free_class()));
         crate::turso_assert!(
-            inner.pending_free.is_empty() || inner.journal.as_ref().is_some_and(Journal::is_poisoned),
+            inner.pending_free.is_empty()
+                || inner.journal.as_ref().is_some_and(Journal::is_poisoned)
+                || inner.free_class() != inner.sync,
             "deferred frees remain after everything buffered was made durable"
         );
         Ok(())
@@ -3828,7 +4335,7 @@ impl BranchStore {
         if let Err(e) = inner.apply_release(id, &mut freed) {
             return Err(inner.fatal(e));
         }
-        inner.release_slots(freed);
+        self.free_after_log(inner, freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
         Ok(())
@@ -3919,7 +4426,7 @@ impl BranchStore {
             }
         }
         let freed_pages = freed.len();
-        inner.release_slots(freed);
+        self.free_after_log(inner, freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
         self.maybe_compact(inner);
@@ -3983,6 +4490,9 @@ impl BranchStore {
             // (review 4 #2): not retried, under this mutex, by every operation until another
             // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
             FlightStart::Failed => {
+                if let Some(cat) = inner.cat.as_mut() {
+                    cat.ckpt.start_failures += 1;
+                }
                 if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
                     journal.defer_compaction();
                 }
@@ -4045,9 +4555,21 @@ impl BranchStore {
             }
         }
         self.mature(inner);
+        // Mutant `capture_waits_bounded` (test builds only; review 7 #7's flagged-edit judge): the
+        // capture waits, at most 3 s, for a flight in the air: a bounded wait a deadline-only
+        // check lets pass.
+        #[cfg(test)]
+        if fe_mutant("capture_waits_bounded") {
+            let g = self.group.lock();
+            if g.flushing {
+                note_wait();
+                let _ = self.group.cv.wait_timeout(g, Duration::from_secs(3));
+            }
+        }
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
-        let flight_in_air = self.group.lock().flushing;
+        // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
+        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -4155,12 +4677,29 @@ impl BranchStore {
             // (`Captured::deferred`).
             self.mature(inner);
             drop(self.group.quiesce());
-            inner.checkpoint_catalog(fail_after_rename)?;
+            // Everything buffered now is in the capture (this holds the store mutex), and the
+            // catalog's commit makes it durable in the rewrite class. Marked as soon as that commit
+            // landed, before the cut's outcome is known (engine review 9 #6): a cut that fails after
+            // it fail-stops the store, yet what the commit made durable was durable before that.
+            // Mutant `cut_failure_unacknowledges` (test builds only): marked only on success.
+            let covered = inner
+                .journal
+                .as_ref()
+                .map(|j| (j.lsn(), j.rewrite_class()));
+            let generation = inner.cat.as_ref().map(|c| c.generation);
+            let checkpointed = inner.checkpoint_catalog(fail_after_rename);
+            if let Some((lsn, class)) = covered {
+                let committed = inner.cat.as_ref().map(|c| c.generation) != generation;
+                if committed && !fe_mutant("cut_failure_unacknowledges") {
+                    self.group.mark_committed(lsn, class);
+                }
+            }
+            checkpointed?;
             if let Some(journal) = inner.journal.as_ref() {
                 // The catalog holds what preceded the capture; the cut log holds, synced, what
                 // followed it in the file.
                 self.group
-                    .mark_durable(journal.lsn() - journal.pending_len(), journal.sync_class());
+                    .mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
             }
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
@@ -4180,7 +4719,7 @@ impl BranchStore {
             return Ok(());
         };
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), journal.sync_class());
+        self.group.mark_durable(journal.lsn(), rewritten_class(journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -4215,6 +4754,8 @@ impl BranchStore {
             if started.elapsed() > limit {
                 return Err(LimboError::Busy);
             }
+            #[cfg(test)]
+            note_wait();
             guard = closed
                 .wait_timeout(guard, Duration::from_millis(100))
                 .unwrap_or_else(|e| e.into_inner())
@@ -4280,7 +4821,7 @@ impl BranchStore {
         if restart {
             // It did (it refuses otherwise): the empty state supersedes everything buffered.
             if let Some(journal) = inner.journal.as_ref() {
-                self.group.mark_durable(journal.lsn(), journal.sync_class());
+                self.group.mark_durable(journal.lsn(), rewritten_class(journal));
             }
         }
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
@@ -4462,12 +5003,7 @@ impl BranchStore {
             )));
         }
         if st.open {
-            return Err(LimboError::InvalidArgument(format!(
-                "branch {} already has an open connection; a branch serves one connection at a \
-                 time, because a second one's page cache would silently miss the first one's \
-                 commits",
-                id.0
-            )));
+            return Err(in_use(id, st.name.as_deref()));
         }
         st.open = true;
         Ok(st.schema.clone())
@@ -4511,7 +5047,7 @@ impl BranchStore {
             let _ = inner.fatal(e);
             return;
         }
-        inner.release_slots(freed);
+        self.free_after_log(&mut inner, freed);
         self.sync_trunk_children(&inner);
     }
 
@@ -4520,6 +5056,18 @@ impl BranchStore {
     /// An error when the release could not be made durable (review N4): the branch is then kept —
     /// nothing is freed in this process — and comes back, detached, at the next open.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
+        self.release_checked(id, false)
+    }
+
+    /// `Database::drop_branch`'s release of a named branch: refused while the branch has an open
+    /// connection (`LimboError::BranchInUse`), as a database server refuses to drop a database in
+    /// use (fastest-wire). A handle's release keeps the branch whole until its connection closes
+    /// instead.
+    pub(crate) fn release_named(&self, id: BranchId) -> Result<Reaped> {
+        self.release_checked(id, true)
+    }
+
+    fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -4555,7 +5103,12 @@ impl BranchStore {
             }
             Handle::Attached | Handle::Detached => {}
         }
+        // Mutant `drop_while_open` (test builds only): a drop releases a branch in use, as before.
+        if refuse_open && st.open && !fe_mutant("drop_while_open") {
+            return Err(in_use(id, st.name.as_deref()));
+        }
         let record = inner.release_record(id);
+        let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
         // Early release (fastest-engine M1 item 2): buffered and applied under the mutex, durable
         // by `wait_durable` after it; the slots it frees wait for that (rule 2).
         let lsn = match self.buffer_records(&mut inner, &[record]) {
@@ -4568,8 +5121,11 @@ impl BranchStore {
                 if let Some(st) = inner.branches.get_mut(&id) {
                     st.handle = Handle::ReleasePending;
                 }
-                // F-W1: gone from the caller's point of view, so not listed (as `is_released` says).
+                // F-W1: gone from the caller's point of view, so not listed (as `is_released` says)
+                // by a running store; a stopped one lists it again, as a reopen would (engine
+                // review 7 #3).
                 inner.live_ids_remove(id);
+                inner.releases_in_air.push_back(ReleaseInAir { lsn: u64::MAX, id, fork_lsn, name });
                 return Err(LimboError::InternalError(format!(
                     "branch {} was not released durably ({e}); it is kept, and comes back at the \
                      next open",
@@ -4578,6 +5134,8 @@ impl BranchStore {
             }
         };
         self.last_release_lsn.fetch_max(lsn, Ordering::AcqRel);
+        // Until it is durable, a stopped store must still report the branch (engine review 7 #3).
+        inner.releases_in_air.push_back(ReleaseInAir { lsn, id, fork_lsn, name });
         let mut freed = Vec::new();
         let spliced = match inner.apply_release(id, &mut freed) {
             Ok(spliced) => spliced,
@@ -4594,6 +5152,8 @@ impl BranchStore {
         let class = inner.sync;
         drop(inner);
         kill_point("release.applied");
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_RELEASE_BUFFERED);
         if let Err(e) = self.wait_durable(lsn, class) {
             // Applied in memory and not durable: the store is fail-stopped, and the slots it freed
             // never return (no flight will cover them); the branch comes back at the next open.
@@ -4661,19 +5221,53 @@ impl BranchStore {
     pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
         self.refuse_if_trunk_only("looking a branch up by name")?;
         check_branch_name(name)?;
-        let (found, poisoned) = {
+        let (found, poisoned, own_release) = {
             let mut inner = self.inner.lock();
-            (inner.name_lookup(name)?, inner.poisoned())
+            let found = inner.name_lookup(name)?;
+            let poisoned = inner.poisoned();
+            // A stopped store still finds a branch whose Release did not become durable: a reopen
+            // brings it back under its name (engine review 7 #3).
+            let found = match found {
+                None if poisoned => {
+                    let durable = self.group.durable(self.class);
+                    let mut unflown = inner.unflown_releases(durable);
+                    unflown.find(|r| r.name.as_deref() == Some(name)).map(|r| r.id)
+                }
+                found => found,
+            };
+            // The newest Release of this very name still in the air, if any (engine review 7
+            // #11): `releases_in_air` holds every early-released Release until it is durable.
+            let own_release = if found.is_none() && !poisoned {
+                inner
+                    .releases_in_air
+                    .iter()
+                    .rev()
+                    .find(|r| r.name.as_deref() == Some(name))
+                    .map(|r| r.lsn)
+            } else {
+                None
+            };
+            (found, poisoned, own_release)
         };
         // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
         if let Some(id) = found {
             self.settle(id, false)?;
         } else if !poisoned && !fe_mutant("lookup_no_release_wait") {
             // Nor reported free before the Release that freed it is durable (review 3 #17): a crash
-            // would bring the branch back under the name. Any release since the last durable one
-            // may be it; with none pending this is one compare. Mutant `lookup_no_release_wait`
-            // (test builds only).
-            self.wait_durable(self.last_release_lsn.load(Ordering::Acquire), self.class)?;
+            // would bring the branch back under the name. Only this name's own Release in the air
+            // may be it, and with none, or with it durable already (a lock-free compare), nothing
+            // is waited for (engine review 7 #11: every miss took the group's lock and waited out
+            // any Release in the air). Mutants `lookup_no_release_wait` (no wait at all) and
+            // `lookup_waits_any_release` (as before: the newest Release of any name), test
+            // builds only.
+            let lsn = if fe_mutant("lookup_waits_any_release") {
+                Some(self.last_release_lsn.load(Ordering::Acquire))
+            } else {
+                own_release
+            };
+            if let Some(lsn) = lsn.filter(|&lsn| self.group.durable(self.class) < lsn) {
+                self.wait_durable(lsn, self.class)?;
+            }
         }
         Ok(found)
     }
@@ -4718,7 +5312,7 @@ impl BranchStore {
     /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let (durable_at, snapshot, failed) = {
+        let (durable_at, snapshot, failed, unreleased) = {
             let mut inner = self.inner.lock();
             // No fork is listed before it is durable (review C-F4): the listing waits for the
             // newest one, after the lock is released. A fail-stopped store makes nothing durable
@@ -4729,20 +5323,30 @@ impl BranchStore {
             let durable_at = if inner.poisoned() || fe_mutant("list_no_durable_wait") {
                 0
             } else {
-                inner.last_fork_lsn.max(self.last_release_lsn.load(Ordering::Acquire))
+                // Mutant `list_no_release_wait` (test builds only, engine review 7 #12): forks only.
+                let releases = if fe_mutant("list_no_release_wait") {
+                    0
+                } else {
+                    self.last_release_lsn.load(Ordering::Acquire)
+                };
+                inner.last_fork_lsn.max(releases)
             };
             // A fail-stopped store lists no fork whose flight failed (review 3 #17): its creator was
-            // told it failed, and a reopen would not have it.
-            let failed: Vec<BranchId> = if inner.poisoned() {
+            // told it failed, and a reopen would not have it. And it lists every branch whose
+            // Release did not become durable, which a reopen brings back (engine review 7 #3).
+            let (failed, unreleased): (Vec<BranchId>, Vec<BranchId>) = if inner.poisoned() {
                 let durable = self.group.durable(self.class);
-                inner
-                    .branches
-                    .iter()
-                    .filter(|(_, st)| st.fork_lsn > durable)
-                    .map(|(id, _)| *id)
-                    .collect()
+                (
+                    inner
+                        .branches
+                        .iter()
+                        .filter(|(_, st)| st.fork_lsn > durable)
+                        .map(|(id, _)| *id)
+                        .collect(),
+                    inner.unflown_releases(durable).map(|r| r.id).collect(),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
@@ -4754,21 +5358,32 @@ impl BranchStore {
                 let rows = inner.shape.ids_build_rows - before;
                 inner.shape.ids_build_rows = before;
                 inner.shape.ids_catalog_rows += rows;
-                (durable_at, set, failed)
+                (durable_at, set, failed, unreleased)
             } else {
                 if inner.live_ids.is_none() {
                     let set = inner.build_live_ids()?;
                     inner.live_ids = Some(set);
                 }
-                (durable_at, inner.live_ids.clone().expect("built above"), failed)
+                (durable_at, inner.live_ids.clone().expect("built above"), failed, unreleased)
             }
         };
-        self.wait_durable(durable_at, self.class)?;
+        // A lock-free compare first: with everything durable the listing takes no group lock
+        // (engine review 7 #11).
+        if self.group.durable(self.class) < durable_at {
+            self.wait_durable(durable_at, self.class)?;
+        }
         let mut ids = Vec::with_capacity(snapshot.len() as usize);
         let mut work = IdSetWork::default();
         snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
         if !failed.is_empty() {
             ids.retain(|id| !failed.contains(id));
+        }
+        if !unreleased.is_empty() {
+            for id in unreleased {
+                if let Err(at) = ids.binary_search(&id) {
+                    ids.insert(at, id);
+                }
+            }
         }
         Ok(ids)
     }
@@ -5014,6 +5629,43 @@ impl BranchStore {
         if g.pending_full.take().is_some() {
             self.group.cv.notify_all();
         }
+    }
+
+    /// A sync of a trunk file failed (review 6 #2, engine review 9 #2 and #5); `drains`: it was a
+    /// drain of the device (an F_FULLFSYNC on Apple, any sync elsewhere). What that drain covered
+    /// may be lost, and a later successful flush would report it durable. So the store fail-stops,
+    /// as after a failed flight — every waiter, the riders the flush would have made durable among
+    /// them, gets the error — exactly when it holds records the drain could have lost: written and
+    /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
+    /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
+    /// (`pending_full`), or a flight in the air, a fuzzy checkpoint's arena sync included (engine
+    /// review 9 #8: the flight it replaced counted here). With nothing at risk (a D2 store whose
+    /// every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop`
+    /// (it never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops,
+    /// as before engine review 9 #5 in D2).
+    pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
+        if fe_mutant("no_wal_fail_stop") {
+            return;
+        }
+        let mut g = self.group.lock();
+        let full = g.durable[class_index(SyncClass::FullFsync)];
+        let drained = if cfg!(target_vendor = "apple") {
+            full
+        } else {
+            g.durable[class_index(SyncClass::Fsync)].max(full)
+        };
+        let at_risk = (self.class.syncs() && g.durable[0] > drained)
+            || g.ordered > full
+            || g.pending_full.is_some()
+            || g.flushing
+            || g.arena_syncing;
+        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
+        if !stop {
+            return;
+        }
+        tracing::warn!("branch store fail-stopped: a trunk file's sync failed with branch records not yet drained");
+        g.pending_full = None;
+        self.group.fail(&mut g);
     }
 
     pub(crate) fn end_trunk_commit(&self) {
@@ -5273,6 +5925,9 @@ impl BranchStore {
     /// trunk commit in flight; the flight it leads is marked pending until its WAL is synced.
     fn order_for_trunk(&self, lsn: u64) -> Result<()> {
         let full = class_index(SyncClass::FullFsync);
+        // An ordered flight barriers the arena: not taken while a checkpoint syncs it (engine
+        // review 9 #8). Mutant `arena_sync_ungated`.
+        let gated = !fe_mutant("arena_sync_ungated");
         loop {
             {
                 let mut g = self.group.lock();
@@ -5283,7 +5938,8 @@ impl BranchStore {
                     if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    if !g.flushing && !g.cutting {
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
+                    if !blocked {
                         break;
                     }
                     g = self.group.wait(g);
@@ -5298,7 +5954,7 @@ impl BranchStore {
                 if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
-                if g.flushing || g.cutting {
+                if g.flushing || g.cutting || (gated && g.arena_syncing) {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
@@ -5342,8 +5998,16 @@ impl BranchStore {
                 tracing::warn!("branch records not ordered ahead of a trunk WAL flush: {e}");
             }
         }
+        // 0 when everything ordered or fsynced is F_FULLFSYNC-durable already (engine review 9 #5):
+        // nothing rides, so `trunk_wal_synced` has nothing to promote and skips its lock and its
+        // broadcast.
         let g = self.group.lock();
-        g.ordered.max(g.durable[class_index(SyncClass::Fsync)])
+        let frontier = g.ordered.max(g.durable[class_index(SyncClass::Fsync)]);
+        if frontier > g.durable[class_index(SyncClass::FullFsync)] {
+            frontier
+        } else {
+            0
+        }
     }
 
     /// The trunk commit's WAL F_FULLFSYNC returned: every journal byte below `frontier` (read by
@@ -5353,8 +6017,10 @@ impl BranchStore {
             return;
         }
         let mut g = self.group.lock();
-        for c in 0..=class_index(SyncClass::FullFsync) {
-            self.group.set_durable(&mut g, c, frontier);
+        if self.group.accepts() {
+            for c in 0..=class_index(SyncClass::FullFsync) {
+                self.group.set_durable(&mut g, c, frontier);
+            }
         }
         if g.pending_full.is_some_and(|p| p <= frontier) {
             g.pending_full = None;
@@ -5717,10 +6383,48 @@ impl BranchStore {
         }
     }
 
+    /// Test builds: whether operations wait for the fuzzy checkpoint in flight (`over_hard`).
+    #[cfg(test)]
+    pub(crate) fn over_hard_for_test(&self) -> bool {
+        self.over_hard.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the slots deferred frees wait on, read without maturing any (engine review 7
+    /// #7: the accessors that list slots in use mature them first).
+    #[cfg(test)]
+    pub(crate) fn deferred_slots_for_test(&self) -> Vec<Slot> {
+        self.inner.lock().pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect()
+    }
+
+    /// Test builds: whether the arena's own bitmap has `slot` free, read without maturing anything.
+    #[cfg(test)]
+    pub(crate) fn arena_slot_free_for_test(&self, slot: Slot) -> bool {
+        self.inner.lock().arena.as_ref().is_some_and(|a| a.is_free(slot))
+    }
+
+    /// Test builds: this store's arena's `forget_listed` calls (engine review 7 #7).
+    #[cfg(test)]
+    pub(crate) fn forget_listed_for_test(&self) -> u64 {
+        self.inner.lock().arena.as_ref().map_or(0, |a| a.forget_listed)
+    }
+
+    /// Test builds: the class the log's rewrites sync in (the store's, or the raised one).
+    #[cfg(test)]
+    pub(crate) fn rewrite_class_for_test(&self) -> SyncClass {
+        self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::rewrite_class)
+    }
+
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
     #[cfg(test)]
     pub(crate) fn arena_dirty(&self) -> bool {
         self.inner.lock().arena.as_ref().is_some_and(Arena::is_dirty)
+    }
+
+    /// Test builds: the syncs fuzzy checkpoints' threads issued settling their captures before the
+    /// catalog commit (engine review 9 #8; `GroupState::settle_syncs`).
+    #[cfg(test)]
+    pub(crate) fn settle_syncs_for_test(&self) -> u64 {
+        self.group.lock().settle_syncs
     }
 
     pub(crate) fn wait_name_filter(&self) {
@@ -5948,6 +6652,13 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         inner.failpoint = failpoint;
         inner.orphans.clear();
+        // Armed in the journal at once: a replacement's sync may run off the store mutex.
+        if failpoint == Some(BranchFailpoint::ReplacementSyncFails) {
+            inner.failpoint = None;
+            if let Some(journal) = inner.journal.as_ref() {
+                journal.fail_next_replacement_sync();
+            }
+        }
     }
 
     pub(crate) fn failpoint_orphans(&self) -> Vec<u32> {
@@ -6001,17 +6712,50 @@ impl BranchStore {
             .map_or([0; 9], |c| c.ckpt.as_array())
     }
 
+    /// Fuzzy checkpoint starts that failed and backed off (engine review 8 #3; observing only).
+    /// Zero for a store that is not a catalog store.
+    pub(crate) fn checkpoint_start_failures(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.start_failures)
+    }
+
+    /// Test builds: the confirmation writer's wakeups with a word pending (engine review 8 #10).
+    #[cfg(test)]
+    pub(crate) fn confirm_wakeups_for_test(&self) -> u64 {
+        self.group.lock().confirm_wakeups
+    }
+
+    /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
+    /// releases it), and read the hook (`HOLD_ARRIVED` or-ed in once it waits there).
+    #[cfg(test)]
+    pub(crate) fn confirm_hold_for_test(&self, stage: u8) {
+        self.group.confirm_hold.store(stage, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_held_for_test(&self) -> u8 {
+        self.group.confirm_hold.load(Ordering::Acquire)
+    }
+
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
     /// observing only).
     pub(crate) fn confirm_counts(&self) -> [u64; 2] {
-        let g = self.group.lock();
-        [g.confirms_written, g.confirm_failures]
+        [
+            self.group.confirms_written.load(Ordering::Relaxed),
+            self.group.confirm_failures.load(Ordering::Relaxed),
+        ]
     }
 
     /// The log's sequence number: every byte buffered or written so far (tests only).
     #[cfg(test)]
     pub(crate) fn log_lsn_for_test(&self) -> u64 {
         self.inner.lock().journal.as_ref().map_or(0, |j| j.lsn())
+    }
+
+    /// The log file's written length, what the compaction threshold and its back-off measure
+    /// (tests only; engine review 8 #3).
+    #[cfg(test)]
+    pub(crate) fn log_len_for_test(&self) -> u64 {
+        self.inner.lock().journal.as_ref().map_or(0, Journal::log_len)
     }
 
     /// A4.G's G-b red: `start_flight` called directly, past G-a (tests only).
@@ -6047,7 +6791,15 @@ impl BranchStore {
     /// this is not a catalog store).
     pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
-        if inner.cat.is_none() || inner.journal.is_none() || inner.arena.is_none() {
+        // Mutant `plant_premise_only` (test builds only): the mutant runner's planted control
+        // (its flagged-edit judge, 2026-10-06T14:45:43Z). It starts nothing, which trips only the
+        // "premise: a fuzzy checkpoint started" of the test it runs: the runner must read it as
+        // a PREMISE-DEATH, never as killed.
+        if inner.cat.is_none()
+            || inner.journal.is_none()
+            || inner.arena.is_none()
+            || fe_mutant("plant_premise_only")
+        {
             return Ok(false);
         }
         // G-a (r13-compose A2.R4a/A4.G): a splice-arm store takes no fuzzy checkpoint (S-12: a
@@ -6060,7 +6812,7 @@ impl BranchStore {
         Ok(self.start_flight(&mut inner) == FlightStart::Started)
     }
 
-    /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_BEFORE_COMMIT`,
+    /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_FLIGHT_TAKEN`, `HOLD_BEFORE_COMMIT`,
     /// `HOLD_AFTER_COMMIT`) until this is called with another value (0 releases it).
     pub(crate) fn checkpoint_hold(&self, stage: u8) {
         self.flight_hold.store(stage, Ordering::Release);
@@ -6083,6 +6835,8 @@ impl Drop for BranchStore {
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
         self.flight_hold.store(0, Ordering::Release);
+        #[cfg(test)]
+        self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
@@ -6117,9 +6871,13 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
 }
 
 fn name_taken(name: &str) -> LimboError {
-    LimboError::InvalidArgument(format!(
-        "branch name {name:?} already names an unreleased branch"
-    ))
+    LimboError::NameTaken(name.to_string())
+}
+
+/// Branch `id` (named `name`, if it is) already has an open connection (fastest-wire's typed
+/// refusal, `LimboError::BranchInUse`): its name, quoted, or its id.
+fn in_use(id: BranchId, name: Option<&str>) -> LimboError {
+    LimboError::BranchInUse(name.map_or_else(|| id.0.to_string(), |n| format!("{n:?}")))
 }
 
 fn reaped(id: BranchId) -> LimboError {
@@ -6175,7 +6933,8 @@ impl StoreInner {
             stamps: RowStamps::default(),
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),
-            held_synced_free: VecDeque::new(),
+            pending_free_slots: 0,
+            releases_in_air: VecDeque::new(),
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
             fail_stop: Arc::new(AtomicBool::new(false)),
@@ -6235,6 +6994,16 @@ impl StoreInner {
         if let Some(set) = self.live_ids.as_mut() {
             set.insert(id_key(id));
         }
+    }
+
+    /// The Releases applied in memory that are not durable at `durable`, of branches whose fork is:
+    /// a reopen brings each of them back (engine review 7 #3). Mutant
+    /// `poisoned_hides_unflown_release` (test builds only): none, as before.
+    fn unflown_releases(&self, durable: u64) -> impl Iterator<Item = &ReleaseInAir> {
+        let hide = fe_mutant("poisoned_hides_unflown_release");
+        self.releases_in_air
+            .iter()
+            .filter(move |r| !hide && r.lsn > durable && r.fork_lsn <= durable)
     }
 
     /// F-W1: `id` is not listed from now on (a release, durable or not), if the set exists.
@@ -6870,10 +7639,28 @@ impl StoreInner {
             // holds a branch or a retained trunk version has pages of the old size and cannot.
             // (VACUUM and journal-mode changes are refused while a branch exists, so only the
             // empty case is reachable.)
-            let catalog_retains = match self.catalog() {
+            let mut catalog_retains = match self.catalog() {
                 Some(cat) => cat.any_retained()?,
                 None => false,
             };
+            // Rows the next checkpoint deletes (trunk versions reaped since the last one, rows of
+            // removed branches) are not state this store holds (engine review 9 #7): with no
+            // branch and no retained trunk version in memory, that checkpoint is taken now, sharp,
+            // and the catalog asked again. Only on a page-size change. Mutant
+            // `restart_guard_counts_reaped` (test builds only): refused over them, as before.
+            let deletable = self.cat.as_ref().is_some_and(|c| !c.trunk_gone.is_empty() || !c.removed.is_empty());
+            if catalog_retains
+                && deletable
+                && self.n_states == 0
+                && self.trunk.lineage.retained.is_empty()
+                && !fe_mutant("restart_guard_counts_reaped")
+            {
+                self.checkpoint_catalog(false)?;
+                catalog_retains = match self.catalog() {
+                    Some(cat) => cat.any_retained()?,
+                    None => false,
+                };
+            }
             if self.n_states > 0 || !self.trunk.lineage.retained.is_empty() || catalog_retains {
                 return Err(LimboError::InternalError(format!(
                     "branch arena holds {current}-byte pages but the database now uses {page_size}"
@@ -6975,11 +7762,21 @@ impl StoreInner {
             // The catalog's meta row and the log header take the new page size in one checkpoint;
             // the arena is truncated only after it committed.
             let old = self.journal.as_ref().map(Journal::page_size);
+            let committed = self.cat.as_ref().map(|c| c.generation);
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
-            if let Err(e) = self.checkpoint_catalog(false) {
-                if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
+            if let Err(e) = self.checkpoint_catalog_as(false, true) {
+                // Once the catalog committed the new page size, the store cannot go back to the old
+                // one: it fail-stops, and the next open rewrites the log at the new size (engine
+                // review 9 #4). Before the commit, nothing changed on disk, and the old size stays.
+                // Mutant `restart_reverts_after_commit` (test builds only): reverted either way.
+                let landed = self.cat.as_ref().map(|c| c.generation) != committed;
+                if landed && !fe_mutant("restart_reverts_after_commit") {
+                    if let Some(journal) = self.journal.as_mut() {
+                        journal.poison();
+                    }
+                } else if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
                     journal.set_page_size(old);
                 }
                 return Err(e);
@@ -7044,8 +7841,12 @@ impl StoreInner {
         self.arena = Some(arena);
         if !fe_mutant("restart_keeps_deferred") {
             self.pending_free.clear();
-            self.held_synced_free.clear();
+            self.pending_free_slots = 0;
         }
+        // A catalog store's free state needs nothing here (engine review 9 #9): the restart's
+        // checkpoint committed an empty free table (`Captured::fresh_arena`), and its install left
+        // nothing taken and the refill re-armed, so the first allocation reads that empty table
+        // once and takes the new arena's high-water mark.
     }
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
@@ -7060,6 +7861,16 @@ impl StoreInner {
     /// runs the same three steps as a fuzzy checkpoint instead, with the write on its own thread
     /// and no store mutex held across it (F-FZ).
     fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
+        self.checkpoint_catalog_as(fail_after_commit, false)
+    }
+
+    /// `checkpoint_catalog`; with `fresh_arena`, for an empty store's page-size restart, whose arena
+    /// is replaced by an empty one at the new page size once this commits (review 6 #4): no slot of
+    /// the old arena may reach the new one, so the checkpoint commits an empty free table (every
+    /// row deleted, none written) and a high-water mark and in-use count of 0 — exact, since an
+    /// empty store references no slot. Mutant `restart_keeps_free_table` (test builds only): the
+    /// old arena's free slots and high-water mark, as before.
+    fn checkpoint_catalog_as(&mut self, fail_after_commit: bool, fresh_arena: bool) -> Result<()> {
         // The catalog must hold the state the log describes: parked Commits first (C-R).
         self.settle()?;
         if self.journal.is_none() || self.arena.is_none() {
@@ -7076,6 +7887,16 @@ impl StoreInner {
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
+        if fresh_arena && !fe_mutant("restart_keeps_free_table") {
+            cap.fresh_arena = true;
+            cap.free_cursor = None;
+            cap.taken.clear();
+            cap.free_list.clear();
+            cap.reserved.clear();
+            cap.deferred.clear();
+            cap.meta.arena_hw = 0;
+            cap.meta.in_use = 0;
+        }
         kill_point("ckpt.captured");
         let mut w = writer.lock();
         let w0 = w.counters.queries;
@@ -7144,28 +7965,90 @@ impl StoreInner {
         }
         // Consumed below, with the marker that names it.
         let generation = cat.next_generation;
-        let dirty = std::mem::take(&mut cat.dirty);
-        let rows: Vec<(CatBranch, u8)> = dirty
-            .iter()
-            .filter_map(|(id, &what)| self.branches.get(id).map(|st| (id, st, what)))
-            .map(|(&id, st, what)| (CatBranch {
-                id: id.0,
-                parent: st.parent.0,
-                fork_epoch: st.fork_epoch,
-                epoch: st.lineage.epoch,
-                released: st.handle == Handle::Released,
-                held_open: st.handle == Handle::Released && st.open,
-                lease: if st.handle == Handle::Released { None } else { st.lease },
-                n_children: st.lineage.n_children,
-                current: st
-                    .current
-                    .iter()
-                    .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                    .collect(),
-                retained: st.lineage.retained_list(),
-                name: None,
-            }, what))
-            .collect();
+        // Mutant `capture_marker_first` (test builds only): the marker buffered before the
+        // fallible steps, as before review 4 #2.
+        let marker_first = fe_mutant("capture_marker_first");
+        if marker_first {
+            let _ = journal.buffer(&Record::Checkpoint { generation });
+            cat.next_generation += 1;
+        }
+        // Mutant `capture_rows_first` (test builds only): the dirty set taken and its rows built
+        // before the fallible steps, as before engine review 8 #2; a failure then threw that O(dirty)
+        // work away, under this mutex, at every retry.
+        let early = fe_mutant("capture_rows_first").then(|| {
+            let dirty = std::mem::take(&mut cat.dirty);
+            let rows = capture_rows(&self.branches, &dirty);
+            (dirty, rows)
+        });
+        // The capture's fallible steps come before any of its work and before its first effect on
+        // the log (review 4 #2, engine review 8 #2): one that fails has built no row, buffered no
+        // marker and taken no generation, so a persistent fault costs a dup and a read snapshot per
+        // attempt, never O(dirty).
+        // A fuzzy checkpoint's slots are made durable by the group's own flights, which its wait
+        // before the commit waits for or leads in `settle_class` (review 6 #3 (b)): it syncs no
+        // arena beside a flight's sync of the same file, and dups no handle under this mutex. In a
+        // D0 store whose rewrites sync, whose flights sync nothing, it then syncs the arena alone,
+        // under group exclusion (`settle_arena`; engine review 9 #8). A sharp one runs with no
+        // flight in the air and the store mutex held, so it syncs what no flight synced (D0 writes
+        // under a raised log) itself. Either syncs only if a slot was written since the arena's
+        // last sync (lead review 1 item 7(4)). Mutant `checkpoint_own_arena_sync` (test builds
+        // only): the fuzzy one takes its handle too and waits in the log's class, as before
+        // review 6 #3 (b). Mutant `checkpoint_settles_by_flight` (test builds only): a raised D0
+        // one waits in Fsync instead, leading a flight of the group that syncs the arena and the
+        // log, as before engine review 9 #8.
+        let rewrite_syncs = journal.rewrite_class().syncs();
+        let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
+        let raised_d0 = rewrite_syncs && !own_sync && !journal.sync_class().syncs();
+        let by_flight = raised_d0 && fe_mutant("checkpoint_settles_by_flight");
+        let settle_arena = raised_d0 && !by_flight;
+        let settle_class = if by_flight {
+            journal.sync_class().max(SyncClass::Fsync)
+        } else {
+            journal.sync_class()
+        };
+        let arena_file = if own_sync && rewrite_syncs && (arena.is_dirty() || flight_in_air) {
+            let handle = if self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaHandleFails).is_some() {
+                Err(LimboError::InternalError(
+                    "failpoint: the capture's arena handle could not be duplicated".to_string(),
+                ))
+            } else {
+                arena.sync_handle()
+            };
+            match handle {
+                Ok(f) => f,
+                Err(e) => {
+                    if let Some((dirty, _)) = early {
+                        cat.dirty = dirty;
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if arena_file.is_some() {
+            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
+        }
+        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
+            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
+        } else {
+            cat.catalog.begin_read_snapshot()
+        };
+        if let Err(e) = snapshot {
+            if let Some((dirty, _)) = early {
+                cat.dirty = dirty;
+            }
+            return Err(e);
+        }
+        let (dirty, rows) = match early {
+            Some(taken) => taken,
+            None => {
+                let dirty = std::mem::take(&mut cat.dirty);
+                let rows = capture_rows(&self.branches, &dirty);
+                (dirty, rows)
+            }
+        };
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
@@ -7199,39 +8082,6 @@ impl StoreInner {
                 .flat_map(|id| branches[id].pending.values().copied())
                 .collect()
         };
-        // The capture's fallible steps come before its first effect on the log (review 4 #2): one
-        // that fails buffers no marker and takes no generation.
-        // The arena is synced before the catalog commit only if a slot was written since its last
-        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
-        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
-        let rewrite_syncs = journal.rewrite_class().syncs();
-        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
-            match arena.sync_handle() {
-                Ok(f) => f,
-                Err(e) => {
-                    cat.dirty = dirty;
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
-            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
-        } else {
-            cat.catalog.begin_read_snapshot()
-        };
-        // Mutant `capture_marker_first` (test builds only): the marker buffered before the
-        // fallible steps, as before.
-        let marker_first = fe_mutant("capture_marker_first");
-        if marker_first {
-            let _ = journal.buffer(&Record::Checkpoint { generation });
-            cat.next_generation += 1;
-        }
-        if let Err(e) = snapshot {
-            cat.dirty = dirty;
-            return Err(e);
-        }
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if !marker_first {
             if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
@@ -7248,13 +8098,25 @@ impl StoreInner {
         // Before `deferred` is taken, so the mutant leaves none (review 4 #11: it died of a usize
         // underflow in `in_use` below, not of the test's assertion).
         if fe_mutant("deferred_matured_at_capture") {
+            self.pending_free_slots = 0;
             for (_, slots) in std::mem::take(&mut self.pending_free) {
                 for slot in slots {
                     arena.release(slot);
                 }
             }
         }
-        let deferred: Vec<Slot> = self.pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        // Every free still waiting: a raised D0 store's frees written and held for a sync included
+        // (engine review 8 #7: they were in a side list the capture never read, so the catalog
+        // counted them in use, listed none free, and the cut dropped their Release: after a reopen
+        // they were lost). Mutant `capture_skips_held` (test builds only): those left out.
+        let written = journal.lsn() - journal.pending_len();
+        let skip_held = fe_mutant("capture_skips_held");
+        let deferred: Vec<Slot> = self
+            .pending_free
+            .iter()
+            .filter(|&&(lsn, _)| !(skip_held && lsn <= written))
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
         let deferred_lsn = journal.lsn();
         let meta = Meta {
             generation,
@@ -7293,7 +8155,7 @@ impl StoreInner {
             );
         }
         cat.flight = true;
-        let fail_arena_sync = arena_file.is_some()
+        let fail_arena_sync = (arena_file.is_some() || settle_arena)
             && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
         Ok(Box::new(Captured {
             generation,
@@ -7304,6 +8166,7 @@ impl StoreInner {
             trunk_new,
             trunk_gone,
             free_cursor: cat.free_cursor,
+            fresh_arena: false,
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
             reserved,
@@ -7315,7 +8178,8 @@ impl StoreInner {
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
-            log_class: self.journal.as_ref().map_or(self.sync, Journal::sync_class),
+            settle_class,
+            settle_arena,
             fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
             // C-F1, the capture takes the names out of the index.
@@ -7444,13 +8308,15 @@ impl StoreInner {
             // The deferred frees the catalog now lists, still waiting for their flight: free in the
             // catalog, so out of memory (their releases are durable with it). One that matured
             // since the capture is on the in-memory list, and leaves it below like any listed slot.
+            // Only those the capture covers: a release buffered after it is not in the catalog, and
+            // its frees mature on their own. Mutant `install_forgets_after_capture` (test builds
+            // only; review 7 #7 (c)): the install takes those too.
             let mut still_deferred: HashSet<Slot> = HashSet::new();
-            while self
-                .pending_free
-                .front()
-                .is_some_and(|&(lsn, _)| lsn <= cap.deferred_lsn)
-            {
+            while self.pending_free.front().is_some_and(|&(lsn, _)| {
+                lsn <= cap.deferred_lsn || fe_mutant("install_forgets_after_capture")
+            }) {
                 let (_, slots) = self.pending_free.pop_front().expect("just looked");
+                self.pending_free_slots = self.pending_free_slots.saturating_sub(slots.len());
                 for slot in slots {
                     arena.forget_listed(slot);
                     still_deferred.insert(slot);
@@ -7523,37 +8389,36 @@ impl StoreInner {
             return;
         }
         if !freed.is_empty() {
+            self.pending_free_slots += freed.len();
             self.pending_free.push_back((lsn, freed));
         }
     }
 
-    /// Return to the arena every deferred free whose Release is `durable` (in the store's class).
-    /// In D0, where that means only written, a slot a synced record names waits until a sync
-    /// (`synced`, durable in Fsync) covers its Release (review 5 #18).
-    fn mature_frees(&mut self, durable: u64, synced: u64) {
+    /// The class whose durability matures a deferred free (review 5 #18, engine review 8 #5): the
+    /// store's own; but in a D0 store whose log was ever raised (its rewrites sync: a synchronous
+    /// trunk made a record durable, now or before the last open) the rewrite class. A raised
+    /// flight's sync makes the whole log durable, so a record a power cut keeps may name any slot
+    /// such a store frees: the free waits until a sync covers its Release. A D0 store never raised
+    /// keeps nothing across a power cut, and frees what is written. Mutant `d0_frees_at_written`
+    /// (test builds only): the store's class.
+    fn free_class(&self) -> SyncClass {
+        let rewrite = self.journal.as_ref().map_or(self.sync, Journal::rewrite_class);
+        if !self.sync.syncs() && rewrite.syncs() && !fe_mutant("d0_frees_at_written") {
+            rewrite
+        } else {
+            self.sync
+        }
+    }
+
+    /// Return to the arena every deferred free whose Release is `durable` (in the free class).
+    fn mature_frees(&mut self, durable: u64) {
         while self
             .pending_free
             .front()
             .is_some_and(|&(lsn, _)| lsn <= durable)
         {
-            let (lsn, freed) = self.pending_free.pop_front().expect("just looked");
-            let (held, now): (Vec<Slot>, Vec<Slot>) = if self.sync.syncs() || lsn <= synced {
-                (Vec::new(), freed)
-            } else {
-                let arena = self.arena.as_ref().expect("slots were freed, so the arena exists");
-                freed.into_iter().partition(|&slot| arena.is_synced_named(slot))
-            };
-            self.release_slots(now);
-            if !held.is_empty() {
-                self.held_synced_free.push_back((lsn, held));
-            }
-        }
-        while self
-            .held_synced_free
-            .front()
-            .is_some_and(|&(lsn, _)| lsn <= synced)
-        {
-            let (_, freed) = self.held_synced_free.pop_front().expect("just looked");
+            let (_, freed) = self.pending_free.pop_front().expect("just looked");
+            self.pending_free_slots = self.pending_free_slots.saturating_sub(freed.len());
             self.release_slots(freed);
         }
     }
@@ -8609,6 +9474,174 @@ mod tests {
         }
     }
 
+    /// Review 6 #4: a CATALOG store's page-size restart leaves the new arena no slot of the old
+    /// one. Its checkpoint wrote the old arena's free slots (those on the in-memory list, beside the
+    /// free table's rows it had not moved into memory) and the old high-water mark, and the first
+    /// allocation after it took them back from the free table into an arena whose high-water mark
+    /// is 0: an abort (`add_free`'s assert), or, without the assert, slots handed out twice.
+    #[test]
+    fn a_catalog_page_size_restart_leaves_the_new_arena_no_old_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        // Slots 0..4 freed and checkpointed: they are in the catalog's free table. Slots 4..6 freed
+        // since: they are on the in-memory list.
+        for n in [4, 2] {
+            let arena = inner.arena.as_mut().unwrap();
+            let slots: Vec<Slot> = (0..n).map(|_| arena.alloc()).collect();
+            for slot in slots {
+                arena.release(slot);
+            }
+            if n == 4 {
+                inner.checkpoint_catalog(false).unwrap();
+            }
+        }
+        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        let mut seen = HashSet::new();
+        for n in 0..8 {
+            let slot = inner.alloc_slot().unwrap();
+            assert_eq!(slot, n, "the restarted arena handed out slot {slot}, not its high-water mark");
+            assert!(seen.insert(slot), "slot {slot} handed out twice after a page-size restart");
+        }
+    }
+
+    /// Engine review 9 #9 (review 6 #4's durable half): a catalog store's page-size restart COMMITS
+    /// an empty free table and a high-water mark and in-use count of 0, so no later checkpoint or
+    /// open hands an old arena's slot to the new one. The test above allocates only in memory,
+    /// where clearing the refill state there passes it alone; the next checkpoint re-arms the
+    /// refill from the free table, which would then hand back stale rows below the new high-water
+    /// mark, slots in use among them (`add_free` checks only that a slot is below it and not free).
+    /// Here the committed catalog is read, two slots are held across a checkpoint, and the store
+    /// is reopened.
+    #[test]
+    fn a_catalog_page_size_restart_commits_an_empty_free_table() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        {
+            let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+            let mut inner = store.inner.lock();
+            inner.ensure_backing(512).unwrap();
+            // As above: slots 0..4 in the catalog's free table, 4..6 on the in-memory list.
+            for n in [4, 2] {
+                let arena = inner.arena.as_mut().unwrap();
+                let slots: Vec<Slot> = (0..n).map(|_| arena.alloc()).collect();
+                for slot in slots {
+                    arena.release(slot);
+                }
+                if n == 4 {
+                    inner.checkpoint_catalog(false).unwrap();
+                }
+            }
+            inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+            let catalog = inner.catalog().unwrap();
+            assert_eq!(
+                catalog.free_all().unwrap(),
+                Vec::<Slot>::new(),
+                "the restart committed the old arena's free slots"
+            );
+            let meta = catalog.meta().unwrap().expect("premise: the restart committed a meta row");
+            assert_eq!(
+                (meta.arena_hw, meta.in_use),
+                (0, 0),
+                "the restart committed the old arena's high-water mark or in-use count"
+            );
+            // Two slots held across a checkpoint, whose install re-arms the refill from the table.
+            // Written, as a branch's slots are: an open refuses a catalog that counts slots the
+            // arena file does not hold.
+            let held: Vec<Slot> = (0..2).map(|_| inner.alloc_slot().unwrap()).collect();
+            for &slot in &held {
+                inner.arena.as_mut().unwrap().write_slot(slot, &[0u8; 1024]).unwrap();
+            }
+            inner.checkpoint_catalog(false).unwrap();
+            let mut seen: HashSet<Slot> = held.iter().copied().collect();
+            for _ in 0..8 {
+                let slot = inner.alloc_slot().unwrap();
+                assert!(seen.insert(slot), "slot {slot} handed out twice after a restart and a checkpoint");
+            }
+            assert_eq!(
+                seen,
+                (0..10).collect::<HashSet<Slot>>(),
+                "the restarted arena handed out a slot other than its own high-water mark's"
+            );
+        }
+        // What the next open reads: the two held slots are in use in the committed state, and no
+        // stale row lists them free.
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        let free = inner.catalog().unwrap().free_all().unwrap();
+        assert!(free.iter().all(|&s| s >= 2), "after a reopen the free table lists a held slot: {free:?}");
+    }
+
+    /// Engine review 9 #4: a catalog page-size restart whose catalog commit landed and whose log
+    /// rewrite then failed leaves the files a crash between the two leaves too: the catalog at the
+    /// new page size and generation, the old log, at the old page size, behind it. A reopen must
+    /// accept them (nothing follows the new generation's marker in the old log, and the open
+    /// rewrites it at the new page size), and the failed restart must fail-stop, not revert to
+    /// the old page size: the catalog already moved. Before, the open refused them for good ("log
+    /// and catalog disagree on the page size").
+    #[test]
+    fn a_page_size_restart_cut_short_after_its_catalog_commit_reopens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        {
+            let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
+            store.inner.lock().ensure_backing(512).unwrap();
+            store.set_failpoint(Some(BranchFailpoint::ReplacementSyncFails));
+            let mut inner = store.inner.lock();
+            assert!(inner.ensure_backing(1024).is_err(), "premise: the restart's log rewrite failed");
+            assert!(inner.poisoned(), "a restart whose catalog commit landed went on");
+            assert_eq!(
+                inner.journal.as_ref().map(Journal::page_size),
+                Some(1024),
+                "the restart reverted to the old page size though the catalog had moved"
+            );
+        }
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path)
+            .expect("the files a restart cut short after its catalog commit left behind were refused at open");
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        assert_eq!(inner.journal.as_ref().map(Journal::page_size), Some(1024));
+        assert_eq!(inner.alloc_slot().unwrap(), 0, "the reopened arena does not start empty");
+    }
+
+    /// Engine review 9 #7: once its last branch is gone, a catalog store follows a page-size
+    /// change even when its catalog still holds rows the next checkpoint deletes: the trunk
+    /// version kept for a released child and reaped since the last checkpoint. Before, the
+    /// emptiness probe counted those rows and refused the change, and with it every create; replay
+    /// of the logged Releases recreated them at every reopen, so the refusal lasted.
+    #[test]
+    fn a_page_size_restart_is_not_refused_over_rows_the_next_checkpoint_deletes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
+        store.inner.lock().ensure_backing(512).unwrap();
+        let b = store.fork_trunk_locked(Arc::new(Schema::default()), 512).unwrap();
+        // A trunk write while b lives keeps its pre-image for b, in the catalog after a checkpoint.
+        store.first_write_trunk(1, &[7u8; 512]).unwrap();
+        store.compact_now().unwrap();
+        assert!(
+            store.inner.lock().catalog().unwrap().any_retained().unwrap(),
+            "premise: the catalog holds the trunk version kept for b"
+        );
+        store.release_handle(b).unwrap();
+        assert!(
+            store.inner.lock().catalog().unwrap().any_retained().unwrap(),
+            "premise: the reaped trunk version is still in the catalog until the next checkpoint"
+        );
+        let mut inner = store.inner.lock();
+        inner
+            .ensure_backing(1024)
+            .expect("a store with no branch refused a new page size over rows its next checkpoint deletes");
+        assert_eq!(inner.alloc_slot().unwrap(), 0, "the restarted arena does not start empty");
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
@@ -8630,9 +9663,18 @@ mod tests {
     /// opens the arena: snapshot and catalog recovery, a fresh store's first backing, and an empty
     /// store's page-size restart, which reopened the arena unchecked. Hook: every arena reports
     /// another device.
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #13): the hook is process-wide, so every arena opened by a
+    /// neighbouring test while it was armed was refused too; the test runs alone in a fresh process
+    /// (`fork_driver::alone`).
+    #[cfg(unix)]
     #[test]
     fn every_arena_open_refuses_another_device() {
         use std::sync::atomic::Ordering as O;
+        let Some(sentinel) = crate::branch::fork_driver::alone("branch::store::tests::every_arena_open_refuses_another_device")
+        else {
+            return;
+        };
         struct Shifted;
         impl Drop for Shifted {
             fn drop(&mut self) {
@@ -8681,6 +9723,7 @@ mod tests {
                 assert!(refused, "{arm} catalog={catalog}: an arena on another device than the log was taken");
             }
         }
+        crate::branch::fork_driver::finished(&sentinel);
     }
 
     /// Review 5 #13: a branch file that is a symbolic link is refused at open. A rename (a reset, a
@@ -8954,7 +9997,7 @@ impl BranchStore {
 /// retained versions and indexes.
 #[cfg(test)]
 mod sota_index_tests {
-    use super::sota_helpers::{crash_image, image, open_store, Mode, Rng, MODES, PAGE};
+    use super::sota_helpers::{crash_image, image, open_store, splice_arm, Mode, Rng, MODES, PAGE};
     use super::*;
     use std::collections::HashSet;
 
@@ -8984,7 +10027,7 @@ mod sota_index_tests {
         let mut written: HashMap<u32, u64> = HashMap::new();
         let mut epoch = 0u64;
         let mut generation = 0u64;
-        let (mut freed_oldest, mut freed_newest, mut freed_middle, mut images) = (0, 0, 0, 0);
+        let (mut freed_oldest, mut freed_newest, mut freed_middle, mut images, mut fuzzy_images) = (0, 0, 0, 0, 0);
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
@@ -9111,7 +10154,7 @@ mod sota_index_tests {
                 // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
                 // (before or after its catalog commit), the crash image taken while it is held,
                 // and the live store checked again after its install.
-                let held = (mode.catalog() && rng.below(2) == 0)
+                let held = (mode.catalog() && rng.below(2) == 0 && !splice_arm())
                     .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
                 let in_flight = held.is_some_and(|stage| {
                     store.checkpoint_hold(stage);
@@ -9131,6 +10174,7 @@ mod sota_index_tests {
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
                 images += 1;
+                fuzzy_images += u64::from(in_flight);
                 recovered.check_indexes();
                 assert_eq!(
                     recovered.slots_in_use(),
@@ -9145,10 +10189,18 @@ mod sota_index_tests {
                 }
             }
         }
+        // FLAGGED TEST EDIT (engine review 7 #9): the fuzzy arm is gated off in the splice arm (it
+        // refuses fuzzy checkpoints; `checkpoint_fuzzy_now().unwrap()` panicked there), and a catalog
+        // run must have taken a crash image with a fuzzy checkpoint in flight at least once.
         assert!(
-            freed_oldest > 0 && freed_newest > 0 && freed_middle > 0 && (!durable || images > 10),
+            freed_oldest > 0
+                && freed_newest > 0
+                && freed_middle > 0
+                && (!durable || images > 10)
+                && (!durable || !mode.catalog() || splice_arm() || fuzzy_images > 0),
             "{mode:?} seed {seed:#x}: reaps that freed versions: oldest {freed_oldest}, newest \
-             {freed_newest}, middle {freed_middle}; crash images {images}"
+             {freed_newest}, middle {freed_middle}; crash images {images} ({fuzzy_images} with a fuzzy \
+             checkpoint in flight)"
         );
         for (id, _, _) in live {
             store.release_handle(id).unwrap();
@@ -9166,7 +10218,7 @@ mod sota_index_tests {
 /// branch must read every page as before, from the same slot set, with consistent indexes.
 #[cfg(test)]
 mod sota_tree_tests {
-    use super::sota_helpers::{crash_image, image, open_store, Mode, Rng, MODES, PAGE};
+    use super::sota_helpers::{crash_image, image, open_store, splice_arm, Mode, Rng, MODES, PAGE};
     use super::*;
 
     const PAGES: u32 = 6;
@@ -9176,6 +10228,7 @@ mod sota_tree_tests {
     /// a WAL flush that never comes left `pending_full` set, and a waiter its flight covered then
     /// stalled for the pending-full wait before leading its own flush. Here that wait is 60 s, so a
     /// stall cannot pass for a slow sync.
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_commit_whose_wal_is_not_full_fsynced_orders_nothing() {
         use std::sync::atomic::Ordering as O;
@@ -9193,6 +10246,9 @@ mod sota_tree_tests {
         let _x = store.fork_trunk_locked(Arc::new(Schema::default()), PAGE).unwrap();
         // The trunk's WAL on the branch files' device, as an F_FULLFSYNC-capable file reports it.
         store.note_trunk_wal(Some(store.files_dev.load(O::Acquire)));
+        // FLAGGED TEST EDIT (engine review 8 #14): the premise that this store orders at all (Apple,
+        // the WAL on the branch files' device): off Apple nothing orders, and the test proved nothing.
+        assert!(store.ordered_trunk(), "premise: the store takes the ordered path for a FULLFSYNC trunk");
         let lsn = {
             let mut inner = store.inner.lock();
             store.buffer_records(&mut inner, &[Record::Clock { now_ms: 7 }]).unwrap()
@@ -9282,7 +10338,7 @@ mod sota_tree_tests {
         let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut nodes: Vec<Node> = Vec::new();
         let mut generation = 0u64;
-        let (mut deferred, mut max_depth, mut wrote_after_fork, mut images) = (0, 0, 0, 0);
+        let (mut deferred, mut max_depth, mut wrote_after_fork, mut images, mut fuzzy_images) = (0, 0, 0, 0, 0);
         for step in 0..2500 {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
@@ -9381,7 +10437,7 @@ mod sota_tree_tests {
                 // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
                 // (before or after its catalog commit), the crash image taken while it is held,
                 // and the live store checked again after its install.
-                let held = (mode.catalog() && rng.below(2) == 0)
+                let held = (mode.catalog() && rng.below(2) == 0 && !splice_arm())
                     .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
                 let in_flight = held.is_some_and(|stage| {
                     store.checkpoint_hold(stage);
@@ -9401,6 +10457,7 @@ mod sota_tree_tests {
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
                 images += 1;
+                fuzzy_images += u64::from(in_flight);
                 recovered.check_indexes();
                 assert_eq!(
                     recovered.slots_in_use(),
@@ -9416,10 +10473,17 @@ mod sota_tree_tests {
             }
         }
         // The shapes the page maps exist for must have occurred, or a green run says nothing.
+        // FLAGGED TEST EDIT (engine review 7 #9): no fuzzy arm in the splice arm, and a catalog run's
+        // crash images include one with a fuzzy checkpoint in flight.
         assert!(
-            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0 && (!durable || images > 20),
+            max_depth >= 10
+                && deferred > 0
+                && wrote_after_fork > 0
+                && (!durable || images > 20)
+                && (!durable || !mode.catalog() || splice_arm() || fuzzy_images > 0),
             "{mode:?} seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
-             after its first fork {wrote_after_fork}, crash images {images}"
+             after its first fork {wrote_after_fork}, crash images {images} ({fuzzy_images} with a fuzzy \
+             checkpoint in flight)"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id).unwrap();
@@ -9650,3 +10714,78 @@ mod sota_tree_tests {
         assert!(max_depth >= 10, "{mode:?} seed {seed:#x}: max depth {max_depth}");
     }
 }
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
+    /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
+    /// of its own, and the log's last flight is now it: the earlier word, written into page 0 by
+    /// the confirmation writer, could never match it. Mutant `ordered_keeps_confirm`.
+    #[test]
+    fn an_ordered_landing_leaves_no_earlier_confirmation_to_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(
+            group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log, true))),
+            "premise: the synced flight landed"
+        );
+        assert!(group.lock().confirm.is_some(), "premise: its confirmation is queued");
+        group.lock().flushing = true;
+        group.land_ordered(20, true);
+        assert_eq!(group.durable(SyncClass::Off), 20, "premise: the ordered flight landed");
+        assert!(
+            group.lock().confirm.is_none(),
+            "an ordered landing left an earlier flight's confirmation to be written"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_stop_tests {
+    use super::*;
+
+    /// Review 6 #3: once the store is fail-stopped, nothing becomes durable in this process, however
+    /// the fail-stop was raised. A flight already in the air when it was raised outside the flight
+    /// (a checkpoint's failed arena sync, a failed trunk WAL sync) landed as if durable: its sync can
+    /// return 0 after another descriptor's fsync consumed the error (Linux errseq is per open file
+    /// description), and on every platform an acknowledgement after a fail-stop breaks the store's
+    /// own contract. So does an ordered landing, a rewrite's mark, and a trunk WAL flush's.
+    #[test]
+    fn nothing_becomes_durable_after_a_fail_stop() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let group = Group::new(10, failed.clone());
+        let durable = |g: &Group| [SyncClass::Off, SyncClass::Fsync, SyncClass::FullFsync].map(|c| g.durable(c));
+        group.lock().flushing = true;
+        // Raised outside the flight, as a checkpoint's arena sync or a trunk WAL sync raises it.
+        failed.store(true, Ordering::Release);
+        group.land(20, SyncClass::FullFsync, true, None);
+        assert_eq!(durable(&group), [10; 3], "a flight in the air landed durable after the fail-stop");
+        group.lock().flushing = true;
+        group.land_ordered(30, true);
+        assert_eq!(durable(&group), [10; 3], "an ordered flight landed after the fail-stop");
+        group.mark_durable(40, SyncClass::FullFsync);
+        assert_eq!(durable(&group), [10; 3], "a rewrite marked bytes durable after the fail-stop");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let store = BranchStore::open(
+            BranchDurability::Durable { sync: SyncClass::FullFsync },
+            None,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let before = store.group.durable(SyncClass::FullFsync);
+        store.group.failed.store(true, Ordering::Release);
+        store.trunk_wal_synced(before + 1000);
+        assert_eq!(
+            store.group.durable(SyncClass::FullFsync),
+            before,
+            "a trunk WAL flush made branch bytes durable after the fail-stop"
+        );
+    }
+}
+

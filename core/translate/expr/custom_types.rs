@@ -75,13 +75,26 @@ pub(super) fn emit_custom_type_operator(
                 dst_reg: col_dst,
                 extra_amount: 0,
             });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
+            // Encode the literal (or the bound parameter) into the fresh function arg slot. A
+            // user type's comparison operand is coerced to the type WITHOUT the column's
+            // parameters, each bound to NULL (PostgreSQL's typmod -1): a value longer than a
+            // length-checked column's length then compares, false, instead of raising 'value too
+            // long' (fastest-wire, 6b). Its ENCODE takes a NULL parameter as unconstrained. A
+            // built-in type keeps its column's parameters (numeric's encode needs them). Mutant
+            // `comparison_encodes_with_params` (test builds only): the column's, as before.
+            let params = if encode_info.type_def.is_builtin
+                || crate::branch::store::fe_mutant("comparison_encodes_with_params")
+            {
+                TypeParams::Column(&encode_info.column)
+            } else {
+                TypeParams::Unconstrained
+            };
+            emit_type_expr_with(
                 program,
                 encode_expr,
                 lit_tmp,
                 lit_dst,
-                &encode_info.column,
+                params,
                 &encode_info.type_def,
                 resolver,
             )?;
@@ -276,47 +289,56 @@ pub(super) fn find_custom_type_operator(
         return None;
     }
 
-    // Case 2: LHS is custom type, RHS is a compatible literal.
+    // Case 2: LHS is custom type, RHS is a compatible literal or a bound parameter.
     if let Some(ref lhs) = lhs_info {
-        if let Some(lit_type) = literal_type_name(e2) {
-            if literal_compatible_with_value_type(lit_type, lhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: lhs.column.clone(),
-                            type_def: lhs.type_def.clone(),
-                            which: EncodeArg::Second,
-                        }),
-                    });
-                }
+        if operand_compatible(e2, lhs.type_def.value_input_type()) {
+            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
+                return Some(ResolvedOperator {
+                    func_name,
+                    swap_args,
+                    negate,
+                    encode_info: Some(OperatorEncodeInfo {
+                        column: lhs.column.clone(),
+                        type_def: lhs.type_def.clone(),
+                        which: EncodeArg::Second,
+                    }),
+                });
             }
         }
     }
 
-    // Case 3: RHS is custom type, LHS is a compatible literal (reversed).
+    // Case 3: RHS is custom type, LHS is a compatible literal or a bound parameter (reversed).
     if let Some(ref rhs) = rhs_info {
-        if let Some(lit_type) = literal_type_name(e1) {
-            if literal_compatible_with_value_type(lit_type, rhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: rhs.column.clone(),
-                            type_def: rhs.type_def.clone(),
-                            which: EncodeArg::First,
-                        }),
-                    });
-                }
+        if operand_compatible(e1, rhs.type_def.value_input_type()) {
+            if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
+                return Some(ResolvedOperator {
+                    func_name,
+                    swap_args,
+                    negate,
+                    encode_info: Some(OperatorEncodeInfo {
+                        column: rhs.column.clone(),
+                        type_def: rhs.type_def.clone(),
+                        which: EncodeArg::First,
+                    }),
+                });
             }
         }
     }
 
     None
+}
+
+/// Whether `expr` may be passed, encoded, to an operator of a custom type whose `value` input type
+/// is `value_input_type`: a literal of a compatible type, or a bound parameter, whose value's type
+/// is known only when it runs (fastest-wire, wire review 2 item 3: a parameter got the plain
+/// comparison, so `code = $1` from every extended-protocol client missed what the literal finds).
+/// Its encoding then checks it as a literal's would. Mutant `param_skips_type_operator` (test
+/// builds only): a parameter is not one, as before.
+fn operand_compatible(expr: &ast::Expr, value_input_type: &str) -> bool {
+    if matches!(expr, ast::Expr::Variable(_)) {
+        return !crate::branch::store::fe_mutant("param_skips_type_operator");
+    }
+    literal_type_name(expr).is_some_and(|t| literal_compatible_with_value_type(t, value_input_type))
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -510,6 +532,31 @@ pub(crate) fn emit_type_expr(
     type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let params = TypeParams::Column(column);
+    emit_type_expr_with(
+        program, expr, value_reg, dest_reg, params, type_def, resolver,
+    )
+}
+
+/// Where a type expression's parameters come from (`emit_type_expr_with`).
+#[derive(Clone, Copy)]
+pub(super) enum TypeParams<'a> {
+    /// The column's own (`column.ty_params`, by position).
+    Column(&'a Column),
+    /// None: each bound to NULL, as PostgreSQL coerces a comparison operand with no typmod.
+    Unconstrained,
+}
+
+/// `emit_type_expr`, with the parameters taken from `params`.
+pub(super) fn emit_type_expr_with(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    value_reg: usize,
+    dest_reg: usize,
+    params: TypeParams<'_>,
+    type_def: &TypeDef,
+    resolver: &Resolver,
+) -> Result<usize> {
     // Set up value override
     program
         .id_register_overrides
@@ -522,12 +569,26 @@ pub(crate) fn emit_type_expr(
         // against the user-provided ty_params by position.
         let user_params: Vec<_> = type_def.user_params().collect();
         for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = column.ty_params.get(i) {
-                let reg = program.alloc_register();
-                translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
+            match params {
+                TypeParams::Column(column) => {
+                    if let Some(param_expr) = column.ty_params.get(i) {
+                        let reg = program.alloc_register();
+                        translate_expr(program, None, param_expr, reg, resolver)?;
+                        program
+                            .id_register_overrides
+                            .insert(param.name.clone(), reg);
+                    }
+                }
+                TypeParams::Unconstrained => {
+                    let reg = program.alloc_register();
+                    program.emit_insn(Insn::Null {
+                        dest: reg,
+                        dest_end: None,
+                    });
+                    program
+                        .id_register_overrides
+                        .insert(param.name.clone(), reg);
+                }
             }
         }
         Ok(())
@@ -602,4 +663,103 @@ pub(crate) fn emit_trigger_decode_registers(
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value, IO};
+    use std::sync::Arc;
+
+    fn open() -> Arc<crate::Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    fn count(conn: &Arc<crate::Connection>, sql: &str, param: Option<Value>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare(sql)?;
+        if let Some(value) = param {
+            stmt.bind_at(1.try_into().unwrap(), value)?;
+        }
+        let rows = stmt.run_collect_rows()?;
+        Ok(rows[0][0].as_int().expect("a count"))
+    }
+
+    /// fastest-wire (wire review 2 item 3, 6b (a)): a bound parameter compared with a custom-type
+    /// column got the plain comparison, not the type's operator, so a numeric column (stored
+    /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
+    /// as a literal of the type's value input type: encoded and passed to the operator. Mutant
+    /// `param_skips_type_operator`.
+    #[test]
+    fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5)").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE x = 1.5", None).unwrap(),
+            1,
+            "premise: the literal finds the row"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM t WHERE x = ?1",
+                Some(Value::from_f64(1.5))
+            )
+            .unwrap(),
+            1,
+            "a bound parameter did not find the row the same literal finds"
+        );
+    }
+
+    /// fastest-wire (6b (b)): a comparison operand was encoded with the column's own parameters,
+    /// so a value longer than a length-checked type's length raised 'value too long' where
+    /// PostgreSQL compares (a comparison operand is coerced to the type with no typmod) and answers
+    /// false. A user type's comparison operand is now encoded with its parameters NULL, and its
+    /// ENCODE takes a NULL parameter as unconstrained. Mutant `comparison_encodes_with_params`.
+    #[test]
+    fn an_over_length_comparison_operand_compares_instead_of_raising() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' glob",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        assert!(
+            conn.execute("INSERT INTO t VALUES (2, 'abcdef')").is_err(),
+            "premise: the column's own length check refuses an over-length value"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None).unwrap(),
+            1,
+            "premise: equal finds it"
+        );
+        let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
+        assert!(
+            matches!(literal, Ok(0)),
+            "an over-length literal raised or matched: {literal:?}"
+        );
+        let param = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("abcdef")),
+        );
+        assert!(
+            matches!(param, Ok(0)),
+            "an over-length parameter raised or matched: {param:?}"
+        );
+    }
 }

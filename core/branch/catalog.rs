@@ -293,6 +293,9 @@ impl Stmt {
         let rows = rows?;
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
+        // fastest-budgets instrument (test builds): catalog statements per thread, every connection.
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false, rows.len() as u64);
         Ok(rows)
     }
 
@@ -313,6 +316,8 @@ impl Stmt {
         ran?;
         counters.queries += 1;
         counters.rows_read += n;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false, n);
         Ok(())
     }
 
@@ -327,6 +332,8 @@ impl Stmt {
         done?;
         counters.queries += 1;
         counters.rows_written += 1;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(true, 1);
         Ok(())
     }
 }
@@ -1418,6 +1425,12 @@ impl Catalog {
 
     pub(crate) fn free_delete_upto(&mut self, slot: Slot) -> Result<()> {
         self.free_del_upto.exec(&[int(slot as u64)], &mut self.counters)
+    }
+
+    /// Delete every row of the free table (an empty store's page-size restart; engine review 9
+    /// #9): every slot is at or below `Slot::MAX`, so the prepared range delete covers them all.
+    pub(crate) fn free_clear(&mut self) -> Result<()> {
+        self.free_delete_upto(Slot::MAX)
     }
 
     pub(crate) fn free_delete(&mut self, slot: Slot) -> Result<()> {
