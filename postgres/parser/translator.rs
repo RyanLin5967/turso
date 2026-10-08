@@ -1619,6 +1619,20 @@ impl PostgreSQLTranslator {
                     "table name \"{target}\" specified more than once"
                 )));
             }
+            // RETURNING returns the target's columns only: a reference to a USING relation, or a
+            // `*` (which PostgreSQL widens to the USING columns), is refused rather than answered
+            // 42703 or short (wire review 11 item 13).
+            if delete
+                .returning_list
+                .iter()
+                .any(|t| returning_reads_beyond(t, &names))
+            {
+                return Err(ParseError::ParseError(
+                    "DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is \
+                     not supported: return the target's columns"
+                        .into(),
+                ));
+            }
             let mut items = vec![pg_query::protobuf::Node {
                 node: Some(pg_query::protobuf::node::Node::RangeVar(relation.clone())),
             }];
@@ -5816,6 +5830,26 @@ pub struct PgBranchCall {
     /// The function name, lower-cased, e.g. `turso_branch_create`.
     pub function: String,
     pub args: Vec<PgBranchArg>,
+}
+
+/// Whether a RETURNING target reads past the target of a DELETE ... USING: a bare `*`, or any
+/// column reference qualified by one of the USING items' names (`k.flag`, `k.*`).
+fn returning_reads_beyond(target: &pg_query::protobuf::Node, using_names: &[String]) -> bool {
+    use pg_query::protobuf::node::Node;
+    let Some(node) = target.node.as_ref() else {
+        return false;
+    };
+    node.nodes().iter().any(|(r, ..)| {
+        let pg_query::NodeRef::ColumnRef(c) = r else {
+            return false;
+        };
+        let field = |i: usize| c.fields.get(i).and_then(|f| f.node.as_ref());
+        match (c.fields.len(), field(0)) {
+            (1, Some(Node::AStar(_))) => true,
+            (n, Some(Node::String(s))) if n >= 2 => using_names.iter().any(|u| *u == s.sval),
+            _ => false,
+        }
+    })
 }
 
 /// The names a FROM item makes visible (its alias, else a table's name; a join's both sides and its
