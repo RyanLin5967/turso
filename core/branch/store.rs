@@ -10738,6 +10738,32 @@ mod group_tests {
             "an ordered landing left an earlier flight's confirmation to be written"
         );
     }
+
+    /// Engine review 12 MED 1: an ordered upgrade flight that carried no frame (a D1 store on Apple
+    /// under a FULL trunk: a trunk commit's barrier floor over bytes already landed) does not move
+    /// the log's last flight, so the queued word still matches it and must still be written. Taking
+    /// it left the tail unconfirmed at a clean close, and the next open cut a damaged slot in that
+    /// flight silently instead of refusing it. Mutant `ordered_upgrade_drops_confirm`.
+    #[test]
+    fn a_frameless_ordered_upgrade_keeps_the_last_flights_confirmation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(
+            group.land(10, SyncClass::Fsync, true, Some(Confirm::for_test(log, false))),
+            "premise: the synced flight landed"
+        );
+        assert!(group.lock().confirm.is_some(), "premise: its confirmation is queued");
+        group.lock().flushing = true;
+        // The upgrade flight ends where the synced one did: it carried no frame.
+        group.land_ordered(10, true);
+        assert_eq!(group.lock().ordered, 10, "premise: the ordered flight landed");
+        assert!(
+            group.lock().confirm.is_some(),
+            "a frameless ordered upgrade dropped the last flight's confirmation"
+        );
+    }
 }
 
 #[cfg(test)]
