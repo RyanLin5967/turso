@@ -693,15 +693,16 @@ mod tests {
     /// fastest-wire (6b (b)): a comparison operand was encoded with the column's own parameters,
     /// so a value longer than a length-checked type's length raised 'value too long' where
     /// PostgreSQL compares (a comparison operand is coerced to the type with no typmod) and answers
-    /// false. A user type's comparison operand is now encoded with its parameters NULL, and its
-    /// ENCODE takes a NULL parameter as unconstrained. Mutant `comparison_encodes_with_params`.
+    /// false. The operand now reaches the type's operator as given, never encoded (engine review 14
+    /// HIGH 1). The type's '=' is `instr`, which finds what a plain '=' does not ('b' in 'abc'), so
+    /// the test sees that a literal and a parameter reach it. Mutant `operand_keeps_column_typmod`.
     #[test]
     fn an_over_length_comparison_operand_compares_instead_of_raising() {
         let conn = open();
         conn.execute(
             "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
              THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
-             for type tag') END DECODE value OPERATOR '=' glob",
+             for type tag') END DECODE value OPERATOR '=' instr",
         )
         .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v tag(3)) STRICT")
@@ -715,6 +716,20 @@ mod tests {
             count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None).unwrap(),
             1,
             "premise: equal finds it"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE v = 'b'", None).unwrap(),
+            1,
+            "premise: a literal reaches the type's '=' (instr), where a plain '=' finds nothing"
+        );
+        let inner = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("b")),
+        );
+        assert!(
+            matches!(inner, Ok(1)),
+            "premise: a parameter reaches the type's '=': {inner:?}"
         );
         let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
         assert!(
