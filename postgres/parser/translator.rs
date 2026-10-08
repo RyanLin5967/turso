@@ -1564,43 +1564,71 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation);
 
-        // DELETE ... USING u WHERE c deletes the target's rows that join a row of u: the engine has
-        // no USING, so it is DELETE ... WHERE EXISTS (SELECT 1 FROM u WHERE c), c's references to
-        // the target correlating to it. The USING clause was dropped, so the WHERE ran against the
-        // target alone and deleted more (wire review 7 item 18).
+        // DELETE FROM t [AS x] USING u WHERE c deletes the target's rows that join a row of u. The
+        // engine has no USING, so it is DELETE FROM t WHERE rowid IN (SELECT x.rowid FROM t [AS x],
+        // u WHERE c): the target and the USING items in ONE namespace, as PostgreSQL reads them, so
+        // a bare name both have is ambiguous (42702). The USING clause was dropped, so the WHERE ran
+        // against the target alone and deleted more (wire review 7 item 18); then translated as
+        // EXISTS (SELECT 1 FROM u WHERE c), a bare name bound to u alone, and `id = 2` deleted every
+        // target row (wire review 11 item 4).
         let where_clause = if delete.using_clause.is_empty() {
             match &delete.where_clause {
                 Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
                 None => None,
             }
         } else {
+            let target = relation
+                .alias
+                .as_ref()
+                .filter(|a| !a.aliasname.is_empty())
+                .map_or(relation.relname.as_str(), |a| a.aliasname.as_str());
+            let mut names = Vec::new();
+            for item in &delete.using_clause {
+                from_item_refnames(item, &mut names);
+            }
+            if names.iter().any(|n| n == target) {
+                return Err(ParseError::ParseError(format!(
+                    "table name \"{target}\" specified more than once"
+                )));
+            }
+            let mut items = vec![pg_query::protobuf::Node {
+                node: Some(pg_query::protobuf::node::Node::RangeVar(relation.clone())),
+            }];
+            items.extend(delete.using_clause.iter().cloned());
             let (from, where_clause) = self.in_select_scope(|| {
-                let from = self.translate_from_items(&delete.using_clause)?;
+                let from = self.translate_from_items(&items)?;
                 let where_clause = match &delete.where_clause {
                     Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
                     None => None,
                 };
                 Ok((from, where_clause))
             })?;
-            Some(Box::new(ast::Expr::Exists(ast::Select {
-                with: None,
-                body: ast::SelectBody {
-                    select: ast::OneSelect::Select {
-                        distinctness: None,
-                        columns: vec![ast::ResultColumn::Expr(
-                            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
-                            None,
-                        )],
-                        from: Some(from),
-                        where_clause,
-                        group_by: None,
-                        window_clause: vec![],
+            Some(Box::new(ast::Expr::InSelect {
+                lhs: Box::new(ast::Expr::Id(ast::Name::from_string("rowid"))),
+                not: false,
+                rhs: ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ast::ResultColumn::Expr(
+                                Box::new(ast::Expr::Qualified(
+                                    ast::Name::from_string(target),
+                                    ast::Name::from_string("rowid"),
+                                )),
+                                None,
+                            )],
+                            from: Some(from),
+                            where_clause,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
                     },
-                    compounds: vec![],
+                    order_by: vec![],
+                    limit: None,
                 },
-                order_by: vec![],
-                limit: None,
-            })))
+            }))
         };
 
         let returning = self.translate_returning(&delete.returning_list)?;
@@ -2078,8 +2106,9 @@ impl PostgreSQLTranslator {
             };
             columns.push(((alias.aliasname.clone(), name), expr));
         }
-        // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM, DELETE ...
-        // USING) has none, and is refused rather than left reading names nothing maps.
+        // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM) has none, and
+        // is refused rather than left reading names nothing maps. DELETE ... USING is read inside
+        // its rewrite's SELECT (translate_delete).
         let mut scopes = self.lateral_scopes.borrow_mut();
         let scope = scopes.last_mut().ok_or_else(refuse)?;
         scope.names.insert(alias.aliasname.clone());
@@ -2284,9 +2313,9 @@ impl PostgreSQLTranslator {
                 })
             });
             if reads_columns {
-                // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM,
-                // DELETE ... USING) has none, and is refused rather than left reading a column
-                // the engine names otherwise.
+                // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM)
+                // has none, and is refused rather than left reading a column the engine names
+                // otherwise. DELETE ... USING is read inside its rewrite's SELECT.
                 let mut scopes = self.lateral_scopes.borrow_mut();
                 let scope = scopes.last_mut().ok_or_else(|| {
                     ParseError::ParseError(
@@ -5744,6 +5773,31 @@ pub struct PgBranchCall {
     /// The function name, lower-cased, e.g. `turso_branch_create`.
     pub function: String,
     pub args: Vec<PgBranchArg>,
+}
+
+/// The names a FROM item makes visible (its alias, else a table's name; a join's both sides and its
+/// own alias), for PostgreSQL's "table name specified more than once" (42712).
+fn from_item_refnames(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
+    use pg_query::protobuf::node::Node;
+    let alias = |a: &Option<pg_query::protobuf::Alias>| {
+        a.as_ref()
+            .filter(|a| !a.aliasname.is_empty())
+            .map(|a| a.aliasname.clone())
+    };
+    match item.node.as_ref() {
+        Some(Node::RangeVar(r)) => names.push(alias(&r.alias).unwrap_or_else(|| r.relname.clone())),
+        Some(Node::RangeSubselect(r)) => names.extend(alias(&r.alias)),
+        Some(Node::RangeFunction(r)) => names.extend(alias(&r.alias)),
+        Some(Node::JoinExpr(j)) => match alias(&j.alias) {
+            Some(a) => names.push(a),
+            None => {
+                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                    from_item_refnames(side, names);
+                }
+            }
+        },
+        _ => {}
+    }
 }
 
 /// Recognise a branch function call (see [`PgBranchCall`]). Arguments may be string, boolean or

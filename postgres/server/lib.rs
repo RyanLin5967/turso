@@ -2192,6 +2192,7 @@ fn sqlstate(e: &LimboError) -> &'static str {
             "42702"
         }
         LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
+        LimboError::ParseError(m) if m.contains("specified more than once") => "42712",
         LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
             "0A000"
         }
