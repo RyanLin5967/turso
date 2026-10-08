@@ -4629,6 +4629,13 @@ impl crate::io::File for FailWalSyncFile {
                 *self.held.lock().unwrap() = Some(c.clone());
                 Ok(c)
             }
+            // This sync passes; the next one fails as mode 1 does (a site after another sync).
+            4 => {
+                if let Some(a) = self.armed.as_ref() {
+                    a.store(1, std::sync::atomic::Ordering::Release);
+                }
+                self.inner.sync(c, sync_type)
+            }
             _ => self.inner.sync(c, sync_type),
         }
     }
@@ -4757,6 +4764,52 @@ fn every_trunk_wal_sync_failure_site_fail_stops_on_its_own() {
             assert!(after.barrier > before.barrier, "{what}: premise: the commit's pre-image was ordered, not flushed");
             assert_fail_stopped(db.connect().unwrap().fork_branch().map(|x| x.into_id()), &format!("{what}: the next fork"));
             drop(b);
+        }
+    }
+}
+
+/// Engine review 10 #5: the trunk WAL syncs issued inside the WAL itself and at shutdown were not
+/// acted on: a checkpoint's sync of the WAL before its backfill (every autocheckpoint that
+/// backfills), a TRUNCATE checkpoint's sync of the truncated log, and the last connection's
+/// shutdown sync. Each fails through `?` past the pager's noted sync, so a failed drain of the
+/// device that holds branch records written and not yet drained (a D1 fork, plain-fsynced on
+/// Apple) left the store running, and the next commit's flush could promote them. Each site
+/// fail-stops the store on its own. Mutants (test builds only): `checkpoint_sync_unwatched`,
+/// `truncate_sync_unwatched`, `shutdown_sync_unwatched`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn every_wal_internal_trunk_sync_failure_fail_stops() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for (site, mode) in [("checkpoint", 1u8), ("truncate", 4), ("shutdown", 1)] {
+            let what = format!("catalog={catalog} site={site}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let (db, armed) = open_failing_wal(&dir.path().join("walinternal.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+            // Frames in the WAL, then a D1 fork: written and plain-fsynced, not drained.
+            trunk.execute("UPDATE t SET v = 'walled' WHERE id = 7").unwrap();
+            let _b = trunk.fork_branch().unwrap().into_id();
+            crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+            armed.store(mode, std::sync::atomic::Ordering::Release);
+            let failed = match site {
+                "checkpoint" => trunk.execute("PRAGMA wal_checkpoint(PASSIVE)").map(|_| ()),
+                "truncate" => trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").map(|_| ()),
+                _ => trunk.close(),
+            };
+            assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the armed sync was reached");
+            assert_eq!(
+                crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+                site,
+                "{what}: premise: the failure reached its site"
+            );
+            assert!(failed.is_err(), "{what}: premise: the failed sync failed its statement");
+            assert_fail_stopped(
+                db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+                &format!("{what}: the next fork after a failed WAL-internal drain"),
+            );
         }
     }
 }

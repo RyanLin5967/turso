@@ -5790,6 +5790,7 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
+            super::wal::wal_sync_site("shutdown");
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }

@@ -616,6 +616,21 @@ trait WalCoordination: Debug + Send + Sync {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: the trunk WAL sync site this thread issued a sync at last (engine review 10 #5:
+    /// a site test names the site its failure reached). Observation only.
+    pub(crate) static WAL_SYNC_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// A trunk WAL sync is issued at `site` (test builds: `WAL_SYNC_SITE`; nothing otherwise).
+#[inline]
+pub(crate) fn wal_sync_site(site: &'static str) {
+    #[cfg(test)]
+    WAL_SYNC_SITE.with(|s| s.set(site));
+    let _ = site;
+}
+
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
@@ -4921,6 +4936,7 @@ impl WalFile {
                 // drops the unsynced WAL tail — a torn database that matches
                 // no committed prefix.
                 CheckpointState::SyncWal => {
+                    wal_sync_site("checkpoint");
                     let c = self.sync(pager.get_sync_type())?;
                     self.ongoing_checkpoint.write().state = CheckpointState::Processing;
                     io_yield_one!(c);
@@ -5243,6 +5259,7 @@ impl WalFile {
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
+            wal_sync_site("truncate");
             let c = file.sync(
                 Completion::new_sync(move |res| {
                     if let Err(err) = res {
