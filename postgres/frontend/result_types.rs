@@ -184,8 +184,7 @@ pub struct StatementTypes {
     pub used: Vec<u32>,
 }
 
-/// The highest parameter number a statement may hold: Bind counts parameters in 16 bits.
-pub const MAX_PARAMETER: u32 = 65535;
+pub use turso_pg_parser::MAX_PARAMETER;
 
 /// The type PostgreSQL infers for each parameter the client did not declare, from its context
 /// (docs, "Prepared statements": the parameter's type is inferred from where it is used): the

@@ -276,8 +276,16 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
                 while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
+                // More than five digits, or a number outside 1..=MAX_PARAMETER, is for
+                // libpg_query to read: [`try_extract_branch_call`] makes no call of a number out of
+                // range, so the ordinary prepare refuses it (42P02; wire review 9 item 1).
+                if i - start > 5 {
+                    return None;
+                }
                 let n: usize = sql[start..i].parse().ok()?;
-                if n == 0 || (i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_')) {
+                if !(1..=turso_pg_parser::MAX_PARAMETER as usize).contains(&n)
+                    || (i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_'))
+                {
                     return None;
                 }
                 PgBranchArg::Param(n)

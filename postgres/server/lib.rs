@@ -2027,6 +2027,29 @@ fn stats_fields(format: &Format) -> Vec<FieldInfo> {
         .collect()
 }
 
+/// A branch call's parameters as a parse types them: each `$n` it holds is text (a branch name),
+/// so Describe answers what [`parameter_types`] answers for any statement, a gap below the highest
+/// $n included (42P18). Describe sized the list by the highest $n with no limit, so one client's
+/// `$18446744073709551615` panicked the server (wire review 9 item 1); a call holds only $n in
+/// 1..=MAX_PARAMETER ([`branch_call`]).
+fn branch_call_types(call: &PgBranchCall) -> StatementTypes {
+    let mut used: Vec<u32> = call
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            PgBranchArg::Param(n) => Some(*n as u32),
+            _ => None,
+        })
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    StatementTypes {
+        columns: Vec::new(),
+        params: used.iter().map(|n| (*n, Type::TEXT.oid())).collect(),
+        used,
+    }
+}
+
 /// The row a branch call returns, for Describe.
 fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
     if call.function == "turso_branch_stats" {
@@ -2494,33 +2517,25 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // Every parameter, $1 up to the highest $n the statement uses or the client declared:
-        // declared ones as declared, the rest as text (wire review 1 item 13).
-        let param_types = |used: usize| -> Vec<Type> {
-            let declared = &target.parameter_types;
-            (0..used.max(declared.len()))
-                .map(|i| declared.get(i).cloned().flatten().unwrap_or(Type::TEXT))
-                .collect()
-        };
         self.refuse_describe_if_aborted(&target.statement)?;
         if let Some(call) = branch_call(&target.statement) {
             let fields = branch_call_fields(&call, &Format::UnifiedText);
-            let used = call
-                .args
-                .iter()
-                .filter_map(|a| match a {
-                    PgBranchArg::Param(n) => Some(*n),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            return Ok(DescribeStatementResponse::new(param_types(used), fields));
+            let params = parameter_types(&branch_call_types(&call), &target.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            return Ok(DescribeStatementResponse::new(params, fields));
         }
         // The special statements return no rows: NoData, from the text (their prepared stand-ins
         // have a dummy column). That their prepare is never what performs them is describe_prepare's
         // job, from the parse, so a form this text test misses is still not performed.
         if is_pg_non_query(&target.statement) {
-            return Ok(DescribeStatementResponse::new(param_types(0), vec![]));
+            // The parameters the client declared, as declared, the rest as text (wire review 1
+            // item 13).
+            let declared = target
+                .parameter_types
+                .iter()
+                .map(|t| t.clone().unwrap_or(Type::TEXT))
+                .collect();
+            return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
         self.describe_prepare(&target.statement)?;
         let fields = self.described_fields(&Format::UnifiedText);

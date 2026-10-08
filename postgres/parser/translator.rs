@@ -5835,7 +5835,11 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
                 Val::Boolval(b) => Some(PgBranchArg::Bool(b.boolval)),
                 _ => None,
             },
-            Node::ParamRef(p) if p.number > 0 => Some(PgBranchArg::Param(p.number as usize)),
+            // A number outside 1..=MAX_PARAMETER is no parameter: no call, so the ordinary
+            // prepare refuses it (42P02); Describe sized the call's list by it (review 9 item 1).
+            Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
+                Some(PgBranchArg::Param(p.number as usize))
+            }
             Node::TypeCast(cast) if to_text(cast.type_name.as_ref()?) => {
                 match arg(cast.arg.as_deref()?)? {
                     PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string())),

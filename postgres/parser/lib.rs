@@ -39,6 +39,11 @@ pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, Par
     pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
+/// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
+/// outside 1..=MAX_PARAMETER names no parameter (42P02) on every path, a branch call's included,
+/// before anything is sized by it (wire review 8 item 3, review 9 item 1).
+pub const MAX_PARAMETER: u32 = 65535;
+
 /// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
 /// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
 /// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
