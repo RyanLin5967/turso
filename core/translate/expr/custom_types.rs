@@ -762,4 +762,175 @@ mod tests {
             "an over-length parameter raised or matched: {param:?}"
         );
     }
+
+    fn exec(conn: &Arc<crate::Connection>, sql: &str, params: &[Value]) -> crate::Result<()> {
+        let mut stmt = conn.prepare(sql)?;
+        for (i, value) in params.iter().enumerate() {
+            stmt.bind_at((i + 1).try_into().unwrap(), value.clone())?;
+        }
+        stmt.run_ignore_rows()
+    }
+
+    /// Engine review 14 HIGH 1: 6b (a) encoded every bound operand of a custom type's operator
+    /// with the COLUMN's parameters, so on numeric(10, 2) a parameter was truncated to two places
+    /// and refused past ten digits, in arithmetic as well as comparisons: `x * ?1` with 1.075
+    /// stored 10.70, `x / ?1` with 0.001 divided by zero, `x = ?1` with 1.509 matched 1.50, and
+    /// `x < ?1` with 1e9 raised. The operator takes its operand as given (the column reaches it
+    /// decoded). Mutant `operand_keeps_column_typmod`.
+    #[test]
+    fn a_numeric_operand_keeps_its_own_precision() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34), (3, 1.50)")
+            .unwrap();
+        let at = |id: i64, literal: &str| {
+            count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE id = {id} AND x = {literal}"),
+                None,
+            )
+        };
+        assert!(matches!(at(3, "1.50"), Ok(1)), "premise: a literal finds row 3");
+        let mul = exec(&conn, "UPDATE t SET x = x * ?1 WHERE id = 1", &[Value::from_f64(1.075)]);
+        assert!(
+            mul.is_ok() && matches!(at(1, "10.75"), Ok(1)),
+            "x * ?1 with 1.075 did not store 10.75: {mul:?}"
+        );
+        let div = exec(&conn, "UPDATE t SET x = x / ?1 WHERE id = 2", &[Value::from_f64(0.001)]);
+        assert!(
+            div.is_ok() && matches!(at(2, "12340"), Ok(1)),
+            "x / ?1 with 0.001 did not store 12340: {div:?}"
+        );
+        for (sql, param, want) in [
+            ("x = ?1", 1.509, 0),
+            ("x >= ?1", 1.501, 0),
+            ("x < ?1", 1e9, 1),
+        ] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE id = 3 AND {sql}"),
+                Some(Value::from_f64(param)),
+            );
+            assert!(
+                matches!(got, Ok(n) if n == want),
+                "{sql} with {param} on 1.50 gave {got:?}, not {want}"
+            );
+        }
+    }
+
+    /// Engine review 14 HIGH 2: 6b (b) bound every user type's parameters to NULL when encoding a
+    /// comparison operand, on a contract nothing states: the documented length-check ENCODE then
+    /// raised on every comparison, a user copy of numeric raised "precision must be an integer",
+    /// and a substr-shaped ENCODE turned the operand into NULL and matched nothing. A user type
+    /// keeps its parameters' meaning; its operator's operand is not encoded at all (HIGH 1).
+    #[test]
+    fn a_user_types_operator_does_not_unbind_its_parameters() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag2(value text, maxlen integer) BASE text ENCODE CASE WHEN \
+             length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type tag2') \
+             END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE money(value any, precision integer, scale integer) BASE blob ENCODE \
+             numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' \
+             numeric_add OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE short(value text, len integer) BASE text ENCODE substr(value, 1, len) \
+             DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v tag2(3), m money(10, 2), s short(3)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 1.5, 'abcdef')")
+            .unwrap();
+        let tag = count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None);
+        assert!(matches!(tag, Ok(1)), "a length-checked user type's comparison gave {tag:?}");
+        let eq = count(&conn, "SELECT count(*) FROM t WHERE m = 1.5", None);
+        assert!(matches!(eq, Ok(1)), "a user numeric's m = 1.5 gave {eq:?}");
+        let lt = count(&conn, "SELECT count(*) FROM t WHERE m < ?1", Some(Value::from_f64(2.0)));
+        assert!(matches!(lt, Ok(1)), "a user numeric's m < ?1 gave {lt:?}");
+        let add = conn.prepare("SELECT m + 1 FROM t").and_then(|mut s| s.run_collect_rows());
+        assert!(add.is_ok(), "a user numeric's m + 1 raised: {add:?}");
+        let short = count(&conn, "SELECT count(*) FROM t WHERE s = 'abc'", None);
+        assert!(matches!(short, Ok(1)), "a substr-encoded user type's comparison gave {short:?}");
+    }
+
+    /// Engine review 14 HIGH 3: a type registered as built-in (the wire's bpchar: a length check
+    /// and a function '=') never took 6b (b)'s unconstrained path, and 6b (a) sent a bound
+    /// parameter through its length-checking ENCODE too: an over-length parameter raised 'value
+    /// too long' where PostgreSQL, and this code before 6b, answer no rows. Both an over-length
+    /// literal and parameter compare, false.
+    #[test]
+    fn a_built_in_length_checked_type_compares_an_over_length_operand() {
+        let conn = open();
+        let sql = "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN \
+                   length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type \
+                   bpc') END DECODE value OPERATOR '=' instr";
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("premise: the type parses");
+        };
+        let def = crate::schema::TypeDef::from_create_type(&type_name, &body, true, sql.to_string())
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema
+                .type_registry
+                .insert(type_name.to_lowercase(), Arc::new(def))
+        })
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v bpc(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        assert!(
+            conn.execute("INSERT INTO t VALUES (2, 'abcdef')").is_err(),
+            "premise: the built-in type's own length check refuses an over-length value"
+        );
+        let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
+        assert!(matches!(literal, Ok(0)), "an over-length literal gave {literal:?}");
+        let param = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("abcdef")),
+        );
+        assert!(matches!(param, Ok(0)), "an over-length parameter gave {param:?}");
+    }
+
+    /// Engine review 14 HIGH 4: NULL bypasses ENCODE and DECODE (create-type.mdx), as the INSERT
+    /// and seek paths keep it, but 6b (a) sent a NULL parameter into the operator path's ENCODE
+    /// unguarded: any ENCODE ending in `ELSE RAISE` raised on `col < ?1` bound NULL, where the
+    /// comparison is NULL and selects no row. Kept as a regression guard.
+    #[test]
+    fn a_null_parameter_never_reaches_a_types_encode() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pint(value integer) BASE integer ENCODE CASE WHEN value > 0 THEN value \
+             ELSE RAISE(ABORT, 'pint must be positive') END DECODE value OPERATOR '<' numeric_lt",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v pint) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE v < 7", None), Ok(1)),
+            "premise: the type's operator compares"
+        );
+        for sql in ["v < ?1", "v >= ?1"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {sql}"),
+                Some(Value::Null),
+            );
+            assert!(matches!(got, Ok(0)), "{sql} bound NULL gave {got:?}");
+        }
+    }
 }
