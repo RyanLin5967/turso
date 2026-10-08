@@ -751,7 +751,7 @@ s3=$(clock_pair f14c); s4=$(clock_pair f14d)
 # first PROVES its setup took effect (each fd -ef the decoy, /dev/null or the real pipe) and exits without stamping
 # if not, so a silently failed exec cannot pass for a refusal (seventh re-review, finding 1). All of it only with a
 # live stamper: a reaped coproc unsets STAMPER, which `set -u` would turn into an abort with no F14 line (finding 2).
-s5="" s6="" s7="" s10="" leak="" stray="" dsz="-" dsz2="-" haveproc=0
+s5="" s6="" s7="" s10="" s11="" s12="" ctl="" leak="" stray="" dsz="-" dsz2="-" haveproc=0
 [ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
 if [ $alive = 1 ] && [ -n "${STAMPER[0]:-}" ] && [ -n "${STAMPER[1]:-}" ]; then
   R=${STAMPER[0]} W=${STAMPER[1]}
@@ -764,23 +764,37 @@ if [ $alive = 1 ] && [ -n "${STAMPER[0]:-}" ] && [ -n "${STAMPER[1]:-}" ]; then
           clock_pair f14f ) 2>/dev/null )
   s7=$( ( eval "exec $R</dev/null $W>&$kw"; setup_is /dev/null "/proc/$STAMPER_SHELL/fd/$W" || exit 3
           clock_pair f14g ) 2>/dev/null )
-  exec {kr}<&- {kw}>&-
   # And decoys that ARE anonymous pipes, like the stamper's own (two fresh ones, opened read-write here through
   # /dev/fd so a leaked request stays readable): only an inode check refuses them -- not "this fd is a pipe" (-p), not
   # "its link reads pipe:[...]", not "same device as the stamper's pipe" (ninth re-review, finding 2; tenth, findings
   # 1-3: the FIFO files this replaces passed the last two mutants and were left in the uploaded raw). No file is made.
-  # The setup proof requires both decoys to be pipes and the stamper's fd numbers to be them. A failed exec leaves the
-  # case unrun (s10 empty, F14 fails) instead of aborting the script under set -u (tenth, finding 4).
-  ar="" aw=""
-  exec {ar}<> <(:) {aw}<> <(:) 2>/dev/null || true
+  # Three cases, as for the other decoys: both fds on the new pipes (s10), then each alone with the other the REAL
+  # pipe (s11: write fd on aw, a leak waits in aw; s12: read fd on ar, the request reaches the real stamper and the
+  # probe below reads its reply first) -- a check that treats the two fds differently is caught (eleventh re-review,
+  # finding 2). The setup proof requires the decoys to be pipes and the fd numbers to be them; and a control line
+  # written through aw must read back from aw, so the leak detector is shown able to fire (finding 3). The exec is
+  # wrapped so its 2>/dev/null is not made permanent (an exec with no command keeps every redirection: it silenced
+  # the rest of the script's stderr; finding 1), and a failed exec leaves the cases unrun (F14 fails) instead of
+  # aborting under set -u (tenth, finding 4).
+  ar="" aw="" ctl=""
+  { exec {ar}<> <(:) {aw}<> <(:); } 2>/dev/null || true
   if [ -n "$ar" ] && [ -n "$aw" ]; then
+    printf 'f14ctl\n' >&"$aw"; IFS= read -r -t 1 ctl <&"$aw"
     s10=$( ( eval "exec $R<&$ar $W>&$aw"
              [ -p "/proc/$BASHPID/fd/$ar" ] && [ -p "/proc/$BASHPID/fd/$aw" ] &&
                setup_is "/proc/$BASHPID/fd/$ar" "/proc/$BASHPID/fd/$aw" || exit 3
              clock_pair f14j ) 2>/dev/null )
+    s11=$( ( eval "exec $R<&$kr $W>&$aw"
+             [ -p "/proc/$BASHPID/fd/$aw" ] && setup_is "/proc/$STAMPER_SHELL/fd/$R" "/proc/$BASHPID/fd/$aw" || exit 3
+             clock_pair f14k ) 2>/dev/null )
     IFS= read -r -t 1 leak <&"$aw"
-    exec {ar}>&- {aw}>&-
+    s12=$( ( eval "exec $R<&$ar $W>&$kw"
+             [ -p "/proc/$BASHPID/fd/$ar" ] && setup_is "/proc/$BASHPID/fd/$ar" "/proc/$STAMPER_SHELL/fd/$W" || exit 3
+             clock_pair f14l ) 2>/dev/null )
   fi
+  [ -n "$ar" ] && exec {ar}>&-
+  [ -n "$aw" ] && exec {aw}>&-
+  exec {kr}<&- {kw}>&-
   dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
   # One probe, answered in order, proves two things at once (eighth re-review, findings 1 and 3): send a one-word
   # line, a non-ASCII line and a request with a fixed nonce, and the FIRST line back must be the probe's own reply.
@@ -811,12 +825,13 @@ if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" &
   $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
   $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 &&
   $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" &&
-  $s10 == "f14j="*" f14j_src=oneshot" && -z $leak &&
+  $s10 == "f14j="*" f14j_src=oneshot" && $s11 == "f14k="*" f14k_src=oneshot" && $s12 == "f14l="*" f14l_src=oneshot" &&
+  $ctl == f14ctl && -z $leak &&
   $stray == "f14probe.0.0 f14p="* && $s8 == "f14h="*" f14h_src=coproc" && $s9 == "f14i="*" f14i_src=oneshot" &&
   $alive2 = 1 && $shapes = 6 ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused with no leaked request [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused together and one at a time with no leaked request (leak detector control read back) [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] [$s11] [$s12] control=[$ctl] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
   fails=$((fails + 1))
 fi
 
