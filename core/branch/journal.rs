@@ -5251,6 +5251,75 @@ mod format_tests {
         }
     }
 
+    /// Engine review 10 #2 (a): the writer's evidence was read across the whole incarnation, and a
+    /// D0 run's unsynced flight earlier in it (kept by a D1 reopen) made every later whole D1
+    /// flight prove nothing: damage under one was cut silently, dropping acknowledged records. The
+    /// evidence is per flight now: a whole later flight its writer tagged synced by its own class
+    /// proves the damaged flight before it was synced. Mutant `writer_evidence_whole_incarnation`.
+    #[test]
+    fn damage_under_a_later_base_synced_flight_is_refused_after_an_earlier_d0_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1], SyncClass::Off);
+        let first_end;
+        {
+            let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
+            let mut arena = Arena::new(512);
+            journal.buffer(&Record::Fork { child: 21, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+            first_end = journal.len;
+            journal.buffer(&Record::Fork { child: 22, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        }
+        assert!(end_tags(&files).1, "premise: the D0 run's flight is still tagged unsynced");
+        // The first D1 flight's end frame is lost; the D1 flight after it is whole.
+        overwrite(&files.log, first_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+        let got = Journal::recover(&files, SyncClass::Fsync);
+        assert!(
+            matches!(got, Err(LimboError::Corrupt(_))),
+            "an acknowledged D1 flight lost under a whole later D1 flight was cut: {:?}",
+            got.map(|r| r.map(|r| forks(&r.records)))
+        );
+    }
+
+    /// Engine review 10 #2 (b): a D0 flight torn whole away (its end frame too) between two raised
+    /// flights left no unsynced flight in the incarnation for the old rule to see, so the later
+    /// raised flight was taken for a syncing writer's and the open refused, "every branch is
+    /// lost", where the D0 flight and the raised one after it were never acknowledged. A raised
+    /// flight's own tag says its writer's class does not sync: cut, at a D0 and a syncing open.
+    /// Mutant `writer_evidence_whole_incarnation`.
+    #[test]
+    fn a_vanished_d0_flight_before_a_raised_flight_is_cut_at_any_open() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let (from, to);
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                let mut arena = Arena::new(512);
+                journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+                journal.raise_pending_class(SyncClass::FullFsync);
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                from = journal.len;
+                journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                to = journal.len;
+                journal.buffer(&Record::Fork { child: 3, parent: 0 }).unwrap();
+                journal.raise_pending_class(SyncClass::FullFsync);
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            }
+            overwrite(&files.log, from, &vec![0u8; (to - from) as usize]);
+            let got = Journal::recover(&files, opener);
+            match got {
+                Ok(Some(r)) => assert_eq!(forks(&r.records), vec![1], "{opener:?}: the torn tail was not cut where it begins"),
+                other => panic!(
+                    "{opener:?}: a vanished D0 flight before a raised one was refused or lost the state: {:?}",
+                    other.map(|r| r.map(|r| forks(&r.records)))
+                ),
+            }
+        }
+    }
+
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
     /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
     /// stays synced only when the rewrite syncs too.
