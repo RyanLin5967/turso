@@ -235,8 +235,16 @@ def selftest():
         cases.append(None)
     # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
     # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
-    for cap, warm, want in (("1800", "1000:10:180", True), ("1800", "1000:10:180.0", True),
-                            ("1800.0", "1000:10:180", True),
+    # Both values are compared as EXACT strings (review of e11a3c993, finding 5: "1.8e3" passed a numeric check and then
+    # made run_system.sh's integer OUTER_S 601 s; "1000:10:180.0" was recorded verbatim): so "1800.0" and
+    # "1000:10:180.0", accepted at d8fef669b, are refused from here on.
+    for cap, warm, want in (("1800", "1000:10:180", True), ("1800", "1000:10:180.0", False),
+                            ("1800.0", "1000:10:180", False), ("1.8e3", "1000:10:180", False),
+                            ("18e2", "1000:10:180", False), ("1_800", "1000:10:180", False),
+                            (" 1800", "1000:10:180", False), ("+1800", "1000:10:180", False),
+                            ("1800", "01000:010:0180", False), ("1800", " 1000:10:180", False),
+                            # the cap ALONE (finding 2): the registered warm-up at a non-registered cap
+                            ("3600", "1000:10:180", False), ("20", "1000:10:180", False),
                             ("1800", "1000:10:2", False),     # the CI smoke cap on a real run: the ruling's plant
                             ("20", "1000:10:2", False),       # = rule(20), but 20 s is not the registered cap
                             ("3600", "1000:10:360", False),   # = rule(3600), but not the registered cap
