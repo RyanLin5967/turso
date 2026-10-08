@@ -852,8 +852,11 @@ fn handle_pg_add_constraints(
             relation.relname = aside_name.clone();
             relation.schemaname.clear();
         }
-        // A serial column of the aside is its integer type: as serial it would create a sequence
-        // named after the aside, which the aside's DROP leaves behind (wire review 3 item 11).
+        // A serial column of the aside is a plain integer, what every serial spelling is stored
+        // as: as serial it would create a sequence named after the aside, which the aside's DROP
+        // leaves behind (wire review 3 item 11); as int2 or int8 it became the engine's smallint,
+        // whose encoding refuses values past 32767, or bigint, no longer the rowid key (wire
+        // review 6 item 2).
         for elt in &mut c.table_elts {
             if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ColumnDef(col)) =
                 elt.node.as_mut()
@@ -863,8 +866,8 @@ fn handle_pg_add_constraints(
                         if let Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) =
                             part.node.as_mut()
                         {
-                            if let Some(base) = serial_base_type(&s.sval) {
-                                s.sval = base.to_string();
+                            if turso_pg_parser::translator::is_serial_type(&s.sval) {
+                                s.sval = "int4".to_string();
                             }
                         }
                     }
@@ -1071,16 +1074,6 @@ fn aside_name_for(table: &str, n: usize) -> String {
         cut -= 1;
     }
     format!("{}{suffix}", &table[..cut])
-}
-
-/// The integer type a PostgreSQL serial type name stands for, or None for any other type.
-fn serial_base_type(name: &str) -> Option<&'static str> {
-    match name.to_ascii_lowercase().as_str() {
-        "serial" | "serial4" => Some("int4"),
-        "bigserial" | "serial8" => Some("int8"),
-        "smallserial" | "serial2" => Some("int2"),
-        _ => None,
-    }
 }
 
 /// The start of the error text of a statement whose undo failed too. The server ends the session on

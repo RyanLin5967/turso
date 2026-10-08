@@ -4655,7 +4655,7 @@ impl PgTypeMapping {
 /// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
 /// Covers all PostgreSQL serial aliases: serial, serial2, serial4, serial8,
 /// smallserial, bigserial.
-fn is_serial_type(pg_type: &str) -> bool {
+pub fn is_serial_type(pg_type: &str) -> bool {
     matches!(
         pg_type.to_uppercase().as_str(),
         "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
