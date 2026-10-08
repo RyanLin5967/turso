@@ -8,7 +8,7 @@
 //! rows hold).
 
 use crate::catalog::sqlite_type_to_pg_oid;
-use turso_core::schema::Schema;
+use turso_core::schema::{Column, Schema};
 use turso_pg_parser::pg_query::protobuf::{node::Node, Node as PgNode, SelectStmt};
 use turso_pg_parser::pg_query::ParseResult;
 
@@ -111,10 +111,10 @@ fn column_type(arg: &PgNode, tables: &[(String, String)], schema: &Schema) -> Op
             _ => None,
         })
         .collect::<Option<_>>()?;
-    let declared = |relname: &str, column: &str| -> Option<String> {
+    let declared = |relname: &str, column: &str| -> Option<Option<u32>> {
         let table = schema.get_btree_table(relname)?;
         let (_, col) = table.get_column(column)?;
-        Some(col.ty_str.clone())
+        Some(column_oid(col))
     };
     let ty = match names.as_slice() {
         [column] => {
@@ -131,7 +131,7 @@ fn column_type(arg: &PgNode, tables: &[(String, String)], schema: &Schema) -> Op
         }
         _ => return None,
     };
-    u32::try_from(sqlite_type_to_pg_oid(&ty)).ok()
+    ty
 }
 
 /// The FROM clause's tables, as (the name a column reference qualifies them by, relation name),
@@ -527,12 +527,7 @@ impl Infer<'_> {
         let columns: Vec<Option<u32>> = if insert.cols.is_empty() {
             self.schema
                 .get_btree_table(&rel.relname)
-                .map(|t| {
-                    t.columns()
-                        .iter()
-                        .map(|c| u32::try_from(sqlite_type_to_pg_oid(&c.ty_str)).ok())
-                        .collect()
-                })
+                .map(|t| t.columns().iter().map(column_oid).collect())
                 .unwrap_or_default()
         } else {
             insert
@@ -893,7 +888,7 @@ impl Infer<'_> {
                             .as_deref()
                             .is_some_and(|n| n.eq_ignore_ascii_case(column))
                     })?;
-                    Some(u32::try_from(sqlite_type_to_pg_oid(&col.ty_str)).ok())
+                    Some(column_oid(col))
                 }
                 Rel::Derived { columns, .. } => columns
                     .iter()
@@ -1119,5 +1114,19 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
 fn declared_type(schema: &Schema, relname: &str, column: &str) -> Option<u32> {
     let table = schema.get_btree_table(relname)?;
     let (_, col) = table.get_column(column)?;
-    u32::try_from(sqlite_type_to_pg_oid(&col.ty_str)).ok()
+    column_oid(col)
+}
+
+/// The type OID of a table column as declared: its type name's, or for an array column the array
+/// type of it (the dimensions are kept apart from the name: an int[] column's is INTEGER), so
+/// `$1 = ANY(xs)` takes xs's element type, as in PostgreSQL. Read from the name alone, an int[]
+/// column was int4, its element untyped, and $1 text, which matched no integer element (wire
+/// review 10 item 3). None for an array of a type with no array type here.
+fn column_oid(col: &Column) -> Option<u32> {
+    let base = u32::try_from(sqlite_type_to_pg_oid(&col.ty_str)).ok()?;
+    if col.array_dimensions() > 0 {
+        array_of(base)
+    } else {
+        Some(base)
+    }
 }
