@@ -335,6 +335,7 @@ v3l() { # v3l before|after MNT
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
 FS_NOW="" V3CELL="" PLANT_NOW=""
+RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
   mkdir -p "$o"
@@ -414,8 +415,9 @@ run_cell() {
     export FASTEST_CELL=$id
     case $system in
       ours)
+        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
         timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
-          --ops "$ops" --warmup 20 --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
+          --ops-total "$ops" --warmup "prereg:$RUN_CAP_S" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|pg18-defaults|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).

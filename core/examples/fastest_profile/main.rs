@@ -4,7 +4,7 @@
 //! the T3 runner. Nothing it prints is credited: it is the subject the instruments measure.
 //!
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
-//!       [--ops N] [--warmup W] [--rows R] [--mode phases|cycle] [--out DIR]
+//!       [--ops N | --ops-total T] [--warmup W | --warmup prereg:CAP_S] [--rows R] [--mode phases|cycle] [--out DIR]
 //!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark] [--phases K]
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
@@ -16,6 +16,11 @@
 //!   whole process that an outside instrument can count over. Its connections live from the
 //!   connect phase to the delete phase (C x N of them at once).
 //! * `--mode cycle`: every client loops whole cycles; one window for the four phases together.
+//! * `--ops-total T`: T ops for the whole run, ceil(T / C) per client; the measured total is recorded (gate-6
+//!   review 12: ops means a run total for every system).
+//! * `--warmup prereg:CAP_S`: PREREG's warm-up rule, the same for every system (gate-6 review 3): cycles run until
+//!   at least 1,000 warm-up ops across all clients AND 10 s have passed, or until 10% of the run's cap CAP_S, whichever
+//!   comes first; the ops and seconds it took are recorded. `--warmup W` (default 20) is W cycles per client.
 //! * `--phases K` (phases mode, 1-4, default 4): only the first K phases, so an instruction counter can
 //!   take a phase's cost as the difference between runs (callgrind's per-function inclusive cost is not
 //!   trustworthy where it reports false recursion: arm64, run 37255309860). With K < 4 the branches are
@@ -45,7 +50,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -70,6 +75,9 @@ struct Args {
     clients: usize,
     ops: usize,
     warmup: usize,
+    /// `--warmup prereg:CAP_S`: the run's cap in seconds; None for a fixed W cycles per client.
+    warmup_cap_s: Option<f64>,
+    ops_total: Option<usize>,
     rows: i64,
     mode: Mode,
     out: Option<PathBuf>,
@@ -93,6 +101,8 @@ fn parse_args() -> Args {
         clients: 1,
         ops: 200,
         warmup: 20,
+        warmup_cap_s: None,
+        ops_total: None,
         rows: 1000,
         mode: Mode::Phases,
         out: None,
@@ -132,7 +142,20 @@ fn parse_args() -> Args {
             "--catalog" => a.catalog = true,
             "--clients" => a.clients = num(val(&mut i), "--clients"),
             "--ops" => a.ops = num(val(&mut i), "--ops"),
-            "--warmup" => a.warmup = num(val(&mut i), "--warmup"),
+            "--ops-total" => a.ops_total = Some(num(val(&mut i), "--ops-total")),
+            "--warmup" => {
+                let v = val(&mut i);
+                match v.strip_prefix("prereg:") {
+                    Some(cap) => {
+                        let c: f64 = cap.parse().unwrap_or_else(|_| not_a_result(&format!("--warmup prereg:CAP_S: {cap}")));
+                        if !(c > 0.0) {
+                            not_a_result("--warmup prereg:CAP_S needs a positive cap");
+                        }
+                        a.warmup_cap_s = Some(c);
+                    }
+                    None => a.warmup = num(v, "--warmup"),
+                }
+            }
             "--rows" => a.rows = num(val(&mut i), "--rows") as i64,
             "--mode" => {
                 a.mode = match val(&mut i).as_str() {
@@ -169,8 +192,11 @@ fn parse_args() -> Args {
     if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
         not_a_result("--phases is 1-4, and below 4 only in phases mode");
     }
-    if a.clients == 0 || a.ops == 0 || a.rows < 1 {
-        not_a_result("--clients, --ops and --rows must be at least 1");
+    if a.clients == 0 || a.ops == 0 || a.rows < 1 || a.ops_total == Some(0) {
+        not_a_result("--clients, --ops, --ops-total and --rows must be at least 1");
+    }
+    if let Some(t) = a.ops_total {
+        a.ops = t.div_ceil(a.clients);
     }
     a
 }
@@ -267,6 +293,10 @@ impl Rng {
 /// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
 /// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
 /// operation's latency), and gives up at 30 s (PREREG: a failed operation).
+/// PREREG warm-up (`--warmup prereg:CAP_S`): cycles done by every client, and the main thread's stop.
+static WARM_OPS: AtomicUsize = AtomicUsize::new(0);
+static WARM_STOP: AtomicBool = AtomicBool::new(false);
+
 static RETRIES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
@@ -387,7 +417,16 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
         }
     };
     gate.wait(); // ready
-    cycles("warm", a.warmup, None);
+    if a.warmup_cap_s.is_some() {
+        let mut k = 0usize;
+        while !WARM_STOP.load(Ordering::Acquire) {
+            cycles(&format!("warm{k}"), 1, None);
+            WARM_OPS.fetch_add(1, Ordering::AcqRel);
+            k += 1;
+        }
+    } else {
+        cycles("warm", a.warmup, None);
+    }
     gate.wait(); // warm-up done
     match a.mode {
         Mode::Cycle => {
@@ -486,6 +525,7 @@ fn main() {
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
+    let warm_secs = std::sync::Mutex::new(0.0f64);
     // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
     let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
@@ -498,6 +538,19 @@ fn main() {
             .collect();
         gate.wait(); // ready
         fence.marker("FASTEST_PHASE warmup begin");
+        if let Some(cap) = a.warmup_cap_s {
+            // min(max(1,000 ops, 10 s), 10% of the cap): both minimums, unless the cap's share ends it first
+            let t = Instant::now();
+            loop {
+                let secs = t.elapsed().as_secs_f64();
+                if (WARM_OPS.load(Ordering::Acquire) >= 1000 && secs >= 10.0) || secs >= 0.1 * cap {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            WARM_STOP.store(true, Ordering::Release);
+            *warm_secs.lock().unwrap() = t.elapsed().as_secs_f64();
+        }
         gate.wait(); // warm-up done
         fence.marker("FASTEST_PHASE warmup end");
         for w in &windows_wanted {
@@ -538,12 +591,21 @@ fn main() {
     }
 
     let ops_total = a.clients * a.ops;
+    let warm_rule = match a.warmup_cap_s {
+        Some(cap) => format!(
+            "{{\"rule\":\"prereg\",\"cap_s\":{cap},\"ops\":{},\"secs\":{:.3}}}",
+            WARM_OPS.load(Ordering::Acquire),
+            *warm_secs.lock().unwrap()
+        ),
+        None => format!("{{\"rule\":\"cycles_per_client\",\"ops\":{}}}", a.clients * a.warmup),
+    };
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"warmup_per_client\":{},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
         a.ops,
+        a.ops_total.map(|t| t.to_string()).unwrap_or_else(|| "null".into()),
         a.warmup,
         a.rows,
         a.phases,
