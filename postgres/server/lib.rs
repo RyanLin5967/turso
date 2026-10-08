@@ -2216,6 +2216,13 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
     ))
 }
 
+/// A statement with nothing in it (whitespace, or a lone `;`): PostgreSQL's empty query, answered
+/// with EmptyQueryResponse on both protocols.
+fn is_blank(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    trimmed.is_empty() || trimmed == ";"
+}
+
 /// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.
 fn warning(code: &str, message: &str) -> Box<ErrorInfo> {
     Box::new(ErrorInfo::new(
@@ -2353,8 +2360,7 @@ impl SimpleQueryHandler for Session {
             return Err(PgWireError::NotReadyForQuery);
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
-        let trimmed = query.query.trim();
-        let responses = if trimmed.is_empty() || trimmed == ";" {
+        let responses = if is_blank(&query.query) {
             vec![(Vec::new(), Response::EmptyQuery)]
         } else {
             self.simple_with_notices(&query.query)
@@ -2676,6 +2682,12 @@ impl ExtendedQueryHandler for Session {
     {
         // Executes up to Sync are one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let sql = &portal.statement.statement;
+        // An empty statement is EmptyQueryResponse and joins no block, as over the simple
+        // protocol; it failed ("contains no statements") after joining the pipeline's implicit
+        // block, which rolled the pipeline back (wire review 12 item 4).
+        if is_blank(sql) {
+            return Ok(Response::EmptyQuery);
+        }
         let call = branch_call(sql);
         let result = self
             .begin_implicit(sql, call.as_ref(), true)
@@ -2693,6 +2705,15 @@ impl ExtendedQueryHandler for Session {
         C: ClientInfo + Unpin + Send + Sync,
     {
         self.refuse_describe_if_aborted(&target.statement)?;
+        // An empty statement returns no rows: NoData (wire review 12 item 4).
+        if is_blank(&target.statement) {
+            let declared = target
+                .parameter_types
+                .iter()
+                .map(|t| t.clone().unwrap_or(Type::TEXT))
+                .collect();
+            return Ok(DescribeStatementResponse::new(declared, vec![]));
+        }
         if let Some(call) = branch_call(&target.statement) {
             let fields =
                 branch_call_fields(&call, &Format::UnifiedText).map_err(PgWireError::UserError)?;
@@ -2732,6 +2753,11 @@ impl ExtendedQueryHandler for Session {
         C: ClientInfo + Unpin + Send + Sync,
     {
         self.refuse_describe_if_aborted(&portal.statement.statement)?;
+        // An empty statement returns no rows: NoData, its result formats ignored (wire review 12
+        // item 4).
+        if is_blank(&portal.statement.statement) {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
         if let Some(call) = branch_call(&portal.statement.statement) {
             let fields = branch_call_fields(&call, &portal.result_column_format)
                 .map_err(PgWireError::UserError)?;
