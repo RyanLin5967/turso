@@ -5649,6 +5649,65 @@ fn a_failed_drain_fail_stops_a_raised_d0_store_with_an_undrained_release() {
     }
 }
 
+/// Engine review 15 HIGH 1: recovery replays the branch log as a prefix and stops at the first
+/// damaged frame, so ANY record written and not drained when a drain fails is a hole every later
+/// record sits behind, not only a Release: (i) a TrunkRetain (a trunk commit that does not sync,
+/// keeping a pre-image for x), (ii) a fork, (iii) a branch Commit holding a free. A raised D0 store
+/// with any of them undrained fail-stops on a failed drain. Mutants `drain_risk_release_only` (the
+/// review 10 #6 predicate) and `drain_risk_barrier_floor_only` (Releases and TrunkRetains only).
+#[test]
+fn a_failed_drain_fail_stops_a_d0_store_with_any_undrained_record() {
+    let _s = serial();
+    for route in ["retain", "fork", "commit"] {
+        for catalog in [false, true] {
+            let what = format!("route={route} catalog={catalog}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("d0-any-undrained.db");
+            let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&path, catalog, route == "commit");
+            match route {
+                "retain" => {
+                    let other = db.connect().unwrap();
+                    other.execute("PRAGMA synchronous = OFF").unwrap();
+                    let before = db.branch_slots_in_use().len();
+                    write_v(&other, 50, "undrained");
+                    assert!(db.branch_slots_in_use().len() > before, "{what}: premise: the commit kept a pre-image for x");
+                }
+                "fork" => {
+                    let _y = trunk.fork_branch().unwrap().into_id();
+                }
+                _ => {
+                    write_v(&x.connect().unwrap(), 40, "again");
+                    assert!(!db.branch_slot_is_free(slots[0]), "{what}: premise: x's superseded slot is held");
+                }
+            }
+            db.branches.trunk_wal_sync_failed(true);
+            assert_fail_stopped(
+                db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+                &format!("{what}: the next fork after a failed drain of an undrained record"),
+            );
+            drop(x);
+        }
+    }
+}
+
+/// Engine review 15 #6, the control: a D0 store whose every record is drained (the fixture's
+/// synchronous FULL trunk commit drained the device after them) puts nothing at risk, and a failed
+/// drain leaves it running. Mutant `drain_failure_ignores_risk` (it always stops).
+#[test]
+fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _trunk, x, _slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("d0-drained.db"), catalog, false);
+        db.branches.trunk_wal_sync_failed(true);
+        db.connect()
+            .unwrap()
+            .fork_branch()
+            .unwrap_or_else(|e| panic!("catalog={catalog}: a failed drain with nothing undrained stopped a D0 store: {e}"));
+        drop(x);
+    }
+}
+
 // ---- engine review 9 #3: a flush under the store mutex honours a refused landing ----
 
 /// Engine review 9 #3: a flush made under the store mutex (`flush_locked`: a lease, an expiry, a
