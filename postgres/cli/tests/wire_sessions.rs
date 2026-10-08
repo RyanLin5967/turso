@@ -3679,3 +3679,50 @@ fn untyped_contexts_type_their_parameters() {
         r.error
     );
 }
+
+/// Set operations keep PostgreSQL's grouping: INTERSECT binds tighter than UNION and EXCEPT, and
+/// parentheses group; a parenthesised arm keeps its own ORDER BY, LIMIT and WITH; and the WITH of
+/// the whole set operation is in scope for every arm. The tree was flattened and run left to right
+/// (`SELECT 1 UNION SELECT 2 INTERSECT SELECT 2` gave {2}), an arm's ORDER BY / LIMIT and every
+/// WITH were dropped, so a CTE named like a table read the table (wire review 7 items 1 and 2).
+/// Expected values: PostgreSQL's by the SQL standard's grouping; the PG18 re-recording is owed
+/// with item 17.
+#[test]
+fn set_operations_keep_their_grouping_and_clauses() {
+    let dir = Scratch::new("setops");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE u(k INT)").ok("u");
+    a.q("INSERT INTO u VALUES (1), (2), (3)").ok("u rows");
+    a.q("CREATE TABLE w(k INT)").ok("w");
+    a.q("INSERT INTO w VALUES (7), (8)").ok("w rows");
+    let sorted = |a: &mut Wire, sql: &str| -> Vec<String> {
+        let mut v: Vec<String> = a
+            .q(sql)
+            .ok(sql)
+            .rows
+            .iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect();
+        v.sort();
+        v
+    };
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    for (sql, want) in [
+        ("SELECT 1 UNION SELECT 2 INTERSECT SELECT 2", s(&["1", "2"])),
+        ("SELECT 1 EXCEPT (SELECT 1 EXCEPT SELECT 1)", s(&["1"])),
+        ("SELECT 1 UNION ALL (SELECT 1 UNION SELECT 1)", s(&["1", "1"])),
+        ("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2", s(&["2"])),
+        (
+            "(SELECT k FROM u ORDER BY k DESC LIMIT 1) UNION ALL (SELECT k FROM w ORDER BY k LIMIT 1)",
+            s(&["3", "7"]),
+        ),
+        ("WITH c AS (SELECT 5 AS x) SELECT x FROM c UNION ALL SELECT 2", s(&["2", "5"])),
+        (
+            "WITH t AS (SELECT 99 AS id) SELECT id FROM t UNION ALL SELECT 2",
+            s(&["2", "99"]),
+        ),
+    ] {
+        assert_eq!(sorted(&mut a, sql), want, "{sql}");
+    }
+}
