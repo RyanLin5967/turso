@@ -3908,6 +3908,51 @@ fn a_raised_d0_fuzzy_install_claims_no_durability_its_cut_lacks() {
     }
 }
 
+/// Engine review 15 MED 2: the fuzzy install marked its catalog commit durable in the rewrite class
+/// read AT THE INSTALL, not the class the commit synced in (the capture's). A FullFsync flight taken
+/// between the two raises it: here an ordered trunk commit (synchronous FULL, fullfsync) whose WAL
+/// F_FULLFSYNC then fails, which fail-stops the store. The commit synced in Off, yet the install
+/// marked everything up to the capture FullFsync-durable, on a fail-stopped store (mark_committed
+/// skips the fail-stop check), so a later FULL trunk commit over a pre-capture Release could take
+/// the fast path. Mutant `fuzzy_committed_class_at_install`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_fuzzy_install_marks_its_commit_in_the_class_it_synced_in() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, armed) = open_failing_wal(&dir.path().join("fuzzy-class.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.fork_branch().unwrap().reap().unwrap();
+    let _y = trunk.fork_branch().unwrap().into_id();
+    assert!(!db.branches.rewrite_class_for_test().syncs(), "premise: the D0 store is not raised at the capture");
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never committed");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let full_before = db.branches.durable_for_test(SyncClass::FullFsync);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+    armed.store(1, O::Release);
+    let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+    assert_eq!(armed.load(O::Acquire), 0, "premise: the trunk commit's WAL sync was reached");
+    assert!(failed.is_err(), "premise: its failed WAL sync failed the commit");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the commit's ordered flight raised the log");
+    assert_fail_stopped(db.connect().unwrap().fork_branch().map(|x| x.into_id()), "premise: the store fail-stopped");
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branches.durable_for_test(SyncClass::FullFsync),
+        full_before,
+        "the fuzzy install marked its Off catalog commit FullFsync-durable on a fail-stopped store"
+    );
+}
+
 /// Sets `store::HOLD_BOUND_FORCED` for one test, and clears it when dropped.
 struct HoldBound;
 

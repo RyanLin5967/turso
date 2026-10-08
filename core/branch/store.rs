@@ -6473,6 +6473,12 @@ impl BranchStore {
         self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::rewrite_class)
     }
 
+    /// Test builds: how far the log is durable in `class` (the group's lock-free mark).
+    #[cfg(test)]
+    pub(crate) fn durable_for_test(&self, class: SyncClass) -> u64 {
+        self.group.durable(class)
+    }
+
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
     #[cfg(test)]
     pub(crate) fn arena_dirty(&self) -> bool {
