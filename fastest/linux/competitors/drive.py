@@ -70,7 +70,7 @@ def strip_subvol(src):
 
 
 def barrier_off(options):
-    return False  # RED stub: barriers never read
+    return any(t in ("nobarrier", "barrier=0") for t in options.split(","))
 
 
 def dev_of(path):
@@ -103,6 +103,8 @@ def disk_record(d):
 
 
 def classify(write_cache, fua, name="?"):
+    if RAM_DISK.match(name):
+        return "ram-volatile"
     if write_cache == "write through":
         return "write-through"
     if write_cache == "write back" and fua == "1":
@@ -152,8 +154,7 @@ def resolve(mnt, sysfs="/sys", devof=dev_of, mountof=mount_of):
     if len(classes) != 1:
         raise Undetermined(f"leaf disks of different classes: {[(x['name'], x['class']) for x in disks]}")
     mounts = []
-    for p in []:  # RED stub: no mount is read
-
+    for p in [mnt] + backs:
         m = dict(mountof(p))
         m["path"] = p
         m["barrier_off"] = barrier_off(m["options"])

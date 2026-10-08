@@ -18,7 +18,8 @@ Prints, tab-separated:
   JOBS     artifact, firecheck verdict, functional verdict, failed functional lines
   TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok)
   FIXTURE  one line: the run's one parent fixture, or why the jobs' fixtures differ
-  DRIVES   artifact, drive class (drive.py: write-through | write-back+fua | write-back-no-fua), disks, device chain
+  DRIVES   artifact, drive class (drive.py CLASSES), whether a flush reaches the drive (no filesystem in the chain
+           mounted nobarrier), disks, device chain
   CELLS    artifact, cell, then stracecount.py's table columns (TABLE_COLS)
 Exit 0 only if every expected job and cell is present and readable, every fire-check passed each PINNED_FIRECHECK
 check (one PASS line each, no FAIL line, one "VERDICT PASS n/n" with n the pinned count), every functional verdict is
@@ -37,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import stracecount  # noqa: E402  (the same table columns as each job's own flushes.tsv)
 import fixture  # noqa: E402  (one parent fixture for every system)
+import drive  # noqa: E402  (the drive classes a job's drive.json may name)
 
 WORKFLOW = ".github/workflows/fastest-competitors.yml"
 _PG = ["pg18-select1", "pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal"]
@@ -224,15 +226,21 @@ def main(argv):
     bad += 1 if fwhy else 0
     # The drive class each job ran on (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3): run/drive.json from
     # drive.py, which run_system.sh writes before any cell; a present job without a readable one is not a pass.
-    print("DRIVES\tartifact\tdrive_class\tdisks\tchain")
+    # A class outside drive.CLASSES, or no flush_reaches_drive boolean, is not a record (review of e11a3c993, findings
+    # 3 and 11).
+    print("DRIVES\tartifact\tdrive_class\tflush_reaches_drive\tdisks\tchain")
     for name in names:
         if name not in present:
             continue
         try:
             dj = json.load(open(os.path.join(d, name, "run", "drive.json")))
-            row = [dj["drive_class"], ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
+            if dj["drive_class"] not in drive.CLASSES or not isinstance(dj["flush_reaches_drive"], bool):
+                raise ValueError(f"drive_class {dj['drive_class']!r}, flush_reaches_drive "
+                                 f"{dj['flush_reaches_drive']!r}")
+            row = [dj["drive_class"], "yes" if dj["flush_reaches_drive"] else "no",
+                   ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
         except (OSError, ValueError, KeyError, TypeError) as e:
-            print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__})")
+            print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__}: {e})")
             bad += 1
             continue
         print("DRIVES\t" + "\t".join([name] + row))

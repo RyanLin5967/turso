@@ -78,9 +78,12 @@ jobs:
         run: |
           timeout 120 python3 -B fastest/linux/competitors/timedrun.py selftest | tail -1
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
-          # the drive class (SMOKE erratum E3): known answers, then this runner's own disk under its temp dir
+          # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
+          # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.
           timeout 120 python3 -B fastest/linux/competitors/drive.py selftest | tail -1
-          timeout 120 python3 -B fastest/linux/competitors/drive.py record "$RUNNER_TEMP" "$RUNNER_TEMP/drive-build.json"
+          mkdir -p "$RUNNER_TEMP/build-hw"
+          timeout 120 python3 -B fastest/linux/competitors/drive.py record "$RUNNER_TEMP" "$RUNNER_TEMP/build-hw/drive-build.json" ||
+            echo "drive.py refused this build runner's disk (rc=$?); each run job records and gates its own"
       - name: Packages (PGDG libpq 18, MariaDB connector, clang, cmake, fio)
         run: |
           sudo apt-get update -q
@@ -234,7 +237,7 @@ jobs:
             >"$RUNNER_TEMP/reduce/reduce.tsv" 2>"$RUNNER_TEMP/reduce/reduce.err" || rc=$?
           echo "reduce_rc=$rc git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT" | tee "$RUNNER_TEMP/reduce/reduce-rc.txt"
           grep '^JOBS' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
-          grep '^DRIVES' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-4 || true
+          grep '^DRIVES' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
           echo "CELLS rows: $(grep '^CELLS' "$RUNNER_TEMP/reduce/reduce.tsv" | awk 'END {print NR - 1}')"
           cat "$RUNNER_TEMP/reduce/reduce.err"
           # SMOKE.md's tables, generated here from the same raw (smoke_table.py, C=1 and C=4)
