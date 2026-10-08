@@ -249,6 +249,22 @@ impl Arena {
         self.free.len()
     }
 
+    /// `(high_water, free list capacity, free-bit words, chunks)`, for resident-size curves.
+    /// Observation only (r11-ever's `BranchResident`). `chunks` counts the MEMORY backing's chunks;
+    /// a file-backed arena keeps its slots in its file and holds none (0).
+    pub(crate) fn shape(&self) -> (usize, usize, usize, usize) {
+        let chunks = match &self.backing {
+            Backing::Memory { chunks } => chunks.len(),
+            Backing::File { .. } => 0,
+        };
+        (
+            self.high_water as usize,
+            self.free.capacity(),
+            self.free_bits.len(),
+            chunks,
+        )
+    }
+
     pub(crate) fn write_slot(&mut self, slot: Slot, bytes: &[u8]) -> Result<()> {
         turso_assert!(bytes.len() == self.page_size, "arena write of a wrong-sized page");
         let offset = self.check(slot) as u64 * self.page_size as u64;
