@@ -240,9 +240,16 @@ pub struct SimStats {
 }
 
 impl SimStats {
-    /// Returns true if the simulation completed successfully (no failures).
+    /// Returns true if the simulation completed successfully: no failures, and it
+    /// actually compared something.
+    ///
+    /// The `statements_executed` floor matters as much as the failure count. Without it
+    /// `--seed 5 -n 0` prints PASSED with "Statements Executed | 0", and so does any run
+    /// whose generation collapses for any other reason -- a zero-work run and a clean run
+    /// are indistinguishable in the output. A harness reporting success without having
+    /// compared anything is the one failure mode CI cannot catch for us.
     pub fn is_success(&self) -> bool {
-        self.oracle_failures == 0
+        self.oracle_failures == 0 && self.statements_executed > 0
     }
 
     /// Create a colorful table displaying simulation results.

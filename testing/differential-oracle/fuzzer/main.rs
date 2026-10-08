@@ -220,6 +220,31 @@ fn fuzzer_main() -> Result<()> {
                             break;
                         }
                     }
+                    // A zero-statement iteration is not a pass, and this is the path CI
+                    // uses (.github/workflows/rust.yml runs `... loop 10`). Guarding only
+                    // run_single left the higher-volume path able to report green having
+                    // compared nothing -- the exact failure the guard exists to close.
+                    Ok(stats) if !stats.is_success() => {
+                        let record = FailureRecord {
+                            iteration: iteration + 1,
+                            seed: args.seed,
+                            error: "no statements were executed, so nothing was compared"
+                                .to_string(),
+                            statements_executed: 0,
+                            oracle_failures: 0,
+                            warnings: stats.warnings,
+                            config: ConfigRecord::from_args(&args),
+                        };
+                        tracing::error!(
+                            "Iteration {} executed nothing (seed {})",
+                            iteration + 1,
+                            args.seed
+                        );
+                        failures.push(record);
+                        if !collecting {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                 }
 
@@ -311,7 +336,13 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
 
 fn run_single(args: &Args) -> Result<()> {
     let stats = run_single_inner(args)?;
-    if stats.oracle_failures > 0 {
+    if !stats.is_success() {
+        if stats.statements_executed == 0 {
+            tracing::error!(
+                "No statements were executed, so nothing was compared -- refusing to report \
+                 success. Check the generator config and the skip counters."
+            );
+        }
         std::process::exit(1);
     }
     Ok(())

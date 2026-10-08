@@ -16,9 +16,25 @@ pub fn generate_literal_with_config(
     data_type: DataType,
     config: &LiteralConfig,
 ) -> Literal {
-    // Check for NULL generation
     if ctx.gen_bool_with_prob(config.null_probability) {
         return Literal::Null;
+    }
+
+    // Drawn here, not inside generate_integer/generate_real: those two must keep every
+    // result inside config.int_min..int_max, and the whole point of the boundary table is
+    // to leave that window. boundary_value_probability: 0.0 opts out.
+    if ctx.gen_bool_with_prob(config.boundary_value_probability) {
+        match data_type {
+            DataType::Integer => {
+                let idx = ctx.gen_range(BOUNDARY_INTEGERS.len());
+                return Literal::Integer(BOUNDARY_INTEGERS[idx]);
+            }
+            DataType::Real => {
+                let idx = ctx.gen_range(BOUNDARY_REALS.len());
+                return Literal::Real(BOUNDARY_REALS[idx]);
+            }
+            _ => {}
+        }
     }
 
     match data_type {
@@ -32,6 +48,67 @@ pub fn generate_literal_with_config(
         }
     }
 }
+
+/// Integers where numeric behaviour changes: the i64 and i32 edges, the float-exactness edge
+/// at 2^53, byte and word boundaries, and the small values that decide truthiness and
+/// division. A table rather than a wider range because repeating a small set is what makes
+/// two operands in one statement EQUAL -- the condition typeof(min(1, 1.0)) needs, which a
+/// uniform draw essentially never produces.
+const BOUNDARY_INTEGERS: &[i64] = &[
+    0,
+    1,
+    -1,
+    2,
+    -2,
+    10,
+    127,
+    128,
+    255,
+    256,
+    32767,
+    32768,
+    65535,
+    65536,
+    2147483647,  // i32::MAX
+    -2147483648, // i32::MIN
+    2147483648,
+    4294967295, // u32::MAX
+    4294967296,
+    9007199254740992, // 2^53, above which f64 cannot hold every integer
+    -9007199254740992,
+    // 2^62, deliberately NOT i64::MAX nor anything adjacent. A row whose rowid is i64::MAX
+    // makes every later NULL-key insert pick a rowid AT RANDOM -- documented SQLite behaviour
+    // that Turso implements too, so both engines are right while disagreeing and the post-DML
+    // snapshot check ends the run on a false divergence. MAX-1 only delays it by one insert.
+    // The overflow edge stays reachable through arithmetic on these values.
+    4611686018427387904,
+    -9223372036854775808, // i64::MIN, where negation overflows
+];
+
+/// Reals chosen for where formatting, affinity and rounding change behaviour, rather than as
+/// a uniform sample of the number line.
+const BOUNDARY_REALS: &[f64] = &[
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    0.1,
+    2.0,
+    1e-300,
+    1e300,
+    5e-324,                  // smallest subnormal
+    2.2250738585072014e-308, // smallest normal
+    1.7976931348623157e308,  // f64::MAX
+    9007199254740993.0,      // 2^53 + 1, not representable
+    // 2^62 as a real, not i64::MAX as a real. CAST(9223372036854775807.0 AS INTEGER)
+    // is exactly i64::MAX on both engines, so that entry put the max rowid back within
+    // reach of an INTEGER PRIMARY KEY through a generated CAST -- reinstating through
+    // this table the random-rowid hazard BOUNDARY_INTEGERS excludes.
+    4611686018427387904.0,
+    1e15,
+    1e16, // either side of 15 significant digits
+];
 
 /// Generate an integer literal.
 pub fn generate_integer(ctx: &mut Context, config: &LiteralConfig) -> Literal {
@@ -262,9 +339,7 @@ mod tests {
 
     #[test]
     fn blobs_are_valid_utf8() {
-        // Casting a blob with invalid UTF-8 to TEXT keeps the bytes in SQLite
-        // but becomes replacement characters in Turso, so generated blobs must
-        // stay valid UTF-8 for the two engines to agree.
+        // Invalid UTF-8 cast to TEXT keeps its bytes in SQLite and becomes U+FFFD in Turso.
         let mut ctx = Context::new_with_seed(7);
         let config = default_config();
         for _ in 0..200 {
@@ -335,6 +410,182 @@ mod tests {
 
         if let Literal::Text(s) = generate_text(&mut ctx, &config) {
             assert!(s.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    /// The table must be reachable through the dispatcher, or it may as well not exist.
+    #[test]
+    fn boundary_values_are_reachable_through_the_dispatcher() {
+        let mut ctx = Context::new_with_seed(20260822);
+        let cfg = LiteralConfig::default();
+        let mut beyond_window = false;
+        let mut saw_i64_min = false;
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                if v.unsigned_abs() > 1_000_000 {
+                    beyond_window = true;
+                }
+                if v == i64::MIN {
+                    saw_i64_min = true;
+                }
+            }
+        }
+        assert!(
+            beyond_window,
+            "no integer outside +/-1e6 in 4000 draws -- the table is unreachable"
+        );
+        assert!(saw_i64_min, "i64::MIN was never drawn");
+        assert!(
+            !BOUNDARY_INTEGERS.contains(&i64::MAX),
+            "i64::MAX must stay out of the table: it manufactures random rowids"
+        );
+        // A real above i64::MAX also reaches that rowid through CAST -- both engines clamp
+        // an out-of-range REAL-to-INTEGER cast to i64::MAX, so CAST(1e300 AS INTEGER) is
+        // i64::MAX. The entry that WAS exactly i64::MAX as a real is gone for that reason.
+        // 1e300 and f64::MAX stay: they are the large-real coverage this table exists for,
+        // and the hazard needs the cast to land in an INTEGER PRIMARY KEY and become the
+        // max rowid. Measured across 24 seed-runs: 17 casts of a large boundary real, 0
+        // rowid false positives. Residual risk, recorded rather than claimed away.
+        assert!(
+            !BOUNDARY_REALS.contains(&9223372036854775807.0),
+            "i64::MAX as a real casts to exactly i64::MAX, manufacturing random rowids"
+        );
+    }
+
+    /// Reals too, including the ones a uniform +/-1e6 draw can never produce.
+    #[test]
+    fn boundary_reals_are_reachable() {
+        let mut ctx = Context::new_with_seed(4242);
+        let cfg = LiteralConfig::default();
+        let mut saw_tiny = false;
+        let mut saw_huge = false;
+        let mut saw_integral = false;
+        for _ in 0..4000 {
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                if v != 0.0 && v.abs() < 1e-100 {
+                    saw_tiny = true;
+                }
+                if v.abs() > 1e100 {
+                    saw_huge = true;
+                }
+                if v == 1.0 || v == 0.0 {
+                    saw_integral = true;
+                }
+            }
+        }
+        assert!(saw_tiny, "no subnormal/tiny real drawn");
+        assert!(saw_huge, "no very large real drawn");
+        assert!(saw_integral, "no small integral real drawn");
+    }
+
+    #[test]
+    fn every_boundary_real_renders_as_sql_that_is_still_real() {
+        for &v in BOUNDARY_REALS {
+            let sql = Literal::Real(v).to_string();
+            assert!(
+                renders_as_a_real(&sql),
+                "{v:?} renders as `{sql}`, which is not lexically a real literal"
+            );
+            assert!(
+                sql.len() <= 40,
+                "{v:?} renders as {} characters, bloating every statement that draws it",
+                sql.len()
+            );
+        }
+    }
+
+    /// Negative zero is the entry the old rendering destroyed most completely: it left as
+    /// `-0`, an integer literal, so the real boundary it exists for was never reached. What
+    /// is asserted is the SQL text -- both engines print `-0.0` back as `0.0`, so the sign
+    /// itself is not observable from a query.
+    #[test]
+    fn negative_zero_keeps_its_sign_through_the_dispatcher() {
+        let mut ctx = Context::new_with_seed(4242);
+        let cfg = LiteralConfig::default();
+        let mut saw_negative_zero = false;
+        for _ in 0..4000 {
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                let sql = Literal::Real(v).to_string();
+                assert!(
+                    renders_as_a_real(&sql),
+                    "generated real {v:?} renders as `{sql}`, not a real literal"
+                );
+                if v == 0.0 && v.is_sign_negative() {
+                    saw_negative_zero = true;
+                    assert_eq!(sql, "-0.0", "negative zero lost its sign in rendering");
+                }
+            }
+        }
+        assert!(saw_negative_zero, "negative zero was never drawn");
+    }
+
+    /// The test that inspects `Literal::Real(v)` cannot see this: reaching the generator is
+    /// only half of it, the value still has to survive rendering. A digit string past
+    /// i64::MAX is the one case both engines still read as a real, so what is enforced here
+    /// is the lexical shape: it must not look like an integer.
+    fn renders_as_a_real(sql: &str) -> bool {
+        sql.contains('.') || sql.contains('e') || sql.contains('E')
+    }
+
+    /// Opting out must be honoured exactly, so callers needing small values keep relying on
+    /// the window.
+    #[test]
+    fn opting_out_keeps_every_value_inside_the_window() {
+        let mut ctx = Context::new_with_seed(99);
+        let small = LiteralConfig::small_integers();
+        assert_eq!(small.boundary_value_probability, 0.0);
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &small)
+            {
+                assert!(
+                    v >= small.int_min && v <= small.int_max,
+                    "{v} escaped the configured window"
+                );
+            }
+        }
+    }
+
+    /// The reason for a table rather than a wider range: repeated values let two operands in
+    /// one statement be equal, which is what typeof(min(1, 1.0)) needs.
+    #[test]
+    fn the_same_value_recurs_often_enough_to_pair_up() {
+        use std::collections::HashMap;
+        let mut ctx = Context::new_with_seed(7);
+        let cfg = LiteralConfig::default();
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                *counts.entry(v).or_default() += 1;
+            }
+        }
+        assert!(
+            counts.values().any(|&c| c > 10),
+            "no value recurred, so two operands will never be equal"
+        );
+    }
+
+    /// The sibling of `opting_out_keeps_every_value_inside_the_window`. `small_integers`
+    /// was given the opt-out and a test; `positive_integers` was given neither, so a config
+    /// whose whole promise is "non-negative" returned negatives about a quarter of the time.
+    #[test]
+    fn positive_integers_stay_positive() {
+        let cfg = LiteralConfig::positive_integers();
+        assert_eq!(cfg.boundary_value_probability, 0.0);
+        let mut ctx = Context::new_with_seed(31337);
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                assert!(v >= 0, "{v} is negative from a positive-integers config");
+            }
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                assert!(v >= 0.0, "{v} is negative from a positive-integers config");
+            }
         }
     }
 }
