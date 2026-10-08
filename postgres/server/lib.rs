@@ -4338,6 +4338,63 @@ mod tests {
         settled(&s, "pipeline at Sync", r.as_ref().err().map(|e| &**e), &[9]);
     }
 
+    /// A transaction verb is read past comments anywhere a token boundary allows one, as
+    /// PostgreSQL's lexer reads a comment as whitespace: before the verb, between its words, after
+    /// it and after its `;`. A comment after the verb made it Other, so `COMMIT/*x*/` and
+    /// `COMMIT -- x` skipped the failed-COMMIT rule (rerun after a refusal; wire review 9 item 7).
+    #[test]
+    fn a_transaction_verb_is_read_past_its_comments() {
+        for (sql, want) in [
+            ("/* c */ COMMIT", TxVerb::Commit),
+            ("-- x\nCOMMIT", TxVerb::Commit),
+            ("COMMIT/*x*/", TxVerb::Commit),
+            ("COMMIT -- x", TxVerb::Commit),
+            ("COMMIT; -- x", TxVerb::Commit),
+            ("COMMIT /* a /* nested */ b */ WORK", TxVerb::Commit),
+            ("END/**/AND NO CHAIN", TxVerb::Commit),
+            ("/* c */ ROLLBACK", TxVerb::Rollback),
+            ("ROLLBACK -- x\n", TxVerb::Rollback),
+            ("/* c */ BEGIN", TxVerb::Begin),
+            ("BEGIN /*x*/ ISOLATION LEVEL READ COMMITTED", TxVerb::Begin),
+            ("COMMIT /* unterminated", TxVerb::Other),
+            ("COMMIT; SELECT 1", TxVerb::Other),
+            ("COMMIT -- x\n garbage", TxVerb::Other),
+            ("COMMIT/* x */garbage", TxVerb::Other),
+        ] {
+            assert_eq!(TxVerb::of(sql), want, "{sql:?}");
+        }
+    }
+
+    /// A COMMIT behind a comment that the trunk refuses settles as a COMMIT's refusal: committed
+    /// or 40001 with nothing kept, the session idle, never run again (wire review 9 item 7).
+    #[test]
+    fn a_commented_commit_that_meets_busy_is_never_run_again() {
+        for sql in ["/* c */ COMMIT", "COMMIT -- x", "COMMIT/*x*/"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let s = busy_commit_fixture(&dir);
+            ok(&s, "BEGIN");
+            ok(&s, "INSERT INTO t VALUES (9, 'x')");
+            s.shared
+                .db
+                .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
+            let replies = s.simple(sql);
+            let kept = count_id(&s, 9);
+            match replies.as_slice() {
+                [Response::Error(e)] => {
+                    assert_eq!(e.code, "40001", "{sql}: {}", e.message);
+                    assert_eq!(kept, 0, "{sql}: failed, yet kept");
+                }
+                [_] => assert_eq!(kept, 1, "{sql}: ok, yet not kept"),
+                other => panic!("{sql} answered {} replies", other.len()),
+            }
+            assert!(
+                matches!(s.transaction_status(), TransactionStatus::Idle),
+                "{sql}: a block is open"
+            );
+            assert!(holds_no_write(&s), "{sql}: the engine still holds a write");
+        }
+    }
+
     /// A claim of a held name waits for its release, as a delete does: released during the wait,
     /// the claim succeeds; never released, it is refused once the wait is spent (wire review 6
     /// item 5).

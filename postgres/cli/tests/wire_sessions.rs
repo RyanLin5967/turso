@@ -4538,3 +4538,40 @@ fn a_transaction_verb_is_read_by_its_whole_grammar() {
     assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
     assert_eq!(r.status, b'I');
 }
+
+/// A transaction verb with a comment before, inside or after it is that verb (PostgreSQL's lexer
+/// reads a comment as whitespace): `ROLLBACK -- why` ends a failed block, `/* c */ BEGIN` in a
+/// block is BEGIN's warning (25001 "there is already a transaction in progress") with the block
+/// still open, and `COMMIT /* c */` outside one is COMMIT's (25P01 "there is no transaction in
+/// progress"). A comment after the verb made it Other: refused 25P02 in a failed block, and a
+/// BEGIN in a block reached the engine, which failed the block (wire review 9 item 7). PostgreSQL
+/// warns for every such BEGIN, COMMIT and ROLLBACK; the server answered their tags with no warning.
+#[test]
+fn a_commented_transaction_verb_is_its_verb() {
+    let dir = Scratch::new("txcomments");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for rollback in ["ROLLBACK -- why", "/* c */ ROLLBACK", "ROLLBACK/**/;"] {
+        a.q("BEGIN").ok("begin");
+        a.q("SELECT 1/0").err("fail the block");
+        let r = a.q(rollback).ok(rollback);
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{rollback}");
+        assert_eq!(r.status, b'I', "{rollback}");
+    }
+    for begin in ["/* c */ BEGIN", "BEGIN -- again", "BEGIN"] {
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'two')").ok("insert");
+        let r = a.q(begin).ok(begin);
+        assert_eq!(r.tags, vec!["BEGIN".to_string()], "{begin}");
+        assert_eq!(r.status, b'T', "{begin}: the block is still open");
+        let codes: Vec<&str> = r.notices.iter().map(|n| n.code.as_str()).collect();
+        assert_eq!(codes, vec!["25001"], "{begin}: {:?}", r.notices);
+        a.q("ROLLBACK").ok("end");
+    }
+    for end in ["COMMIT /* c */", "-- c\nROLLBACK", "COMMIT"] {
+        let r = a.q(end).ok(end);
+        assert_eq!(r.status, b'I', "{end}");
+        let codes: Vec<&str> = r.notices.iter().map(|n| n.code.as_str()).collect();
+        assert_eq!(codes, vec!["25P01"], "{end}: {:?}", r.notices);
+    }
+}
