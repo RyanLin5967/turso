@@ -563,18 +563,23 @@ impl Group {
     }
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
-    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. The log's
-    /// last flight is now this one, which has no confirmation (barriered, not synced), so the
-    /// earlier flight's queued word is dropped: it could never match (engine review 8 #9). Mutant
-    /// `ordered_keeps_confirm` (test builds only): kept, as before.
+    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. A flight
+    /// that carried frames is now the log's last flight, which has no confirmation (barriered, not
+    /// synced), so the earlier flight's queued word is dropped: it can never match the LAST flight
+    /// (engine review 8 #9; mutant `ordered_keeps_confirm`, test builds only: kept, as before). An
+    /// upgrade that carried none ends where the landed bytes end, so the last flight is unchanged
+    /// and its word is kept (engine review 12 MED 1; mutant `ordered_upgrade_drops_confirm`).
     fn land_ordered(&self, end: u64, ok: bool) {
         let mut g = self.lock();
         g.flushing = false;
         let mut stale = None;
         if ok && self.accepts() {
+            // Flights are exclusive (`flushing`), so every byte below the Off mark is in a landed
+            // flight: this one carried frames exactly when it ends past it.
+            let carried = end > g.durable[0] || fe_mutant("ordered_upgrade_drops_confirm");
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
-            if !fe_mutant("ordered_keeps_confirm") {
+            if carried && !fe_mutant("ordered_keeps_confirm") {
                 stale = g.confirm.take();
             }
         } else {
@@ -587,9 +592,10 @@ impl Group {
         drop(stale);
     }
 
-    /// Every byte below `end` is durable in `class` and every weaker one, by a rewrite of the log
-    /// made under the store mutex with no flight in the air (a compaction's snapshot, a checkpoint's
-    /// catalog commit and cut log), and waiters are woken.
+    /// Every byte below `end` is durable in `class` and every weaker one: by a rewrite of the log (a
+    /// compaction's snapshot, a sharp checkpoint's catalog commit and cut log), or, at a fuzzy
+    /// install, by the flights that wrote it after the capture, in their own class. Marked holding
+    /// the store mutex once the group is quiesced, and waiters are woken.
     fn mark_durable(&self, end: u64, class: SyncClass) {
         let mut g = self.lock();
         if self.accepts() {
@@ -2684,10 +2690,28 @@ fn run_flight(
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
+        let (deferred_lsn, committed) = (cap.deferred_lsn, written.is_ok());
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
-        if installed.is_ok() {
-            if let Some(journal) = guard.journal.as_ref() {
-                group.mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
+        if let Some(journal) = guard.journal.as_ref() {
+            // The catalog's commit made everything the capture covers durable in the rewrite
+            // class, even if the cut failed after it, as at the sharp path (`compact`): a raised D0
+            // store's held frees up to the capture mature on it with no raised operation (engine
+            // review 11 MED 1). Mutant `settle_arena_marks_no_durable` (test builds only): not
+            // marked.
+            if committed && !fe_mutant("settle_arena_marks_no_durable") {
+                group.mark_committed(deferred_lsn, journal.rewrite_class());
+            }
+            // What the flights after the capture wrote is durable only in their own class: the
+            // arena was settled before them and the cut's rename waits for the next flight's
+            // directory sync (engine review 13 HIGH 1). Mutant `fuzzy_install_marks_rewrite_class`
+            // (test builds only): the rewrite class, as in d7600ed20.
+            if installed.is_ok() {
+                let class = if fe_mutant("fuzzy_install_marks_rewrite_class") {
+                    rewritten_class(journal)
+                } else {
+                    journal.sync_class()
+                };
+                group.mark_durable(journal.lsn() - journal.pending_len(), class);
             }
         }
         let hold_ns = ns(t);
@@ -5639,10 +5663,13 @@ impl BranchStore {
     /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
     /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
     /// (`pending_full`), or a flight in the air, a fuzzy checkpoint's arena sync included (engine
-    /// review 9 #8: the flight it replaced counted here). With nothing at risk (a D2 store whose
-    /// every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop`
-    /// (it never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops,
-    /// as before engine review 9 #5 in D2).
+    /// review 9 #8: the flight it replaced counted here). Undrained records count in a store whose
+    /// class syncs, and in a D0 store too once a Release is undrained: its trunk barrier relies on
+    /// that Release being durable, and it is at best plain-fsynced (engine review 10 #6; mutant
+    /// `drain_risk_by_store_class`: only the store's class, as before). With nothing at risk (a D2
+    /// store whose every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only):
+    /// `no_wal_fail_stop` (it never stops, as before review 6 #2) and `drain_failure_ignores_risk`
+    /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         if fe_mutant("no_wal_fail_stop") {
             return;
@@ -5654,7 +5681,9 @@ impl BranchStore {
         } else {
             g.durable[class_index(SyncClass::Fsync)].max(full)
         };
-        let at_risk = (self.class.syncs() && g.durable[0] > drained)
+        let release_undrained = self.last_release_lsn.load(Ordering::Acquire) > drained
+            && !fe_mutant("drain_risk_by_store_class");
+        let at_risk = (g.durable[0] > drained && (self.class.syncs() || release_undrained))
             || g.ordered > full
             || g.pending_full.is_some()
             || g.flushing
@@ -10740,6 +10769,32 @@ mod group_tests {
         assert!(
             group.lock().confirm.is_none(),
             "an ordered landing left an earlier flight's confirmation to be written"
+        );
+    }
+
+    /// Engine review 12 MED 1: an ordered upgrade flight that carried no frame (a D1 store on Apple
+    /// under a FULL trunk: a trunk commit's barrier floor over bytes already landed) does not move
+    /// the log's last flight, so the queued word still matches it and must still be written. Taking
+    /// it left the tail unconfirmed at a clean close, and the next open cut a damaged slot in that
+    /// flight silently instead of refusing it. Mutant `ordered_upgrade_drops_confirm`.
+    #[test]
+    fn a_frameless_ordered_upgrade_keeps_the_last_flights_confirmation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(
+            group.land(10, SyncClass::Fsync, true, Some(Confirm::for_test(log, false))),
+            "premise: the synced flight landed"
+        );
+        assert!(group.lock().confirm.is_some(), "premise: its confirmation is queued");
+        group.lock().flushing = true;
+        // The upgrade flight ends where the synced one did: it carried no frame.
+        group.land_ordered(10, true);
+        assert_eq!(group.lock().ordered, 10, "premise: the ordered flight landed");
+        assert!(
+            group.lock().confirm.is_some(),
+            "a frameless ordered upgrade dropped the last flight's confirmation"
         );
     }
 }
