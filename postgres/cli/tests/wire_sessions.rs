@@ -3395,3 +3395,24 @@ fn a_fatal_startup_error_ends_the_session() {
         "a query after the FATAL ran"
     );
 }
+
+/// A parameter number past PostgreSQL's limit (65535: Bind counts parameters in 16 bits) is refused
+/// with 42P02 before anything is sized by it, on both protocols, and the session answers on.
+/// `SELECT 1 LIMIT $2147483647` sized the inferred-type list by the number (about 16 GiB zeroed),
+/// from one unauthenticated simple query (wire review 8 item 3).
+#[test]
+fn a_parameter_number_past_the_limit_is_refused() {
+    let dir = Scratch::new("paramlimit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "SELECT 1 LIMIT $2147483647",
+        "SELECT v FROM t WHERE id = $65536",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}");
+        let r = a.describe_statement(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}, extended");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    }
+}
