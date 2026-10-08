@@ -471,11 +471,19 @@ async fn serve_session(
 ) -> Result<(), std::io::Error> {
     let startup_timeout = tokio::time::sleep(STARTUP_TIMEOUT);
     tokio::pin!(startup_timeout);
+    // Every way a session ends before its startup completes is logged: the client sees only the
+    // socket close (the "closed the connection during startup" flake, lead).
     let socket = tokio::select! {
-        _ = &mut startup_timeout => return Ok(()),
-        socket = pgwire::tokio::server::negotiate_tls(socket, None) => socket?,
+        _ = &mut startup_timeout => {
+            warn!("session ended before startup: the startup timeout passed during TLS negotiation");
+            return Ok(());
+        }
+        socket = pgwire::tokio::server::negotiate_tls(socket, None) => socket.inspect_err(|e| {
+            warn!("session ended before startup: TLS negotiation failed: {}", e);
+        })?,
     };
     let Some(mut socket) = socket else {
+        warn!("session ended before startup: TLS negotiation returned no socket");
         return Ok(());
     };
     // The handlers by their concrete types: the session, and pgwire's no-op ones for COPY FROM
@@ -518,7 +526,19 @@ async fn serve_session(
                     .await;
                 break Ok(());
             }
-            None => break Ok(()),
+            None => {
+                if matches!(
+                    socket.state(),
+                    PgWireConnectionState::AwaitingStartup
+                        | PgWireConnectionState::AuthenticationInProgress
+                ) {
+                    warn!(
+                        "session ended before startup: the client's stream ended, or the startup \
+                         timeout passed"
+                    );
+                }
+                break Ok(());
+            }
         };
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
             break Ok(());
