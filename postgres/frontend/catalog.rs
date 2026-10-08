@@ -172,15 +172,12 @@ impl Dialect for PostgresDialect {
 /// dropped is refused. The wire server pads a bpchar column back to n characters on output.
 /// `=` and `<` (and the `<>`, `>`, `<=`, `>=` the engine derives from them) are bpchareq and
 /// bpcharlt (functions.rs), which ignore trailing blanks on both sides, so a scan agrees with an
-/// index seek, whose key is encoded (wire review 2 item 3). A NULL maxlen is PostgreSQL's "no
-/// typmod" and checks no length: the engine encodes a comparison's other operand (a literal or a
-/// bound parameter) with the type's parameters bound to NULL (fastest-engine 6b, bc4d033a9), so a
-/// literal or `$1` longer than n compares false instead of raising 'value too long', and only a
-/// stored value is held to n. Without the NULL case every such comparison fell to RAISE, since
-/// `length(...) <= NULL` is NULL.
+/// index seek, whose key is encoded (wire review 2 item 3). Two engine limits remain (COMPAT.md):
+/// the engine applies a type's operators only against a column or a literal, not a bound
+/// parameter, and it encodes the literal with the column's length check, so comparing with a
+/// literal longer than n raises 'value too long' where PostgreSQL answers false.
 const BPCHAR_TYPE_SQL: &str = "CREATE TYPE bpchar(value text, maxlen integer) BASE text \
-    ENCODE CASE WHEN maxlen IS NULL THEN rtrim(value, ' ') \
-    WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
+    ENCODE CASE WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
     ELSE RAISE(ABORT, 'value too long for type character') END DECODE value \
     OPERATOR '=' bpchareq OPERATOR '<' bpcharlt";
 
