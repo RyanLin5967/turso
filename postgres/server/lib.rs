@@ -2796,9 +2796,26 @@ fn bind_portal_parameters(
             ),
         )));
     }
+    // The format codes: none (all text), one (for all), or one per parameter, else a protocol
+    // violation; pgwire's format_for would index past a short list (wire review 8 item 4).
+    if let Format::Individual(codes) = &portal.parameter_format {
+        if codes.len() != types.len() {
+            return Err(PgWireError::UserError(error(
+                "08P01",
+                format!(
+                    "bind message has {} parameter formats but {} parameters",
+                    codes.len(),
+                    types.len()
+                ),
+            )));
+        }
+    }
     for (i, pg_type) in types.iter().enumerate() {
         let value = match &portal.parameters[i] {
             None => Value::Null,
+            Some(bytes) if portal.parameter_format.is_binary(i) => {
+                pg_binary_to_value(bytes, pg_type, i + 1)?
+            }
             Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
         };
         let index = NonZero::new(i + 1).expect("i + 1 >= 1");
@@ -2810,6 +2827,85 @@ fn bind_portal_parameters(
         }
     }
     Ok(())
+}
+
+/// A parameter sent in binary format, read as PostgreSQL's binary receive function for its type
+/// reads it: int2/int4/int8 and float4/float8 big-endian of their exact width, bool one byte
+/// (non-zero is true), bytea its bytes, text-like types and json their UTF-8 bytes, jsonb its
+/// version byte (1) then the text. A wrong width or version is 22P03, as PostgreSQL's "incorrect
+/// binary data format"; any other type's binary form is refused (0A000), never read as text: it
+/// was, so a binary int4 2 failed and the bytes "0001" bound 1 (wire review 8 item 4). `n` is the
+/// parameter's number, for the messages.
+fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
+    let bad = || {
+        PgWireError::UserError(error(
+            "22P03",
+            format!("incorrect binary data format in bind parameter {n} (type {pg_type})"),
+        ))
+    };
+    let text = |b: &[u8]| -> PgWireResult<Value> {
+        std::str::from_utf8(b)
+            .map(|s| Value::from_text(s.to_owned()))
+            .map_err(|e| {
+                PgWireError::UserError(error(
+                    "22021",
+                    format!("invalid UTF-8 in bind parameter {n}: {e}"),
+                ))
+            })
+    };
+    let t = pg_type;
+    if *t == Type::INT2 {
+        Ok(Value::from_i64(
+            i16::from_be_bytes(bytes.try_into().map_err(|_| bad())?).into(),
+        ))
+    } else if *t == Type::INT4 {
+        Ok(Value::from_i64(
+            i32::from_be_bytes(bytes.try_into().map_err(|_| bad())?).into(),
+        ))
+    } else if *t == Type::INT8 {
+        Ok(Value::from_i64(i64::from_be_bytes(
+            bytes.try_into().map_err(|_| bad())?,
+        )))
+    } else if *t == Type::FLOAT4 {
+        Ok(Value::from_f64(
+            f32::from_be_bytes(bytes.try_into().map_err(|_| bad())?).into(),
+        ))
+    } else if *t == Type::FLOAT8 {
+        Ok(Value::from_f64(f64::from_be_bytes(
+            bytes.try_into().map_err(|_| bad())?,
+        )))
+    } else if *t == Type::BOOL {
+        match bytes {
+            [b] => Ok(Value::from_i64((*b != 0) as i64)),
+            _ => Err(bad()),
+        }
+    } else if *t == Type::BYTEA {
+        Ok(Value::from_blob(bytes.to_vec()))
+    } else if *t == Type::JSONB {
+        match bytes.split_first() {
+            Some((1, rest)) => text(rest),
+            _ => Err(bad()),
+        }
+    } else if [
+        Type::TEXT,
+        Type::VARCHAR,
+        Type::BPCHAR,
+        Type::NAME,
+        Type::UNKNOWN,
+        Type::JSON,
+    ]
+    .contains(t)
+    {
+        text(bytes)
+    } else {
+        Err(PgWireError::UserError(error(
+            "0A000",
+            format!(
+                "binary format for bind parameter {n} of type {t} is not supported; send it in \
+                 text format"
+            ),
+        )))
+    }
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
