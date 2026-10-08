@@ -1,7 +1,7 @@
 name: fastest-competitors
 # Lane fastest-linux-comp: the FASTEST competitors on Linux -- PostgreSQL 18 (PGDG; STRATEGY=FILE_COPY with
 # file_copy_method=clone and STRATEGY=WAL_LOG, each at D2 = pg18-d2 and at defaults = pg18-defaults, amendment 14),
-# Dolt 2.3.5 and Doltgres 1.3.3 (release binaries at the Mac's versions, sha256-checked, telemetry off; amendment 14
+# Dolt and Doltgres at the registered versions of versions.tsv (2.4.1, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
 # variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
 # and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
 # Every job records its hardware (fastest/linux/hw/record.sh) and fire-checks the flush counter before using it.
@@ -24,6 +24,18 @@ on:
       idle_s:
         description: "seconds of the idle control per cell"
         default: "30"
+      cap_s:
+        description: "per-run cap in seconds: the measured window's bound (registered: 1800)"
+        default: "1800"
+      warmup:
+        description: "warm-up OPS:S:MAX_S; empty = PREREG :210's rule at cap_s (1000:10:180 at 1800 s)"
+        default: "1000:10:2"
+      age:
+        description: "aging UPDATEs applied to the parent (PREREG §7: 1e5; 0 = fresh)"
+        default: "200"
+      prebranch:
+        description: "live branches made before the cells, each with one private write"
+        default: "20"
   push:
     branches: [fastest-branching, fastest-linux-comp]
     paths:
@@ -97,6 +109,16 @@ jobs:
       FT_N4: ${{ inputs.n4 || '200' }}
       FT_ROWS: ${{ inputs.rows || '10000' }}
       FT_IDLE_S: ${{ inputs.idle_s || '30' }}
+      # The registered 1800 s cap bounds every measured window (gate-6 item 16). SMOKE overrides only the warm-up's
+      # MAX_S: 1000:10:2 is PREREG :210's OPS and S with at most 2 s of warm-up (a full 1000-op warm-up per run would
+      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used, and FT_WARMUP empty gives
+      # the registered 1000:10:180.
+      FT_CAP_S: ${{ inputs.cap_s || '1800' }}
+      FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
+      # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
+      # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
+      FT_AGE: ${{ inputs.age || '200' }}
+      FT_PREBRANCH: ${{ inputs.prebranch || '20' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -109,7 +131,11 @@ jobs:
           sudo apt-get install -y -q postgresql-common
           echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -q postgresql-18 libpq5 mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
+          # PostgreSQL pinned to the registered package of versions.tsv (gate-6 review, t3run item 13); a PGDG
+          # repository without it fails here rather than installing another version.
+          pgv=$(awk -F'\t' '$1 == "postgresql" && $4 == "pgdg_package" {print $5}' fastest/linux/competitors/versions.tsv)
+          [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
+          sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
           pg_lsclusters || true
       # The servers' ports (PG 55432, Doltgres 55433, Dolt 53306) lie inside the ephemeral range 32768-60999, so a
@@ -125,7 +151,7 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP age=$FT_AGE prebranch=$FT_PREBRANCH";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries
@@ -133,8 +159,10 @@ jobs:
         run: bash fastest/linux/competitors/fetch_dolt.sh "$HOME/fastest-bin" "$RAW/dolt-fetch.txt"
       - name: Filesystem under test
         id: fs
-        # 40G sparse: 200 ops x ~16 cells, WAL_LOG and the copy control writing ~9 MB per created database
-        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 40G 2>&1 | tee "$RAW/mkloop.txt"
+        # 80G sparse: each cell now runs twice (a traced labelling run and an untraced timed run, gate-6 item 2) plus
+        # warm-ups, WAL_LOG and the copy control writing ~9 MB per created database; run 37551016447's pg18-defaults
+        # XFS job peaked at 17.9 GB used with one run per cell. / has ~91 GB free on these runners.
+        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 80G 2>&1 | tee "$RAW/mkloop.txt"
       - name: Hardware record (fio on the filesystem under test)
         run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
       - name: Allow strace to attach to the servers (ptrace_scope 0)

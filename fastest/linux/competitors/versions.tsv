@@ -1,0 +1,12 @@
+# The registered competitor versions on Linux, ONE table (gate-6 review, t3run item 13; PREREG §6(6): Dolt 2.4.1,
+# Doltgres 1.4.0, PostgreSQL 18). fetch_dolt.sh, the workflow's PG install and run_system.sh all read it (pins.py)
+# and refuse a mismatch. Tarball sha256s are the digests GitHub reports for the release assets
+# (`gh release view <tag> -R dolthub/<repo> --json assets`, field digest, read 2026-10-08T20:3xZ). The PG row is the
+# PGDG package installed in run 37809124979 (`dpkg-query -W postgresql-18`), PostgreSQL 18.6 like the Mac's
+# Homebrew postgresql@18 18.6. The annex's binary table holds the Mac rows; these are its Linux rows.
+# system	version	arch	kind	value
+dolt	2.4.1	amd64	tarball_sha256	85edfe4d307cc75d336be5c30c7601d6eaddb209b08dddf104db32979a00bdc6
+dolt	2.4.1	arm64	tarball_sha256	4ec68affe22be060f008ff7135b33362a46befefc26a76df3258c82fbc9bd107
+doltgres	1.4.0	amd64	tarball_sha256	3868d1293ce6b24680d29c31a8661a913656459e02c3ef8f61cb737908d6d667
+doltgres	1.4.0	arm64	tarball_sha256	bdb379fe00829eb2c18b277cc12ba01ab3f6c0a813ee75e78877e04c08830af3
+postgresql	18.6	any	pgdg_package	18.6-1.pgdg24.04+2

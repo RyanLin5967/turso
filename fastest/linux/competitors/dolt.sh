@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dolt.sh -- Dolt 2.3.5 sql-server (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
+# dolt.sh -- Dolt sql-server (the version versions.tsv registers) (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
 # LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/dolt.sh @648ce2929):
 # unchanged except that the binaries and python come from common.sh (FT_DOLT = the dolt-linux-<arch> release
 # tarball, sha256-checked by fetch_dolt.sh; FT_MARIADB = Ubuntu's mariadb client).
@@ -9,7 +9,7 @@
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
 #   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
 #                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS         bench.t(ROWS rows) through the MariaDB client, then DOLT_COMMIT on main
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
@@ -46,8 +46,25 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | my bench
+  AGE=${4:-0}
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
+  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each its own autocommitted
+  # statement, then Dolt's documented maintenance: dolt_commit, then dolt_gc.
+  if [ "$AGE" -gt 0 ]; then
+    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | my bench
+    my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
+    # DOLT_GC ends the calling session in sql-server mode, so success is checked by a new connection afterwards; a
+    # failed GC fails the seed (the recorded maintenance must be what ran).
+    my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || true
+    my -N bench -e "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after DOLT_GC ($(tail -1 "$DATA.gc.txt"))"
+    # the session it ends reads as ERROR 2013/2006 (lost connection); any other error is a failed GC
+    grep -viE 'lost connection|gone away|2013|2006' "$DATA.gc.txt" | grep -qi 'error' &&
+      die "REFUSED: DOLT_GC failed: $(tail -1 "$DATA.gc.txt")"
+    echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
+  else
+    echo "maintenance: DOLT_COMMIT seed"
+  fi
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)

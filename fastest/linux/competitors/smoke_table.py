@@ -19,6 +19,21 @@ import sys
 
 COLS = [("ubuntu-24.04", "xfs", "x86_64 XFS"), ("ubuntu-24.04", "btrfs", "x86_64 btrfs"),
         ("ubuntu-24.04-arm", "xfs", "arm64 XFS"), ("ubuntu-24.04-arm", "btrfs", "arm64 btrfs")]
+import glob
+import re
+
+# The Dolt/Doltgres labels name the version the RUN used (each job's run/version.txt), never a constant: the
+# registered versions moved from 2.3.5/1.3.3 to 2.4.1/1.4.0 (gate-6 review, t3run item 13) and old runs keep theirs.
+# Placeholders until main() reads the run dir.
+DOLT, DOLTGRES = "Dolt ? sql-server", "Doltgres ?"
+
+
+def run_version(rundir, system):
+    for p in sorted(glob.glob(os.path.join(rundir, f"competitors-{system}-*", "run", "version.txt"))):
+        m = re.search(r"(\d+\.\d+\.\d+)", open(p, errors="replace").read())
+        if m:
+            return m.group(1)
+    return "?"
 # (system label, variant label, job system, create spec, create+first-write spec or None)
 ROWS = [
     ("PostgreSQL 18", "FILE_COPY, file_copy_method=clone, D2 (M1c-create / M1)", "pg18-d2", "pg18-create", "pg18-m1"),
@@ -32,19 +47,19 @@ ROWS = [
     ("PostgreSQL 18", "FILE_COPY, file_copy_method=copy (clone-proof control)", "pg18-defaults", "pg18-create-copy",
      None),
     ("PostgreSQL 18", "SELECT 1 floor", "pg18-d2", "pg18-select1", None),
-    ("Dolt 2.3.5 sql-server", "(a) DOLT_CHECKOUT(main) + DOLT_CHECKOUT('-b', b)", "dolt", "dolt-a-m1c", "dolt-a-m1"),
-    ("Dolt 2.3.5 sql-server", "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
-    ("Dolt 2.3.5 sql-server", "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
+    (DOLT, "(a) DOLT_CHECKOUT(main) + DOLT_CHECKOUT('-b', b)", "dolt", "dolt-a-m1c", "dolt-a-m1"),
+    (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
+    (DOLT, "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
      "dolt-c-m1"),
-    ("Dolt 2.3.5 sql-server", "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
-    ("Dolt 2.3.5 sql-server", "SELECT 1 floor", "dolt", "dolt-select1", None),
-    ("Doltgres 1.3.3", "(a) dolt_checkout(main) + dolt_checkout('-b', b)", "doltgres", "doltgres-a-m1c",
+    (DOLT, "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
+    (DOLT, "SELECT 1 floor", "dolt", "dolt-select1", None),
+    (DOLTGRES, "(a) dolt_checkout(main) + dolt_checkout('-b', b)", "doltgres", "doltgres-a-m1c",
      "doltgres-a-m1"),
-    ("Doltgres 1.3.3", "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
-    ("Doltgres 1.3.3", "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",
+    (DOLTGRES, "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
+    (DOLTGRES, "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",
      "doltgres-c-m1"),
-    ("Doltgres 1.3.3", "dolt_branch(b, main) alone", "doltgres", "doltgres-create", None),
-    ("Doltgres 1.3.3", "SELECT 1 floor", "doltgres", "doltgres-select1", None),
+    (DOLTGRES, "dolt_branch(b, main) alone", "doltgres", "doltgres-create", None),
+    (DOLTGRES, "SELECT 1 floor", "doltgres", "doltgres-select1", None),
     ("B1 (FICLONE of SQLite 3.53.4)", "D2: fsync(clone) + fsync(dir); write synchronous=FULL", "b1", "b1-m1c-d2",
      "b1-m1-d2"),
     ("B1 (FICLONE of SQLite 3.53.4)", "D0: no flush (reported as D0 only)", "b1", "b1-m1c-d0", "b1-m1-d0"),
@@ -93,7 +108,10 @@ def main(rundir, c):
     print(f"#### Flushes per op at C={c}: create / create+first-write (idle control subtracted)\n")
     print("| System | Variant | " + " | ".join(h for _, _, h in COLS) + " |")
     print("|---|---|" + "---|" * len(COLS))
+    label = {DOLT: f"Dolt {run_version(rundir, 'dolt')} sql-server",
+             DOLTGRES: f"Doltgres {run_version(rundir, 'doltgres')}"}
     for sysl, var, system, cspec, wspec in ROWS:
+        sysl = label.get(sysl, sysl)
         cells = []
         for runner, fs, _ in COLS:
             a = fmt(load(rundir, system, runner, fs, cspec, c))

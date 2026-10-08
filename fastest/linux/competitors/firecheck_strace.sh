@@ -51,7 +51,11 @@
 #      err widening; a table with no call lines. Each is REFUSED for its own reason, or ok where the err widens the
 #      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
 #   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
-#      reply in its pipe is skipped; the next top-level calls are served by the coproc.
+#      reply in its pipe is skipped; the next top-level calls are served by the coproc; the stamper's fd numbers
+#      reopened onto decoys (a file and /dev/null, both and then each alone, and two anonymous pipes; the setup
+#      proven by /proc) are refused with nothing written; then one in-order probe after a one-word and a non-ASCII line must get its
+#      own reply first (no leaked request, no answer to a malformed line); clock_pair stamps one-shot when the shape
+#      check refuses; the reply-shape check passes the stamper's format and refuses 5 malformed replies.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -314,7 +318,7 @@ if strace_attach "$OUT/f3" "$PP"; then
   # had no table and no call lines) is part of the check: an untested F3b fails. The window given is a well-formed
   # LAUNCH record (strace_rc 0), so the only thing missing is the attach proof, and the refusal must be the missing
   # table, not a malformed record (third review, finding 7: without any window it was refused for the record alone).
-  printf 'cmd=f3b-control t0=%s\nt1=%s\nstrace_rc=0\n' "$(date +%s.%N)" "$(date +%s.%N)" >"$OUT/f3b.window"
+  { echo "cmd=f3b-control"; clock_pair t0; clock_pair t1; echo "strace_rc=0"; } >"$OUT/f3b.window"  # as strace_run writes it
   python3 "$SC" count "$OUT/f3.strace" --extra "$OUT/f3.strace.err" --root "$DIR" --window "$OUT/f3b.window" >"$OUT/f3b.json"
   check F3b-unproven-empty-refused "$OUT/f3b.json" \
     'not r["lines"] and not r["summary"] and r["problems"]==["no -c summary table found"]'
@@ -697,11 +701,19 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
   awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
-  for k in a b c d e f g h i j k l m n; do count "f13$k"; done
+  # Launch windows (strace_run) carry clock pairs too (SMOKE.md erratum E4), on copies of F1's: (p) unmodified, ok
+  # with F1's 10 flushes and t0/t1 from the stamper; (q) t1's realtime +0.1 s, refused for the step; (r) the t0 pair
+  # line removed, refused for the missing pair.
+  for k in p q r; do
+    for x in strace strace.err window cmd.err; do cp "$OUT/f1.$x" "$OUT/f13$k.$x" 2>/dev/null; done
+  done
+  awk '/^t1=/ { split($1, a, "="); $1 = sprintf("t1=%.9f", a[2] + 0.1) } { print }' "$OUT/f1.window" >"$OUT/f13q.window"
+  awk '!/^t0=/ { print }' "$OUT/f1.window" >"$OUT/f13r.window"
+  for k in a b c d e f g h i j k l m n p q r; do count "f13$k"; done
   if python3 -c "
 import json, sys
 o = sys.argv[1]
-J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmn'}
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqr'}
 v = {k: r['verdict'] for k, r in J.items()}
 src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
@@ -713,9 +725,12 @@ ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
       refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and refused('n', 'zero call lines') and
       v['l'] == 'ok' and J['l']['flushes'] == 10 and v['m'] == 'ok' and J['m']['flushes'] == 10 and
       v['c'] == 'ok' and J['c']['flushes'] == 10 and
-      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'})
-print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijkn'), '| (l)', v['l'][:20], J['l']['flushes'],
-      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src)
+      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'} and
+      v['p'] == 'ok' and J['p']['flushes'] == 10 and J['p'].get('clock_src') == {'t0': 'coproc', 't1': 'coproc'} and
+      refused('q', STEP) and refused('r', 'without its clock pair'))
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqr'), '| (l)', v['l'][:20], J['l']['flushes'],
+      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src,
+      '| (p)', v['p'][:20], J['p']['flushes'], J['p'].get('clock_src'))
 sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
     log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
   else
@@ -739,32 +754,95 @@ s3=$(clock_pair f14c); s4=$(clock_pair f14d)
 # ...and a ( ) subshell that reopened the stamper's fd numbers onto a decoy file and /dev/null: the fds are open but
 # are not the coproc's pipes, so the /proc inode half of stamper_fds_ok must refuse them -- one-shot, and nothing
 # written into the decoy (fifth re-review, finding 1: no case made that half refuse). Linux /proc is required.
-decoy="$OUT/f14.decoy"; : >"$decoy"
-s5=$( ( eval "exec ${STAMPER[1]}>\"\$decoy\" ${STAMPER[0]}</dev/null"; clock_pair f14e ) 2>/dev/null )
-# Each fd alone, with the other one the REAL pipe, so an inode check covering only one of the two is caught (sixth
-# re-review, finding 2): the write fd onto a second decoy (must stay empty), then the read fd onto /dev/null (no
-# request may reach the real stamper: nothing may wait in its pipe afterwards). Done in ( ) subshells handed the real
-# pipes through duplicates made here: bash closes the coproc's own fds in ( ), and an `exec` onto a coproc fd number
-# inside a command substitution did not take effect at all on bash 5.3 (measured on the Mac: the fd stayed the pipe).
-exec {kr}<&"${STAMPER[0]}" {kw}>&"${STAMPER[1]}"
-decoy2="$OUT/f14.decoy2"; : >"$decoy2"
-s6=$( ( eval "exec ${STAMPER[0]}<&$kr ${STAMPER[1]}>\"\$decoy2\""; clock_pair f14f ) 2>/dev/null )
-s7=$( ( eval "exec ${STAMPER[0]}</dev/null ${STAMPER[1]}>&$kw"; clock_pair f14g ) 2>/dev/null )
-exec {kr}<&- {kw}>&-
-stray=""; [ -n "${STAMPER_PID:-}" ] && IFS= read -r -t 1 stray <&"${STAMPER[0]}" 2>/dev/null
-dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
+# Each fd alone too, with the other one the REAL pipe, so an inode check covering only one of the two is caught
+# (sixth re-review, finding 2): the write fd onto a second decoy (must stay empty), then the read fd onto /dev/null
+# (no request may reach the real stamper: nothing may wait in its pipe afterwards). Done in ( ) subshells handed the
+# real pipes through duplicates made here: bash closes the coproc's own fds in ( ), and an `exec` onto a coproc fd
+# number inside a command substitution did not take effect at all on bash 5.3 (measured on the Mac). Each subshell
+# first PROVES its setup took effect (each fd -ef the decoy, /dev/null or the real pipe) and exits without stamping
+# if not, so a silently failed exec cannot pass for a refusal (seventh re-review, finding 1). All of it only with a
+# live stamper: a reaped coproc unsets STAMPER, which `set -u` would turn into an abort with no F14 line (finding 2).
+s5="" s6="" s7="" s10="" s11="" s12="" ctl="" leak="" stray="" dsz="-" dsz2="-" haveproc=0
+[ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
+if [ $alive = 1 ] && [ -n "${STAMPER[0]:-}" ] && [ -n "${STAMPER[1]:-}" ]; then
+  R=${STAMPER[0]} W=${STAMPER[1]}
+  setup_is() { [ "/proc/$BASHPID/fd/$R" -ef "$1" ] && [ "/proc/$BASHPID/fd/$W" -ef "$2" ]; }  # (read fd, write fd)
+  decoy="$OUT/f14.decoy"; : >"$decoy"
+  s5=$( ( eval "exec $W>\"\$decoy\" $R</dev/null"; setup_is /dev/null "$decoy" || exit 3; clock_pair f14e ) 2>/dev/null )
+  exec {kr}<&"$R" {kw}>&"$W"
+  decoy2="$OUT/f14.decoy2"; : >"$decoy2"
+  s6=$( ( eval "exec $R<&$kr $W>\"\$decoy2\""; setup_is "/proc/$STAMPER_SHELL/fd/$R" "$decoy2" || exit 3
+          clock_pair f14f ) 2>/dev/null )
+  s7=$( ( eval "exec $R</dev/null $W>&$kw"; setup_is /dev/null "/proc/$STAMPER_SHELL/fd/$W" || exit 3
+          clock_pair f14g ) 2>/dev/null )
+  # And decoys that ARE anonymous pipes, like the stamper's own (two fresh ones, opened read-write here through
+  # /dev/fd so a leaked request stays readable): only an inode check refuses them -- not "this fd is a pipe" (-p), not
+  # "its link reads pipe:[...]", not "same device as the stamper's pipe" (ninth re-review, finding 2; tenth, findings
+  # 1-3: the FIFO files this replaces passed the last two mutants and were left in the uploaded raw). No file is made.
+  # Three cases, as for the other decoys: both fds on the new pipes (s10), then each alone with the other the REAL
+  # pipe (s11: write fd on aw, a leak waits in aw; s12: read fd on ar, the request reaches the real stamper and the
+  # probe below reads its reply first) -- a check that treats the two fds differently is caught (eleventh re-review,
+  # finding 2). The setup proof requires the decoys to be pipes and the fd numbers to be them; and a control line
+  # written through aw must read back from aw, so the leak detector is shown able to fire (finding 3). The exec is
+  # wrapped so its 2>/dev/null is not made permanent (an exec with no command keeps every redirection: it silenced
+  # the rest of the script's stderr; finding 1), and a failed exec leaves the cases unrun (F14 fails) instead of
+  # aborting under set -u (tenth, finding 4).
+  ar="" aw="" ctl=""
+  { exec {ar}<> <(:) {aw}<> <(:); } 2>/dev/null || true
+  if [ -n "$ar" ] && [ -n "$aw" ]; then
+    printf 'f14ctl\n' >&"$aw"; IFS= read -r -t 1 ctl <&"$aw"
+    s10=$( ( eval "exec $R<&$ar $W>&$aw"
+             [ -p "/proc/$BASHPID/fd/$ar" ] && [ -p "/proc/$BASHPID/fd/$aw" ] &&
+               setup_is "/proc/$BASHPID/fd/$ar" "/proc/$BASHPID/fd/$aw" || exit 3
+             clock_pair f14j ) 2>/dev/null )
+    s11=$( ( eval "exec $R<&$kr $W>&$aw"
+             [ -p "/proc/$BASHPID/fd/$aw" ] && setup_is "/proc/$STAMPER_SHELL/fd/$R" "/proc/$BASHPID/fd/$aw" || exit 3
+             clock_pair f14k ) 2>/dev/null )
+    IFS= read -r -t 1 leak <&"$aw"
+    s12=$( ( eval "exec $R<&$ar $W>&$kw"
+             [ -p "/proc/$BASHPID/fd/$ar" ] && setup_is "/proc/$BASHPID/fd/$ar" "/proc/$STAMPER_SHELL/fd/$W" || exit 3
+             clock_pair f14l ) 2>/dev/null )
+  fi
+  [ -n "$ar" ] && exec {ar}>&-
+  [ -n "$aw" ] && exec {aw}>&-
+  exec {kr}<&- {kw}>&-
+  dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
+  # One probe, answered in order, proves two things at once (eighth re-review, findings 1 and 3): send a one-word
+  # line, a non-ASCII line and a request with a fixed nonce, and the FIRST line back must be the probe's own reply.
+  # A request leaked by the read-fd decoy case would have its reply first (no timing involved), and a stamper that
+  # answers the non-ASCII line (the text-mode one does in C-family locales, via surrogateescape) fails too.
+  stray=$( { printf 'garbage\n\377\376 bytes\nf14probe.0.0 f14p\n' >&"$W"; IFS= read -r -t 2 l <&"$R" && printf '%s' "$l"; } 2>/dev/null )
+fi
 # The stamper lived throughout, so the decoy cases were refused by the fd check, not by a dead stamper (sixth
-# re-review, finding 3).
+# re-review, finding 3), and still answers a well-formed request from the coproc after the malformed ones.
+s8=$(clock_pair f14h)
+# clock_pair must judge each reply with stamp_reply_ok: with it made to refuse everything, the stamp is one-shot
+# (eighth re-review, finding 2: testing the function alone did not show clock_pair calls it).
+s9=$( stamp_reply_ok() { return 1; }; clock_pair f14i )
 alive2=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive2=1
-haveproc=0; [ -d "/proc/$STAMPER_SHELL/fd" ] && haveproc=1
+# The reply-shape check itself, on known lines: the stamper's own format passes; 9 or 11 realtime integer digits, 8
+# fraction digits, a splice of two replies, or a missing field fail (seventh re-review, finding 3).
+good="t0=1791297035.254772186 t0_mono=100.431402634 t0_err=0.000000500"
+shapes=0
+stamp_reply_ok "$good" t0 && shapes=$((shapes + 1))
+for bad in "t0=179129703.254772186 t0_mono=100.431402634 t0_err=0.000000500" \
+  "t0=17912970351.254772186 t0_mono=100.431402634 t0_err=0.000000500" \
+  "t0=1791297035.25477218 t0_mono=100.431402634 t0_err=0.000000500" \
+  "t0=1791297035.254772186 t0_mono=100.431402634 t0_err=0.0000005t1=1791297035.254772186 t1_mono=100.431402634" \
+  "t0=1791297035.254772186 t0_mono=100.431402634"; do
+  stamp_reply_ok "$bad" t0 || shapes=$((shapes + 1))
+done
 if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
   $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
   $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 &&
-  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" && -z $stray &&
-  $alive2 = 1 ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds refused together and one at a time (0 bytes written, no stray reply): [$s3]"
+  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" &&
+  $s10 == "f14j="*" f14j_src=oneshot" && $s11 == "f14k="*" f14k_src=oneshot" && $s12 == "f14l="*" f14l_src=oneshot" &&
+  $ctl == f14ctl && -z $leak &&
+  $stray == "f14probe.0.0 f14p="* && $s8 == "f14h="*" f14h_src=coproc" && $s9 == "f14i="*" f14i_src=oneshot" &&
+  $alive2 = 1 && $shapes = 6 ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused together and one at a time with no leaked request (leak detector control read back) [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] stray=[$stray]"
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] [$s11] [$s12] control=[$ctl] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
   fails=$((fails + 1))
 fi
 

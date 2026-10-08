@@ -32,6 +32,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import stracecount  # noqa: E402  (the same table columns as each job's own flushes.tsv)
+import fixture  # noqa: E402  (one parent fixture for every system)
 
 WORKFLOW = ".github/workflows/fastest-competitors.yml"
 _PG = ["pg18-select1", "pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal"]
@@ -189,6 +190,32 @@ def main(argv):
             except (OSError, ValueError) as e:
                 cells.append((name, f"{cell} MISSING ({e.__class__.__name__})", None))
                 missing += 1
+            # Every cell's latency comes from its untraced timed run, judged by timedrun.py (gate-6 review, t3run
+            # item 2): a cell without a timed run, or whose timed run was traced, is not a cell.
+            tj = os.path.join(a, "run", "cells", cell, "timed.json")
+            try:
+                tv = json.load(open(tj)).get("verdict")
+            except (OSError, ValueError) as e:
+                tv = f"MISSING ({e.__class__.__name__})"
+            if tv != "ok":
+                print(f"TIMED\t{name}\t{cell}\t{tv}")
+                bad += 1
+    # One parent fixture for every system of the run (gate-6 review, t3run item 4): every present job's
+    # run/fixture.json must name the same rows, aging, live branches and generator digest (fixture.py compare).
+    fxs = []
+    for name in names:
+        fp = os.path.join(d, name, "run", "fixture.json")
+        if name not in present:
+            continue
+        try:
+            fxs.append(json.load(open(fp)))
+        except (OSError, ValueError) as e:
+            print(f"FIXTURE\t{name}\tMISSING ({e.__class__.__name__})")
+            bad += 1
+    fwhy = fixture.compare(fxs)
+    print("FIXTURE\tall jobs\t" + ("one parent: " + json.dumps({k: fxs[0].get(k) for k in fixture.KEYS})
+                                   if not fwhy else "REFUSED: " + "; ".join(fwhy)))
+    bad += 1 if fwhy else 0
     print("CELLS\tartifact\tcell\t" + "\t".join(stracecount.TABLE_COLS))
     for name, cell, c in cells:
         if c is None:

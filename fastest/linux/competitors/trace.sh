@@ -58,9 +58,11 @@ import sys, time
 # an undefined reference point and on macOS CPython it starts near zero in each process (measured on the Mac).
 def mono():
     return time.clock_gettime(time.CLOCK_MONOTONIC)
-for req in sys.stdin:
-    try:  # a malformed line is skipped, not a crash that leaves every later stamp to the one-shot path
-        nonce, name = req.split()
+for raw in sys.stdin.buffer:
+    # A malformed line -- not two words, or not ASCII (UnicodeDecodeError is a ValueError) -- is skipped, not a crash
+    # that leaves every later stamp to the one-shot path (sixth and seventh re-reviews).
+    try:
+        nonce, name = raw.decode("ascii").split()
     except ValueError:
         continue
     best = None
@@ -87,6 +89,17 @@ stamper_fds_ok() { # the coproc's two fds are open in THIS shell and, where /pro
     if [ -d "/proc/$STAMPER_SHELL/fd" ]; then [ "/proc/$BASHPID/fd/$f" -ef "/proc/$STAMPER_SHELL/fd/$f" ] || return 1; fi
   done
 }
+# stamp_reply_ok REPLY NAME -> 0 when REPLY (a stamper line, nonce removed) has the stamper's exact shape for NAME:
+# "NAME=<10 digits>.<9> NAME_mono=<digits>.<9> NAME_err=<digits>.<9>". Bash reads a pipe a byte at a time, so a
+# concurrent reader (a process substitution runs beside its parent) could splice two replies; most spliced lines fail
+# the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a digit of the monotonic integer
+# part is refused downstream by the realtime-vs-monotonic check (sixth re-review, finding 1). The realtime field has
+# exactly 10 integer digits until 2286. Callers must not stamp concurrently in any case. F14 tests it directly.
+stamp_reply_ok() {
+  local d='[0-9]+\.[0-9]{9}'
+  local want="^$2=[0-9]{10}\.[0-9]{9} ${2}_mono=$d ${2}_err=$d\$"
+  [[ $1 =~ $want ]]
+}
 clock_pair() {
   local name=$1 line="" src=oneshot nonce
   STAMP_SEQ=$((STAMP_SEQ + 1))
@@ -98,17 +111,10 @@ clock_pair() {
     # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
     line=$( {
       printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
-      # The whole reply must have the stamper's exact shape, not just this call's nonce: bash reads a pipe a byte at a
-      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; most
-      # spliced lines fail the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a
-      # digit of the monotonic integer part is refused downstream by the realtime-vs-monotonic check (sixth re-review,
-      # finding 1). The realtime field has exactly 10 integer digits (until 2286). Callers must not stamp
-      # concurrently in any case.
-      d='[0-9]+\.[0-9]{9}'
-      want="^$nonce $name=[0-9]{10}\.[0-9]{9} ${name}_mono=$d ${name}_err=$d\$"
+      # This call's reply (its nonce, literally) with the stamper's exact shape (stamp_reply_ok), else one-shot.
       for ((k = 0; k < 8; k++)); do
         IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
-        case $l in "$nonce "*) [[ $l =~ $want ]] && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
+        case $l in "$nonce "*) stamp_reply_ok "${l#"$nonce "}" "$name" && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
       done
       exit 1
     } 2>/dev/null )
@@ -165,6 +171,21 @@ task_check() {
     return
   fi
   if is_dead_state "$s"; then echo dead; elif [ "$tp" = "$2" ]; then echo traced; else echo untraced; fi
+}
+
+tracer_sample() { # tracer_sample PHASE PID... -> "PHASE pid tid tracerpid" for every live task of each PID
+  # Builtins only (no fork per task), since it also runs beside a TIMED run.
+  local ph=$1 p t k v
+  shift
+  for p in "$@"; do
+    for t in /proc/"$p"/task/*; do
+      [ -e "$t" ] || continue
+      while read -r k v _; do
+        [ "$k" = TracerPid: ] && { echo "$ph $p ${t##*/} $v"; break; }
+      done 2>/dev/null <"$t/status"
+    done
+  done
+  return 0
 }
 
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
@@ -359,12 +380,14 @@ strace_detach() {
 strace_run() {
   local out=$1 rc=0
   shift
-  echo "cmd=$* t0=$(date +%s.%N)" >"$out.window"
+  # t0 and t1 are clock pairs, as in an attach window, so stracecount's clock-step checks cover launch windows too
+  # (SMOKE.md erratum E4: they were `date` stamps with no pair).
+  { echo "cmd=$*"; clock_pair t0; } >"$out.window"
   # The traced command's own stderr goes to OUT.cmd.err (an sh that redirects fd 2 and execs it, traced from the
   # start), so OUT.strace.err holds strace's messages only: a Python DeprecationWarning from the fire-check's F1
   # probe sat in strace.err in 2 of 20 jobs of run 37244177784 and would now refuse the window (third review, 3).
   strace "${STRACE_OPTS[@]}" -o "$out.strace" /bin/sh -c 'exec "$@" 2>"$0"' "$out.cmd.err" "$@" 2>"$out.strace.err" || rc=$?
-  { echo "t1=$(date +%s.%N)"; echo "strace_rc=$rc"; } >>"$out.window"
+  { clock_pair t1; echo "strace_rc=$rc"; } >>"$out.window"
   return $rc
 }
 

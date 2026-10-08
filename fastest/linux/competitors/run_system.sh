@@ -9,7 +9,11 @@
 # For each spec and each C in FT_CLIENTS (default "1 4"), one CELL (RAW/cells/<spec>-c<C>/):
 #   conncheck : C+16 connections opened at once and a SELECT 1 on each (amendment 27 (1)); untraced
 #   idle      : strace -f -C attached to every server process for FT_IDLE_S seconds with no client (the control)
-#   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise)
+#   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise): the traced
+#               LABELLING run (bb/), whose latencies are never used
+#   timed     : the identical bbload command again with no tracer anywhere (timed/), its TracerPid samples
+#               (timed.tracer.tsv) and exit status (timed.rc), judged by timedrun.py into timed.json: the cell's only
+#               latency file is timed/raw.tsv (gate-6 review, t3run item 2; PREREG :173)
 #   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
 #               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
 #               op's dirty pages), reported apart from the window and never added to it
@@ -39,6 +43,21 @@ N4=${FT_N4:-200}
 ROWS=${FT_ROWS:-10000}
 IDLE_S=${FT_IDLE_S:-30}
 CLIENTS=${FT_CLIENTS:-1 4}
+# The warm-up of every timed and labelling run (gate-6 review, t3run item 3): PREREG :210's one rule,
+# min(max(1000 ops, 10 s), 10% of the cap), as bbload/clonebench --warmup OPS:S:MAX_S; FT_WARMUP overrides it only
+# with the same OPS:S:MAX_S form (the T3 driver passes the value it gives fastest_profile). FT_CAP_S is the
+# registered per-run cap (default 1800 s). Recorded in run-info.txt and in every run's summary.json warmup_rule.
+CAP_S=${FT_CAP_S:-1800}
+WARMUP=${FT_WARMUP:-$(python3 "$HERE/timedrun.py" rule "$CAP_S")}
+# One parent fixture for every system (gate-6 review, t3run item 4): gen_seed.py's t at ROWS rows, aged by AGE
+# committed single-row UPDATEs (0 = fresh; PREREG §7 ages with 1e5) and the system's documented maintenance, with
+# PREBRANCH live branches made before the cells, each with one private write (the system's own M1 op, untimed and
+# untraced). RAW/fixture.json records it (fixture.py write); reduce.py refuses a run whose systems' fixtures differ.
+AGE=${FT_AGE:-0}
+PREBRANCH=${FT_PREBRANCH:-0}
+[[ $AGE =~ ^[0-9]+$ && $PREBRANCH =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_AGE [$AGE] / FT_PREBRANCH [$PREBRANCH] not counts" >&2; exit 2; }
+PSUM=$(python3 "$HERE/gen_seed.py" sum --rows "$ROWS" --updates "$AGE")  # the parent's sum(v) after the aging
+[[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
 SC="$HERE/stracecount.py"
 FH="$HERE/fthelp.py"
 SPECS="$HERE/loadgen/specs"
@@ -54,7 +73,13 @@ fail() { fun "FAIL $*"; nfail=$((nfail + 1)); }
 expect() { # expect NAME GOT WANT
   if [ "$2" = "$3" ]; then pass "$1: $2"; else fail "$1: got [$2] want [$3]"; fi
 }
-nops() { [ "$1" = 1 ] && echo "$N1" || echo "$N4"; }
+# nops C -> the run's ops TOTAL (all clients together): FT_OPS_TOTAL for every C and system when set, else N1 at C=1
+# and N4 otherwise (gate-6 review, t3run item 12); timedrun.py check refuses a run that measured another total.
+nops() { python3 "$HERE/timedrun.py" ops "$1" "$N1" "$N4" "${FT_OPS_TOTAL:-}"; }
+# The registered per-run cap bounds every measured window (bbload/clonebench --max-window-s CAP_S: a run it ends with
+# >= 1000 ok ops is complete with reduced n), and one outer timeout above it, the same for every system, bounds each
+# invocation (gate-6 review, t3run item 16).
+OUTER_S=$((${CAP_S%.*} + 600))
 fsused() { sync -f "$MNT"; df -B1 --output=used "$MNT" | tail -1 | tr -d ' '; }
 
 # Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG, each
@@ -101,7 +126,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS]";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 
@@ -156,11 +181,46 @@ count_branches() {
   esac
 }
 
-bbload() { # bbload SPEC C N OUT -> bbload's rc
+bb_args() { # bb_args SPEC C N OUT [nowarm] -> BBA: the one bbload command line, so the labelling and timed runs are
+  # identical; both warm up by WARMUP (gate-6 review, t3run item 3). nowarm: the untimed conncheck.
+  BBA=("$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS"
+    --stall-s 600 --max-window-s "$CAP_S")
+  BBA=(timeout "$OUTER_S" "${BBA[@]}")
+  [ "${5:-}" = nowarm ] || BBA+=(--warmup "$WARMUP")
+}
+bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
   local rc=0
-  "$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS" \
-    --stall-s 600 --max-window-s 3600 >"$4.txt" 2>&1 || rc=$?
+  bb_args "$@"
+  "${BBA[@]}" >"$4.txt" 2>&1 || rc=$?
   cat "$4.txt"
+  return $rc
+}
+server_tree() { [ -n "${1:-}" ] && { echo "$1"; descendants "$1"; }; }  # server_tree PID -> PID and its live descendants
+# timed_run OUT SERVERPID -- CMD...: the UNTRACED timed run (PREREG :173; gate-6 review, t3run item 2). CMD runs with
+# no strace anywhere; the TracerPid of every task of CMD's process and of the server's processes is sampled at its
+# start and at its end into OUT.tracer.tsv ("phase pid tid tracerpid"; CMD's end sample is its last one while alive),
+# CMD's output into OUT.txt and its exit status into OUT.rc. timedrun.py check refuses the cell unless every sample is
+# 0 at both ends. SERVERPID is empty for the embedded B1.
+timed_run() {
+  local out=$1 spid=$2 rc=0 pid last=""
+  shift 3
+  "$@" >"$out.txt" 2>&1 &
+  pid=$!
+  sleep 0.2  # let CMD's own process (under its `timeout` wrapper) start, so the start sample sees it
+  { tracer_sample start $(server_tree "$pid"); tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
+  # CMD's process tree's latest sample, every 0.5 s while it runs (CMD runs under `timeout`, so the tree is the
+  # wrapper and the driver): builtins for the reads, one `ps` and one `sleep` per sample, so the sampler adds no
+  # measurable load beside the timed run.
+  : >"$out.tracer.last"
+  while kill -0 "$pid" 2>/dev/null; do
+    tracer_sample end $(server_tree "$pid") >"$out.tracer.last.new" && mv -f "$out.tracer.last.new" "$out.tracer.last"
+    sleep 0.5
+  done
+  wait "$pid" || rc=$?
+  { cat "$out.tracer.last"; tracer_sample end $(server_tree "$spid"); } >>"$out.tracer.tsv"
+  rm -f "$out.tracer.last" "$out.tracer.last.new"
+  echo "$rc" >"$out.rc"
+  cat "$out.txt"
   return $rc
 }
 
@@ -182,6 +242,16 @@ ops_of() {
   case $(basename "$2") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac  # variant (a): step 1 checks out the parent, step 2 creates
   if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
 }
+# timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
+# N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
+timedrun_check() {
+  local k=1
+  case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
+  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
+    fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
+  fi
+}
 # judge_cell CELLDIR -- the cell's verdict must be "ok"; anything else (REFUSED, INCOMPLETE, NOT CLEAN, a missing or
 # unreadable cell.json) FAILS the job.
 judge_cell() {
@@ -196,7 +266,7 @@ run_server_cell() { # run_server_cell SPEC C
   d="$RAW/cells/$spec-c$c"
   mkdir -p "$d"
   echo "=== $SYSTEM $spec C=$c N=$n"
-  bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" >/dev/null ||
+  bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" nowarm >/dev/null ||
     fail "$spec-c$c conncheck: C+16=$((c + 16)) connections (rc $?, $(tail -1 "$d/conncheck.txt"))"
   strace_attach "$d/idle" "$(server_pid)" || { fail "$spec-c$c idle attach"; return; }
   sleep "$IDLE_S"
@@ -239,6 +309,15 @@ run_server_cell() { # run_server_cell SPEC C
     tw=(--template-waits "$d/template_waits.txt")
     [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
   fi
+  # The TIMED run: the identical bbload command with no tracer anywhere (gate-6 review, t3run item 2; PREREG :173).
+  # The labelling run above gives the flush counts, never a latency; this one gives the only latency file
+  # (timed/raw.tsv). PG: the template must be idle again first, and a CHECKPOINT after it (untraced) keeps the timed
+  # run's deferred work out of the next cell's idle control and labelling window.
+  if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s (before the timed run)"; fi
+  bb_args "$spec" "$c" "$n" "$d/timed"
+  timed_run "$d/timed" "$(server_pid)" -- "${BBA[@]}" >/dev/null || true
+  if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
+  timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
   if [ "$KIND" = pg ]; then
     count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
@@ -253,6 +332,44 @@ run_server_cell() { # run_server_cell SPEC C
     ${defer[@]+"${defer[@]}"} ${tw[@]+"${tw[@]}"} >"$d/cell.json"
   judge_cell "$d"
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
+}
+
+# server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
+# parent's own files, the size as the engine reports it (or why it cannot), the extent count of its data files.
+server_fixture() {
+  local du=() ext=() eb="" why="" maint
+  maint=$(sed -n 's/^maintenance: //p' "$RAW/seed.txt" | tail -1)
+  case $KIND in
+    pg)
+      du=("$DATA/base/$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")")
+      eb=$(sqlq "SELECT pg_database_size('p')")
+      ext=("$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")") ;;
+    dolt)
+      du=("$DATA/dbs/bench")
+      why="Dolt has no SQL function for a database's size; du only"
+      ext=("$DATA"/dbs/bench/.dolt/noms/*) ;;
+    doltgres)
+      du=("$DATA/databases")
+      why="Doltgres has no working pg_database_size; du only"
+      ext=("$DATA"/databases/*/.dolt/noms/*) ;;
+  esac
+  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+    --prebranch "$PREBRANCH" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} ${why:+--engine-why "$why"} \
+    --extents "${ext[@]}" --maintenance "$maint" >/dev/null || fail "fixture.json"
+}
+# prebranch_server -- PREBRANCH live branches before the cells, each with one private write: the system's own M1 op
+# (bbload, C=4, no warm-up, untraced, untimed); their creates join the branch-count check (RAW/prebranch.ops.txt).
+prebranch_server() {
+  [ "$PREBRANCH" -gt 0 ] || return 0
+  local sp
+  case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
+  bbload "$sp" 4 "$PREBRANCH" "$RAW/prebranch" nowarm >/dev/null || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
+  if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
+  python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || { fail "prebranch ops reader"; echo "0 0 0" >"$RAW/prebranch.ops.txt"; }
+  local created
+  created=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")
+  [ "$created" -ge "$PREBRANCH" ] 2>/dev/null && pass "prebranch: $created live branches with one private write each" ||
+    fail "prebranch: $created branches made, want >= $PREBRANCH"
 }
 
 server_main() {
@@ -274,11 +391,20 @@ server_main() {
     fi
   fi
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
-  srv seed "$DATA" "$ROWS" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  server_fixture
+  prebranch_server
   if [ "$KIND" = pg ]; then
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
     expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
+    # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15), recorded in pg_settings.tsv and meminfo.txt
+    cp /proc/meminfo "$RAW/meminfo.txt"
+    if python3 -B "$HERE/pins.py" check-pg "$RAW/pg_settings.tsv" "$RAW/meminfo.txt" >"$RAW/shared_buffers-check.txt" 2>&1; then
+      pass "server shared_buffers = 25% of MemTotal ($(awk -F'\t' '$1 == "shared_buffers" {print $2}' "$RAW/pg_settings.tsv") x 8 kB)"
+    else
+      fail "server shared_buffers: $(cat "$RAW/shared_buffers-check.txt")"
+    fi
   fi
   if [ "$KIND" = pg ]; then  # the seed's own checkpoint; a failure FAILS the job (second review, finding 9)
     sqlq "CHECKPOINT" >"$RAW/seed-checkpoint.txt" 2>&1 || fail "pre-cell CHECKPOINT rc=$? ($(tail -1 "$RAW/seed-checkpoint.txt"))"
@@ -289,6 +415,17 @@ server_main() {
     dolt) { "$FT_DOLT" version; sha256sum "$FT_DOLT"; } >"$RAW/version.txt" 2>&1 ;;
     doltgres) { (cd "$ROOT" && "$FT_DOLTGRES" -version); sha256sum "$FT_DOLTGRES"; } >"$RAW/version.txt" 2>&1 ;;
   esac
+  # The server is the registered version of versions.tsv, or the job fails (gate-6 review, t3run item 13); PG's
+  # installed package must also be the registered one.
+  local vsys
+  case $KIND in pg) vsys=postgresql ;; *) vsys=$KIND ;; esac
+  head -1 "$RAW/version.txt" >"$RAW/version-line.txt"
+  python3 -B "$HERE/pins.py" check-version "$vsys" "$RAW/version-line.txt" >"$RAW/version-check.txt" 2>&1 &&
+    pass "server version: $(cat "$RAW/version-check.txt")" || fail "server version: $(cat "$RAW/version-check.txt")"
+  if [ "$KIND" = pg ]; then
+    expect "PGDG postgresql-18 package" "$(awk '$1 == "postgresql-18" {print $2}' "$RAW/version.txt")" \
+      "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
+  fi
   for spec in $SPECLIST; do
     for c in $CLIENTS; do
       run_server_cell "$spec" "$c"
@@ -298,11 +435,13 @@ server_main() {
   fun "## functional checks ($SYSTEM on $(findmnt -n -o FSTYPE -T "$MNT"))"
   # The clone proof first: a later read of the template could dirty a page whose write-back un-shares its extent.
   if [ "$KIND" = pg ]; then pg_clone_proof; fi
-  expect "isolation: parent/main count|sum(v)" "$(sqlp "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+  expect "isolation: parent/main count|sum(v)" "$(sqlp "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
   local want=0 m1 br
+  [ -f "$RAW/prebranch.ops.txt" ] && want=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")  # the live branches made first
   for d in "$RAW"/cells/*; do
     case $(basename "$d") in *select1*) continue ;; esac
     [ -f "$d/ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/ops.txt")))
+    [ -f "$d/timed.ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/timed.ops.txt")))  # the timed run's creates too
   done
   [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
   expect "branch count (every created branch exists; created from raw.tsv)" "$(count_branches)" "$want"
@@ -313,7 +452,7 @@ server_main() {
     nm1=$((nm1 + 1))
     br=$(python3 "$FH" branch "$d/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
     expect "isolation: $m1 branch $br count|sum(v) after one UPDATE" \
-      "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|1"
+      "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|$((PSUM + 1))"
   done
   [ $nm1 -gt 0 ] || fail "isolation: no M1 cell to read a branch from"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
@@ -355,7 +494,23 @@ b1_main() {
   local cell spec op sync c n d rc total ok created bdir
   DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/<cell>/...
   mkdir -p "$ROOT/branches"
-  "$CB" mkparent --db "$ROOT/parent.db" --rows "$ROWS" | tee "$RAW/mkparent.json" || { fail "mkparent"; return; }
+  # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
+  # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
+  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" | tee "$RAW/mkparent.json" ||
+    { fail "parent (fixture.py sqlite)"; return; }
+  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+    --prebranch "$PREBRANCH" --du "$ROOT/parent.db" \
+    --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
+    --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
+    >/dev/null || fail "fixture.json"
+  if [ "$PREBRANCH" -gt 0 ]; then  # PREBRANCH live branches first, each with one private write (untraced, untimed)
+    mkdir -p "$ROOT/branches/prebranch"
+    "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" --clients 4 \
+      --max-ops "$PREBRANCH" --rows "$ROWS" --out "$RAW/prebranch" >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
+    python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || echo "0 0 0" >"$RAW/prebranch.ops.txt"
+    expect "prebranch: live branch files" "$(find "$ROOT/branches/prebranch" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" \
+      "$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")"
+  fi
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}
@@ -366,8 +521,9 @@ b1_main() {
       mkdir -p "$d" "$bdir"
       echo "=== b1 $spec C=$c N=$n"
       rc=0
-      strace_run "$d/load" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$bdir" \
-        --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
+      strace_run "$d/load" timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
+        --dir "$bdir" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
+        --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
       count "$d/load"
@@ -379,20 +535,29 @@ b1_main() {
       python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
       expect "b1-$spec-c$c branch files (every created branch exists)" \
         "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$created"
+      # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
+      # t3run item 2): the only latency file of the cell is timed/raw.tsv.
+      mkdir -p "$bdir.timed"
+      timed_run "$d/timed" "" -- timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
+        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
+        --out "$d/timed" >/dev/null || true
+      timedrun_check "$d" "$n" "b1-$spec-c$c"
+      expect "b1-$spec-c$c timed run branch files (every created branch exists)" \
+        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$(cut -d' ' -f3 "$d/timed.ops.txt")"
     done
   done
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
-  expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+  expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
   local f
   for spec in m1-d2 m1-d0; do
     f=$(find "$ROOT/branches/$spec-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
     [ -n "$f" ] || { fail "isolation $spec: no branch b_*_0_0.db"; continue; }
     expect "isolation: $spec branch $(basename "$f") integrity|count|sum(v)" \
-      "$("$SQ3" "$f" "PRAGMA integrity_check; SELECT count(*), sum(v) FROM t;" | tr '\n' '|' | sed 's/|$//')" "ok|$ROWS|1"
+      "$("$SQ3" "$f" "PRAGMA integrity_check; SELECT count(*), sum(v) FROM t;" | tr '\n' '|' | sed 's/|$//')" "ok|$ROWS|$((PSUM + 1))"
   done
   f=$(find "$ROOT/branches/m1c-d2-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
   if [ -n "$f" ]; then
-    expect "isolation: m1c-d2 branch $(basename "$f") count|sum(v)" "$("$SQ3" "$f" "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+    expect "isolation: m1c-d2 branch $(basename "$f") count|sum(v)" "$("$SQ3" "$f" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
     sync -f "$MNT"
     python3 "$FH" cloneproof "$ROOT/parent.db" "$f" >"$RAW/cloneproof-m1c.json"
     expect "clone proof (filefrag, parent vs $(basename "$f")): verdict" \

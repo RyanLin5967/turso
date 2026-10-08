@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # doltgres.sh -- Doltgres (prebuilt darwin-arm64, go1.26.8) for the branch benchmark, native settings (PREREG §4).
 # LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/doltgres.sh
-# @648ce2929): unchanged except that the binaries and python come from common.sh (FT_DOLTGRES = the 1.3.3
+# @648ce2929): unchanged except that the binaries and python come from common.sh (FT_DOLTGRES = the registered (versions.tsv)
 # doltgresql-linux-<arch> release tarball, sha256-checked by fetch_dolt.sh; psql from PGDG postgresql-18).
 #
 #   doltgres.sh init  DATA PORT       write DATA/config.yaml (DATA must not exist; *.noindex): data, cfg, auth,
@@ -9,7 +9,7 @@
 #                                     to the cwd, and with no config it serves $HOME/doltgres/databases)
 #   doltgres.sh start DATA [V1RUN]    run `doltgres -config DATA/config.yaml` with cwd DATA, detached; pid ->
 #                                     DATA.ftpid, log -> DATA.log; waits until SELECT 1 answers
-#   doltgres.sh seed  DATA ROWS       t(ROWS rows) in database postgres, then dolt_commit so main holds it
+#   doltgres.sh seed  DATA ROWS [AGE] t(ROWS rows) in database postgres, dolt_commit; AGE>0: aged, dolt_commit, dolt_gc
 #   doltgres.sh sql   DATA SQL        one statement through psql
 #   doltgres.sh stop  DATA            SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): dolt_checkout('-b', b) [BranchBench's create, includes the switch], or
@@ -60,8 +60,25 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: doltgres.sh seed DATA ROWS"
   alive "$PIDF" "$CONF" || die "REFUSED: no running server recorded for $DATA"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc
+  AGE=${4:-0}
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | psqlc
   psqlc -At -c "SELECT dolt_commit('-Am', 'seed')"
+  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each autocommitted, then the
+  # documented maintenance: dolt_commit, then dolt_gc.
+  if [ "$AGE" -gt 0 ]; then
+    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc
+    psqlc -At -c "SELECT dolt_commit('-am', 'age')"
+    # dolt_gc may end the calling session, so success is checked by a new connection afterwards; a failed GC fails
+    # the seed (the recorded maintenance must be what ran).
+    psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || true
+    psqlc -At -c "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after dolt_gc ($(tail -1 "$DATA.gc.txt"))"
+    # the session it ends reads as a closed connection; any other error is a failed GC
+    grep -viE 'closed the connection|terminat|connection to server|lost' "$DATA.gc.txt" | grep -qi 'error' &&
+      die "REFUSED: dolt_gc failed: $(tail -1 "$DATA.gc.txt")"
+    echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
+  else
+    echo "maintenance: dolt_commit seed"
+  fi
   echo "seeded t rows=$(psqlc -At -c 'SELECT count(*) FROM t') branch=$(psqlc -At -c 'SELECT active_branch()')"
   ;;
 sql)

@@ -3,9 +3,14 @@
  *   bbload --spec FILE --out DIR --clients C
  *          [--mode closed|open] [--rate R]          open loop: Poisson arrivals, R ops/s in total
  *          [--warmup-s S] [--warmup-ops N]           warm-up ends when both are reached (default 0, 0)
+ *          [--warmup OPS:S:MAX_S]                    the same, ending at MAX_S at the latest (0: no limit); PREREG
+ *                                                    :210 is min(max(1000 ops, 10 s), 10% of the cap), e.g. 1000:10:180
+ *                                                    at an 1800 s cap. Recorded verbatim as summary.json warmup_rule.
  *          [--duration-s S] [--min-ops N]            the measured window ends when both are reached
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
- *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600)
+ *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
+ *                                                    with --max-ops it is the registered per-run cap: a run it ends
+ *                                                    with >= 1000 ok ops is complete with reduced n (capped: true)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
  *          [--stall-s S] [--allow-errors]
  *
@@ -145,7 +150,9 @@ typedef struct {
 
 static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
-static double RATE = 0, WARM_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static char WARM_RULE[64] = "";
+#define CAPPED_MIN 1000ULL /* PREREG: a capped run with >= 1000 measured ok ops is complete with reduced n */
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
 static char RUNTAG[64];
 static int NSET; static char *SETK[MAXLIST], *SETV[MAXLIST];
@@ -653,6 +660,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rate") && v) RATE = atof(argv[++i]);
         else if (!strcmp(a, "--warmup-s") && v) WARM_S = atof(argv[++i]);
         else if (!strcmp(a, "--warmup-ops") && v) WARM_OPS = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S */
+            unsigned long long wo; double ws, wm; char extra;
+            if (sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || ws < 0 || wm < 0) {
+                fprintf(stderr, "bbload: --warmup OPS:S:MAX_S (got %s)\n", v); return 2;
+            }
+            WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
+            snprintf(WARM_RULE, sizeof WARM_RULE, "%s", v);
+            i++;
+        }
         else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
         else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--max-ops") && v) MAX_OPS = strtoull(argv[++i], NULL, 10);
@@ -743,7 +759,8 @@ int main(int argc, char **argv) {
         if (done != last_done) { last_done = done; last_progress = n; }
         else if ((n - last_progress) / 1e9 > STALL_S) { stalled = 1; break; }
         int ph = g_phase;
-        if (ph == PH_WARM && g_warm_claimed >= WARM_OPS && (n - g_t0) / 1e9 >= WARM_S) {
+        double wel = (n - g_t0) / 1e9;
+        if (ph == PH_WARM && ((g_warm_claimed >= WARM_OPS && wel >= WARM_S) || (WARM_MAX_S > 0 && wel >= WARM_MAX_S))) {
             getrusage(RUSAGE_SELF, &ru0);
             __atomic_store_n(&g_tm0, n, __ATOMIC_RELEASE);
             __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
@@ -842,8 +859,12 @@ int main(int argc, char **argv) {
     int rc = 0;
     const char *verdict = "ok";
     if (meas_ok == 0) { rc = 3; verdict = "REFUSED: no measured operation succeeded"; }
-    else if (short_window) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
+    /* gate-6 review, t3run item 16: with --max-ops, the window cap is the registered per-run cap; a run it ended with
+     * >= CAPPED_MIN ok ops is complete with a reduced n (summary.json capped=1), one with fewer is refused. */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
+    else if (short_window && MAX_OPS && meas_ok < CAPPED_MIN) { rc = 3; verdict = "REFUSED: the window cap ended the run before 1000 ok ops"; }
+    else if (short_window && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
+    /* else: complete, or capped by the window with >= CAPPED_MIN ok ops (capped: true, reduced n) */
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"spec\":\"%s\",\"run_tag\":\"%s\",\"clients\":%d,\"mode\":\"%s\",\"rate\":%.3f,"
@@ -857,6 +878,9 @@ int main(int argc, char **argv) {
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
+    fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
+    if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:0", (unsigned long long)WARM_OPS, WARM_S);
+    fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",
