@@ -887,7 +887,8 @@ impl Session {
 
     /// After a statement of an open implicit block: a failure rolls the whole block back and leaves
     /// the session idle, as PostgreSQL does; a block verb (BEGIN, COMMIT, ROLLBACK) has made the
-    /// block the client's or ended it.
+    /// block the client's or ended it. Any other statement leaves the block implicit: a savepoint
+    /// verb (refused there, see `run`) never ends it (wire review 11 item 6).
     fn after_implicit(&self, sql: &str, failed: bool) {
         let mut st = self.state();
         if !st.implicit {
@@ -901,7 +902,10 @@ impl Session {
                     let _ = engine_tx(&conn, TxStmt::Rollback);
                 }
             }
-        } else if TxVerb::of(sql) == TxVerb::Other {
+        } else if !matches!(
+            TxVerb::of(sql),
+            TxVerb::Begin | TxVerb::Commit | TxVerb::Rollback
+        ) {
             st.implicit = true;
         }
     }
@@ -998,10 +1002,13 @@ impl Session {
             TxVerb::Begin if in_tx => return Ok(Response::Execution(Tag::new("BEGIN"))),
             TxVerb::Commit if !in_tx => return Ok(Response::Execution(Tag::new("COMMIT"))),
             TxVerb::Rollback if !in_tx => return Ok(Response::Execution(Tag::new("ROLLBACK"))),
-            // Savepoints exist only in a block: outside one PostgreSQL refuses them (25P01) and
-            // stays idle. They reached the engine, which opened a transaction for SAVEPOINT and
-            // answered XX000 for the others (wire review 6 item 6, review 3 item 24).
-            TxVerb::RollbackTo | TxVerb::Release | TxVerb::Savepoint if !in_tx => {
+            // Savepoints exist only in a block the client opened: outside one, and in an implicit
+            // block (a multi-statement query, a pipeline before Sync), PostgreSQL refuses them
+            // (25P01). Outside a block they reached the engine, which opened a transaction for
+            // SAVEPOINT and answered XX000 for the others (wire review 6 item 6, review 3 item 24);
+            // in an implicit block they ran and the block's engine transaction was left open with
+            // nobody to commit it (wire review 11 item 6).
+            TxVerb::RollbackTo | TxVerb::Release | TxVerb::Savepoint if !in_tx || st.implicit => {
                 let what = match verb {
                     TxVerb::RollbackTo => "ROLLBACK TO SAVEPOINT",
                     TxVerb::Release => "RELEASE SAVEPOINT",
