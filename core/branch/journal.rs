@@ -152,6 +152,10 @@ pub(crate) struct BranchFiles {
     pub(crate) snap: PathBuf,
     /// The catalog of a catalog-mode store (`catalog.rs`), in place of `snap`.
     pub(crate) cat: PathBuf,
+    /// F-PW (r11-githost-attr PREREG A3): the slots the last clean close used most recently, read
+    /// back into the page cache at open while `R11_PREWARM` is set. A hint, never state: `exist`
+    /// ignores it, and a missing or refused one only means no prewarm.
+    pub(crate) hot: PathBuf,
 }
 
 impl BranchFiles {
@@ -166,6 +170,7 @@ impl BranchFiles {
             log: named("-branch-log"),
             snap: named("-branch-snap"),
             cat: named("-branch-cat"),
+            hot: named("-branch-hot"),
         }
     }
 

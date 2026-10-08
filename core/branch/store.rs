@@ -295,6 +295,7 @@ pub(crate) struct BranchStore {
     /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
     resolve_calls: AtomicU64,
     arena_reads: AtomicU64,
+<<<<<<< HEAD
     /// Per-fork lock holds (fastest-engine M1 item 5; observing only).
     holds: ForkHoldCounters,
     /// Group commit with the flush outside the store mutex (fastest-engine M1 item 2); see
@@ -1017,6 +1018,23 @@ impl<G: std::ops::DerefMut<Target = StoreInner>> Drop for Counted<G> {
         let ns = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
         COUNTED_HOLD_NS.with(|c| c.set(c.get().saturating_add(ns)));
     }
+||||||| 484270f95
+=======
+    /// r11-githost-attr M7 instruments (observing only), each timer paired with its count: branch
+    /// connections that reparsed their schema (`connect_branch`, a state with no schema), and F-S's
+    /// source-key reads and adoptions.
+    schema_reparses: AtomicU64,
+    schema_reparse_ns: AtomicU64,
+    schema_keys: AtomicU64,
+    schema_key_ns: AtomicU64,
+    /// PREREG A3.10: the source-key reads that ran key v2 (a subset of `schema_keys`).
+    schema_keys_v2: AtomicU64,
+    schema_adoptions: AtomicU64,
+    /// F-S (r11-githost-attr PREREG A1; only while `R11_SCHEMA_SHARE` is set): parsed schemas by
+    /// the exact bytes a reparse of them would read (`Connection::branch_schema_source_key`). Its
+    /// own lock, never taken with `inner`.
+    shared_schemas: Mutex<HashMap<Vec<u8>, Arc<Schema>>>,
+>>>>>>> r11-githost-attr-kv2.noindex
 }
 
 struct StoreInner {
@@ -1150,6 +1168,7 @@ struct ShapeCounters {
     table_moved: u64,
     evictions: u64,
     evicted_states: u64,
+<<<<<<< HEAD
     /// r13-compose I4: `ensure` calls that loaded at least one state, the states they loaded in
     /// all, and the most loaded by one call.
     ensure_cold: u64,
@@ -1256,6 +1275,23 @@ struct V4Work {
     base_arena: u64,
     base_refused: u64,
     base_examined: u64,
+||||||| 484270f95
+=======
+    /// r11-githost-attr instruments (observing only), each timer paired with its count: the
+    /// resolution of `resolve_into` (the arena read after it is timed by the arena; C-P's trunk
+    /// probes, counted by `trunk_probes`, and any `ensure` load, also in `cat_load_ns`, are inside);
+    /// every record flush (`log`, `log_all`, the trunk commit's barrier; not the barrier's
+    /// stamp-only flush, which runs only while a lease is outstanding), buffering included (the
+    /// arena fsync inside a flush is also in the arena's sync timer);
+    /// and `ensure` calls that loaded at least one state from the catalog, with the time they took
+    /// (the catalog queries, `insert_loaded` and C-R's parked commits).
+    resolve_ns: u64,
+    resolve_timed: u64,
+    flush_ns: u64,
+    flushes: u64,
+    cat_load_ns: u64,
+    cat_loading_ensures: u64,
+>>>>>>> r11-githost-attr-kv2.noindex
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -3115,6 +3151,7 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+<<<<<<< HEAD
             holds: ForkHoldCounters::new(),
             group: Arc::new(Group::new(0, Arc::new(AtomicBool::new(false)))),
             class: SyncClass::Off,
@@ -3129,6 +3166,16 @@ impl BranchStore {
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             fuzzy: false,
+||||||| 484270f95
+=======
+            schema_reparses: AtomicU64::new(0),
+            schema_reparse_ns: AtomicU64::new(0),
+            schema_keys: AtomicU64::new(0),
+            schema_key_ns: AtomicU64::new(0),
+            schema_keys_v2: AtomicU64::new(0),
+            schema_adoptions: AtomicU64::new(0),
+            shared_schemas: Mutex::new(HashMap::new()),
+>>>>>>> r11-githost-attr-kv2.noindex
         }
     }
 
@@ -3197,6 +3244,7 @@ impl BranchStore {
         let opened = Instant::now();
         let mut stats = BranchOpenStats::default();
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+<<<<<<< HEAD
         // r12-catload: the prewarm (`R12_PREWARM`, off when unset). The arena is warmed here, before
         // recovery reads anything; the catalog by `recover_catalog`, on its own handle.
         let (warm, targets) = if matches!(durability, BranchDurability::Volatile) {
@@ -3211,6 +3259,11 @@ impl BranchStore {
         if targets.arena && !memory {
             prewarm::warm_files(&[BranchFiles::for_db(db_path).arena.as_path()], warm, &mut warmed)?;
         }
+||||||| 484270f95
+=======
+        // F-PW: an invalid R11_PREWARM_SLOTS refuses the open rather than run on a default.
+        let prewarm = super::arena::prewarm_cap()?.is_some();
+>>>>>>> r11-githost-attr-kv2.noindex
         let inner = match durability {
             BranchDurability::Volatile => {
                 if !memory && BranchFiles::for_db(db_path).exist() {
@@ -3374,8 +3427,15 @@ impl BranchStore {
                 inner
             }
         };
+<<<<<<< HEAD
         // Every byte the open buffered was flushed by the recovery itself (single-threaded).
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
+||||||| 484270f95
+=======
+        if prewarm {
+            Self::prewarm(&inner, &mut stats);
+        }
+>>>>>>> r11-githost-attr-kv2.noindex
         let mut store = Self {
             fuzzy,
             group: Arc::new(Group::new(opened_lsn, inner.fail_stop.clone())),
@@ -3409,7 +3469,18 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+<<<<<<< HEAD
             holds: ForkHoldCounters::new(),
+||||||| 484270f95
+=======
+            schema_reparses: AtomicU64::new(0),
+            schema_reparse_ns: AtomicU64::new(0),
+            schema_keys: AtomicU64::new(0),
+            schema_key_ns: AtomicU64::new(0),
+            schema_keys_v2: AtomicU64::new(0),
+            schema_adoptions: AtomicU64::new(0),
+            shared_schemas: Mutex::new(HashMap::new()),
+>>>>>>> r11-githost-attr-kv2.noindex
         };
         if store.inner.lock().files.is_some() {
             store.start_confirm_writer();
@@ -3463,10 +3534,70 @@ impl BranchStore {
         Ok(store)
     }
 
+<<<<<<< HEAD
     /// A catalog store's replay into a fresh `inner`, over `catalog` as of its checkpoint (`meta`):
     /// every record in order, each loading only the state it touches. Returns every slot a record
     /// named (in use) or its replay freed, the last word on each slot winning.
     fn replay_catalog_store(
+||||||| 484270f95
+    /// Catalog-mode recovery (on demand): open the catalog and read its meta row, replay the log's
+    /// tail — which loads only the branches and trunk pages its records touch — collect released
+    /// branches the catalog kept for a connection that no longer exists, and rebuild the arena's
+    /// free space from the catalog's free table plus what the replay changed. Nothing here reads a
+    /// branch that no record since the last checkpoint touches.
+    fn recover_catalog(
+=======
+    /// F-PW (r11-githost-attr PREREG A3): read the slots `<db>-branch-hot` names into the OS page
+    /// cache, before the expiry pass and before any caller, as pg_prewarm's `read` mode does. The
+    /// arena itself started remembering this process's slots when it was created. Never fails the
+    /// open: a missing, refused or unreadable list only means no prewarm, and `prewarm_file` says
+    /// which. A store with no arena yet (a new one) has nothing to warm.
+    fn prewarm(inner: &StoreInner, stats: &mut BranchOpenStats) {
+        let (Some(files), Some(arena)) = (inner.files.as_ref(), inner.arena.as_ref()) else {
+            return;
+        };
+        if !arena.is_file_backed() {
+            return;
+        }
+        let t = Instant::now();
+        match std::fs::read(&files.hot) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => stats.prewarm_file = 0,
+            Err(e) => {
+                stats.prewarm_file = 3;
+                tracing::debug!("branch hot list not read: {e}");
+            }
+            Ok(bytes) => match super::arena::decode_hot(&bytes, arena.page_size()) {
+                Err(why) => {
+                    stats.prewarm_file = 2;
+                    tracing::debug!("branch hot list refused: {why}");
+                }
+                Ok(slots) => {
+                    stats.prewarm_slots = slots.len() as u64;
+                    match arena.prewarm(&slots) {
+                        Ok(p) => {
+                            stats.prewarm_file = 1;
+                            stats.prewarm_read_slots = p.read_slots;
+                            stats.prewarm_bytes = p.bytes;
+                            stats.prewarm_ranges = p.ranges;
+                        }
+                        Err(e) => {
+                            stats.prewarm_file = 3;
+                            tracing::debug!("branch prewarm read failed: {e}");
+                        }
+                    }
+                }
+            },
+        }
+        stats.prewarm_ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+
+    /// Catalog-mode recovery (on demand): open the catalog and read its meta row, replay the log's
+    /// tail — which loads only the branches and trunk pages its records touch — collect released
+    /// branches the catalog kept for a connection that no longer exists, and rebuild the arena's
+    /// free space from the catalog's free table plus what the replay changed. Nothing here reads a
+    /// branch that no record since the last checkpoint touches.
+    fn recover_catalog(
+>>>>>>> r11-githost-attr-kv2.noindex
         inner: &mut StoreInner,
         catalog: Catalog,
         meta: &Meta,
@@ -3878,6 +4009,7 @@ impl BranchStore {
     /// Append `records` and make them durable with ONE flush before the caller acts on any of
     /// them, holding the store mutex (`flush_locked`). A no-op when volatile.
     fn log_all(&self, inner: &mut StoreInner, records: Vec<Record>) -> Result<()> {
+<<<<<<< HEAD
         {
             let StoreInner {
                 journal,
@@ -3902,9 +4034,51 @@ impl BranchStore {
             {
                 self.last_release_lsn.fetch_max(journal.lsn(), Ordering::AcqRel);
             }
+||||||| 484270f95
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            lease,
+            ..
+        } = inner;
+        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+            return Ok(());
+        };
+        injected_flush_failure(failpoint, journal)?;
+        for record in &records {
+            journal.buffer(record)?;
+=======
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            lease,
+            shape,
+            ..
+        } = inner;
+        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+            return Ok(());
+        };
+        injected_flush_failure(failpoint, journal)?;
+        let started = Instant::now();
+        for record in &records {
+            journal.buffer(record)?;
+>>>>>>> r11-githost-attr-kv2.noindex
         }
+<<<<<<< HEAD
         self.flush_locked(inner, SyncClass::Off)?;
         inner.lease.flushed();
+||||||| 484270f95
+        journal.flush(arena)?;
+        lease.flushed();
+=======
+        journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
+        lease.flushed();
+>>>>>>> r11-githost-attr-kv2.noindex
         self.unsynced.store(false, Ordering::Release);
         Ok(())
     }
@@ -4506,7 +4680,48 @@ impl BranchStore {
     /// Append `record` and make it durable before the caller acts on it, holding the store mutex
     /// (`flush_locked`). A no-op when volatile.
     fn log(&self, inner: &mut StoreInner, record: Record) -> Result<()> {
+<<<<<<< HEAD
         self.log_all(inner, vec![record])
+||||||| 484270f95
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            lease,
+            ..
+        } = inner;
+        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+            return Ok(());
+        };
+        injected_flush_failure(failpoint, journal)?;
+        journal.buffer(&record)?;
+        journal.flush(arena)?;
+        lease.flushed();
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+=======
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            lease,
+            shape,
+            ..
+        } = inner;
+        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+            return Ok(());
+        };
+        injected_flush_failure(failpoint, journal)?;
+        let started = Instant::now();
+        journal.buffer(&record)?;
+        journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
+        lease.flushed();
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+>>>>>>> r11-githost-attr-kv2.noindex
     }
 
     /// Compact the log into a snapshot if it has outgrown the live state. Best effort: the
@@ -5878,6 +6093,13 @@ impl BranchStore {
             failpoint,
             orphans,
             lease,
+<<<<<<< HEAD
+||||||| 484270f95
+            leases,
+=======
+            leases,
+            shape,
+>>>>>>> r11-githost-attr-kv2.noindex
             ..
         } = &mut *inner;
         let (Some(journal), Some(_)) = (journal.as_mut(), arena.as_ref()) else {
@@ -5913,6 +6135,7 @@ impl BranchStore {
                 stamp_due = true;
             }
         }
+<<<<<<< HEAD
         if unsynced {
             journal.raise_pending_class(class);
         }
@@ -5956,6 +6179,23 @@ impl BranchStore {
             }
             Err(e) => Err(e),
         }
+||||||| 484270f95
+        journal.flush(arena)?;
+        lease.flushed();
+        self.unsynced.store(false, Ordering::Release);
+        self.maybe_compact(&mut inner);
+        Ok(())
+=======
+        let started = Instant::now();
+        journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
+        lease.flushed();
+        self.unsynced.store(false, Ordering::Release);
+        self.maybe_compact(&mut inner);
+        Ok(())
+>>>>>>> r11-githost-attr-kv2.noindex
     }
 
     /// Whether a trunk commit that F_FULLFSYNCs its WAL makes the branch files durable with it: Apple
@@ -6208,7 +6448,11 @@ impl BranchStore {
         }
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let (mut levels, mut examined) = (0, 0);
+        let started = Instant::now();
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
+        // r11-githost-attr instrument (observing only).
+        inner.shape.resolve_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        inner.shape.resolve_timed += 1;
         inner.work.resolve_calls += 1;
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
@@ -6642,6 +6886,7 @@ impl BranchStore {
         )
     }
 
+<<<<<<< HEAD
     /// Per-fork lock holds since open (fastest-engine M1 item 5).
     pub(crate) fn fork_holds(&self) -> super::ForkHolds {
         super::ForkHolds {
@@ -6671,6 +6916,87 @@ impl BranchStore {
         }
     }
 
+||||||| 484270f95
+=======
+    /// r11-githost-attr M7 instrument (observing only): one branch connection reparsed its schema.
+    pub(crate) fn note_schema_reparse(&self, ns: u64) {
+        self.schema_reparses.fetch_add(1, Ordering::Relaxed);
+        self.schema_reparse_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// r11-githost-attr F-S instrument (observing only): one source-key read of `version`, and its
+    /// time.
+    pub(crate) fn note_schema_key(&self, ns: u64, version: u8) {
+        self.schema_keys.fetch_add(1, Ordering::Relaxed);
+        self.schema_key_ns.fetch_add(ns, Ordering::Relaxed);
+        if version == 2 {
+            self.schema_keys_v2.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// r11-githost-attr F-S instrument (observing only): one connection adopted a shared schema.
+    pub(crate) fn note_schema_adoption(&self) {
+        self.schema_adoptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// F-S: the schema parsed in this process from exactly `key`, if one was shared.
+    pub(crate) fn shared_schema(&self, key: &[u8]) -> Option<Arc<Schema>> {
+        self.shared_schemas.lock().get(key).cloned()
+    }
+
+    /// F-S: offer `schema`, parsed from exactly `key`, to later connections. At most
+    /// `SHARED_SCHEMAS_MAX` distinct sources are kept; past that, later ones are not shared (they
+    /// reparse, as without F-S), so the map cannot grow with the number of branches.
+    pub(crate) fn share_schema(&self, key: Vec<u8>, schema: Arc<Schema>) {
+        const SHARED_SCHEMAS_MAX: usize = 64;
+        let mut shared = self.shared_schemas.lock();
+        if shared.len() < SHARED_SCHEMAS_MAX {
+            shared.entry(key).or_insert(schema);
+        }
+    }
+
+    /// r11-githost-attr instrument (observing only): see [`super::BranchIoCounters`]. Reads memory
+    /// only; runs no catalog query and no I/O.
+    pub(crate) fn io_counters(&self) -> super::BranchIoCounters {
+        let inner = self.inner.lock();
+        let s = &inner.shape;
+        let mut c = super::BranchIoCounters {
+            resolve_ns: s.resolve_ns,
+            resolve_timed: s.resolve_timed,
+            flush_ns: s.flush_ns,
+            flushes: s.flushes,
+            cat_load_ns: s.cat_load_ns,
+            cat_loading_ensures: s.cat_loading_ensures,
+            parked_applied: inner.parked_applied,
+            schema_reparses: self.schema_reparses.load(Ordering::Relaxed),
+            schema_reparse_ns: self.schema_reparse_ns.load(Ordering::Relaxed),
+            schema_keys: self.schema_keys.load(Ordering::Relaxed),
+            schema_keys_v2: self.schema_keys_v2.load(Ordering::Relaxed),
+            schema_key_ns: self.schema_key_ns.load(Ordering::Relaxed),
+            schema_adoptions: self.schema_adoptions.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        if let Some(arena) = inner.arena.as_ref() {
+            let io = &arena.io;
+            let get = super::arena::ArenaIo::get;
+            c.arena_file_reads = get(&io.reads);
+            c.arena_read_ns = get(&io.read_ns);
+            c.arena_file_writes = get(&io.writes);
+            c.arena_write_ns = get(&io.write_ns);
+            c.arena_syncs = get(&io.syncs);
+            c.arena_sync_ns = get(&io.sync_ns);
+            c.ubc_read_hits = get(&io.ubc_read_hits);
+            c.ubc_read_misses = get(&io.ubc_read_misses);
+            c.ubc_read_unknown = get(&io.ubc_read_unknown);
+            c.ubc_write_hits = get(&io.ubc_write_hits);
+            c.ubc_write_misses = get(&io.ubc_write_misses);
+            c.ubc_write_appends = get(&io.ubc_write_appends);
+            c.ubc_write_unknown = get(&io.ubc_write_unknown);
+        }
+        c
+    }
+
+>>>>>>> r11-githost-attr-kv2.noindex
     pub(crate) fn stats(&self) -> Result<BranchStats> {
         self.refuse_if_trunk_only("branch statistics")?;
         let mut inner = self.inner.lock();
@@ -6958,9 +7284,22 @@ impl Drop for BranchStore {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
             }
         }
+<<<<<<< HEAD
         // After the stamp, which is a flight of its own.
         drop(inner);
         self.close_confirms();
+||||||| 484270f95
+=======
+        // F-PW (r11-githost-attr PREREG A3): name the slots this process used most recently, for
+        // the next open to read back (`arena::write_hot`: a hint, never state).
+        if let (Some(files), Some(arena)) = (inner.files.as_ref(), inner.arena.as_ref()) {
+            if let Some(slots) = arena.hot_slots() {
+                if let Err(e) = super::arena::write_hot(&files.hot, arena.page_size(), &slots) {
+                    tracing::debug!("branch hot list not written at close: {e}");
+                }
+            }
+        }
+>>>>>>> r11-githost-attr-kv2.noindex
     }
 }
 
@@ -7348,6 +7687,7 @@ impl StoreInner {
         if self.cat.is_none() {
             return Ok(false);
         }
+        let started = Instant::now();
         let mut chain: Vec<CatBranch> = Vec::new();
         let mut next = id;
         while !next.is_trunk() && !self.branches.contains_key(&next) {
@@ -7382,6 +7722,9 @@ impl StoreInner {
             self.insert_loaded(b);
             self.apply_parked(loaded)?;
         }
+        // r11-githost-attr instrument (observing only): only an `ensure` that loaded gets here.
+        self.shape.cat_load_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape.cat_loading_ensures += 1;
         Ok(true)
     }
 

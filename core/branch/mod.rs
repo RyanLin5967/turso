@@ -54,6 +54,9 @@
 
 pub(crate) mod arena;
 
+#[doc(hidden)]
+pub use arena::{file_pages_resident, file_residency};
+
 /// Process-wide page I/O counters (r11-restart lane instrument, observing only): pages read from
 /// and written to database files (`DatabaseFile::read_page` / `write_page(s)`) and WAL frames read
 /// and appended, across every database in the process. `[db reads, db writes, wal reads, wal writes]`.
@@ -664,6 +667,16 @@ pub struct BranchOpenStats {
     pub snapshot_copies: u64,
     pub replays: u64,
     pub checked_slots: u64,
+    /// F-PW (r11-githost-attr PREREG A3), while `R11_PREWARM` is set: what became of
+    /// `<db>-branch-hot` (0 none, or prewarm off; 1 read back; 2 refused by its checks; 3 a read
+    /// failed), the slots it named, the named slots read (past the arena's end skipped), bytes read
+    /// (bridged gaps included), read runs, and the time, inside `total_ns`.
+    pub prewarm_file: u64,
+    pub prewarm_slots: u64,
+    pub prewarm_read_slots: u64,
+    pub prewarm_bytes: u64,
+    pub prewarm_ranges: u64,
+    pub prewarm_ns: u64,
 }
 
 /// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an
@@ -835,6 +848,104 @@ pub struct LeafCensus {
     pub rowid_varint_bytes: u64,
     /// Cells whose payload spills to an overflow page: counted, not width-parsed.
     pub overflow_cells: u64,
+}
+
+/// Where a branch operation's time goes, for attributing a latency that grows while the work
+/// counters stay flat (r11-githost-attr lane instrument, observing only; cumulative since open).
+/// Each `_ns` timer is paired with the count of the calls it timed. The arena fields count the
+/// file arena's own system calls (zero for a memory arena). The `ubc_*` fields move only while
+/// `R11_UBC_PROBE` is set: the page-cache residency of each slot's VM page just before it is read
+/// or written ([`file_pages_resident`]); a write at or past the end of the file is an append.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchIoCounters {
+    pub arena_file_reads: u64,
+    pub arena_read_ns: u64,
+    pub arena_file_writes: u64,
+    pub arena_write_ns: u64,
+    pub arena_syncs: u64,
+    pub arena_sync_ns: u64,
+    pub ubc_read_hits: u64,
+    pub ubc_read_misses: u64,
+    pub ubc_read_unknown: u64,
+    pub ubc_write_hits: u64,
+    pub ubc_write_misses: u64,
+    pub ubc_write_appends: u64,
+    pub ubc_write_unknown: u64,
+    /// `resolve_into`'s resolution (C-P trunk probes and any catalog load inside it included; the
+    /// arena read after it excluded).
+    pub resolve_ns: u64,
+    pub resolve_timed: u64,
+    /// Record flushes (`log`, `log_all`, the trunk commit's barrier), buffering and the arena fsync
+    /// inside them included.
+    pub flush_ns: u64,
+    pub flushes: u64,
+    /// Catalog stores: `ensure` calls that loaded at least one state, and their time (catalog
+    /// queries, derivation, C-R's parked commits).
+    pub cat_load_ns: u64,
+    pub cat_loading_ensures: u64,
+    /// C-R: parked commits applied, cumulative from the open (whose own share `BranchOpenStats` has).
+    pub parked_applied: u64,
+    /// M7 (r11-githost-attr PREREG A1): branch connections that reparsed their schema because the
+    /// state carried none (every state loaded at open or from the catalog), and the time the reparse
+    /// and its stats refresh took; F-S's source-key reads with their time, and adoptions.
+    pub schema_reparses: u64,
+    pub schema_reparse_ns: u64,
+    pub schema_keys: u64,
+    pub schema_key_ns: u64,
+    pub schema_adoptions: u64,
+    /// PREREG A3.10: the source-key reads that ran key v2 (a subset of `schema_keys`), so a run can
+    /// show which key it used rather than which environment it was given.
+    pub schema_keys_v2: u64,
+}
+
+/// F-S (r11-githost-attr PREREG A1): `R11_SCHEMA_SHARE` set means a branch connection whose state
+/// carries no schema adopts one already parsed in this process from byte-identical source instead
+/// of reparsing. Unset (the default) leaves `connect_branch` as it was, apart from M7's counters.
+fn schema_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R11_SCHEMA_SHARE").is_some())
+}
+
+/// F-S key version (r11-githost-attr PREREG A3.10): `R11_SCHEMA_KEY` unset or `1` keeps the A1 key
+/// (`Connection::branch_schema_source_key` v1); `2` reads the same inputs raw (v2). Any other value
+/// refuses the branch connection rather than run on a guess.
+pub(crate) fn schema_key_version() -> Result<u8> {
+    static V: std::sync::OnceLock<std::result::Result<u8, String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| match std::env::var("R11_SCHEMA_KEY") {
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Ok(v) if v == "1" => Ok(1),
+        Ok(v) if v == "2" => Ok(2),
+        Ok(v) => Err(format!("R11_SCHEMA_KEY={v:?} is neither 1 nor 2")),
+        Err(e) => Err(format!("R11_SCHEMA_KEY: {e}")),
+    })
+    .clone()
+    .map_err(LimboError::InvalidArgument)
+}
+
+/// F-S: whether a parsed schema may be offered to other connections. Its parse must have read
+/// nothing but the page-1 cookie and `sqlite_schema`'s rows (which the key holds exactly): no
+/// sequence backing table, no custom-types table and no `sqlite_stat1` were read, and it holds no
+/// virtual table other than the built-in table-valued functions, whose instances every connection of
+/// the database already shares through `clone_schema`. Each of these is a function of the rows, so
+/// an adopter with the same key would read none of them either. It must also hold no materialized
+/// view (A2, r11-githost-attr-refute N2): `Schema::try_clone` copies an `incremental_views` entry's
+/// `Arc<Mutex<IncrementalView>>`, not the view, so copy-on-write separates only the outer `Schema`
+/// and two adopters would drive one DBSP circuit. (The fork path shares the trunk's Arc the same way;
+/// that is round11/r11-fatnode-lb C2 and is not changed here.)
+fn schema_shareable(schema: &crate::schema::Schema) -> bool {
+    schema.incremental_views.is_empty()
+        && schema.sequences.is_empty()
+        && schema.get_btree_table(crate::stats::STATS_TABLE).is_none()
+        && !schema
+            .tables
+            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        && schema.tables.values().all(|t| match t.as_ref() {
+            crate::schema::Table::Virtual(v) => {
+                matches!(v.kind, turso_ext::VTabKind::TableValuedFunction)
+            }
+            _ => true,
+        })
 }
 
 /// A snapshot of the branch arena's accounting.
@@ -1368,6 +1479,13 @@ impl Database {
         self.branches.probe_split_counters()
     }
 
+    /// Where branch operations' time went since open: arena I/O, page-cache residency, record
+    /// flushes, resolution and catalog loads (r11-githost-attr lane instrument; reads memory only).
+    #[doc(hidden)]
+    pub fn branch_io_counters(&self) -> BranchIoCounters {
+        self.branches.io_counters()
+    }
+
     /// Trunk pre-images the store holds now (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {
@@ -1569,9 +1687,40 @@ impl Database {
                 default_cache_size,
                 Some(self.clone_schema()),
             )?;
+            // F-S (r11-githost-attr PREREG A1): with R11_SCHEMA_SHARE set, read the exact inputs a
+            // reparse would read (cookie and `sqlite_schema` rows, plus the flags and table-valued
+            // functions it keeps), and adopt a schema already parsed from the same bytes.
+            let key = if schema_share() {
+                let version = schema_key_version()?;
+                let started = std::time::Instant::now();
+                let key = conn.branch_schema_source_key(version)?;
+                self.branches.note_schema_key(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    version,
+                );
+                Some(key)
+            } else {
+                None
+            };
+            if let Some(shared) = key.as_ref().and_then(|k| self.branches.shared_schema(k)) {
+                conn.adopt_branch_schema(shared.clone());
+                self.branches.note_schema_adoption();
+                self.branches.set_schema(id, shared)?;
+                return Ok(conn);
+            }
+            // M7 (r11-githost-attr): the reparse and its stats refresh, timed and counted.
+            let started = std::time::Instant::now();
             conn.force_reparse_schema_without_publish()?;
             crate::stats::refresh_analyze_stats(&conn);
-            self.branches.set_schema(id, conn.schema.read().clone())?;
+            self.branches
+                .note_schema_reparse(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let parsed = conn.schema.read().clone();
+            if let Some(key) = key {
+                if schema_shareable(&parsed) {
+                    self.branches.share_schema(key, parsed.clone());
+                }
+            }
+            self.branches.set_schema(id, parsed)?;
             return Ok(conn);
         };
         self._connect_with_pager_and_default_cache_size(
@@ -1696,6 +1845,9 @@ pub(crate) mod budget_probe;
 
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod schema_key_tests;
 
 #[cfg(test)]
 mod tests {
