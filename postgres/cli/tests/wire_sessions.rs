@@ -4133,6 +4133,87 @@ fn an_array_parameter_is_read_by_its_element_type() {
     }
 }
 
+/// An undeclared parameter compared with a column of a relation the inference walk must open to
+/// type it is typed from that relation: a view's column (walked from the view's query), an
+/// alias-less subquery's, a `*` a CTE or derived table expands, and a column of the innermost
+/// relation that has it even when an outer one has a column of that name. Each fell to the text
+/// fallback, or bound to the outer relation's column: count(*) compared as Numeric against Text and
+/// rows went missing, and a text view column was bound as the outer int column, so 'abc' failed
+/// (wire review 11 item 3: review 8 item 7's failure, still open; E5-QUEUE P7 reopened). Every case
+/// is checked before the test fails, so one run names all of them.
+#[test]
+fn a_parameter_is_typed_through_views_subqueries_and_stars() {
+    const INT8: u32 = 20;
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    let dir = Scratch::new("inferviews");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, n INT, name TEXT)")
+        .ok("p");
+    a.q("INSERT INTO p VALUES (1, 5, 'abc'), (2, 7, 'def'), (3, 9, 'ghi')")
+        .ok("rows");
+    a.q("CREATE VIEW d AS SELECT count(*) AS c FROM p")
+        .ok("view d");
+    a.q("CREATE VIEW v AS SELECT id, name AS n FROM p")
+        .ok("view v");
+    let cases: Vec<(&str, u32, &str, Vec<&str>)> = vec![
+        ("SELECT c FROM d WHERE c > $1", INT8, "2", vec!["3"]),
+        (
+            "SELECT c FROM (SELECT count(*) AS c FROM p) WHERE c > $1",
+            INT8,
+            "2",
+            vec!["3"],
+        ),
+        (
+            "WITH w AS (SELECT * FROM p) SELECT id FROM w WHERE n > $1 ORDER BY id",
+            INT4,
+            "6",
+            vec!["2", "3"],
+        ),
+        (
+            "WITH w(a, b, c) AS (SELECT * FROM p) SELECT a FROM w WHERE a = $1",
+            INT4,
+            "1",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM v WHERE v.id = p.id AND n = $1)",
+            TEXT,
+            "abc",
+            vec!["1"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, oid, value, want) in cases {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(vec![oid]) {
+            wrong.push(format!(
+                "{sql}: Describe {:?} {:?}, want [{oid}]",
+                r.params, r.error
+            ));
+        }
+        let r = a.xt(sql, &[(0, 0, value.as_bytes())]);
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect();
+        if r.error.is_some() || got != want {
+            wrong.push(format!(
+                "{sql} with {value}: {got:?} {:?}, want {want:?}",
+                r.error
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A recursive CTE's self-reference is typed by its non-recursive term, as PostgreSQL types it, so
 /// `x < $1` in the recursive term compares x (int4, from `SELECT 1`) with an int4 and the recursion
 /// stops at 10. The CTE was walked before it was in scope, so x was untyped, $1 bound as text, and
