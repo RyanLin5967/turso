@@ -8,14 +8,15 @@
                                                       3 void). MODE is bound or smoke; a bound batch names its verdict
   batchgate.py flushgate SUMMARY STAMP_END            the diskstats leaf flush gate alone (JSON)
   batchgate.py leafclass SUMMARY                      wb | wt | brd for a probe summary (exit 2 if it has none)
-  batchgate.py fixture OUT CELL ARCH LEAF SHA FSTYPE [MOD]   a PLANTED full-shape verdict for firecheck.sh's F4 plants,
+  batchgate.py fixture OUT CELL ARCH LEAF SHA FSTYPE BOX [MOD]   a PLANTED full-shape verdict for firecheck.sh's F4 plants
+                                                      (BOX: virt=vm|bare,flip=yes|no, as check.py --box reads it),
                                                       always "planted": true (MOD: allfail | fail-one | drop-one |
                                                       cell=<c> | harness | bindfail: also a failed binding record |
                                                       pending: also a pending one)
   batchgate.py self-test DATA                         the gates on banked and planted inputs; exit 0 iff all as expected
 
 Binding (item 8): a verdict binds only if it has check.py's whole shape -- a "checks" list whose ids equal
-check.plan(cell, arch, leaf class), every check passing, pass == total, all_pass true -- for this cell, binary sha256,
+check.plan(cell, arch, leaf class, box), every check passing, pass == total, all_pass true -- for this cell, binary sha256,
 arch and fstype, with "unplanted_refusals" listed, a leaf class that is not brd, no "planted" key, and the sha256 of
 every fire-check harness file equal to this run.sh's own copies (a verdict vouches only for the checker that wrote
 it), and the fire-check's own binding record next to it (<verdict>.bind.json, check.py --bind) passed for this very
@@ -54,9 +55,27 @@ def load(p):
         return json.load(f)
 
 
-def plan(cell, arch, leaf):
+def plan(cell, arch, leaf, box):
     import check  # check.py is importable: its work runs only under __main__
-    return check.plan(cell, arch, leaf)
+    return check.plan(cell, arch, leaf, box)
+
+
+BOX_VALUES = {"virt": ("vm", "bare"), "flip": ("yes", "no")}
+
+
+def box_problems(box):
+    """the verdict's box (sixth review H1: the plan depends on the box the fire-check ran on)."""
+    if not isinstance(box, dict) or any(box.get(k) not in vals for k, vals in BOX_VALUES.items()):
+        return ["box: %r is not {virt: vm|bare, flip: yes|no}" % (box,)]
+    return []
+
+
+def parse_box(spec):
+    """'virt=vm,flip=yes' -> dict (firecheck.sh's fixture argument)."""
+    try:
+        return dict(kv.split("=", 1) for kv in spec.split(","))
+    except ValueError:
+        return {}
 
 
 def gated_list():
@@ -159,15 +178,16 @@ def verdict_problems(v, cell, sha, arch, fstype):
         bad.append("harness: the verdict was made by a different fire-check harness than this run.sh's (%s differ)" %
                    ", ".join(diff[:6]))
     lc = v.get("leaf_class")
+    bad += box_problems(v.get("box"))
     if lc not in ("wb", "wt", "brd"):
         bad.append("leaf_class: %r" % lc)
     elif lc == "brd":
         bad.append("leaf_class brd: a brd fire-check is fire-check only and never binds a batch")
     # the verdict's ids against the plan for this cell and the verdict's own arch and leaf, so that a wrong arch or
     # leaf is refused by its own rule above and a truncated verdict by this one
-    if cell in v3cell.CELLS and lc in ("wb", "wt") and checks:
+    if cell in v3cell.CELLS and lc in ("wb", "wt") and checks and not box_problems(v.get("box")):
         va = v.get("arch") if isinstance(v.get("arch"), str) else arch
-        want = plan(cell, va, lc)
+        want = plan(cell, va, lc, v["box"])
         ids = [c.get("id") for c in checks]
         if ids != want:
             miss = [i for i in want if i not in ids]
@@ -186,7 +206,8 @@ def cmd_verdict(p, cell, sha, arch, fstype):
         return 2
     vsha = hashlib.sha256(raw).hexdigest()
     bad = verdict_problems(v, cell, sha, arch, fstype) + bind_problems(p, vsha)
-    print(json.dumps({"ok": not bad, "reasons": bad, "verdict_sha256": vsha,
+    basis = "binding record" if os.path.exists(bind_path(p)[0]) else "pending record, bind step" if not bad else None
+    print(json.dumps({"ok": not bad, "reasons": bad, "verdict_sha256": vsha, "bind_basis": basis,
                       "run_id": v.get("run_id") if isinstance(v, dict) else None,
                       "leaf_class": v.get("leaf_class") if isinstance(v, dict) else None}))
     return 0 if not bad else 2
@@ -432,10 +453,14 @@ def post(out, cell, sha, mode, verdict_path):
     return rc
 
 
-def fixture(out, cell, arch, leaf, sha, fstype, mod):
-    ids = plan(cell, arch, leaf)
+def fixture(out, cell, arch, leaf, sha, fstype, boxspec, mod):
+    box = parse_box(boxspec)
+    if box_problems(box):
+        raise SystemExit("batchgate fixture: BOX %r is not virt=vm|bare,flip=yes|no" % boxspec)
+    ids = plan(cell, arch, leaf, box)
     checks = [{"id": i, "check": i, "pass": True, "detail": "planted"} for i in ids]
     v = {"cell": cell, "fstype": fstype, "arch": arch, "leaf_class": leaf, "v3floor_sha256": sha, "run_id": "fixture",
+         "box": {"virt": box["virt"], "flip": box["flip"]},
          "pass": len(checks), "total": len(checks), "all_pass": True, "unplanted_refusals": [],
          "harness_sha256": harness(), "checks": checks, "planted": True}
     if mod == "allfail":
@@ -638,7 +663,8 @@ def self_test(data):
     sha, cell, arch = "ab" * 32, "xfs", "x86_64"
     good = {"cell": cell, "fstype": "xfs", "arch": arch, "leaf_class": "wb", "v3floor_sha256": sha, "run_id": "1",
             "all_pass": True, "unplanted_refusals": [], "harness_sha256": harness(),
-            "checks": [{"id": i, "pass": True} for i in plan(cell, arch, "wb")]}
+            "box": {"virt": "vm", "flip": "yes"},
+            "checks": [{"id": i, "pass": True} for i in plan(cell, arch, "wb", {"virt": "vm", "flip": "yes"})]}
     good["pass"] = good["total"] = len(good["checks"])
     chk("item 8: a full-shape passing verdict binds", verdict_problems(good, cell, sha, arch, "xfs") == [],
         verdict_problems(good, cell, sha, arch, "xfs"))
@@ -652,7 +678,7 @@ def self_test(data):
 
     def other_arch(v):  # an aarch64 verdict, whole and passing for aarch64, on this x86_64 batch
         v["arch"] = "aarch64"
-        v["checks"] = [{"id": i, "pass": True} for i in plan(cell, "aarch64", "wb")]
+        v["checks"] = [{"id": i, "pass": True} for i in plan(cell, "aarch64", "wb", v["box"])]
         v["pass"] = v["total"] = len(v["checks"])
 
     for name, mut, prefix in (("planted", lambda v: v.update(planted=True), "planted:"),
@@ -665,6 +691,8 @@ def self_test(data):
                               ("another fstype", lambda v: v.update(fstype="ext4"), "fstype:"),
                               ("another harness", lambda v: v["harness_sha256"].update({"check.py": "0" * 64}), "harness:"),
                               ("a brd leaf", lambda v: v.update(leaf_class="brd"), "leaf_class brd:"),
+                              ("no box", lambda v: v.pop("box"), "box:"),
+                              ("a box of unknowns", lambda v: v.update(box={"virt": "unknown", "flip": "yes"}), "box:"),
                               ("no unplanted_refusals", lambda v: v.pop("unplanted_refusals"), "unplanted_refusals:")):
         v = _copy.deepcopy(good)
         mut(v)
@@ -691,6 +719,9 @@ def self_test(data):
     chk("fifth review L1: pending for this verdict outside the bind step -> refused ('bind: pending')",
         bool(b) and all(x.startswith("bind: pending") for x in b), b)
     chk("L3 bind: pending for another verdict -> refused", bind_problems(vp, "00" * 32, pending_sha="00" * 32) != [])
+    b = bind_problems(vp, vs, pending_sha="ab" * 32)
+    chk("sixth review L1: pending for this verdict while the bind step names ANOTHER verdict -> refused ('bind: pending')",
+        bool(b) and all(x.startswith("bind: pending") for x in b), b)
     ok_rec = {"verdict_sha256": vs, "all_pass": True, "checks": [{"id": "bind:P_runsh_ok", "pass": True}]}
     for name, rec, prefix in (("passed for this verdict", ok_rec, None),
                               ("failed", dict(ok_rec, all_pass=False, checks=[{"id": "bind:P_runsh_ok", "pass": False}]),
@@ -752,8 +783,8 @@ def main(a):
             return 2
         print(c)
         return 0
-    if len(a) in (7, 8) and a[0] == "fixture":
-        return fixture(*a[1:7], a[7] if len(a) == 8 else "")
+    if len(a) in (8, 9) and a[0] == "fixture":
+        return fixture(*a[1:8], a[8] if len(a) == 9 else "")
     if len(a) == 2 and a[0] == "self-test":
         return self_test(a[1])
     print(__doc__, file=sys.stderr)

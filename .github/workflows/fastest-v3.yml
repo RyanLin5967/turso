@@ -52,7 +52,9 @@ jobs:
           python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
           python3 -B fastest/linux/v3/check.py --self-test 2>&1 | tee st/check-selftest.txt
           for c in ext4 xfs btrfs ext4loop xfsloop btrfsloop; do for a in x86_64 aarch64; do for l in wb wt brd; do
-            echo "$c $a $l $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" | wc -l)"; done; done; done | tee st/plan-sizes.txt
+            for v in vm bare; do for f in yes no; do
+              echo "$c $a $l $v $f $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" "$v" "$f" | wc -l)"
+            done; done; done; done; done | tee st/plan-sizes.txt
           grep -q '^BLKFLUSH SELF-TEST .* PASS$' st/blkflush-selftest.txt
           grep -q '^BATCHGATE SELF-TEST .* PASS$' st/batchgate-selftest.txt
           grep -q '^CHECK SELF-TEST .* PASS$' st/check-selftest.txt
@@ -95,15 +97,13 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$RAW" dist "$V3_BASE" "$V3_PREV"
-          gcc -O2 -std=gnu11 -Wall -Wextra -Werror -static -o dist/v3floor fastest/linux/v3/v3floor.c 2>&1 | tee "$RAW/build.txt"
-          gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o dist/v3floor.dyn fastest/linux/v3/v3floor.c 2>&1 | tee -a "$RAW/build.txt"
-          gcc -O2 -shared -fPIC -o dist/statfs_shim.so fastest/linux/v3/statfs_shim.c -ldl 2>&1 | tee -a "$RAW/build.txt"
-          gcc -O2 -Wall -Wextra -Werror -shared -fPIC -o dist/noop_shim.so fastest/linux/v3/noop_shim.c 2>&1 | tee -a "$RAW/build.txt"
+          # the one build of the probe and its fire-check binaries (t3run.sh calls the same script)
+          bash fastest/linux/v3/build.sh dist
+          cp dist/build.txt "$RAW/build.txt"
           for f in v3floor.c run.sh stamp.py check.py; do git show "$V3_BASE_SHA:fastest/linux/v3/$f" > "$V3_BASE/$f"; done
           gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$V3_BASE/v3floor" "$V3_BASE/v3floor.c" 2>&1 | tee -a "$RAW/build.txt"
           for f in v3floor.c batchgate.py check.py v3cell.py; do git show "$V3_PREV_SHA:fastest/linux/v3/$f" > "$V3_PREV/$f"; done
           gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$V3_PREV/v3floor" "$V3_PREV/v3floor.c" 2>&1 | tee -a "$RAW/build.txt"
-          file dist/v3floor dist/v3floor.dyn | tee -a "$RAW/build.txt"
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} cell=$CELL";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME base=$V3_BASE_SHA prev=$V3_PREV_SHA";
             gcc --version | head -1; sha256sum dist/v3floor dist/v3floor.dyn dist/statfs_shim.so dist/noop_shim.so "$V3_BASE/v3floor" "$V3_PREV/v3floor";

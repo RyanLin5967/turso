@@ -59,7 +59,7 @@ done
 sha=$(sha256sum "$BIN" | cut -d' ' -f1) && [ -n "$sha" ] || refuse "cannot hash $BIN"
 fstype=$(findmnt -n -o FSTYPE -T "$DIR") || refuse "cannot find the filesystem of $DIR"
 arch=$(uname -m)
-vsha="" vrun="" vleaf=""
+vsha="" vrun="" vleaf="" vbasis=""
 if [ -n "${V3_FIRECHECK_VERDICT:-}" ] && [ -n "${V3_SMOKE:-}" ]; then
   refuse "set V3_FIRECHECK_VERDICT or V3_SMOKE=1, not both"
 elif [ -n "${V3_FIRECHECK_VERDICT:-}" ]; then
@@ -67,8 +67,8 @@ elif [ -n "${V3_FIRECHECK_VERDICT:-}" ]; then
   vj=$(python3 -B "$GATE" verdict "$V3_FIRECHECK_VERDICT" "$CELL" "$sha" "$arch" "$fstype")
   vrc=$?
   [ "$vrc" -eq 0 ] || refuse "$V3_FIRECHECK_VERDICT does not bind this batch (binary $sha, fs $fstype, arch $arch, cell $CELL): $vj"
-  { read -r vsha; read -r vrun; read -r vleaf; } < <(python3 -B -c 'import json, sys; v = json.loads(sys.argv[1]); print("\n".join(str(v[k]) for k in ("verdict_sha256", "run_id", "leaf_class")))' "$vj")
-  { [ -n "$vsha" ] && [ -n "$vrun" ] && [ -n "$vleaf" ]; } || refuse "the binding fields could not be read back from: $vj"
+  { read -r vsha; read -r vrun; read -r vleaf; read -r vbasis; } < <(python3 -B -c 'import json, sys; v = json.loads(sys.argv[1]); print("\n".join(str(v[k]) for k in ("verdict_sha256", "run_id", "leaf_class", "bind_basis")))' "$vj")
+  { [ -n "$vsha" ] && [ -n "$vrun" ] && [ -n "$vleaf" ] && [ -n "$vbasis" ] && [ "$vbasis" != None ]; } || refuse "the binding fields could not be read back from: $vj"
   mode=bound
   bound="fire-checked: $V3_FIRECHECK_VERDICT"
 elif [ "${V3_SMOKE:-}" = 1 ]; then
@@ -102,8 +102,8 @@ if [ -d "$OUT" ]; then
     python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
     rrc=$?
   fi
-  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\n' \
-    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" > "$OUT/binary.txt"
+  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\n' \
+    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" > "$OUT/binary.txt"
   if [ -f "$OUT/summary.json" ]; then
     if [ "$mode" = bound ]; then
       python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" "$V3_FIRECHECK_VERDICT"

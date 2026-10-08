@@ -8,7 +8,10 @@ CELL is explicit (v3cell.py: ext4|xfs|btrfs on a block device, ext4loop|xfsloop|
                                byte rules on planted records; exit 0 iff all fire as written
   check.py --bind OUT CELL     after run.sh was bound to OUT/verdict.json (firecheck.sh's last step): write
                                OUT/verdict.bind.json (the binding record run.sh requires) and remove the pending one
-  check.py --plan CELL ARCH LEAF   print the check ids a verdict for that cell, arch and leaf class must hold
+  check.py --plan CELL ARCH LEAF VIRT FLIP   print the check ids a verdict for that cell, arch, leaf class (wb|wt|brd)
+                               and box (VIRT vm|bare from systemd-detect-virt; FLIP yes|no: can the leaf disk's
+                               write cache be made to disagree with the drive) must hold
+  check.py --box OUT           print the box firecheck.sh recorded in OUT/info.txt, as check.py reads it
 
 Every expectation below comes from the arm definitions (v3floor.c's header, PREREG section 11 M0 exit 1), written
 here by hand. None is read from the probe's summary: the summary is a subject, checked against numbers recomputed
@@ -145,7 +148,7 @@ POST_PLANTS = {"R_post_traceclock": "trace_clock=1 in the summary", "R_post_cell
 # the fire-check harness a verdict vouches for (fourth review L9: the fixtures' and plants' sources, the banked test
 # data, the loop maker and the workflow too); a missing file is a mismatch
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
-           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "statfs_shim.c", "noop_shim.c",
+           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "statfs_shim.c", "noop_shim.c",
            "../fs/mkloop.sh",
            "../../../.github/workflows/fastest-v3.yml"]
 
@@ -198,10 +201,11 @@ def plant_names(kind):
     return p
 
 
-def plan(cell, arch, leaf):
-    """The check ids a verdict for (cell, arch, leaf class wb|wt|brd) holds, in order. Pure: the spec only."""
+def plan(cell, arch, leaf, box):
+    """The check ids a verdict for (cell, arch, leaf class wb|wt|brd, box {virt, flip}) holds, in order. Pure: the
+    spec only."""
     k = kind_of(cell)
-    ids = ["cell:fstype", "cell:source", "cell:layers", "cell:aslr", "cell:leaf"]
+    ids = ["cell:fstype", "cell:source", "cell:layers", "cell:aslr", "cell:leaf", "cell:box"]
     for s in F1_SETS:
         ids.append("F1:%s%s" % (tagof(s), ":refused" if all_flushed_refused(s.split(","), k) else ""))
     ids += ["F1b:real-all", "F1b:real-4k", "F2d:mutant-all", "F1b:selftest:count"]
@@ -224,7 +228,7 @@ def plan(cell, arch, leaf):
     ids.append("F4:P_nest3")
     ids.append("F4:R_ficlone_accept" if k == "ext4" else "F4:X_allclones")
     ids.append("F4:R_leftover")
-    if leaf != "brd":
+    if box.get("flip") == "yes":
         ids.append("F4:R_leaf_flip")
     if arch == "x86_64":
         ids.append("F4:R_clocksource")
@@ -234,8 +238,11 @@ def plan(cell, arch, leaf):
         ids.append("F4:" + t)
     for t in POST_PLANTS:
         ids.append("F4:" + t)
-    ids += ["F4:P_sdbg_wb", "F4:R_sdbg_flip", "F4:R_virt_hidden", "F4:P_virt_bare", "F4:R_leaf_remote",
-            "F4:R_ldso_preload", "F4:P_ldso_static"]
+    ids += ["F4:P_sdbg_wb", "F4:R_sdbg_flip"]
+    if box.get("virt") == "vm":
+        ids.append("F4:R_virt_hidden")
+    ids += ["F4:R_virt_planted", "F4:P_virt_bare", "F4:P_virt_bare_wt", "F4:R_leaf_remote", "F4:R_ldso_preload",
+            "F4:P_ldso_static"]
     ids += ["work:empty", "harness:stable"]
     return ids
 
@@ -730,10 +737,27 @@ def wce_from_hex(src):
     return (page[2] >> 2) & 1, bad
 
 
-# the SCSI hosts an sd leaf may sit on, written by hand from the probe's header (fifth review M1, M2)
-SD_HOSTS = ["ahci", "ata_piix", "mpt3sas", "mpt2sas", "megaraid_sas", "smartpqi", "hpsa", "aacraid", "mvsas", "isci",
-            "pm80xx", "storvsc_host", "virtio_scsi", "vmw_pvscsi", "ibmvscsi"]
+# the SCSI hosts an sd leaf may sit on, written by hand from the probe's header (fifth review M1, M2; sixth review M1:
+# no SAS or RAID HBA, whose disk may be a controller logical volume answering for the drive)
+SD_HOSTS = ["ahci", "ata_piix", "storvsc_host", "virtio_scsi", "vmw_pvscsi", "ibmvscsi"]
 QUAL = {True: "a virtual drive", None: "virtualization not ruled out"}
+
+
+def cell_leaf_check(lf, leaf, leaf_src, kv):
+    """cell:leaf (called by main; the self-test calls it on planted leaf records)."""
+    lbad = []
+    if leaf is None:
+        lbad.append("no leaf class (no F3 or F1 summary)")
+    elif leaf == "brd":
+        if v3cell.is_loop(CELL) or kv.get("brd_cell") != "1":
+            lbad.append("a brd leaf outside a brd cell")
+        if lf.get("creditable") is not False:
+            lbad.append("a brd leaf not marked creditable false")
+    else:
+        lbad += leaf_problems(lf, kv.get("brd_cell") == "1")
+    check("cell:leaf", not lbad, {"leaf": lf, "class": leaf, "from": leaf_src, "bad": lbad},
+          "the leaf is an allowlisted drive (kind drive, creditable; NVMe over pcie; sd on an allowlisted host) whose own "
+          "cache report agrees with the kernel, an sd report re-read from its MODE SENSE bytes (or brd on a brd cell)")
 
 
 def leaf_problems(lf, brd_cell):
@@ -811,6 +835,46 @@ VIRT_KIND = {  # leaf class -> virtualized (True, False, None) -> floor_kind, wr
 }
 
 
+FLUSH_SENT = {  # leaf class -> virtualized -> flush_sent_to_device prefix, written by hand from the probe's texts
+    "wb": {False: "yes: the leaf reports a volatile write cache and the drive agrees",
+           True: "yes, to the virtual device:", None: "yes, to the device (virtualization not ruled out):"},
+    "wt": {False: "no: the leaf reports write-through and the drive agrees",
+           True: "no: the (virtual) leaf reports write-through",
+           None: "no: the leaf reports write-through and its device report agrees"},
+}
+BRD_LABELS = ("brd: no drive (fire-check only, never credited)", "no: the leaf is brd")
+
+
+def label_problems(sj, leaf, vm):
+    """floor_kind, flush_sent_to_device and the probe's floor_claim against the hand-written tables for this leaf
+    class and virtualization (sixth review M2: every one of the six wb/wt x true/false/null texts is compared)."""
+    if leaf == "brd":
+        fk, fs = BRD_LABELS
+    elif leaf in VIRT_KIND and (vm is True or vm is False or vm is None):  # identity: 1 and 0 are not answers
+        fk, fs = VIRT_KIND[leaf][vm], FLUSH_SENT[leaf][vm]
+    else:
+        return [("labels", "no labels for leaf %r virtualized %r" % (leaf, vm))]
+    bad = []
+    if sj.get("floor_kind") != fk:
+        bad.append(("floor_kind", sj.get("floor_kind"), fk))
+    if not str(sj.get("flush_sent_to_device", "")).startswith(fs):
+        bad.append(("flush_sent_to_device", sj.get("flush_sent_to_device"), fs))
+    if leaf != "brd":
+        bad += qualifier_problems(str(sj.get("floor_claim", "")), vm, leaf, "floor_claim")
+    return bad
+
+
+def box_of(kv):
+    """The box the fire-check ran on, from facts firecheck.sh recorded (sixth review H1): virt = vm when
+    systemd-detect-virt names a hypervisor, bare when it says none; flip = yes when the leaf disk's write cache can be
+    made to disagree with the drive (write back: set it write through; an sd disk: sd's 'temporary write back')."""
+    dv = (kv.get("detect_virt") or "").strip()
+    m = re.match(r"(\S+) write_cache=\[([^\]]*)\] scsi=([01])$", (kv.get("leafdisk") or "").strip())
+    return {"virt": "bare" if dv == "none" else "vm" if dv else "unknown",
+            "flip": ("yes" if m.group(2) == "write back" or m.group(3) == "1" else "no") if m else "unknown",
+            "leafdisk": m.group(1) if m else None}
+
+
 def find_leaf_class():
     """The leaf class from the F3 batch, else from F1's first run (every probe run on the work dir sees one leaf)."""
     for p in (os.path.join(OUT, "F3", "summary.json"), os.path.join(OUT, "F1", "nosync25.n1.out", "summary.json")):
@@ -880,19 +944,136 @@ def self_test():
     chk("MODE SENSE bytes: WCE=0 and WCE=1 read back", wce_from_hex(hexs)[0] == 0 and wce_from_hex(w1)[0] == 1)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
+    # sixth review H1: the box and the plan it selects
+    kvb = {"detect_virt": "none", "leafdisk": "nvme1n1 write_cache=[write through] scsi=0"}
+    chk("box: detect-virt none and a write-through NVMe leaf -> bare, no flip",
+        box_of(kvb) == {"virt": "bare", "flip": "no", "leafdisk": "nvme1n1"}, box_of(kvb))
+    chk("box: microsoft and a write-through sd leaf -> vm, flip (sd's temporary write back)",
+        box_of({"detect_virt": "microsoft", "leafdisk": "sda write_cache=[write through] scsi=1"})["flip"] == "yes"
+        and box_of({"detect_virt": "microsoft"})["virt"] == "vm")
+    chk("box: nothing recorded -> unknown, unknown", box_of({}) == {"virt": "unknown", "flip": "unknown", "leafdisk": None})
+    pb = plan("xfs", "x86_64", "wt", {"virt": "bare", "flip": "no"})
+    pv = plan("xfs", "x86_64", "wt", {"virt": "vm", "flip": "yes"})
+    chk("plan: a bare box with a write-through NVMe leaf plans neither R_virt_hidden nor R_leaf_flip, and R_virt_planted",
+        "F4:R_virt_hidden" not in pb and "F4:R_leaf_flip" not in pb and "F4:R_virt_planted" in pb and "cell:box" in pb)
+    chk("plan: a VM box with a flippable leaf plans both", "F4:R_virt_hidden" in pv and "F4:R_leaf_flip" in pv)
+    # sixth review M2: every label text against its table, on all six wb/wt x virtualization combinations
+    for lc in ("wb", "wt"):
+        for vm in (True, False, None):
+            good = {"floor_kind": VIRT_KIND[lc][vm], "flush_sent_to_device": FLUSH_SENT[lc][vm] + " ...",
+                    "floor_claim": "per stack ..." + {True: "; on a virtual drive: reach to media unknown",
+                                                      None: "; virtualization not ruled out: reach to media unknown",
+                                                      False: ""}[vm]}
+            others = [v for v in (True, False, None) if v is not vm]
+            swapped = dict(good, flush_sent_to_device=FLUSH_SENT[lc][others[0]] + " ...")
+            chk("labels: %s, virtualized %r: its own texts pass, another virtualization's flush_sent_to_device is "
+                "refused" % (lc, vm), label_problems(good, lc, vm) == [] and
+                [t[0] for t in label_problems(swapped, lc, vm)] == ["flush_sent_to_device"],
+                (label_problems(good, lc, vm), label_problems(swapped, lc, vm)))
+    chk("labels: virtualized 1 is not an answer", label_problems({}, "wb", 1) != [])
+    # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
+    # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
+    real_selftest(chk)
     ok = all(res) and len(res) > 0
     print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL"))
     return 0 if ok else 1
+
+
+BANKED_F3 = "f3-37528595878-x86-ext4loop"
+
+
+def real_selftest(chk):
+    import contextlib, io, shutil, tempfile
+    global CELL, KIND, W, OUT, results
+    src = os.path.join(HERE, "testdata", BANKED_F3)
+    info = rd(os.path.join(src, "info.txt")) or ""
+    kv = dict(l.split("=", 1) for l in info.splitlines() if "=" in l and not l.startswith(("loop ", "block ")))
+    saved = (CELL, KIND, W, OUT, results)
+    td = tempfile.mkdtemp(prefix="check-selftest-")
+
+    def run(name, probe=None, merged=None, report=None):
+        global CELL, KIND, W, OUT, results
+        d = os.path.join(td, name)
+        shutil.copytree(os.path.join(src, "F3"), d)
+        for f, mut in (("summary.probe.json", probe), ("summary.json", merged), (os.path.join("blkflush", "report.json"), report)):
+            if mut:
+                j = rj(os.path.join(d, f))
+                mut(j)
+                with open(os.path.join(d, f), "w") as fh:
+                    json.dump(j, fh)
+        CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv.get("work", ""), td, []
+        with contextlib.redirect_stdout(io.StringIO()):
+            check_real(d, 0, kv, "wb")
+        got = {r["id"]: r for r in results}
+        return got
+
+    def tags(r):
+        return [x[0] if isinstance(x, (list, tuple)) else x for x in (r.get("detail") or {}).get("bad", [])]
+
+    try:
+        F3IDS = ["F3:complete", "F3:devflush", "F3:merge", "F3:gate", "F3:record"]
+        g = run("control")
+        chk("real: the banked write-back batch passes all five F3 checks unplanted",
+            [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [], {i: tags(g.get(i, {})) for i in F3IDS})
+
+        def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
+            return {"probe": f, "merged": f}
+
+        cases = [
+            ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
+            ("flush_sent", both(lambda j: j.update(flush_sent_to_device=FLUSH_SENT["wb"][False] + " (planted)")),
+             "F3:record", ["flush_sent_to_device"]),
+            ("floor_claim", both(lambda j: j.update(floor_claim=j["floor_claim"].split("; on a virtual drive")[0])),
+             "F3:record", ["floor_claim lacks the qualifier"]),
+            ("linkage", both(lambda j: j.update(linkage="not static: other files mapped (fire-check only)")), "F3:record",
+             ["linkage/mapped_files"]),
+            ("clocksource", both(lambda j: j.update(clocksource="hpet")), "F3:record", ["clocksource", "stamp clocksource"]),
+            ("claim", {"merged": lambda j: j.update(floor_claim_from_counts=j["floor_claim_from_counts"].split("; a virtual drive")[0])},
+             "F3:record", ["floor_claim_from_counts lacks the qualifier"]),
+            ("fuaonly", {"report": lambda j: j["windows"]["arms"]["append25"]["devices"]["nvme0n1"].update(flush_carrying_zero_windows=1)},
+             "F3:devflush", ["a gated op's window holds no flush-carrying request to a write-back layer"]),
+        ]
+        for name, muts, cid, want in cases:
+            g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"))
+            t = tags(g.get(cid, {}))
+            others = [i for i in F3IDS if i != cid and g.get(i, {}).get("pass") is not True]
+            chk("real: planted %s -> %s fails with %s only, the other F3 checks pass" % (name, cid, want),
+                g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
+        m = both(lambda j: j["virtualization"].update(virtualized=False, evidence=[]))
+        g = run("virtualized", m["probe"], m["merged"])
+        chk("real: planted virtualized false on a VM (detect-virt microsoft) -> F3:record fails with virtualization",
+            g["F3:record"]["pass"] is False and "virtualization" in tags(g["F3:record"]), tags(g["F3:record"]))
+        # cell:leaf through its own function
+        f3 = rj(os.path.join(src, "F3", "summary.probe.json"))
+        sdl = rj(os.path.join(src, "sd_leaf.json"))
+        for name, lf, ok in (("the banked NVMe leaf", f3["leaf"], True), ("the banked Hyper-V sd leaf", sdl, True),
+                             ("NVMe over tcp", dict(f3["leaf"], nvme_transport=["tcp"]), False),
+                             ("a scsi_debug kind", dict(sdl, kind="scsi_debug", creditable=False), False),
+                             ("sd on megaraid_sas", dict(sdl, sd_host="megaraid_sas"), False),
+                             ("sd bytes saying WCE=1 under a write-through report",
+                              dict(sdl, drive_report_source=sdl["drive_report_source"].replace("08 0a 00", "08 0a 04")), False)):
+            CELL, KIND, results = "ext4loop", "ext4", []
+            with contextlib.redirect_stdout(io.StringIO()):
+                cell_leaf_check(lf, "wb" if lf.get("write_cache") == "write back" else "wt", "planted", {"brd_cell": "0"})
+            chk("real: cell:leaf on %s -> %s" % (name, "pass" if ok else "fail"), results[0]["pass"] is ok, results[0]["detail"])
+    finally:
+        CELL, KIND, W, OUT, results = saved
+        shutil.rmtree(td)
 
 
 def main(argv):
     global OUT, CELL, KIND, W
     if argv == ["--self-test"]:
         return self_test()
-    if len(argv) == 4 and argv[0] == "--plan":
-        if argv[1] not in v3cell.CELLS:
+    if len(argv) == 6 and argv[0] == "--plan":
+        if argv[1] not in v3cell.CELLS or argv[4] not in ("vm", "bare") or argv[5] not in ("yes", "no"):
             return 2
-        print("\n".join(plan(argv[1], argv[2], argv[3])))
+        print("\n".join(plan(argv[1], argv[2], argv[3], {"virt": argv[4], "flip": argv[5]})))
+        return 0
+    if len(argv) == 2 and argv[0] == "--box":
+        info = rd(os.path.join(argv[1], "info.txt")) or ""
+        print(json.dumps(box_of(dict(l.split("=", 1) for l in info.splitlines() if "=" in l
+                                     and not l.startswith(("loop ", "block "))))))
         return 0
     if len(argv) == 3 and argv[0] == "--bind":
         return bind(argv[1], argv[2])
@@ -906,7 +1087,8 @@ def main(argv):
     W = kv.get("work", "")
     arch = kv.get("arch", "")
     leaf, leaf_src = find_leaf_class()
-    the_plan = plan(CELL, arch, leaf or "unknown")
+    box = box_of(kv)
+    the_plan = plan(CELL, arch, leaf or "unknown", box)
 
     # cell: the explicit layout (review 2 item 4)
     check("cell:fstype", kv.get("work_fstype") == KIND, {"work_fstype": kv.get("work_fstype"), "want": KIND},
@@ -920,20 +1102,19 @@ def main(argv):
     pers = kv.get("personality_under_setarch_R", "")
     check("cell:aslr", re.fullmatch(r"[0-9a-fA-F]+", pers or "x") is not None and int(pers, 16) & 0x0040000 != 0,
           {"personality": pers}, "setarch -R turns ASLR off for the traced runs (ADDR_NO_RANDOMIZE 0x0040000)")
-    lf = f3.get("leaf") or {}
-    lbad = []
-    if leaf is None:
-        lbad.append("no leaf class (no F3 or F1 summary)")
-    elif leaf == "brd":
-        if v3cell.is_loop(CELL) or kv.get("brd_cell") != "1":
-            lbad.append("a brd leaf outside a brd cell")
-        if lf.get("creditable") is not False:
-            lbad.append("a brd leaf not marked creditable false")
-    else:
-        lbad += leaf_problems(lf, kv.get("brd_cell") == "1")
-    check("cell:leaf", not lbad, {"leaf": lf, "class": leaf, "from": leaf_src, "bad": lbad},
-          "the leaf is an allowlisted drive (kind drive, creditable; NVMe over pcie; sd on an allowlisted host) whose own "
-          "cache report agrees with the kernel, an sd report re-read from its MODE SENSE bytes (or brd on a brd cell)")
+    cell_leaf_check(f3.get("leaf") or {}, leaf, leaf_src, kv)
+    bbad = []
+    if box["virt"] not in ("vm", "bare"):
+        bbad.append(("systemd-detect-virt gave nothing", kv.get("detect_virt")))
+    if box["flip"] not in ("yes", "no"):
+        bbad.append(("no leafdisk record", kv.get("leafdisk")))
+    fp3 = f3.get("flush_path") or []
+    want_disk = (kv.get("root_disk") or "").split(" ")[0] if leaf == "brd" else (fp3[-1].get("disk") if fp3 else None)
+    if not box["leafdisk"] or box["leafdisk"] != want_disk:
+        bbad.append(("the leaf disk the plants used is not the cell's", box["leafdisk"], want_disk))
+    check("cell:box", not bbad, {"box": box, "bad": bbad},
+          "the box is known: systemd-detect-virt answered (vm or bare), and the disk the leaf plants used is this cell's "
+          "leaf (the root disk on a brd cell), its flip class read from its write cache and driver")
 
     # F1: per-op syscall counts under strace -f -c at n = 1, 2, 3, 40
     f1 = {}
@@ -1172,7 +1353,7 @@ def main(argv):
         check("F4:X_allclones", rc in (0, 3) and sorted(rows) == ["cfr2b", "clone1b", "clone2b", "nosync25"],
               {"rc": rc, "arms": sorted(rows)}, "on %s the copy arms with nosync25 run (rc 0/3, all in raw)" % KIND)
     refusal("R_leftover", "every flushed arm" if KIND == "ext4" else "left over")
-    if leaf != "brd":  # wb: the kernel's write_cache disabled; wt sd: sd's "temporary write back" (fresh review H2)
+    if box["flip"] == "yes":  # wb: the kernel's write_cache disabled; sd: sd's "temporary write back" (fresh review H2)
         refusal("R_leaf_flip", "but the drive reports", state=True)
     if arch == "x86_64":
         refusal("R_clocksource", "the clocksource is", state=True)
@@ -1198,10 +1379,12 @@ def main(argv):
         ok = rc == 2 and any(str(r).startswith(want) for r in g.get("refusals") or [])
         check("F4:" + tag, ok, {"rc": rc, "refusals": g.get("refusals")},
               "batchgate.py post on a copy of the F3 batch with one planted field refuses (rc 2) with '%s'" % want)
-    fourth_review_plants(arch)
+    fourth_review_plants(arch, box)
     left = rd(os.path.join(OUT, "work-leftover.txt"))
-    check("work:empty", left is not None and left.strip() == "", {"leftover": (left or "MISSING")[:400]},
-          "the work dir is empty after every run (teardown and the ext4 FICLONE trial clean up)")
+    lleft = rd(os.path.join(OUT, "leafw-leftover.txt"))
+    check("work:empty", left is not None and left.strip() == "" and lleft is not None and lleft.strip() == "",
+          {"leftover": (left or "MISSING")[:400], "leaf_plant_dir_leftover": (lleft or "MISSING")[:400]},
+          "the work dir and the leaf plants' dir are empty after every run (teardown and the ext4 FICLONE trial clean up)")
     # the harness this verdict vouches for is the one that ran: hashed at the start (info.txt) and now (L9)
     moved = harness_moved(rj(os.path.join(OUT, "harness_start.json")), harness_sha256())
     check("harness:stable", not moved, {"changed_or_missing": moved[:8]},
@@ -1225,7 +1408,8 @@ def main(argv):
          "t3_positive": {"rule_holds_on_this_box": kv.get("t3_rule_holds"),
                          "P_runsh_t3_rc": rc_of(os.path.join(OUT, "F4", "P_runsh_t3.rc")),
                          "note": "recorded, not a check: only some runners expose cpufreq on 'performance'"},
-         "unplanted_refusals": unplanted(arch, leaf), "harness_sha256": harness_sha256(), "checks": results}
+         "box": {"virt": box["virt"], "flip": box["flip"]},
+         "unplanted_refusals": unplanted(arch, leaf, box), "harness_sha256": harness_sha256(), "checks": results}
     with open(os.path.join(OUT, "verdict.json"), "w") as f:
         json.dump(v, f, indent=1)
     # the binding check (firecheck.sh's last step) is pending for this verdict; check.py --bind replaces this record
@@ -1241,7 +1425,7 @@ def main(argv):
     return 0 if v["all_pass"] else 1
 
 
-def fourth_review_plants(arch):
+def fourth_review_plants(arch, box):
     """F4 plants for the fourth review's probe fixes: a write-back SCSI drive (scsi_debug, WCE=1) accepted and its
     override refused (M2), the VM detector with cpuinfo and DMI hidden (M1), /etc/ld.so.preload (M4)."""
     f4 = os.path.join(OUT, "F4")
@@ -1258,22 +1442,44 @@ def fourth_review_plants(arch):
           "a scsi_debug disk (WCE=1) under V3FLOOR_FIRECHECK=1: accepted as write-back, MODE SENSE's bytes say WCE=1, "
           "the leaf marked scsi_debug and not creditable")
     refusal("R_sdbg_flip", "but the drive reports 'write back'", state=True)
-    # M1: cpuinfo's hypervisor flag and DMI's names hidden in a mount namespace; the leaf still shows the VM
-    rc = rc_of(os.path.join(f4, "R_virt_hidden.rc"))
-    sj = rj(os.path.join(f4, "R_virt_hidden.out", "summary.json")) or {}
+    # M1: cpuinfo's hypervisor flag and DMI's names hidden in a mount namespace; the leaf still shows the VM (a VM box
+    # only: a bare-metal leaf has nothing to show, sixth review H1)
+    if box["virt"] == "vm":
+        rc = rc_of(os.path.join(f4, "R_virt_hidden.rc"))
+        sj = rj(os.path.join(f4, "R_virt_hidden.out", "summary.json")) or {}
+        vz = sj.get("virtualization") or {}
+        ev = vz.get("evidence") or []
+        prem = rd(os.path.join(f4, "R_virt_hidden.premise")) or ""
+        lc = leaf_class_of(sj)
+        premise = "product_name=PowerEdge R650" in prem and "sys_vendor=Dell Inc." in prem and "hypervisor_flags=0" in prem
+        hb = [] if lc in VIRT_KIND else [("leaf class", lc)]
+        hb += label_problems(sj, lc, True) if lc in VIRT_KIND else []
+        check("F4:R_virt_hidden", rc in (0, 3) and premise and vz.get("virtualized") is True
+              and any(str(e).startswith("leaf:") for e in ev) and not any(str(e).startswith(("cpuinfo:", "DMI:")) for e in ev)
+              and vz.get("dmi_product_name") == "PowerEdge R650" and not hb,
+              {"rc": rc, "premise": prem.strip(), "virtualization": vz, "labels": hb,
+               "text": (rd(os.path.join(f4, "R_virt_hidden.txt")) or "")[-300:]},
+              "with cpuinfo's hypervisor flag and DMI's names hidden (a bind mount in a private namespace, read back), "
+              "the leaf alone (driver, model, host path) still makes the run virtualized, and its labels say so")
+    # sixth review H1, M2: on any box, a leaf with no VM evidence (scsi_debug) with a hypervisor flag planted in
+    # cpuinfo and a VM planted in DMI: each detector fires on its own, and the virtual labels follow
+    rc = rc_of(os.path.join(f4, "R_virt_planted.rc"))
+    sj = rj(os.path.join(f4, "R_virt_planted.out", "summary.json")) or {}
     vz = sj.get("virtualization") or {}
-    ev = vz.get("evidence") or []
-    prem = rd(os.path.join(f4, "R_virt_hidden.premise")) or ""
-    lc = leaf_class_of(sj)
-    premise = "product_name=PowerEdge R650" in prem and "sys_vendor=Dell Inc." in prem and "hypervisor_flags=0" in prem
-    check("F4:R_virt_hidden", rc in (0, 3) and premise and vz.get("virtualized") is True
-          and any(str(e).startswith("leaf:") for e in ev) and not any(str(e).startswith(("cpuinfo:", "DMI:")) for e in ev)
-          and vz.get("dmi_product_name") == "PowerEdge R650" and lc in VIRT_KIND
-          and sj.get("floor_kind") == VIRT_KIND[lc][True],
-          {"rc": rc, "premise": prem.strip(), "virtualization": vz, "floor_kind": sj.get("floor_kind"),
-           "text": (rd(os.path.join(f4, "R_virt_hidden.txt")) or "")[-300:]},
-          "with cpuinfo's hypervisor flag and DMI's names hidden (a bind mount in a private namespace, read back), the "
-          "leaf alone (driver, model, host path) still makes the run virtualized, and its floor_kind says so")
+    ev = [str(e) for e in vz.get("evidence") or []]
+    prem = rd(os.path.join(f4, "R_virt_planted.premise")) or ""
+    premise = "product_name=Virtual Machine" in prem and "sys_vendor=QEMU" in prem and \
+        re.search(r"hypervisor_flags=[1-9]", prem) is not None
+    pb = [] if (rc in (0, 3) and premise) else [("rc/premise", rc, prem.strip())]
+    if vz.get("virtualized") is not True or not any(e.startswith("cpuinfo:") for e in ev) or \
+            not any(e.startswith("DMI:") for e in ev) or any(e.startswith("leaf:") for e in ev):
+        pb.append(("virtualization", vz))
+    if (sj.get("leaf") or {}).get("kind") != "scsi_debug":
+        pb.append(("leaf", sj.get("leaf")))
+    pb += label_problems(sj, "wb", True)
+    check("F4:R_virt_planted", not pb, {"bad": pb, "text": (rd(os.path.join(f4, "R_virt_planted.txt")) or "")[-300:]},
+          "a scsi_debug leaf (no VM evidence of its own) with a hypervisor flag planted in cpuinfo and a VM in DMI "
+          "(read back): virtualized true with both a cpuinfo and a DMI item and no leaf item, and the virtual labels")
     # fifth review L6: a leaf with no VM evidence of its own (scsi_debug), cpuinfo and DMI hidden: bare metal on x86_64,
     # not ruled out on arm64, and the labels that go with each
     rc = rc_of(os.path.join(f4, "P_virt_bare.rc"))
@@ -1282,23 +1488,32 @@ def fourth_review_plants(arch):
     prem = rd(os.path.join(f4, "P_virt_bare.premise")) or ""
     want = False if arch == "x86_64" else None
     premise = "product_name=PowerEdge R650" in prem and "sys_vendor=Dell Inc." in prem and "hypervisor_flags=0" in prem
-    fst = {False: "yes: the leaf reports a volatile write cache and the drive agrees",
-           None: "yes, to the device (virtualization not ruled out)"}[want]
-    vb = []
-    if not (rc in (0, 3) and premise):
-        vb.append(("rc/premise", rc, prem.strip()))
-    if "virtualized" not in vz or vz.get("virtualized") is not want or vz.get("evidence") != []:
-        vb.append(("virtualization", vz))
-    if (sj.get("leaf") or {}).get("kind") != "scsi_debug" or leaf_class_of(dict(sj, leaf=dict(sj.get("leaf") or {}, kind="drive"))) != "wb":
-        vb.append(("leaf", sj.get("leaf")))
-    if sj.get("floor_kind") != VIRT_KIND["wb"][want]:
-        vb.append(("floor_kind", sj.get("floor_kind"), VIRT_KIND["wb"][want]))
-    if not str(sj.get("flush_sent_to_device", "")).startswith(fst):
-        vb.append(("flush_sent_to_device", sj.get("flush_sent_to_device"), fst))
-    vb += qualifier_problems(str(sj.get("floor_claim", "")), want, "wb", "floor_claim")
-    check("F4:P_virt_bare", not vb, {"bad": vb, "text": (rd(os.path.join(f4, "P_virt_bare.txt")) or "")[-300:]},
-          "a write-back leaf with no VM evidence (scsi_debug) with cpuinfo's flag and DMI's names hidden: virtualized %r "
-          "with no evidence, floor_kind %r, and the matching flush_sent_to_device and floor_claim" % (want, VIRT_KIND["wb"][want]))
+    for tag, lc in (("P_virt_bare", "wb"), ("P_virt_bare_wt", "wt")):
+        rc = rc_of(os.path.join(f4, tag + ".rc"))
+        sj = rj(os.path.join(f4, tag + ".out", "summary.json")) or {}
+        vz = sj.get("virtualization") or {}
+        prem = rd(os.path.join(f4, tag + ".premise")) or ""
+        premise = "product_name=PowerEdge R650" in prem and "sys_vendor=Dell Inc." in prem and "hypervisor_flags=0" in prem
+        vb = []
+        if not (rc in (0, 3) and premise):
+            vb.append(("rc/premise", rc, prem.strip()))
+        if lc == "wt":  # scsi_debug's caching page set to WCE=0 by MODE SELECT, read back (sixth review M2)
+            st = rd(os.path.join(f4, tag + ".state")) or ""
+            if "changed=1" not in st:
+                vb.append(("state", st.strip()))
+        if "virtualized" not in vz or vz.get("virtualized") is not want or vz.get("evidence") != []:
+            vb.append(("virtualization", vz))
+        lf = sj.get("leaf") or {}
+        if lf.get("kind") != "scsi_debug" or leaf_class_of(dict(sj, leaf=dict(lf, kind="drive"))) != lc:
+            vb.append(("leaf", lf))
+        if lf.get("drive_reports") != {"wb": "write back", "wt": "write through"}[lc]:
+            vb.append(("drive report", lf.get("drive_reports")))
+        vb += label_problems(sj, lc, want)
+        check("F4:" + tag, not vb, {"bad": vb, "text": (rd(os.path.join(f4, tag + ".txt")) or "")[-300:]},
+              "a %s leaf with no VM evidence (scsi_debug%s) with cpuinfo's flag and DMI's names hidden: virtualized %r "
+              "with no evidence, floor_kind %r, and the matching flush_sent_to_device and floor_claim" %
+              ("write-back" if lc == "wb" else "write-through", "" if lc == "wb" else ", WCE cleared", want,
+               VIRT_KIND[lc][want]))
     # fifth review M1, M2: the root disk's leaf made remote (an sd host or an NVMe transport outside its allowlist)
     rc = rc_of(os.path.join(f4, "R_leaf_remote.rc"))
     txt = rd(os.path.join(f4, "R_leaf_remote.txt")) or ""
@@ -1310,7 +1525,7 @@ def fourth_review_plants(arch):
     check("F4:R_leaf_remote", exp is not None and rc == 2 and exp[0] in prem and exp[1] in txt
           and not os.path.exists(os.path.join(f4, "R_leaf_remote.out")),
           {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:]},
-          "the root disk's leaf with its SCSI host named tcm_loopback (sd) or its NVMe transport tcp, read back inside a "
+          "the cell's leaf disk with its SCSI host named tcm_loopback (sd) or its NVMe transport tcp, read back inside a "
           "private mount namespace: refused by the host or transport allowlist (rc 2)")
     # M4: /etc/ld.so.preload names a library; the dynamic build loads it and refuses, the static build never loads it
     rc = rc_of(os.path.join(f4, "R_ldso_preload.rc"))
@@ -1333,7 +1548,7 @@ def fourth_review_plants(arch):
           "only its own file")
 
 
-def unplanted(arch, leaf):
+def unplanted(arch, leaf, box):
     u = ["a mount whose mountinfo line is malformed or too long", "statx returning no mount id",
          "an unreadable /proc/fs/ext4 options file or /proc/fs/jbd2", "a SCSI or virtio cache_type that cannot be read "
          "or parsed", "NVMe controllers of one subsystem disagreeing on VWC", "a brd leaf whose write_cache is not "
@@ -1345,8 +1560,14 @@ def unplanted(arch, leaf):
          "zero page length (scsi_debug always answers whole)", "/proc/self/maps unreadable",
          "a hypervisor that hides the CPUID bit and presents non-virtual DMI and drive identities (the stated blind spot; "
          "the plant hides cpuinfo and DMI only)"]
+    if box.get("flip") != "yes":
+        u.append("the kernel's write_cache disagreeing with the drive: the leaf disk reads write-through and is not sd, "
+                 "so neither direction can be planted (the kernel refuses 'write back' on a queue without a volatile "
+                 "cache: recalled, unverified)")
+    if box.get("virt") != "vm":
+        u.append("the leaf's own VM evidence (driver, model, SCSI host, device path) on this box: a bare-metal leaf has "
+                 "none to hide (R_virt_planted fires the cpuinfo and DMI detectors; the CI VMs fire the leaf detector)")
     if leaf == "brd":
-        u.append("the kernel's write_cache disagreeing with the drive (this cell's leaf is brd)")
         u.append("post's brd rule as a plant (this cell's batch is brd before anything is planted; the drive cells' "
                  "R_post_brd discriminates it)")
     if arch != "x86_64":
@@ -1525,6 +1746,21 @@ def check_real(o3, rc, kv, leaf):
     check("F3:gate", not gb, {"bad": gb, "gate": g},
           "run.sh's gate: no post-run refusal; the diskstats leaf flush gate passes on a write-back leaf (>= n x gated "
           "arms) and labels a write-through or brd leaf, never passes it")
+    rb = record_problems(sj, merged, rep, st0, kv, leaf)
+    check("F3:record", not rb, {"bad": rb},
+          "the batch records the clocksource (allowlisted, in summary and stamp), cpufreq/cpuidle, the binary's own sha256 "
+          "(static, nothing else mapped), per-layer write_cache/fua and ext4 data=/commit=/async commit, virtualization "
+          "consistent with systemd-detect-virt, floor_kind and flush_sent_to_device for its leaf and virtualization, the "
+          "claim re-derived from the clean arm's windows with its qualifier, the gated set (clone1b report-only) and "
+          "'durability unverified on Linux'")
+    rec["flush_gate"] = fg
+    return rec
+
+
+def record_problems(sj, merged, rep, st0, kv, leaf):
+    """F3:record's rules on the batch's own records (check_real calls it; the self-test drives check_real itself on
+    planted copies of a banked batch, so the call is covered too: sixth review M3)."""
+    rep = rep or {}
     rb = []
     if sj.get("clocksource") not in CLOCKSOURCES:
         rb.append(("clocksource", sj.get("clocksource")))
@@ -1549,10 +1785,7 @@ def check_real(o3, rc, kv, leaf):
     vbad = virt_problems(vz, (kv.get("detect_virt") or "").strip(), arch_of(kv))
     if vbad:
         rb.append(("virtualization", vbad, vz))
-    fk = VIRT_KIND[leaf].get(vm) if leaf in VIRT_KIND and vm in (True, False, None) else \
-        "brd: no drive (fire-check only, never credited)" if leaf == "brd" else None
-    if sj.get("floor_kind") != fk:
-        rb.append(("floor_kind", sj.get("floor_kind"), fk, "virtualized", vm))
+    rb += label_problems(sj, leaf, vm)
     rb += linkage_problems(sj)
     # the claim the batch may make, re-derived here from the device flush record's clean windows (fresh reviews
     # P-H1, B-H2; fourth review L1, L2, L9)
@@ -1575,11 +1808,8 @@ def check_real(o3, rc, kv, leaf):
     if not claim.startswith(want_claim):
         rb.append(("floor_claim_from_counts", claim, want_claim, clean_k))
     rb += qualifier_problems(claim, vm, leaf, "floor_claim_from_counts")
-    rb += qualifier_problems(str(sj.get("floor_claim", "")), vm, leaf, "floor_claim")
     if sj.get("fstype") == "btrfs" and "bare flush" in str(sj.get("floor_claim", "")) and "no bare-flush" not in str(sj.get("floor_claim", "")):
         rb.append(("btrfs floor_claim promises a bare flush", sj.get("floor_claim")))
-    if not str(sj.get("flush_sent_to_device", "")).startswith("yes" if leaf == "wb" else "no"):
-        rb.append(("flush_sent_to_device", sj.get("flush_sent_to_device")))
     if sj.get("arms_gated") != GATED:
         rb.append(("arms_gated", sj.get("arms_gated")))
     if "clone1b" not in (sj.get("arms_report_only") or {}):
@@ -1587,14 +1817,7 @@ def check_real(o3, rc, kv, leaf):
     du = sj.get("durability") or {}
     if "unverified on Linux" not in du.get("clone2b", "") or "unverified on Linux" not in du.get("cfr2b", ""):
         rb.append(("durability", du))
-    check("F3:record", not rb, {"bad": rb},
-          "the batch records the clocksource (allowlisted, in summary and stamp), cpufreq/cpuidle, the binary's own sha256 "
-          "(static, nothing else mapped), per-layer write_cache/fua and ext4 data=/commit=/async commit, virtualization "
-          "consistent with systemd-detect-virt, floor_kind and flush_sent_to_device for its leaf and virtualization, the "
-          "claim re-derived from the clean arm's windows with its qualifier, the gated set (clone1b report-only) and "
-          "'durability unverified on Linux'")
-    rec["flush_gate"] = fg
-    return rec
+    return rb
 
 
 def arch_of(kv):
@@ -1619,6 +1842,7 @@ def bind(out, cell):
         rcl = rd(os.path.join(out, "F4", "P_runsh_ok.out", "rc")) or ""
         ok = (rc in (0, 3) and "bound=fire-checked: " in bt and ("verdict_sha256=%s" % vs) in bt and
               ("v3floor_sha256=%s" % v.get("v3floor_sha256")) in bt and ("cell=%s" % cell) in bt and
+              "bind_basis=pending record, bind step" in bt and
               isinstance(g, dict) and g.get("refusals") == [] and re.search(r"gate_rc=(0|3) ", rcl) is not None)
         g = g or {}
         # the batch ran append25 and nosync25 only, so its claim must say the clean arm did not run (fourth review L1)

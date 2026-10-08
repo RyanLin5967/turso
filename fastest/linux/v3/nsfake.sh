@@ -3,9 +3,9 @@
 # review M1, M2, L6). Run it as root inside a private mount namespace:
 #   sudo unshare -m --propagation private bash nsfake.sh PREMISE UID GID SRC:DST... -- CMD...
 # Each DST (a file under /proc or /sys the probe reads) is bind-mounted over by SRC in that namespace only, so nothing
-# outside it sees the change and it ends with CMD. The premise is then read back INSIDE the namespace into PREMISE,
-# one line per DST, "<basename of DST>=<its first line>", plus "hypervisor_flags=<count of the word hypervisor in
-# /proc/cpuinfo>", before CMD starts as UID:GID (setpriv, supplementary groups from the user database).
+# outside it sees the change and it ends with CMD. The premise is then read back INSIDE the namespace, as UID:GID,
+# into PREMISE: one line per DST, "<basename of DST>=<its first line>", plus "hypervisor_flags=<count of the word
+# hypervisor in /proc/cpuinfo>", before CMD starts as UID:GID (setpriv, supplementary groups from the user database).
 # Fire-check only. Exit: 2 usage, 97 a bind failed, else CMD's.
 set -u
 [ $# -ge 5 ] || { echo "nsfake: usage: PREMISE UID GID SRC:DST... -- CMD..." >&2; exit 2; }
@@ -18,8 +18,13 @@ shift
 for b in "${binds[@]}"; do
   mount --bind "${b%%:*}" "${b#*:}" || { echo "nsfake: bind of ${b%%:*} over ${b#*:} failed" >&2; exit 97; }
 done
-{
-  for b in "${binds[@]}"; do d=${b#*:}; echo "$(basename "$d")=$(head -1 "$d")"; done
-  echo "hypervisor_flags=$(grep -c -w hypervisor /proc/cpuinfo)"
-} > "$prem"
+# the premise is read as the user the probe runs as (sixth review L3: a root-only file would otherwise read back here
+# and not in the probe)
+dsts=()
+for b in "${binds[@]}"; do dsts+=("${b#*:}"); done
+setpriv --reuid="$uid" --regid="$gid" --init-groups bash -c '
+  p=$1; shift
+  { for d in "$@"; do echo "$(basename "$d")=$(head -1 "$d")"; done
+    echo "hypervisor_flags=$(grep -c -w hypervisor /proc/cpuinfo)"; } > "$p"' _ "$prem" "${dsts[@]}" \
+  || { echo "nsfake: the premise could not be read as uid $uid" >&2; exit 97; }
 exec setpriv --reuid="$uid" --regid="$gid" --init-groups "$@"
