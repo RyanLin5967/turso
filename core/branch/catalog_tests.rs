@@ -698,6 +698,76 @@ fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
     check(&db, &model);
 }
 
+/// PREREG A27 (r11-restart-r3-capgate; added by resolve-durable-churn-restart after its
+/// fresh-context review found the gated arm untested): a capture with the gate on copies no page
+/// map for a branch whose row alone changed (a parent that only forked: `DIRTY_ROW`), and the
+/// checkpoint it feeds loses nothing: after it and a reopen the parent still reads every row it
+/// committed. The gate off is the control: the same capture copies the parent's whole map. The
+/// gate is forced on this thread (`store::CAPTURE_GATE_FOR_TEST`), where the sharp capture of
+/// `branch_compact_now` runs.
+#[test]
+fn a_gated_capture_copies_no_page_map_for_a_parent_that_only_forked_and_loses_nothing() {
+    for gate in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let n = 40;
+        let parent;
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            let trunk = db.connect().unwrap();
+            trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+            let p = trunk.fork_branch().unwrap();
+            {
+                let c = p.connect().unwrap();
+                c.execute("CREATE TABLE big(id INTEGER PRIMARY KEY, x BLOB)").unwrap();
+                c.execute("BEGIN").unwrap();
+                for i in 0..n {
+                    c.execute(format!("INSERT INTO big VALUES ({i}, zeroblob(3000))")).unwrap();
+                }
+                c.execute("COMMIT").unwrap();
+            }
+            let owned = p.owned_slots().len() as u64;
+            assert!(owned > 0, "gate={gate}: premise: the parent owns no page");
+            db.branch_checkpoint_wait();
+            db.branch_compact_now().unwrap();
+            // The fork changes the parent's row (its epoch and child count) and nothing else.
+            {
+                let c = p.connect().unwrap();
+                let _ = c.fork_branch().unwrap().into_id();
+            }
+            parent = p.into_id();
+            db.branch_checkpoint_wait();
+            let e0 = db.branch_checkpoint_capture_entries();
+            store::CAPTURE_GATE_FOR_TEST.with(|c| c.set(Some(gate)));
+            let compacted = db.branch_compact_now();
+            store::CAPTURE_GATE_FOR_TEST.with(|c| c.set(None));
+            compacted.unwrap();
+            let entries = db.branch_checkpoint_capture_entries() - e0;
+            if gate {
+                assert_eq!(entries, 0, "the gated capture copied {entries} entries no write reads");
+            } else {
+                assert!(
+                    entries >= owned,
+                    "control: the ungated capture copied {entries} entries for a parent owning {owned} pages"
+                );
+            }
+            drop(trunk);
+        }
+        let db = open_at(&path, catalog()).unwrap();
+        let c = db.branch(parent).unwrap().connect().unwrap();
+        let rows = c
+            .prepare("SELECT count(*) FROM big WHERE length(x) = 3000")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(n),
+            "gate={gate}: the parent lost rows after its checkpoint and a reopen"
+        );
+    }
+}
+
 /// F-FZ's log bound: with fuzzy checkpoints the log may pass the threshold while one is in flight,
 /// but an operation that finds it past twice the threshold waits for the install, so the log never
 /// exceeds twice the threshold plus one operation's records. (The sharp checkpoint's bound, the

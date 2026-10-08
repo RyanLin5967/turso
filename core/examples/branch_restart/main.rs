@@ -1368,10 +1368,22 @@ fn catonly(args: &Args) {
 /// `capfork` (PREREG A27): the entries a fuzzy checkpoint's capture copies under the store mutex
 /// after K forks of each of P parents that own about D pages each, and whose own state a sharp
 /// checkpoint has already written. Counters only; the hold time is printed, not claimed.
+///
+/// Always a catalog store with branch syncs off (`open_db(.., false, true)`): `--mode` and `--sync`
+/// are not read. `entries_under_mutex` counts captured ROW entries (each row's current pages and
+/// retained versions, `CkptCounters::capture_entries`), not trunk versions or free-list work.
+/// `ckpt_hold_ns` is this checkpoint's store-mutex hold (capture + install); `hold_max_ns` is the
+/// process-wide maximum, which the earlier sharp checkpoint usually sets, so it does not compare
+/// the arms. (Fixes from the fresh-context review of resolve-durable-churn-restart: an empty
+/// fixture is refused, the counters are read once no checkpoint is in flight, and the gate-off arm
+/// must have copied at least the parents' pages.)
 fn capfork(args: &Args) {
     let gate = std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on");
     if args.fix != gate {
         die("capfork: --fix and R11_CAPTURE_GATE=on go together (the flag names the arm the store reads)");
+    }
+    if args.n == 0 || args.forks == 0 || args.parents == 0 {
+        die("capfork: --n, --forks and --parents must each be at least 1 (an empty fixture measures nothing)");
     }
     let ok = |r: turso_core::Result<()>, what: &str| r.unwrap_or_else(|e| not_a_result(&format!("capfork {what}: {e}")));
     let db = open_db(&args.db, false, true);
@@ -1397,7 +1409,6 @@ fn capfork(args: &Args) {
     // overlap a flight).
     db.branch_checkpoint_wait();
     db.branch_compact_now().unwrap_or_else(|e| not_a_result(&format!("capfork compact: {e}")));
-    let e0 = db.branch_checkpoint_capture_entries();
     for &(id, _) in &parents {
         let b = db.branch(id).unwrap_or_else(|e| not_a_result(&format!("capfork attach: {e}")));
         let c = b.connect().unwrap_or_else(|e| not_a_result(&format!("capfork connect: {e}")));
@@ -1407,6 +1418,11 @@ fn capfork(args: &Args) {
         drop(c);
         let _ = b.into_id();
     }
+    // A checkpoint the forks' own records started must install first: its capture would land in
+    // `entries_under_mutex` without the one-checkpoint check below seeing it, and while it is in
+    // flight `branch_checkpoint_fuzzy_now` starts nothing.
+    db.branch_checkpoint_wait();
+    let e0 = db.branch_checkpoint_capture_entries();
     let before = db.branch_checkpoint_counters();
     let mut calls = 0;
     while !db.branch_checkpoint_fuzzy_now().unwrap_or_else(|e| not_a_result(&format!("capfork fuzzy: {e}"))) {
@@ -1422,13 +1438,25 @@ fn capfork(args: &Args) {
         not_a_result(&format!("capfork: {} checkpoints installed, not 1", after[0] - before[0]));
     }
     let owned: Vec<usize> = parents.iter().map(|p| p.1).collect();
+    let owned_total: u64 = owned.iter().map(|&n| n as u64).sum();
+    if owned_total == 0 {
+        not_a_result("capfork: premise: the parents own no page");
+    }
+    // Ungated, every parent row is copied whole: at least the pages the parents own.
+    if !gate && e1 - e0 < owned_total {
+        not_a_result(&format!(
+            "capfork: premise: the ungated capture copied {} entries for parents owning {owned_total}",
+            e1 - e0
+        ));
+    }
     println!(
-        "CAPFORK\td={d}\tforks={}\tparents={}\towned={owned:?}\tgate={}\tentries_under_mutex={}\tstmts_locked={}\thold_max_ns={}\tsettle_calls={calls}",
+        "CAPFORK\td={d}\tforks={}\tparents={}\towned={owned:?}\tgate={}\tentries_under_mutex={}\tstmts_locked={}\tckpt_hold_ns={}\thold_max_ns={}\tsettle_calls={calls}",
         args.forks,
         args.parents,
         if gate { "on" } else { "off" },
         e1 - e0,
         after[5] - before[5],
+        after[2] - before[2],
         after[3]
     );
 }

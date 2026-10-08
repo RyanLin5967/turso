@@ -1541,17 +1541,6 @@ fn fuzzy_checkpoints() -> bool {
     })
 }
 
-/// PREREG A27 (the F-FZ capture residual): with `R11_CAPTURE_GATE=on`, a checkpoint's capture copies a
-/// branch's `current` only when a writer of its row needs it (`DIRTY_NEW` or `DIRTY_CUR`), and its
-/// retained versions only for `DIRTY_NEW` or `DIRTY_RET`, as `checkpoint_write` uses them. A branch
-/// that is only `DIRTY_ROW` (a parent that forked) is then one row, not its whole page map. Off by
-/// default until the counter arm is scored: the lane's arm-switch pattern (read once per process,
-/// as `R11_CKPT` was on the lane's base; on this base `R11_CKPT` is the test models' switch only).
-fn capture_gate() -> bool {
-    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on"))
-}
-
 impl CatState {
     fn new(catalog: Catalog, sync: SyncClass, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
@@ -1595,6 +1584,13 @@ const DIRTY_NEW: u8 = 8;
 /// Spliced into its parent's place since the last checkpoint: its (parent, fork epoch) moved, so
 /// the row is re-keyed and its `branch_children` entry with it (F7 durable port, U6).
 const DIRTY_KEY: u8 = 16;
+/// The flags under which `checkpoint_write` reads a captured row's `current` (`put_branch`,
+/// `put_cur`) and its retained versions (`put_branch`, `put_ret`); `update_row` and `rekey` read
+/// neither. The A27 capture gate (`capture_rows`) copies a field only under its mask, so a write
+/// that comes to read either field under another flag must widen the mask here, or a gated
+/// capture hands it an empty list.
+const NEEDS_CUR: u8 = DIRTY_NEW | DIRTY_CUR;
+const NEEDS_RET: u8 = DIRTY_NEW | DIRTY_RET;
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
 ///
@@ -2358,16 +2354,15 @@ impl Lineage {
 /// resident branch's row, current page map and retained versions, with what changed in it.
 fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
     // PREREG A27 (r11-restart-r3-capgate), opt-in: with `R11_CAPTURE_GATE=on` a row's `current` is
-    // copied only for `DIRTY_NEW | DIRTY_CUR` and its retained versions only for `DIRTY_NEW |
-    // DIRTY_RET`, the only flags under which `checkpoint_write` reads them (`put_branch`, `put_cur`,
-    // `put_ret`; `update_row` and `rekey` read neither). Off (the default), every row is copied whole.
+    // copied only under `NEEDS_CUR` and its retained versions only under `NEEDS_RET`, the only
+    // flags under which `checkpoint_write` reads them. Off (the default), every row is copied whole.
     let gate = capture_gate();
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
         .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
         .map(|(&id, st, what)| {
-            let need_current = !gate || what & (DIRTY_NEW | DIRTY_CUR) != 0;
-            let need_retained = !gate || what & (DIRTY_NEW | DIRTY_RET) != 0;
+            let need_current = !gate || what & NEEDS_CUR != 0;
+            let need_retained = !gate || what & NEEDS_RET != 0;
             (CatBranch {
                 id: id.0,
                 parent: st.parent.0,
@@ -2393,6 +2388,29 @@ fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u
     #[cfg(test)]
     CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
     rows
+}
+
+/// PREREG A27 (the F-FZ capture residual): with `R11_CAPTURE_GATE=on`, a checkpoint's capture copies a
+/// branch's `current` only when a writer of its row needs it (`NEEDS_CUR`), and its retained
+/// versions only under `NEEDS_RET`, as `checkpoint_write` uses them. A branch that is only
+/// `DIRTY_ROW` (a parent that forked) is then one row, not its whole page map. Off by default until
+/// the counter arm is scored: the lane's arm-switch pattern (read once per process, as `R11_CKPT`
+/// was on the lane's base; on this base `R11_CKPT` is the test models' switch only). Test builds
+/// can force it on the calling thread (`CAPTURE_GATE_FOR_TEST`), where a sharp capture runs.
+fn capture_gate() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CAPTURE_GATE_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test builds: `capture_gate()` on this thread, whatever the environment says (`None`: the
+    /// environment's answer).
+    pub(crate) static CAPTURE_GATE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A Release applied in memory whose record is not yet durable (`StoreInner::releases_in_air`).
@@ -2533,6 +2551,8 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     catalog.raise_sync(cap.arena_sync)?;
     catalog.begin()?;
     let written = (|| -> Result<()> {
+        // A row's `current` is read only under `NEEDS_CUR` and its retained versions only under
+        // `NEEDS_RET` (put_branch, put_cur, put_ret): a gated capture (A27) copies nothing else.
         for (b, what) in &cap.rows {
             if what & DIRTY_NEW != 0 {
                 catalog.put_branch(b)?;
@@ -8211,7 +8231,7 @@ impl StoreInner {
                 })
                 .collect();
             eprintln!(
-                "R11SLOT checkpoint gen={generation} log_from={log_from} rows={named:?} removed={:?} trunk_new={:?} trunk_gone={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
+                "R11SLOT checkpoint gen={generation} log_from={log_from} rows={named:?} removed={:?} trunk_new={:?} trunk_gone={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={} capture_gate={}",
                 cat.removed,
                 trunk_new,
                 trunk_gone,
@@ -8219,7 +8239,9 @@ impl StoreInner {
                 cat.taken,
                 arena.free_list(),
                 arena.high_water(),
-                arena.in_use()
+                arena.in_use(),
+                // A27: gated, a row's lists hold only what its flags make the write read.
+                if capture_gate() { "on" } else { "off" }
             );
         }
         cat.flight = true;
