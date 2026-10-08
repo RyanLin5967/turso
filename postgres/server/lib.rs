@@ -3256,11 +3256,8 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
-                let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
-                        "invalid bytea hex parameter: {e}"
-                    ))))
-                })?;
+                let data =
+                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22P02", e)))?;
                 Ok(Value::from_blob(data))
             } else {
                 // Raw bytes as-is
@@ -3273,18 +3270,29 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
 }
 
-/// Decode a hex string into bytes.
+/// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
+/// digits, whitespace skipped between pairs, its messages on bad input (22P02 at the caller). Read
+/// by character, never sliced: `&hex[i..i + 2]` cut a multi-byte character and panicked, and under
+/// the release build's panic=abort one client's Bind ended every session (wire review 9 item 5).
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
-        return Err("odd-length hex string".to_owned());
+    let digit = |c: char| {
+        c.to_digit(16)
+            .ok_or_else(|| format!("invalid hexadecimal digit: \"{c}\""))
+    };
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars();
+    while let Some(c) = chars.next() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            continue;
+        }
+        let high = digit(c)?;
+        let low = match chars.next() {
+            Some(d) => digit(d)?,
+            None => return Err("invalid hexadecimal data: odd number of digits".to_owned()),
+        };
+        out.push((high * 16 + low) as u8);
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex at position {i}: {e}"))
-        })
-        .collect()
+    Ok(out)
 }
 
 fn encode_value(
