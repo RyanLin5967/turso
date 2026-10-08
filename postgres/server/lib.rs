@@ -511,9 +511,15 @@ async fn serve_session(
         };
         let msg = match msg {
             Some(Ok(msg)) => msg,
-            // A message the codec cannot read: the stream is out of step, so the session ends with
+            // A frame the codec cannot read: a length below 4 or past the limit, an unknown
+            // message type, or a startup-phase message that does not hold what it says. The
+            // stream is out of step (or the session never started), so the session ends with
             // FATAL 08P01, as PostgreSQL ends it on an invalid frontend message (wire review 5
-            // item 4: it closed without a word).
+            // item 4: it closed without a word). A message read whole whose body is short or
+            // malformed does not come here: the vendored pgwire hands it on as
+            // PgWireFrontendMessage::Malformed, answered below with an ERROR (08P01) and, in the
+            // extended protocol, a skip to Sync, as PostgreSQL answers it (wire review 10 item 2;
+            // postgres/vendor/pgwire/VENDORED.md).
             Some(Err(e)) => {
                 error!("invalid frontend message: {}", e);
                 let info = ErrorInfo::new(
@@ -1183,8 +1189,8 @@ impl Session {
     }
 
     /// The result columns of the statement [`Session::describe_prepare`] kept.
-    fn described_fields(&self, format: &Format) -> Vec<FieldInfo> {
-        self.state().described.as_ref().map_or_else(Vec::new, |d| {
+    fn described_fields(&self, format: &Format) -> SqlResult<Vec<FieldInfo>> {
+        self.state().described.as_ref().map_or(Ok(Vec::new()), |d| {
             result_fields(&d.stmt, &d.types.columns, format)
         })
     }
@@ -1289,9 +1295,21 @@ impl Session {
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
-        if let Some(portal) = portal {
-            bind_portal_parameters(&mut stmt, portal, &types)
-                .map_err(|e| unprepared(wire_info(e)))?;
+        match portal {
+            Some(portal) => bind_portal_parameters(&mut stmt, portal, &types)
+                .map_err(|e| unprepared(wire_info(e)))?,
+            // Nothing binds a parameter over the simple protocol, so a $n names none: 42P02, as
+            // PostgreSQL answers, before the statement runs. It ran with the parameter unbound,
+            // which the engine reads as NULL: `UPDATE t SET v = $1` nulled every row (wire review
+            // 9 item 3).
+            None => {
+                if let Some(n) = types.used.first() {
+                    return Err(unprepared(error(
+                        "42P02",
+                        format!("there is no parameter ${n}"),
+                    )));
+                }
+            }
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql, backoff)
@@ -1327,11 +1345,11 @@ impl Session {
         if f == "turso_branch_current" {
             arity(call, 0)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
-            return Ok(one_text(f, name, format));
+            return one_text(f, name, format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
-            return Ok(stats_row(format));
+            return stats_row(format);
         }
         if !matches!(
             f,
@@ -1343,6 +1361,9 @@ impl Session {
             ));
         }
         arity(call, 1)?;
+        // The result-format list is checked before the call changes anything: a create refused
+        // after it ran would leave its branch behind (wire review 9 item 2).
+        result_format(format, 0, 1)?;
         let name = text_arg(&call.args[0], portal)?;
         // As PostgreSQL refuses CREATE DATABASE and DROP DATABASE in a transaction block. The
         // engine refuses a fork there too; a switch would abandon the transaction.
@@ -1361,7 +1382,7 @@ impl Session {
                     ));
                 }
                 match self.waiting(|| conn.inner().create_branch(&name)) {
-                    Ok(id) => Ok(one_int8(f, id.0 as i64, format)),
+                    Ok(id) => one_int8(f, id.0 as i64, format),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
             }
@@ -1382,7 +1403,7 @@ impl Session {
                         next.adopt_session_of(conn);
                         st.branch = Some((name.clone(), next));
                     }
-                    return Ok(one_text(f, &name, format));
+                    return one_text(f, &name, format);
                 }
                 let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
@@ -1412,7 +1433,7 @@ impl Session {
                     drop(left_conn);
                     st.left = Some(left);
                 }
-                Ok(one_text(f, &name, format))
+                one_text(f, &name, format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
                 "55006",
@@ -1426,7 +1447,7 @@ impl Session {
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
-                    Ok(_) => Ok(one_text(f, &name, format)),
+                    Ok(_) => one_text(f, &name, format),
                     Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
                 }
             }
@@ -1935,8 +1956,9 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<String>>) -> SqlResult<Str
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
         PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
+            // Over the simple protocol nothing binds one (wire review 9 item 3).
             let portal =
-                portal.ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
+                portal.ok_or_else(|| error("42P02", format!("there is no parameter ${n}")))?;
             // A parameter declared as another type is not a name, whatever its bytes spell. A text
             // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
             // function's text) is its bytes in either format: textrecv reads binary text as is.
@@ -1966,24 +1988,27 @@ fn one_row(
     pg_type: Type,
     format: &Format,
     encode: impl FnOnce(&mut DataRowEncoder) -> PgWireResult<()>,
-) -> Response {
+) -> SqlResult<Response> {
     let header = Arc::new(vec![FieldInfo::new(
         f.to_string(),
         None,
         None,
         pg_type,
-        format.format_for(0),
+        result_format(format, 0, 1)?,
     )]);
     let mut encoder = DataRowEncoder::new(header.clone());
     let row = encode(&mut encoder).and_then(|()| encoder.finish());
-    Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
+    Ok(Response::Query(QueryResponse::new(
+        header,
+        stream::iter(vec![row]),
+    )))
 }
 
-fn one_text(f: &str, value: &str, format: &Format) -> Response {
+fn one_text(f: &str, value: &str, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::TEXT, format, |e| e.encode_field(&value))
 }
 
-fn one_int8(f: &str, value: i64, format: &Format) -> Response {
+fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
@@ -1998,8 +2023,8 @@ const STATS_COLUMNS: [&str; 5] = [
 /// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
 /// the call runs, NULLs where the platform does not count them; then the server's own count of
 /// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]).
-fn stats_row(format: &Format) -> Response {
-    let header = Arc::new(stats_fields(format));
+fn stats_row(format: &Format) -> SqlResult<Response> {
+    let header = Arc::new(stats_fields(format)?);
     let mut encoder = DataRowEncoder::new(header.clone());
     let values = counters::process_counters()
         .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
@@ -2008,27 +2033,78 @@ fn stats_row(format: &Format) -> Response {
         .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
         .and_then(|()| encoder.encode_field(&skipped))
         .and_then(|()| encoder.finish());
-    Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
+    Ok(Response::Query(QueryResponse::new(
+        header,
+        stream::iter(vec![row]),
+    )))
 }
 
-fn stats_fields(format: &Format) -> Vec<FieldInfo> {
+fn stats_fields(format: &Format) -> SqlResult<Vec<FieldInfo>> {
     STATS_COLUMNS
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            FieldInfo::new(
+            Ok(FieldInfo::new(
                 name.to_string(),
                 None,
                 None,
                 Type::INT8,
-                format.format_for(i),
-            )
+                result_format(format, i, STATS_COLUMNS.len())?,
+            ))
         })
         .collect()
 }
 
+/// The format of result column `i` of `columns` under a Bind's result-format codes: none (every
+/// column text), one (for every column), or one per column. Any other count is a protocol
+/// violation, refused in PostgreSQL's words (its PortalSetResultFormat), where pgwire's
+/// `Format::format_for` indexed the list unchecked: two codes for three columns panicked the
+/// session, and under the release build's panic=abort ended every session (wire review 9 item 2,
+/// review 10 item 1). PostgreSQL refuses at Bind; here the check is made where the column count is
+/// first known, at Describe of the portal or at Execute, since an engine statement's columns are
+/// known only once it is prepared. A statement returning no rows builds no columns and ignores the
+/// list, as in PostgreSQL.
+fn result_format(format: &Format, i: usize, columns: usize) -> SqlResult<FieldFormat> {
+    match format {
+        Format::Individual(codes) => match codes.get(i) {
+            Some(code) if codes.len() == columns => Ok(FieldFormat::from(*code)),
+            _ => Err(error(
+                "08P01",
+                format!(
+                    "bind message has {} result formats but query has {columns} columns",
+                    codes.len()
+                ),
+            )),
+        },
+        unified => Ok(unified.format_for(i)),
+    }
+}
+
+/// A branch call's parameters as a parse types them: each `$n` it holds is text (a branch name),
+/// so Describe answers what [`parameter_types`] answers for any statement, a gap below the highest
+/// $n included (42P18). Describe sized the list by the highest $n with no limit, so one client's
+/// `$18446744073709551615` panicked the server (wire review 9 item 1); a call holds only $n in
+/// 1..=MAX_PARAMETER ([`branch_call`]).
+fn branch_call_types(call: &PgBranchCall) -> StatementTypes {
+    let mut used: Vec<u32> = call
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            PgBranchArg::Param(n) => Some(*n as u32),
+            _ => None,
+        })
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    StatementTypes {
+        columns: Vec::new(),
+        params: used.iter().map(|n| (*n, Type::TEXT.oid())).collect(),
+        used,
+    }
+}
+
 /// The row a branch call returns, for Describe.
-fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
+fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<FieldInfo>> {
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
     }
@@ -2037,13 +2113,13 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
     } else {
         Type::TEXT
     };
-    vec![FieldInfo::new(
+    Ok(vec![FieldInfo::new(
         call.function.clone(),
         None,
         None,
         pg_type,
-        format.format_for(0),
-    )]
+        result_format(format, 0, 1)?,
+    )])
 }
 
 /// A statement's failure, boxed: an `ErrorInfo` is ~280 bytes and failure is the rare path.
@@ -2494,36 +2570,31 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // Every parameter, $1 up to the highest $n the statement uses or the client declared:
-        // declared ones as declared, the rest as text (wire review 1 item 13).
-        let param_types = |used: usize| -> Vec<Type> {
-            let declared = &target.parameter_types;
-            (0..used.max(declared.len()))
-                .map(|i| declared.get(i).cloned().flatten().unwrap_or(Type::TEXT))
-                .collect()
-        };
         self.refuse_describe_if_aborted(&target.statement)?;
         if let Some(call) = branch_call(&target.statement) {
-            let fields = branch_call_fields(&call, &Format::UnifiedText);
-            let used = call
-                .args
-                .iter()
-                .filter_map(|a| match a {
-                    PgBranchArg::Param(n) => Some(*n),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            return Ok(DescribeStatementResponse::new(param_types(used), fields));
+            let fields =
+                branch_call_fields(&call, &Format::UnifiedText).map_err(PgWireError::UserError)?;
+            let params = parameter_types(&branch_call_types(&call), &target.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            return Ok(DescribeStatementResponse::new(params, fields));
         }
         // The special statements return no rows: NoData, from the text (their prepared stand-ins
         // have a dummy column). That their prepare is never what performs them is describe_prepare's
         // job, from the parse, so a form this text test misses is still not performed.
         if is_pg_non_query(&target.statement) {
-            return Ok(DescribeStatementResponse::new(param_types(0), vec![]));
+            // The parameters the client declared, as declared, the rest as text (wire review 1
+            // item 13).
+            let declared = target
+                .parameter_types
+                .iter()
+                .map(|t| t.clone().unwrap_or(Type::TEXT))
+                .collect();
+            return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
         self.describe_prepare(&target.statement)?;
-        let fields = self.described_fields(&Format::UnifiedText);
+        let fields = self
+            .described_fields(&Format::UnifiedText)
+            .map_err(PgWireError::UserError)?;
         let params = self
             .described_parameters(&target.parameter_types)
             .map_err(PgWireError::UserError)?;
@@ -2540,14 +2611,17 @@ impl ExtendedQueryHandler for Session {
     {
         self.refuse_describe_if_aborted(&portal.statement.statement)?;
         if let Some(call) = branch_call(&portal.statement.statement) {
-            let fields = branch_call_fields(&call, &portal.result_column_format);
+            let fields = branch_call_fields(&call, &portal.result_column_format)
+                .map_err(PgWireError::UserError)?;
             return Ok(DescribePortalResponse::new(fields));
         }
         if is_pg_non_query(&portal.statement.statement) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
         self.describe_prepare(&portal.statement.statement)?;
-        let fields = self.described_fields(&portal.result_column_format);
+        let fields = self
+            .described_fields(&portal.result_column_format)
+            .map_err(PgWireError::UserError)?;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -2634,7 +2708,7 @@ fn result_fields(
     stmt: &turso_core::Statement,
     types: &[Option<u32>],
     format: &Format,
-) -> Vec<FieldInfo> {
+) -> SqlResult<Vec<FieldInfo>> {
     field_info(stmt, format, |i| column_type(stmt, types, i))
 }
 
@@ -2654,11 +2728,13 @@ fn field_info(
     stmt: &turso_core::Statement,
     format: &Format,
     pg_type: impl Fn(usize) -> Type,
-) -> Vec<FieldInfo> {
-    (0..stmt.num_columns())
+) -> SqlResult<Vec<FieldInfo>> {
+    let columns = stmt.num_columns();
+    (0..columns)
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
-            FieldInfo::new(name, None, None, pg_type(i), format.format_for(i))
+            let format = result_format(format, i, columns)?;
+            Ok(FieldInfo::new(name, None, None, pg_type(i), format))
         })
         .collect()
 }
@@ -2759,7 +2835,7 @@ fn execute_query(
     schema: &turso_core::schema::Schema,
     backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
-    let header = Arc::new(result_fields(stmt, types, format));
+    let header = Arc::new(result_fields(stmt, types, format).map_err(PgWireError::UserError)?);
     // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
     // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
     // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
@@ -3180,11 +3256,8 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
-                let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
-                        "invalid bytea hex parameter: {e}"
-                    ))))
-                })?;
+                let data =
+                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22P02", e)))?;
                 Ok(Value::from_blob(data))
             } else {
                 // Raw bytes as-is
@@ -3197,18 +3270,29 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
 }
 
-/// Decode a hex string into bytes.
+/// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
+/// digits, whitespace skipped between pairs, its messages on bad input (22P02 at the caller). Read
+/// by character, never sliced: `&hex[i..i + 2]` cut a multi-byte character and panicked, and under
+/// the release build's panic=abort one client's Bind ended every session (wire review 9 item 5).
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
-        return Err("odd-length hex string".to_owned());
+    let digit = |c: char| {
+        c.to_digit(16)
+            .ok_or_else(|| format!("invalid hexadecimal digit: \"{c}\""))
+    };
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars();
+    while let Some(c) = chars.next() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            continue;
+        }
+        let high = digit(c)?;
+        let low = match chars.next() {
+            Some(d) => digit(d)?,
+            None => return Err("invalid hexadecimal data: odd number of digits".to_owned()),
+        };
+        out.push((high * 16 + low) as u8);
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex at position {i}: {e}"))
-        })
-        .collect()
+    Ok(out)
 }
 
 fn encode_value(
@@ -3716,6 +3800,31 @@ mod tests {
         assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
         assert!(decode_hex("0").is_err()); // odd length
         assert!(decode_hex("GG").is_err()); // invalid hex
+    }
+
+    /// A bytea parameter's hex is read byte by byte: a multi-byte character among the digits is
+    /// an invalid digit (22P02, as PostgreSQL's byteain answers), never a slice inside it.
+    /// `&hex[i..i + 2]` sliced a &str inside `é` and panicked, and under the release build's
+    /// panic=abort one client's Bind ended every session (wire review 9 item 5).
+    #[test]
+    fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
+        for text in [
+            "\\x0\u{e9}0",
+            "\\x\u{e9}",
+            "\\x0\u{1F600}0",
+            "\\xGG",
+            "\\x0",
+        ] {
+            let e = match pg_bytes_to_value(text.as_bytes(), &Type::BYTEA) {
+                Err(PgWireError::UserError(info)) => info,
+                other => panic!("{text:?}: {other:?}"),
+            };
+            assert_eq!(e.code, "22P02", "{text:?}: {e:?}");
+        }
+        assert_eq!(
+            pg_bytes_to_value(b"\\x00Ff", &Type::BYTEA).ok(),
+            Some(Value::from_blob(vec![0x00, 0xff]))
+        );
     }
 
     #[test]

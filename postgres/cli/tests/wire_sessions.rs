@@ -3440,6 +3440,74 @@ fn a_parameter_number_past_the_limit_is_refused() {
     }
 }
 
+/// A `$n` sent over the simple protocol names no parameter (nothing binds one there): 42P02 "there
+/// is no parameter $1", before the statement runs, as PostgreSQL answers. It ran with the parameter
+/// unbound, which the engine reads as NULL: `UPDATE t SET v = $1` set every row's v to NULL,
+/// `DELETE ... WHERE id = $1` answered DELETE 0, and a branch call answered 08P01 (wire review 9
+/// item 3).
+#[test]
+fn a_parameter_over_the_simple_protocol_is_refused() {
+    let dir = Scratch::new("simpleparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "UPDATE t SET v = $1",
+        "DELETE FROM t WHERE id = $1",
+        "INSERT INTO t VALUES (2, $1)",
+        "SELECT v FROM t WHERE id = $1",
+        "SELECT turso_branch_create($1)",
+    ] {
+        let r = a.q(sql);
+        let e = r.err(sql);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("42P02", "there is no parameter $1"),
+            "{sql}"
+        );
+        assert_eq!(
+            a.q("SELECT id, v FROM t ORDER BY id").ok(sql).rows,
+            vec![vec![Some("1".to_string()), Some("trunk".to_string())]],
+            "{sql}: nothing changed"
+        );
+    }
+    // The same statement in a multi-statement query fails it there, and the statements before it
+    // are rolled back with the implicit block.
+    let r = a.q("INSERT INTO t VALUES (3, 'x'); UPDATE t SET v = $1");
+    assert_eq!(r.err("in a multi-statement query").code, "42P02");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t")
+            .single("the block rolled back"),
+        "1"
+    );
+}
+
+/// A branch call's `$n` past the limit is refused with 42P02 too, at Describe and over the simple
+/// protocol, and the server serves on. Branch calls never reached the prepare-time limit: Describe
+/// sized its parameter list by the number, so `$18446744073709551615` panicked on capacity overflow
+/// and `$2147483647` asked for about 32 GiB, and under the release build's panic=abort one client
+/// ended every session (wire review 9 item 1). The 20-digit case comes first, so at the base the
+/// test fails on its panic before it asks for the 32 GiB.
+#[test]
+fn a_branch_call_parameter_past_the_limit_is_refused() {
+    let dir = Scratch::new("branchparamlimit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "SELECT turso_branch_create($18446744073709551615)",
+        "SELECT turso_branch_create($65536)",
+        "SELECT turso_branch_switch($2147483647)",
+        "SELECT turso_branch_create($99999999999999999999999)",
+    ] {
+        let r = a.describe_statement(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}, extended");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}");
+        let mut b = server.connect();
+        assert_eq!(b.q("SELECT 1").single("a second session is served"), "1");
+    }
+}
+
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
 /// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
 /// described and is bound, as in PostgreSQL. They were read from the engine's slots, so
@@ -3552,6 +3620,246 @@ fn bind_reads_each_parameter_in_its_format() {
     let r = a.read_reply();
     assert_eq!(r.err("three format codes for two parameters").code, "08P01");
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+}
+
+/// A bytea parameter in text format whose hex holds a non-ASCII character is 22P02, and the server
+/// serves on: the hex was sliced as a &str, inside the character, which panicked the session (and
+/// under the release build's panic=abort every session) from one Bind that declares OID 17 (wire
+/// review 9 item 5).
+#[test]
+fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
+    const BYTEA: u32 = 17;
+    let dir = Scratch::new("byteahex");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE ty(y BYTEA)").ok("ty");
+    for bytes in [&b"\\x0\xc3\xa90"[..], "\\x0\u{1F600}0".as_bytes()] {
+        let r = a.xt("INSERT INTO ty(y) VALUES ($1)", &[(BYTEA, 0, bytes)]);
+        assert_eq!(r.err("a non-ASCII hex digit").code, "22P02", "{bytes:?}");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+        let mut b = server.connect();
+        assert_eq!(b.q("SELECT 1").single("a second session"), "1");
+    }
+    a.xt("INSERT INTO ty(y) VALUES ($1)", &[(BYTEA, 0, b"\\x00ff")])
+        .ok("valid hex");
+    assert_eq!(a.q("SELECT count(*) FROM ty").single("one row"), "1");
+}
+
+/// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
+/// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
+/// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
+/// as its body. A parameter length below -1 is the same refusal (only -1 is NULL). A frame whose
+/// length cannot hold itself (below 4) ends the session. pgwire decoded a message's body from the
+/// whole read buffer with unchecked reads: a 6-byte Bind panicked the session (and under the
+/// release build's panic=abort, the server, before any login), a length past the frame read the
+/// messages pipelined behind it as parameter bytes, and every negative length read as NULL (wire
+/// review 10 item 2).
+#[test]
+fn a_message_body_shorter_than_it_says_is_refused_in_step() {
+    let dir = Scratch::new("shortbody");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    let parse = |sql: &str| -> Vec<u8> {
+        let mut p = vec![0u8];
+        p.extend_from_slice(sql.as_bytes());
+        p.extend_from_slice(&[0, 0, 0]);
+        frame(b'P', &p)
+    };
+    // A Bind of one parameter, its length field as given and `bytes` after it, then no result
+    // formats.
+    let bind_one = |len: i32, bytes: &[u8]| -> Vec<u8> {
+        let mut b = vec![0u8, 0u8];
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&1i16.to_be_bytes());
+        b.extend_from_slice(&len.to_be_bytes());
+        b.extend_from_slice(bytes);
+        b.extend_from_slice(&0i16.to_be_bytes());
+        frame(b'B', &b)
+    };
+    let execute = frame(b'E', &[0, 0, 0, 0, 0]);
+    let sync = frame(b'S', &[]);
+    let rounds: Vec<(&str, Vec<u8>)> = vec![
+        // Portal and statement names, then nothing: the format count is missing.
+        (
+            "a 6-byte Bind",
+            [parse("SELECT 1"), frame(b'B', &[0, 0]), sync.clone()].concat(),
+        ),
+        (
+            "a Parse with no parameter count",
+            [frame(b'P', b"\0SELECT 1\0"), sync.clone()].concat(),
+        ),
+        (
+            "a parameter length of -2",
+            [
+                parse("SELECT $1::text"),
+                bind_one(-2, b""),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+        (
+            "a parameter length past its frame",
+            [
+                parse("SELECT $1::text"),
+                bind_one(8, b"x"),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+        (
+            "a parameter length past everything sent",
+            [
+                parse("SELECT $1::text"),
+                bind_one(1000, b"x"),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+    ];
+    for (what, bytes) in rounds {
+        a.s.write_all(&bytes).unwrap();
+        let r = a.read_reply();
+        let e = r.err(what);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("08P01", "insufficient data left in message"),
+            "{what}"
+        );
+        assert_eq!(r.status, b'I', "{what}: the session is idle after Sync");
+        assert_eq!(
+            a.q("SELECT 1").single(what),
+            "1",
+            "{what}: the session answers"
+        );
+        let mut b = server.connect();
+        assert_eq!(
+            b.q("SELECT 1").single(what),
+            "1",
+            "{what}: a second session"
+        );
+    }
+    // A frame length of 2 cannot hold itself: the session ends, and the server serves on.
+    let mut c = server.connect();
+    c.s.write_all(&[b'S', 0, 0, 0, 2]).unwrap();
+    let r = c.read_reply();
+    assert_eq!(
+        r.status, 0,
+        "a frame length below 4 ends the session: {r:?}"
+    );
+    assert_eq!(a.q("SELECT 1").single("after the bad frame"), "1");
+    let mut b = server.connect();
+    assert_eq!(b.q("SELECT 1").single("after the bad frame"), "1");
+}
+
+/// A Bind whose result-format list is neither empty, one code, nor one code per result column is a
+/// protocol violation (08P01, PostgreSQL's "bind message has N result formats but query has M
+/// columns"), at Describe of the portal and at Execute, and the session and a second connection are
+/// served; the same for a parameter-format list that is neither 0, 1 nor one per parameter. pgwire
+/// reads the result list unchecked (`fv[idx]`), so two codes for three columns indexed past it and
+/// panicked the session, and under the release build's panic=abort ended every session (wire
+/// review 9 item 2). A statement that returns no rows ignores the result list, as PostgreSQL does.
+#[test]
+fn a_bind_format_list_of_the_wrong_length_is_a_protocol_violation() {
+    let dir = Scratch::new("bindformats");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (no declared types), Bind with the given parameter codes, values and result codes,
+    // optionally Describe the portal, Execute, Sync.
+    fn round(
+        w: &mut Wire,
+        sql: &str,
+        pcodes: &[i16],
+        values: &[&[u8]],
+        rcodes: &[i16],
+        describe: bool,
+    ) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        w.send(b'B', &bind);
+        if describe {
+            w.send(b'D', b"P\0");
+        }
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    for describe in [true, false] {
+        for (sql, rcodes) in [
+            ("SELECT 1, 2, 3", &[0i16, 0][..]),
+            ("SELECT 1, 2, 3", &[0, 0, 0, 0][..]),
+            ("SELECT turso_branch_stats()", &[0, 1][..]),
+            ("SELECT turso_branch_current()", &[0, 0][..]),
+        ] {
+            let what = format!(
+                "{sql} with {} result formats, describe {describe}",
+                rcodes.len()
+            );
+            let r = round(&mut a, sql, &[], &[], rcodes, describe);
+            assert_eq!(r.err(&what).code, "08P01", "{what}");
+            assert_eq!(r.status, b'I', "{what}");
+            assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+            let mut b = server.connect();
+            assert_eq!(b.q("SELECT 1").single("a second session is served"), "1");
+        }
+    }
+    // Two parameter codes for three parameters.
+    let r = round(
+        &mut a,
+        "SELECT $1::int4 + $2::int4 + $3::int4",
+        &[0, 0],
+        &[b"1", b"2", b"3"],
+        &[],
+        false,
+    );
+    assert_eq!(
+        r.err("two parameter formats, three parameters").code,
+        "08P01"
+    );
+    assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    // One code per column, and a write with no rows, which ignores the list.
+    let r = round(&mut a, "SELECT 1, 2, 3", &[], &[], &[0, 0, 0], true);
+    assert_eq!(
+        r.ok("three formats, three columns").rows,
+        vec![vec![Some("1".into()), Some("2".into()), Some("3".into())]]
+    );
+    round(
+        &mut a,
+        "INSERT INTO t VALUES (7, 'x')",
+        &[],
+        &[],
+        &[0, 0],
+        false,
+    )
+    .ok("no rows, two formats");
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 7").single("the write ran"),
+        "x"
+    );
 }
 
 /// `col = ANY($1)` and `col <> ALL($1)` give an undeclared $1 the ARRAY of the column's type, as

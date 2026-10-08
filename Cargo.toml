@@ -53,7 +53,7 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo"]
+exclude = ["perf/latency/limbo", "postgres/vendor/pgwire"]
 
 default-members = [
     "bindings/java",
@@ -173,6 +173,10 @@ windows-sys = "0.61.2"
 # Multi threading testing
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
+
+# pgwire 0.36.3, vendored for its frontend-message decoders: postgres/vendor/pgwire/VENDORED.md.
+[patch.crates-io]
+pgwire = { path = "postgres/vendor/pgwire" }
 
 [profile.dev.package.similar]
 opt-level = 3
