@@ -563,18 +563,23 @@ impl Group {
     }
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
-    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. The log's
-    /// last flight is now this one, which has no confirmation (barriered, not synced), so the
-    /// earlier flight's queued word is dropped: it could never match (engine review 8 #9). Mutant
-    /// `ordered_keeps_confirm` (test builds only): kept, as before.
+    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. A flight
+    /// that carried frames is now the log's last flight, which has no confirmation (barriered, not
+    /// synced), so the earlier flight's queued word is dropped: it can never match the LAST flight
+    /// (engine review 8 #9; mutant `ordered_keeps_confirm`, test builds only: kept, as before). An
+    /// upgrade that carried none ends where the landed bytes end, so the last flight is unchanged
+    /// and its word is kept (engine review 12 MED 1; mutant `ordered_upgrade_drops_confirm`).
     fn land_ordered(&self, end: u64, ok: bool) {
         let mut g = self.lock();
         g.flushing = false;
         let mut stale = None;
         if ok && self.accepts() {
+            // Flights are exclusive (`flushing`), so every byte below the Off mark is in a landed
+            // flight: this one carried frames exactly when it ends past it.
+            let carried = end > g.durable[0] || fe_mutant("ordered_upgrade_drops_confirm");
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
-            if !fe_mutant("ordered_keeps_confirm") {
+            if carried && !fe_mutant("ordered_keeps_confirm") {
                 stale = g.confirm.take();
             }
         } else {
