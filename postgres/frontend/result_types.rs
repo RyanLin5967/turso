@@ -447,11 +447,39 @@ impl Infer<'_> {
         scope: &Scope,
     ) -> usize {
         let depth = self.ctes.len();
+        let recursive = with.is_some_and(|w| w.recursive);
         for cte in with.map_or(&[][..], |w| w.ctes.as_slice()) {
             let Some(Node::CommonTableExpr(c)) = cte.node.as_ref() else {
                 continue;
             };
             let columns = match c.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+                // WITH RECURSIVE: the set operation's left arm, the non-recursive term, types the
+                // CTE's columns, as PostgreSQL types them; the CTE is in scope for the right arm,
+                // which references it, and for the set operation's LIMIT and OFFSET. Walked whole
+                // before it was in scope, the self-reference was untyped, its $n bound as text,
+                // and `x < $1` never ended the recursion (wire review 11 item 2).
+                Some(Node::SelectStmt(s)) if recursive => {
+                    match (s.larg.as_deref(), s.rarg.as_deref()) {
+                        (Some(l), Some(r)) => {
+                            let columns = self.select(l, scope);
+                            self.ctes.push((
+                                c.ctename.clone(),
+                                rename(columns.clone(), &c.aliascolnames),
+                            ));
+                            self.select(r, scope);
+                            for limit in [s.limit_count.as_deref(), s.limit_offset.as_deref()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                self.set(limit, Some(INT8));
+                                self.expr(limit, scope);
+                            }
+                            self.ctes.pop();
+                            columns
+                        }
+                        _ => self.select(s, scope),
+                    }
+                }
                 Some(Node::SelectStmt(s)) => self.select(s, scope),
                 _ => Vec::new(),
             };
