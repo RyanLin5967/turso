@@ -3645,6 +3645,154 @@ fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
     assert_eq!(a.q("SELECT count(*) FROM ty").single("one row"), "1");
 }
 
+/// A Bind PostgreSQL refuses is refused AT the Bind, before BindComplete, so the Execute after it
+/// runs nothing: a format code other than 0 or 1 (22023 "unsupported format code: 2", even for a
+/// NULL value, and among the result codes), a parameter-format list that is neither 0, 1 nor one
+/// per parameter (08P01), and, for a branch call, a parameter count other than the call's (08P01).
+/// These were checked at Execute, or for a branch call not at all: `SELECT turso_branch_create($1)`
+/// bound with three format codes, with two values or with code 2 created the branch durably and
+/// acknowledged it (wire review 10 item 5).
+#[test]
+fn a_bind_postgresql_refuses_is_refused_before_bind_complete() {
+    let dir = Scratch::new("bindchecks");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse, Bind (the given parameter codes, values and result codes), Execute, Sync; then every
+    // message type byte up to ReadyForQuery and the first error.
+    fn round(
+        w: &mut Wire,
+        sql: &str,
+        pcodes: &[i16],
+        values: &[Option<&[u8]>],
+        rcodes: &[i16],
+    ) -> (Vec<u8>, Option<WireError>) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            match v {
+                Some(v) => {
+                    bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(v);
+                }
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        let (mut tags, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            tags.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (tags, error);
+            }
+        }
+    }
+    let create = "SELECT turso_branch_create($1)";
+    let cases: Vec<(&str, &str, Vec<i16>, Vec<Option<&[u8]>>, Vec<i16>, &str)> = vec![
+        (
+            "three codes, one parameter",
+            create,
+            vec![0, 0, 0],
+            vec![Some(&b"b1"[..])],
+            vec![],
+            "08P01",
+        ),
+        (
+            "two values for one parameter",
+            create,
+            vec![],
+            vec![Some(&b"b1"[..]), Some(&b"b2"[..])],
+            vec![],
+            "08P01",
+        ),
+        (
+            "parameter code 2",
+            create,
+            vec![2],
+            vec![Some(&b"b1"[..])],
+            vec![],
+            "22023",
+        ),
+        (
+            "parameter code 2, NULL",
+            create,
+            vec![2],
+            vec![None],
+            vec![],
+            "22023",
+        ),
+        (
+            "result code 2",
+            create,
+            vec![],
+            vec![Some(&b"b1"[..])],
+            vec![2],
+            "22023",
+        ),
+        (
+            "result code -1",
+            "SELECT 1",
+            vec![],
+            vec![],
+            vec![-1],
+            "22023",
+        ),
+        (
+            "engine: three codes, two values",
+            "SELECT $1::int4 + $2::int4",
+            vec![0, 0, 0],
+            vec![Some(&b"1"[..]), Some(&b"2"[..])],
+            vec![],
+            "08P01",
+        ),
+    ];
+    for (what, sql, pcodes, values, rcodes, code) in cases {
+        let (tags, error) = round(&mut a, sql, &pcodes, &values, &rcodes);
+        let e = error.unwrap_or_else(|| panic!("{what}: no error, messages {tags:?}"));
+        assert_eq!(e.code, code, "{what}: {e:?}");
+        if code == "22023" {
+            assert!(
+                e.message.starts_with("unsupported format code: "),
+                "{what}: {e:?}"
+            );
+        }
+        assert!(
+            !tags.contains(&b'2'),
+            "{what}: BindComplete was sent: {tags:?}"
+        );
+        assert_eq!(
+            a.q("SELECT 1").single(what),
+            "1",
+            "{what}: the session answers"
+        );
+    }
+    for name in ["b1", "b2"] {
+        let r = a.q(&format!("SELECT turso_branch_switch('{name}')"));
+        assert_eq!(r.err(name).code, "3D000", "branch {name} must not exist");
+    }
+}
+
 /// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
 /// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
 /// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
