@@ -131,7 +131,12 @@ jobs:
       - name: Refusal fixtures
         run: |
           # a fixture that fails is recorded and its plant then fails in check.py; the fire-check still runs
-          rc=0; V3_NEST_DIR="$MNT" bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?
+          # the nest fixture starts on the filesystem that holds the cell's leaf: the cell's mount for a block cell,
+          # the directory of the cell's loop backing file for a loop cell (seventh review M3; run 37808860197)
+          src=$(findmnt -n -o SOURCE "$MNT")
+          case $src in /dev/loop*) NEST=$(dirname "$(losetup -n -O BACK-FILE "$src" | xargs)") ;; *) NEST=$MNT ;; esac
+          echo "nest dir: $NEST (cell source $src)"
+          rc=0; V3_NEST_DIR="$NEST" bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?
           echo "mkfixtures rc=$rc" >> "$RAW/fixtures.txt"
           cat "$RAW/fixtures.txt"
       - name: Hardware record (fio on the cell)

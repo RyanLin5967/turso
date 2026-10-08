@@ -449,11 +449,12 @@ def report(out, device=None, windows=None, pid=None):
         d["comms"][e[5]] = d["comms"].get(e[5], 0) + 1
     rep = {"tool": "blkflush.py", "proves": PROVES, "instance": s.get("instance"), "filter": s.get("filter"),
            "trace_clock": "mono_raw", "window_s": (hi - lo) / 1e9, "events": len(events), "device_filter": device,
-           "devices": dev, "syscalls": rep_sys}
+           "devices": dev}
     rep_sys = {"traced": s.get("syscall_events") or [], "events": len(sysev),
                "by_pid": {}}
     for e in sysev:
         rep_sys["by_pid"][str(e[6])] = rep_sys["by_pid"].get(str(e[6]), 0) + 1
+    rep["syscalls"] = rep_sys
     if windows:
         w = read_windows(windows)
         if pid is not None and s.get("syscall_events"):
@@ -586,6 +587,37 @@ def self_test():
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
+    import shutil, tempfile
+    rd_ = tempfile.mkdtemp(prefix="blkflush-selftest-")
+    try:
+        rec = os.path.join(rd_, "rec")
+        os.makedirs(rec)
+        allines = lines + [sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.002020")]
+        with open(os.path.join(rec, "start.json"), "w") as f:
+            json.dump({"devices": devs, "start_mono_raw_ns": 0, "syscall_events": ["sys_enter_fsync", "sys_enter_fdatasync"],
+                       "instance": "planted", "filter": FILTER}, f)
+        with open(os.path.join(rec, "stop.json"), "w") as f:
+            json.dump({"stop_mono_raw_ns": 10 ** 9}, f)
+        with open(os.path.join(rec, "stats.json"), "w") as f:
+            json.dump({"cpu0": {"overrun": 0, "commit overrun": 0, "dropped events": 0}}, f)
+        with gzip.open(os.path.join(rec, "trace.txt.gz"), "wt") as f:
+            f.write(HDR % (len(allines), len(allines)) + "\n".join(allines) + "\n")
+        wt = os.path.join(rd_, "raw.tsv")
+        with open(wt, "w") as f:
+            f.write("arm\ti\tns\tt0_ns\n")
+            for t0, t1, a, i in windows:
+                f.write("%s\t%d\t%d\t%d\n" % (a, i, t1 - t0, t0))
+        r = report(rec, None, wt, 99)
+        sa = (r.get("syscalls") or {}).get("arms") or {}
+        chk("report() end to end on a planted record: per-arm syncs by pid 99 (append25 synced in both windows), the "
+            "block events by device, and the syscalls record", sa.get("append25", {}).get("windows_without_a_sync") == 0
+            and sa.get("append25", {}).get("syncs") == 2 and r["syscalls"]["pid"] == 99
+            and r["windows"]["arms"]["append25"]["devices"]["loop0"]["events"] == 3, r.get("syscalls"))
+        r2 = report(rec, None, wt, None)
+        chk("report() without --pid: the syscalls record has no per-arm sync count (post then refuses)",
+            "arms" not in r2["syscalls"] and r2["syscalls"]["events"] == 2, r2.get("syscalls"))
+    finally:
+        shutil.rmtree(rd_)
     tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "blkflush-selftest-%d.tsv" % os.getpid())
     with open(tmp, "w") as f:
         f.write("arm\ti\tns\tt0_ns\nappend25\t0\t100\t1000\nnosync25\t0\t100\t1050\n")

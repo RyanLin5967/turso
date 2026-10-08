@@ -60,6 +60,8 @@ def main(a):
     if plant in ("wtflush", "wtmismatch"):  # the batch made write-through first, so the verdict mirrors that class
         for k in ("write_cache", "drive_reports"):
             sj.setdefault("leaf", {})[k] = "write through"
+        if sj["leaf"].get("kind") == "brd":  # a brd cell's batch made a write-through drive (run 37808860197)
+            sj["leaf"].update(kind="drive", driver="sd", creditable=True)
         sj["leaf_write_cache"] = "write through"
         (sj.get("flush_path") or [{}])[-1]["write_cache"] = "write through"
         lc = "wt"

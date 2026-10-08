@@ -13,7 +13,8 @@
 #         file is made at the path sysfs now shows for L2's backing                     R_lazy (10, 12)
 #   del   an ext4 loop whose backing file was deleted                                    R_deleted (12a)
 #   n3/n4 3 and 4 nested loops (ext4 in ext4 ...): 4 layers accepted, 5 refused          P_nest3, R_nest4 (12b)
-#         (the first image on V3_NEST_DIR, a dir on the cell's filesystem, when set; else on /)
+#         (the first image on V3_NEST_DIR when set: a dir on the filesystem that holds the cell's leaf, i.e. the
+#         cell's mount for a block cell, the directory of its loop backing file for a loop cell; else on /)
 #   ds    an ext4 loop mounted -o dirsync (an option outside the allowlist)              R_dirsync (15)
 #   ld    XFS with an external log (-l logdev=, mounted -o logdev=)                      R_logdev (15)
 #   ej    ext4 with an external journal (mkfs -J device=)                                R_extjournal (15)

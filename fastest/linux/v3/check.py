@@ -438,9 +438,11 @@ def counted_set(stage, s, mutant):
         if rc is None or c is None or sj is None or rows is None:
             probs.append(("missing output", n, rc, c is None, sj is None, rows is None, txt[-200:]))
             continue
-        any_gated = any(a in GATED for a in ran(arms, KIND))
-        if rc not in ((0, 3) if any_gated else (0,)):
-            probs.append(("rc", n, rc))
+        # rc 3 exactly when the summary records a void: the timing control (append25) or the D0 control, which strace's
+        # slowdown can trip on nosync25 (run 37808860197); anything else is 0
+        void = str(sj.get("timing_control", "")).startswith("FAIL") or str(sj.get("d0_control", "")).startswith("FAIL")
+        if rc != (3 if void else 0):
+            probs.append(("rc", n, rc, sj.get("timing_control"), sj.get("d0_control")))
         want_ref = sorted(a for a in arms if a not in ran(arms, KIND))
         if sorted(sj.get("refused_arms", {})) != want_ref:
             probs.append(("refused_arms", n, sorted(sj.get("refused_arms", {})), want_ref))
