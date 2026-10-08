@@ -4925,6 +4925,47 @@ fn a_transaction_verb_is_read_by_its_whole_grammar() {
     assert_eq!(r.status, b'I');
 }
 
+/// COMMIT AND CHAIN and ROLLBACK AND CHAIN outside a block are 25P01 ("... can only be used in
+/// transaction blocks"), as PostgreSQL refuses them; inside one the chain is not supported (0A000),
+/// which fails the block, and its writes are not committed. BEGIN READ ONLY is not supported either
+/// (0A000): the engine has no read-only transaction. COMMIT AND CHAIN committed and left the session
+/// idle, so a later ROLLBACK undid nothing and writes the client meant to discard stayed committed,
+/// and BEGIN READ ONLY began a block that wrote (wire review 11 item 7).
+#[test]
+fn a_chained_or_read_only_transaction_is_refused() {
+    let dir = Scratch::new("txchain");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN", "END AND CHAIN"] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "25P01", "{sql} outside a block");
+        assert_eq!(r.status, b'I', "{sql}");
+    }
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert");
+    let r = a.q("COMMIT AND CHAIN");
+    assert_eq!(r.err("COMMIT AND CHAIN in a block").code, "0A000");
+    assert_eq!(r.status, b'E', "the block failed");
+    let r = a.q("ROLLBACK").ok("end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2")
+            .single("not committed"),
+        "0"
+    );
+    for sql in [
+        "BEGIN READ ONLY",
+        "START TRANSACTION READ ONLY",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "0A000", "{sql}");
+        assert_eq!(r.status, b'I', "{sql}: no block begun");
+    }
+    a.q("BEGIN READ WRITE").ok("read write");
+    a.q("COMMIT").ok("end");
+}
+
 /// A transaction verb with a comment before, inside or after it is that verb (PostgreSQL's lexer
 /// reads a comment as whitespace): `ROLLBACK -- why` ends a failed block, `/* c */ BEGIN` in a
 /// block is BEGIN's warning (25001 "there is already a transaction in progress") with the block
