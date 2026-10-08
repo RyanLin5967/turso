@@ -929,3 +929,119 @@ fn a_branch_transaction_that_really_overflows_the_page_cache_commits_intact() {
     assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
     assert_eq!(table(&db.connect().unwrap()).len(), 50, "the branch's transaction reached the trunk");
 }
+
+/// The branch store's shared trunk-page cache, through SQL. A second branch reading the pages a
+/// first one read is served from the cache — no page read from the file. Then the trunk's last
+/// child goes and the trunk rewrites a row with no branch alive, a write the branch store never
+/// sees; a branch forked after that must read the NEW row, not the version cached before.
+#[test]
+fn a_trunk_write_with_no_branch_alive_is_never_served_from_the_trunk_page_cache() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let a = trunk.fork_branch().unwrap();
+    let conn = a.connect().unwrap();
+    assert_eq!(value(&conn, 7).as_deref(), Some(original(7).as_str()));
+    drop(conn);
+
+    let before = db.branch_stats().unwrap().work;
+    let b = trunk.fork_branch().unwrap();
+    let conn = b.connect().unwrap();
+    assert_eq!(value(&conn, 7).as_deref(), Some(original(7).as_str()));
+    drop(conn);
+    let after = db.branch_stats().unwrap().work;
+    assert!(
+        after.trunk_page_hits > before.trunk_page_hits,
+        "a second branch reading the first one's trunk pages was never served from the cache"
+    );
+    assert_eq!(
+        after.trunk_page_misses, before.trunk_page_misses,
+        "a trunk page the first branch had read was read from the file again"
+    );
+
+    drop(a);
+    drop(b);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
+    set(&trunk, 7, "rewritten-while-no-branch-was-alive");
+    let c = trunk.fork_branch().unwrap();
+    let conn = c.connect().unwrap();
+    assert_eq!(
+        value(&conn, 7).as_deref(),
+        Some("rewritten-while-no-branch-was-alive"),
+        "a branch was served a trunk page cached before the trunk rewrote it with no branch alive"
+    );
+}
+
+/// F6's snapshot argument under real threads (PREREG amendment 8a). One thread owns the trunk: it
+/// rewrites rows and forks branches in an order it records, so every branch's expected table is
+/// known — each trunk write committed before its fork, none after. Four reader threads take the
+/// branches as they are forked and read them on their own connections while the trunk keeps
+/// writing, so a reader resolves pages the trunk is rewriting at that moment: a page rewritten
+/// after the fork must come from the retained copy, one not rewritten from the shared cache or the
+/// file, and a version cached by one reader must never reach a branch that forked after the trunk
+/// rewrote it. Readers drop their branches as they finish, so the trunk also passes through moments
+/// with no live child and writes then without a copy decision.
+#[test]
+fn branches_read_their_fork_while_the_trunk_writes_concurrently() {
+    use std::sync::mpsc;
+    const ROWS: i64 = 400;
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, ROWS);
+    let (tx, rx) = mpsc::sync_channel::<(Branch, BTreeMap<i64, String>)>(8);
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                let mut branches = 0usize;
+                loop {
+                    let next = rx.lock().unwrap().recv();
+                    let Ok((branch, expected)) = next else {
+                        return branches;
+                    };
+                    let conn = branch.connect().unwrap();
+                    for id in (1..=ROWS).step_by(7) {
+                        assert_eq!(
+                            value(&conn, id).as_deref(),
+                            Some(expected[&id].as_str()),
+                            "branch {} row {id}",
+                            branch.id().0
+                        );
+                    }
+                    drop(conn);
+                    // A second connection: every page resolved again, now with the cache warm and
+                    // the trunk further on.
+                    let conn = branch.connect().unwrap();
+                    assert_eq!(table(&conn), expected, "branch {}", branch.id().0);
+                    drop(conn);
+                    branches += 1;
+                }
+            })
+        })
+        .collect();
+    let mut current: BTreeMap<i64, String> = (1..=ROWS).map(|id| (id, original(id))).collect();
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    for step in 0..300 {
+        for _ in 0..3 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let id = (rng % ROWS as u64) as i64 + 1;
+            let v = format!("step{step:04}-row{id:04}");
+            set(&trunk, id, &v);
+            current.insert(id, v);
+        }
+        let branch = trunk.fork_branch().unwrap();
+        tx.send((branch, current.clone())).unwrap();
+    }
+    drop(tx);
+    let read: usize = readers.into_iter().map(|r| r.join().unwrap()).sum();
+    assert_eq!(read, 300, "every forked branch must have been read");
+    let work = db.branch_stats().unwrap().work;
+    assert!(
+        work.trunk_page_hits > 0 && work.trunk_page_misses > 0,
+        "the cache was not exercised both ways: {work:?}"
+    );
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0, "branches leaked");
+}

@@ -166,10 +166,46 @@
 //! understated interval can ever exist, and every retention the lower bound later triggers covers
 //! only children that see the trunk's current version, which is exactly what it copies.
 //!
+//! # Trunk pages without the file — a shared, versioned page cache (F6, turso `9f6b50daf`)
+//!
+//! A page no branch in a chain wrote is the trunk's, and the pager reads it through the WAL or the
+//! database file. Every branch connection starts with an empty page cache, so under many short
+//! connections every one of those reads is a read system call on the one file every thread shares,
+//! and on the volatile lane's box the kernel serialised them (branch_curve PREREG amendments 7 and
+//! 8). The store therefore keeps the trunk's pages as branches have read them, shared by every
+//! branch, keyed by page and by the trunk epoch of the page's last COMMIT — the shared buffer pool
+//! of every server database, with the version in the key as in a buffer tag with its LSN.
+//!
+//! A cached version is immutable. A branch reads the trunk's current version of a page only when
+//! the trunk's last commit of it came in an epoch at or before the branch's `trunk_at` (`resolve`
+//! refuses otherwise). `written` holds the epoch of each page's last commit, stamped at the
+//! commit's serialization point (`begin_trunk_commit`, F-L), so a commit after the fork at
+//! `trunk_at` stamps its pages with a later epoch before it publishes them, and no trunk write can
+//! change the version the key names (r11-forklock 573642f19 keyed F6 by the commit epoch the same
+//! way). The one gap is a trunk with no live child: it writes without telling the store (its pages
+//! carry no pre-image, see `decide_trunk_pages`), so `written` can name an epoch whose page has
+//! since changed. The trunk's last child going therefore bumps the cache's generation
+//! (`sync_trunk_children`), and a version cached under an older generation is never served. A
+//! recovered `written` (see "Durability") can only under-state an epoch, and the cache starts empty
+//! at every open, so no two versions are ever cached under one key. The cache is filled by the
+//! pager after it reads a page for a branch ([`BranchStore::fill_trunk_page`]), under the key
+//! [`BranchStore::resolve_page_into`] gave; the Merger's reads ([`BranchStore::resolve_into`])
+//! neither consult nor fill it.
+//!
+//! The trunk's page format is recorded at a fork (`note_trunk_format`), so a branch connection is
+//! built without reading the trunk's header (`Database::_init_branch`). Unlike the volatile store
+//! F6 was written for, this store may restart at another page size once no branch exists
+//! (`ensure_backing`), and a durable store reopens with branches no fork of this process recorded:
+//! so the format is re-recorded by the first fork after the store had no branch, and a branch
+//! connection with none recorded reads the header as before and records it.
+//!
 //! # What this does not do
 //!
 //! * One `Mutex` guards every branch, held across the durable store's fsyncs. Correct, and a named
 //!   wall under concurrent writers; the benchmark this lane ships is single-threaded and says so.
+//!   Every acquisition goes through [`StoreMutex::lock`], which counts it (see [`BranchWork`]'s
+//!   `lock_*` counters; F6's amendment-7 instrument, turso `323dbfd79`), so the wall can be read
+//!   from integers rather than inferred from a latency curve.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it, so dropping a map never frees
 //!   a page and keeping one never pins a page.
@@ -227,8 +263,9 @@ use super::{
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, OnceLock};
 use crate::{LimboError, Result};
+use arc_swap::ArcSwapOption;
 
 pub(crate) struct BranchStore {
     /// Shared with a fuzzy checkpoint's thread, which takes it for its install (F-FZ).
@@ -332,6 +369,137 @@ pub(crate) struct BranchStore {
     /// rolled back) is not decided again by the retry — the page's written epoch already is the
     /// commit's own — yet the commit overwrites what it kept (review 3 #1).
     retain_floor: AtomicU64,
+    /// The trunk's pages as branches have read them (F6; see "Trunk pages without the file").
+    trunk_pages: TrunkPages,
+    /// The trunk's page size and reserved bytes per page as [`pack_format`] packs them, recorded by
+    /// a fork (`note_trunk_format`); 0 until one is. Neither can change while a branch exists (both
+    /// need VACUUM, which is refused), so a branch connection takes its page format from here
+    /// instead of reading the trunk's file header (F6).
+    trunk_format: AtomicU64,
+}
+
+/// Where the page a branch asked for comes from (F6, [`BranchStore::resolve_page_into`]).
+pub(crate) enum Resolved {
+    /// The page is in the caller's buffer: a branch version from the arena, or the trunk's version
+    /// from the shared cache.
+    Filled,
+    /// The branch sees the trunk's current version and the cache does not hold it: the caller reads
+    /// it through the WAL or the database file, and may hand it to
+    /// [`BranchStore::fill_trunk_page`] under this key.
+    Trunk(TrunkPageKey),
+}
+
+/// A version of a trunk page: the page, the trunk epoch of its last commit, and the cache
+/// generation it was resolved in (F6).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrunkPageKey {
+    page: u32,
+    epoch: u64,
+    generation: u64,
+}
+
+/// A map from page number to `T` that any thread can read without a lock: three levels of 2^10,
+/// 2^10 and 2^12 entries over the 32-bit page number, each installed once and never freed or moved
+/// until the store drops. A lookup is three acquire loads and no write, so readers share the lines
+/// they read instead of taking them from one another (F6).
+struct Radix<T> {
+    top: OnceLock<Box<[OnceLock<Box<[OnceLock<Box<[T]>>]>>]>>,
+}
+
+impl<T: Default> Radix<T> {
+    const TOP: usize = 1 << 10;
+    const MID: usize = 1 << 10;
+    const LEAF: usize = 1 << 12;
+
+    fn new() -> Self {
+        Self {
+            top: OnceLock::new(),
+        }
+    }
+
+    fn split(page: u32) -> (usize, usize, usize) {
+        let page = page as usize;
+        (page >> 22, (page >> 12) & (Self::MID - 1), page & (Self::LEAF - 1))
+    }
+
+    fn get(&self, page: u32) -> Option<&T> {
+        let (t, m, l) = Self::split(page);
+        let leaf = self.top.get()?[t].get()?[m].get()?;
+        Some(&leaf[l])
+    }
+
+    fn get_or_insert(&self, page: u32) -> &T {
+        let (t, m, l) = Self::split(page);
+        let top = self
+            .top
+            .get_or_init(|| (0..Self::TOP).map(|_| OnceLock::new()).collect());
+        let mid = top[t].get_or_init(|| (0..Self::MID).map(|_| OnceLock::new()).collect());
+        let leaf = mid[m].get_or_init(|| (0..Self::LEAF).map(|_| T::default()).collect());
+        &leaf[l]
+    }
+}
+
+/// One cached trunk page. `std::sync::Arc`, as `arc_swap` requires.
+struct CachedPage {
+    generation: u64,
+    epoch: u64,
+    bytes: Box<[u8]>,
+}
+
+struct TrunkPages {
+    /// Bumped whenever the trunk's last child goes (see "Trunk pages without the file").
+    generation: AtomicU64,
+    pages: Radix<ArcSwapOption<CachedPage>>,
+}
+
+impl TrunkPages {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            pages: Radix::new(),
+        }
+    }
+
+    /// Copy the version `key` names into `out`, if it is cached.
+    fn copy_into(&self, key: TrunkPageKey, out: &mut [u8]) -> bool {
+        let Some(slot) = self.pages.get(key.page) else {
+            return false;
+        };
+        let cached = slot.load();
+        match cached.as_deref() {
+            Some(p) if p.generation == key.generation && p.epoch == key.epoch => {
+                out.copy_from_slice(&p.bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cache `bytes` as the version `key` names, unless the generation has moved on since `key` was
+    /// resolved or a version at least as new is already cached.
+    fn fill(&self, key: TrunkPageKey, bytes: &[u8]) {
+        if key.generation != self.generation.load(Ordering::Acquire) {
+            return;
+        }
+        let new = std::sync::Arc::new(CachedPage {
+            generation: key.generation,
+            epoch: key.epoch,
+            bytes: bytes.into(),
+        });
+        self.pages.get_or_insert(key.page).rcu(|old| match old {
+            Some(p) if p.generation == key.generation && p.epoch >= key.epoch => Some(p.clone()),
+            _ => Some(new.clone()),
+        });
+    }
+}
+
+/// A trunk page format as `BranchStore::trunk_format` holds it: never 0, since no page size is.
+fn pack_format(page_size: usize, reserved: u8) -> u64 {
+    ((page_size as u64) << 8) | u64::from(reserved)
+}
+
+fn unpack_format(word: u64) -> Option<(usize, u8)> {
+    (word != 0).then(|| ((word >> 8) as usize, (word & 0xff) as u8))
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -886,43 +1054,87 @@ thread_local! {
 /// The store mutex. A thin wrapper: in test builds its guard also marks this thread as holding it,
 /// so every sync issued meanwhile is counted (`syncs_under_store_mutex`; lead review 1 item 7's
 /// instrument — a flush inside the store mutex stalls every operation behind it).
-struct StoreMutex(Mutex<StoreInner>);
+///
+/// Every acquisition is also counted into `StoreInner::work` (F6's lock accounting, branch_curve
+/// PREREG amendment 7, turso `323dbfd79`): every one, the ones that found the lock held, and how
+/// long those waited. The counts are written under the lock itself, so counting adds no shared
+/// write the lock does not already make, and the clock is read only on the contended path, by the
+/// thread that is waiting anyway — except with lock timing on (`timing`), which reads it once more
+/// at the acquisition and once at the release. Observation only.
+struct StoreMutex {
+    mutex: Mutex<StoreInner>,
+    /// Whether [`StoreMutex::lock`] times how long each acquisition holds the lock. Off by
+    /// default: it is the one part of the lock accounting that adds work inside the critical
+    /// section.
+    timing: AtomicBool,
+}
 
 impl StoreMutex {
     fn new(inner: StoreInner) -> Self {
-        Self(Mutex::new(inner))
+        Self {
+            mutex: Mutex::new(inner),
+            timing: AtomicBool::new(false),
+        }
     }
 
     fn lock(&self) -> StoreGuard<'_> {
-        let guard = self.0.lock();
+        let (mut guard, waited) = match self.mutex.try_lock() {
+            Some(guard) => (guard, None),
+            None => {
+                let start = Instant::now();
+                let guard = self.mutex.lock();
+                (guard, Some(start.elapsed()))
+            }
+        };
+        let work = &mut guard.work;
+        work.lock_acquisitions += 1;
+        if let Some(waited) = waited {
+            work.lock_contended += 1;
+            work.lock_wait_ns += waited.as_nanos() as u64;
+        }
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked();
-        StoreGuard(guard)
+        let since = self.timing.load(Ordering::Relaxed).then(Instant::now);
+        StoreGuard { guard, since }
+    }
+
+    /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
+    fn set_timing(&self, on: bool) {
+        self.timing.store(on, Ordering::Relaxed);
     }
 }
 
-struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>);
+/// The store mutex, held. Dropping it adds the time it was held to `lock_hold_ns` when lock
+/// timing was on at the acquisition (observation only).
+struct StoreGuard<'a> {
+    guard: crate::sync::MutexGuard<'a, StoreInner>,
+    since: Option<Instant>,
+}
 
 impl std::ops::Deref for StoreGuard<'_> {
     type Target = StoreInner;
     fn deref(&self) -> &StoreInner {
-        &self.0
+        &self.guard
     }
 }
 
 impl std::ops::DerefMut for StoreGuard<'_> {
     fn deref_mut(&mut self) -> &mut StoreInner {
-        &mut self.0
+        &mut self.guard
     }
 }
 
-#[cfg(test)]
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
+        if let Some(since) = self.since {
+            self.guard.work.lock_hold_ns += since.elapsed().as_nanos() as u64;
+        }
+        #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() - 1));
+        #[cfg(test)]
         super::budget_probe::store_unlocked();
     }
 }
@@ -3123,6 +3335,8 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
+            trunk_pages: TrunkPages::new(),
+            trunk_format: AtomicU64::new(0),
             fuzzy: false,
         }
     }
@@ -3385,6 +3599,8 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
+            trunk_pages: TrunkPages::new(),
+            trunk_format: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -3852,8 +4068,88 @@ impl BranchStore {
     }
 
     fn sync_trunk_children(&self, inner: &StoreInner) {
-        self.trunk_children
-            .store(inner.trunk.lineage.n_children as usize, Ordering::Release);
+        let now = inner.trunk.lineage.n_children as usize;
+        let was = self.trunk_children.swap(now, Ordering::AcqRel);
+        if was > 0 && now == 0 {
+            // F6 (9f6b50daf): from here the trunk writes without telling the store, so no cached
+            // trunk page can be trusted once a branch exists again. No branch can read in between:
+            // the next first child is forked under the trunk's WAL write lock and this mutex.
+            self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The trunk's page size and reserved bytes per page, once a fork (or a branch connection
+    /// after a reopen) has recorded them (F6).
+    pub(crate) fn trunk_page_format(&self) -> Option<(usize, u8)> {
+        unpack_format(self.trunk_format.load(Ordering::Acquire))
+    }
+
+    /// Record the trunk's page format at a trunk fork, under the store mutex (F6, as `fork_trunk`
+    /// recorded it at 9f6b50daf). While a branch exists the format cannot change, so a different one
+    /// is refused. With no branch the store may have restarted at another page size
+    /// (`ensure_backing`), and the new format replaces the old; no trunk page cached under the old
+    /// one survives (the generation moved when the last child went, and moves again here).
+    fn note_trunk_format(&self, inner: &StoreInner, page_size: usize, reserved: u8) -> Result<()> {
+        let word = pack_format(page_size, reserved);
+        let had = self.trunk_format.load(Ordering::Acquire);
+        if had == word {
+            return Ok(());
+        }
+        if let Some((size, res)) = unpack_format(had) {
+            if inner.n_states > 0 {
+                return Err(LimboError::InternalError(format!(
+                    "branches were forked from {size}-byte pages with {res} reserved bytes, but the \
+                     database now has {page_size} and {reserved}"
+                )));
+            }
+            self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.trunk_format.store(word, Ordering::Release);
+        Ok(())
+    }
+
+    /// Record the trunk's page format read from its header by a branch connection that found none
+    /// recorded (a durable store reopened with branches no fork of this process has seen; see
+    /// `Database::_init_branch`). A branch exists, so a different format already recorded is
+    /// refused as at a fork.
+    pub(crate) fn note_trunk_format_read(&self, page_size: usize, reserved: u8) -> Result<()> {
+        let word = pack_format(page_size, reserved);
+        match self
+            .trunk_format
+            .compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(()),
+            Err(had) if had == word => Ok(()),
+            Err(had) => {
+                let (size, res) = unpack_format(had).expect("a recorded format is never 0");
+                Err(LimboError::InternalError(format!(
+                    "branches were forked from {size}-byte pages with {res} reserved bytes, but the \
+                     database's header now says {page_size} and {reserved}"
+                )))
+            }
+        }
+    }
+
+    /// Cache a trunk page the pager has read for a branch, under the key
+    /// [`Self::resolve_page_into`] gave for it (F6). `bytes` must be the whole page as the WAL or
+    /// the database file held it under the reading connection's snapshot. Only a fill that raced a
+    /// format change can be of another length, and `note_trunk_format` moves the generation before
+    /// it records the new format, so such a fill is dropped (its key is of an older generation).
+    pub(crate) fn fill_trunk_page(&self, key: TrunkPageKey, bytes: &[u8]) {
+        if self.trunk_page_format().map(|f| f.0) != Some(bytes.len()) {
+            crate::turso_assert!(
+                key.generation != self.trunk_pages.generation.load(Ordering::Acquire),
+                "a trunk page to cache is not one page long"
+            );
+            return;
+        }
+        self.trunk_pages.fill(key, bytes);
+    }
+
+    /// Turn the store mutex's lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]; F6's
+    /// amendment-7 instrument).
+    pub(crate) fn set_lock_timing(&self, on: bool) {
+        self.inner.set_timing(on);
     }
 
     /// Call after anything that adds or removes a lease.
@@ -4836,10 +5132,14 @@ impl BranchStore {
     /// child captured no pre-image, so the first child is forked under the writer's lock:
     /// `NeedsWriterLock`). The check, the registration and the children count move together in one
     /// store-mutex hold.
+    ///
+    /// `reserved_space` is the trunk's reserved bytes per page: with `page_size`, the page format a
+    /// branch connection is built with (F6, `note_trunk_format`).
     pub(crate) fn fork_trunk(
         &self,
         schema: Arc<Schema>,
         page_size: usize,
+        reserved_space: u8,
         seen: Option<u64>,
         name: Option<&str>,
     ) -> Result<TrunkFork> {
@@ -4868,6 +5168,9 @@ impl BranchStore {
                 self.group.mark_durable(journal.lsn(), rewritten_class(journal));
             }
         }
+        // F6: the page format a branch connection is built with; refused if it changed while a
+        // branch exists, replaced if none does (a restart at another page size, just above).
+        self.note_trunk_format(&inner, page_size, reserved_space)?;
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
@@ -4933,7 +5236,8 @@ impl BranchStore {
     /// store's model tests, which drive the store without a pager: it always registers.
     #[cfg(test)]
     pub(crate) fn fork_trunk_locked(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        match self.fork_trunk(schema, page_size, None, None)? {
+        // No reserved bytes, as F6's own model tests forked (9f6b50daf).
+        match self.fork_trunk(schema, page_size, 0, None, None)? {
             TrunkFork::Forked { id, lsn, .. } => {
                 self.wait_durable(lsn, self.sync_class())?;
                 Ok(id)
@@ -6197,8 +6501,21 @@ impl BranchStore {
 
     /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
     /// means the branch sees the trunk's current version, which the caller reads through the
-    /// ordinary WAL / database-file path.
+    /// ordinary WAL / database-file path. The shared trunk-page cache is neither consulted nor
+    /// filled: the Merger reads the trunk through its own write transaction (`merge.rs`), and the
+    /// store's model tests ask what the arena holds.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+        Ok(matches!(self.resolve_with(id, page, out, false)?, Resolved::Filled))
+    }
+
+    /// Fill `out` with `page` as branch `id` sees it — a version in the arena, or the trunk's
+    /// version from the shared cache (F6, 9f6b50daf; the branch pager's read). Otherwise the answer
+    /// is [`Resolved::Trunk`] with the key to cache the caller's read under.
+    pub(crate) fn resolve_page_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
+        self.resolve_with(id, page, out, true)
+    }
+
+    fn resolve_with(&self, id: BranchId, page: u32, out: &mut [u8], cached: bool) -> Result<Resolved> {
         let mut inner = self.inner.lock();
         // One atomic load on the hot path: a branch can be in doubt only once the store stopped.
         if inner.fail_stop.load(Ordering::Acquire) {
@@ -6211,7 +6528,23 @@ impl BranchStore {
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
         let Some((slot, crc)) = resolved? else {
-            return Ok(false);
+            // `resolve` answered "the trunk's current version" (it refuses one committed after the
+            // branch's fork), so the trunk's last commit of this page came at or before the
+            // branch's `trunk_at`, in a closed epoch, and `written` (made known by `resolve`) names it.
+            let key = TrunkPageKey {
+                page,
+                epoch: inner.trunk.written.get(&page).copied().unwrap_or(0),
+                generation: self.trunk_pages.generation.load(Ordering::Acquire),
+            };
+            if !cached {
+                return Ok(Resolved::Trunk(key));
+            }
+            if self.trunk_pages.copy_into(key, out) {
+                inner.work.trunk_page_hits += 1;
+                return Ok(Resolved::Filled);
+            }
+            inner.work.trunk_page_misses += 1;
+            return Ok(Resolved::Trunk(key));
         };
         self.arena_reads.fetch_add(1, Ordering::Relaxed);
         let arena = inner
@@ -6227,7 +6560,7 @@ impl BranchStore {
                 id.0
             )));
         }
-        Ok(true)
+        Ok(Resolved::Filled)
     }
 
     /// Fill `out` with `page` as the trunk held it when branch `id` forked, if that version lives
@@ -10781,6 +11114,152 @@ mod sota_tree_tests {
             );
         }
         assert!(max_depth >= 10, "{mode:?} seed {seed:#x}: max depth {max_depth}");
+    }
+}
+
+/// F6's two store tests (turso `323dbfd79` and `9f6b50daf`, the volatile store's `tests` module),
+/// ported to the durable store: the store mutex's lock accounting, forced to fire and shown not to
+/// fire spuriously; and the shared trunk-page cache against a model, in every store mode as the
+/// base's other model tests run here.
+#[cfg(test)]
+mod f6_tests {
+    use super::sota_helpers::{image, open_store, Mode, Rng, MODES, PAGE};
+    use super::*;
+
+    const PAGES: u32 = 6;
+
+    /// The lock accounting, forced to fire and shown not to fire spuriously. One thread alone makes
+    /// only uncontended acquisitions, one per call, and with timing off no hold time. A holder that
+    /// keeps the lock for 500 ms while a second thread asks for it makes that acquisition contended,
+    /// with a non-zero wait, and with timing on its own hold is counted before the waiter can read
+    /// the counters. The bounds are loose on purpose: the waiter would have to be descheduled for the
+    /// whole 500 ms to miss the hold, and nothing here is timed tighter than "more than zero".
+    #[test]
+    fn lock_accounting_counts_a_forced_wait_and_nothing_else() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(open_store(Mode::Volatile, dir.path(), "db"));
+        let base = store.stats().unwrap().work;
+        for _ in 0..10 {
+            store.stats().unwrap();
+        }
+        let quiet = store.stats().unwrap().work;
+        assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11);
+        assert_eq!(
+            (quiet.lock_contended, quiet.lock_wait_ns, quiet.lock_hold_ns),
+            (0, 0, 0),
+            "one thread, timing off: nothing contended, nothing timed"
+        );
+
+        store.set_lock_timing(true);
+        let hold = std::time::Duration::from_millis(500);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let held = store.inner.lock();
+                tx.send(()).unwrap();
+                std::thread::sleep(hold);
+                drop(held);
+            })
+        };
+        rx.recv().unwrap();
+        let forced = store.stats().unwrap().work;
+        holder.join().unwrap();
+        assert_eq!(forced.lock_contended, 1, "the waiting acquisition was not counted");
+        assert!(forced.lock_wait_ns > 0, "a contended acquisition waited 0 ns");
+        assert!(
+            forced.lock_hold_ns >= hold.as_nanos() as u64,
+            "the holder's {hold:?} was counted as {} ns",
+            forced.lock_hold_ns
+        );
+    }
+
+    /// The shared trunk-page cache against a model. Children fork and are reaped, often down to
+    /// none, so the trunk also writes pages while it has no child — as the pager then does, with no
+    /// pre-image and so nothing the store can see. The trunk rewrites pages with and without
+    /// children (with them, as a one-page trunk commit and its barrier), and after every step every
+    /// live child reads every page through `resolve_page_into`. A miss is answered from the model's
+    /// trunk and cached under the key the store gave, as the pager does after its read. Every read
+    /// must return the page as of the child's fork, and the cache must have served reads: a cache
+    /// that never hits has not been tested.
+    #[test]
+    fn the_trunk_page_cache_serves_each_branch_the_version_it_forked_from() {
+        for mode in MODES {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run_cache(seed, mode);
+            }
+        }
+    }
+
+    fn run_cache(seed: u64, mode: Mode) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = open_store(mode, dir.path(), "db");
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+        let (mut generation, mut childless_writes, mut emptied) = (0u64, 0u64, 0u64);
+        let mut buf = vec![0u8; PAGE];
+        for step in 0..3000 {
+            match rng.below(10) {
+                0..=2 if live.len() < 3 => {
+                    let id = store.fork_trunk_locked(Arc::new(Schema::default()), PAGE).unwrap();
+                    live.push((id, current.clone()));
+                }
+                3..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        let required = store
+                            .barrier_floor()
+                            .max(store.first_write_trunk(page, &image(current[&page])).unwrap());
+                        store.durability_barrier_to(SyncClass::Off, required).unwrap();
+                    } else {
+                        childless_writes += 1;
+                    }
+                    generation += 1;
+                    current.insert(page, generation);
+                }
+                _ if !live.is_empty() => {
+                    let (id, _) = live.swap_remove(rng.below(live.len() as u64) as usize);
+                    let reaped = store.release_handle(id).unwrap();
+                    assert!(!reaped.deferred, "{mode:?} seed {seed:#x} step {step}");
+                    if live.is_empty() {
+                        emptied += 1;
+                    }
+                }
+                _ => {}
+            }
+            for (id, view) in &live {
+                for page in 0..PAGES {
+                    let got = match store.resolve_page_into(*id, page, &mut buf).unwrap() {
+                        Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                        Resolved::Trunk(key) => {
+                            store.fill_trunk_page(key, &image(current[&page]));
+                            current[&page]
+                        }
+                    };
+                    assert_eq!(
+                        got, view[&page],
+                        "{mode:?} seed {seed:#x} step {step}: branch {} read the wrong page {page}",
+                        id.0
+                    );
+                }
+            }
+        }
+        let work = store.stats().unwrap().work;
+        assert!(
+            work.trunk_page_hits > 0 && childless_writes > 0 && emptied > 0,
+            "{mode:?} seed {seed:#x}: cache hits {}, trunk writes with no child {childless_writes}, \
+             times the last child went {emptied}",
+            work.trunk_page_hits
+        );
+        for (id, _) in live {
+            store.release_handle(id).unwrap();
+        }
+        assert_eq!(
+            store.stats().unwrap().arena_slots_in_use,
+            0,
+            "{mode:?} seed {seed:#x}: versions leaked"
+        );
     }
 }
 

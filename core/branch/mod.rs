@@ -819,6 +819,7 @@ pub struct BranchStats {
 /// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
 /// (Ported from the volatile store's counters, turso `c41a1909b`, so durable and volatile runs of
 /// the same workload can be compared integer for integer. Recovery's replay counts too.)
+/// The `lock_*` counters describe that lock itself; only `lock_hold_ns` adds work under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
@@ -861,6 +862,23 @@ pub struct BranchWork {
     pub trunk_commits_decided: u64,
     pub trunk_pre_images_captured: u64,
     pub trunk_pre_images_retained: u64,
+    /// Acquisitions of the store's lock. Every store entry point takes it (a `stats` call counts
+    /// its own), so this is an integer the workload fixes and load cannot move.
+    pub lock_acquisitions: u64,
+    /// Acquisitions that found the lock held by another thread and waited for it.
+    pub lock_contended: u64,
+    /// Nanoseconds those acquisitions waited, summed. The clock is read only on the contended path,
+    /// by the waiting thread.
+    pub lock_wait_ns: u64,
+    /// Nanoseconds the lock was held, summed over acquisitions made while lock timing was on
+    /// ([`Database::set_branch_lock_timing`]); 0 while it is off. The one counter that adds work
+    /// inside the critical section: two clock reads per acquisition.
+    pub lock_hold_ns: u64,
+    /// Resolutions of a trunk page that the shared trunk-page cache answered.
+    pub trunk_page_hits: u64,
+    /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
+    /// the database file.
+    pub trunk_page_misses: u64,
 }
 
 impl Branch {
@@ -1163,7 +1181,16 @@ impl Connection {
             None => self.reread_schema_at_snapshot(cookie)?,
         };
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size, seen, name)
+        // F6 (turso 9f6b50daf): the store records the trunk's page format at the fork, so a branch
+        // connection is built without reading the trunk's file header (`Database::_init_branch`).
+        let reserved_space = pager.get_reserved_space().ok_or_else(|| {
+            LimboError::InternalError(
+                "an initialized database's pager has no reserved-space byte".to_string(),
+            )
+        })?;
+        self.db
+            .branches
+            .fork_trunk(schema, page_size, reserved_space, seen, name)
     }
 
     /// The schema this connection's open read snapshot holds, when no schema in hand matches its
@@ -1354,6 +1381,13 @@ impl Database {
         self.branches.trunk_retained_count()
     }
 
+    /// Time how long each acquisition holds the branch store's lock, into
+    /// [`BranchWork::lock_hold_ns`]. Observation only; off by default.
+    #[doc(hidden)]
+    pub fn set_branch_lock_timing(&self, on: bool) {
+        self.branches.set_lock_timing(on);
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -1515,6 +1549,9 @@ impl Database {
 
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
+    ///
+    /// The pager is built by `_init_branch`, bound before it reads anything, so page 1 — like every
+    /// page after it — is read as the BRANCH sees it, and nothing of the trunk's can be left in it.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open_conn(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
@@ -1522,12 +1559,8 @@ impl Database {
             store: self.branches.clone(),
             id,
         };
-        let pager = self._init(None, None)?;
-        // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
-        // survive into the branch's view.
-        pager.clear_page_cache(false);
+        let pager = self._init_branch(binding)?;
         pager.set_schema_cookie(None);
-        pager.bind_branch(binding)?;
         let pager = Arc::new(pager);
         let default_cache_size = pager
             .io

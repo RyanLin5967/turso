@@ -3,7 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::{BranchStore, TrunkPending};
+use crate::branch::store::{BranchStore, Resolved, TrunkPageKey, TrunkPending};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -72,6 +72,15 @@ const PENDING_BYTE: u32 = 0x40000000;
 
 #[cfg(feature = "autovacuum")]
 use ptrmap::*;
+
+/// What a branch pager's read of a page found in the branch store.
+enum BranchRead {
+    /// The page, loaded: from the branch's page space or the shared trunk-page cache.
+    Served((PageRef, Completion)),
+    /// The trunk's current version, which the cache does not hold: to be read, and cached under
+    /// this key.
+    Trunk(TrunkPageKey),
+}
 
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
@@ -3570,11 +3579,41 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
-        if let Some(branch) = self.branch.get() {
-            if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
-                return Ok(read);
-            }
+        let Some(branch) = self.branch.get() else {
+            return self.read_page_from_log_or_file(page_idx, frame_watermark, allow_empty_read);
+        };
+        let key = match self.read_branch_page(branch, page_idx, frame_watermark)? {
+            BranchRead::Served(read) => return Ok(read),
+            BranchRead::Trunk(key) => key,
+        };
+        let (page, c) =
+            self.read_page_from_log_or_file(page_idx, frame_watermark, allow_empty_read)?;
+        if allow_empty_read {
+            // A read that may find nothing is never cached.
+            return Ok((page, c));
         }
+        // Once the read has loaded the page, hand it to the branch store's shared trunk-page cache
+        // under the key the store gave, so the next branch to read this version is served from
+        // memory. A group of one: its callback runs when the read completes, at once if it already
+        // has, and a failed read reaches it as an error and is not cached.
+        let store = branch.store.clone();
+        let loaded = page.clone();
+        let mut fill = CompletionGroup::new(move |res| {
+            if res.is_ok() && loaded.is_loaded() {
+                store.fill_trunk_page(key, loaded.get_contents().as_slice());
+            }
+        });
+        fill.add(&c);
+        Ok((page, fill.build()))
+    }
+
+    /// The ordinary read of a page, from the WAL or the database file.
+    fn read_page_from_log_or_file(
+        &self,
+        page_idx: i64,
+        frame_watermark: Option<u64>,
+        allow_empty_read: bool,
+    ) -> Result<(PageRef, Completion)> {
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -3692,26 +3731,29 @@ impl Pager {
         }
     }
 
-    /// Read `page_idx` from the branch's page space, if the branch sees a version that lives there.
-    /// `None` means the branch sees the trunk's current version, which the caller reads through
-    /// the ordinary WAL / database-file path under the branch connection's WAL read snapshot.
+    /// Read `page_idx` as the branch sees it, if the branch store can serve it: a version in the
+    /// branch's page space, or the trunk's version from the store's shared cache. `Trunk` means the
+    /// branch sees the trunk's current version and the cache does not hold it; the caller reads it
+    /// through the ordinary WAL / database-file path under the branch connection's WAL read
+    /// snapshot, and may cache it under the key.
     fn read_branch_page(
         &self,
         branch: &BranchBinding,
         page_idx: i64,
         frame_watermark: Option<u64>,
-    ) -> Result<Option<(PageRef, Completion)>> {
+    ) -> Result<BranchRead> {
         if frame_watermark.is_some() {
             return Err(LimboError::InternalError(
                 "a branch pager does not read the WAL at an explicit watermark".to_string(),
             ));
         }
         let buf = Arc::new(self.buffer_pool.get_page());
-        if !branch
-            .store
-            .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
+        if let Resolved::Trunk(key) =
+            branch
+                .store
+                .resolve_page_into(branch.id, page_idx as u32, buf.as_mut_slice())?
         {
-            return Ok(None);
+            return Ok(BranchRead::Trunk(key));
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
@@ -3728,7 +3770,7 @@ impl Pager {
         // The bytes are already in the buffer: complete the read in place, as an in-memory IO
         // backend would.
         c.complete(len as i32);
-        Ok(Some((page, c)))
+        Ok(BranchRead::Served((page, c)))
     }
 
     fn begin_read_disk_page(
