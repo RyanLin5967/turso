@@ -3581,6 +3581,121 @@ fn bind_reads_each_parameter_in_its_format() {
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
 }
 
+/// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
+/// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
+/// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
+/// as its body. A parameter length below -1 is the same refusal (only -1 is NULL). A frame whose
+/// length cannot hold itself (below 4) ends the session. pgwire decoded a message's body from the
+/// whole read buffer with unchecked reads: a 6-byte Bind panicked the session (and under the
+/// release build's panic=abort, the server, before any login), a length past the frame read the
+/// messages pipelined behind it as parameter bytes, and every negative length read as NULL (wire
+/// review 10 item 2).
+#[test]
+fn a_message_body_shorter_than_it_says_is_refused_in_step() {
+    let dir = Scratch::new("shortbody");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    let parse = |sql: &str| -> Vec<u8> {
+        let mut p = vec![0u8];
+        p.extend_from_slice(sql.as_bytes());
+        p.extend_from_slice(&[0, 0, 0]);
+        frame(b'P', &p)
+    };
+    // A Bind of one parameter, its length field as given and `bytes` after it, then no result
+    // formats.
+    let bind_one = |len: i32, bytes: &[u8]| -> Vec<u8> {
+        let mut b = vec![0u8, 0u8];
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&1i16.to_be_bytes());
+        b.extend_from_slice(&len.to_be_bytes());
+        b.extend_from_slice(bytes);
+        b.extend_from_slice(&0i16.to_be_bytes());
+        frame(b'B', &b)
+    };
+    let execute = frame(b'E', &[0, 0, 0, 0, 0]);
+    let sync = frame(b'S', &[]);
+    let rounds: Vec<(&str, Vec<u8>)> = vec![
+        // Portal and statement names, then nothing: the format count is missing.
+        (
+            "a 6-byte Bind",
+            [parse("SELECT 1"), frame(b'B', &[0, 0]), sync.clone()].concat(),
+        ),
+        (
+            "a Parse with no parameter count",
+            [frame(b'P', b"\0SELECT 1\0"), sync.clone()].concat(),
+        ),
+        (
+            "a parameter length of -2",
+            [
+                parse("SELECT $1::text"),
+                bind_one(-2, b""),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+        (
+            "a parameter length past its frame",
+            [
+                parse("SELECT $1::text"),
+                bind_one(8, b"x"),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+        (
+            "a parameter length past everything sent",
+            [
+                parse("SELECT $1::text"),
+                bind_one(1000, b"x"),
+                execute.clone(),
+                sync.clone(),
+            ]
+            .concat(),
+        ),
+    ];
+    for (what, bytes) in rounds {
+        a.s.write_all(&bytes).unwrap();
+        let r = a.read_reply();
+        let e = r.err(what);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("08P01", "insufficient data left in message"),
+            "{what}"
+        );
+        assert_eq!(r.status, b'I', "{what}: the session is idle after Sync");
+        assert_eq!(
+            a.q("SELECT 1").single(what),
+            "1",
+            "{what}: the session answers"
+        );
+        let mut b = server.connect();
+        assert_eq!(
+            b.q("SELECT 1").single(what),
+            "1",
+            "{what}: a second session"
+        );
+    }
+    // A frame length of 2 cannot hold itself: the session ends, and the server serves on.
+    let mut c = server.connect();
+    c.s.write_all(&[b'S', 0, 0, 0, 2]).unwrap();
+    let r = c.read_reply();
+    assert_eq!(
+        r.status, 0,
+        "a frame length below 4 ends the session: {r:?}"
+    );
+    assert_eq!(a.q("SELECT 1").single("after the bad frame"), "1");
+    let mut b = server.connect();
+    assert_eq!(b.q("SELECT 1").single("after the bad frame"), "1");
+}
+
 /// A Bind whose result-format list is neither empty, one code, nor one code per result column is a
 /// protocol violation (08P01, PostgreSQL's "bind message has N result formats but query has M
 /// columns"), at Describe of the portal and at Execute, and the session and a second connection are
