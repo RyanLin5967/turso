@@ -4028,6 +4028,91 @@ fn a_message_body_shorter_than_it_says_is_refused_in_step() {
     assert_eq!(b.q("SELECT 1").single("after the bad frame"), "1");
 }
 
+/// A named portal runs once, as in PostgreSQL: a second Execute of a portal whose statement ran to
+/// completion without rows (an UPDATE) is 55000 'portal "p" cannot be run', which fails the
+/// pipeline, so its implicit block rolls back and the row is unchanged; a second Execute of a query
+/// portal that returned all its rows answers "SELECT 0"; and a named portal is gone once the
+/// transaction it was bound in ends, so Execute of it after Sync is 34000 'portal "p" does not
+/// exist'. The UPDATE ran twice and committed both, a finished query answered NoData, and portals
+/// outlived their transaction (wire review 12 item 5).
+#[test]
+fn a_named_portal_runs_once_and_ends_with_its_transaction() {
+    let dir = Scratch::new("portalonce");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, n INT)").ok("c");
+    a.q("INSERT INTO c VALUES (1, 0)").ok("row");
+    fn frame(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+    // Parse the unnamed statement, Bind it to portal "p", then `executes` Executes of p and a Sync;
+    // every message type of the reply, the first error, and each CommandComplete's tag.
+    fn rounds(
+        w: &mut Wire,
+        sql: &str,
+        bind: bool,
+        executes: usize,
+    ) -> (Vec<u8>, Option<WireError>, Vec<String>) {
+        let mut out = Vec::new();
+        if bind {
+            let mut parse = vec![0u8];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            frame(&mut out, b'P', &parse);
+            frame(&mut out, b'B', &[b'p', 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        for _ in 0..executes {
+            frame(&mut out, b'E', &[b'p', 0, 0, 0, 0, 0]);
+        }
+        frame(&mut out, b'S', &[]);
+        w.s.write_all(&out).unwrap();
+        let (mut tags, mut error, mut completes) = (Vec::new(), None, Vec::new());
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            match head[0] {
+                b'E' if error.is_none() => error = Some(error_fields(&body)),
+                b'C' => completes.push(cstr(&body)),
+                _ => {}
+            }
+            tags.push(head[0]);
+            if head[0] == b'Z' {
+                return (tags, error, completes);
+            }
+        }
+    }
+    let (_, error, completes) = rounds(&mut a, "UPDATE c SET n = n + 1 WHERE id = 1", true, 2);
+    let e = error.expect("the second Execute of a finished UPDATE portal");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("55000", "portal \"p\" cannot be run")
+    );
+    assert_eq!(completes, vec!["UPDATE 1".to_string()]);
+    assert_eq!(
+        a.q("SELECT n FROM c WHERE id = 1")
+            .single("the pipeline rolled back"),
+        "0"
+    );
+    let (_, error, completes) = rounds(&mut a, "SELECT n FROM c", true, 2);
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(
+        completes,
+        vec!["SELECT 1".to_string(), "SELECT 0".to_string()]
+    );
+    let (_, error, _) = rounds(&mut a, "", false, 1);
+    let e = error.expect("Execute of p after its transaction ended");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("34000", "portal \"p\" does not exist")
+    );
+    assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+}
+
 /// An empty statement over the extended protocol is no error: Describe of its portal answers NoData,
 /// Execute answers EmptyQueryResponse (whatever result formats the Bind named), and a pipeline it
 /// sits in commits at Sync, as in PostgreSQL. It failed at Describe and Execute with "contains no
