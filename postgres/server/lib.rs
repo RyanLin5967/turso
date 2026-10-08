@@ -998,10 +998,28 @@ impl Session {
             }
         }
         match verb {
-            // PostgreSQL warns and carries on for these; the engine would refuse them.
-            TxVerb::Begin if in_tx => return Ok(Response::Execution(Tag::new("BEGIN"))),
-            TxVerb::Commit if !in_tx => return Ok(Response::Execution(Tag::new("COMMIT"))),
-            TxVerb::Rollback if !in_tx => return Ok(Response::Execution(Tag::new("ROLLBACK"))),
+            // PostgreSQL warns and carries on for these; the engine would refuse them. A BEGIN in
+            // an implicit block makes the block the client's, unwarned (after_implicit). The
+            // warnings were missing (wire review 9 item 7).
+            TxVerb::Begin if in_tx => {
+                if !st.implicit {
+                    st.notices.push(warning(
+                        "25001",
+                        "there is already a transaction in progress",
+                    ));
+                }
+                return Ok(Response::Execution(Tag::new("BEGIN")));
+            }
+            TxVerb::Commit | TxVerb::Rollback if !in_tx => {
+                st.notices
+                    .push(warning("25P01", "there is no transaction in progress"));
+                let tag = if verb == TxVerb::Commit {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                };
+                return Ok(Response::Execution(Tag::new(tag)));
+            }
             // Savepoints exist only in a block the client opened: outside one, and in an implicit
             // block (a multi-statement query, a pipeline before Sync), PostgreSQL refuses them
             // (25P01). Outside a block they reached the engine, which opened a transaction for
@@ -1264,7 +1282,14 @@ impl Session {
         loop {
             // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
-                Err(mut f) if verb == TxVerb::Commit => {
+                // The state backstop: a statement that failed after the engine left the block it
+                // ran in (a COMMIT the verb reader did not see, or an error the engine answered by
+                // rolling the whole transaction back) is settled as a COMMIT is and never run
+                // again: run anew it would run outside the block (wire review 9 item 7; 476798d89
+                // had dropped f2804f119's state check).
+                Err(mut f)
+                    if verb == TxVerb::Commit || (in_tx && conn.inner().get_auto_commit()) =>
+                {
                     f.info = commit_failed(conn, f.info);
                     return Err(f);
                 }
@@ -1708,45 +1733,59 @@ impl TxVerb {
     }
 }
 
-/// The words of a statement for [`TxVerb::of`]: leading `--` and `/* */` comments skipped, a
-/// trailing `;` dropped, a `"quoted"` name one word, `,` a word of its own, each a slice of `sql`.
-/// None for a statement that does not start with a transaction verb (one word's scan, no
-/// allocation), and for text the verbs' grammar cannot hold (a `'` string, `$`, another `;`, a
-/// comment after the start), which is Other.
+/// The words of a statement for [`TxVerb::of`], each a slice of `sql`: a comment is whitespace
+/// wherever it stands (`--` to the line's end, `/* */` nested), as PostgreSQL's lexer reads one, so
+/// it also ends a word; a `"quoted"` name is one word, `,` a word of its own, and `$` continues a
+/// word after its first byte, as in an identifier; a `;` ends the statement, after which only
+/// whitespace and comments may follow. None for a statement that does not start with a
+/// transaction verb (one word's scan, no allocation), and for text the verbs' grammar cannot hold
+/// (a `'` string, a word starting with `$`, a second statement, an unterminated comment), which is
+/// Other. A comment after the verb made it Other, so `COMMIT -- c` skipped the failed-COMMIT rule
+/// and `ROLLBACK /* c */` could never end a failed block (wire review 9 item 7, review 11 item 7).
 fn tx_words(sql: &str) -> Option<Vec<&str>> {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest.split_once('\n').map_or("", |(_, r)| r).trim_start();
-        } else if s.starts_with("/*") {
-            let b = s.as_bytes();
-            let (mut depth, mut i) = (0usize, 0usize);
-            while i < b.len() {
-                if b[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if b[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    i += 1;
+    let b = sql.as_bytes();
+    // The length of the comment at the start of `b`: None if none starts there, Some(None) for
+    // one that never ends.
+    let comment = |b: &[u8]| -> Option<Option<usize>> {
+        if b.starts_with(b"--") {
+            let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
+            return Some(Some(end.map_or(b.len(), |p| p + 1)));
+        }
+        if !b.starts_with(b"/*") {
+            return None;
+        }
+        let (mut depth, mut i) = (0usize, 0usize);
+        while i < b.len() {
+            if b[i..].starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else if b[i..].starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(Some(i));
                 }
+            } else {
+                i += 1;
             }
-            if depth != 0 {
-                return None;
-            }
-            s = s[i..].trim_start();
-        } else {
-            break;
+        }
+        Some(None)
+    };
+    let mut i = 0;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match comment(&b[i..]) {
+            Some(len) => i += len?,
+            None => break,
         }
     }
-    let first_end = s
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(s.len());
-    let first = &s[..first_end];
+    let first_end = b[i..]
+        .iter()
+        .position(|c| !c.is_ascii_alphabetic())
+        .map_or(b.len(), |p| i + p);
+    let first = &sql[i..first_end];
     if ![
         "BEGIN",
         "START",
@@ -1762,16 +1801,22 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
     {
         return None;
     }
-    let body = s.trim_end();
-    let body = body.strip_suffix(';').unwrap_or(body).trim_end();
-    let b = body.as_bytes();
     let mut words = Vec::new();
-    let mut i = 0;
+    let mut ended = false;
     while i < b.len() {
+        if let Some(len) = comment(&b[i..]) {
+            i += len?;
+            continue;
+        }
         match b[i] {
             c if c.is_ascii_whitespace() => i += 1,
+            _ if ended => return None,
+            b';' => {
+                ended = true;
+                i += 1;
+            }
             b',' => {
-                words.push(&body[i..i + 1]);
+                words.push(&sql[i..i + 1]);
                 i += 1;
             }
             b'"' => {
@@ -1788,19 +1833,19 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
                         None => return None,
                     }
                 }
-                words.push(&body[start..i]);
+                words.push(&sql[start..i]);
             }
-            b'\'' | b'$' | b';' => return None,
-            _ if b[i..].starts_with(b"--") || b[i..].starts_with(b"/*") => return None,
+            b'\'' | b'$' => return None,
             _ => {
                 let start = i;
                 while i < b.len()
                     && !b[i].is_ascii_whitespace()
-                    && !matches!(b[i], b',' | b'"' | b'\'' | b'$' | b';')
+                    && !matches!(b[i], b',' | b'"' | b'\'' | b';')
+                    && comment(&b[i..]).is_none()
                 {
                     i += 1;
                 }
-                words.push(&body[start..i]);
+                words.push(&sql[start..i]);
             }
         }
     }
@@ -2137,6 +2182,15 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
         "ERROR".to_string(),
         code.to_string(),
         message,
+    ))
+}
+
+/// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.
+fn warning(code: &str, message: &str) -> Box<ErrorInfo> {
+    Box::new(ErrorInfo::new(
+        "WARNING".to_string(),
+        code.to_string(),
+        message.to_string(),
     ))
 }
 
