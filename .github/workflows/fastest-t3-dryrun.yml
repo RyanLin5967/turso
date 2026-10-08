@@ -87,12 +87,15 @@ jobs:
           s = json.load(open(sys.argv[1]))
           print("planned", s["planned_runs"], "complete", s["complete_runs"], "incomplete", s["incomplete"],
                 "failed_stages", s["failed_stages"], "failed_blocks", s.get("failed_blocks"),
-                "failed_checks", s.get("failed_checks"))
+                "failed_checks", s.get("failed_checks"), "parity_refusals", s.get("parity_refusals"),
+                "normaliser_missing", s.get("normaliser_missing"), "unquiet_runs", s.get("unquiet_runs"))
           for b in s.get("blocks", []):
               print("block", b["fs"], b.get("cell"), "ok" if b["ok"] else "NOT OK", json.dumps(
-                  {"v3": {k: {f: v.get(f) for f in ("rc", "flush_control", "frame_arm_p50_us", "flush_sent_to_device",
-                                                       "floor_kind")} for k, v in b.get("v3", {}).items()},
-                   "v3_drift_us": b.get("v3_frame_arm_drift_us"), "v3l": b.get("v3l", {}).get("published"),
+                  {"v3": {k: {f: v.get(f) for f in ("rc", "timing_control", "d0_control", "voids", "frame_arm_p50_us",
+                                                       "flush_sent_to_device", "floor_kind")} for k, v in b.get("v3", {}).items()},
+                   "v3_drift_us": {"append25": b.get("v3_append25_drift_us"), "frame": b.get("v3_frame_arm_drift_us"),
+                                   "outcome": (b.get("v3_drift") or {}).get("outcome")},
+                   "v3l": b.get("v3l", {}).get("published"),
                    "v3l_verdict": b.get("v3l", {}).get("verdict")}))
           plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
           if plant:
@@ -112,7 +115,7 @@ jobs:
               print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
               sys.exit(0 if ok else 1)
           sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or s.get("failed_blocks")
-                         or not s["planned_runs"]) else 0)
+                         or s.get("parity_refusals") or s.get("normaliser_missing") or not s["planned_runs"]) else 0)
           PY
       - name: Upload the package
         if: always()
