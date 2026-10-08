@@ -42,8 +42,10 @@
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
 #   v3l-fsync-half      the BEFORE V3L's fio syncs every 2nd write (V3L_PLANT=fsync2: V1L and fio must VOID it)
-#   v3l-wt-layer        the block's loop is set to write through before V3L BEFORE: fsyncs stop reaching the drive,
-#                       and the drive's flush counter gate must VOID it (review M3, forced on real hardware)
+#   v3l-cache-lie       a write-cache lie under V3L BEFORE, on real hardware, whichever drive the runner draws: on a
+#                       write-back drive the block's loop is set to write through (fsyncs stop reaching the drive, and
+#                       the drive's flush counter gate must VOID it); on a write-through drive the drive's own queue is
+#                       set to write back (the kernel/drive cross-check must VOID it). Restored right after.
 # A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
@@ -98,9 +100,9 @@ SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
 if [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
-  case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-wt-layer) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
+  case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-cache-lie) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
   # brd batches are smoke (unbound) and brd has no loop, so these plants would plant nothing there
-  case $PLANT:$BLOCK in v3-verdict-missing:brd|v3l-wt-layer:brd)
+  case $PLANT:$BLOCK in v3-verdict-missing:brd|v3l-cache-lie:brd)
     echo "t3run: REFUSED: plant $PLANT needs --block loop" >&2; exit 2 ;; esac
   case ${PLP:=no} in no) ;; *) echo "t3run: REFUSED: --plp is for real runs (a dry run's drives are what they are)" >&2; exit 2 ;; esac
 else
@@ -145,18 +147,23 @@ finish() {
   python3 -B "$L/t3/summarize.py" "$OUT" "$SHA" "$DRY" "$MANIFEST" > "$OUT/summary.json" 2> "$OUT/summarize.stderr" ||
     { [ "$rc" = 0 ] && rc=1; }
   cat "$OUT/summarize.stderr"
-  ( cd "$(dirname "$OUT")" && tar --exclude="$(basename "$OUT")/work" -czf "$OUT.tar.gz" "$(basename "$OUT")" &&
-    sha256sum "$(basename "$OUT").tar.gz" > "$OUT.tar.gz.sha256" )
+  if ! ( cd "$(dirname "$OUT")" && tar --exclude="$(basename "$OUT")/work" -czf "$OUT.tar.gz" "$(basename "$OUT")" &&
+         sha256sum "$(basename "$OUT").tar.gz" > "$OUT.tar.gz.sha256" ); then
+    echo "t3run: package failed (tar or sha256sum)"; rc=1  # gate-6 review 17
+  fi
   echo "# t3run done rc=$rc wall_s=$t package=$OUT.tar.gz"
   exit "$rc"
 }
 
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
-NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py hw/record.sh fs/mkloop.sh
+NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES
+  hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
+  competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
+  competitors/fthelp.py competitors/gen_seed.py competitors/reduce.py competitors/trace.sh
   v3/v3floor.c v3/statfs_shim.c v3/noop_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
-  v3/batchgate.py v3/blkflush.py v3/stamp.py"
+  v3/batchgate.py v3/blkflush.py v3/stamp.py v3/crash.sh v3/nsfake.sh v3/postplant.py v3/red.py"
 preflight() {
   [ -f "$MAN" ] || { echo "no manifest $MAN"; return 2; }
   # the files the run calls must be in the COMMIT (review M8: an untracked leftover satisfied a disk check), and
@@ -165,8 +172,9 @@ preflight() {
   head=$(git -C "$SRC" rev-parse HEAD) || { echo "REFUSED: $SRC is not a git checkout"; return 2; }
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
-  dirty=$(git -C "$SRC" status --porcelain --untracked-files=all -- fastest .github)
-  [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head under fastest/ or .github/: $dirty"; return 2; }
+  # the WHOLE tree (lane review LOW 8: a modified core/ would be built and recorded as sha=$SHA)
+  dirty=$(git -C "$SRC" status --porcelain --untracked-files=all)
+  [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head: $(echo "$dirty" | head -5)"; return 2; }
   grep -q 'Ubuntu 24' /etc/os-release || { echo "not Ubuntu 24.04"; return 2; }
   sudo -n true || { echo "needs passwordless sudo"; return 2; }
   local msha; msha=$(sha256sum "$MAN" | cut -c1-64)
@@ -179,7 +187,18 @@ preflight() {
     [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
-    python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
+    sudo -n python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
+    # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
+    local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
+    [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
+    # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
+    # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
+    if [ "$PLP" = yes ]; then
+      local dn model fw; dn=$(basename "$(readlink -f "$DEVICE")")
+      model=$(xargs < "/sys/block/$dn/device/model" 2>/dev/null) fw=$(xargs < "/sys/block/$dn/device/firmware_rev" 2>/dev/null)
+      grep -qxF "$(printf '%s\t%s' "$model" "$fw")" "$L/t3/PLP-DRIVES" ||
+        { echo "REFUSED: --plp yes but '$model' firmware '$fw' is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
+    fi
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -278,20 +297,38 @@ v3batch() { # v3batch before|after DIR
 
 # V3L before or after a block (review 2 item 6; PREREG line 180): VOID or refused fails the stage.
 v3l() { # v3l before|after MNT
-  local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc
+  local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc lie=""
   local -a env=()
-  [ "$PLANT_NOW:$when" = v3l-fsync-half:before ] && env=(V3L_PLANT=fsync2)
-  if [ "$PLANT_NOW:$when" = v3l-wt-layer:before ]; then
-    local lo; lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
-    case $lo in loop*) echo "write through" | sudo tee "/sys/block/$lo/queue/write_cache" > /dev/null &&
-      echo "plant v3l-wt-layer: /sys/block/$lo/queue/write_cache = $(cat "/sys/block/$lo/queue/write_cache")" ;;
-      *) echo "plant v3l-wt-layer: $mnt is not on a loop ($lo)"; return 1 ;; esac
+  [ $DRY = 0 ] && env+=(V3L_REAL=1)
+  [ "$PLANT_NOW:$when" = v3l-fsync-half:before ] && env+=(V3L_PLANT=fsync2)
+  if [ "$PLANT_NOW:$when" = v3l-cache-lie:before ]; then
+    # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
+    # (no fsync reaches the drive), or a write-through drive whose kernel queue claims write back
+    local lo disk wc
+    lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
+    disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
+    wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
+    case $wc:$lo in
+      "write back:loop"*) lie="/sys/block/$lo/queue/write_cache=write through" ;;
+      "write through:"*) lie="/sys/block/$disk/queue/write_cache=write back" ;;
+      *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
+    esac
+    printf '%s\n' "${lie#*=}" | sudo tee "${lie%%=*}" > /dev/null || { echo "plant v3l-cache-lie: cannot write ${lie%%=*}"; return 1; }
+    [ "$(cat "${lie%%=*}")" = "${lie#*=}" ] || { echo "plant v3l-cache-lie: ${lie%%=*} did not take"; return 1; }
+    echo "plant v3l-cache-lie: ${lie%%=*} = ${lie#*=} (was $( [ "${lie#*=}" = "write back" ] && echo "write through" || echo "write back"))" | tee "$o/plant.txt"
+    env+=(V3L_PLANT=cache-lie)
   fi
   env "${env[@]}" timeout 1800 python3 -B "$L/t3/v3l.py" measure "$mnt/v3l-$when" "$o/v3l-$when" \
     "$o/v3-before/summary.json" > "$o/v3l-$when.txt" 2>&1
   rc=$?
+  if [ -n "$lie" ]; then  # restore at once, so the rest of the run sees the drive as it is
+    printf '%s\n' "$( [ "${lie#*=}" = "write back" ] && echo "write through" || echo "write back")" | sudo tee "${lie%%=*}" > /dev/null
+  fi
   echo "$when rc=$rc" >> "$o/v3l.rc"
   [ $rc = 0 ] || { echo "V3L $when on $FS_NOW: rc $rc ($(tail -1 "$o/v3l-$when.txt"))"; return 1; }
+  # the counter and agreement gates forced to fire on copies of this real record (v3l.py plants)
+  python3 -B "$L/t3/v3l.py" plants "$o/v3l-$when/v3l.json" "$o/v3l-$when-plants.json" > /dev/null ||
+    { echo "V3L $when plants on $FS_NOW: not every plant fired"; return 1; }
   return 0
 }
 
@@ -350,7 +387,11 @@ block_cleanup() {
   local mnt=/mnt/t3-$FS_NOW dev back
   findmnt -n "$mnt" > /dev/null 2>&1 || return 0
   dev=$(findmnt -n -o SOURCE "$mnt")
-  sudo umount "$mnt" || sudo umount -l "$mnt" || { echo "cleanup: cannot unmount $mnt"; return 1; }
+  # a process still holding the test filesystem (a competitor server under setsid, a stray cell) is ours: kill it,
+  # then a plain umount; a lazy umount would report success over a live filesystem (lane review LOW 9)
+  sudo fuser -k -m "$mnt" > /dev/null 2>&1
+  sleep 1
+  sudo umount "$mnt" || { echo "cleanup: cannot unmount $mnt: $(sudo fuser -v -m "$mnt" 2>&1 | tail -3)"; return 1; }
   case $BLOCK:$dev in loop:/dev/loop*)
     back=$(losetup -n -O BACK-FILE "$dev" | xargs)
     sudo losetup -d "$dev" && sudo rm -f "$back" ;;
@@ -415,7 +456,8 @@ selftests() {
   done
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd; rd=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1)
-  if [ -n "$rd" ] && python3 -B "$L/t3/devguard.py" check "/dev/$rd" > "$OUT/devguard-root.txt" 2>&1; then
+  [ -n "$rd" ] || { echo "selftests: cannot tell the root disk, so devguard's root refusal cannot be fired"; return 1; }
+  if sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$rd" > "$OUT/devguard-root.txt" 2>&1; then
     echo "devguard ALLOWED the root disk /dev/$rd"; return 1
   fi
   return 0

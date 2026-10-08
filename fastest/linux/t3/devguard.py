@@ -8,8 +8,10 @@ denylist, and a partition of the root disk or a symlink to /dev/ram0 passed it).
 Rules (all must hold):
   - DEVICE resolves (symlinks followed) to /dev/<name> with name a whole NVMe namespace (nvmeXnY), SCSI disk (sdX) or
     virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem or anything else is refused);
-  - no partition or holder of it is mounted or in use (lsblk MOUNTPOINTS anywhere in its tree; /sys/block/<name>/holders
-    empty, so it is not under dm or md);
+  - no partition or holder of it is mounted or in use: lsblk MOUNTPOINTS anywhere in its tree; every descendant is a
+    bare partition (an LVM volume, md array, crypt or dm child refuses); the disk's AND each partition's
+    /sys/block/<disk>/<part>/holders are empty; and an exclusive open (O_EXCL) of the disk and of each partition
+    succeeds, so nothing in the kernel claims them (lane review MED 5; needs root, so t3run runs it under sudo -n);
   - it is not the disk that holds "/" (compared by disk, so a spare partition of the root disk cannot pass);
   - it is not a native-multipath NVMe head (/sys/block/<name>/multipath non-empty): its flush counter may live on the
     path devices, which V3L does not read (stated blind spot, refused rather than guessed).
@@ -37,7 +39,15 @@ def root_disk(devices):
     return None
 
 
-def problems(name, devices, holders, multipath):
+def descendants(node):
+    out = []
+    for c in node.get("children") or []:
+        out.append(c)
+        out += descendants(c)
+    return out
+
+
+def problems(name, devices, holders, multipath, part_holders=None, busy=None):
     bad = []
     if not ALLOWED.match(name or ""):
         bad.append(f"{name!r} is not an NVMe namespace, SCSI disk or virtio disk (allowlist nvmeXnY, sdX, vdX)")
@@ -52,6 +62,14 @@ def problems(name, devices, holders, multipath):
         bad.append(f"{name} or a partition is mounted at {m}")
     if holders:
         bad.append(f"{name} is held by {holders} (dm/md)")
+    for c in descendants(node):
+        if c.get("type") != "part":
+            bad.append(f"{name} carries {c.get('name')} of TYPE {c.get('type')!r} (LVM/md/crypt/dm): in use")
+    for part, h in sorted((part_holders or {}).items()):
+        if h:
+            bad.append(f"partition {part} of {name} is held by {h}")
+    for dev, why in sorted((busy or {}).items()):
+        bad.append(f"{dev} cannot be opened exclusively ({why}): the kernel claims it")
     if multipath:
         bad.append(f"{name} is a multipath NVMe head ({multipath}): its flush counter may be on the path devices")
     rd = root_disk(devices)
@@ -75,7 +93,20 @@ def check(dev):
     holders = sorted(os.listdir(hp)) if os.path.isdir(hp) else []
     mp = f"/sys/block/{name}/multipath"
     multipath = sorted(os.listdir(mp)) if os.path.isdir(mp) else []
-    return name, problems(name, devices, holders, multipath)
+    node = next((d for d in devices if d.get("name") == name), {}) or {}
+    parts = [c.get("name") for c in descendants(node) if c.get("type") == "part"]
+    part_holders = {}
+    for p in parts:
+        ph = f"/sys/block/{name}/{p}/holders"
+        part_holders[p] = sorted(os.listdir(ph)) if os.path.isdir(ph) else []
+    busy = {}
+    for dev in [name] + parts:
+        try:
+            fd = os.open(f"/dev/{dev}", os.O_RDONLY | os.O_EXCL)
+            os.close(fd)
+        except OSError as e:
+            busy[dev] = e.strerror
+    return name, problems(name, devices, holders, multipath, part_holders, busy)
 
 
 def self_test():
@@ -98,6 +129,14 @@ def self_test():
         ("a held disk (dm/md) is refused", problems("nvme1n1", devs, ["dm-0"], []) != []),
         ("a multipath NVMe head is refused", problems("nvme1n1", devs, [], ["nvme1c1n1"]) != []),
         ("no disk holding / is refused", problems("nvme1n1", [spare], [], []) != []),
+        ("MED 5: a partition carrying an unmounted LVM volume is refused",
+         problems("nvme2n1", devs + [{"name": "nvme2n1", "type": "disk", "mountpoints": [None], "children": [
+             {"name": "nvme2n1p1", "type": "part", "mountpoints": [None],
+              "children": [{"name": "vg-lv", "type": "lvm", "mountpoints": [None]}]}]}], [], []) != []),
+        ("MED 5: a partition held by an md array is refused",
+         problems("nvme1n1", devs, [], [], {"nvme1n1p1": ["md0"]}) != []),
+        ("MED 5: a device the kernel claims (EBUSY on O_EXCL) is refused",
+         problems("nvme1n1", devs, [], [], {}, {"nvme1n1": "Device or resource busy"}) != []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:

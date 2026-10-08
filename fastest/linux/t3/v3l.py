@@ -216,24 +216,41 @@ def gates(rec):
             if a["timed"].get("fsync_p50_us") is None or not a["timed"].get("fsync_bins_ns"):
                 bad.append("fio fsync/timed: no fsync p50 or no latency histogram (the block's normaliser is unmeasured)")
     for lay in rec["leaf"].get("layers") or []:
-        if lay.get("write_cache") == "write back":
-            d = lay.get("flush_ios_delta")
-            if d is None or d < N:
-                bad.append(f"write-back loop layer {lay.get('name')}: its flush counter rose {d} across {N} fsyncs "
-                           f"(fewer than one per fsync)")
+        bad += counter_gate(f"loop layer {lay.get('name')}", lay.get("write_cache"), lay.get("flush_ios_delta"),
+                            lay.get("lab_flush_ios_delta"))
     dr = rec["leaf"].get("drive_reports")
     if dr in ("write back", "write through") and rec["leaf"]["write_cache"] in ("write back", "write through") \
             and dr != rec["leaf"]["write_cache"]:
         bad.append(f"drive {rec['leaf']['disk']}: the kernel's write_cache ({rec['leaf']['write_cache']}) disagrees with "
                    f"the drive's own report ({dr})")
     wc = rec["leaf"]["write_cache"]
-    if wc == "write back":
-        d = rec["arms"]["fsync"]["timed"].get("flush_ios_delta")
-        if d is None or d < N:
-            bad.append(f"write-back drive {rec['leaf']['disk']}: its flush counter rose {d} across {N} fsyncs "
-                       f"(fewer than one per fsync)")
-    elif wc != "write through":
+    if wc in ("write back", "write through"):
+        bad += counter_gate(f"drive {rec['leaf']['disk']}", wc, rec["arms"]["fsync"]["timed"].get("flush_ios_delta"),
+                            rec["arms"]["fsync"]["timed"].get("lab_flush_ios_delta"))
+    else:
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
+    return bad
+
+
+def counter_gate(what, wc, timed, lab):
+    """One device's flush counter over the timed fsync run (A16):
+    write back: at least one flush per fsync, AND at least the whole flushes per fsync the strace-checked labelling run
+      showed this stack making (floor(lab / N), e.g. 2 through a loop), so a timed run that lost part of its fsyncs
+      cannot pass on a stack that makes 2 per fsync (gate-6 review 7, lane review MED 3). Absent a labelling count
+      (records before it was taken) only the first rule applies;
+    write through: the counter must read 0 in both runs (the block layer sends no flush; a count contradicts the
+      recorded state and VOIDs)."""
+    bad = []
+    if wc == "write back":
+        if timed is None or timed < N:
+            bad.append(f"write-back {what}: its flush counter rose {timed} across {N} fsyncs (fewer than one per fsync)")
+        elif isinstance(lab, int) and lab >= N and timed < (lab // N) * N:
+            bad.append(f"write-back {what}: its flush counter rose {timed} in the timed run, fewer than the "
+                       f"{lab // N} per fsync the labelling run showed ({lab} across {N})")
+    elif wc == "write through":
+        if timed != 0 or (lab is not None and lab != 0):
+            bad.append(f"write-through {what}: its flush counter rose {timed} (labelling {lab}); a write-through queue "
+                       "gets no flush request, so a count contradicts the recorded state (A16)")
     return bad
 
 
@@ -242,12 +259,16 @@ def measure(d, out, leafrec=None):
         raise RuntimeError(f"{out} exists")
     os.makedirs(d, exist_ok=True)
     chain, disk = resolve_leaf(d)
-    drive_reports = None
+    if os.environ.get("V3L_REAL") == "1" and (any(c.startswith("loop") for c in chain) or disk.startswith("ram")):
+        raise RuntimeError(f"a real run on {chain} -> {disk}: loop and ram devices are dry-run only (A16)")
+    drive_reports, virt = None, None
     if leafrec:
-        lr = (json.load(open(leafrec)).get("leaf") or {})
+        lj = json.load(open(leafrec))
+        lr = lj.get("leaf") or {}
         if lr.get("disk") != disk:
             raise RuntimeError(f"the leaf record {leafrec} names disk {lr.get('disk')!r}, V3L resolved {disk!r}")
         drive_reports = lr.get("drive_reports")
+        virt = lj.get("virtualization")
     rc, sv, _ = sh("strace", "-V")
     rec = {"instrument": "V3L (PREREG-v1-FINAL-CANDIDATE line 180; V1L line 173)", "dir": os.path.realpath(d),
            "n": N, "fio_version": sh("fio", "--version")[1].strip(),
@@ -258,7 +279,7 @@ def measure(d, out, leafrec=None):
                     "drive_reports_from": leafrec,
                     "layers": [{"name": c, "write_cache": disk_attr(c, "queue/write_cache")}
                                for c in chain if c.startswith("loop")]},
-           "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
+           "virtualization": virt, "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
     os.makedirs(out)
@@ -270,7 +291,11 @@ def measure(d, out, leafrec=None):
         tr, lj = os.path.join(out, f"{arm}.v1l"), os.path.join(out, f"{arm}-labelling.json")
         cmd = V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj)
         rec["argv"][f"{arm}/labelling"] = cmd
+        k0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
+        g0 = flush_ios(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        g1 = flush_ios(disk)
+        k1 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         if r.returncode != 0:
             raise RuntimeError(f"labelling {arm} run rc {r.returncode}: {r.stderr[-400:]}")
         a["v1l"] = parse_v1l(open(tr).read(), f)
@@ -288,10 +313,12 @@ def measure(d, out, leafrec=None):
         if arm == "fsync":
             for lay in rec["leaf"]["layers"]:
                 lay["flush_ios_delta"] = l1[lay["name"]] - l0[lay["name"]]
+                lay["lab_flush_ios_delta"] = k1[lay["name"]] - k0[lay["name"]]
         if r.returncode != 0:
             raise RuntimeError(f"timed {arm} run rc {r.returncode}: {r.stderr[-400:]}")
         a["timed"] = fio_numbers(tj)
         a["timed"]["flush_ios_delta"] = f1 - f0
+        a["timed"]["lab_flush_ios_delta"] = g1 - g0
         os.unlink(f)
         rec["arms"][arm] = a
     ft, ct = rec["arms"]["fsync"]["timed"], rec["arms"]["control"]["timed"]
@@ -300,8 +327,11 @@ def measure(d, out, leafrec=None):
                         "fsync_over_control_write_p50": ratio(ft.get("fsync_p50_us"), ct.get("write_p50_us")),
                         "flush_ios_per_fsync": round(ft["flush_ios_delta"] / N, 3)}
     rec["floor_kind"] = ("brd: no drive (dry runs only, never credited)" if disk.startswith("ram")
-                         else "drive flush: write-back drive, its flush counter checked"
-                         if rec["leaf"]["write_cache"] == "write back" else "no volatile cache: no drive flush")
+                         else "write-back drive: flush requests completed by the driver (issued and acknowledged, not "
+                              "persistence)" if rec["leaf"]["write_cache"] == "write back"
+                         else "no volatile cache: no flush request sent (counter 0 checked)")
+    if virt and virt.get("virtualized") is not False:
+        rec["floor_kind"] += f"; virtualized {virt.get('virtualized')!r}: reach to media unknown"
     bad = gates(rec)
     rec["verdict"] = "VOID" if bad else "VALID"
     rec["void_reasons"] = bad
@@ -367,8 +397,75 @@ def block(b, a):
     return rec
 
 
+def plants(rec):
+    """The V3L counter and agreement gates forced to fire on copies of a real record (gate-6 review 7, lane review
+    MED 3/4): each plant is one field changed on a record whose control passes gates(). The branch the real drive is
+    not on is reached by setting the leaf (and its loop layers) to that state with consistent counts (write back: the
+    real per-fsync counts if any, else 2 per fsync; write through: 0), then changing one field.
+    Returns (results, ok); a control that does not pass makes every plant NOT-RUN (ok False)."""
+    import copy as _c
+    out = []
+    again = gates(rec)
+    out.append({"plant": "control", "want": "VALID", "got": again or "VALID", "fired": not again})
+    if again:
+        out.append({"plant": "all", "fired": False, "why": "NOT-RUN: the real record is not VALID"})
+        return out, False
+
+    def as_state(r, wc):
+        r = _c.deepcopy(r)
+        r["leaf"]["write_cache"] = wc
+        r["leaf"]["drive_reports"] = wc
+        t = r["arms"]["fsync"]["timed"]
+        if wc == "write through":
+            t["flush_ios_delta"] = t["lab_flush_ios_delta"] = 0
+        else:
+            if not t.get("flush_ios_delta"):
+                t["flush_ios_delta"] = 2 * N
+            if t.get("lab_flush_ios_delta") is None:  # a record from before the labelling counter: the timed count
+                t["lab_flush_ios_delta"] = t["flush_ios_delta"]
+        for lay in r["leaf"].get("layers") or []:
+            lay["write_cache"] = wc
+            if wc == "write through":
+                lay["flush_ios_delta"] = lay["lab_flush_ios_delta"] = 0
+            else:
+                if not lay.get("flush_ios_delta"):
+                    lay["flush_ios_delta"] = 2 * N
+                if lay.get("lab_flush_ios_delta") is None:
+                    lay["lab_flush_ios_delta"] = lay["flush_ios_delta"]
+        return r
+
+    def arm(name, base_wc, mutate, want):
+        r = as_state(rec, base_wc)
+        if gates(r):
+            out.append({"plant": name, "fired": False, "why": f"NOT-RUN: the {base_wc} base does not pass: {gates(r)}"})
+            return
+        mutate(r)
+        got = gates(r)
+        out.append({"plant": name, "want": want, "got": got, "fired": any(want in x for x in got)})
+
+    def half_timed(r):
+        t = r["arms"]["fsync"]["timed"]
+        t["flush_ios_delta"] = t["flush_ios_delta"] // 2
+
+    arm("wb-half-flushes", "write back", half_timed, "write-back drive")
+    arm("wt-one-flush", "write through", lambda r: r["arms"]["fsync"]["timed"].__setitem__("flush_ios_delta", 1),
+        "write-through drive")
+    arm("timed-half-syncs", rec["leaf"]["write_cache"],
+        lambda r: r["arms"]["fsync"]["timed"].__setitem__("syncs", r["arms"]["fsync"]["timed"]["syncs"] // 2),
+        "they must agree")
+    arm("drive-mismatch", rec["leaf"]["write_cache"],
+        lambda r: r["leaf"].__setitem__("drive_reports", "write through" if r["leaf"]["write_cache"] == "write back"
+                                        else "write back"), "disagrees with the drive's own report")
+    return out, all(p["fired"] for p in out)
+
+
 def _nobins(r):
     r["arms"]["fsync"]["timed"]["fsync_bins_ns"] = None
+    return r
+
+
+def _lab(r, lab):
+    r["arms"]["fsync"]["timed"]["lab_flush_ios_delta"] = lab
     return r
 
 
@@ -438,6 +535,14 @@ def self_test():
         ("M6: kernel write through over a drive reporting write back VOIDs",
          gates(rec(wc="write through", delta=0, drive="write back")) != []),
         ("M6: kernel and drive agreeing on write back is VALID", gates(rec(drive="write back")) == []),
+        ("A16: write-through drive with a non-zero counter VOIDs", gates(rec(wc="write through", delta=1)) != []),
+        ("A16: write-through loop layer with a non-zero counter VOIDs",
+         gates(rec(layers=[{"name": "loop3", "write_cache": "write through", "flush_ios_delta": 3}])) != []),
+        ("floor rule: labelling 2 per fsync, timed 1.5 per fsync VOIDs", gates(_lab(rec(delta=15000), 20004)) != []),
+        ("floor rule: labelling 2 per fsync, timed 2 per fsync is VALID", gates(_lab(rec(delta=20003), 20004)) == []),
+        ("plants on a VALID write-back record: control passes and all four fire", plants(rec(delta=20003))[1]),
+        ("plants on a VALID write-through record: all four fire", plants(rec(wc="write through", delta=0))[1]),
+        ("plants on a VOID record: NOT-RUN", not plants(rec(fsyncs=N - 1))[1]),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
@@ -455,6 +560,11 @@ def main(a):
             return self_test()
         if len(a) in (4, 5) and a[1] == "measure":
             return measure(a[2], a[3], a[4] if len(a) == 5 else None)
+        if len(a) == 4 and a[1] == "plants":
+            res, ok = plants(json.load(open(a[2])))
+            json.dump({"plants": res, "all_fired": ok}, open(a[3], "w"), indent=1, default=str)
+            print(json.dumps({"all_fired": ok, "fired": {p["plant"]: p["fired"] for p in res}}))
+            return 0 if ok else 1
         if len(a) == 4 and a[1] == "block":
             r = block(a[2], a[3])
             print(json.dumps(r, indent=1))
