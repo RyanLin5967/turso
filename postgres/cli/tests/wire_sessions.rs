@@ -3475,7 +3475,8 @@ fn a_parameter_over_the_simple_protocol_is_refused() {
     let r = a.q("INSERT INTO t VALUES (3, 'x'); UPDATE t SET v = $1");
     assert_eq!(r.err("in a multi-statement query").code, "42P02");
     assert_eq!(
-        a.q("SELECT count(*) FROM t").single("the block rolled back"),
+        a.q("SELECT count(*) FROM t")
+            .single("the block rolled back"),
         "1"
     );
 }
