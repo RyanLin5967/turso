@@ -4285,6 +4285,41 @@ fn set_operations_keep_their_grouping_and_clauses() {
     }
 }
 
+/// DELETE ... USING reads its target and its USING items in ONE namespace, as PostgreSQL does: an
+/// unqualified name both have is ambiguous (42702) and nothing is deleted, and the target named
+/// again in USING is 42712 ("table name specified more than once"). Translated as EXISTS over the
+/// USING items, a bare name bound to the USING side alone (the innermost scope), so `id = 2`
+/// became uncorrelated and deleted EVERY target row (wire review 11 item 4, a regression from
+/// 911392515). An aliased target is read by its alias.
+#[test]
+fn delete_using_reads_one_namespace() {
+    let dir = Scratch::new("deleteusingns");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .ok("d rows");
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true), (3, false)")
+        .ok("k rows");
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM d").single("count");
+    let r = a.q("DELETE FROM d USING k WHERE id = 2");
+    assert_eq!(r.err("an unqualified name both have").code, "42702");
+    assert_eq!(count(&mut a), "3", "nothing deleted");
+    let r = a.q("DELETE FROM d USING d WHERE d.id = 1");
+    assert_eq!(r.err("the target again in USING").code, "42712");
+    assert_eq!(count(&mut a), "3", "nothing deleted");
+    let r = a
+        .q("DELETE FROM d AS x USING k WHERE x.id = k.id AND k.flag RETURNING x.v")
+        .ok("an aliased target");
+    assert_eq!(r.rows, vec![vec![Some("b".to_string())]]);
+    let r = a
+        .q("DELETE FROM d USING k AS j WHERE v = 'c' AND j.id = 3")
+        .ok("a name only the target has");
+    assert_eq!(r.tags, vec!["DELETE 1".to_string()]);
+    assert_eq!(a.q("SELECT id FROM d").single("one row left"), "1");
+}
+
 /// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
 /// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
 /// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
