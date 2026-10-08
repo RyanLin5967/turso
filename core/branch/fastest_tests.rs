@@ -1442,6 +1442,66 @@ fn a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page() {
     }
 }
 
+/// Wire review 7 HIGH 3 (engine LEAD-ORDER item 2, the commit-started flag): an explicit COMMIT
+/// whose trunk commit is refused at its copy-decision pass (`Busy`) and is then stepped again
+/// resumes that commit. Before the fix, the first step had already set `auto_commit` while
+/// `commit_state` was still `Ready`, so the second step read "no transaction is active" (TxError),
+/// its abort rolled nothing back, and the session kept its write transaction (and the WAL write
+/// lock) with autocommit on. The commit must happen exactly once: one WAL commit frame for the
+/// transaction, its write visible to another connection, no transaction left open, and the live
+/// child still reading its fork-point version.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_commit_re_stepped_after_a_busy_decision_pass_commits_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-commit.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        let page_size = a.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let before = a.wal_state().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        a.execute("BEGIN").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        let mut commit = a.prepare("COMMIT").unwrap();
+        let first = commit.run_ignore_rows();
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused: {first:?}"
+        );
+        let second = commit.run_ignore_rows();
+        assert!(
+            second.is_ok(),
+            "catalog={catalog}: CLAIM: the re-stepped COMMIT resumes its commit: {second:?}"
+        );
+        drop(commit);
+        let after = a.wal_state().unwrap();
+        assert_eq!(
+            after.checkpoint_seq_no, before.checkpoint_seq_no,
+            "catalog={catalog}: premise: no checkpoint restarted the WAL in between"
+        );
+        let mut frame = vec![0u8; 24 + page_size];
+        let commit_frames = (before.max_frame + 1..=after.max_frame)
+            .filter(|&n| a.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+            .count();
+        assert_eq!(commit_frames, 1, "catalog={catalog}: the transaction committed exactly once");
+        assert!(a.get_auto_commit(), "catalog={catalog}: the session is back in autocommit");
+        let rollback = a.execute("ROLLBACK");
+        assert!(
+            matches!(rollback, Err(LimboError::TxError(_))),
+            "catalog={catalog}: the COMMIT left a transaction open: ROLLBACK gave {rollback:?}"
+        );
+        let b = db.connect().unwrap();
+        assert_eq!(read_wide(&b, 3), "new", "catalog={catalog}: another connection reads the commit");
+        let c = child.connect().unwrap();
+        assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog}: the child reads its fork point");
+    }
+}
+
 /// Review A-F1: a raw WAL session's commit (`wal_insert_end(true)`) closes the commit gate it opens,
 /// so the next trunk commit takes its own copy decisions and no fork waits on a gate nobody holds.
 #[cfg(feature = "conn_raw_api")]
