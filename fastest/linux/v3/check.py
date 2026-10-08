@@ -1082,7 +1082,8 @@ def self_test():
     return 0 if ok else 1
 
 
-BANKED_F3 = "f3-37528595878-x86-ext4loop"
+BANKED_F3 = "f3-37528595878-x86-ext4loop"   # write-back NVMe (upgraded: its README)
+BANKED_F3_WT = "f3-37811638228-arm-ext4loop"  # write-through Hyper-V sd, a real batch of the current record format
 
 
 def real_selftest(chk):
@@ -1190,6 +1191,46 @@ def real_selftest(chk):
         chk("real: planted virtualized false on a VM (detect-virt microsoft) -> F3:record fails with exactly the "
             "virtualization rule and the four labels that follow from it", g["F3:record"]["pass"] is False
             and sorted(set(tags(g["F3:record"]))) == want_v, sorted(set(tags(g["F3:record"]))))
+        # the write-through rules through check_real, on a real write-through batch (seventh review M1)
+        src_wt = os.path.join(HERE, "testdata", BANKED_F3_WT)
+        kv_wt = dict(l.split("=", 1) for l in (rd(os.path.join(src_wt, "info.txt")) or "").splitlines()
+                     if "=" in l and not l.startswith(("loop ", "block ")))
+
+        def run_wt(name, probe=None, merged=None, report=None):
+            global CELL, KIND, W, OUT, results
+            d = os.path.join(td, "wt-" + name)
+            shutil.copytree(os.path.join(src_wt, "F3"), d)
+            for f, mut in (("summary.probe.json", probe), ("summary.json", merged), (os.path.join("blkflush", "report.json"), report)):
+                if mut:
+                    j = rj(os.path.join(d, f))
+                    mut(j)
+                    with open(os.path.join(d, f), "w") as fh:
+                        json.dump(j, fh)
+            CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv_wt.get("work", ""), td, []
+            with contextlib.redirect_stdout(io.StringIO()):
+                check_real(d, 0, kv_wt, "wt")
+            return {r["id"]: r for r in results}
+
+        g = run_wt("control")
+        chk("real: the banked write-through batch passes all five F3 checks unplanted",
+            [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [], {i: tags(g.get(i, {})) for i in F3IDS})
+        wtl = lambda j: j["flush_path"][-1]["disk"]  # noqa: E731
+        for name, muts, cid, want in (
+                ("a flush request on the write-through leaf",
+                 {"report": lambda j: j["devices"].update({"sda": {"total": 3, "by_kind": {"flush": 3}, "comms": {}}})},
+                 "F3:devflush", ["flush requests issued to a write-through (or brd) device"]),
+                ("the write-back label on a write-through leaf",
+                 both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][True])), "F3:record", ["floor_kind"]),
+                ("flush_sent without the host-caching qualifier",
+                 both(lambda j: j.update(flush_sent_to_device=FLUSH_SENT["wt"][True] + " and its device report agrees")),
+                 "F3:record", ["flush_sent_to_device"]),
+                ("timing control applied to a write-through leaf", both(lambda j: j.update(timing_control="pass", flush_control="pass")),
+                 "F3:complete", ["timing_control disagrees with raw and the leaf (A14, A17)"])):
+            g = run_wt(name.replace(" ", "_")[:24], muts.get("probe"), muts.get("merged"), muts.get("report"))
+            t = tags(g.get(cid, {}))
+            others = [i for i in F3IDS if i != cid and g.get(i, {}).get("pass") is not True]
+            chk("real (write-through): planted %s -> %s fails with %s only, the other F3 checks pass" % (name, cid, want),
+                g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
         # cell:leaf through its own function
         f3 = rj(os.path.join(src, "F3", "summary.probe.json"))
         sdl = rj(os.path.join(src, "sd_leaf.json"))
@@ -1557,8 +1598,10 @@ def main(argv):
                   "(the brd rule on a brd cell): the control for the plants")
             continue
         g = g or {}
-        if want.startswith("VOID "):
-            ok = rc == 3 and g.get("refusals") == [] and any(str(x).startswith(want[5:]) for x in g.get("voids") or [])
+        if want.startswith("VOID "):  # on a brd cell the copy is also refused by the brd rule (bound mode), and only by it
+            refs = g.get("refusals") or []
+            ok = any(str(x).startswith(want[5:]) for x in g.get("voids") or []) and (
+                rc == 3 and refs == [] if leaf != "brd" else rc == 2 and bool(refs) and all(str(r).startswith("leaf brd:") for r in refs))
         else:
             ok = rc == 2 and any(str(r).startswith(want) for r in g.get("refusals") or [])
         check("F4:" + tag, ok, {"rc": rc, "refusals": g.get("refusals"), "voids": g.get("voids")},

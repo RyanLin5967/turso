@@ -133,7 +133,7 @@ jobs:
           # a fixture that fails is recorded and its plant then fails in check.py; the fire-check still runs
           # the nest fixture starts on the filesystem that holds the cell's leaf: the cell's mount for a block cell,
           # the directory of the cell's loop backing file for a loop cell (seventh review M3; run 37808860197)
-          src=$(findmnt -n -o SOURCE "$MNT")
+          src=$(findmnt -n -o SOURCE -T "$MNT" || true)
           case $src in /dev/loop*) NEST=$(dirname "$(losetup -n -O BACK-FILE "$src" | xargs)") ;; *) NEST=$MNT ;; esac
           echo "nest dir: $NEST (cell source $src)"
           rc=0; V3_NEST_DIR="$NEST" bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?

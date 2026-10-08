@@ -25,5 +25,7 @@ sixth review's box. The fields that probe never wrote were synthesized from the 
 The script that made the upgrade is lane-local, in the lane's scratchpad `v3/upgrade_td.py`. Every other byte is the
 banked run's.
 
-The next CI run's real batches replace it: a write-back cell and a write-through cell, so the write-through rules
-also run through check_real. When that happens, this README is replaced by a plain provenance line.
+A real batch of the current format now drives the write-through rules: testdata/f3-37811638228-arm-ext4loop, a
+write-through Hyper-V sd cell from run 37811638228 at ed3496f52, copied unchanged. This write-back batch stays upgraded
+until a write-back cell lands in a green run of the current format (in run 37811638228 every x86 runner had sda), and
+then it is replaced.
