@@ -5087,6 +5087,40 @@ mod format_tests {
         );
     }
 
+    /// Engine review 10 #4: `dir_dirty` lives in memory, so a process that died after a cut's
+    /// rename and before the flight that would sync the directory (C1 kills at cut.renamed) left
+    /// the rename not durable, and the next process acknowledged syncing flights over it: a power
+    /// cut can bring back the older-generation log and lose them. An open of a whole log, which
+    /// cuts nothing, cannot tell whether the dead process renamed: a syncing open syncs the
+    /// log's directory before anything follows, and a D0 open leaves it to the next flight that
+    /// syncs. Mutant `open_forgets_unsynced_rename`.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_makes_a_rename_the_dead_process_left_durable() {
+        let dirs = || DIR_SYNCS.with(|c| c.get());
+        for class in [SyncClass::Fsync, SyncClass::FullFsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            flights(&files, 0, &[1, 1], class);
+            let before = dirs();
+            let recovered = Journal::recover(&files, class).unwrap().expect("state");
+            assert!(!recovered.records.is_empty(), "{class:?}: premise: the whole log was kept");
+            assert!(
+                dirs() > before,
+                "{class:?}: a syncing open left the log's directory unsynced"
+            );
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert!(!recovered.records.is_empty(), "Off: premise: the whole log was kept");
+        assert!(
+            recovered.journal.dir_dirty,
+            "Off: a D0 open left a rename no later syncing flight makes durable"
+        );
+    }
+
     /// Engine review 7 #2 (a): review 5 #26's rule (damage under one whole later synced flight lies
     /// in an acknowledged flight) rests on the WRITER syncing every flight before the next, so it
     /// holds for a log D1/D2 flights were synced into whatever class reopens it. Before, a D0 open
