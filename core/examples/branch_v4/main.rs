@@ -1,9 +1,16 @@
 //! V4 base-diff confirm run (r11-merge lane; PREREG A20 in frontier/round11/r11-merge/PREREG.md).
 //!
-//!   branch_v4 victim --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
-//!   branch_v4 reopen --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
+//!   branch_v4 victim --db PATH (--age A [--forks F] | --versions V) [--rows R] [--keys K] [--per M] [--seed S]
+//!   branch_v4 reopen (the same arguments)
 //!   branch_v4 nvictim --db PATH --live N [--every C] [--sample S] [--skeys K] [--rows R] [--seed S] [--tail]
 //!   branch_v4 nreopen --db PATH --live N [--every C] [--sample S] [--skeys K] [--rows R] [--seed S] [--plant]
+//!
+//! A20c's arms: `--forks F` (the N arm) forks F more branches from the trunk, detached and never
+//! written, spread evenly over the A commits (floor(F*g/A) - floor(F*(g-1)/A) before commit g).
+//! `--versions V` (the V arm) replaces the random commits: V rounds of one trunk commit updating
+//! B's K key rows, so rewriting B's leaves, then one observer fork, detached; each of B's leaves
+//! then carries V retained trunk versions and B's base is the oldest. Neither applies to nvictim
+//! or nreopen (K8-N), which refuse them.
 //!
 //! `nvictim`/`nreopen` are lane r12-composition's arm K8-N (frontier/round12/r12-composition/PREREG.md §3):
 //! V4's base read on the N axis. N branches are forked from the trunk and detached (live); S of them,
@@ -15,7 +22,7 @@
 //! every sampled key through `Database::branch_base_page`, compares the base cell with the model's
 //! value at that writer's fork and V4's verdict (base != the trunk's current row) with the model's
 //! truth (the trunk wrote the key after the fork). `--plant` expects the wrong base for the first
-//! sampled key (a fire-check: it must print FINDING and exit 3). `victim`/`reopen` are unchanged.
+//! sampled key (a fire-check: it must print FINDING and exit 3). K8-N leaves `victim`/`reopen` as A20c has them.
 //!
 //! `victim` is the kill -9 VICTIM. It opens a fresh catalog-mode store (`Catalog { sync: turso_core::branch::SyncClass::Off }`;
 //! the files are the same bytes as with sync), creates t(id INTEGER PRIMARY KEY, v TEXT) with R
@@ -76,6 +83,8 @@ struct Args {
     skeys: usize,
     tail: bool,
     plant: bool,
+    forks: u64,
+    versions: u64,
 }
 
 fn parse_args() -> Args {
@@ -95,6 +104,8 @@ fn parse_args() -> Args {
         skeys: 4,
         tail: false,
         plant: false,
+        forks: 0,
+        versions: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -111,6 +122,8 @@ fn parse_args() -> Args {
             "--skeys" => args.skeys = val().parse().unwrap_or_else(|_| die("bad --skeys")),
             "--tail" => args.tail = true,
             "--plant" => args.plant = true,
+            "--forks" => args.forks = val().parse().unwrap_or_else(|_| die("bad --forks")),
+            "--versions" => args.versions = val().parse().unwrap_or_else(|_| die("bad --versions")),
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -124,10 +137,19 @@ fn parse_args() -> Args {
         if args.skeys as i64 > args.rows || args.rows < 1 {
             die("--skeys exceeds --rows");
         }
+        if args.forks != 0 || args.versions != 0 {
+            die("--forks and --versions are victim/reopen's A20c arms; nvictim and nreopen take --live");
+        }
         return args;
     }
+    if args.versions > 0 {
+        if args.age != 0 || args.forks != 0 {
+            die("--versions sets the commits and the forks; it takes no --age or --forks");
+        }
+        args.age = args.versions;
+    }
     if args.db.as_os_str().is_empty() || args.age == 0 || args.rows < 1 || args.keys == 0 || args.per == 0 {
-        die("--db and --age are required; --rows, --keys and --per must be positive");
+        die("--db and --age (or --versions) are required; --rows, --keys and --per must be positive");
     }
     if args.keys as i64 > args.rows {
         die("--keys exceeds --rows");
@@ -165,10 +187,24 @@ fn draws(args: &Args) -> Draws {
             keys.push(k);
         }
     }
-    let trunk = (0..args.age)
-        .map(|_| (0..args.per).map(|_| rng.row(args.rows)).collect())
-        .collect();
+    let trunk = if args.versions > 0 {
+        vec![keys.clone(); args.versions as usize]
+    } else {
+        (0..args.age)
+            .map(|_| (0..args.per).map(|_| rng.row(args.rows)).collect())
+            .collect()
+    };
     Draws { keys, trunk }
+}
+
+/// The N arm's forks before commit `g` (1-based): F spread evenly over the A commits.
+fn forks_before(args: &Args, g: u64) -> u64 {
+    args.forks * g / args.age - args.forks * (g - 1) / args.age
+}
+
+/// Live branches the run leaves: B, the N arm's forks, the V arm's observers.
+fn n_live(args: &Args) -> usize {
+    (1 + args.forks + args.versions) as usize
 }
 
 fn trunk_value(id: i64) -> String {
@@ -262,9 +298,11 @@ fn victim(args: &Args) {
     trunk.execute("COMMIT").unwrap();
     checkpoint_truncate(&trunk);
     println!(
-        "# victim pid={} age={} rows={} keys={} per={} seed={} page_size={} page_count={}",
+        "# victim pid={} age={} forks={} versions={} rows={} keys={} per={} seed={} page_size={} page_count={}",
         std::process::id(),
         args.age,
+        args.forks,
+        args.versions,
         args.rows,
         args.keys,
         args.per,
@@ -284,17 +322,28 @@ fn victim(args: &Args) {
     conn.execute("COMMIT").unwrap();
     drop(conn);
     let _ = branch.into_id();
+    let fork_one = || {
+        let b = trunk.fork_branch().unwrap();
+        let _ = b.into_id();
+    };
     for (g, rows) in d.trunk.iter().enumerate() {
-        let value = trunk_write_value(g as u64 + 1);
+        let g = g as u64 + 1;
+        for _ in 0..if args.forks > 0 { forks_before(args, g) } else { 0 } {
+            fork_one();
+        }
+        let value = trunk_write_value(g);
         trunk.execute("BEGIN").unwrap();
         for &r in rows {
             trunk.execute(format!("UPDATE t SET v = '{value}' WHERE id = {r}")).unwrap();
         }
         trunk.execute("COMMIT").unwrap();
+        if args.versions > 0 {
+            fork_one();
+        }
     }
     let st = db.branch_stats().unwrap();
-    if st.live_branches != 1 {
-        not_a_result(&format!("after the trunk commits: {st:?}, expected 1 live branch"));
+    if st.live_branches != n_live(args) {
+        not_a_result(&format!("after the trunk commits: {st:?}, expected {} live branches", n_live(args)));
     }
     println!(
         "# victim before checkpoint: trunk_commits={} trunk_retained={} arena_slots_in_use={} {}",
@@ -554,22 +603,39 @@ fn reopen(args: &Args) {
         args.age,
         rewritten_leaves.len()
     );
+    let (base_reads, base_arena, base_refused, base_examined) = (
+        v4_1.base_reads - v4_0.base_reads,
+        v4_1.base_arena - v4_0.base_arena,
+        v4_1.base_refused - v4_0.base_refused,
+        v4_1.base_examined - v4_0.base_examined,
+    );
+    let (cp_probes, cp_rows) = (v4_1.cp_probes - v4_0.cp_probes, v4_1.cp_rows - v4_0.cp_rows);
+    let (probe_calls, probe_found) = (v4_1.probe_calls - v4_0.probe_calls, v4_1.probe_found - v4_0.probe_found);
+    // (s): B-tree seeks + cursor steps; (g): pages fetched; per probe that found a version (index
+    // and table) and per empty probe (index alone). A20d.
+    let s_found = (v4_1.found_seeks + v4_1.found_steps) - (v4_0.found_seeks + v4_0.found_steps);
+    let s_all = (v4_1.probe_seeks + v4_1.probe_steps) - (v4_0.probe_seeks + v4_0.probe_steps);
+    let g_found = v4_1.found_page_gets - v4_0.found_page_gets;
+    let g_all = v4_1.probe_page_gets - v4_0.probe_page_gets;
+    let probe_empty = probe_calls - probe_found;
     println!(
-        "V4\tage={}\trows={}\tkeys={n}\tper={}\tseed={}\tbase_reads={}\tbase_arena={}\tbase_refused={}\tbase_examined={}\t\
-         cp_probes={}\tcp_rows={}\tcat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
+        "V4\tage={}\tforks={}\tversions={}\tn_live={}\trows={}\tkeys={n}\tper={}\tseed={}\t\
+         base_reads={base_reads}\tbase_arena={base_arena}\tbase_refused={base_refused}\tbase_examined={base_examined}\t\
+         cp_probes={cp_probes}\tcp_rows={cp_rows}\tprobe_calls={probe_calls}\tprobe_found={probe_found}\t\
+         s_total={s_all}\ts_found={s_found}\tg_total={g_all}\tg_found={g_found}\t\
+         cat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
          resolve_calls={}\tresolve_arena_reads={}\tarena_by_depth={:?}\tcurrent_by_depth={:?}\tpath_pages_total={}\th_min={h_min}\th_max={h_max}\t\
          expect_arena_leaf={expect_arena_leaf}\tleaves_rewritten={}\tpaths_equal={paths_equal}\tbase_ok={base_ok}\tours_differs={ours_differs}\t\
-         M={:.4}\tM1={:.4}\tM2_cp_rows_per_arena={}\tM2_examined_per_arena={}\tpage_io_open={:?}\tpage_io_v4={:?}",
+         M={:.4}\tM1={:.4}\tM2_cp_rows_per_arena={}\tM2_examined_per_arena={}\t\
+         s_per_probe={}\ts_per_found={}\ts_per_empty={}\tg_per_probe={}\tg_per_found={}\tg_per_empty={}\t\
+         page_io_open={:?}\tpage_io_v4={:?}",
         args.age,
+        args.forks,
+        args.versions,
+        n_live(args),
         args.rows,
         args.per,
         args.seed,
-        v4_1.0 - v4_0.0,
-        v4_1.1 - v4_0.1,
-        v4_1.2 - v4_0.2,
-        v4_1.3 - v4_0.3,
-        v4_1.4 - v4_0.4,
-        v4_1.5 - v4_0.5,
         cat1.0 - cat0.0,
         cat1.1 - cat0.1,
         cat1.2 - cat0.2,
@@ -582,8 +648,14 @@ fn reopen(args: &Args) {
         rewritten_leaves.len(),
         arena as f64 / n as f64,
         path_pages.iter().sum::<u64>() as f64 / n as f64,
-        ratio(v4_1.5 - v4_0.5, v4_1.1 - v4_0.1),
-        ratio(v4_1.3 - v4_0.3, v4_1.1 - v4_0.1),
+        ratio(cp_rows, base_arena),
+        ratio(base_examined, base_arena),
+        ratio(s_all, probe_calls),
+        ratio(s_found, probe_found),
+        ratio(s_all - s_found, probe_empty),
+        ratio(g_all, probe_calls),
+        ratio(g_found, probe_found),
+        ratio(g_all - g_found, probe_empty),
         delta(io0, io1),
         delta(io1, io2)
     );
@@ -592,8 +664,13 @@ fn reopen(args: &Args) {
         println!("FINDING: {f}");
     }
     let _ = std::io::stdout().flush();
-    if v4_1.1 - v4_0.1 != arena {
-        not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
+    if probe_calls != cp_probes {
+        not_a_result(&format!(
+            "the catalog counted {probe_calls} trunk_pred calls and the store {cp_probes} C-P probes: a range read ran in the window"
+        ));
+    }
+    if base_arena != arena {
+        not_a_result(&format!("the store counted {base_arena} arena base reads, the harness {arena}"));
     }
 
     // Theirs, after the counters are taken (these reads go through the ordinary resolve path).
@@ -624,8 +701,8 @@ fn reopen(args: &Args) {
                 db.branch_trunk_retained(),
                 files_line(&args.db)
             );
-            if st.live_branches != 1 {
-                later.push(format!("after the reopen: {st:?}, expected 1 live branch"));
+            if st.live_branches != n_live(args) {
+                later.push(format!("after the reopen: {st:?}, expected {} live branches", n_live(args)));
             }
         }
         Err(e) => later.push(format!("branch_stats after the reopen: {e}")),
@@ -865,13 +942,13 @@ fn nreopen(args: &Args) {
                 path.push(page);
                 let (r0, p0, l0) = (
                     turso_core::branch::page_io()[0],
-                    db.branch_v4_counters().4,
+                    db.branch_v4_counters().cp_probes,
                     db.branch_catalog_counters().0,
                 );
                 let answer = db.branch_base_page(id, page, &mut buf);
                 let (dr, dp, dl) = (
                     turso_core::branch::page_io()[0] - r0,
-                    db.branch_v4_counters().4 - p0,
+                    db.branch_v4_counters().cp_probes - p0,
                     db.branch_catalog_counters().0 - l0,
                 );
                 probes_max = probes_max.max(dp);
@@ -947,7 +1024,7 @@ fn nreopen(args: &Args) {
     let h_max = *path_pages.iter().max().unwrap();
     let delta = |a: [u64; 4], b: [u64; 4]| [b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]];
     let io_v4 = delta(io1, io2);
-    let probes = v4_1.4 - v4_0.4;
+    let probes = v4_1.cp_probes - v4_0.cp_probes;
     println!("# nreopen open_stats {open_stats:?}");
     println!(
         "# nreopen at open: files {files_at_open}; catalog (branch_loads, trunk_page_loads, queries, rows_read) {cat_open:?}; page_io {:?}",
@@ -975,11 +1052,11 @@ fn nreopen(args: &Args) {
         args.seed,
         args.tail,
         args.plant,
-        v4_1.0 - v4_0.0,
-        v4_1.1 - v4_0.1,
-        v4_1.2 - v4_0.2,
-        v4_1.3 - v4_0.3,
-        v4_1.5 - v4_0.5,
+        v4_1.base_reads - v4_0.base_reads,
+        v4_1.base_arena - v4_0.base_arena,
+        v4_1.base_refused - v4_0.base_refused,
+        v4_1.base_examined - v4_0.base_examined,
+        v4_1.cp_rows - v4_0.cp_rows,
         cat1.0 - cat0.0,
         cat1.1 - cat0.1,
         cat1.2 - cat0.2,
@@ -989,8 +1066,8 @@ fn nreopen(args: &Args) {
         &arena_by_depth[..(h_max as usize).min(8)],
         &current_by_depth[..(h_max as usize).min(8)],
         path_pages.iter().sum::<u64>(),
-        ratio(probes, v4_1.0 - v4_0.0),
-        ratio(v4_1.5 - v4_0.5, probes),
+        ratio(probes, v4_1.base_reads - v4_0.base_reads),
+        ratio(v4_1.cp_rows - v4_0.cp_rows, probes),
         ratio(io_v4[0], probes),
         delta(io0, io_open),
     );
@@ -1011,13 +1088,13 @@ fn nreopen(args: &Args) {
         ratio(twk_reads, twk_probes),
         ratio(tva_reads, tva_probes),
     );
-    if twk_probes + tva_probes != v4_1.4 - v4_0.4 {
+    if twk_probes + tva_probes != v4_1.cp_probes - v4_0.cp_probes {
         not_a_result(&format!(
             "probes split {twk_probes} + {tva_probes}, the store counted {} C-P probes",
-            v4_1.4 - v4_0.4
+            v4_1.cp_probes - v4_0.cp_probes
         ));
     }
-    let cp_rows = v4_1.5 - v4_0.5;
+    let cp_rows = v4_1.cp_rows - v4_0.cp_rows;
     println!(
         "K8B\tlive={}\ttail={}\tkeys={n}\tarena_per_key={:.4}\tcp_rows_per_key={:.4}\ttwk_probes={twk_probes}\ttwk_rows={twk_rows}\t\
          twk_rows_per_key={:.4}\tother_rows_per_key={:.4}\tpure_calls={pure_calls}\tpure_probes={pure_probes}\tpure_reads={pure_reads}\t\
@@ -1037,11 +1114,11 @@ fn nreopen(args: &Args) {
         println!("FINDING: {f}");
     }
     let _ = std::io::stdout().flush();
-    if v4_1.1 - v4_0.1 != arena {
-        not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
+    if v4_1.base_arena - v4_0.base_arena != arena {
+        not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.base_arena - v4_0.base_arena));
     }
-    if pure_calls + load_calls != v4_1.0 - v4_0.0 {
-        not_a_result(&format!("bracketed {} calls, the store counted {} base reads", pure_calls + load_calls, v4_1.0 - v4_0.0));
+    if pure_calls + load_calls != v4_1.base_reads - v4_0.base_reads {
+        not_a_result(&format!("bracketed {} calls, the store counted {} base reads", pure_calls + load_calls, v4_1.base_reads - v4_0.base_reads));
     }
 
     // Theirs and the live count, after the counters are taken (these settle and read through the
@@ -1092,7 +1169,7 @@ fn nreopen(args: &Args) {
     println!("DONE live={}", args.live);
 }
 
-/// `num/den` to four places, or `na` when nothing was arena-resolved.
+/// `num/den` to four places, or `na` when the denominator is 0.
 fn ratio(num: u64, den: u64) -> String {
     if den == 0 {
         "na".to_string()
