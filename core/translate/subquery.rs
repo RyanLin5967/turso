@@ -765,6 +765,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -901,6 +902,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
@@ -1051,6 +1053,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -1809,6 +1812,18 @@ fn emit_materialized_subquery_table(
     // Allocate registers for reading result columns
     let result_columns_start_reg = program.alloc_registers(columns.len());
 
+    let build_end = if plan_is_correlated(plan) {
+        None
+    } else {
+        let label = program.allocate_label();
+        // A correlated parent query can reach this code more than once.
+        // SQLite keeps an uncorrelated FROM source for the full statement.
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    };
+
     // Open the ephemeral table
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
@@ -1872,6 +1887,10 @@ fn emit_materialized_subquery_table(
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
         }
+    }
+
+    if let Some(build_end) = build_end {
+        program.preassign_label_to_next_insn(build_end);
     }
 
     Ok((result_columns_start_reg, cursor_id, ephemeral_table))

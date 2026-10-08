@@ -117,7 +117,11 @@ pub fn rows_per_leaf_page_for_index(
 /// * `base_row_count` - Total rows in the table
 /// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
 /// * `params` - Cost model parameters
-fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
+pub(super) fn estimate_scan_cost(
+    base_row_count: f64,
+    num_scans: f64,
+    params: &CostModelParams,
+) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
 
     // First scan reads all pages; subsequent scans benefit from caching
@@ -249,6 +253,28 @@ pub(crate) fn is_unique_point_lookup(
     index_info.unique && eq_count >= index_info.column_count
 }
 
+/// Return true when an index access uses its complete unique key.
+pub(crate) fn index_access_is_unique_point_lookup(
+    index: Option<&Index>,
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let index_info = match index {
+        Some(index) => IndexInfo {
+            unique: index.unique,
+            column_count: index.columns.len(),
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+        None => IndexInfo {
+            unique: true,
+            column_count: 1,
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+    };
+    is_unique_point_lookup(index_info, usable_constraint_refs)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowCountEstimate {
     HardcodedFallback(f64),
@@ -289,8 +315,10 @@ pub(crate) fn estimate_rows_per_seek(
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> f64 {
+    let join_probe_constant_selectivity =
+        join_probe_constant_selectivity(constraints, usable_constraint_refs);
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
-        return 1.0;
+        return join_probe_constant_selectivity;
     }
 
     if let Some(ctx) = analyze_ctx {
@@ -318,7 +346,8 @@ pub(crate) fn estimate_rows_per_seek(
                         sel
                     })
                     .product();
-                return (eq_prefix_rows * range_selectivity).max(1.0);
+                return (eq_prefix_rows * range_selectivity).max(1.0)
+                    * join_probe_constant_selectivity;
             }
         }
     }
@@ -340,7 +369,27 @@ pub(crate) fn estimate_rows_per_seek(
         })
         .product();
 
-    (selectivity_multiplier * *base_row_count).max(1.0)
+    (selectivity_multiplier * *base_row_count).max(1.0) * join_probe_constant_selectivity
+}
+
+fn join_probe_constant_selectivity(
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> f64 {
+    let equality_constraints = usable_constraint_refs
+        .iter()
+        .take_while(|constraint| constraint.eq.is_some())
+        .map(|constraint| &constraints[constraint.eq.as_ref().unwrap().constraint_pos]);
+    if !equality_constraints
+        .clone()
+        .any(|constraint| !constraint.lhs_mask.is_empty())
+    {
+        return 1.0;
+    }
+    equality_constraints
+        .filter(|constraint| constraint.lhs_mask.is_empty())
+        .map(|constraint| constraint.selectivity)
+        .product()
 }
 
 /// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).

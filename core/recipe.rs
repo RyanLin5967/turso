@@ -1162,7 +1162,15 @@ impl CompiledRecipe {
             match insn.to_function()(&self.program, &mut self.state, insn, pager)? {
                 InsnFunctionStepResult::Step => {}
                 InsnFunctionStepResult::Done => break,
-                InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row => {
+                InsnFunctionStepResult::IO => {
+                    // The yield parked its completion in the sub-program's state, which is reused
+                    // by the next run: drop it with this one.
+                    let _ = self.state.take_suspended_io();
+                    return Err(LimboError::InternalError(
+                        "recipe sub-program yielded".to_string(),
+                    ));
+                }
+                InsnFunctionStepResult::Row => {
                     return Err(LimboError::InternalError(
                         "recipe sub-program yielded".to_string(),
                     ))

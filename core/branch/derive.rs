@@ -162,7 +162,7 @@ struct Parsed {
 impl Parsed {
     fn new(page: u32, bytes: &[u8], usable: usize) -> Option<Parsed> {
         let mut inner = PageInner::from_buffer(Buffer::new(bytes.to_vec()));
-        inner.id = page as usize;
+        inner.set_id(page as usize);
         let kind = inner.page_type().ok()?;
         let n = inner.cell_count();
         // A page that is not a b-tree page can carry any type byte: its cell count must at least

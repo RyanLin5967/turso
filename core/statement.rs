@@ -24,6 +24,7 @@ use crate::{
             EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE,
             EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
         },
+        ProgramStep,
     },
     Connection, EqpFormat, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
     EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, EXPLAIN_QUERY_PLAN_JSON_COLUMNS,
@@ -304,10 +305,7 @@ pub struct Statement {
     /// - `Some(Some(duration))`: override with a query-specific timeout
     /// - `Some(None)`: disable timeout for this execution
     query_timeout_override: Option<Option<Duration>>,
-    /// True once step() has returned Row for a write statement (INSERT/UPDATE/DELETE
-    /// with RETURNING). With ephemeral-buffered RETURNING, the first Row proves all
-    /// DML completed — only the scan-back remains. Used by reset_internal to decide
-    /// commit vs rollback when a statement is abandoned.
+    /// True once [Self::step] has returned a [Row].
     has_returned_row: bool,
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
@@ -335,7 +333,7 @@ impl std::fmt::Debug for Statement {
 }
 
 impl Statement {
-    pub(crate) fn prepare_index_methods(&mut self) -> Result<crate::IOResult<()>> {
+    pub(crate) fn prepare_index_methods(&mut self) -> crate::types::IOResultOr<()> {
         crate::vdbe::execute::index_method_stage_statement_all(&mut self.state)
     }
 
@@ -522,14 +520,10 @@ impl Statement {
         }
         let timeout = match self.query_timeout_override {
             Some(timeout_override) => timeout_override,
-            None => {
-                let connection_timeout = self.program.connection.get_query_timeout();
-                if connection_timeout.is_zero() {
-                    None
-                } else {
-                    Some(connection_timeout)
-                }
-            }
+            None => match self.program.connection.get_query_timeout_ms() {
+                0 => None,
+                millis => Some(Duration::from_millis(millis)),
+            },
         };
         let Some(timeout) = timeout else {
             return;
@@ -561,7 +555,44 @@ impl Statement {
         }
     }
 
+    /// Every step of a statement passes through here, so the work that only
+    /// matters on the first call, the last call, a busy wait or an error is
+    /// gated behind cheap flag tests and kept out of line. A row in the middle
+    /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            || !self.counted_as_active_root
+            || self.busy_handler_state.is_some()
+        {
+            if let Some(result) = self.prepare_step(waker)? {
+                return Ok(result);
+            }
+        }
+        let res = match self.query_mode {
+            QueryMode::Normal => {
+                match self
+                    .program
+                    .normal_step(&mut self.state, &self.pager, waker)
+                {
+                    ProgramStep::Row => {
+                        self.busy = true;
+                        self.has_returned_row = true;
+                        return Ok(StepResult::Row);
+                    }
+                    step => step.into(),
+                }
+            }
+            _ => self
+                .program
+                .step(&mut self.state, &self.pager, self.query_mode, waker),
+        };
+        self.finish_step(res, waker)
+    }
+
+    /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
+    /// hand back to the caller when the statement must not run yet.
+    #[inline(never)]
+    fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
@@ -577,7 +608,7 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
-            if self.program.connection.mvcc_enabled() {
+            if self.state.db_mv_store(&self.program.connection).is_some() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
                 self.program.connection.maybe_update_schema();
@@ -605,19 +636,26 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::Sleep {
+                return Ok(Some(StepResult::Sleep {
                     duration: busy_state.get_delay(now),
-                });
+                }));
             }
         }
+        Ok(None)
+    }
 
+    /// Everything [`Self::_step`] does after the interpreter returned something
+    /// other than a row: schema retries, completion, busy handling and errors.
+    #[inline(never)]
+    fn finish_step(
+        &mut self,
+        mut res: std::result::Result<StepResult, Box<LimboError>>,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
-        let mut res = self
-            .program
-            .step(&mut self.state, &self.pager, self.query_mode, waker);
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
-            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+            if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
                 break;
             }
             // In a write transaction, reprepare may not help (e.g. cross-process
@@ -645,18 +683,15 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            self.program
-                .connection
-                .metrics
-                .write()
-                .record_statement(&self.metrics());
+            let connection = &self.program.connection;
+            self.state
+                .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
             self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
-            let sql = self.program.sql.trim_start().as_bytes();
-            if sql.len() >= 7 && sql[..7].eq_ignore_ascii_case(b"ANALYZE") {
+            if self.program.refreshes_analyze_stats {
                 // The stats refresh runs a SELECT on this same connection. At
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
@@ -693,13 +728,7 @@ impl Statement {
             // else: Handler says stop, res stays as Busy
         }
 
-        // Track when a write statement yields its first Row. With ephemeral-buffered
-        // RETURNING, this proves all DML completed — only the scan-back remains.
-        if matches!(res, Ok(StepResult::Row))
-            && self.query_mode == QueryMode::Normal
-            && self.program.change_cnt_on
-            && !self.program.result_columns.is_empty()
-        {
+        if matches!(res, Ok(StepResult::Row)) {
             self.has_returned_row = true;
         }
 
@@ -721,7 +750,9 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
-        res
+        // The interpreter chain carries a boxed error to keep per-row returns
+        // register-sized; unbox once at the public boundary.
+        res.map_err(|err| *err)
     }
 
     #[inline]
@@ -741,6 +772,7 @@ impl Statement {
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
+            .map_err(|err| *err)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -804,7 +836,7 @@ impl Statement {
     /// Used by engine-internal callers that must stay non-blocking (MVCC
     /// bootstrap/recovery) so they don't call `io.step()` on backends that have
     /// no synchronous IO pump (e.g. WASM).
-    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+    pub fn run_ignore_rows_nonblock(&mut self) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -815,8 +847,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -835,7 +867,7 @@ impl Statement {
     pub fn run_with_row_callback_nonblock(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
-    ) -> Result<crate::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
@@ -848,8 +880,8 @@ impl Statement {
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy.into()),
             }
         }
     }
@@ -1424,7 +1456,7 @@ impl Statement {
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path
-        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // (e.g. SequenceExhausted), rollback_current_txn_state
         // rolled back what mv_tx pointed at — the inner — and set
         // auto_commit=true under the assumption it was the only live tx.
         // Restoring mv_tx to the outer without also restoring auto_commit=false
@@ -1484,7 +1516,12 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        let in_flight = self
+            .state
+            .io_completions
+            .take()
+            .filter(|io| !io.0.is_wait());
+        if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
@@ -1517,7 +1554,11 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO) => {
+                            // halt() is re-entered until it finishes; the
+                            // IO loop runs once per attempt, as before the
+                            // completion was parked in the state.
+                            drop(self.state.take_suspended_io());
                             if let Err(e) = self.pager.io.step() {
                                 capture_reset_error(
                                     &mut reset_error,
@@ -1530,7 +1571,7 @@ impl Statement {
                         Err(e) => {
                             capture_reset_error(
                                 &mut reset_error,
-                                e,
+                                *e,
                                 "Error halting statement during reset",
                             );
                             break;
@@ -1830,6 +1871,63 @@ mod tests {
 
         stmt.reset_metrics();
         assert_eq!(stmt.metrics().rows_written, 0);
+    }
+
+    #[test]
+    fn test_seek_metrics_separate_index_and_table_work() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(a, b)").unwrap();
+        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT b FROM t WHERE a = 2").unwrap();
+        stmt.run_collect_rows().unwrap();
+        let metrics = stmt.metrics();
+
+        assert_eq!(metrics.btree_seeks, 2);
+        assert_eq!(metrics.btree_table_seeks, 1);
+        assert_eq!(metrics.btree_index_seeks, 1);
+        assert_eq!(metrics.btree_deferred_seeks, 1);
+    }
+
+    #[test]
+    fn test_correlated_subquery_runs_after_selective_join() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, allowed_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE allowed(id INTEGER PRIMARY KEY, enabled INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE inner_rows(outer_id INTEGER, value INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX inner_outer_id ON inner_rows(outer_id)")
+            .unwrap();
+        conn.execute("INSERT INTO allowed VALUES (1, 0), (2, 1)")
+            .unwrap();
+        conn.execute("INSERT INTO outer_rows VALUES (1, 1), (2, 1), (3, 2)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inner_rows
+             SELECT id, CASE WHEN id = 3 THEN 0 ELSE id END FROM outer_rows",
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.id
+                 FROM outer_rows o CROSS JOIN allowed a
+                 WHERE a.id = o.allowed_id
+                   AND a.enabled = 1
+                   AND EXISTS (
+                       SELECT 1 FROM inner_rows i
+                       WHERE i.outer_id = o.id AND i.value <> o.id
+                   )",
+            )
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
+        assert_eq!(stmt.metrics().btree_index_seeks, 1);
     }
 
     #[test]
