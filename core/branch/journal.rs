@@ -5131,6 +5131,47 @@ mod format_tests {
         );
     }
 
+    /// Engine review 10 #3: a log a D1 run synced (acknowledged in Fsync) reopened in D0 has
+    /// rewrite class Off: its header was never raised, and the class recovery decided for it was
+    /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
+    /// compaction, then replaced the log holding those acknowledged records with an unsynced file
+    /// and no directory sync. Until that first rewrite lands, the store rewrites in the class the
+    /// records were made durable in. Mutant `inherited_floor_dropped`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_open_of_a_synced_log_rewrites_in_the_class_it_was_synced_in() {
+        let dirs = || DIR_SYNCS.with(|c| c.get());
+        for compaction in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            flights(&files, 0, &[1, 1], SyncClass::Fsync);
+            let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+            assert!(!journal.raised.syncs(), "compaction={compaction}: premise: the D1 run never raised the header");
+            let (before, synced) = (dirs(), super::super::sync_counts());
+            if compaction {
+                journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
+            } else {
+                let end = journal.mark();
+                let generation = journal.generation;
+                journal.rewrite_from(end, generation).unwrap();
+            }
+            let after = super::super::sync_counts();
+            assert!(
+                after.fsync + after.full_fsync > synced.fsync + synced.full_fsync,
+                "compaction={compaction}: the first rewrite of acknowledged records synced no file"
+            );
+            assert!(
+                dirs() > before,
+                "compaction={compaction}: the first rewrite of acknowledged records synced no directory"
+            );
+            let before = dirs();
+            let end = journal.mark();
+            let generation = journal.generation;
+            journal.rewrite_from(end, generation).unwrap();
+            assert_eq!(dirs(), before, "compaction={compaction}: the inherited floor outlived the rewrite that carried its records");
+        }
+    }
+
     /// Engine review 7 #2 (a): review 5 #26's rule (damage under one whole later synced flight lies
     /// in an acknowledged flight) rests on the WRITER syncing every flight before the next, so it
     /// holds for a log D1/D2 flights were synced into whatever class reopens it. Before, a D0 open
