@@ -4903,6 +4903,38 @@ fn untyped_contexts_type_their_parameters() {
     );
 }
 
+/// INTERSECT ALL and EXCEPT ALL are refused (0A000): the engine has neither, and they ran as
+/// INTERSECT and EXCEPT, dropping the duplicates PostgreSQL keeps (union.out:271-277: `SELECT 1
+/// UNION ALL SELECT 1 INTERSECT ALL SELECT 1` keeps two). A VALUES arm runs as a set operation's arm
+/// (`SELECT 1 UNION VALUES (2)` is {1, 2}); it failed (wire review 11 item 14).
+#[test]
+fn intersect_all_and_except_all_are_refused_and_values_arms_run() {
+    let dir = Scratch::new("setopall");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT 1 INTERSECT ALL SELECT 1",
+        "SELECT 1 EXCEPT ALL SELECT 2",
+        "SELECT 1 UNION ALL (SELECT 1 INTERSECT ALL SELECT 1)",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    let r = a
+        .q("SELECT 1 AS x UNION VALUES (2) ORDER BY 1")
+        .ok("a VALUES arm");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+    let r = a
+        .q("VALUES (3) UNION ALL SELECT 4 ORDER BY 1")
+        .ok("a VALUES left arm");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("3".to_string())], vec![Some("4".to_string())]]
+    );
+}
+
 /// Set operations keep PostgreSQL's grouping: INTERSECT binds tighter than UNION and EXCEPT, and
 /// parentheses group; a parenthesised arm keeps its own ORDER BY, LIMIT and WITH; and the WITH of
 /// the whole set operation is in scope for every arm. The tree was flattened and run left to right
