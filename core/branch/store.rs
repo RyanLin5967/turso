@@ -376,6 +376,10 @@ pub(crate) struct BranchStore {
     /// need VACUUM, which is refused), so a branch connection takes its page format from here
     /// instead of reading the trunk's file header (F6).
     trunk_format: AtomicU64,
+    /// r11-walpin FW3 for this database's branches (ported onto F6 for r11-walpin-conc row G,
+    /// dbeeb2cf4): taken from the process switch when the store is created, or set per database by
+    /// a test.
+    fw3: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from (F6, [`BranchStore::resolve_page_into`]).
@@ -3337,6 +3341,7 @@ impl BranchStore {
             retain_floor: AtomicU64::new(0),
             trunk_pages: TrunkPages::new(),
             trunk_format: AtomicU64::new(0),
+            fw3: AtomicBool::new(super::walpin::fw3()),
             fuzzy: false,
         }
     }
@@ -3601,6 +3606,7 @@ impl BranchStore {
             retain_floor: AtomicU64::new(0),
             trunk_pages: TrunkPages::new(),
             trunk_format: AtomicU64::new(0),
+            fw3: AtomicBool::new(super::walpin::fw3()),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -4076,6 +4082,26 @@ impl BranchStore {
             // the next first child is forked under the trunk's WAL write lock and this mutex.
             self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    pub(crate) fn fw3(&self) -> bool {
+        self.fw3.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fw3(&self, on: bool) {
+        self.fw3.store(on, Ordering::Relaxed);
+    }
+
+    /// r11-walpin FW3: whether branch `id` still reads `page` from the trunk (the store holds no
+    /// version of it for this branch). Not counted in the work counters. As `resolve_with`, a
+    /// branch in doubt after a fail-stop is refused.
+    pub(crate) fn sees_trunk(&self, id: BranchId, page: u32) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.fail_stop.load(Ordering::Acquire) {
+            inner.refuse_in_doubt(id)?;
+        }
+        let (mut levels, mut examined) = (0, 0);
+        Ok(inner.resolve(id, page, &mut levels, &mut examined)?.is_none())
     }
 
     /// The trunk's page size and reserved bytes per page, once a fork (or a branch connection
