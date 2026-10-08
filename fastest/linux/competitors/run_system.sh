@@ -58,6 +58,18 @@ PREBRANCH=${FT_PREBRANCH:-0}
 [[ $AGE =~ ^[0-9]+$ && $PREBRANCH =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_AGE [$AGE] / FT_PREBRANCH [$PREBRANCH] not counts" >&2; exit 2; }
 PSUM=$(python3 "$HERE/gen_seed.py" sum --rows "$ROWS" --updates "$AGE")  # the parent's sum(v) after the aging
 [[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
+# Real or smoke (lead ruling, artie DECISIONS 6b0bef481b): the CI smoke warm-up cap (FT_WARMUP=1000:10:2) is accepted
+# for SMOKE runs only, which say so with FT_DRY=1 and are never credited. Every other run is REAL (FT_DRY=0, also the
+# default: a run that does not declare itself smoke is held to the registration) and refuses, before anything runs, any
+# cap but the registered 1800 s and any warm-up but PREREG :210's rule at it (timedrun.py real). The T3 runner passes
+# FT_DRY=1 only on --dry-run.
+DRY=${FT_DRY:-0}
+case $DRY in
+  1) ;;
+  0) why=$(python3 -B "$HERE/timedrun.py" real "$CAP_S" "$WARMUP") ||
+       { echo "REFUSED: a real run (FT_DRY=0) takes only the registered cap and warm-up: [${why#REFUSED: }] (timedrun.py real)" >&2; exit 2; } ;;
+  *) echo "REFUSED: FT_DRY [$DRY] is neither 0 (a real run) nor 1 (smoke, uncredited)" >&2; exit 2 ;;
+esac
 SC="$HERE/stracecount.py"
 FH="$HERE/fthelp.py"
 SPECS="$HERE/loadgen/specs"
@@ -128,7 +140,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
   [ "$KIND" = pg ] && echo "pg_systems=pg18-d2 (with pg18-create-copy) pg18-defaults=DROPPED on Linux (lead ruling artie 6b0bef481b)"
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"

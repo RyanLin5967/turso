@@ -30,7 +30,7 @@ on:
         description: "per-run cap in seconds: the measured window's bound (registered: 1800)"
         default: "1800"
       warmup:
-        description: "warm-up OPS:S:MAX_S; empty = PREREG :210's rule at cap_s (1000:10:180 at 1800 s)"
+        description: "warm-up OPS:S:MAX_S (smoke cap 1000:10:2; PREREG :210's rule at 1800 s is 1000:10:180; empty gives 1000:10:2)"
         default: "1000:10:2"
       age:
         description: "aging UPDATEs applied to the parent (PREREG §7: 1e5; 0 = fresh)"
@@ -71,6 +71,13 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # Lead ruling (artie DECISIONS 6b0bef481b): the smoke warm-up cap is for smoke only, so a real run (FT_DRY=0, or
+      # unset) with it must refuse; plant_real.sh makes run_system.sh meet it, the dropped pg18-defaults and the other
+      # real-run refusals, plus controls that must get past them. A failure here fails the build, so no cell runs.
+      - name: Refusal plants (a real run with the smoke warm-up cap, pg18-defaults) and timedrun.py selftest
+        run: |
+          timeout 120 python3 -B fastest/linux/competitors/timedrun.py selftest | tail -1
+          timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
       - name: Packages (PGDG libpq 18, MariaDB connector, clang, cmake, fio)
         run: |
           sudo apt-get update -q
@@ -114,10 +121,13 @@ jobs:
       FT_IDLE_S: ${{ inputs.idle_s || '30' }}
       # The registered 1800 s cap bounds every measured window (gate-6 item 16). SMOKE overrides only the warm-up's
       # MAX_S: 1000:10:2 is PREREG :210's OPS and S with at most 2 s of warm-up (a full 1000-op warm-up per run would
-      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used, and FT_WARMUP empty gives
-      # the registered 1000:10:180.
+      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used. An empty input also gives
+      # 1000:10:2 (the `||` default); pass 1000:10:180 for the registered rule. That cap is accepted for SMOKE only
+      # (lead ruling, artie DECISIONS 6b0bef481b): these jobs say so with FT_DRY=1, and run_system.sh refuses the cap
+      # on a real run (FT_DRY=0, its default; the build job's plant proves it).
       FT_CAP_S: ${{ inputs.cap_s || '1800' }}
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
+      FT_DRY: "1"
       # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
       # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
       FT_AGE: ${{ inputs.age || '200' }}
@@ -154,7 +164,7 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP age=$FT_AGE prebranch=$FT_PREBRANCH";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP dry=$FT_DRY (smoke, uncredited) age=$FT_AGE prebranch=$FT_PREBRANCH";
             echo "systems=pg18-d2,dolt,doltgres,b1 pg18-defaults=DROPPED (lead ruling artie 6b0bef481b: on Linux it is pg18-d2's server; pg18-d2 runs the copy control pg18-create-copy)";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
