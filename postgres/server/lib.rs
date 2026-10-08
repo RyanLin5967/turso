@@ -3862,4 +3862,34 @@ mod tests {
         let r = s.end_implicit();
         settled(&s, "pipeline at Sync", r.as_ref().err().map(|e| &**e), &[9]);
     }
+
+    /// A claim of a held name waits for its release, as a delete does: released during the wait,
+    /// the claim succeeds; never released, it is refused once the wait is spent (wire review 6
+    /// item 5).
+    #[test]
+    fn a_claim_of_a_held_name_waits_for_its_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wait = std::time::Duration::from_millis(400);
+        let s = shared(&dir, wait);
+        s.claim("x", "ERROR").unwrap();
+        let start = std::time::Instant::now();
+        let r = s.claim("x", "ERROR");
+        assert!(r.is_err(), "a second claim of a held name succeeded");
+        assert!(
+            start.elapsed() >= wait,
+            "refused after {:?}, before the wait was spent",
+            start.elapsed()
+        );
+        let releaser = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                s.release("x");
+            })
+        };
+        s.claim("x", "ERROR")
+            .expect("a claim of a name released during the wait");
+        releaser.join().unwrap();
+        assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
+    }
 }
