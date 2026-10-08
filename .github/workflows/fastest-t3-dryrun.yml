@@ -53,8 +53,8 @@ jobs:
           - {block: loop, plant: ""}
           - {block: brd, plant: ""}
           - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
-          - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID: &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
-          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID: &&write-back drive &&: its flush counter rose||V3L VOID: &&disagrees with the drive's own report"}
+          - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID (block 1): &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
+          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose||V3L VOID (block 1): &&disagrees with the drive's own report"}
     env:
       PLANT: ${{ matrix.plant }}
       EXPECT: ${{ matrix.expect }}

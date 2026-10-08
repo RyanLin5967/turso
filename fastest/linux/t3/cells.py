@@ -2,9 +2,10 @@
 """T3 cell manifest: validate it, list its filesystems, and plan one filesystem's runs.
 
   cells.py fslist MANIFEST          the filesystems, in manifest order, one per line
-  cells.py plan MANIFEST FS SEED    one row per run: cell-rK, system, clients, ops, runs, class
+  cells.py plan MANIFEST FS SEED    one row per run: cell-rK, system, clients, ops, runs, class, K
                                     (every run of every cell on FS, in a seeded shuffle of blocks:
-                                    block k holds run k of every cell, amendment 34's interleaving)
+                                    block k holds run k of every cell, amendment 34's interleaving; K is
+                                    the block, so the runner can take V3L at every block boundary)
 
 Manifest: TSV with a header row `cell system fs clients ops runs class`, '#' comments allowed.
 system: ours | pg18-d2 | pg18-defaults | dolt | doltgres | b1. class: the engine's sync class for
@@ -71,7 +72,8 @@ def main(a):
             block = [r for r in rows if int(r["runs"]) >= k]
             rng.shuffle(block)
             for r in block:
-                print("\t".join([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"]]))
+                print("\t".join([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"],
+                                  str(k)]))
         return 0
     print(__doc__, file=sys.stderr)
     return 2

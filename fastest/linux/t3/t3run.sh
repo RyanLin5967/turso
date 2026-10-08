@@ -295,13 +295,15 @@ v3batch() { # v3batch before|after DIR
   return 0
 }
 
-# V3L before or after a block (review 2 item 6; PREREG line 180): VOID or refused fails the stage.
-v3l() { # v3l before|after MNT
+# V3L at a block boundary (review 2 item 6; PREREG line 180; gate-6 review 9: per section-7 block, not per
+# filesystem): b0 before block 1, then bK after block K, which is also before block K+1 (nothing runs between).
+# VOID or refused fails the stage.
+v3l() { # v3l bK MNT
   local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc lie=""
   local -a env=()
   [ $DRY = 0 ] && env+=(V3L_REAL=1)
-  [ "$PLANT_NOW:$when" = v3l-fsync-half:before ] && env+=(V3L_PLANT=fsync2)
-  if [ "$PLANT_NOW:$when" = v3l-cache-lie:before ]; then
+  [ "$PLANT_NOW:$when" = v3l-fsync-half:b0 ] && env+=(V3L_PLANT=fsync2)
+  if [ "$PLANT_NOW:$when" = v3l-cache-lie:b0 ]; then
     # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
     # (no fsync reaches the drive), or a write-through drive whose kernel queue claims write back
     local lo disk wc
@@ -368,17 +370,19 @@ fs_block() {
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
   v3batch before "$mnt/v3b" || return 1
-  v3l before "$mnt" || return 1
+  v3l b0 "$mnt" || return 1
   # flush counter fire-check for the competitor cells on this filesystem (run_system.sh requires its verdict)
   sudo sysctl -w kernel.yama.ptrace_scope=0 > /dev/null
   timeout 900 bash "$L/competitors/firecheck_strace.sh" "$o/strace-firecheck" "$mnt/strace-fc.noindex" \
     > "$o/strace-firecheck.txt" 2>&1 || { echo "strace fire-check failed on $fs"; return 1; }
   python3 -B "$L/t3/cells.py" plan "$MAN" "$fs" "$SEED" > "$o/plan.tsv" || return 1
-  local cell system clients ops runs class
-  while IFS=$'\t' read -r cell system clients ops runs class; do
+  local cell system clients ops runs class blk cur=1
+  # fd 3, so nothing a cell runs can read the plan from stdin
+  while IFS=$'\t' read -r cell system clients ops runs class blk <&3; do
+    if [ "$blk" != "$cur" ]; then v3l "b$cur" "$mnt" || return 1; cur=$blk; fi
     run_cell "$fs" "$mnt" "$o" "$cell" "$system" "$clients" "$ops" "$class"
-  done < "$o/plan.tsv"
-  v3l after "$mnt" || return 1
+  done 3< "$o/plan.tsv"
+  v3l "b$cur" "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
   return 0
 }
