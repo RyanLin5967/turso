@@ -4812,6 +4812,7 @@ fn untyped_contexts_type_their_parameters() {
     const BOOL: u32 = 16;
     const INT8: u32 = 20;
     const INT4: u32 = 23;
+    const TEXT: u32 = 25;
     let dir = Scratch::new("untypedctx");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -4819,6 +4820,8 @@ fn untyped_contexts_type_their_parameters() {
         .ok("p");
     a.q("INSERT INTO p VALUES (1, 'abc', 10), (2, 'de', NULL), (3, 'fghi', 30)")
         .ok("rows");
+    // Every case is checked before the test fails, so one run names every wrong one.
+    let mut wrong = Vec::new();
     for (sql, want_type, bind, want_rows) in [
         (
             "SELECT id FROM p WHERE length(name) = $1",
@@ -4850,11 +4853,12 @@ fn untyped_contexts_type_their_parameters() {
             "79",
             vec!["1"],
         ),
+        // 'true', so a parameter bound as text ('true' is not the boolean) would return row 1 only.
         (
             "SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id",
             BOOL,
-            "false",
-            vec!["1"],
+            "true",
+            vec!["1", "2", "3"],
         ),
         (
             "SELECT c FROM (SELECT count(*) AS c FROM p) AS d WHERE c > $1",
@@ -4875,31 +4879,94 @@ fn untyped_contexts_type_their_parameters() {
             vec!["1", "1"],
         ),
     ] {
-        let r = a.describe_statement(sql).ok(sql);
-        assert_eq!(r.params, Some(vec![want_type]), "{sql}");
-        let r = a.xt(sql, &[(0, 0, bind.as_bytes())]).ok(sql);
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(vec![want_type]) {
+            wrong.push(format!(
+                "{sql}: Describe {:?} {:?}, want [{want_type}]",
+                r.params, r.error
+            ));
+        }
+        let r = a.xt(sql, &[(0, 0, bind.as_bytes())]);
         let got: Vec<String> = r
             .rows
             .iter()
             .map(|row| row[0].clone().unwrap_or_default())
             .collect();
-        assert_eq!(got, want_rows, "{sql} with {bind}");
+        if r.error.is_some() || got != want_rows {
+            wrong.push(format!(
+                "{sql} with {bind}: {got:?} {:?}, want {want_rows:?}",
+                r.error
+            ));
+        }
+    }
+    // A Describe for each further context 935586643 types (PostgreSQL's types by these fixtures'
+    // semantics; the PG18 recording is owed with E5-QUEUE P7).
+    for (sql, want) in [
+        ("SELECT count(*) FROM p GROUP BY n > $1", vec![INT4]),
+        ("SELECT id FROM p ORDER BY n = $1, id", vec![INT4]),
+        (
+            "SELECT sum(n) OVER (PARTITION BY n > $1) FROM p",
+            vec![INT4],
+        ),
+        (
+            "INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = excluded.n \
+             WHERE excluded.n > $1",
+            vec![INT4],
+        ),
+        (
+            "UPDATE p SET (n, name) = ($1, $2) WHERE id = 1",
+            vec![INT4, TEXT],
+        ),
+        (
+            "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT 'x' AS n) AS q WHERE n = $1)",
+            vec![TEXT],
+        ),
+        (
+            "WITH w(a) AS (SELECT n FROM p) SELECT a FROM w WHERE a = $1",
+            vec![INT4],
+        ),
+        ("SELECT id FROM p WHERE upper($1) = name", vec![TEXT]),
+        ("SELECT id FROM p WHERE greatest(n, 0) = $1", vec![INT4]),
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(want.clone()) {
+            wrong.push(format!(
+                "{sql}: Describe {:?} {:?}, want {want:?}",
+                r.params, r.error
+            ));
+        }
     }
     // ON CONFLICT DO UPDATE: its SET takes the column's type and its WHERE is boolean.
     let sql = "INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = $1 WHERE $2";
-    let r = a.describe_statement(sql).ok(sql);
-    assert_eq!(r.params, Some(vec![INT4, BOOL]), "{sql}");
-    a.xt(sql, &[(0, 0, b"11"), (0, 0, b"true")]).ok(sql);
-    assert_eq!(a.q("SELECT n FROM p WHERE id = 1").single("n"), "11");
-    // Compared with something no context types: refused, not compared as text.
-    let sql = "SELECT id FROM p WHERE no_such_typing(name) = $1";
     let r = a.describe_statement(sql);
+    if r.error.is_some() || r.params != Some(vec![INT4, BOOL]) {
+        wrong.push(format!("{sql}: Describe {:?} {:?}", r.params, r.error));
+    }
+    let r = a.xt(sql, &[(0, 0, b"11"), (0, 0, b"true")]);
+    if r.error.is_some() {
+        wrong.push(format!("{sql}: {:?}", r.error));
+    }
+    let n = a.q("SELECT n FROM p WHERE id = 1").single("n");
+    if n != "11" {
+        wrong.push(format!("ON CONFLICT SET n = $1 left n = {n}"));
+    }
+    // Compared with something no context types (a function the engine has, which the walk does not
+    // type): exactly 42P18, the lead's fail-closed rule, where the base served it as text; a
+    // function that does not exist is the engine's 42883.
+    for (sql, code) in [
+        ("SELECT id FROM p WHERE typeof(name) = $1", "42P18"),
+        ("SELECT id FROM p WHERE no_such_typing(name) = $1", "42883"),
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some(code) {
+            wrong.push(format!("{sql}: {:?}, want {code}", r.error));
+        }
+    }
     assert!(
-        r.error
-            .as_ref()
-            .is_some_and(|e| e.code == "42P18" || e.code == "42883"),
-        "{sql}: {:?}",
-        r.error
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
     );
 }
 
