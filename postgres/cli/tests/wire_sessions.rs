@@ -3865,3 +3865,33 @@ fn an_alter_rebuild_keeps_every_serial_spellings_values() {
         assert_eq!(e.code, "23505", "{ty}: the key is enforced");
     }
 }
+
+/// A reconnect to a branch right after its session closed is not refused: the closed session's
+/// server thread may not have released the branch yet, and the new claim waits for that release
+/// as a delete already does. claim refused a held name at once, so `close; connect db/x` met FATAL
+/// 55006 whenever the old thread was behind (wire review 6 item 5, review 5 item 6).
+#[test]
+fn a_reconnect_right_after_a_close_is_not_refused() {
+    let dir = Scratch::new("reconnect");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('x')").ok("create");
+    let mut refused = Vec::new();
+    for round in 0..100 {
+        let mut c = match server.connect_to("postgres/x") {
+            Ok(c) => c,
+            Err(e) => {
+                refused.push((round, e));
+                continue;
+            }
+        };
+        // Terminate and close without waiting for the server's EOF.
+        c.send(b'X', &[]);
+        drop(c);
+    }
+    assert!(
+        refused.is_empty(),
+        "{} of 100 reconnects refused: {refused:?}",
+        refused.len()
+    );
+}
