@@ -3851,6 +3851,65 @@ fn read_raw_reply(w: &mut Wire) -> (Vec<u8>, Vec<WireError>, u8) {
     }
 }
 
+/// A simple Query whose body is malformed (a string with no terminator) fails the block it arrives
+/// in, as any error there does: inside BEGIN the block is failed (25P02 until its end, which
+/// answers ROLLBACK), and in a pipeline its implicit block is rolled back. The malformed message's
+/// error never reached the session's block state: ReadyForQuery said 'E' from pgwire's own copy,
+/// the next statement ran, and COMMIT committed (wire review 12 item 7).
+#[test]
+fn a_malformed_query_fails_its_block() {
+    let dir = Scratch::new("badquery");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert");
+    a.s.write_all(&frame(b'Q', b"SELECT 1")).unwrap();
+    let (_, errors, status) = read_raw_reply(&mut a);
+    let codes: Vec<(&str, &str)> = errors
+        .iter()
+        .map(|e| (e.code.as_str(), e.message.as_str()))
+        .collect();
+    assert_eq!(codes, vec![("08P01", "invalid string in message")]);
+    assert_eq!(status, b'E', "the block is failed");
+    let r = a.q("SELECT 1");
+    assert_eq!(r.err("in the failed block").code, "25P02");
+    let r = a.q("COMMIT").ok("end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2")
+            .single("not committed"),
+        "0"
+    );
+    // A pipeline: Execute an INSERT, the malformed Query, then Sync.
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"INSERT INTO t VALUES (3, 'three')");
+    parse.extend_from_slice(&[0, 0, 0]);
+    let pipeline = [
+        frame(b'P', &parse),
+        frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
+        frame(b'E', &[0, 0, 0, 0, 0]),
+        frame(b'Q', b"SELECT 1"),
+    ]
+    .concat();
+    a.s.write_all(&pipeline).unwrap();
+    let (_, errors, _) = read_raw_reply(&mut a);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    a.send(b'S', &[]);
+    let (_, _, status) = read_raw_reply(&mut a);
+    assert_eq!(status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 3")
+            .single("the pipeline rolled back"),
+        "0"
+    );
+}
+
 /// A Sync whose body is not empty is refused (08P01 "invalid message format") and still answered
 /// with ReadyForQuery, as PostgreSQL ends a skip at any Sync before it reads the body; the pipeline
 /// it ends is rolled back. Read as an extended message in error, it set the session waiting for a
