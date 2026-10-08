@@ -3895,3 +3895,35 @@ fn a_reconnect_right_after_a_close_is_not_refused() {
         refused.len()
     );
 }
+
+/// A savepoint that does not exist is 3B001 wherever it is named, and ROLLBACK TO or RELEASE
+/// outside a block is 25P01, as in PostgreSQL. Only an engine-dropped failed block answered 3B001;
+/// a mistyped ROLLBACK TO in a live block, RELEASE of an unknown name and either verb in autocommit
+/// reached the engine's "no such savepoint" as XX000 (wire review 6 item 6, review 3 item 24).
+#[test]
+fn a_missing_savepoint_is_3b001_and_outside_a_block_25p01() {
+    let dir = Scratch::new("savepoints");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("SAVEPOINT s").ok("savepoint");
+    let r = a.q("ROLLBACK TO b");
+    assert_eq!(
+        r.err("rollback to a savepoint that does not exist").code,
+        "3B001"
+    );
+    assert_eq!(r.status, b'E', "the block is not failed");
+    a.q("ROLLBACK").ok("end the block");
+    a.q("BEGIN").ok("begin");
+    let r = a.q("RELEASE nosuch");
+    assert_eq!(
+        r.err("release a savepoint that does not exist").code,
+        "3B001"
+    );
+    a.q("ROLLBACK").ok("end the block");
+    for sql in ["ROLLBACK TO s", "RELEASE s", "RELEASE SAVEPOINT s"] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "25P01", "{sql} outside a block");
+        assert_eq!(r.status, b'I', "{sql} opened a block");
+    }
+}
