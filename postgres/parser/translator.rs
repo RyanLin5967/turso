@@ -399,6 +399,7 @@ impl PostgreSQLTranslator {
                             });
                         }
                         ConstrType::ConstrForeign => {
+                            refuse_match_full(constraint)?;
                             if let Some(fk) = extract_foreign_key(constraint) {
                                 table_constraints.push(
                                     self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs),
@@ -5060,6 +5061,21 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
         }
     }
     Ok(cols)
+}
+
+/// A multi-column MATCH FULL foreign key is refused: the engine enforces MATCH SIMPLE only, which
+/// exempts a row whose key is partly NULL where MATCH FULL refuses it; it was accepted and enforced
+/// as MATCH SIMPLE (wire review 11 item 12). Over one column the two are the same key. An ALTER's
+/// added key reaches this through the rebuild's CREATE TABLE.
+fn refuse_match_full(constraint: &pg_query::protobuf::Constraint) -> Result<(), ParseError> {
+    if constraint.fk_matchtype == "f" && constraint.fk_attrs.len() > 1 {
+        return Err(ParseError::ParseError(
+            "MATCH FULL foreign keys over more than one column are not supported: the engine \
+             enforces MATCH SIMPLE"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extract a foreign key constraint from a PG Constraint node.
