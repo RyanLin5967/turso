@@ -760,6 +760,7 @@ fn run_instruments(cell: &str) -> String {
     probe::store_locked();
     std::hint::black_box(Box::new([0u64; 8]));
     probe::store_unlocked();
+    let threads_before = probe::threads();
     std::thread::spawn(|| {
         probe::store_locked();
         std::hint::black_box(Box::new([0u64; 2]));
@@ -767,6 +768,14 @@ fn run_instruments(cell: &str) -> String {
     })
     .join()
     .unwrap();
+    // A joined thread can still be exiting. The thread-count arm below reads its base next, so
+    // this arm leaves only once its thread has left the count (base14 read base 3, after 2, when
+    // it did not wait).
+    let t = std::time::Instant::now();
+    while probe::threads() != threads_before && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    s.insert("hold_thread_left", u64::from(probe::threads() == threads_before));
     probe::mark_foreground(false);
     let (bg_bytes, _) = probe::take_background_hold_maxima();
     let (all_bytes, _) = probe::take_hold_maxima();
@@ -1304,6 +1313,7 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
     assert_eq!(get("fc_live_and_hold", "bg_hold_alloc_bytes"), 16, "the background maximum: the spawned thread's 16 B hold, not the foreground's 64 B");
     assert_eq!(get("fc_live_and_hold", "all_hold_alloc_bytes"), 64, "the all-threads maximum: the foreground's 64 B hold");
+    assert_eq!(get("fc_live_and_hold", "hold_thread_left"), 1, "the hold arm's joined thread never left the thread count");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
