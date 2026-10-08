@@ -124,6 +124,11 @@ impl Backoff {
         }
     }
 
+    /// A Backoff that never waits: its statement is never stepped again or run anew.
+    fn never() -> Self {
+        Self::new(std::time::Duration::ZERO)
+    }
+
     /// Sleep the schedule's next delay and say so, or say false, without sleeping, when the delay
     /// would end past the lock wait: then the next attempt is the last.
     fn wait(&mut self) -> bool {
@@ -912,7 +917,8 @@ impl Session {
             if !conn.inner().get_auto_commit() {
                 let _ = engine_tx(&conn, TxStmt::Rollback);
             }
-            return Err(engine_info(&e));
+            // The same rule as a client's COMMIT (wire review 8 item 1).
+            return Err(commit_failed(&conn, engine_info(&e)));
         }
         Ok(())
     }
@@ -986,7 +992,7 @@ impl Session {
             }
             None => {
                 drop(st);
-                let r = self.engine_statement(&conn, sql, portal, format);
+                let r = self.engine_statement(&conn, sql, verb, portal, format);
                 st = self.state();
                 r.map_err(|f| {
                     ran = f.prepared;
@@ -1189,28 +1195,27 @@ impl Session {
         &self,
         conn: &PgConnection,
         sql: &str,
+        verb: TxVerb,
         portal: Option<&Portal<String>>,
         format: &Format,
     ) -> Result<Response, StatementFailure> {
         let in_tx = !conn.inner().get_auto_commit();
-        let mut backoff = Backoff::new(self.shared.lock_wait);
+        // A COMMIT or ROLLBACK is never stepped again or run anew: the engine's COMMIT has left
+        // autocommit and armed its rollback before it meets a Busy, so stepped again it fails and
+        // strands the transaction, and dropped it rolls the block back, after which run anew it
+        // finds no transaction (wire review 8 item 1, review 7 item 3). Decided by the verb,
+        // never by the statement's change count (review 8 item 13).
+        let ends_block = matches!(verb, TxVerb::Commit | TxVerb::Rollback);
+        let mut backoff = if ends_block {
+            Backoff::never()
+        } else {
+            Backoff::new(self.shared.lock_wait)
+        };
         loop {
             // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
-                // The block the statement ran in ended with its failure: a COMMIT refused at the
-                // trunk's commit rolls the block back. Run anew it would run outside the block (a
-                // COMMIT that finds no transaction: XX000), so the failure is the block's, a
-                // serialization failure the client retries (wire review 5 item 8).
-                Err(mut f)
-                    if in_tx
-                        && conn.inner().get_auto_commit()
-                        && matches!(f.info.code.as_str(), "55P03" | "40001") =>
-                {
-                    f.info.code = "40001".to_string();
-                    f.info.message = format!(
-                        "could not serialize access: the transaction was rolled back ({})",
-                        f.info.message
-                    );
+                Err(mut f) if verb == TxVerb::Commit => {
+                    f.info = commit_failed(conn, f.info);
                     return Err(f);
                 }
                 Err(f)
@@ -1588,6 +1593,36 @@ enum TxStmt {
 
 /// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
 /// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
+/// What a failed COMMIT tells the client, once the engine's transaction is settled: a COMMIT the
+/// engine refused for a lock (Busy at the trunk's commit) ended the block, rolled back, which is a
+/// serialization failure the client retries (40001; PostgreSQL's answer to a commit that cannot
+/// serialize). Any other failure (a deferred foreign key, 23503) is its own. A transaction the
+/// engine still holds in autocommit cannot be ended on this connection (its COMMIT left autocommit
+/// before failing, and a ROLLBACK there finds no block): the connection is broken, and the session
+/// ends (FATAL 08006) rather than answer statements that would join the stranded transaction.
+/// The caller rolls back a block the engine still has open. Blind spot: only a WRITE transaction
+/// is visible (Connection::is_in_write_tx); a stranded read transaction is not.
+fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
+    if conn.inner().get_auto_commit() && conn.inner().is_in_write_tx() {
+        info.code = "08006".to_string();
+        info.severity = "FATAL".to_string();
+        info.message = format!(
+            "the transaction could not be ended after its COMMIT failed ({}); the connection is \
+             closed",
+            info.message
+        );
+        return info;
+    }
+    if matches!(info.code.as_str(), "55P03" | "40001") {
+        info.code = "40001".to_string();
+        info.message = format!(
+            "could not serialize access: the transaction was rolled back ({})",
+            info.message
+        );
+    }
+    info
+}
+
 fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
     use turso_parser::ast::Stmt;
     let (stmt, text) = match tx {
@@ -2289,6 +2324,11 @@ impl ExtendedQueryHandler for Session {
         // A pipeline's implicit block commits here; a failed commit is reported before
         // ReadyForQuery (wire review 1 item 8).
         if let Err(e) = self.end_implicit() {
+            // A FATAL one (a transaction the engine could not end) ends the session: serve_session
+            // sends it and closes.
+            if e.severity == "FATAL" {
+                return Err(PgWireError::UserError(e));
+            }
             client
                 .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                 .await?;
