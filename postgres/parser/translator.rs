@@ -1816,7 +1816,7 @@ impl PostgreSQLTranslator {
             &pg_query::protobuf::SelectStmt,
             bool,
         )> = Vec::new();
-        Self::flatten_set_operation(select, &mut parts);
+        Self::flatten_set_operation(select, &mut parts)?;
 
         if parts.is_empty() {
             return Err(ParseError::ParseError("Empty set operation".to_string()));
@@ -1899,27 +1899,35 @@ impl PostgreSQLTranslator {
             &'a pg_query::protobuf::SelectStmt,
             bool,
         )>,
-    ) {
+    ) -> Result<(), ParseError> {
         use pg_query::protobuf::SetOperation;
 
         let set_op = stmt.op();
         if set_op == SetOperation::SetopNone || set_op == SetOperation::Undefined {
-            // Leaf select
-            parts.push((None, stmt, false));
-            return;
+            // Leaf select; a VALUES leaf runs wrapped, as `SELECT * FROM (VALUES ...)`, which an
+            // arm of the engine's compound can be (it failed in place; wire review 11 item 14).
+            parts.push((None, stmt, !stmt.values_lists.is_empty()));
+            return Ok(());
         }
 
         let operator = match (set_op, stmt.all) {
             (SetOperation::SetopUnion, true) => ast::CompoundOperator::UnionAll,
             (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
-            (SetOperation::SetopIntersect, _) => ast::CompoundOperator::Intersect,
-            (SetOperation::SetopExcept, _) => ast::CompoundOperator::Except,
-            _ => return,
+            // The engine has no INTERSECT ALL or EXCEPT ALL: they ran as INTERSECT and EXCEPT,
+            // dropping the duplicates PostgreSQL keeps (wire review 11 item 14).
+            (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
+                return Err(ParseError::ParseError(
+                    "INTERSECT ALL and EXCEPT ALL are not supported".into(),
+                ))
+            }
+            (SetOperation::SetopIntersect, false) => ast::CompoundOperator::Intersect,
+            (SetOperation::SetopExcept, false) => ast::CompoundOperator::Except,
+            _ => return Ok(()),
         };
 
         if let Some(larg) = &stmt.larg {
             if Self::arm_in_place(larg, true) {
-                Self::flatten_set_operation(larg, parts);
+                Self::flatten_set_operation(larg, parts)?;
             } else {
                 parts.push((None, larg, true));
             }
@@ -1928,7 +1936,7 @@ impl PostgreSQLTranslator {
             // The first element pushed from rarg gets the operator
             let prev_len = parts.len();
             if Self::arm_in_place(rarg, false) {
-                Self::flatten_set_operation(rarg, parts);
+                Self::flatten_set_operation(rarg, parts)?;
             } else {
                 parts.push((None, rarg, true));
             }
@@ -1936,6 +1944,7 @@ impl PostgreSQLTranslator {
                 parts[prev_len].0 = Some(operator);
             }
         }
+        Ok(())
     }
 
     /// Translate a single leaf SELECT (no set operations) into a OneSelect.
