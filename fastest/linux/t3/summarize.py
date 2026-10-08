@@ -10,8 +10,11 @@ result/summary.json; a competitor: result/functional.txt ending in a VERDICT lin
 refused the class (adapter rc 4, 'NOT AVAILABLE' -- a recorded absence, not a result). A complete
 competitor run whose VERDICT is not PASS is listed in failed_checks (complete raws of a failed cell;
 the dry-run workflow fails on any).
-A block is OK when both its V3 batches (before, after) returned rc 0 and left summary.json and raw.tsv, and its
-V3L before and after are both VALID (review 2 items 5 and 6; a VOID V3L voids the block, PREREG line 180). Each
+A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5 and ruling A14: rc 0, or a
+brd timing VOID recorded, or on a drive with no volatile cache or PLP a timing VOID recorded with the flush counter
+meeting the sync count; summary.json and raw.tsv present; the write-cache state recorded), the A14 plants on its
+real record all fired (blockgate-plants.json), and its V3L before and after are both VALID with the verdicts
+re-derived from their own arms (items 6, review L5; a VOID V3L voids the block, PREREG line 180). Each
 batch's rc, flush_control, frame-arm p50, D0 ratio, flush_sent_to_device and floor_kind, the before-to-after
 frame-arm drift, and V3L's pooled p50, ratio and drift are copied in (published, not gates).
 Exit 1 if any planned run is not complete, any block is not OK or never ran (fslist.txt names every block), a
@@ -26,6 +29,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import blockgate  # noqa: E402
 import v3l  # noqa: E402
 
 
@@ -40,7 +44,7 @@ def read_rcs(path):
     return rcs
 
 
-def v3_batch(fsdir, when, rc, block=None):
+def v3_batch(fsdir, when, rc, block=None, plp="no"):
     d = os.path.join(fsdir, f"v3-{when}")
     rec = {"rc": rc, "summary": os.path.exists(os.path.join(d, "summary.json")),
            "raw": os.path.exists(os.path.join(d, "raw.tsv"))}
@@ -59,15 +63,17 @@ def v3_batch(fsdir, when, rc, block=None):
     b = os.path.join(d, "binary.txt")
     if os.path.exists(b):
         rec["bound"] = next((l[6:] for l in open(b).read().splitlines() if l.startswith("bound=")), None)
-    complete = rec["summary"] and rec["raw"] and "summary_error" not in rec
-    # brd (dry runs only): a VOID batch with complete raws is recorded; brd has no drive, so the probe's timing
-    # control cannot discriminate there (t3run.sh v3batch). Every other block keeps rc 0.
-    rec["brd_void_recorded"] = rc == 3 and block == "brd" and bool(complete)
-    rec["ok"] = bool(complete) and (rc == 0 or rec["brd_void_recorded"])
+    t = os.path.join(fsdir, f"v3-{when}.txt")
+    rec["run_sh_tail"] = open(t, errors="replace").read().strip().splitlines()[-1:] if os.path.exists(t) else []
+    sj, raw = blockgate.load(d)
+    g = blockgate.decide(sj, raw, rc, block or "loop", plp)
+    rec["blockgate"] = g
+    rec["brd_void_recorded"] = g["decision"] == "RECORDED"
+    rec["ok"] = g["decision"] in ("PASS", "RECORDED") and "summary_error" not in rec
     return rec
 
 
-def block_record(out, fs):
+def block_record(out, fs, plp="no"):
     fsdir = os.path.join(out, f"fs-{fs}")
     if not os.path.isdir(fsdir):
         return {"fs": fs, "ok": False, "why": ["the block never ran"]}
@@ -82,11 +88,22 @@ def block_record(out, fs):
             rec["v3"][when] = {"rc": None, "ok": False}
             rec["why"].append(f"V3 {when}: no batch ran")
             continue
-        r = v3_batch(fsdir, when, rcs[when], meta.get("block"))
+        r = v3_batch(fsdir, when, rcs[when], meta.get("block"), plp)
         rec["v3"][when] = r
         if not r["ok"]:
             rec["why"].append(f"V3 {when}: rc {r['rc']}, summary.json {'present' if r['summary'] else 'MISSING'}, "
-                              f"raw.tsv {'present' if r['raw'] else 'MISSING'}")
+                              f"raw.tsv {'present' if r['raw'] else 'MISSING'}; "
+                              + "; ".join(r["blockgate"]["reasons"]) + "; run.sh: " + " ".join(r["run_sh_tail"]))
+    pl = os.path.join(fsdir, "blockgate-plants.json")
+    try:
+        rec["a14_plants"] = json.load(open(pl))
+        if not rec["a14_plants"].get("all_fired"):
+            rec["why"].append("A14 plants: not every plant was decided as planted "
+                              + str({p["plant"]: p["fired"] for p in rec["a14_plants"].get("plants", [])}))
+    except (OSError, ValueError) as e:
+        rec["a14_plants"] = None
+        if rec["v3"].get("before", {}).get("ok"):
+            rec["why"].append(f"A14 plants: no record ({type(e).__name__})")
     b, a = rec["v3"]["before"].get("frame_arm_p50_us"), rec["v3"]["after"].get("frame_arm_p50_us")
     rec["v3_frame_arm_drift_us"] = round(a - b, 2) if a is not None and b is not None else None
     rec["v3l"] = v3l.block(os.path.join(fsdir, "v3l-before", "v3l.json"), os.path.join(fsdir, "v3l-after", "v3l.json"))
@@ -147,7 +164,11 @@ def summarize(out, sha, dry, manifest):
             incomplete.append(f"{fs}/{cell}: {why}")
     fl = os.path.join(out, "fslist.txt")
     fslist = open(fl).read().split() if os.path.exists(fl) else []
-    blocks = [block_record(out, fs) for fs in fslist]
+    plp = "no"
+    mt0 = os.path.join(out, "mode.txt")
+    if os.path.exists(mt0):
+        plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
+    blocks = [block_record(out, fs, plp) for fs in fslist]
     failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
@@ -185,18 +206,43 @@ def self_test():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "w").write(text)
 
-    def v3lj(verdict="VALID"):
-        return json.dumps({"verdict": verdict, "void_reasons": [] if verdict == "VALID" else ["planted"],
-                           "floor_kind": "no volatile cache: no drive flush", "leaf": {"disk": "ram0"},
-                           "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
-                           "arms": {"fsync": {"timed": {"fsync_bins_ns": {"10000": 5}}}}})
+    N = v3l.N
 
-    def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop"):
+    def v3lj(verdict="VALID", lie=False):
+        """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
+        over VOID arms (review L5)."""
+        fs = N if verdict == "VALID" and not lie else N // 2
+
+        def arm(fsyncs, syncs):
+            return {"v1l": {"data_writes": N, "data_fsyncs": fsyncs, "other_fsyncs": 0, "failed": 0, "io_uring_setup": 0,
+                            "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0},
+                    "labelling_fio": {"writes": N, "syncs": syncs},
+                    "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": 10.0 if syncs else None,
+                              "fsync_bins_ns": {"10000": 5} if syncs else None, "flush_ios_delta": 2 * N}}
+        r = {"verdict": "VALID" if lie else verdict, "void_reasons": [] if verdict == "VALID" or lie else ["planted"],
+             "floor_kind": "x", "leaf": {"disk": "nvme0n1", "write_cache": "write back", "layers": []},
+             "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
+             "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
+        return json.dumps(r)
+
+    def v3sum(rc, block):
+        brd = block == "brd"
+        return json.dumps({"frame_arm": "append64", "arms": {"append64": {"p50_us": 80.0}}, "floor_kind": "x",
+                           "flush_control": "FAIL: run void (ow4k)" if rc == 3 else "pass",
+                           "leaf": {"kind": "brd" if brd else "drive", "disk": "ram0" if brd else "nvme0n1",
+                                    "write_cache": "write through" if brd else "write back",
+                                    "drive_reports": None if brd else "write back"},
+                           "flush_gate": {"outcome": "not applicable: brd" if brd else "pass", "required_flushes": 1400,
+                                          "leaf_flushes_completed": 0 if brd else 2800,
+                                          "blkflush_leaf_gate": {"outcome": "not applicable" if brd else "pass"}}})
+
+    def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
+             plants=True, plants_fired=True, plp="no", lie=False):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\nxfs\tours-full-c1\tours\t1\t1\t0\tVALID\n")
         w(f"{out}/fslist.txt", fslist + "\n")
-        w(f"{out}/mode.txt", "dry=1\nblock=loop\nplant=\n")
+        w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
         f = f"{out}/fs-xfs"
         w(f"{f}/plan.tsv", "ours-full-c1\tours\t1\t200\t1\tfull\n")
         w(f"{f}/cells/ours-full-c1/a1/result/summary.json", "{}")
@@ -205,10 +251,13 @@ def self_test():
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
         for when in ("before", "after"):
             if not (when == "before" and before_rc == 2):  # a refused batch leaves no out dir
-                w(f"{f}/v3-{when}/summary.json", json.dumps({"frame_arm": "append64", "arms": {"append64": {"p50_us": 80.0}},
-                                                             "flush_control": "pass", "floor_kind": "x"}))
+                w(f"{f}/v3-{when}/summary.json", v3sum(before_rc if when == "before" else 0, block))
                 w(f"{f}/v3-{when}/raw.tsv", "arm\tus\n")
-        w(f"{f}/v3l-before/v3l.json", v3lj(before_v3l))
+            w(f"{f}/v3-{when}.txt", "run.sh: REFUSED: planted refusal text\n" if before_rc == 2 and when == "before" else "ok\n")
+        if plants:
+            res, ok = blockgate.plants(json.loads(v3sum(0, block)), True, 0, plp)
+            w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
+        w(f"{f}/v3l-before/v3l.json", v3lj(before_v3l, lie))
         if after_v3l:
             w(f"{f}/v3l-after/v3l.json", v3lj(after_v3l))
         if drop:
@@ -229,6 +278,11 @@ def self_test():
         ("a VOID (rc 3) V3 batch with complete raws fails a loop block", {"before_rc": 3}, False),
         ("a VOID (rc 3) V3 batch with complete raws is recorded on a brd block", {"before_rc": 3, "block": "brd"}, True),
         ("a refused (rc 2) V3 batch fails a brd block too", {"before_rc": 2, "block": "brd"}, False),
+        ("A14: PLP declared, a timing VOID with the flush counter met passes", {"before_rc": 3, "plp": "yes"}, True),
+        ("A14: the plants record missing fails the block", {"plants": False}, False),
+        ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False),
+        ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False),
+        ("review M2: a refusal's run.sh line reaches the block's why", {"before_rc": 2}, False),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:
@@ -236,6 +290,8 @@ def self_test():
             good = ok == want_ok
             if "reads VOID" in name:
                 good = good and s["failed_blocks"][0].startswith("xfs: V3L VOID: planted")
+            if "M2" in name:
+                good = good and "planted refusal text" in s["failed_blocks"][0]
             cases.append((name, good, s["failed_blocks"]))
         finally:
             shutil.rmtree(root)

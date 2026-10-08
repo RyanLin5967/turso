@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """V3L, the registered T3 floor (PREREG-v1-FINAL-CANDIDATE line 180): one measurement, before or after a block.
 
-  v3l.py measure DIR OUT        run it on the filesystem holding DIR; write OUT/v3l.json and the raw fio and strace
-                                files; exit 0 VALID, 3 VOID (a registered gate failed), 2 refused (nothing measured)
+  v3l.py measure DIR OUT [LEAFREC]
+                                run it on the filesystem holding DIR; write OUT/v3l.json and the raw fio and strace
+                                files; exit 0 VALID, 3 VOID (a registered gate failed), 2 refused (nothing measured).
+                                LEAFREC: the block's V3 batch summary.json, whose leaf record carries the drive's own
+                                cache report (the probe's NVMe VWC / SCSI WCE / virtio read): V3L refuses another disk,
+                                and VOIDs a kernel write_cache that disagrees with the drive (gate-6 review M6)
   v3l.py block BEFORE AFTER     one block's record from its two v3l.json files: the pooled fsync p50 (the block's
                                 normaliser), the ratio and the drift (published, never gates); exit 0 when both are
                                 VALID, 3 when either is VOID, 2 when either is missing or unreadable
@@ -27,7 +31,10 @@ Gates (any failure makes the measurement VOID, and the block with it):
     in the timed run as in the V1L-checked labelling run (the timed run has no tracer; this ties it to the checked one);
   - the drive's queue/write_cache reads "write back" or "write through" (anything else VOIDs); on "write back" the flush
     counter rises by at least 10,000 across the timed fsync run (a lower bound: another process's flushes can pad
-    it, never shrink it).
+    it, never shrink it). Every LOOP layer whose queue reads "write back" is gated the same way on its own counter
+    (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
+  - the timed fsync run carries fio's own sync count (N-1 or N; fio 3.36 does not count the end_fsync), a p50 and
+    the histogram bins (review M1: no measurement, no normaliser, no VALID).
 Published, not gates (lines 180 and 553): the fsync p50, the fsync/control write p50 ratio, the before-to-after
 drift. On a write-through drive floor_kind says "no volatile cache: no drive flush": the block layer sends such a
 drive no flush, so the fsync latency is not a drive flush (GitHub-hosted runners' disks are such drives).
@@ -35,7 +42,8 @@ The pooled p50 merges the two timed fsync runs' latency histograms (fio json+ bi
 
 Blind spots, stated: the labelling and timed runs are separate executions of one command; the flush counter is the
 whole drive's, so concurrent work on that drive pads it; a filesystem behind device-mapper or md is refused, not
-resolved; a loop is followed through its backing file to the drive under it.
+resolved, and so is a native-multipath NVMe head (its counter may live on the path devices); a loop is followed
+through its backing file to the drive under it. Every fio argv is recorded in v3l.json (review M7).
 """
 import json
 import os
@@ -80,6 +88,10 @@ def resolve_leaf(d):
             raise RuntimeError(f"{name}: device-mapper and md are not resolved to a drive (refused)")
         sysp = os.path.realpath(f"/sys/class/block/{name}")
         disk = os.path.basename(os.path.dirname(sysp)) if os.path.exists(f"{sysp}/partition") else name
+        mp = f"/sys/block/{disk}/multipath"
+        if os.path.isdir(mp) and os.listdir(mp):
+            raise RuntimeError(f"{disk} is a native-multipath NVMe head ({sorted(os.listdir(mp))}): its flush counter "
+                               "may live on the path devices (refused, not resolved)")
         return chain, disk
     raise RuntimeError(f"more than 5 layers under {d}")
 
@@ -195,9 +207,25 @@ def gates(rec):
             for run in ("labelling_fio", "timed"):
                 if a[run].get("syncs", 0):
                     bad.append(f"fio control/{run}: {a[run]['syncs']} syncs, registered 0")
-        elif a["timed"].get("syncs") != a["labelling_fio"].get("syncs"):
-            bad.append(f"fio fsync: the timed run made {a['timed'].get('syncs')} syncs, the V1L-checked labelling run "
-                       f"{a['labelling_fio'].get('syncs')} (one command; they must agree)")
+        else:
+            if a["timed"].get("syncs") != a["labelling_fio"].get("syncs"):
+                bad.append(f"fio fsync: the timed run made {a['timed'].get('syncs')} syncs, the V1L-checked labelling "
+                           f"run {a['labelling_fio'].get('syncs')} (one command; they must agree)")
+            if a["timed"].get("syncs") not in (N - 1, N):
+                bad.append(f"fio fsync/timed: {a['timed'].get('syncs')} syncs, not {N - 1} or {N}")
+            if a["timed"].get("fsync_p50_us") is None or not a["timed"].get("fsync_bins_ns"):
+                bad.append("fio fsync/timed: no fsync p50 or no latency histogram (the block's normaliser is unmeasured)")
+    for lay in rec["leaf"].get("layers") or []:
+        if lay.get("write_cache") == "write back":
+            d = lay.get("flush_ios_delta")
+            if d is None or d < N:
+                bad.append(f"write-back loop layer {lay.get('name')}: its flush counter rose {d} across {N} fsyncs "
+                           f"(fewer than one per fsync)")
+    dr = rec["leaf"].get("drive_reports")
+    if dr in ("write back", "write through") and rec["leaf"]["write_cache"] in ("write back", "write through") \
+            and dr != rec["leaf"]["write_cache"]:
+        bad.append(f"drive {rec['leaf']['disk']}: the kernel's write_cache ({rec['leaf']['write_cache']}) disagrees with "
+                   f"the drive's own report ({dr})")
     wc = rec["leaf"]["write_cache"]
     if wc == "write back":
         d = rec["arms"]["fsync"]["timed"].get("flush_ios_delta")
@@ -209,19 +237,28 @@ def gates(rec):
     return bad
 
 
-def measure(d, out):
+def measure(d, out, leafrec=None):
     if os.path.exists(out):
         raise RuntimeError(f"{out} exists")
     os.makedirs(d, exist_ok=True)
     chain, disk = resolve_leaf(d)
+    drive_reports = None
+    if leafrec:
+        lr = (json.load(open(leafrec)).get("leaf") or {})
+        if lr.get("disk") != disk:
+            raise RuntimeError(f"the leaf record {leafrec} names disk {lr.get('disk')!r}, V3L resolved {disk!r}")
+        drive_reports = lr.get("drive_reports")
     rc, sv, _ = sh("strace", "-V")
     rec = {"instrument": "V3L (PREREG-v1-FINAL-CANDIDATE line 180; V1L line 173)", "dir": os.path.realpath(d),
            "n": N, "fio_version": sh("fio", "--version")[1].strip(),
            "strace_version": sv.splitlines()[0] if rc == 0 and sv else None,
            "leaf": {"chain": chain, "disk": disk, "write_cache": disk_attr(disk, "queue/write_cache"),
                     "fua": disk_attr(disk, "queue/fua"), "rotational": disk_attr(disk, "queue/rotational"),
-                    "model": disk_attr(disk, "device/model")},
-           "arms": {}, "plant": os.environ.get("V3L_PLANT") or None}
+                    "model": disk_attr(disk, "device/model"), "drive_reports": drive_reports,
+                    "drive_reports_from": leafrec,
+                    "layers": [{"name": c, "write_cache": disk_attr(c, "queue/write_cache")}
+                               for c in chain if c.startswith("loop")]},
+           "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
     os.makedirs(out)
@@ -231,8 +268,9 @@ def measure(d, out):
         if os.path.exists(f):
             os.unlink(f)
         tr, lj = os.path.join(out, f"{arm}.v1l"), os.path.join(out, f"{arm}-labelling.json")
-        r = subprocess.run(V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj),
-                           capture_output=True, text=True, timeout=3600)
+        cmd = V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj)
+        rec["argv"][f"{arm}/labelling"] = cmd
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if r.returncode != 0:
             raise RuntimeError(f"labelling {arm} run rc {r.returncode}: {r.stderr[-400:]}")
         a["v1l"] = parse_v1l(open(tr).read(), f)
@@ -240,9 +278,16 @@ def measure(d, out):
         a["labelling_fio"].pop("fsync_bins_ns", None)
         os.unlink(f)
         tj = os.path.join(out, f"{arm}-timed.json")
+        cmd = fio_cmd(f"v3l-{arm}", f, fs, tj)
+        rec["argv"][f"{arm}/timed"] = cmd
+        l0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         f0 = flush_ios(disk)
-        r = subprocess.run(fio_cmd(f"v3l-{arm}", f, fs, tj), capture_output=True, text=True, timeout=3600)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         f1 = flush_ios(disk)
+        l1 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
+        if arm == "fsync":
+            for lay in rec["leaf"]["layers"]:
+                lay["flush_ios_delta"] = l1[lay["name"]] - l0[lay["name"]]
         if r.returncode != 0:
             raise RuntimeError(f"timed {arm} run rc {r.returncode}: {r.stderr[-400:]}")
         a["timed"] = fio_numbers(tj)
@@ -254,7 +299,8 @@ def measure(d, out):
                         "control_write_p50_us": ct.get("write_p50_us"),
                         "fsync_over_control_write_p50": ratio(ft.get("fsync_p50_us"), ct.get("write_p50_us")),
                         "flush_ios_per_fsync": round(ft["flush_ios_delta"] / N, 3)}
-    rec["floor_kind"] = ("drive flush: write-back drive, its flush counter checked"
+    rec["floor_kind"] = ("brd: no drive (dry runs only, never credited)" if disk.startswith("ram")
+                         else "drive flush: write-back drive, its flush counter checked"
                          if rec["leaf"]["write_cache"] == "write back" else "no volatile cache: no drive flush")
     bad = gates(rec)
     rec["verdict"] = "VOID" if bad else "VALID"
@@ -290,9 +336,15 @@ def block(b, a):
     for k, p in (("before", b), ("after", a)):
         try:
             r = json.load(open(p))
-            rec[k] = {"verdict": r["verdict"], "void_reasons": r["void_reasons"], "published": r["published"],
-                      "floor_kind": r["floor_kind"], "leaf": r["leaf"],
+            rec[k] = {"verdict": r["verdict"], "void_reasons": list(r["void_reasons"]), "published": r["published"],
+                      "floor_kind": r["floor_kind"], "leaf": r["leaf"], "plant": r.get("plant"),
                       "fsync_bins_ns": r["arms"]["fsync"]["timed"].get("fsync_bins_ns")}
+            # review L5: the verdict is re-derived from the record's own arms, never trusted as a string
+            again = gates(r)
+            if bool(again) != (r["verdict"] == "VOID") or r["verdict"] not in ("VALID", "VOID"):
+                rec[k]["verdict"] = "VOID"
+                rec[k]["void_reasons"].append(f"recorded verdict {r['verdict']!r} disagrees with the gates re-run on its "
+                                              f"own arms ({again or 'VALID'})")
         except (OSError, ValueError, KeyError, TypeError) as e:
             rec[k] = {"verdict": "MISSING", "why": f"{p}: {type(e).__name__}: {e}"}
     vb, va = rec["before"]["verdict"], rec["after"]["verdict"]
@@ -301,6 +353,9 @@ def block(b, a):
     if "MISSING" not in (vb, va):
         pb, pa = rec["before"]["published"]["fsync_p50_us"], rec["after"]["published"]["fsync_p50_us"]
         p = pooled_p50_ns([rec["before"]["fsync_bins_ns"], rec["after"]["fsync_bins_ns"]])
+        if p is None and rec["verdict"] == "VALID":
+            rec["verdict"] = "VOID"  # review M1: no pooled p50, no normaliser for the block
+            rec["after"]["void_reasons"].append("no pooled fsync p50 (a histogram is missing)")
         rec["published"] = {"pooled_fsync_p50_us": round(p / 1e3, 2) if p is not None else None,
                             "pooled_note": None if p is not None else "fio emitted no sync histogram bins",
                             "drift_fsync_p50_us": round(pa - pb, 2) if pa is not None and pb is not None else None,
@@ -310,6 +365,11 @@ def block(b, a):
     for k in ("before", "after"):
         rec[k].pop("fsync_bins_ns", None)
     return rec
+
+
+def _nobins(r):
+    r["arms"]["fsync"]["timed"]["fsync_bins_ns"] = None
+    return r
 
 
 def self_test():
@@ -338,14 +398,16 @@ def self_test():
                   c2["failed"] == 2 and c2["data_fsyncs"] == 2 and c2["io_uring_setup"] == 1))
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
-            timed_syncs=N - 1, ctl_fio_syncs=0):
+            timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive=None, lab_syncs=N - 1):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
-            return {"v1l": v, "labelling_fio": {"writes": fio_w, "syncs": syncs}, "timed": {"writes": fio_w, "syncs": tsyncs}}
+            return {"v1l": v, "labelling_fio": {"writes": fio_w, "syncs": syncs},
+                    "timed": {"writes": fio_w, "syncs": tsyncs, "fsync_p50_us": 300.0, "fsync_bins_ns": {"300000": tsyncs}}}
         # fio's own sync count is whatever it reports (9,999 or 10,000 with end_fsync); only agreement is gated
-        r = {"leaf": {"disk": "nvme1n1", "write_cache": wc},
-             "arms": {"fsync": arm(fsyncs, N - 1, timed_syncs), "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
+        r = {"leaf": {"disk": "nvme1n1", "write_cache": wc, "layers": layers or [], "drive_reports": drive},
+             "arms": {"fsync": arm(fsyncs, lab_syncs, timed_syncs),
+                      "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
         return r
 
@@ -364,6 +426,18 @@ def self_test():
         ("write-back with 9,999 flushes VOIDs", gates(rec(delta=N - 1)) != []),
         ("write-back with no counter reading VOIDs", gates(rec(delta=None)) != []),
         ("an unreadable write_cache VOIDs", gates(rec(wc=None)) != []),
+        ("M1: a timed run with no histogram VOIDs", gates(_nobins(rec())) != []),
+        ("M1: a timed run with fio reporting 0 syncs VOIDs (0 == 0 agreement is not enough)",
+         gates(rec(timed_syncs=0, lab_syncs=0)) != []),
+        ("M3: a write-back loop layer whose counter rose 0 VOIDs",
+         gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": 0}])) != []),
+        ("M3: a write-back loop layer with 10,000 flushes is VALID",
+         gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N}])) == []),
+        ("M3: a write-through loop layer is not gated on its own counter",
+         gates(rec(layers=[{"name": "loop3", "write_cache": "write through", "flush_ios_delta": 0}])) == []),
+        ("M6: kernel write through over a drive reporting write back VOIDs",
+         gates(rec(wc="write through", delta=0, drive="write back")) != []),
+        ("M6: kernel and drive agreeing on write back is VALID", gates(rec(drive="write back")) == []),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
@@ -379,8 +453,8 @@ def main(a):
     try:
         if a[1:] == ["self-test"]:
             return self_test()
-        if len(a) == 4 and a[1] == "measure":
-            return measure(a[2], a[3])
+        if len(a) in (4, 5) and a[1] == "measure":
+            return measure(a[2], a[3], a[4] if len(a) == 5 else None)
         if len(a) == 4 and a[1] == "block":
             r = block(a[2], a[3])
             print(json.dumps(r, indent=1))
