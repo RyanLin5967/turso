@@ -34,6 +34,7 @@ mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+pub mod recipe;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;

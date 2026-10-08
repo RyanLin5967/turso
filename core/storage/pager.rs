@@ -3421,6 +3421,7 @@ impl Pager {
             }
             pages
         };
+        crate::recipe::count(crate::recipe::counter::BRANCH_DIRTY, dirty.len() as u64);
         branch.store.commit_pages(branch.id, &dirty)?;
         if schema_did_change {
             branch
@@ -3615,6 +3616,7 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        crate::recipe::count(crate::recipe::counter::PAGE_FETCH, 1);
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
@@ -4808,6 +4810,10 @@ impl Pager {
                         continue;
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
+                    crate::recipe::count(
+                        crate::recipe::counter::TRUNK_DIRTY,
+                        dirty_pages.len() as u64,
+                    );
                     let mut cache = self.page_cache.write();
 
                     for page_id in dirty_pages.iter() {
@@ -6436,6 +6442,10 @@ impl Pager {
                     .expect("the branch is open, so it exists"),
                 None => connection.db.clone_schema(),
             };
+            // Statements prepared under the discarded schema carry its version, which the next
+            // schema change reuses; only a context bump makes them reprepare (k1-recipe-build
+            // adversary finding: a cached SELECT served a rolled-back recipe).
+            connection.bump_prepare_context_generation();
         }
         // A branch transaction never appended to the WAL, so there is nothing there to undo.
         if is_write && self.branch.get().is_none() {

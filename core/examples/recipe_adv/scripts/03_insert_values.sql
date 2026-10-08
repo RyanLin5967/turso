@@ -1,0 +1,14 @@
+# INSERT without a column list, and INSERT ... SELECT *, on a table that has a recipe.
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+CREATE TABLE src(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+INSERT INTO t VALUES (1, 1, 'x'), (2, 2, 'y')
+INSERT INTO src VALUES (10, 10, 'p')
+UPDATE t SET b = a * 10
+INSERT INTO t VALUES (3, 3, 'z')
+INSERT INTO t SELECT * FROM src
+INSERT INTO t SELECT id + 100, a, b FROM t
+SELECT * FROM t ORDER BY id
+SELECT * FROM t WHERE id > 100 ORDER BY id
+CREATE TABLE copy AS SELECT * FROM t
+SELECT * FROM copy ORDER BY id
+PRAGMA table_info(t)

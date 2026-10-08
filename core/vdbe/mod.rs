@@ -895,6 +895,9 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// The recipe read path's per-statement state: compiled recipes and the current row's
+    /// decoded values (lane k1-recipe-build, see `crate::recipe`).
+    pub(crate) recipe_exec: crate::recipe::RecipeExec,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
@@ -990,6 +993,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            recipe_exec: Default::default(),
         }
     }
 
@@ -1141,6 +1145,13 @@ impl ProgramState {
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        self.recipe_exec.clear();
+    }
+
+    /// Count `n` rows as changed by this statement at once (a recipe backfill's matched rows).
+    pub(crate) fn record_statement_changes(&self, n: i64) {
+        self.n_change.fetch_add(n, Ordering::SeqCst);
+        self.n_total_change.fetch_add(n, Ordering::SeqCst);
     }
 
     pub(crate) fn record_statement_change(&self) {

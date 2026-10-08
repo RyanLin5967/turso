@@ -2897,6 +2897,7 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            recipe_backfill: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),

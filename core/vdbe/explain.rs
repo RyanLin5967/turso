@@ -2422,6 +2422,15 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
+            Insn::RecipeInstall { data } => (
+                "RecipeInstall",
+                data.count_reg as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("recipe_install({}, gen {})", data.table, data.generation),
+            ),
             Insn::AddColumn { data } => (
                 "AddColumn",
                 0,

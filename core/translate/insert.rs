@@ -2144,7 +2144,12 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.is_generated()).count()
+        // Hidden columns take no value from a column-less INSERT (the mapping below skips them).
+        table
+            .columns()
+            .iter()
+            .filter(|c| !c.is_generated() && !c.hidden())
+            .count()
     } else {
         columns.len()
     };
@@ -2346,10 +2351,11 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
+            // Hidden columns take no value here either: the column mapping skips them.
             let storable_columns: Vec<_> = table
                 .columns()
                 .iter()
-                .filter(|c| !c.is_generated())
+                .filter(|c| !c.is_generated() && !c.hidden())
                 .collect();
             let num_values = storable_columns.len();
             let is_strict = table.is_strict();
@@ -2596,6 +2602,10 @@ fn build_insertion<'a>(
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Generated columns cannot be written to directly
                 col_in_table.ensure_not_generated("INSERT into", &column_name)?;
+                // Nor can a recipe table's generation column (see `crate::recipe`).
+                if crate::recipe::is_gen_column(col_in_table) {
+                    crate::bail_parse_error!("column {} is reserved", crate::recipe::GEN_COLUMN);
+                }
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2804,6 +2814,20 @@ fn translate_column(
         });
     } else if column.is_virtual_generated() {
         // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if crate::recipe::is_gen_column(column) {
+        // A recipe table's generation column: every new row is written at the table's current
+        // generation, its in-memory DEFAULT (see `crate::recipe`).
+        match (column.default.as_ref(), crate::recipe::mutant()) {
+            (Some(default_expr), m) if m != crate::recipe::Mutant::M2 => {
+                translate_expr(program, None, default_expr, column_register, resolver)?;
+            }
+            _ => {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: column_register,
+                });
+            }
+        }
     } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,
