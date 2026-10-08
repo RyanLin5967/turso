@@ -18,6 +18,10 @@ into CELLDIR/timed.tracer.tsv ("phase pid tid tracerpid"), and writes the run's 
                                 with >= 1000 measured ok ops is complete with reduced n (item 16)
   timedrun.py rule CAP_S        PREREG :210's warm-up for a run capped at CAP_S seconds, as bbload/clonebench
                                 --warmup OPS:S:MAX_S: min(max(1000 ops, 10 s), 10% of the cap)
+  timedrun.py real CAP_S WARMUP exit 0 only when a REAL run (run_system.sh FT_DRY=0, the T3 runner) may use this cap
+                                and warm-up: the registered cap (REGISTERED_CAP_S) and PREREG :210's rule at it. The
+                                CI smoke warm-up cap (1000:10:2) is accepted for smoke runs only (lead ruling, artie
+                                DECISIONS 6b0bef481b); anything else prints why and exits 2
   timedrun.py selftest          known-answer fixtures for check; exit 0 only if every verdict is as expected
 """
 import json
@@ -66,6 +70,12 @@ def ops(c, n1, n4, total=""):
 
 
 CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 measured ops is complete, reduced n
+REGISTERED_CAP_S = 1800  # PREREG's per-run cap (30 min; t3run.sh RUN_CAP_S)
+
+
+def real_problem(cap_s, warmup):
+    """RED stub: accepts every cap and warm-up."""
+    return None
 
 
 def check(celldir, n, warm_rule=None):
@@ -200,6 +210,22 @@ def selftest():
         print(("PASS" if got == want else "FAIL"), f"rule({cap}) = {got!r}, want {want!r}")
         bad += got != want
         cases.append(None)
+    # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
+    # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
+    for cap, warm, want in (("1800", "1000:10:180", True), ("1800", "1000:10:180.0", True),
+                            ("1800.0", "1000:10:180", True),
+                            ("1800", "1000:10:2", False),     # the CI smoke cap on a real run: the ruling's plant
+                            ("20", "1000:10:2", False),       # = rule(20), but 20 s is not the registered cap
+                            ("3600", "1000:10:360", False),   # = rule(3600), but not the registered cap
+                            ("1800", "20:0:0", False), ("1800", "1000:5:180", False), ("1800", "", False),
+                            ("1800", "1000:10", False), ("1800", "1000:10:180:1", False), ("1800", "x:10:180", False),
+                            ("", "1000:10:180", False), ("nan", "1000:10:180", False), ("inf", "1000:10:180", False)):
+        why = real_problem(cap, warm)
+        got = why is None
+        print(("PASS" if got == want else "FAIL"), f"real run cap={cap!r} warmup={warm!r} ->",
+              "accepted" if got else f"refused: {why}")
+        bad += got != want
+        cases.append(None)
     print(f"timedrun selftest: {len(cases) - bad}/{len(cases)}")
     return 1 if bad else 0
 
@@ -219,6 +245,10 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "rule":
         print(rule(sys.argv[2]))
         sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == "real":
+        why = real_problem(sys.argv[2], sys.argv[3])
+        print("accepted: the registered cap and warm-up" if why is None else "REFUSED: " + why)
+        sys.exit(0 if why is None else 2)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(selftest())
     sys.exit(__doc__)
