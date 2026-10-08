@@ -421,7 +421,10 @@ def plants(rec):
         else:
             if not t.get("flush_ios_delta"):
                 t["flush_ios_delta"] = 2 * N
-            if t.get("lab_flush_ios_delta") is None:  # a record from before the labelling counter: the timed count
+            # a write-through record's labelling count is 0, and older records have none: the base takes the timed
+            # count, so the labelling run shows the same flushes per fsync (dry run 37812992594: a 0 kept here left
+            # the floor rule unarmed and the half-flushes plant could not fire)
+            if not t.get("lab_flush_ios_delta") or t["lab_flush_ios_delta"] < N:
                 t["lab_flush_ios_delta"] = t["flush_ios_delta"]
         for lay in r["leaf"].get("layers") or []:
             lay["write_cache"] = wc
@@ -430,7 +433,7 @@ def plants(rec):
             else:
                 if not lay.get("flush_ios_delta"):
                     lay["flush_ios_delta"] = 2 * N
-                if lay.get("lab_flush_ios_delta") is None:
+                if not lay.get("lab_flush_ios_delta") or lay["lab_flush_ios_delta"] < N:
                     lay["lab_flush_ios_delta"] = lay["flush_ios_delta"]
         return r
 
@@ -542,6 +545,10 @@ def self_test():
         ("floor rule: labelling 2 per fsync, timed 2 per fsync is VALID", gates(_lab(rec(delta=20003), 20004)) == []),
         ("plants on a VALID write-back record: control passes and all four fire", plants(rec(delta=20003))[1]),
         ("plants on a VALID write-through record: all four fire", plants(rec(wc="write through", delta=0))[1]),
+        ("plants on a write-through record carrying labelling count 0 (as measured now): all four fire",
+         plants(_lab(rec(wc="write through", delta=0), 0))[1]),
+        ("plants on a write-back record carrying its labelling count: all four fire",
+         plants(_lab(rec(delta=20003), 20004))[1]),
         ("plants on a VOID record: NOT-RUN", not plants(rec(fsyncs=N - 1))[1]),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
