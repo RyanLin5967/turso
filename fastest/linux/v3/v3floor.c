@@ -19,8 +19,9 @@
  *   clean        fsync of a file with nothing dirty (the dirty/clean control; never mutated)
  *   nosync25     the append25 write with no flush (D0): the flush control's reference
  *   Report-only extra: fdatasync4k (ow4k with fdatasync in place of fsync).
- * Flush-gated arms (every op must issue a device flush, run.sh's gates): append25, append64, ow4k, ow64k, ow1m, clone2b,
- *   cfr2b. The timing control gates append25 only (A17, below).
+ * Flush-gated arms (every op must issue a device flush and its own sync, run.sh's gates): append25, append64, ow4k,
+ *   ow64k, ow1m, clone2b, cfr2b, and fdatasync4k (an A18 floor candidate: eighth review M1). The timing control gates
+ *   append25 only (A17, below).
  * Frame arm: PREREG §4 picks, among the M0 append and overwrite arms, the smallest bytes per flush >= the M1 build's
  *   median create frame. Review 2 item 11 puts a named create's flight at about 56-60 B (unverified here), so
  *   without append64 the rule would pick ow4k, an overwrite; append64 is that append. summary.json names it.
@@ -192,7 +193,7 @@ enum { APPEND25, APPEND64, OW4K, OW64K, OW1M, CLONE2B, CFR2B, CLONE1B, FDATASYNC
 static const char *NAMES[NARMS] = {"append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b", "clone1b",
                                    "fdatasync4k", "clean", "nosync25"};
 #define MIB (1u << 20)
-static int gated(int a) { return a <= CFR2B; }                       /* flush-gated: a device flush per op */
+static int gated(int a) { return a <= CFR2B || a == FDATASYNC4K; }  /* flush-gated: a device flush per op */
 static int flushed(int a) { return a <= FDATASYNC4K; }               /* a flush the mutant removes */
 static int is_ficlone(int a) { return a == CLONE1B || a == CLONE2B; } /* refused on ext4 */
 static int is_copy(int a) { return a == CLONE1B || a == CLONE2B || a == CFR2B; }
@@ -212,6 +213,7 @@ static dev_t DIR_DEV;
 static int MUTANT, TRACE_CLOCK, CRASH_AIM;
 static const char *PLP = NULL;     /* --plp yes|no: the operator's power-loss-protection declaration (A14) */
 static const char *REGPATH = NULL; /* --registered: the registered thresholds and frame arm (A17, MED 5) */
+static int REQREG = 0;             /* --require-registered: rental mode refuses before any op without them (L7) */
 
 /* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. -> 0 when key was found (the last line
  * with it wins), 1 when absent, -1 when the file cannot be read. */
@@ -223,11 +225,15 @@ static int reg_lookup(const char *path, const char *key, char *val, size_t vcap,
     while (fgets(line, sizeof line, fp)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         line[strcspn(line, "\n")] = 0;
+        /* one strict rule, the same as check.py's (eighth review L5): exactly three non-empty tab-separated fields,
+         * no CR; anything else in the file refuses the run (-2) rather than being skipped */
         char *t1 = strchr(line, '\t');
-        if (!t1) continue;
+        char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (!t1 || !t2 || strchr(t2 + 1, '\t') || strchr(line, '\r') || t1 == line || t2 == t1 + 1 || !t2[1]) {
+            fclose(fp);
+            return -2;
+        }
         *t1++ = 0;
-        char *t2 = strchr(t1, '\t');
-        if (!t2) continue;
         *t2++ = 0;
         if (!strcmp(line, key)) {
             snprintf(val, vcap, "%s", t1);
@@ -1374,6 +1380,7 @@ int main(int argc, char **argv) {
             PLP = argv[++i];
             if (strcmp(PLP, "yes") && strcmp(PLP, "no")) { fprintf(stderr, "v3floor: REFUSED: --plp %s is not yes or no\n", PLP); return 2; }
         } else if (!strcmp(argv[i], "--registered") && i + 1 < argc) REGPATH = argv[++i];
+        else if (!strcmp(argv[i], "--require-registered")) REQREG = 1;
         else { fprintf(stderr, "v3floor: bad argument %s\n", argv[i]); return 2; }
     }
     if ((MUTANT || TRACE_CLOCK || crash_arm || CRASH_AIM) && !firecheck_env())
@@ -1457,6 +1464,16 @@ int main(int argc, char **argv) {
         virt_record(&VIRT, &LEAF, u0.machine);
     }
     const int leaf_brd = !strcmp(LEAF.kind, "brd"), leaf_wb = !strcmp(leaf->wc, "write back");
+    /* traced? (eighth review H2): a ptrace tracer stops every syscall, so the D0 control's p50 then measures the tracer,
+     * not a foreign writer; recorded, and run.sh's gate refuses a traced batch */
+    int traced = 0;
+    {
+        static char st[8192];
+        if (read_all("/proc/self/status", st, sizeof st) == 0) {
+            const char *t = strstr(st, "\nTracerPid:");
+            traced = t && atoi(t + 11) != 0;
+        }
+    }
     char d0key[192], d0val[64] = "", d0ref[256] = "", frame_reg[64] = "", frame_ref[256] = "";
     snprintf(d0key, sizeof d0key, "d0_threshold/%s/%s/%s", top->fstype, leaf_brd ? "brd" : leaf_wb ? "wb" : "wt",
              VIRT.vm > 0 ? "vm" : VIRT.vm == 0 ? "bare" : "nr");
@@ -1464,19 +1481,35 @@ int main(int argc, char **argv) {
     int d0_registered = 0, frame_registered = 0;
     if (REGPATH) {
         int r = reg_lookup(REGPATH, d0key, d0val, sizeof d0val, d0ref, sizeof d0ref);
-        if (r < 0) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
+        if (r == -1) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
+        if (r == -2) refuse("%s has a line that is not 'key<TAB>value<TAB>ref' (a comment starts with '#')", REGPATH);
         if (r == 0) {
-            char *e;
-            d0_t = strtod(d0val, &e);
-            if (*e || !(d0_t > 1.0)) refuse("%s: %s = '%s' is not a threshold above 1", REGPATH, d0key, d0val);
+            /* a plain decimal above 1 (no exponent, inf, nan or hex: the same rule as check.py's) */
+            int ok = d0val[0] >= '0' && d0val[0] <= '9', dots = 0;
+            for (const char *c = d0val; *c && ok; c++) {
+                if (*c == '.') dots++;
+                else if (*c < '0' || *c > '9') ok = 0;
+            }
+            d0_t = ok && dots <= 1 ? strtod(d0val, NULL) : 0;
+            if (!(d0_t > 1.0)) refuse("%s: %s = '%s' is not a plain decimal threshold above 1", REGPATH, d0key, d0val);
             d0_registered = 1;
         }
         if (reg_lookup(REGPATH, "frame_arm", frame_reg, sizeof frame_reg, frame_ref, sizeof frame_ref) == 0) {
-            int known = 0;
-            for (int a = 0; a < NARMS; a++) known |= !strcmp(frame_reg, NAMES[a]);
-            if (!known) refuse("%s: frame_arm '%s' is not an arm", REGPATH, frame_reg);
+            /* the M0 append and overwrite arms only (PREREG section 4; eighth review L1) */
+            if (strcmp(frame_reg, "append25") && strcmp(frame_reg, "append64") && strcmp(frame_reg, "ow4k") &&
+                strcmp(frame_reg, "ow64k") && strcmp(frame_reg, "ow1m"))
+                refuse("%s: frame_arm '%s' is not an M0 append or overwrite arm (append25, append64, ow4k, ow64k, ow1m)",
+                       REGPATH, frame_reg);
             frame_registered = 1;
         }
+    }
+    /* rental mode (run.sh with V3_REQUIRE_T3=1): refuse here, before any op, what post would refuse after a batch of
+     * 10000 (eighth review L7): an unregistered frame arm, or no registered threshold where the timing control applies */
+    if (REQREG) {
+        if (!REGPATH) refuse("--require-registered without --registered");
+        if (!frame_registered) refuse("rental mode: no registered frame arm in %s", REGPATH);
+        if (!leaf_brd && leaf_wb && !(PLP && !strcmp(PLP, "yes")) && !d0_registered)
+            refuse("rental mode: no registered d0 threshold %s in %s (A17)", d0key, REGPATH);
     }
     dir_identity();
     if (DIR_MNT != top->id) refuse("D's mount changed between the lookup (mount id %llu) and now (%llu)",
@@ -1617,7 +1650,8 @@ int main(int argc, char **argv) {
     jstr(f, clocksrc);
     if (have_seed) fprintf(f, ",\"seed_arg\":%llu", (unsigned long long)seed);
     else fprintf(f, ",\"seed_arg\":null");
-    fprintf(f, ",\"pid\":%d,\"plp\":\"%s\",\"registered_file\":", (int)getpid(), PLP ? PLP : "not given");
+    fprintf(f, ",\"pid\":%d,\"traced\":%s,\"plp\":\"%s\",\"registered_file\":", (int)getpid(), traced ? "true" : "false",
+            PLP ? PLP : "not given");
     if (REGPATH) jstr(f, REGPATH); else fprintf(f, "null");
     fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"linkage\":\"%s\","
             "\"mapped_files\":[", other_maps ? "not static: other files mapped (fire-check only)" : "static");
@@ -1853,29 +1887,37 @@ int main(int argc, char **argv) {
         }
         /* the D0 control's own validity: a foreign writer on the device (PREREG section 4, gate-6 review MED 6) */
         double d0us = p50[have_d0] / 1e3;
-        if (d0us >= 50.0) {
+        if (traced)
+            fprintf(f, ",\"d0_control\":\"not applicable: traced (nosync25 p50 %.1f us under a tracer)\"", d0us);
+        else if (d0us >= 50.0) {
             fprintf(f, ",\"d0_control\":\"FAIL: run void (nosync25 p50 %.1f us >= 50 us: a foreign writer on the device)\"", d0us);
             rc = 3;
         } else fprintf(f, ",\"d0_control\":\"pass (nosync25 p50 %.1f us < 50 us)\"", d0us);
     } else {
-        snprintf(tc, sizeof tc, "not applicable: no flushed arm selected");
+        snprintf(tc, sizeof tc, "not run: nosync25 not selected");
         fprintf(f, ",\"d0_control\":\"not run: nosync25 not selected\"");
     }
     fprintf(f, ",\"timing_control\":"); jstr(f, tc);
     fprintf(f, ",\"flush_control\":"); jstr(f, tc); /* the same verdict, under its old name */
     /* the floor reference (A18): the cheapest durable barrier measured here */
     {
+        /* candidates (A18): append25 + fsync, ow4k + fdatasync (fdatasync4k), and the registered frame arm + fdatasync,
+         * which this probe has only for ow4k (= fdatasync4k); another registered frame arm's variant is recorded as
+         * missing (eighth review M2) */
         int best = -1;
         for (int j = 0; j < na; j++) {
             int cand = sel[j] == APPEND25 || sel[j] == FDATASYNC4K;
-            if (frame_registered && !strcmp(NAMES[sel[j]], frame_reg)) cand = 1;
             if (cand && !(MUTANT && flushed(sel[j])) && (best < 0 || p50[j] < p50[best])) best = j;
         }
+        fprintf(f, ",\"floor_frame_variant\":\"%s\"", !frame_registered ? "no frame arm registered"
+                : !strcmp(frame_reg, "ow4k") ? "fdatasync4k (ow4k + fdatasync)"
+                : "none in this probe: the registered frame arm has no fdatasync variant arm (A18 needs one)");
         fprintf(f, ",\"floor_reference\":");
         if (best < 0) fprintf(f, "null");
         else
             fprintf(f, "{\"arm\":\"%s\",\"barrier\":\"%s\",\"p50_us\":%.1f,\"rule\":\"annex A18: min p50 over append25 "
-                    "(fsync), fdatasync4k (ow4k + fdatasync) and the registered frame arm, among the arms run\"}",
+                    "(fsync), fdatasync4k (ow4k + fdatasync) and the registered frame arm's fdatasync variant, among the "
+                    "arms run\"}",
                     NAMES[sel[best]], sel[best] == FDATASYNC4K ? "fdatasync" : "fsync", p50[best] / 1e3);
     }
     fprintf(f, "}\n");

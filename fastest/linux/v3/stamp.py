@@ -140,6 +140,11 @@ def main():
         if a.get("diskstats") and b.get("diskstats"):
             b["diskstats_delta"] = {dev: {k: row[k] - a["diskstats"][dev].get(k, 0) for k in row}
                                     for dev, row in b["diskstats"].items() if dev in a["diskstats"]}
+        for dev, w0 in (a.get("block") or {}).items():  # a write cache flipped during the batch (eighth review L8)
+            w1 = (b.get("block") or {}).get(dev)
+            if w1 is not None and w0.get("write_cache") != w1.get("write_cache"):
+                b["problems"].append("%s's write_cache changed during the batch: %r -> %r" % (dev, w0.get("write_cache"),
+                                                                                         w1.get("write_cache")))
         if a.get("clocksource") != b.get("clocksource"):
             b["problems"].append("the clocksource changed during the batch: %r -> %r" % (a.get("clocksource"), b.get("clocksource")))
         b["problems"] = a.get("problems", []) + b["problems"]

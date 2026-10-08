@@ -405,7 +405,23 @@ def per_arm(events, w):
 def sync_windows(sysev, w, pid):
     """per arm: windows in which process pid entered no fsync or fdatasync (and the count it entered)."""
     mine = [e for e in sysev if e[6] == pid]
-    inside, amb, _ = attribute(mine, w)
+    # the probe is single-threaded and enters its sync inside its op's window, so a sync event belongs to the one
+    # window its +-500 ns interval OVERLAPS (eighth review M4: requiring the interval wholly inside a window left a
+    # sync within 0.5 us of the op's start ambiguous, and fast hardware puts it there)
+    starts = [x[0] for x in w]
+    inside, amb = {}, []
+    for e in mine:
+        lo, hi = e[0] - e[1], e[0] + e[1]
+        k = bisect.bisect_right(starts, hi)
+        poss = []
+        j = k - 1
+        while j >= 0 and w[j][1] >= lo and len(poss) < 3:
+            poss.append(j)
+            j -= 1
+        if len(poss) == 1:
+            inside.setdefault(poss[0], []).append(e)
+        elif poss:
+            amb.append((e, poss))
     res = {}
     for k, (t0, t1, a, i) in enumerate(w):
         r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0, "ambiguous": 0})
@@ -584,6 +600,12 @@ def self_test():
     chk("syscall lines parse: 3 syscall events and 1 block event, the header count matching both",
         len(se) == 3 and len(be) == 1 and not sp and [x[3] for x in se] == ["fsync", "fdatasync", "fsync"], (se, sp))
     sw = sync_windows(se, windows, 99)
+    # eighth review M4: a sync printed 0.3 us after its window opened (interval straddling the start) is that window's
+    edge = [(1000000, 1100000, "append25", 0), (1200000, 1300000, "append25", 1)]
+    ee, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001000"), sev("v3floor", 99, "0.001200")]) + "\n", devs)[1:], None
+    swe = sync_windows(ee[0], edge, 99)
+    chk("sync windows: a sync whose +-500 ns interval overlaps only its own window's start is attributed to it",
+        swe.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 0, "ambiguous": 0}, swe)
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)

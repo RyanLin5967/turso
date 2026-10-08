@@ -98,8 +98,15 @@ if [ "$mode" = bound ]; then
 else
   shape="smoke: N=$N arms ${args[*]:-default}"
 fi
+rental=no
 if [ "${V3_REQUIRE_T3:-}" = 1 ]; then
+  rental=yes
   tj=$(python3 -B "$GATE" t3pre) || refuse "V3_REQUIRE_T3=1 and the registered T3 preconditions do not hold: $tj"
+  # a real run is on a drive (A16; eighth review M6): no loop cell; the probe itself refuses an unregistered frame arm
+  # or threshold before any op (--require-registered, eighth review L7), and post re-checks both after
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(1 if v3cell.is_loop(sys.argv[2]) else 0)' "$HERE" "$CELL" \
+    || refuse "rental: V3_CELL=$CELL is a loop cell; a real run is on a drive (A16: loop devices are dry-run only)"
+  args+=(--require-registered)
 fi
 TMP="$OUT.stamp_start.json" BLKD="$OUT.blkflush"
 { [ ! -e "$OUT" ] && [ ! -e "$TMP" ] && [ ! -e "$BLKD" ]; } || refuse "$OUT, $TMP or $BLKD exists"
@@ -128,8 +135,8 @@ if [ -d "$OUT" ]; then
     fi
     rrc=$?
   fi
-  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\nplp=%s\nshape=%s\n' \
-    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" "$V3_PLP" "$shape" > "$OUT/binary.txt"
+  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\nplp=%s\nshape=%s\nrental=%s\n' \
+    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" "$V3_PLP" "$shape" "$rental" > "$OUT/binary.txt"
   if [ -f "$OUT/summary.json" ]; then
     if [ "$mode" = bound ]; then
       python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" "$V3_FIRECHECK_VERDICT"

@@ -3,53 +3,67 @@
  "devices": {
   "loop0": {
    "by_kind": {
-    "flush": 2814,
+    "flush": 2806,
     "fua": 0,
     "other": 0,
     "preflush": 0,
     "preflush+fua": 0
    },
    "comms": {
-    "kworker/0:1H": 731,
-    "kworker/1:1H": 544,
-    "kworker/2:1H": 935,
-    "kworker/3:1H": 604
+    "kworker/0:1H": 978,
+    "kworker/1:1H": 744,
+    "kworker/2:1H": 481,
+    "kworker/3:1H": 603
    },
-   "total": 2814
+   "total": 2806
+  },
+  "loop2": {
+   "by_kind": {
+    "flush": 2,
+    "fua": 0,
+    "other": 0,
+    "preflush": 0,
+    "preflush+fua": 0
+   },
+   "comms": {
+    "kworker/0:1H": 1,
+    "kworker/2:1H": 1
+   },
+   "total": 2
   }
  },
- "events": 2814,
+ "events": 2808,
  "filter": "rwbs ~ \"*F*\"",
- "instance": "v3blk_11893_180432000",
+ "instance": "v3blk_11903_98933958",
  "proves": "flush requests and FUA writes ISSUED to each device's driver (tracefs block:block_rq_issue), never persistence; on a device reporting write-through the block layer strips flushes before issue, so 0 there by construction; other processes' requests inside a window are counted too, and a request an op causes after its window closes is not, so a window's count is neither a strict upper nor lower bound on the op's own; a zero is exact only for windows longer than 1 us (the trace prints microseconds)",
  "syscalls": {
   "arms": {
    "append25": {
-    "ambiguous": 9,
+    "ambiguous": 15,
     "ops": 200,
     "syncs": 200,
     "windows_without_a_sync": 0
    },
    "append64": {
-    "ambiguous": 18,
+    "ambiguous": 16,
     "ops": 200,
     "syncs": 200,
     "windows_without_a_sync": 0
    },
    "cfr2b": {
-    "ambiguous": 35,
+    "ambiguous": 53,
     "ops": 200,
-    "syncs": 379,
+    "syncs": 368,
     "windows_without_a_sync": 0
    },
    "clean": {
-    "ambiguous": 105,
+    "ambiguous": 118,
     "ops": 200,
-    "syncs": 98,
-    "windows_without_a_sync": 102
+    "syncs": 85,
+    "windows_without_a_sync": 115
    },
    "fdatasync4k": {
-    "ambiguous": 8,
+    "ambiguous": 11,
     "ops": 200,
     "syncs": 200,
     "windows_without_a_sync": 0
@@ -61,7 +75,7 @@
     "windows_without_a_sync": 200
    },
    "ow1m": {
-    "ambiguous": 7,
+    "ambiguous": 11,
     "ops": 200,
     "syncs": 200,
     "windows_without_a_sync": 0
@@ -73,17 +87,17 @@
     "windows_without_a_sync": 0
    },
    "ow64k": {
-    "ambiguous": 9,
+    "ambiguous": 12,
     "ops": 200,
     "syncs": 200,
     "windows_without_a_sync": 0
    }
   },
   "by_pid": {
-   "11936": 1811
+   "11946": 1811
   },
   "events": 1811,
-  "pid": 11936,
+  "pid": 11946,
   "traced": [
    "sys_enter_fsync",
    "sys_enter_fdatasync"
@@ -91,7 +105,7 @@
  },
  "tool": "blkflush.py",
  "trace_clock": "mono_raw",
- "window_s": 2.315703584,
+ "window_s": 1.984564968,
  "windows": {
   "ambiguous": 0,
   "ambiguous_by_device": {},
@@ -167,6 +181,23 @@
       "max_in_window": 2,
       "per_op": 2.0,
       "zero_windows": 0
+     },
+     "loop2": {
+      "bare_flush_zero_windows": 199,
+      "by_kind": {
+       "flush": 2,
+       "fua": 0,
+       "other": 0,
+       "preflush": 0,
+       "preflush+fua": 0
+      },
+      "events": 2,
+      "flush_carrying_zero_windows": 199,
+      "flush_per_op": 0.01,
+      "fua_per_op": 0.0,
+      "max_in_window": 2,
+      "per_op": 0.01,
+      "zero_windows": 199
      }
     },
     "ops": 200,
@@ -204,18 +235,18 @@
      "loop0": {
       "bare_flush_zero_windows": 0,
       "by_kind": {
-       "flush": 200,
+       "flush": 202,
        "fua": 0,
        "other": 0,
        "preflush": 0,
        "preflush+fua": 0
       },
-      "events": 200,
+      "events": 202,
       "flush_carrying_zero_windows": 0,
-      "flush_per_op": 1.0,
+      "flush_per_op": 1.01,
       "fua_per_op": 0.0,
-      "max_in_window": 1,
-      "per_op": 1.0,
+      "max_in_window": 3,
+      "per_op": 1.01,
       "zero_windows": 0
      }
     },
@@ -227,7 +258,7 @@
     "ambiguous_by_device": {},
     "devices": {},
     "ops": 200,
-    "windows_under_1us": 6
+    "windows_under_1us": 4
    },
    "ow1m": {
     "ambiguous": 0,
@@ -261,18 +292,18 @@
      "loop0": {
       "bare_flush_zero_windows": 0,
       "by_kind": {
-       "flush": 395,
+       "flush": 390,
        "fua": 0,
        "other": 0,
        "preflush": 0,
        "preflush+fua": 0
       },
-      "events": 395,
+      "events": 390,
       "flush_carrying_zero_windows": 0,
-      "flush_per_op": 1.975,
+      "flush_per_op": 1.95,
       "fua_per_op": 0.0,
       "max_in_window": 2,
-      "per_op": 1.975,
+      "per_op": 1.95,
       "zero_windows": 0
      }
     },
@@ -286,18 +317,18 @@
      "loop0": {
       "bare_flush_zero_windows": 0,
       "by_kind": {
-       "flush": 397,
+       "flush": 392,
        "fua": 0,
        "other": 0,
        "preflush": 0,
        "preflush+fua": 0
       },
-      "events": 397,
+      "events": 392,
       "flush_carrying_zero_windows": 0,
-      "flush_per_op": 1.985,
+      "flush_per_op": 1.96,
       "fua_per_op": 0.0,
       "max_in_window": 2,
-      "per_op": 1.985,
+      "per_op": 1.96,
       "zero_windows": 0
      }
     },

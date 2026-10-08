@@ -8,9 +8,9 @@ CELL is explicit (v3cell.py: ext4|xfs|btrfs on a block device, ext4loop|xfsloop|
                                byte rules on planted records; exit 0 iff all fire as written
   check.py --bind OUT CELL     after run.sh was bound to OUT/verdict.json (firecheck.sh's last step): write
                                OUT/verdict.bind.json (the binding record run.sh requires) and remove the pending one
-  check.py --plan CELL ARCH LEAF VIRT FLIP   print the check ids a verdict for that cell, arch, leaf class (wb|wt|brd)
-                               and box (VIRT vm|bare from systemd-detect-virt; FLIP yes|no: can the leaf disk's
-                               write cache be made to disagree with the drive) must hold
+  check.py --plan CELL ARCH LEAF VIRT FLIP PLP   print the check ids a verdict for that cell, arch, leaf class
+                               (wb|wt|brd) and box (VIRT vm|bare from systemd-detect-virt; FLIP yes|no: can the leaf
+                               disk's write cache be made to disagree with the drive; PLP yes|no, V3_PLP) must hold
   check.py --box OUT           print the box firecheck.sh recorded in OUT/info.txt, as check.py reads it
 
 Every expectation below comes from the arm definitions (v3floor.c's header, PREREG section 11 M0 exit 1), written
@@ -54,7 +54,10 @@ APPEND_BASE = 4096  # the append arms' files start one 4 KiB block long (setup),
 REC = {"ow4k": 4096, "ow64k": 65536, "ow1m": 1 << 20, "fdatasync4k": 4096}
 CAP = {"ow4k": 16 << 20, "ow64k": 16 << 20, "ow1m": 128 << 20, "fdatasync4k": 16 << 20}
 FLUSHED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "fdatasync4k", "clone1b", "clone2b", "cfr2b"]
-GATED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b"]  # the flush control gates these (rc 3)
+# flush-gated: every op must issue a device flush and its own sync (post's gates); fdatasync4k since it is an A18
+# floor candidate (eighth review M1; measured: it issues a flush-carrying request in 200/200 windows on the three
+# write-back cells of run 37812355435). The TIMING control gates append25 only (A17).
+GATED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b", "fdatasync4k"]
 CLONES = ["clone1b", "clone2b"]  # FICLONE: refused on ext4
 COPIES = ["clone1b", "clone2b", "cfr2b"]
 FLUSH_FAMILY = ["fsync", "fdatasync", "sync", "syncfs", "sync_file_range", "msync"]
@@ -161,15 +164,25 @@ HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3c
            "../../../.github/workflows/fastest-v3.yml"]
 
 
-def registered(here=HERE):
+REGISTRY_FILE = "REGISTERED.tsv"  # the self-test points this at a fixed snapshot (eighth review M7)
+
+
+def registered(here=HERE, path="REGISTERED.tsv"):
     """REGISTERED.tsv: key -> (value, registration ref) (annex A17; gate-6 review MED 5)."""
     out = {}
-    for line in (rd(os.path.join(here, "REGISTERED.tsv")) or "").splitlines():
-        if not line.strip() or line.startswith("#"):
+    try:  # bytes, so that a CR is seen (text mode would translate it away)
+        text = open(os.path.join(here, path), "rb").read().decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    for line in text.split("\n"):
+        if not line or line.startswith("#"):
             continue
-        f = line.split("\t")
-        if len(f) >= 3:
-            out[f[0]] = (f[1], f[2])
+        f = line.split("\t")  # the probe's rule (eighth review L5): exactly three non-empty fields, no CR
+        if len(f) != 3 or not all(f) or "\r" in line:
+            raise ValueError("REGISTERED.tsv: a line that is not key<TAB>value<TAB>ref: %r" % line[:80])
+        if f[0].startswith("d0_threshold/") and not re.fullmatch(r"[0-9]+(\.[0-9]*)?", f[1]):
+            raise ValueError("REGISTERED.tsv: %s = %r is not a plain decimal" % (f[0], f[1]))
+        out[f[0]] = (f[1], f[2])
     return out
 
 
@@ -177,7 +190,7 @@ def timing_expect(sj, p50):
     """The timing control and the D0 control the probe must record, recomputed from raw p50s and the leaf, written
     by hand from the rulings: A14 (not applicable on no volatile cache, declared PLP, brd), A17 (append25 only, the
     registered threshold or a provisional 10), PREREG section 4 (nosync25 p50 >= 50 us voids). -> (expect, voids)."""
-    reg = registered()
+    reg = registered(path=REGISTRY_FILE)
     lf = sj.get("leaf") or {}
     lc = "brd" if lf.get("kind") == "brd" else "wb" if sj.get("leaf_write_cache") == "write back" else "wt"
     vz = (sj.get("virtualization") or {}).get("virtualized")
@@ -200,9 +213,12 @@ def timing_expect(sj, p50):
             voids.append("timing")
     dc = None
     if d0 is not None:
-        dc = "FAIL: run void (nosync25 p50" if d0 / 1e3 >= 50 else "pass (nosync25 p50"
-        if d0 / 1e3 >= 50:
-            voids.append("d0")
+        if sj.get("traced") is True:  # a tracer's stops, not a foreign writer (eighth review H2)
+            dc = "not applicable: traced"
+        else:
+            dc = "FAIL: run void (nosync25 p50" if d0 / 1e3 >= 50 else "pass (nosync25 p50"
+            if d0 / 1e3 >= 50:
+                voids.append("d0")
     return {"key": key, "threshold": t, "ref": reg[key][1] if key in reg else None, "timing": tc, "d0": dc}, voids
 
 
@@ -1038,6 +1054,23 @@ def self_test():
     chk("harness: no start record", harness_moved(None, dict(a)) != [])
     w1 = hexs.replace("WCE=0", "WCE=1").replace("08 0a 00", "08 0a 04")
     chk("MODE SENSE bytes: WCE=0 and WCE=1 read back", wce_from_hex(hexs)[0] == 0 and wce_from_hex(w1)[0] == 1)
+    # eighth review L5: REGISTERED.tsv has one strict rule (three non-empty fields, a plain decimal threshold)
+    import tempfile as _tf
+    rd_ = _tf.mkdtemp(prefix="check-reg-")
+    for name, text, ok in (("a good line", "d0_threshold/ext4/wb/bare\t9.5\tDECISIONS x\n", True),
+                           ("two fields", "d0_threshold/ext4/wb/bare\t9.5\n", False),
+                           ("a CR", "d0_threshold/ext4/wb/bare\t9.5\tref\r\n", False),
+                           ("an exponent", "d0_threshold/ext4/wb/bare\t1e1\tref\n", False),
+                           ("inf", "d0_threshold/ext4/wb/bare\tinf\tref\n", False)):
+        open(os.path.join(rd_, "r.tsv"), "w").write("# comment\n" + text)
+        try:
+            registered(rd_, "r.tsv")
+            got = True
+        except ValueError:
+            got = False
+        chk("REGISTERED.tsv rule: %s -> %s" % (name, "read" if ok else "refused"), got is ok)
+    import shutil as _sh
+    _sh.rmtree(rd_)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
     # sixth review H1: the box and the plan it selects
@@ -1082,13 +1115,14 @@ def self_test():
     return 0 if ok else 1
 
 
-BANKED_F3 = "f3-37528595878-x86-ext4loop"   # write-back NVMe (upgraded: its README)
-BANKED_F3_WT = "f3-37811638228-arm-ext4loop"  # write-through Hyper-V sd, a real batch of the current record format
+BANKED_F3 = "f3-37812355435-x86-ext4loop"     # write-back MSFT NVMe, real (four format fields: its README)
+BANKED_F3_WT = "f3-37812355435-arm-ext4loop"  # write-through Hyper-V sd, real (the same four fields)
 
 
 def real_selftest(chk):
     import contextlib, io, shutil, tempfile
-    global CELL, KIND, W, OUT, results
+    global CELL, KIND, W, OUT, results, REGISTRY_FILE
+    REGISTRY_FILE = os.path.join("testdata", "REGISTERED.selftest.tsv")
     src = os.path.join(HERE, "testdata", BANKED_F3)
     info = rd(os.path.join(src, "info.txt")) or ""
     kv = dict(l.split("=", 1) for l in info.splitlines() if "=" in l and not l.startswith(("loop ", "block ")))
@@ -1177,6 +1211,8 @@ def real_selftest(chk):
             ("a window without the probe's fsync", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_without_a_sync=1)},
              "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
             ("PLP declared yes to the fire-check", {"kvmut": lambda k: k.update(plp="yes")}, "F3:record", ["plp"]),
+            ("traced, the D0 control still judged", both(lambda j: j.update(traced=True)), "F3:complete",
+             ["d0_control disagrees with raw"]),
         ]
         for name, muts, cid, want in cases:
             g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"))
@@ -1233,7 +1269,7 @@ def real_selftest(chk):
                 g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
         # cell:leaf through its own function
         f3 = rj(os.path.join(src, "F3", "summary.probe.json"))
-        sdl = rj(os.path.join(src, "sd_leaf.json"))
+        sdl = (rj(os.path.join(src_wt, "F3", "summary.probe.json")) or {}).get("leaf")  # the real Hyper-V sd leaf
         for name, lf, ok in (("the banked NVMe leaf", f3["leaf"], True), ("the banked Hyper-V sd leaf", sdl, True),
                              ("NVMe over tcp", dict(f3["leaf"], nvme_transport=["tcp"]), False),
                              ("a scsi_debug kind", dict(sdl, kind="scsi_debug", creditable=False), False),
@@ -1277,6 +1313,7 @@ def real_selftest(chk):
             chk("real: cell:box with %s -> %s" % (name, "pass" if ok else "fail"), results[0]["pass"] is ok, results[0]["detail"])
     finally:
         CELL, KIND, W, OUT, results = saved
+        REGISTRY_FILE = "REGISTERED.tsv"
         shutil.rmtree(td)
 
 
@@ -1284,10 +1321,11 @@ def main(argv):
     global OUT, CELL, KIND, W
     if argv == ["--self-test"]:
         return self_test()
-    if len(argv) == 6 and argv[0] == "--plan":
-        if argv[1] not in v3cell.CELLS or argv[4] not in ("vm", "bare") or argv[5] not in ("yes", "no"):
+    if len(argv) == 7 and argv[0] == "--plan":
+        if argv[1] not in v3cell.CELLS or argv[4] not in ("vm", "bare") or argv[5] not in ("yes", "no") or \
+                argv[6] not in ("yes", "no"):
             return 2
-        print("\n".join(plan(argv[1], argv[2], argv[3], {"virt": argv[4], "flip": argv[5]})))
+        print("\n".join(plan(argv[1], argv[2], argv[3], {"virt": argv[4], "flip": argv[5], "plp": argv[6]})))
         return 0
     if len(argv) == 2 and argv[0] == "--box":
         info = rd(os.path.join(argv[1], "info.txt")) or ""
@@ -1450,17 +1488,21 @@ def main(argv):
                   "append25). The registered threshold for a class (REGISTERED.tsv) is taken from such candidates "
                   "before any rental; the other arms are descriptive and left to the flush gate",
           "registered_key": (rj(os.path.join(OUT, "F3", "summary.probe.json")) or {}).get("d0_threshold_key"),
-          "max_mutant_gated": max(gm) if gm else None, "min_real_gated": min(gr) if gr else None, "per_arm": {}}
+          "max_mutant_gated": max(gm) if gm else None, "min_real_gated": min(gr) if gr else None, "per_arm": {},
+          "pooled_over_flush_gated_arms_descriptive": True}
     for a in GATED:
         if a in mut_ratios and a in real_r:
             mu, re_ = mut_ratios[a], real_r[a]
             d0["per_arm"][a] = {"mutant": mu, "real": re_, "separates": mu < re_,
                                 "candidate": round((mu * re_) ** 0.5, 2) if mu < re_ and mu > 0 else None,
                                 "threshold_10_separates": mu < 10 < re_}
-    if gm and gr:
-        d0["separates"] = max(gm) < min(gr)
-        d0["candidate"] = round((max(gm) * min(gr)) ** 0.5, 2) if d0["separates"] else None
-        d0["threshold_10_separates"] = max(gm) < 10 < min(gr)
+    # the registered candidate is append25's alone (A17; eighth review M3): the pooled max/min above are descriptive
+    a25 = d0["per_arm"].get("append25")
+    if a25:
+        d0["separates"] = a25["separates"]
+        d0["candidate"] = a25["candidate"]
+        d0["threshold_10_separates"] = a25["threshold_10_separates"]
+        d0["candidate_arm"] = "append25"
 
     # frame arm (item 11; gate-6 review MED 5): the registered one, else none with the rule's candidate; append64 (an
     # append of >= the ~60 B flight and < 4 KiB) runs in F3, descriptive until registered
@@ -1832,6 +1874,8 @@ def unplanted(arch, leaf, box):
         u.append("the kernel's write_cache disagreeing with the drive: the leaf disk reads write-through and is not sd, "
                  "so neither direction can be planted (the kernel refuses 'write back' on a queue without a volatile "
                  "cache: recalled, unverified)")
+    u.append("run.sh's rental-mode loop-cell refusal and the probe's --require-registered refusals (on a runner without "
+             "the performance governor t3pre refuses first; post's rental rules are self-tested: batchgate self-test)")
     if leaf != "wt":
         u.append("A16's write-through refusals on this cell's own batch (its leaf is not write-through; the post plants "
                  "R_post_wtflush and R_post_wtmismatch make a copy of it write-through)")
@@ -2157,13 +2201,14 @@ def bind(out, cell):
                                                                            "claim": claim, "claim_want": want},
                     "check": "run.sh binds a batch to this cell's real passing verdict, records its sha256 and run id, "
                              "and the batch's claim says its clean arm did not run"})
-        rc = rc_of(os.path.join(out, "F4", "R_runsh_boundshape.rc"))
-        txt = rd(os.path.join(out, "F4", "R_runsh_boundshape.txt")) or ""
-        res.append({"id": "bind:R_runsh_boundshape", "pass": rc == 2 and "bound shape: a bound batch runs N=10000" in txt
-                    and not os.path.exists(os.path.join(out, "F4", "R_runsh_boundshape.out")),
-                    "detail": {"rc": rc, "text": txt[-300:]},
-                    "check": "the same verdict, bound, but N=5: run.sh refuses before the probe runs (the registered V3 "
-                             "shape: gate-6 review MED 6)"})
+        for tag, what in (("R_runsh_boundshape", "N=5"), ("R_runsh_boundarms", "N=10000 without fdatasync4k")):
+            rc = rc_of(os.path.join(out, "F4", tag + ".rc"))
+            txt = rd(os.path.join(out, "F4", tag + ".txt")) or ""
+            res.append({"id": "bind:" + tag, "pass": rc == 2 and "bound shape: a bound batch runs N=10000" in txt
+                        and not os.path.exists(os.path.join(out, "F4", tag + ".out")),
+                        "detail": {"rc": rc, "text": txt[-300:]},
+                        "check": "the same verdict, bound, but %s: run.sh refuses before the probe runs (the registered "
+                                 "V3 shape: gate-6 review MED 6, eighth review L4)" % what})
     vsha = hashlib.sha256(open(os.path.join(out, "verdict.json"), "rb").read()).hexdigest() \
         if os.path.exists(os.path.join(out, "verdict.json")) else None
     b = {"cell": cell, "verdict_sha256": vsha, "verdict_all_pass": v.get("all_pass"), "checks": res,

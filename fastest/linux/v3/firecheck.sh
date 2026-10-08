@@ -573,7 +573,7 @@ if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
 else
   echo "V3_SHIM missing" > "$OUT/F4/R_runsh_ldpreload.txt"; echo missing > "$OUT/F4/R_runsh_ldpreload.rc"
 fi
-refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated)" 5 --arms fdatasync4k,nosync25
+refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated)" 5 --arms clean,nosync25
 # fresh review I-H1: a batch gate that fails (here a stub batchgate.py in a copy of the harness exiting 1) is a
 # refusal, never the probe's rc 0
 GH="$OUT/F4/gatecrash-harness"
@@ -710,6 +710,8 @@ else
   timeout 1800 env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 10000 --arms "$BSHAPE" > "$OUT/F4/P_runsh_ok.txt" 2>&1
   echo $? > "$OUT/F4/P_runsh_ok.rc"
   refuse R_runsh_boundshape env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o R_runsh_boundshape)" 5 --arms "$BSHAPE"
+  # ... and the other half of the shape: N=10000 with an arm missing (eighth review L4)
+  refuse R_runsh_boundarms env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o R_runsh_boundarms)" 10000 --arms append25,nosync25
 fi
 python3 -B "$HERE/check.py" --bind "$OUT" "$CELL"
 brc=$?

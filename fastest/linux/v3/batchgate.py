@@ -366,7 +366,13 @@ def post(out, cell, sha, mode, verdict_path):
                         "mismatch refuses)" % (lfr.get("drive_reports"), lfr.get("write_cache")))
     if sj.get("plp") not in ("yes", "no"):
         refusals.append("plp: the batch declares %r, not yes or no (run.sh passes V3_PLP)" % (sj.get("plp"),))
+    if sj.get("traced") is not False:  # a tracer's stops change every timing (eighth review H2)
+        refusals.append("traced: the probe ran under a tracer (or did not record whether it did): %r" % (sj.get("traced"),))
     if os.environ.get("V3_REQUIRE_T3") == "1":  # rental mode: the registered values must exist (A17, MED 5)
+        # ... and a real run is on a drive: no loop layer, no brd leaf (A16; eighth review M6)
+        if v3cell.is_loop(cell) or len(sj.get("flush_path") or []) != 1 or lc == "brd":
+            refusals.append("rental: a real run is on a drive: cell %s, %d layer(s), leaf class %r (A16: ram and loop "
+                            "devices are dry-run only)" % (cell, len(sj.get("flush_path") or []), lc))
         tc = str(sj.get("timing_control", ""))
         if not tc.startswith("not applicable") and not sj.get("d0_threshold_ref"):
             refusals.append("registration: no registered d0 threshold for %s (A17: rental mode refuses a provisional "
@@ -531,6 +537,30 @@ def drift(start_out, end_out):
     why = []
     if a.get("frame_arm") != b.get("frame_arm"):
         why.append("the frame arm differs: %r then %r" % (a.get("frame_arm"), b.get("frame_arm")))
+    # the same kind of batch at both ends, each passed by its own gate (eighth review L3)
+    for k in ("exe_sha256", "plp", "fstype", "mount_source", "leaf_write_cache", "n"):
+        if a.get(k) != b.get(k):
+            why.append("%s differs: %r then %r" % (k, a.get(k), b.get(k)))
+    if (a.get("leaf") or {}).get("disk") != (b.get("leaf") or {}).get("disk"):
+        why.append("the leaf disk differs")
+    for side, d in (("start", start_out), ("end", end_out)):
+        try:
+            g = load(os.path.join(d, "gate.json"))
+            bt = open(os.path.join(d, "binary.txt")).read()
+        except (OSError, ValueError) as e:
+            why.append("%s: no gate.json or binary.txt: %r" % (side, e))
+            continue
+        if g.get("rc") != 0:
+            why.append("%s: its own gate gave rc %r" % (side, g.get("rc")))
+        if "cell=%s" % (g.get("cell"),) not in bt:
+            why.append("%s: binary.txt does not name the gate's cell" % side)
+    try:
+        sa = [l for l in open(os.path.join(start_out, "binary.txt")).read().splitlines() if l.startswith(("cell=", "shape="))]
+        sb = [l for l in open(os.path.join(end_out, "binary.txt")).read().splitlines() if l.startswith(("cell=", "shape="))]
+        if sa != sb:
+            why.append("cell or shape differs: %r then %r" % (sa, sb))
+    except OSError:
+        pass
     arms = ["append25"] + ([a["frame_arm"]] if a.get("frame_arm") else [])
     rec, void = {}, []
     for arm in arms:
@@ -622,7 +652,7 @@ def _post_batch(d, sha, mod):
           "virtualization": {"virtualized": False, "evidence": []}, "n": 5, "pid": 4242, "plp": "no",
           "arms": {"append25": {}, "nosync25": {}}, "flush_control_arms": {"append25": {"gated": True}},
           "timing_control": "not applicable: no volatile cache" if wt else "pass", "d0_threshold_key": "d0_threshold/ext4/wb/bare",
-          "d0_threshold_ref": None, "frame_arm": None}
+          "d0_threshold_ref": None, "frame_arm": None, "traced": False}
     win = {"events": 5, "zero_windows": 0, "flush_carrying_zero_windows": 0, "bare_flush_zero_windows": 0, "per_op": 1.0}
     rep = {"proves": "planted", "devices": {},
            "windows": {"arms": {"append25": {"ops": 5, "devices": {} if wt else {"nvme0n1": win}},
@@ -644,6 +674,14 @@ def _post_batch(d, sha, mod):
         rep["windows"]["arms"]["append25"]["devices"]["loop0"] = dict(win, flush_carrying_zero_windows=1)
     if mod == "plp":
         sj["plp"] = "yes"
+    if mod == "traced":
+        sj["traced"] = True
+    if mod == "loopflush-rental":  # a loop cell, everything registered: only the rental-drive rule is left
+        sj["flush_path"].insert(0, {"fstype": "ext4", "source": "/dev/loop0", "loop_backing": "/x.img", "disk": "loop0",
+                                    "sys": "/sys/block/loop0", "mount": "/l", "write_cache": "write back"})
+        sj["mount_source"] = "/dev/loop0"
+        rep["windows"]["arms"]["append25"]["devices"]["loop0"] = dict(win)
+        sj.update(d0_threshold_ref="planted", frame_arm="ow4k")
     with open(os.path.join(d, "summary.json"), "w") as f:
         json.dump(sj, f)
     with open(os.path.join(d, "stamp_end.json"), "w") as f:
@@ -683,14 +721,16 @@ def post_selftest(chk):
              "VOID flush-carrying:", {}),
             ("A14: a batch declaring PLP bound to a verdict fire-checked without", "plp", "bound", 2, "plp:", {}),
             ("A17: rental mode with no registered threshold or frame arm", "", "smoke", 2, "registration:",
-             {"V3_REQUIRE_T3": "1"})):
+             {"V3_REQUIRE_T3": "1"}),
+            ("A16/eighth review M6: rental mode on a loop cell", "loopflush-rental", "smoke", 2, "rental:", {"V3_REQUIRE_T3": "1"}),
+            ("eighth review H2: a batch the probe ran traced", "traced", "smoke", 2, "traced:", {})):
         d = os.path.join(td, (mod or "control") + "-" + mode + ("-t3" if env else ""))
         vp = _post_batch(d, sha, mod)
         old = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = post(d, "ext4loop" if mod == "loopflush" else "ext4", sha, mode, vp if mode == "bound" else None)
+                rc = post(d, "ext4loop" if mod.startswith("loopflush") else "ext4", sha, mode, vp if mode == "bound" else None)
         finally:
             for k, x in old.items():
                 if x is None:
@@ -711,14 +751,30 @@ def post_selftest(chk):
             ok, (rc, g))
     # gate-6 MED 6: the start-to-end drift
     for name, ea, ok_rc in (("4 us", 1004.0, 0), ("61 us", 1061.0, 3)):
-        sd, ed = os.path.join(td, "drift-s-" + name[:2]), os.path.join(td, "drift-e-" + name[:2])
+        sd, ed = os.path.join(td, "drift-s-" + name.split()[0]), os.path.join(td, "drift-e-" + name.split()[0])
         for dd, p50 in ((sd, 1000.0), (ed, ea)):
             os.makedirs(dd)
             with open(os.path.join(dd, "summary.json"), "w") as f:
-                json.dump({"frame_arm": None, "arms": {"append25": {"p50_us": p50}}}, f)
+                json.dump({"frame_arm": None, "arms": {"append25": {"p50_us": p50}}, "exe_sha256": "ab", "plp": "no",
+                           "n": 10000, "leaf": {"disk": "nvme1n1"}}, f)
+            with open(os.path.join(dd, "gate.json"), "w") as f:
+                json.dump({"rc": 0, "cell": "xfs"}, f)
+            with open(os.path.join(dd, "binary.txt"), "w") as f:
+                f.write("cell=xfs\nshape=bound V3: N=10000, append25,fdatasync4k,nosync25\n")
         with contextlib.redirect_stdout(io.StringIO()):
             rc = drift(sd, ed)
         chk("drift: append25 p50 moved %s -> rc %d" % (name, ok_rc), rc == ok_rc, rc)
+    # eighth review L3: ends of a different kind, or an end its own gate did not pass, refuse
+    for name, mut in (("another binary at the end", lambda d: json.dump(dict(json.load(open(os.path.join(d, "summary.json"))),
+                                                                              exe_sha256="cd"), open(os.path.join(d, "summary.json"), "w"))),
+                      ("an end whose gate voided it", lambda d: json.dump({"rc": 3, "cell": "xfs"}, open(os.path.join(d, "gate.json"), "w")))):
+        sd, ed = os.path.join(td, "drift-s-4"), os.path.join(td, "drift-e-4")
+        ed2 = ed + "-" + name[:5].replace(" ", "")
+        shutil.copytree(ed, ed2)
+        mut(ed2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = drift(sd, ed2)
+        chk("drift: %s -> refused (rc 2)" % name, rc == 2, rc)
     shutil.rmtree(td)
 
 

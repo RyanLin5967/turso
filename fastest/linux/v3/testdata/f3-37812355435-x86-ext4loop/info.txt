@@ -1,5 +1,5 @@
-utc=2026-10-06T20:54:43Z
-run_id=37528595878-1
+utc=2026-10-08T18:10:33Z
+run_id=37812355435-1
 cell=ext4loop
 kind=ext4
 brd_cell=0
@@ -32,7 +32,7 @@ loop /dev/loop12 /mnt/v3fx/n3/x.img           0
 loop /dev/loop3  /v3fx-ht.img                 0
 loop /dev/loop20 /v3fx-wt.img                 0
 loop /dev/loop10 /mnt/v3fx/n1/x.img           0
-v3floor_sha256=46c69cba520997d23392b67e2f9422a08cb31768504e026289f843dec4b7ecfa
+v3floor_sha256=47025d72f07965ea543c98f1443d0a497595fd46ba4fdaae67ba561e452475aa
 arch=x86_64
 uname=Linux 6.17.0-1022-azure x86_64
 strace=strace -- version 6.8
@@ -94,17 +94,18 @@ acl /dev/loop9 user:runner:r--
 acl /dev/nvme0 user:runner:r--
 acl /dev/sda user:runner:r--
 detect_virt=microsoft
+plp=no
 scsi_hosts=host0:storvsc_host host1:scsi_debug 
-v3dyn_sha256=3023591ee9908b2ea7ae6e73468263b3a8990203aad8cc94aec970d1edf73e05 noop_sha256=9d1787d9d4608158d64c94892b00d4eb44a0f583fa292dc13eb45bb273d953b2
+v3dyn_sha256=f23f813fb3e5bc8464e486769e27fbd2b851e04d7095d9bbeb110ac39738fd02 noop_sha256=9d1787d9d4608158d64c94892b00d4eb44a0f583fa292dc13eb45bb273d953b2
 prev_sha=40a3c9502d4998067d2080d32650ec28fdb9b367
 prev_v3floor_sha256=1ea06022d1d9753e0b828c272db961803833682a6cd563422a5489f8651bcc19
 ldso_preload_before=
 leaf_class=wb
+leafdisk=nvme0n1 write_cache=[write back] scsi=0
+box=virt=vm,flip=yes,plp=no
 shm_fstype=tmpfs
 chattr_dir=/mnt/fastest-v3-ext4loop/v3chattr-work --S-----------e------- /mnt/fastest-v3-ext4loop/v3chattr-work
 ficlone_ioctl_index=5
+leafw=/mnt/fastest-v3-ext4loop/v3leaf-work
 ldso_preload_after=
 t3_rule_holds=0
-plp=no
-leafdisk=nvme0n1 write_cache=[write back] scsi=0
-box=virt=vm,flip=yes,plp=no
