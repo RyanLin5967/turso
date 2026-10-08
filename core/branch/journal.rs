@@ -886,6 +886,16 @@ impl Scanned {
                     // directory first, as after a cut in this process.
                     journal.dir_dirty = true;
                 }
+                // The records kept were made durable in `class` by the run that wrote them: the
+                // first rewrite of them syncs in it too (engine review 10 #3), set after the cut
+                // above, so the open's own rewrite does not clear it. Mutant
+                // `inherited_floor_dropped` (test builds only): not set, as before.
+                if class.syncs()
+                    && class > journal.sync.max(journal.raised)
+                    && !super::store::fe_mutant("inherited_floor_dropped")
+                {
+                    journal.inherited = class;
+                }
             }
             End::Reset => journal.reset_log(generation)?,
         }
@@ -1002,6 +1012,12 @@ pub(crate) struct Journal {
     /// checkpoint and its log cut), which therefore syncs in `rewrite_class` (fastest-engine review
     /// B-F3). Kept in the log header, so a restart keeps it too.
     raised: SyncClass,
+    /// The class an earlier run made the recovered records durable in, when it is stronger than
+    /// `sync` and `raised` (a D1 or D2 log reopened in D0; engine review 10 #3): set by the open,
+    /// cleared once the first rewrite lands, which carries those records into a snapshot, the
+    /// catalog or a new log synced in it. Not kept in the header: a later run's records are only
+    /// as durable as that run's class.
+    inherited: SyncClass,
     /// This incarnation of the log's nonce (format 11): in its header, and seeding every end
     /// frame's checksums, so recovery never takes an older incarnation's flight for one of this.
     nonce: u32,
@@ -1124,6 +1140,7 @@ impl Journal {
             lsn: 0,
             pending_class: SyncClass::Off,
             raised: SyncClass::Off,
+            inherited: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1323,6 +1340,7 @@ impl Journal {
             lsn: 0,
             pending_class: SyncClass::Off,
             raised,
+            inherited: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1708,6 +1726,8 @@ impl Journal {
             // a power cut could rename away. Mutant `unsynced_rename_left_clean` (test builds only).
             self.dir_dirty = !super::store::fe_mutant("unsynced_rename_left_clean");
         }
+        // The records an earlier run made durable are carried in a synced rewrite now.
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
@@ -1840,6 +1860,8 @@ impl Journal {
         // class: in D0 that is a raised flight (engine review 7 #1). Mutant
         // `unsynced_rename_left_clean` (test builds only): only when the rewrite class syncs.
         self.dir_dirty = class.syncs() || !super::store::fe_mutant("unsynced_rename_left_clean");
+        // The records an earlier run made durable are carried in a synced rewrite now.
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
@@ -1872,13 +1894,14 @@ impl Journal {
     }
 
     /// The class every rewrite of the log's records syncs in: the store's own, or the strongest one
-    /// any record was made durable in, if stronger (see `raised`).
+    /// any record was made durable in, if stronger (see `raised`, and `inherited` until the first
+    /// rewrite after an open lands).
     pub(crate) fn rewrite_class(&self) -> SyncClass {
         // fastest-engine mutant `rewrite_store_class` (test builds only): rewrites in the store's.
         if super::store::fe_mutant("rewrite_store_class") {
             return self.sync;
         }
-        self.sync.max(self.raised)
+        self.sync.max(self.raised).max(self.inherited)
     }
 
     /// A write in `class` is about to make records durable: remember a class stronger than any so
@@ -2349,6 +2372,9 @@ impl Journal {
         self.len = LOG_HEADER_LEN as u64;
         self.header_stale = false;
         self.dir_dirty = false;
+        // The records an earlier run made durable are carried in a synced rewrite now (a
+        // compaction's snapshot, synced before this reset; a page-size restart's empty state).
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
