@@ -3829,6 +3829,76 @@ fn a_bind_postgresql_refuses_is_refused_before_bind_complete() {
     }
 }
 
+/// Reply messages up to ReadyForQuery: each type byte, the error fields of each ErrorResponse, and
+/// the ReadyForQuery status. Waits on the client's 30-second read timeout, so a reply that never
+/// ends fails the test there instead of hanging it.
+fn read_raw_reply(w: &mut Wire) -> (Vec<u8>, Vec<WireError>, u8) {
+    let (mut tags, mut errors) = (Vec::new(), Vec::new());
+    loop {
+        let mut head = [0u8; 5];
+        w.s.read_exact(&mut head)
+            .expect("the server sent ReadyForQuery before the read timeout");
+        let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        w.s.read_exact(&mut body).unwrap();
+        tags.push(head[0]);
+        if head[0] == b'E' {
+            errors.push(error_fields(&body));
+        }
+        if head[0] == b'Z' {
+            return (tags, errors, body[0]);
+        }
+    }
+}
+
+/// A Sync whose body is not empty is refused (08P01 "invalid message format") and still answered
+/// with ReadyForQuery, as PostgreSQL ends a skip at any Sync before it reads the body; the pipeline
+/// it ends is rolled back. Read as an extended message in error, it set the session waiting for a
+/// Sync that had just arrived, or was dropped while one was awaited: no ReadyForQuery came, and the
+/// client hung holding its connection slot and branch (wire review 12 item 6).
+#[test]
+fn a_malformed_sync_is_still_answered() {
+    let dir = Scratch::new("badsync");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"INSERT INTO t VALUES (5, 'five')");
+    parse.extend_from_slice(&[0, 0, 0]);
+    let pipeline = [
+        frame(b'P', &parse),
+        frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
+        frame(b'E', &[0, 0, 0, 0, 0]),
+        frame(b'S', &[0]),
+    ]
+    .concat();
+    a.s.write_all(&pipeline).unwrap();
+    let (_, errors, status) = read_raw_reply(&mut a);
+    let codes: Vec<(&str, &str)> = errors
+        .iter()
+        .map(|e| (e.code.as_str(), e.message.as_str()))
+        .collect();
+    assert_eq!(codes, vec![("08P01", "invalid message format")]);
+    assert_eq!(status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 5")
+            .single("the pipeline rolled back"),
+        "0"
+    );
+    // A malformed Parse starts a skip; the malformed Sync still ends it.
+    let skip = [frame(b'P', b"\0SELECT 1\0"), frame(b'S', &[0])].concat();
+    a.s.write_all(&skip).unwrap();
+    let (_, errors, status) = read_raw_reply(&mut a);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(status, b'I');
+    assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+}
+
 /// A Bind that supplies a value count other than the statement's parameters is 08P01 for EVERY
 /// statement, as PostgreSQL's exec_bind_message refuses it, before anything runs: a branch call
 /// (create with two format codes and one value, create with two values, delete of a literal with one
