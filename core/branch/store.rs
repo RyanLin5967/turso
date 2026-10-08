@@ -5643,10 +5643,13 @@ impl BranchStore {
     /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
     /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
     /// (`pending_full`), or a flight in the air, a fuzzy checkpoint's arena sync included (engine
-    /// review 9 #8: the flight it replaced counted here). With nothing at risk (a D2 store whose
-    /// every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop`
-    /// (it never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops,
-    /// as before engine review 9 #5 in D2).
+    /// review 9 #8: the flight it replaced counted here). Undrained records count in a store whose
+    /// class syncs, and in a D0 store too once a Release is undrained: its trunk barrier relies on
+    /// that Release being durable, and it is at best plain-fsynced (engine review 10 #6; mutant
+    /// `drain_risk_by_store_class`: only the store's class, as before). With nothing at risk (a D2
+    /// store whose every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only):
+    /// `no_wal_fail_stop` (it never stops, as before review 6 #2) and `drain_failure_ignores_risk`
+    /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         if fe_mutant("no_wal_fail_stop") {
             return;
@@ -5658,7 +5661,9 @@ impl BranchStore {
         } else {
             g.durable[class_index(SyncClass::Fsync)].max(full)
         };
-        let at_risk = (self.class.syncs() && g.durable[0] > drained)
+        let release_undrained = self.last_release_lsn.load(Ordering::Acquire) > drained
+            && !fe_mutant("drain_risk_by_store_class");
+        let at_risk = (g.durable[0] > drained && (self.class.syncs() || release_undrained))
             || g.ordered > full
             || g.pending_full.is_some()
             || g.flushing
