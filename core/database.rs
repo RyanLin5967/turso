@@ -966,9 +966,6 @@ impl Database {
             branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);
-        // fastest-engine (lead review 1 item 6): whether a trunk WAL flush also drains the branch
-        // files' device.
-        branches.note_trunk_wal(&wal_path);
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -1301,6 +1298,7 @@ impl Database {
         durability: crate::branch::BranchDurability,
         lease: Option<std::time::Duration>,
         splice: bool,
+        checkpoint: Option<crate::branch::BranchCheckpoint>,
         for_attach: bool,
     ) -> Result<()> {
         if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
@@ -1334,6 +1332,25 @@ impl Database {
                  than it asked; close the other handle first, or open with the same branch lease",
                 db.path, db.opts.branch_lease, lease
             )));
+        }
+        // The checkpoint mode (review 4 #8): a catalog store's, resolved as this open would resolve
+        // it. Mutant `registry_ignores_checkpoint` (test builds only).
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && matches!(durability, crate::branch::BranchDurability::Catalog { .. })
+            && !crate::branch::store::fe_mutant("registry_ignores_checkpoint")
+        {
+            let asked = crate::branch::BranchCheckpoint::resolve(checkpoint, splice)?;
+            if db.branches.checkpoint_mode() != asked {
+                return Err(LimboError::InvalidArgument(format!(
+                    "{} is open in this process with {:?} branch checkpoints, and this open asks for \
+                     {asked:?}: it would receive that instance; close the other handle first, or open \
+                     with the same checkpoint mode",
+                    db.path,
+                    db.branches.checkpoint_mode()
+                )));
+            }
         }
         if !flags.contains(OpenFlags::ReadOnly)
             && !for_attach
@@ -1486,6 +1503,7 @@ impl Database {
                     options.db_opts.branch_durability,
                     options.db_opts.branch_lease,
                     options.db_opts.branch_splice,
+                    options.db_opts.branch_checkpoint,
                     options.for_attach,
                 )?;
                 return Ok(Some(db));
@@ -1652,6 +1670,7 @@ impl Database {
                                 options.db_opts.branch_durability,
                                 options.db_opts.branch_lease,
                                 options.db_opts.branch_splice,
+                                options.db_opts.branch_checkpoint,
                                 options.for_attach,
                             )?;
                             return Ok(IOResult::Done(db));
