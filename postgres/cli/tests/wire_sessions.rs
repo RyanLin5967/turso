@@ -4133,6 +4133,48 @@ fn an_array_parameter_is_read_by_its_element_type() {
     }
 }
 
+/// The 42P18 refusal of a parameter compared with something no context types applies only to a
+/// parameter the client left untyped (OID 0, or none declared): one declared in Parse has its
+/// declared type, at Describe and at Execute, as in PostgreSQL. The refusal was made at prepare,
+/// from the text alone, before the declared OIDs were read: `typeof(v) = $1` declared text was
+/// 42P18 at Describe and at Execute alike, so it could never run, and inside a block its Describe
+/// failed the block (wire review 11 item 1, a regression from 935586643).
+#[test]
+fn a_declared_parameter_is_never_refused_as_untyped() {
+    const TEXT: u32 = 25;
+    let dir = Scratch::new("declared42p18");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "SELECT id FROM t WHERE typeof(v) = $1";
+    // Parse declaring `oid`, Describe the statement, Sync.
+    let describe = |a: &mut Wire, oid: u32| -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&oid.to_be_bytes());
+        a.send(b'P', &parse);
+        a.send(b'D', b"S\0");
+        a.send(b'S', &[]);
+        a.read_reply()
+    };
+    let r = describe(&mut a, TEXT).ok("declared text, Describe");
+    assert_eq!(r.params, Some(vec![TEXT]));
+    let r = a
+        .xt(sql, &[(TEXT, 0, b"text")])
+        .ok("declared text, Execute");
+    assert_eq!(r.rows, vec![vec![Some("1".to_string())]]);
+    let r = describe(&mut a, 0);
+    assert_eq!(r.err("undeclared, Describe").code, "42P18");
+    let r = a.xt(sql, &[(0, 0, b"text")]);
+    assert_eq!(r.err("undeclared, Execute").code, "42P18");
+    a.q("BEGIN").ok("begin");
+    describe(&mut a, TEXT).ok("declared text, Describe in a block");
+    let r = a.q("SELECT 1").ok("the block is live");
+    assert_eq!(r.status, b'T');
+    a.q("ROLLBACK").ok("end");
+}
+
 /// An undeclared parameter is typed by every context PostgreSQL types it by, so a value sent as
 /// text compares as PostgreSQL compares it: a scalar function's result (length() is int4), COALESCE,
 /// CASE, a scalar subquery and sum() take their arms' or arguments' types; a bare $n in WHERE or OR
