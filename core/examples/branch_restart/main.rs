@@ -49,6 +49,10 @@
 //!   barrier stamps it; nothing expires), READY. `leaseopen` times the open that follows (F-EXP: one
 //!   bounded pass; `R11_EXPIRE=unbounded` for the BEFORE arm), then `expire_branches` for the rest.
 //! * `catonly --n N --writes D --phase build|measure` (A13 amended): the catalog-only fixture.
+//! * `capfork --n D --forks K [--parents P] [--fix]` (PREREG A27, the F-FZ capture residual): P
+//!   parents forked from the trunk each commit D one-page rows; a sharp checkpoint; K forks of each
+//!   parent; one fuzzy checkpoint. Prints the entries its capture materialised under the store mutex.
+//!   `--fix` is the gated arm and must agree with `R11_CAPTURE_GATE=on`, which the store reads.
 //!
 //! r12-catload (frontier/round12/r12-catload/PREREG.md), observing only:
 //!
@@ -106,6 +110,10 @@ struct Args {
     phase: String,
     /// `open --probes` / `churn --window W`: draw ids from W consecutive ids (0: all N; r12-catload).
     window: usize,
+    /// `capfork --forks K --parents P [--fix]`.
+    forks: usize,
+    parents: usize,
+    fix: bool,
 }
 
 fn parse_args() -> Args {
@@ -127,6 +135,9 @@ fn parse_args() -> Args {
         lease_ms: 0,
         phase: String::new(),
         window: 0,
+        forks: 1,
+        parents: 1,
+        fix: false,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -151,6 +162,9 @@ fn parse_args() -> Args {
             "--lease-ms" => args.lease_ms = val().parse().unwrap_or_else(|_| die("bad --lease-ms")),
             "--phase" => args.phase = val(),
             "--window" => args.window = val().parse().unwrap_or_else(|_| die("bad --window")),
+            "--forks" => args.forks = val().parse().unwrap_or_else(|_| die("bad --forks")),
+            "--parents" => args.parents = val().parse().unwrap_or_else(|_| die("bad --parents")),
+            "--fix" => args.fix = true,
             "--mode" => {
                 args.catalog = match val().as_str() {
                     "snapshot" => false,
@@ -1351,6 +1365,74 @@ fn catonly(args: &Args) {
     println!("{line}");
 }
 
+/// `capfork` (PREREG A27): the entries a fuzzy checkpoint's capture copies under the store mutex
+/// after K forks of each of P parents that own about D pages each, and whose own state a sharp
+/// checkpoint has already written. Counters only; the hold time is printed, not claimed.
+fn capfork(args: &Args) {
+    let gate = std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on");
+    if args.fix != gate {
+        die("capfork: --fix and R11_CAPTURE_GATE=on go together (the flag names the arm the store reads)");
+    }
+    let ok = |r: turso_core::Result<()>, what: &str| r.unwrap_or_else(|e| not_a_result(&format!("capfork {what}: {e}")));
+    let db = open_db(&args.db, false, true);
+    let trunk = db.connect().unwrap_or_else(|e| not_a_result(&format!("capfork connect: {e}")));
+    ok(trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"), "create");
+    ok(trunk.execute("INSERT INTO t VALUES (1, 'trunk')"), "insert");
+    let d = args.n;
+    let mut parents: Vec<(BranchId, usize)> = Vec::new();
+    for p in 0..args.parents {
+        let b = trunk.fork_branch().unwrap_or_else(|e| not_a_result(&format!("capfork fork parent: {e}")));
+        let c = b.connect().unwrap_or_else(|e| not_a_result(&format!("capfork connect parent: {e}")));
+        ok(c.execute(format!("CREATE TABLE big{p}(id INTEGER PRIMARY KEY, x BLOB)")), "create big");
+        ok(c.execute("BEGIN"), "begin");
+        for i in 0..d {
+            ok(c.execute(format!("INSERT INTO big{p} VALUES ({i}, zeroblob(3000))")), "insert big");
+        }
+        ok(c.execute("COMMIT"), "commit");
+        drop(c);
+        let owned = b.owned_slots().len();
+        parents.push((b.into_id(), owned));
+    }
+    // Any fuzzy checkpoint the commits started must install before the sharp one (it refuses to
+    // overlap a flight).
+    db.branch_checkpoint_wait();
+    db.branch_compact_now().unwrap_or_else(|e| not_a_result(&format!("capfork compact: {e}")));
+    let e0 = db.branch_checkpoint_capture_entries();
+    for &(id, _) in &parents {
+        let b = db.branch(id).unwrap_or_else(|e| not_a_result(&format!("capfork attach: {e}")));
+        let c = b.connect().unwrap_or_else(|e| not_a_result(&format!("capfork connect: {e}")));
+        for _ in 0..args.forks {
+            let _ = c.fork_branch().unwrap_or_else(|e| not_a_result(&format!("capfork fork child: {e}"))).into_id();
+        }
+        drop(c);
+        let _ = b.into_id();
+    }
+    let before = db.branch_checkpoint_counters();
+    let mut calls = 0;
+    while !db.branch_checkpoint_fuzzy_now().unwrap_or_else(|e| not_a_result(&format!("capfork fuzzy: {e}"))) {
+        calls += 1;
+        if calls >= 16 {
+            not_a_result("capfork: no fuzzy checkpoint started after 16 calls");
+        }
+    }
+    db.branch_checkpoint_wait();
+    let after = db.branch_checkpoint_counters();
+    let e1 = db.branch_checkpoint_capture_entries();
+    if after[0] != before[0] + 1 {
+        not_a_result(&format!("capfork: {} checkpoints installed, not 1", after[0] - before[0]));
+    }
+    let owned: Vec<usize> = parents.iter().map(|p| p.1).collect();
+    println!(
+        "CAPFORK\td={d}\tforks={}\tparents={}\towned={owned:?}\tgate={}\tentries_under_mutex={}\tstmts_locked={}\thold_max_ns={}\tsettle_calls={calls}",
+        args.forks,
+        args.parents,
+        if gate { "on" } else { "off" },
+        e1 - e0,
+        after[5] - before[5],
+        after[3]
+    );
+}
+
 /// `(resident pages, pages)` of a file in the OS page cache, by mmap + mincore; `(0, 0)` if absent.
 /// Maps read-only and touches nothing (the r11-restart resident.py instrument, in-process).
 fn resident_pages(path: &Path) -> (u64, u64) {
@@ -1459,6 +1541,7 @@ fn main() {
         "leasedown" => leasedown(&args),
         "leaseopen" => leaseopen(&args),
         "catonly" => catonly(&args),
+        "capfork" => capfork(&args),
         "churn" => churn(&args),
         "catload" => catload(&args),
         other => die(&format!("unknown command {other}")),
