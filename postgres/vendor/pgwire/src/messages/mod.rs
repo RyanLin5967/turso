@@ -176,6 +176,14 @@ pub enum PgWireFrontendMessage {
     CopyData(copy::CopyData),
     CopyFail(copy::CopyFail),
     CopyDone(copy::CopyDone),
+
+    /// A message read whole (its frame consumed by its length) whose body does not hold what it
+    /// says: its type byte and PostgreSQL's words for the fault. It is answered with an ERROR
+    /// (08P01) and, in the extended protocol, the messages up to Sync are discarded, as
+    /// PostgreSQL does; the stream stays in step. An error from the decoder instead would end
+    /// the stream (tokio-util's Framed returns None after one), so it is a message (vendored
+    /// change, wire review 10 item 2).
+    Malformed(u8, &'static str),
 }
 
 impl PgWireFrontendMessage {
@@ -190,7 +198,7 @@ impl PgWireFrontendMessage {
                 | Self::PortalSuspended(_)
                 | Self::Flush(_)
                 | Self::Sync(_)
-        )
+        ) || matches!(self, Self::Malformed(t, _) if b"PBCDEHS".contains(t))
     }
 
     pub fn encode(&self, buf: &mut BytesMut) -> PgWireResult<()> {
@@ -221,6 +229,8 @@ impl PgWireFrontendMessage {
             Self::CopyData(msg) => msg.encode(buf),
             Self::CopyFail(msg) => msg.encode(buf),
             Self::CopyDone(msg) => msg.encode(buf),
+
+            Self::Malformed(..) => Ok(()),
         }
     }
 
@@ -276,7 +286,7 @@ impl PgWireFrontendMessage {
         } else if buf.remaining() > 1 {
             let first_byte = buf[0];
 
-            match first_byte {
+            let decoded = match first_byte {
                 // Password, SASLInitialResponse, SASLResponse can only be
                 // decoded under certain context
                 startup::MESSAGE_TYPE_BYTE_PASSWORD_MESSAGE_FAMILY => {
@@ -324,6 +334,14 @@ impl PgWireFrontendMessage {
                     copy::CopyDone::decode(buf, ctx).map(|v| v.map(Self::CopyDone))
                 }
                 _ => Err(PgWireError::InvalidMessageType(first_byte)),
+            };
+            // A body fault is raised only after decode_packet consumed the frame (vendored
+            // change): the message is read, and answered as malformed.
+            match decoded {
+                Err(PgWireError::MalformedMessage(fault)) => {
+                    Ok(Some(Self::Malformed(first_byte, fault)))
+                }
+                decoded => decoded,
             }
         } else {
             Ok(None)

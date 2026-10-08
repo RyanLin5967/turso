@@ -511,9 +511,15 @@ async fn serve_session(
         };
         let msg = match msg {
             Some(Ok(msg)) => msg,
-            // A message the codec cannot read: the stream is out of step, so the session ends with
+            // A frame the codec cannot read: a length below 4 or past the limit, an unknown
+            // message type, or a startup-phase message that does not hold what it says. The
+            // stream is out of step (or the session never started), so the session ends with
             // FATAL 08P01, as PostgreSQL ends it on an invalid frontend message (wire review 5
-            // item 4: it closed without a word).
+            // item 4: it closed without a word). A message read whole whose body is short or
+            // malformed does not come here: the vendored pgwire hands it on as
+            // PgWireFrontendMessage::Malformed, answered below with an ERROR (08P01) and, in the
+            // extended protocol, a skip to Sync, as PostgreSQL answers it (wire review 10 item 2;
+            // postgres/vendor/pgwire/VENDORED.md).
             Some(Err(e)) => {
                 error!("invalid frontend message: {}", e);
                 let info = ErrorInfo::new(

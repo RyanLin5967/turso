@@ -23,13 +23,74 @@ pub(crate) fn get_cstring(buf: &mut BytesMut) -> Option<String> {
 
     // i+1: include the '\0'
     // move cursor to the end of cstring
-    let string_buf = buf.split_to(i + 1);
+    // (vendored change: a string with no '\0' takes the rest of the buffer; split_to(i + 1)
+    // panicked past its end. The frontend decoders read with `read_cstring`, which refuses it.)
+    let string_buf = buf.split_to((i + 1).min(buf.remaining()));
 
     if i == 0 {
         None
     } else {
         Some(String::from_utf8_lossy(&string_buf[..i]).into_owned())
     }
+}
+
+/// A message body that holds less than it says (a count, length or field past its end): PostgreSQL's
+/// pq_getmsg* answer, an ERROR (08P01). The body is its frame alone ([`decode_packet`]), so the
+/// stream stays in step and the session goes on (vendored change, wire review 10 item 2: every
+/// read here was unchecked against the whole read buffer).
+pub(crate) const INSUFFICIENT_DATA: &str = "insufficient data left in message";
+
+fn take<const N: usize>(buf: &mut BytesMut) -> PgWireResult<[u8; N]> {
+    if buf.remaining() < N {
+        return Err(PgWireError::MalformedMessage(INSUFFICIENT_DATA));
+    }
+    let mut bytes = [0u8; N];
+    buf.copy_to_slice(&mut bytes);
+    Ok(bytes)
+}
+
+/// Checked reads of a frontend message body (vendored change): each refuses a body that ends
+/// first with [`PgWireError::MalformedMessage`].
+pub(crate) fn read_u8(buf: &mut BytesMut) -> PgWireResult<u8> {
+    take::<1>(buf).map(|b| b[0])
+}
+
+pub(crate) fn read_u16(buf: &mut BytesMut) -> PgWireResult<u16> {
+    take(buf).map(u16::from_be_bytes)
+}
+
+pub(crate) fn read_u32(buf: &mut BytesMut) -> PgWireResult<u32> {
+    take(buf).map(u32::from_be_bytes)
+}
+
+pub(crate) fn read_i32(buf: &mut BytesMut) -> PgWireResult<i32> {
+    take(buf).map(i32::from_be_bytes)
+}
+
+/// The next `len` bytes of the body.
+pub(crate) fn read_bytes(buf: &mut BytesMut, len: usize) -> PgWireResult<BytesMut> {
+    if buf.remaining() < len {
+        return Err(PgWireError::MalformedMessage(INSUFFICIENT_DATA));
+    }
+    Ok(buf.split_to(len))
+}
+
+/// [`get_cstring`], refusing a string the body does not terminate (PostgreSQL's "invalid string
+/// in message").
+pub(crate) fn read_cstring(buf: &mut BytesMut) -> PgWireResult<Option<String>> {
+    if !buf.contains(&b'\0') {
+        return Err(PgWireError::MalformedMessage("invalid string in message"));
+    }
+    Ok(get_cstring(buf))
+}
+
+/// The body has been read to its end: bytes left over are PostgreSQL's "invalid message format"
+/// (pq_getmsgend).
+pub(crate) fn read_end(buf: &BytesMut) -> PgWireResult<()> {
+    if buf.has_remaining() {
+        return Err(PgWireError::MalformedMessage("invalid message format"));
+    }
+    Ok(())
 }
 
 /// Put null-termianted string
@@ -72,10 +133,20 @@ where
         if msg_len > max_size {
             return Err(PgWireError::MessageTooLarge(msg_len, max_size));
         }
+        // A length that cannot hold itself leaves no frame to skip: the stream is out of step
+        // (vendored change; PostgreSQL ends the session on "invalid message length").
+        if msg_len < 4 {
+            return Err(PgWireError::InvalidMessageLength(msg_len));
+        }
 
         if buf.remaining() >= msg_len + offset {
             buf.advance(offset + 4);
-            return decode_fn(buf, msg_len).map(|r| Some(r));
+            // The body is its frame and nothing past it (vendored change): decode_fn read from
+            // the whole buffer, so a length or count past the frame read the messages pipelined
+            // behind it, or panicked past the buffer's end (wire review 10 item 2). Whatever a
+            // decoder leaves of its body is dropped with the frame.
+            let mut body = buf.split_to(msg_len - 4);
+            return decode_fn(&mut body, msg_len).map(|r| Some(r));
         }
     }
 

@@ -178,6 +178,17 @@ where
         return Ok(());
     }
 
+    // A message read whole whose body did not hold what it said (vendored change, wire review
+    // 10 item 2): discarded while awaiting Sync, as PostgreSQL discards every message up to it;
+    // otherwise answered with its ERROR, after which the caller's process_error skips to Sync in
+    // the extended protocol.
+    if let PgWireFrontendMessage::Malformed(_, fault) = message {
+        if matches!(socket.state(), PgWireConnectionState::AwaitingSync) {
+            return Ok(());
+        }
+        return Err(PgWireError::MalformedMessage(fault));
+    }
+
     match socket.state() {
         PgWireConnectionState::AwaitingStartup
         | PgWireConnectionState::AuthenticationInProgress => {

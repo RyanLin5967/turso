@@ -34,7 +34,9 @@ impl Message for Query {
     }
 
     fn decode_body(buf: &mut BytesMut, _: usize, _ctx: &DecodeContext) -> PgWireResult<Self> {
-        let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
+        // Checked within the frame (vendored change, wire review 10 item 2).
+        let query = codec::read_cstring(buf)?.unwrap_or_else(|| "".to_owned());
+        codec::read_end(buf)?;
 
         Ok(Query::new(query))
     }

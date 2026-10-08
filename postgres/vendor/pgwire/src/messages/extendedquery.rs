@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{codec, DecodeContext, Message};
-use crate::error::PgWireResult;
+use crate::error::{PgWireError, PgWireResult};
 
 /// Request from frontend to parse a prepared query string
 #[non_exhaustive]
@@ -48,14 +48,16 @@ impl Message for Parse {
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
-        let name = codec::get_cstring(buf);
-        let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
-        let type_oid_count = buf.get_u16();
+        // Checked reads within the frame (vendored change, wire review 10 item 2).
+        let name = codec::read_cstring(buf)?;
+        let query = codec::read_cstring(buf)?.unwrap_or_else(|| "".to_owned());
+        let type_oid_count = codec::read_u16(buf)?;
 
-        let mut type_oids = Vec::with_capacity(type_oid_count as usize);
+        let mut type_oids = Vec::with_capacity((type_oid_count as usize).min(buf.remaining() / 4));
         for _ in 0..type_oid_count {
-            type_oids.push(buf.get_u32());
+            type_oids.push(codec::read_u32(buf)?);
         }
+        codec::read_end(buf)?;
 
         Ok(Parse {
             name,
@@ -137,8 +139,9 @@ impl Message for Close {
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
-        let target_type = buf.get_u8();
-        let name = codec::get_cstring(buf);
+        let target_type = codec::read_u8(buf)?;
+        let name = codec::read_cstring(buf)?;
+        codec::read_end(buf)?;
 
         Ok(Close { target_type, name })
     }
@@ -251,34 +254,42 @@ impl Message for Bind {
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
-        let portal_name = codec::get_cstring(buf);
-        let statement_name = codec::get_cstring(buf);
+        // Checked reads within the frame (vendored change, wire review 10 item 2): every read was
+        // unchecked against the whole read buffer, so a short Bind panicked, a parameter length
+        // past the frame read the messages behind it, and every negative length was NULL.
+        let portal_name = codec::read_cstring(buf)?;
+        let statement_name = codec::read_cstring(buf)?;
 
-        let parameter_format_code_len = buf.get_u16();
-        let mut parameter_format_codes = Vec::with_capacity(parameter_format_code_len as usize);
+        let parameter_format_code_len = codec::read_u16(buf)?;
+        let mut parameter_format_codes =
+            Vec::with_capacity((parameter_format_code_len as usize).min(buf.remaining() / 2));
 
         for _ in 0..parameter_format_code_len {
-            parameter_format_codes.push(buf.get_i16());
+            parameter_format_codes.push(codec::read_u16(buf)? as i16);
         }
 
-        let parameter_len = buf.get_u16();
-        let mut parameters = Vec::with_capacity(parameter_len as usize);
+        let parameter_len = codec::read_u16(buf)?;
+        let mut parameters = Vec::with_capacity((parameter_len as usize).min(buf.remaining() / 4));
         for _ in 0..parameter_len {
-            let data_len = buf.get_i32();
+            let data_len = codec::read_i32(buf)?;
 
-            if data_len >= 0 {
-                parameters.push(Some(buf.split_to(data_len as usize).freeze()));
-            } else {
-                parameters.push(None);
+            // Only -1 is NULL; any other negative length is PostgreSQL's pq_getmsgbytes refusal.
+            match data_len {
+                -1 => parameters.push(None),
+                n if n < 0 => {
+                    return Err(PgWireError::MalformedMessage(codec::INSUFFICIENT_DATA));
+                }
+                n => parameters.push(Some(codec::read_bytes(buf, n as usize)?.freeze())),
             }
         }
 
-        let result_column_format_code_len = buf.get_i16();
+        let result_column_format_code_len = codec::read_u16(buf)?;
         let mut result_column_format_codes =
-            Vec::with_capacity(result_column_format_code_len as usize);
+            Vec::with_capacity((result_column_format_code_len as usize).min(buf.remaining() / 2));
         for _ in 0..result_column_format_code_len {
-            result_column_format_codes.push(buf.get_i16());
+            result_column_format_codes.push(codec::read_u16(buf)? as i16);
         }
+        codec::read_end(buf)?;
 
         Ok(Bind {
             portal_name,
@@ -362,8 +373,9 @@ impl Message for Describe {
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
-        let target_type = buf.get_u8();
-        let name = codec::get_cstring(buf);
+        let target_type = codec::read_u8(buf)?;
+        let name = codec::read_cstring(buf)?;
+        codec::read_end(buf)?;
 
         Ok(Describe { target_type, name })
     }
@@ -400,8 +412,9 @@ impl Message for Execute {
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
-        let name = codec::get_cstring(buf);
-        let max_rows = buf.get_i32();
+        let name = codec::read_cstring(buf)?;
+        let max_rows = codec::read_i32(buf)?;
+        codec::read_end(buf)?;
 
         Ok(Execute { name, max_rows })
     }
@@ -429,10 +442,11 @@ impl Message for Flush {
     }
 
     fn decode_body(
-        _buf: &mut bytes::BytesMut,
+        buf: &mut bytes::BytesMut,
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
+        codec::read_end(buf)?;
         Ok(Flush)
     }
 }
@@ -460,10 +474,11 @@ impl Message for Sync {
     }
 
     fn decode_body(
-        _buf: &mut bytes::BytesMut,
+        buf: &mut bytes::BytesMut,
         _: usize,
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
+        codec::read_end(buf)?;
         Ok(Sync)
     }
 }
