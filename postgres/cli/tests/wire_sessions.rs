@@ -3890,6 +3890,39 @@ fn any_and_all_of_a_parameter_take_an_array() {
     }
 }
 
+/// `$1 = ANY(xs)` over an array column takes the column's ELEMENT type, as PostgreSQL types it
+/// (int4, 23, for an int[] column), so '1' finds the rows whose array holds 1 and `$1 <> ALL(xs)`
+/// excludes them. The column's type was read from its declared name alone (an int[] column's is
+/// INTEGER: the dimensions are kept apart), so xs was int4, its element type nothing, and $1 text:
+/// text '1' equals no integer element, so `= ANY` found no row and `<> ALL` kept the rows holding 1
+/// (wire review 10 item 3, a regression from ed890b346).
+#[test]
+fn a_parameter_against_an_array_column_takes_its_element_type() {
+    const INT4: u32 = 23;
+    let dir = Scratch::new("anycolumn");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE a(id INT PRIMARY KEY, xs INT[])").ok("a");
+    a.q("INSERT INTO a VALUES (1, ARRAY[1, 2]), (2, ARRAY[3]), (3, ARRAY[1])")
+        .ok("rows");
+    for (sql, want) in [
+        (
+            "SELECT id FROM a WHERE $1 = ANY(xs) ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM a WHERE $1 <> ALL(xs) ORDER BY id",
+            vec!["2"],
+        ),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(vec![INT4]), "{sql}");
+        let r = a.xt(sql, &[(0, 0, b"1")]).ok(sql);
+        let got: Vec<String> = r.rows.iter().map(|row| row[0].clone().unwrap()).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
 /// An undeclared parameter is typed by every context PostgreSQL types it by, so a value sent as
 /// text compares as PostgreSQL compares it: a scalar function's result (length() is int4), COALESCE,
 /// CASE, a scalar subquery and sum() take their arms' or arguments' types; a bare $n in WHERE or OR
