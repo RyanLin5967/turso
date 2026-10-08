@@ -3789,6 +3789,42 @@ fn a_rewrite_of_a_raised_d0_log_matures_the_frees_it_covers() {
     }
 }
 
+/// Engine review 13 MED 4: a D0 open of a log an earlier D1 or D2 run synced (never raised in its
+/// header) freed at written once its first rewrite had landed: the class recovery decided was
+/// not kept, so the free class was the store's (Off). But the earlier run's records naming x's
+/// slots are durable (now in the rewrite's snapshot or catalog), and a D0 Release a power cut
+/// loses brings x back over a reused slot. The free is held until a sync covers its Release.
+/// Mutant `free_class_ignores_synced_open`.
+#[test]
+fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
+    let _s = serial();
+    for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
+        let what = format!("catalog={catalog} written={written:?}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("synced-open.db");
+        let (id, slots, incarnation) = {
+            let db = open_at(&path, opts(catalog, written));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            let slots = x.owned_slots();
+            assert!(!slots.is_empty(), "{what}: premise: x's write took a slot");
+            (x.into_id(), slots, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        db.branch_compact_now().unwrap();
+        assert!(!db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the log is not raised once the first rewrite landed");
+        let trunk = db.connect().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(
+            took.is_empty(),
+            "{what}: slots {took:?} were reused before a sync covered the Release, over records an earlier run made durable"
+        );
+    }
+}
+
 /// Engine review 8 #7: in a catalog store, a held free (above) was in no list a checkpoint writes:
 /// the capture took only `pending_free` as deferred, so the slot stayed counted in use, no free
 /// table row named it, and the cut dropped its Release. A catalog open has no reachability sweep,
