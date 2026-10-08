@@ -2174,6 +2174,11 @@ impl Journal {
         Ok(Some(d))
     }
 
+    /// The last snapshot's size in bytes (observation only, r11-churn).
+    pub(crate) fn snapshot_len(&self) -> u64 {
+        self.snapshot_len
+    }
+
     pub(crate) fn wants_compaction(&self) -> bool {
         // fastest-engine mutant `no_compaction_backoff` (test builds only).
         let backed_off = self.len <= self.compact_after && !super::store::fe_mutant("no_compaction_backoff");
@@ -3569,6 +3574,14 @@ pub(crate) fn one_device(log: Option<u64>, arena: Option<u64>) -> Result<()> {
     }
 }
 
+/// Observation only (r11-churn instrument; nothing reads it): every `fsync_file` call that syncs
+/// (class not `Off`), process-wide and on the calling thread. Every branch-file sync goes through
+/// `fsync_file` (a `barrier_file` barrier is not counted unless it falls back to a full sync).
+pub(crate) static FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Sync `file` in `class` (see [`SyncClass`]): `Fsync` is `fsync(2)`, as Turso's own
 /// `FileSyncType::Fsync`; `FullFsync` is `fcntl(F_FULLFSYNC)` on Apple platforms, as Turso's
 /// `FileSyncType::FullFsync` (`io/unix.rs`), and `fsync(2)` elsewhere. `Off` syncs nothing.
@@ -3576,6 +3589,8 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
     if !class.syncs() {
         return Ok(());
     }
+    FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_FSYNCS.with(|n| n.set(n.get() + 1));
     // A sync makes the held writes reach the file first (simulated power loss, test builds).
     #[cfg(all(test, unix))]
     lose_unsynced::apply(file)?;

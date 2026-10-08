@@ -1735,6 +1735,32 @@ enum Stamp {
     Flush,
 }
 
+/// Observation only (r11-churn instrument; nothing reads them): what expiry passes that found
+/// something due did, and what compactions cost. Process-wide; updated under the store mutex.
+pub(crate) mod churn_counters {
+    use std::sync::atomic::AtomicU64;
+    pub(crate) static EXPIRE_PASSES_WITH_DUE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_REAPED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FREED_PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    /// Passes whose records rode on a fork's own flight (r11-churn amendment 2's fix).
+    pub(crate) static EXPIRE_PIGGYBACKED: AtomicU64 = AtomicU64::new(0);
+    /// Synchronous compactions (`maybe_compact`'s `compact`: a snapshot compaction or a sharp
+    /// catalog checkpoint); a fuzzy checkpoint's start is not counted.
+    pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+}
+
+/// An expiry pass planned but not yet applied (see `BranchStore::expire_plan`).
+struct ExpirePlan {
+    due: Vec<BranchId>,
+    records: Vec<Record>,
+    now: u64,
+}
+
 /// The finest grain at which expiry passes queue a clock stamp.
 const STAMP_EVERY_MS: u64 = 1000;
 
@@ -4371,13 +4397,38 @@ impl BranchStore {
     /// rather than retired and then freed. Each release takes F4's path: an interior with a live
     /// child keeps exactly the versions that child can read. The Release records are made durable
     /// together, before anything is freed.
+    ///
+    /// A fork's pass instead rides on the fork's own flight (`expire_plan` +
+    /// `expire_buffered`; r11-churn amendment 2, as gc 389b474b4's `expire_apply_at`).
     fn expire(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<(Expired, u64)> {
+        let mut plan = self.expire_plan(inner, stamp)?;
+        let now = plan.now;
+        if plan.due.is_empty() {
+            return Ok((Expired::default(), now));
+        }
+        let fsyncs0 = super::journal::FSYNCS.load(Ordering::Relaxed);
+        self.log_all(inner, std::mem::take(&mut plan.records))?;
+        let fsyncs = super::journal::FSYNCS.load(Ordering::Relaxed) - fsyncs0;
+        let expired = self.expire_apply_at(inner, plan, fsyncs, None)?;
+        self.maybe_compact(inner);
+        Ok((expired, now))
+    }
+
+    /// The first half of an expiry pass: what is due, and the records that release it (deepest
+    /// first, then a clock stamp), WITHOUT buffering or flushing them. With nothing due, the stamp
+    /// is handled here exactly as the pass always did, and the plan is empty.
+    fn expire_plan(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<ExpirePlan> {
         let now = inner.lease.now_ms();
+        let empty = ExpirePlan {
+            due: Vec::new(),
+            records: Vec::new(),
+            now,
+        };
         inner.expire_more = false;
         // A fail-stopped store cannot make a Release durable, so it reaps nothing (and frees
         // nothing); reads stay available and the next open recovers from disk.
         if inner.poisoned() {
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         // Catalog stores: a lease a branch not yet resident carries is in the catalog's lease
         // index; the rows due are made resident, which puts their deadlines in `leases`. F-EXP: at
@@ -4431,7 +4482,7 @@ impl BranchStore {
                     }
                 }
             }
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         let mut by_depth = Vec::with_capacity(due.len());
         for id in due {
@@ -4442,7 +4493,64 @@ impl BranchStore {
         let mut records: Vec<Record> = due.iter().map(|&id| inner.release_record(id)).collect();
         records.push(Record::Clock { now_ms: now });
         inner.lease.queued(now);
-        self.log_all(inner, records)?;
+        Ok(ExpirePlan { due, records, now })
+    }
+
+    /// The pass a fork runs, riding on the fork's own flight (r11-churn amendment 2; gc
+    /// 389b474b4's `expire_apply_at`): the plan's records are buffered FIRST, so the log carries
+    /// the pass's records and then the fork's, as the pass's own flush followed by the fork's
+    /// always did, and the fork's `wait_durable` makes both durable with one flight. The releases
+    /// are applied now, so every check the fork makes after the pass sees them, as before; they
+    /// are early-released exactly as `release_checked`'s are: the trunk barrier's floor
+    /// (`last_release_lsn`), `releases_in_air` until durable, and the slots they free held until
+    /// that flight lands (rule 2). Returns the log sequence number that makes the pass durable, or
+    /// `None` when nothing was due. A fork REFUSED after this must make the pass durable before it
+    /// reports (`complete_pass`), so no refusal reports a reap that is not durable.
+    fn expire_buffered(&self, inner: &mut StoreInner, mut plan: ExpirePlan) -> Result<Option<u64>> {
+        if plan.due.is_empty() {
+            return Ok(None);
+        }
+        let records = std::mem::take(&mut plan.records);
+        let lsn = self.buffer_records(inner, &records)?;
+        self.expire_apply_at(inner, plan, 0, Some(lsn))?;
+        Ok(Some(lsn))
+    }
+
+    /// Make a pass `expire_buffered` buffered durable now, under the mutex, as the pass's own flush
+    /// did before it rode on the fork's (for a fork that is refused after its pass).
+    fn complete_pass(&self, inner: &mut StoreInner, pass: Option<u64>) -> Result<()> {
+        if pass.is_some() {
+            self.log_all(inner, Vec::new())?;
+            self.maybe_compact(inner);
+        }
+        Ok(())
+    }
+
+    /// The second half of an expiry pass, once its records are durable (`defer_to: None`) or
+    /// buffered ahead of a fork's (`Some(lsn)`, see `expire_buffered`): release what was due and
+    /// free what that frees. `fsyncs` is what the flush that carried the records cost the pass (0
+    /// when it rides on a fork's flight); observation only.
+    fn expire_apply_at(
+        &self,
+        inner: &mut StoreInner,
+        plan: ExpirePlan,
+        fsyncs: u64,
+        defer_to: Option<u64>,
+    ) -> Result<Expired> {
+        let due = plan.due;
+        if let Some(lsn) = defer_to {
+            // As `release_checked`'s early release: the next trunk commit's barrier covers these
+            // Releases (skill review 2 #3), and until they are durable a stopped store still
+            // reports the branches (engine review 7 #3) and a lookup of their names waits for them.
+            self.last_release_lsn.fetch_max(lsn, Ordering::AcqRel);
+            for &id in &due {
+                let (fork_lsn, name) = inner
+                    .branches
+                    .get(&id)
+                    .map_or((0, None), |st| (st.fork_lsn, st.name.clone()));
+                inner.releases_in_air.push_back(ReleaseInAir { lsn, id, fork_lsn, name });
+            }
+        }
         let mut freed = Vec::new();
         for &id in &due {
             if let Err(e) = inner.apply_release(id, &mut freed) {
@@ -4450,17 +4558,32 @@ impl BranchStore {
             }
         }
         let freed_pages = freed.len();
-        self.free_after_log(inner, freed);
+        {
+            use churn_counters::*;
+            EXPIRE_PASSES_WITH_DUE.fetch_add(1, Ordering::Relaxed);
+            EXPIRE_REAPED.fetch_add(due.len() as u64, Ordering::Relaxed);
+            EXPIRE_FREED_PAGES.fetch_add(freed_pages as u64, Ordering::Relaxed);
+            EXPIRE_FSYNCS.fetch_add(fsyncs, Ordering::Relaxed);
+        }
+        match defer_to {
+            Some(lsn) => inner.defer_frees(lsn, freed),
+            None => self.free_after_log(inner, freed),
+        }
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
-        self.maybe_compact(inner);
-        Ok((
-            Expired {
-                reaped: due,
-                freed_pages,
-            },
-            now,
-        ))
+        Ok(Expired {
+            reaped: due,
+            freed_pages,
+        })
+    }
+
+    /// Leases outstanding, and how many of them have run out (observation only, r11-churn). In a
+    /// catalog store, only the leases of resident branches (`leases`).
+    pub(crate) fn lease_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        let due = inner.leases.range(..=(now, BranchId(u64::MAX))).count();
+        (inner.leases.len(), due)
     }
 
     /// Move the lease clock forward, for tests. It never moves back.
@@ -4848,7 +4971,12 @@ impl BranchStore {
                 self.group.mark_durable(journal.lsn(), rewritten_class(journal));
             }
         }
-        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        // The expiry pass rides on the fork's own flight (r11-churn amendment 2; gc 389b474b4's
+        // `expire_apply_at`): buffered ahead of the fork's records and applied now, made durable by
+        // the caller's `wait_durable` with the fork's; a refusal below completes it first.
+        let plan = self.expire_plan(&mut inner, Stamp::Queue)?;
+        let now = plan.now;
+        let pass = self.expire_buffered(&mut inner, plan)?;
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
         let mut schema = Some(schema);
@@ -4862,6 +4990,7 @@ impl BranchStore {
         }
         if let Some(seen) = seen {
             if inner.trunk.lineage.n_children == 0 {
+                self.complete_pass(&mut inner, pass)?;
                 return Ok(TrunkFork::NeedsWriterLock);
             }
             let now = self.trunk_commits.load(Ordering::Acquire);
@@ -4878,6 +5007,7 @@ impl BranchStore {
         // The name's uniqueness is decided in the same store-mutex hold that buffers its record.
         if let Some(name) = name {
             if inner.name_lookup(name)?.is_some() {
+                self.complete_pass(&mut inner, pass)?;
                 return Err(name_taken(name));
             }
         }
@@ -4889,6 +5019,9 @@ impl BranchStore {
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
         let lsn = self.buffer_records(&mut inner, &records)?;
+        if pass.is_some() {
+            churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, Ordering::Relaxed);
+        }
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
         if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
             return Err(inner.fatal(e));
