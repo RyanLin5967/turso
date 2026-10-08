@@ -3309,9 +3309,25 @@ fn an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind() {
     // A gap below the highest $n: PostgreSQL cannot type $1.
     let r = a.describe_statement("SELECT v FROM t WHERE id = $2");
     assert_eq!(r.err("$2 alone").code, "42P18");
-    // One parameter more than the statement has: the bind fails.
+    // One parameter more than the statement has, none declared: the bind fails (08P01). Declared
+    // (one OID 0) but unused, the parameter cannot be typed: 42P18, as PostgreSQL answers.
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"SELECT 1");
+    parse.extend_from_slice(&[0, 0, 0]);
+    a.send(b'P', &parse);
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    bind.extend_from_slice(&1i32.to_be_bytes());
+    bind.push(b'1');
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    a.send(b'B', &bind);
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err("an extra parameter, none declared").code, "08P01");
     let r = a.xt("SELECT 1", &[(0, 0, b"1")]);
-    assert_eq!(r.err("an extra parameter").code, "08P01");
+    assert_eq!(r.err("an unused declared parameter").code, "42P18");
 }
 
 /// HAVING without GROUP BY filters the one aggregate row, as in PostgreSQL: `SELECT count(*) FROM t
