@@ -3416,3 +3416,44 @@ fn a_parameter_number_past_the_limit_is_refused() {
         assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
     }
 }
+
+/// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
+/// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
+/// described and is bound, as in PostgreSQL. They were read from the engine's slots, so
+/// `HAVING count(*) > $1` was 42P18, `WHERE false AND id = $1` refused its one parameter (08P01),
+/// and `id = $2 AND (true OR v = $1)` was 42P18 (wire review 8 item 5).
+#[test]
+fn every_parameter_in_the_text_is_a_parameter() {
+    const INT8: u32 = 20;
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    let dir = Scratch::new("paramtree");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for (sql, want, binds, rows) in [
+        (
+            "SELECT count(*) FROM t HAVING count(*) > $1",
+            vec![INT8],
+            vec![&b"0"[..]],
+            1,
+        ),
+        (
+            "SELECT v FROM t WHERE false AND id = $1",
+            vec![INT4],
+            vec![&b"1"[..]],
+            0,
+        ),
+        (
+            "SELECT v FROM t WHERE id = $2 AND (true OR v = $1)",
+            vec![TEXT, INT4],
+            vec![&b"x"[..], &b"1"[..]],
+            1,
+        ),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(want), "{sql}");
+        let params: Vec<(u32, i16, &[u8])> = binds.iter().map(|b| (0, 0, *b)).collect();
+        let r = a.xt(sql, &params).ok(sql);
+        assert_eq!(r.rows.len(), rows, "{sql}");
+    }
+}
