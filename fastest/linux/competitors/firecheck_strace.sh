@@ -764,14 +764,19 @@ if [ $alive = 1 ] && [ -n "${STAMPER[0]:-}" ] && [ -n "${STAMPER[1]:-}" ]; then
   s7=$( ( eval "exec $R</dev/null $W>&$kw"; setup_is /dev/null "/proc/$STAMPER_SHELL/fd/$W" || exit 3
           clock_pair f14g ) 2>/dev/null )
   exec {kr}<&- {kw}>&-
-  IFS= read -r -t 1 stray <&"$R" 2>/dev/null
   dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
+  # One probe, answered in order, proves two things at once (eighth re-review, findings 1 and 3): send a one-word
+  # line, a non-ASCII line and a request with a fixed nonce, and the FIRST line back must be the probe's own reply.
+  # A request leaked by the read-fd decoy case would have its reply first (no timing involved), and a stamper that
+  # answers the non-ASCII line (the text-mode one does in C-family locales, via surrogateescape) fails too.
+  stray=$( { printf 'garbage\n\377\376 bytes\nf14probe.0.0 f14p\n' >&"$W"; IFS= read -r -t 2 l <&"$R" && printf '%s' "$l"; } 2>/dev/null )
 fi
 # The stamper lived throughout, so the decoy cases were refused by the fd check, not by a dead stamper (sixth
-# re-review, finding 3); and it survives malformed requests (two words expected, ASCII only) and still answers a
-# well-formed one from the coproc (seventh re-review, finding 3).
-[ $alive = 1 ] && : "$( { printf 'garbage\n\377\376 bytes\n' >&"${STAMPER[1]}"; } 2>/dev/null )"
+# re-review, finding 3), and still answers a well-formed request from the coproc after the malformed ones.
 s8=$(clock_pair f14h)
+# clock_pair must judge each reply with stamp_reply_ok: with it made to refuse everything, the stamp is one-shot
+# (eighth re-review, finding 2: testing the function alone did not show clock_pair calls it).
+s9=$( stamp_reply_ok() { return 1; }; clock_pair f14i )
 alive2=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive2=1
 # The reply-shape check itself, on known lines: the stamper's own format passes; 9 or 11 realtime integer digits, 8
 # fraction digits, a splice of two replies, or a missing field fail (seventh re-review, finding 3).
@@ -788,11 +793,12 @@ done
 if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
   $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" &&
   $haveproc = 1 && $s5 == "f14e="*" f14e_src=oneshot" && $dsz = 0 &&
-  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" && -z $stray &&
-  $s8 == "f14h="*" f14h_src=coproc" && $alive2 = 1 && $shapes = 6 ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written, no stray reply), malformed requests survived, 6/6 reply shapes judged: [$s8]"
+  $s6 == "f14f="*" f14f_src=oneshot" && $dsz2 = 0 && $s7 == "f14g="*" f14g_src=oneshot" &&
+  $stray == "f14probe.0.0 f14p="* && $s8 == "f14h="*" f14h_src=coproc" && $s9 == "f14i="*" f14i_src=oneshot" &&
+  $alive2 = 1 && $shapes = 6 ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written, no stray reply), the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] stray=[$stray]; after malformed=[$s8]; shapes $shapes/6"
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
   fails=$((fails + 1))
 fi
 
