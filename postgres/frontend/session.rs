@@ -898,11 +898,15 @@ fn handle_pg_add_constraints(
         execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
         execute_root(conn, format!("DROP TABLE {quoted}"))?;
         run_pg_statement(pg_conn, &rebuilt)?;
-        // With foreign keys enforced, the copy back checks every row against the new
-        // constraints, as PostgreSQL validates an added constraint.
-        conn.set_foreign_keys_enabled(true);
+        // The copy back checks every row against the new PRIMARY KEY, UNIQUE and CHECK
+        // constraints. It runs with foreign keys off, as the DROP does, so neither half touches
+        // the connection's pending deferred-key count: with keys on it counted the rows again, and
+        // a block's deferred orphan was cancelled, or a fixed one counted twice (wire review 6
+        // item 1). The keys the ALTER adds are then checked by one query each.
         execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
-        conn.set_foreign_keys_enabled(false);
+        for key in add.constraints.iter().filter_map(added_foreign_key) {
+            check_added_foreign_key(conn, &quoted, &key)?;
+        }
         execute_root(conn, format!("DROP TABLE {aside}"))?;
         for sql in &dependents {
             match catalog::decode_stored_pg_schema_sql(sql) {
@@ -913,21 +917,36 @@ fn handle_pg_add_constraints(
         Ok(())
     })();
     conn.set_foreign_keys_enabled(enforced);
-    match rebuild {
-        Ok(()) => execute_root(
+    // The rebuild's own end, its COMMIT or RELEASE, fails into the same undo as its steps: a
+    // failed COMMIT returned without it left the transaction open, the session 'T' holding the
+    // trunk's write lock (wire review 6 item 1).
+    let rebuild = rebuild.and_then(|()| {
+        execute_root(
             conn,
             if in_tx {
                 "RELEASE SAVEPOINT __turso_rebuild"
             } else {
                 "COMMIT"
             },
-        ),
+        )
+    });
+    match rebuild {
+        Ok(()) => Ok(()),
         Err(e) => {
             let undone = if in_tx {
                 execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_rebuild")
                     .and_then(|()| execute_root(conn, "RELEASE SAVEPOINT __turso_rebuild"))
-            } else {
+            } else if !conn.get_auto_commit() {
                 execute_root(conn, "ROLLBACK")
+            } else if conn.is_in_write_tx() {
+                // A COMMIT that left autocommit before failing: the transaction cannot be ended
+                // on this connection.
+                Err(LimboError::InternalError(
+                    "the rebuild's transaction is held after its COMMIT failed".to_string(),
+                ))
+            } else {
+                // The engine already rolled the rebuild back.
+                Ok(())
             };
             // An undo that failed leaves the table half rebuilt in a transaction nobody can name:
             // the connection is broken, not merely the statement (the server ends the session).
@@ -944,6 +963,97 @@ fn handle_pg_add_constraints(
                 }
             }
         }
+    }
+}
+
+/// A FOREIGN KEY an ALTER adds: its columns, the parent table and the parent's columns (empty: the
+/// parent's primary key).
+struct AddedForeignKey {
+    columns: Vec<String>,
+    parent: String,
+    parent_columns: Vec<String>,
+}
+
+fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option<AddedForeignKey> {
+    use turso_pg_parser::pg_query::protobuf::{node::Node, ConstrType};
+    let Some(Node::Constraint(c)) = node.node.as_ref() else {
+        return None;
+    };
+    if ConstrType::try_from(c.contype).ok()? != ConstrType::ConstrForeign {
+        return None;
+    }
+    let names = |nodes: &[turso_pg_parser::pg_query::protobuf::Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    Some(AddedForeignKey {
+        columns: names(&c.fk_attrs),
+        parent: c.pktable.as_ref()?.relname.clone(),
+        parent_columns: names(&c.pk_attrs),
+    })
+}
+
+/// The check PostgreSQL makes when it adds a foreign key, as one query: a row of `table` whose key
+/// columns are all non-NULL (MATCH SIMPLE) and match no parent row fails the ALTER with 23503.
+fn check_added_foreign_key(
+    conn: &Arc<Connection>,
+    table: &str,
+    key: &AddedForeignKey,
+) -> Result<()> {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let parent_columns = if key.parent_columns.is_empty() {
+        conn.current_schema()
+            .get_btree_table(&key.parent)
+            .map(|t| {
+                t.primary_key_columns
+                    .iter()
+                    .map(|(c, _)| c.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        key.parent_columns.clone()
+    };
+    if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "the foreign key on {table} names {} columns and its parent key {}",
+            key.columns.len(),
+            parent_columns.len()
+        )));
+    }
+    let not_null = key
+        .columns
+        .iter()
+        .map(|c| format!("c.{} IS NOT NULL", quote(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let matches = key
+        .columns
+        .iter()
+        .zip(&parent_columns)
+        .map(|(c, p)| format!("p.{} = c.{}", quote(p), quote(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT 1 FROM {table} AS c WHERE {not_null} AND NOT EXISTS (SELECT 1 FROM {} AS p WHERE \
+         {matches}) LIMIT 1",
+        quote(&key.parent)
+    );
+    let orphans = conn.prepare_sqlite(&sql)?.run_collect_rows()?;
+    if orphans.is_empty() {
+        Ok(())
+    } else {
+        Err(LimboError::ForeignKeyConstraint(format!(
+            "insert or update on table {table} violates the foreign key constraint it adds: a \
+             row's key ({}) is not present in table \"{}\"",
+            key.columns.join(", "),
+            key.parent
+        )))
     }
 }
 
