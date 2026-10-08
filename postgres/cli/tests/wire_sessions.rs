@@ -4359,6 +4359,53 @@ fn delete_using_deletes_only_the_joined_rows() {
     assert_eq!(left(&mut a), vec!["1", "4"], "nothing joins an empty table");
 }
 
+/// ALTER TABLE ADD FOREIGN KEY refuses a parent key PostgreSQL would: columns no UNIQUE or PRIMARY
+/// KEY constraint covers (42830 "there is no unique constraint matching given keys"), a column
+/// count that differs from the parent key's (42830), and a parent that does not exist (42P01); the
+/// child is unchanged and still takes rows. With the copy-back's keys off, only orphans were
+/// checked, so a non-unique parent key was accepted, and afterwards every INSERT into the child
+/// failed 'foreign key mismatch' (23503) with no way back but DROP TABLE (wire review 11 item 5, a
+/// regression from c9763b97b). A parent key a unique index covers is accepted and enforced.
+#[test]
+fn an_added_foreign_key_needs_a_unique_parent_key() {
+    let dir = Scratch::new("fkunique");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("INSERT INTO p VALUES (1, 5), (2, 5)").ok("p rows");
+    a.q("CREATE TABLE q(id INT PRIMARY KEY, code INT UNIQUE)")
+        .ok("q");
+    a.q("INSERT INTO q VALUES (1, 5)").ok("q row");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    for (sql, code) in [
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(code)",
+            "42830",
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id, code)",
+            "42830",
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES nosuch(id)",
+            "42P01",
+        ),
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, code, "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+        a.q("INSERT INTO c VALUES (6)")
+            .ok(&format!("after {sql}: c takes rows"));
+        a.q("DELETE FROM c WHERE x = 6").ok("undo");
+    }
+    a.q("ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES q(code)")
+        .ok("a unique parent key");
+    let r = a.q("INSERT INTO c VALUES (7)");
+    assert_eq!(r.err("an orphan after the key").code, "23503");
+    a.q("INSERT INTO c VALUES (5)").ok("a matching child");
+}
+
 /// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
 /// it. Its copy-back ran with foreign keys enforced, so it counted rows again: (i) a block's
 /// deferred orphan was cancelled by a valid child the copy re-inserted, and COMMIT kept the
