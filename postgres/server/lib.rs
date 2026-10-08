@@ -1295,9 +1295,21 @@ impl Session {
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
-        if let Some(portal) = portal {
-            bind_portal_parameters(&mut stmt, portal, &types)
-                .map_err(|e| unprepared(wire_info(e)))?;
+        match portal {
+            Some(portal) => bind_portal_parameters(&mut stmt, portal, &types)
+                .map_err(|e| unprepared(wire_info(e)))?,
+            // Nothing binds a parameter over the simple protocol, so a $n names none: 42P02, as
+            // PostgreSQL answers, before the statement runs. It ran with the parameter unbound,
+            // which the engine reads as NULL: `UPDATE t SET v = $1` nulled every row (wire review
+            // 9 item 3).
+            None => {
+                if let Some(n) = types.used.first() {
+                    return Err(unprepared(error(
+                        "42P02",
+                        format!("there is no parameter ${n}"),
+                    )));
+                }
+            }
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql, backoff)
@@ -1944,8 +1956,9 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<String>>) -> SqlResult<Str
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
         PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
+            // Over the simple protocol nothing binds one (wire review 9 item 3).
             let portal =
-                portal.ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
+                portal.ok_or_else(|| error("42P02", format!("there is no parameter ${n}")))?;
             // A parameter declared as another type is not a name, whatever its bytes spell. A text
             // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
             // function's text) is its bytes in either format: textrecv reads binary text as is.
