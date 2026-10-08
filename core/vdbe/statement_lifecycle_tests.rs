@@ -22,6 +22,8 @@ struct FailingPrepareAttachment {
 #[derive(Debug, Default)]
 struct FailingPrepareCursor {
     dirty: bool,
+    /// Outer-join null-row flag. See [`crate::index_method::IndexMethodCursor::set_null_flag`].
+    null_flag: bool,
 }
 
 impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
@@ -109,6 +111,14 @@ impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
 
     fn query_rowid(&mut self) -> Result<crate::IOResult<Option<i64>>> {
         Ok(crate::IOResult::Done(None))
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.null_flag
     }
 
     fn stage_statement_commit(

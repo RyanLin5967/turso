@@ -2189,8 +2189,13 @@ fn op_column_fetch(
                 .as_mut()
                 .expect("cursor should exist");
             let cursor = cursor.as_index_method_mut();
-            let value = return_if_io!(cursor.query_column(column));
-            state.registers[dest].set_value(value);
+            // In an outer join, a NullRow'd cursor returns NULL for every column.
+            if cursor.get_null_flag() {
+                state.registers[dest].set_null();
+            } else {
+                let value = return_if_io!(cursor.query_column(column));
+                state.registers[dest].set_value(value);
+            }
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
@@ -3399,8 +3404,15 @@ pub fn op_next(
             }
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
-                let has_more = return_if_io!(cursor.query_next());
-                !has_more
+                // A NullRow'd cursor (outer join with no match) has no real row to advance to;
+                // report exhaustion and clear the flag, mirroring the BTree branch above.
+                if cursor.get_null_flag() {
+                    cursor.set_null_flag(false);
+                    true // is_empty = true
+                } else {
+                    let has_more = return_if_io!(cursor.query_next());
+                    !has_more
+                }
             }
             _ => panic!("Next on non-btree/materialized-view cursor"),
         }
@@ -5893,7 +5905,9 @@ pub fn op_row_id(
                     .get_mut(*cursor_id)
                     .expect("cursor_id should be valid")
                 {
-                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
+                    if cursor.get_null_flag() {
+                        state.registers[*dest].set_null();
+                    } else if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest].set_null();
@@ -5931,6 +5945,9 @@ pub fn op_idx_row_id(
 
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+        // In an outer join, a NullRow'd index-method cursor must report a NULL rowid
+        // rather than the (stale) rowid of whatever row it last pointed at.
+        Cursor::IndexMethod(cursor) if cursor.get_null_flag() => None,
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
@@ -13460,6 +13477,9 @@ pub fn op_index_method_query(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
+    // Repositioning the cursor clears any outer-join null-row flag left over from a previous
+    // outer row that had no match (mirrors BTree clearing its null flag on seek/rewind).
+    cursor.set_null_flag(false);
     let has_rows =
         return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
     if !has_rows {
