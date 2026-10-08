@@ -26,9 +26,54 @@ def load(path):
         return None
 
 
+def tracer_rows(path):
+    """[(phase, pid, tid, tracerpid)] or None if the record is missing or unreadable."""
+    try:
+        with open(path) as f:
+            out = []
+            for ln in f:
+                p = ln.split()
+                if not p:
+                    continue
+                if len(p) != 4 or p[0] not in ("start", "end") or not all(x.isdigit() for x in p[1:]):
+                    return None
+                out.append((p[0], p[1], p[2], int(p[3])))
+            return out
+    except OSError:
+        return None
+
+
 def check(celldir, n):
-    """STUB (red): accepts every cell, so the selftest's refusal cases fail."""
-    return []
+    """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
+    why = []
+    lab = load(os.path.join(celldir, "bb", "summary.json"))
+    if not lab or lab.get("measured_ops") != n:
+        why.append(f"labelling run measured {lab.get('measured_ops') if lab else 'nothing'}, not N={n}")
+    t = load(os.path.join(celldir, "timed", "summary.json"))
+    if t is None or not os.path.exists(os.path.join(celldir, "timed", "raw.tsv")):
+        why.append("no timed run (timed/summary.json and timed/raw.tsv): only the traced labelling run's latency")
+    else:
+        if t.get("verdict") != "ok" or t.get("rc") != 0:
+            why.append(f"timed run verdict {t.get('verdict')} rc {t.get('rc')}")
+        if t.get("measured_ops") != n:
+            why.append(f"timed run measured {t.get('measured_ops')} ops, not N={n} (not the identical command)")
+    try:
+        rc = open(os.path.join(celldir, "timed.rc")).read().strip()
+    except OSError:
+        rc = "missing"
+    if rc != "0":
+        why.append(f"timed run exit status {rc}")
+    rows = tracer_rows(os.path.join(celldir, "timed.tracer.tsv"))
+    if rows is None:
+        why.append("tracer record timed.tracer.tsv missing or unreadable")
+    else:
+        for ph in ("start", "end"):
+            if not any(r[0] == ph for r in rows):
+                why.append(f"no TracerPid sample at the timed run's {ph}")
+        traced = [r for r in rows if r[3] != 0]
+        if traced:
+            why.append(f"traced during the timed run: {traced[:5]}")
+    return why
 
 
 def write_verdict(celldir, n, why):

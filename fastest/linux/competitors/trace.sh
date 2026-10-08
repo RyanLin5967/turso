@@ -173,6 +173,19 @@ task_check() {
   if is_dead_state "$s"; then echo dead; elif [ "$tp" = "$2" ]; then echo traced; else echo untraced; fi
 }
 
+tracer_sample() { # tracer_sample PHASE PID... -> "PHASE pid tid tracerpid" for every live task of each PID
+  local ph=$1 p t tp
+  shift
+  for p in "$@"; do
+    for t in /proc/"$p"/task/*; do
+      [ -e "$t" ] || continue
+      tp=$(awk '/^TracerPid:/ {print $2}' "$t/status" 2>/dev/null)
+      [ -n "$tp" ] && echo "$ph $p ${t##*/} $tp"
+    done
+  done
+  return 0
+}
+
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
   local st=$1 p t
   shift

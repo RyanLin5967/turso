@@ -189,6 +189,16 @@ def main(argv):
             except (OSError, ValueError) as e:
                 cells.append((name, f"{cell} MISSING ({e.__class__.__name__})", None))
                 missing += 1
+            # Every cell's latency comes from its untraced timed run, judged by timedrun.py (gate-6 review, t3run
+            # item 2): a cell without a timed run, or whose timed run was traced, is not a cell.
+            tj = os.path.join(a, "run", "cells", cell, "timed.json")
+            try:
+                tv = json.load(open(tj)).get("verdict")
+            except (OSError, ValueError) as e:
+                tv = f"MISSING ({e.__class__.__name__})"
+            if tv != "ok":
+                print(f"TIMED\t{name}\t{cell}\t{tv}")
+                bad += 1
     print("CELLS\tartifact\tcell\t" + "\t".join(stracecount.TABLE_COLS))
     for name, cell, c in cells:
         if c is None:

@@ -9,7 +9,11 @@
 # For each spec and each C in FT_CLIENTS (default "1 4"), one CELL (RAW/cells/<spec>-c<C>/):
 #   conncheck : C+16 connections opened at once and a SELECT 1 on each (amendment 27 (1)); untraced
 #   idle      : strace -f -C attached to every server process for FT_IDLE_S seconds with no client (the control)
-#   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise)
+#   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise): the traced
+#               LABELLING run (bb/), whose latencies are never used
+#   timed     : the identical bbload command again with no tracer anywhere (timed/), its TracerPid samples
+#               (timed.tracer.tsv) and exit status (timed.rc), judged by timedrun.py into timed.json: the cell's only
+#               latency file is timed/raw.tsv (gate-6 review, t3run item 2; PREREG :173)
 #   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
 #               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
 #               op's dirty pages), reported apart from the window and never added to it
@@ -156,11 +160,37 @@ count_branches() {
   esac
 }
 
+bb_args() { # bb_args SPEC C N OUT -> BBA: the one bbload command line, so the labelling and timed runs are identical
+  BBA=("$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS"
+    --stall-s 600 --max-window-s 3600)
+}
 bbload() { # bbload SPEC C N OUT -> bbload's rc
   local rc=0
-  "$BB" --spec "$SPECS/$1.spec" --out "$4" --clients "$2" --max-ops "$3" --set port="$PORT" --set rows="$ROWS" \
-    --stall-s 600 --max-window-s 3600 >"$4.txt" 2>&1 || rc=$?
+  bb_args "$@"
+  "${BBA[@]}" >"$4.txt" 2>&1 || rc=$?
   cat "$4.txt"
+  return $rc
+}
+server_tree() { [ -n "${1:-}" ] && { echo "$1"; descendants "$1"; }; }  # server_tree PID -> PID and its live descendants
+# timed_run OUT SERVERPID -- CMD...: the UNTRACED timed run (PREREG :173; gate-6 review, t3run item 2). CMD runs with
+# no strace anywhere; the TracerPid of every task of CMD's process and of the server's processes is sampled at its
+# start and at its end into OUT.tracer.tsv ("phase pid tid tracerpid"; CMD's end sample is its last one while alive),
+# CMD's output into OUT.txt and its exit status into OUT.rc. timedrun.py check refuses the cell unless every sample is
+# 0 at both ends. SERVERPID is empty for the embedded B1.
+timed_run() {
+  local out=$1 spid=$2 rc=0 pid last=""
+  shift 3
+  "$@" >"$out.txt" 2>&1 &
+  pid=$!
+  { tracer_sample start "$pid"; tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
+  while kill -0 "$pid" 2>/dev/null; do
+    last=$(tracer_sample end "$pid")
+    sleep 0.05
+  done
+  wait "$pid" || rc=$?
+  { [ -n "$last" ] && printf '%s\n' "$last"; tracer_sample end $(server_tree "$spid"); } >>"$out.tracer.tsv"
+  echo "$rc" >"$out.rc"
+  cat "$out.txt"
   return $rc
 }
 
@@ -181,6 +211,16 @@ ops_of() {
   local k=1
   case $(basename "$2") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac  # variant (a): step 1 checks out the parent, step 2 creates
   if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
+}
+# timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
+# N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
+timedrun_check() {
+  local k=1
+  case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
+  python3 "$HERE/timedrun.py" check "$1" "$2" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
+    fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
+  fi
 }
 # judge_cell CELLDIR -- the cell's verdict must be "ok"; anything else (REFUSED, INCOMPLETE, NOT CLEAN, a missing or
 # unreadable cell.json) FAILS the job.
@@ -239,6 +279,15 @@ run_server_cell() { # run_server_cell SPEC C
     tw=(--template-waits "$d/template_waits.txt")
     [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
   fi
+  # The TIMED run: the identical bbload command with no tracer anywhere (gate-6 review, t3run item 2; PREREG :173).
+  # The labelling run above gives the flush counts, never a latency; this one gives the only latency file
+  # (timed/raw.tsv). PG: the template must be idle again first, and a CHECKPOINT after it (untraced) keeps the timed
+  # run's deferred work out of the next cell's idle control and labelling window.
+  if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s (before the timed run)"; fi
+  bb_args "$spec" "$c" "$n" "$d/timed"
+  timed_run "$d/timed" "$(server_pid)" -- "${BBA[@]}" >/dev/null || true
+  if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
+  timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
   if [ "$KIND" = pg ]; then
     count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
@@ -303,6 +352,7 @@ server_main() {
   for d in "$RAW"/cells/*; do
     case $(basename "$d") in *select1*) continue ;; esac
     [ -f "$d/ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/ops.txt")))
+    [ -f "$d/timed.ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/timed.ops.txt")))  # the timed run's creates too
   done
   [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
   expect "branch count (every created branch exists; created from raw.tsv)" "$(count_branches)" "$want"
@@ -379,6 +429,14 @@ b1_main() {
       python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
       expect "b1-$spec-c$c branch files (every created branch exists)" \
         "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$created"
+      # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
+      # t3run item 2): the only latency file of the cell is timed/raw.tsv.
+      mkdir -p "$bdir.timed"
+      timed_run "$d/timed" "" -- "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
+        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/timed" >/dev/null || true
+      timedrun_check "$d" "$n" "b1-$spec-c$c"
+      expect "b1-$spec-c$c timed run branch files (every created branch exists)" \
+        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$(cut -d' ' -f3 "$d/timed.ops.txt")"
     done
   done
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
