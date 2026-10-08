@@ -4028,6 +4028,75 @@ fn a_message_body_shorter_than_it_says_is_refused_in_step() {
     assert_eq!(b.q("SELECT 1").single("after the bad frame"), "1");
 }
 
+/// A wrong-length result-format list is refused BEFORE a statement with a side effect runs: a branch
+/// create, switch or delete changes nothing, and an `INSERT ... RETURNING` writes no row; the
+/// refusals are worded as PostgreSQL words them. No test pinned the order: the earlier rows change
+/// nothing, so a fix that checked after the create would have left the branch behind and passed
+/// (wire review 12 item 3). The guard is `result_format(format, 0, 1)?` in `branch()` before
+/// `text_arg`, and `result_fields` before `execute_query` runs.
+#[test]
+fn a_wrong_result_format_list_is_refused_before_the_side_effect() {
+    let dir = Scratch::new("formatorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('old')")
+        .ok("a branch to keep");
+    // Parse, Bind with the given result codes (no parameters), Execute, Sync.
+    fn round(w: &mut Wire, sql: &str, rcodes: &[i16]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8, 0, 0, 0, 0];
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    for (sql, columns) in [
+        ("SELECT turso_branch_create('rf')", 1),
+        ("SELECT turso_branch_switch('old')", 1),
+        ("SELECT turso_branch_delete('old')", 1),
+    ] {
+        let r = round(&mut a, sql, &[0, 0]);
+        let e = r.err(sql);
+        assert_eq!(e.code, "08P01", "{sql}");
+        assert_eq!(
+            e.message,
+            format!("bind message has 2 result formats but query has {columns} columns"),
+            "{sql}"
+        );
+    }
+    let r = a.q("SELECT turso_branch_switch('rf')");
+    assert_eq!(r.err("rf must not exist").code, "3D000");
+    assert_eq!(
+        a.q("SELECT turso_branch_current()")
+            .single("still on the trunk"),
+        "main"
+    );
+    a.q("SELECT turso_branch_switch('old')")
+        .ok("old was not deleted");
+    a.q("SELECT turso_branch_switch('main')")
+        .ok("back to the trunk");
+    let sql = "INSERT INTO t VALUES (8, 'y') RETURNING id, v";
+    let r = round(&mut a, sql, &[0, 0, 0]);
+    let e = r.err(sql);
+    assert_eq!(e.code, "08P01", "{sql}");
+    assert_eq!(
+        e.message,
+        "bind message has 3 result formats but query has 2 columns"
+    );
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 8")
+            .single("no row written"),
+        "0"
+    );
+}
+
 /// A Bind whose result-format list is neither empty, one code, nor one code per result column is a
 /// protocol violation (08P01, PostgreSQL's "bind message has N result formats but query has M
 /// columns"), at Describe of the portal and at Execute, and the session and a second connection are
