@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dolt.sh -- Dolt 2.3.5 sql-server (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
+# dolt.sh -- Dolt sql-server (the version versions.tsv registers) (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
 # LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/dolt.sh @648ce2929):
 # unchanged except that the binaries and python come from common.sh (FT_DOLT = the dolt-linux-<arch> release
 # tarball, sha256-checked by fetch_dolt.sh; FT_MARIADB = Ubuntu's mariadb client).
@@ -54,7 +54,13 @@ seed)
   if [ "$AGE" -gt 0 ]; then
     "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | my bench
     my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
-    my -N bench -e "CALL DOLT_GC()" >/dev/null 2>&1 || my -N bench -e "SELECT 1" >/dev/null
+    # DOLT_GC ends the calling session in sql-server mode, so success is checked by a new connection afterwards; a
+    # failed GC fails the seed (the recorded maintenance must be what ran).
+    my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || true
+    my -N bench -e "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after DOLT_GC ($(tail -1 "$DATA.gc.txt"))"
+    # the session it ends reads as ERROR 2013/2006 (lost connection); any other error is a failed GC
+    grep -viE 'lost connection|gone away|2013|2006' "$DATA.gc.txt" | grep -qi 'error' &&
+      die "REFUSED: DOLT_GC failed: $(tail -1 "$DATA.gc.txt")"
     echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
   else
     echo "maintenance: DOLT_COMMIT seed"

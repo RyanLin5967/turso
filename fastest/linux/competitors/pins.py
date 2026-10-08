@@ -33,28 +33,49 @@ def table(path=TABLE):
 
 
 def get(system, arch, kind, path=TABLE):
-    """STUB (red)."""
+    for r in table(path):
+        if r["system"] == system and r["kind"] == kind and r["arch"] in (arch, "any"):
+            return r["value"]
     return None
 
 
 def version(system, path=TABLE):
-    """STUB (red)."""
-    return None
+    vs = {r["version"] for r in table(path) if r["system"] == system}
+    return vs.pop() if len(vs) == 1 else None  # two versions of one system in the table is no registration
 
 
 def check_version(system, text, path=TABLE):
-    """STUB (red)."""
-    return True
+    v = version(system, path)
+    return bool(v) and re.search(r"(?<![\w.])" + re.escape(v) + r"(?![\w.]*\d)", text) is not None
+
+
+def mem_total_kb(meminfo_text):
+    m = re.search(r"^MemTotal:\s+(\d+)\s+kB", meminfo_text, re.M)
+    return int(m.group(1)) if m else None
 
 
 def shared_buffers_mb(meminfo_text):
-    """STUB (red)."""
-    return 128
+    kb = mem_total_kb(meminfo_text)
+    if kb is None:
+        raise ValueError("no MemTotal in meminfo")
+    return kb // 4 // 1024
 
 
 def check_pg(settings_tsv_text, meminfo_text):
-    """STUB (red)."""
-    return []
+    why = []
+    if mem_total_kb(meminfo_text) is None:
+        return ["no MemTotal in meminfo: 25% cannot be computed"]
+    want_mb = shared_buffers_mb(meminfo_text)
+    row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
+    if row is None or len(row) < 2 or not row[1].isdigit():
+        return ["no shared_buffers row in pg_settings"]
+    # pg18.sh settings dumps (name, setting, source); pg_settings reports shared_buffers in 8 kB pages
+    units = {"8kB": 8 * 1024, "kB": 1024, "MB": 1 << 20}
+    per = units.get(row[2], 8 * 1024) if len(row) > 2 else 8 * 1024
+    got = int(row[1]) * per
+    if got != want_mb << 20:
+        why.append(f"shared_buffers {got >> 20} MB, not 25% of MemTotal = {want_mb} MB")
+    return why
 
 
 def selftest():
@@ -82,9 +103,11 @@ def selftest():
     os.unlink(p)
     mem = "MemTotal:       16374968 kB\nMemFree:  100 kB\n"
     ok("shared_buffers = 25% of MemTotal, MB rounded down (16374968 kB -> 3997MB)", shared_buffers_mb(mem) == 3997)
-    good = "shared_buffers\t511616\t8kB\tconfiguration file\n"  # 3997 MB = 511616 x 8 kB
+    # pg18.sh settings' own format (name, setting, source), as banked in run 37809124979: setting in 8 kB pages
+    good = "fsync\ton\tdefault\nshared_buffers\t511616\tconfiguration file\n"  # 3997 MB = 511616 x 8 kB
     ok("check-pg: 25% accepted", check_pg(good, mem) == [])
-    ok("check-pg: initdb's 128 MB refused", check_pg("shared_buffers\t16384\t8kB\tdefault\n", mem) != [])
+    ok("check-pg: initdb's 128 MB refused (run 37809124979's value)",
+       check_pg("shared_buffers\t16384\tconfiguration file\n", mem) != [])
     ok("check-pg: no shared_buffers row refused", check_pg("fsync\ton\t\tdefault\n", mem) != [])
     ok("check-pg: no MemTotal refused", check_pg(good, "MemFree: 1 kB\n") != [])
     print(f"pins selftest: {14 - bad}/14")

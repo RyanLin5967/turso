@@ -51,6 +51,9 @@ init)
     echo "listen_addresses = '127.0.0.1'"
     echo "unix_socket_directories = ''"
     echo "max_connections = 1100"
+    # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15; initdb's default is 128 MB); run_system.sh
+    # refuses a server whose pg_settings value differs (pins.py check-pg)
+    echo "shared_buffers = $("$FT_PY" -B "$FT_HERE/pins.py" shared-buffers /proc/meminfo)"
     if [ "$MODE" = d2 ]; then
       echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"

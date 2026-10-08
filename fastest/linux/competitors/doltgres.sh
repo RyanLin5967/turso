@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # doltgres.sh -- Doltgres (prebuilt darwin-arm64, go1.26.8) for the branch benchmark, native settings (PREREG §4).
 # LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/doltgres.sh
-# @648ce2929): unchanged except that the binaries and python come from common.sh (FT_DOLTGRES = the 1.3.3
+# @648ce2929): unchanged except that the binaries and python come from common.sh (FT_DOLTGRES = the registered (versions.tsv)
 # doltgresql-linux-<arch> release tarball, sha256-checked by fetch_dolt.sh; psql from PGDG postgresql-18).
 #
 #   doltgres.sh init  DATA PORT       write DATA/config.yaml (DATA must not exist; *.noindex): data, cfg, auth,
@@ -68,7 +68,13 @@ seed)
   if [ "$AGE" -gt 0 ]; then
     "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc
     psqlc -At -c "SELECT dolt_commit('-am', 'age')"
-    psqlc -At -c "SELECT dolt_gc()" >/dev/null 2>&1 || psqlc -At -c "SELECT 1" >/dev/null
+    # dolt_gc may end the calling session, so success is checked by a new connection afterwards; a failed GC fails
+    # the seed (the recorded maintenance must be what ran).
+    psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || true
+    psqlc -At -c "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after dolt_gc ($(tail -1 "$DATA.gc.txt"))"
+    # the session it ends reads as a closed connection; any other error is a failed GC
+    grep -viE 'closed the connection|terminat|connection to server|lost' "$DATA.gc.txt" | grep -qi 'error' &&
+      die "REFUSED: dolt_gc failed: $(tail -1 "$DATA.gc.txt")"
     echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
   else
     echo "maintenance: dolt_commit seed"

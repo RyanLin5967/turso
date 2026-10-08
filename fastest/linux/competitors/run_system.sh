@@ -398,6 +398,13 @@ server_main() {
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
     expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
+    # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15), recorded in pg_settings.tsv and meminfo.txt
+    cp /proc/meminfo "$RAW/meminfo.txt"
+    if python3 -B "$HERE/pins.py" check-pg "$RAW/pg_settings.tsv" "$RAW/meminfo.txt" >"$RAW/shared_buffers-check.txt" 2>&1; then
+      pass "server shared_buffers = 25% of MemTotal ($(awk -F'\t' '$1 == "shared_buffers" {print $2}' "$RAW/pg_settings.tsv") x 8 kB)"
+    else
+      fail "server shared_buffers: $(cat "$RAW/shared_buffers-check.txt")"
+    fi
   fi
   if [ "$KIND" = pg ]; then  # the seed's own checkpoint; a failure FAILS the job (second review, finding 9)
     sqlq "CHECKPOINT" >"$RAW/seed-checkpoint.txt" 2>&1 || fail "pre-cell CHECKPOINT rc=$? ($(tail -1 "$RAW/seed-checkpoint.txt"))"
@@ -408,6 +415,17 @@ server_main() {
     dolt) { "$FT_DOLT" version; sha256sum "$FT_DOLT"; } >"$RAW/version.txt" 2>&1 ;;
     doltgres) { (cd "$ROOT" && "$FT_DOLTGRES" -version); sha256sum "$FT_DOLTGRES"; } >"$RAW/version.txt" 2>&1 ;;
   esac
+  # The server is the registered version of versions.tsv, or the job fails (gate-6 review, t3run item 13); PG's
+  # installed package must also be the registered one.
+  local vsys
+  case $KIND in pg) vsys=postgresql ;; *) vsys=$KIND ;; esac
+  head -1 "$RAW/version.txt" >"$RAW/version-line.txt"
+  python3 -B "$HERE/pins.py" check-version "$vsys" "$RAW/version-line.txt" >"$RAW/version-check.txt" 2>&1 &&
+    pass "server version: $(cat "$RAW/version-check.txt")" || fail "server version: $(cat "$RAW/version-check.txt")"
+  if [ "$KIND" = pg ]; then
+    expect "PGDG postgresql-18 package" "$(awk '$1 == "postgresql-18" {print $2}' "$RAW/version.txt")" \
+      "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
+  fi
   for spec in $SPECLIST; do
     for c in $CLIENTS; do
       run_server_cell "$spec" "$c"
