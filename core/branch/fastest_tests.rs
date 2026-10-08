@@ -4048,6 +4048,35 @@ fn a_raised_d0_store_holds_no_more_than_its_bound_for_a_sync() {
     }
 }
 
+/// Engine review 13 MED 2: the held-free bound's upgrade flight (an arena fsync, a directory
+/// fsync, a log F_FULLFSYNC, and a bound's worth of slots released under the store mutex) was led
+/// by whichever operation waited for durability next: usually the create whose `mature` armed it,
+/// or a connect, a commit, a delete, a trunk barrier under the WAL write lock. It is led off the
+/// acknowledgement paths, by the store's background writer: past the bound (forced to 1) a create
+/// on this thread syncs nothing, and the held slots come free once the upgrade lands. Mutant
+/// `upgrade_on_ack_path`.
+#[test]
+fn the_held_free_upgrade_is_led_off_the_acknowledgement_path() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-off-ack.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "catalog={catalog}: premise: x's release frees two slots, past the bound");
+        x.reap().unwrap();
+        let syncs = super::store::thread_syncs();
+        let _y = trunk.fork_branch().unwrap().into_id();
+        assert_eq!(
+            super::store::thread_syncs() - syncs,
+            0,
+            "catalog={catalog}: a create past the bound synced on its own thread: it led the upgrade flight"
+        );
+        eventually(&format!("catalog={catalog}: the held slots never came free"), || {
+            slots.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+    }
+}
+
 /// Engine review 8 #8: three free paths skipped the hold: a lease's expiry (every fork's expiry
 /// pass), `reap_if_due`, and a close's collection of a branch released while a connection was
 /// open. They logged the Release with a write only, then freed at once. Here a lease runs out and

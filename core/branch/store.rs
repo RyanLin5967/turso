@@ -952,7 +952,7 @@ thread_local! {
 
 /// See `THREAD_SYNCS`.
 #[cfg(test)]
-fn thread_syncs() -> u64 {
+pub(crate) fn thread_syncs() -> u64 {
     THREAD_SYNCS.with(std::cell::Cell::get)
 }
 
