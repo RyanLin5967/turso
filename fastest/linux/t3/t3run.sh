@@ -155,7 +155,7 @@ finish() {
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
-  v3/v3floor.c v3/statfs_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
+  v3/v3floor.c v3/statfs_shim.c v3/noop_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
   v3/batchgate.py v3/blkflush.py v3/stamp.py"
 preflight() {
   [ -f "$MAN" ] || { echo "no manifest $MAN"; return 2; }
@@ -226,11 +226,17 @@ build() {
   cp "$SRC/target/release/examples/fastest_profile" "$DIST/" || return 1
   timeout 1800 bash "$L/competitors/build.sh" "$DIST" > "$OUT/build-competitors.txt" 2>&1 || return 1
   timeout 1800 bash "$L/competitors/fetch_dolt.sh" "$DIST/dolt-bin" "$OUT/dolt-fetch.txt" > "$OUT/build-dolt.txt" 2>&1 || return 1
-  gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$DIST/v3floor" "$L/v3/v3floor.c" > "$OUT/build-v3.txt" 2>&1 || return 1
-  gcc -O2 -shared -fPIC -o "$DIST/statfs_shim.so" "$L/v3/statfs_shim.c" -ldl >> "$OUT/build-v3.txt" 2>&1 || return 1
+  # the V3 probe as its own workflow builds it (fastest-v3.yml at the V3 tip): v3floor STATIC (the probe refuses any
+  # mapped file but its own, V3 fourth review M4), a dynamic build of the same source for the fire-check's preload
+  # plants, and the plants' two shims. Dry run 37798270085 failed every fire-check on a dynamic v3floor.
+  { gcc -O2 -std=gnu11 -Wall -Wextra -Werror -static -o "$DIST/v3floor" "$L/v3/v3floor.c" &&
+    gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$DIST/v3floor.dyn" "$L/v3/v3floor.c" &&
+    gcc -O2 -shared -fPIC -o "$DIST/statfs_shim.so" "$L/v3/statfs_shim.c" -ldl &&
+    gcc -O2 -Wall -Wextra -Werror -shared -fPIC -o "$DIST/noop_shim.so" "$L/v3/noop_shim.c" &&
+    file "$DIST/v3floor" "$DIST/v3floor.dyn"; } > "$OUT/build-v3.txt" 2>&1 || return 1
   { echo "sha=$SHA"; rustc -V; gcc --version | head -1; /usr/lib/postgresql/18/bin/postgres --version
     fio --version; strace -V | head -1
-    ( cd "$DIST" && sha256sum fastest_profile bbload clonebench sqlite3 v3floor statfs_shim.so ); } > "$OUT/binaries.txt"
+    ( cd "$DIST" && sha256sum fastest_profile bbload clonebench sqlite3 v3floor v3floor.dyn statfs_shim.so noop_shim.so ); } > "$OUT/binaries.txt"
   return 0
 }
 
@@ -319,7 +325,8 @@ fs_block() {
     echo "REFUSED: $mnt has a nobarrier layer on its flush path"; return 1
   fi
   bash "$L/hw/record.sh" "$o/hw" "$mnt/hw" 15 > "$o/hw.stdout" 2>&1 || return 1
-  V3_FX=$V3FX V3_SHIM=$DIST/statfs_shim.so timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
+  V3_FX=$V3FX V3_SHIM=$DIST/statfs_shim.so V3_DYN=$DIST/v3floor.dyn V3_NOOP=$DIST/noop_shim.so \
+    timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
   v3batch before "$mnt/v3b" || return 1
