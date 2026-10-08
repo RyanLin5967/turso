@@ -69,8 +69,17 @@
  *   "no volatile cache: no drive flush" and can never back a drive-flush sentence. The kernel's view must agree with
  *   the drive's own report (NVMe Identify Controller VWC bit 0, read through NVME_IOCTL_ADMIN_CMD on the controller's
  *   character device; SCSI MODE SENSE(10) caching page WCE through SG_IO -- not sd's cache_type, which is the kernel's
- *   own copy; virtio_blk cache_type, from the device config), else the run is refused. On a VM (cpuinfo hypervisor
- *   flag, /sys/hypervisor, DMI) a write-back leaf's floor is "virtual drive flush: reach to media unknown".
+ *   own copy; virtio_blk cache_type, from the device config), else the run is refused. The MODE SENSE reply's header
+ *   and caching page are recorded in hex (drive_report_source), so the WCE bit can be re-read from the raw bytes.
+ * Virtualization (summary "virtualization", fourth review M1): "virtualized" is true on ANY evidence of a VM (the
+ *   cpuinfo hypervisor flag, /sys/hypervisor/type, a device-tree hypervisor node, DMI names, and the leaf itself: a
+ *   virtio_blk driver, a virtual drive model, an sd host on Hyper-V's VMBus or a paravirtual SCSI host); false ONLY on
+ *   positive bare-metal evidence (x86_64, where a hypervisor sets the CPUID hypervisor bit: the flag absent, DMI
+ *   readable and naming no VM, and no leaf evidence); else null ("not ruled out": arm64 has no such bit). Only false
+ *   gets the plain labels: a write-back leaf's floor_kind is "drive flush" when false, "virtual drive flush: reach to
+ *   media unknown" when true, "drive flush, virtualization not ruled out: reach to media unknown" when null, and a
+ *   write-through leaf's label carries the same qualifier (a virtual drive's "no cache" is the hypervisor's claim).
+ *   Blind spot, stated: a hypervisor that hides the CPUID bit and presents non-virtual DMI and drive identities.
  *
  * Refusals (rc 2, nothing left behind):
  *   - the clocksource is not tsc or arch_sys_counter;
@@ -88,7 +97,11 @@
  *     a layer whose device, queue/write_cache or options cannot be read refuses too;
  *   - the leaf's driver is not nvme, sd or virtio_blk: brd, zram, nbd, dm, md and anything unknown refuse. brd is
  *     accepted only with V3FLOOR_BRD=1 (set by firecheck.sh's brd cells, refused by run.sh in a bound batch), and its
- *     summary says "fire-check only, never credited";
+ *     summary says "fire-check only, never credited"; an sd leaf's SCSI host must be in an allowlist of local HBAs
+ *     and paravirtual VM hosts (SD_HOSTS: a LIO loopback, iSCSI, FC, SRP, USB bridges and unknown hosts refuse), and
+ *     a scsi_debug host (a RAM disk posing as a SCSI drive) is accepted only under V3FLOOR_FIRECHECK=1 (the WCE=1
+ *     fire-check fixture; never through run.sh); an NVMe controller's transport must be pcie (nvme-loop and the
+ *     fabrics tcp, rdma, fc refuse);
  *   - the kernel's write_cache disagrees with the drive's own report, or that report cannot be read;
  *   - nice != 0, a scheduling policy other than SCHED_OTHER, or an I/O priority other than the default;
  *   - D's path is too long, the out dir exists, n is not a positive integer, an unknown or repeated arm;
@@ -106,12 +119,17 @@
  *
  * Blind spots, stated: foreign I/O on the device and cgroup I/O throttling are not observed here (run.sh's stamps
  *   record /proc/diskstats and PSI around the batch); device-mapper, md and network block layers below D are not
- *   followed (only loop devices are; such a leaf refuses on its driver), but network disks that present as SCSI
- *   (iSCSI, FC, SRP) use sd and are accepted. NVMe VWC says a cache is present, not enabled (Get Features 06h needs
+ *   followed (only loop devices are; such a leaf refuses on its driver, a network SCSI or NVMe leaf on its host or
+ *   transport allowlist). NVMe VWC says a cache is present, not enabled (Get Features 06h needs
  *   CAP_SYS_ADMIN). The VM test can miss a hypervisor that hides itself. On Linux an fsync is per inode plus the
  *   filesystem's journal, not a device-wide cache flush as F_FULLFSYNC is on Apple.
  * Also refused: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH set (outside the fire-check), and inode flags on D or an arm
  *   file outside {extents, directory index} (chattr +S/+D/+j/+C/+c/+x change what an fsync does).
+ * The binary is linked static (fourth review M4): exe_sha256 then covers the libc whose fsync it calls, and neither
+ *   LD_PRELOAD nor /etc/ld.so.preload can load anything into it. The probe reads /proc/self/maps and refuses any
+ *   file-backed mapping other than its own executable (by device and inode), outside the fire-check; summary
+ *   "mapped_files" lists what was mapped. (firecheck.sh's statfs-shim plant runs a dynamic build of the same source
+ *   under V3FLOOR_FIRECHECK=1.)
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -580,7 +598,9 @@ static const char *GENERIC_OPTS[] = {"rw", "relatime", "noatime", "nodiratime", 
                                      "nodev", "noexec", "nosymfollow", "seclabel", NULL};
 static const char *EXT4_OPTS[] = {
     "errors=", "commit=", "data=ordered", "data=writeback", "journal_async_commit", "journal_checksum", "discard",
-    "nodiscard", "delalloc", "nodelalloc", "dioread_nolock", "dioread_lock", "auto_da_alloc", "noauto_da_alloc",
+    "nodiscard", "delalloc", "nodelalloc", "dioread_nolock", "dioread_lock",
+    "nodioread_nolock", /* the kernel's own spelling of dioread_lock in mountinfo (a data=journal mount shows it) */
+    "auto_da_alloc", "noauto_da_alloc",
     "user_xattr", "nouser_xattr", "acl", "noacl", "noquota", "quota", "usrquota", "grpquota", "stripe=",
     "inode_readahead_blks=", "init_itable=", "noinit_itable", "max_batch_time=", "min_batch_time=", "i_version",
     "prefetch_block_bitmaps", "no_prefetch_block_bitmaps", "block_validity", "noblock_validity", "bsddf", "minixdf",
@@ -788,14 +808,21 @@ static const char *layer_fs_checks(layer *l, int k) { /* options allowlist, ext4
 
 /* ---- the leaf: its driver (an allowlist) and the drive's own cache report ---- */
 typedef struct {
-    char driver[64], kind[16]; /* kind: drive | brd */
-    char report[32], report_source[PATH_MAX + 128], cache_type[64], model[64];
-    char ctrls[MAXCTRL][32];
+    char driver[64], kind[16]; /* kind: drive | brd | scsi_debug (fire-check only) */
+    char report[32], report_source[PATH_MAX + 512], cache_type[64], model[64];
+    char ctrls[MAXCTRL][32], transport[MAXCTRL][16];
     int nctrl;
     char paths[MAXCTRL][64], pathdevs[MAXCTRL][32];
     int npath;
+    char sd_host[64], devpath[PATH_MAX]; /* sd: the SCSI host's proc_name; the device's sysfs realpath */
 } leafinfo;
 static leafinfo LEAF;
+static int firecheck_env(void);
+
+static void rtrim(char *s) {
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
+}
 
 static void nvme_ctrls(const char *disk, leafinfo *li) {
     char p[PATH_MAX], r[PATH_MAX];
@@ -812,9 +839,16 @@ static void nvme_ctrls(const char *disk, leafinfo *li) {
     closedir(d);
 }
 
-static const char *nvme_vwc(const char *ctrl, int *vwc, char *model, size_t mcap) {
+static const char *nvme_vwc(const char *ctrl, int *vwc, char *model, size_t mcap, char *transport, size_t tcap) {
     char node[64], p[PATH_MAX], dv[32];
     snprintf(node, sizeof node, "/dev/%s", ctrl);
+    /* the transport, an allowlist of one: a local PCIe drive. nvme-loop is a loopback target over a file or RAM, and a
+     * fabrics target (tcp, rdma, fc) is another machine's storage whose flush may end anywhere (fifth review M2) */
+    pathf(p, sizeof p, "/sys/class/nvme/%s/transport", ctrl);
+    if (read_line(p, transport, tcap) != 0) return whyf("cannot read %s", p);
+    if (strcmp(transport, "pcie"))
+        return whyf("NVMe controller %s has transport '%s', not pcie: a fabrics or loopback target (nvme-loop, tcp, rdma, "
+                    "fc) is not a local drive", ctrl, transport);
     pathf(p, sizeof p, "/sys/class/nvme/%s/dev", ctrl);
     unsigned maj = 0, mnr = 0;
     struct stat sb;
@@ -850,7 +884,7 @@ static const char *nvme_vwc(const char *ctrl, int *vwc, char *model, size_t mcap
  * through SG_IO on a read-only fd -- a read-safe command the kernel allows any opener. sd's cache_type is NOT the
  * drive's report: it and queue/write_cache both derive from sd's cached WCE bit, so "temporary write back|through"
  * moves both together (fresh review H2). */
-static const char *scsi_wce(const layer *l, int *wce) {
+static const char *scsi_wce(const layer *l, int *wce, char *hex, size_t hcap) {
     char node[96];
     unsigned maj = 0, mnr = 0;
     struct stat sb;
@@ -882,22 +916,129 @@ static const char *scsi_wce(const layer *l, int *wce) {
     if ((io.info & SG_INFO_OK_MASK) != SG_INFO_OK || io.status || io.host_status || io.driver_status)
         return whyf("cannot read the drive's own cache report: MODE SENSE(10) on %s failed (status 0x%x host 0x%x driver "
                     "0x%x)", node, io.status, io.host_status, io.driver_status);
+    /* the bytes the drive actually sent (fourth review L8: a short transfer leaves zero fill, which reads as WCE=0) */
+    unsigned got = io.resid >= 0 && (unsigned)io.resid <= sizeof resp ? (unsigned)(sizeof resp - (unsigned)io.resid) : 0;
     unsigned len = ((unsigned)resp[0] << 8 | resp[1]) + 2, bdl = (unsigned)resp[6] << 8 | resp[7], off = 8 + bdl;
-    if (off + 3 > len || off + 3 > sizeof resp || (resp[off] & 0x3F) != 0x08)
-        return whyf("cannot read the drive's own cache report: no caching mode page in %s's MODE SENSE reply", node);
+    if (len > got) len = got;
+    if (got < 8 || off + 3 > len || off + 3 > sizeof resp)
+        return whyf("cannot read the drive's own cache report: %s's MODE SENSE reply is %u bytes (resid %d), too short "
+                    "for a caching page at offset %u", node, got, io.resid, off);
+    if ((resp[off] & 0x3F) != 0x08 || (resp[off] & 0x40) || resp[off + 1] < 1)
+        return whyf("cannot read the drive's own cache report: no caching mode page in %s's MODE SENSE reply (page byte "
+                    "0x%02x: code 0x%02x, SPF %d; page length %u)", node, resp[off], resp[off] & 0x3F, !!(resp[off] & 0x40),
+                    resp[off + 1]);
     *wce = (resp[off + 2] >> 2) & 1;
+    /* the raw reply, recorded: the 8-byte header, then the caching page (up to 20 bytes) -- check.py re-reads WCE
+     * from these bytes (fourth review M2) */
+    size_t h = 0;
+    h += (size_t)snprintf(hex + h, hcap - h, "header");
+    for (unsigned k = 0; k < 8 && h < hcap; k++) h += (size_t)snprintf(hex + h, hcap - h, " %02x", resp[k]);
+    if (h < hcap) h += (size_t)snprintf(hex + h, hcap - h, "; page at %u", off);
+    unsigned pend = off + 2 + resp[off + 1];
+    if (pend > len) pend = len;
+    if (pend > off + 20) pend = off + 20;
+    for (unsigned k = off; k < pend && h < hcap; k++) h += (size_t)snprintf(hex + h, hcap - h, " %02x", resp[k]);
     return NULL;
 }
 
-static void virt_record(int *vm, int *flag, char *hyp, char *vendor, char *product, size_t cap) {
+/* the SCSI host under an sd leaf: its proc_name, from the hostN component of the device's sysfs path */
+static void scsi_host_of(const char *disk, char *proc, size_t pcap, char *devpath, size_t dcap) {
+    char p[PATH_MAX], r[PATH_MAX];
+    proc[0] = 0;
+    devpath[0] = 0;
+    pathf(p, sizeof p, "%s/device", disk);
+    if (!realpath(p, r)) return;
+    copy(devpath, dcap, r);
+    for (char *s = strstr(r, "/host"); s; s = strstr(s + 1, "/host")) {
+        char *e = s + 5;
+        size_t n = strspn(e, "0123456789");
+        if (n && n < 16 && e[n] == '/') {
+            char q[PATH_MAX], hn[32] = "host";
+            memcpy(hn + 4, e, n);
+            hn[4 + n] = 0;
+            pathf(q, sizeof q, "/sys/class/scsi_host/%s/proc_name", hn);
+            if (read_line(q, proc, pcap) != 0) proc[0] = 0;
+            return;
+        }
+    }
+}
+
+/* Virtualization (fourth review M1): any evidence of a VM sets it; "not virtualized" needs positive bare-metal
+ * evidence, which only x86_64's CPUID hypervisor bit gives (every mainstream hypervisor sets it; one that hides it
+ * and also presents non-virtual DMI and drive identities is the stated blind spot). */
+typedef struct {
+    int vm; /* 1 virtualized, 0 positive bare-metal evidence, -1 not ruled out */
+    int flag, flags_line, devtree;
+    char hyp[64], vendor[128], product[128];
+    char ev[8][PATH_MAX + 160];
+    int nev;
+    char basis[512];
+} virtinfo;
+static virtinfo VIRT;
+static const char *VM_DMI[] = {"Virtual", "VMware", "QEMU", "KVM", "Xen", "Bochs", "BHYVE", "VirtualBox", "innotek",
+                               "Parallels", "OpenStack", "Amazon EC2", "Google", "Alibaba", "DigitalOcean", "Droplet",
+                               "Linode", "Hetzner vServer", "Scaleway", "Nutanix", "oVirt", "RHEV", "Cloud Hypervisor",
+                               "Firecracker", "Hyper-V", NULL};
+static const char *VM_MODEL[] = {"Virtual", "VMware", "QEMU", "VBOX", "MSFT", "Msft", "Google", "PersistentDisk", "Amazon",
+                                 "Xen", "Hyper-V", "BHYVE", "virtio", NULL};
+static const char *VM_SCSI_HOST[] = {"storvsc", "virtio_scsi", "vmw_pvscsi", "xen-scsifront", "ibmvscsi", NULL};
+/* the SCSI hosts an sd leaf may sit on (exact proc_name): local SATA/SAS/RAID HBAs, then paravirtual VM hosts
+ * (storvsc_host is Hyper-V's, read on the hosted runners; the others as their drivers name themselves, unverified
+ * here: a wrong name only refuses) */
+static const char *SD_HOSTS[] = {"ahci", "ata_piix", "mpt3sas", "mpt2sas", "megaraid_sas", "smartpqi", "hpsa", "aacraid",
+                                 "mvsas", "isci", "pm80xx", "storvsc_host", "virtio_scsi", "vmw_pvscsi", "ibmvscsi", NULL};
+static const char *VM_DEVPATH[] = {"VMBUS", "vmbus", "MSFT1000", "/virtio", "/xen", NULL};
+
+static const char *name_hit(const char *s, const char **list) {
+    for (int k = 0; s[0] && list[k]; k++)
+        if (strstr(s, list[k])) return list[k];
+    return NULL;
+}
+static void vev(virtinfo *v, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void vev(virtinfo *v, const char *fmt, ...) {
+    if (v->nev >= 8) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(v->ev[v->nev++], sizeof v->ev[0], fmt, ap);
+    va_end(ap);
+}
+
+static void virt_record(virtinfo *v, const leafinfo *li, const char *machine) {
     static char ci[1 << 20];
-    *flag = 0;
-    if (read_all("/proc/cpuinfo", ci, sizeof ci) == 0 && (strstr(ci, " hypervisor ") || strstr(ci, " hypervisor\n"))) *flag = 1;
-    if (read_line("/sys/hypervisor/type", hyp, cap) != 0) hyp[0] = 0;
-    if (read_line("/sys/class/dmi/id/sys_vendor", vendor, cap) != 0) vendor[0] = 0;
-    if (read_line("/sys/class/dmi/id/product_name", product, cap) != 0) product[0] = 0;
-    *vm = *flag || hyp[0] || strstr(product, "Virtual") || strstr(product, "KVM") || strstr(product, "VMware") ||
-          strstr(vendor, "QEMU") || strstr(vendor, "Amazon EC2") || strstr(vendor, "Google") || strstr(vendor, "Xen");
+    memset(v, 0, sizeof *v);
+    if (read_all("/proc/cpuinfo", ci, sizeof ci) == 0) {
+        v->flags_line = starts(ci, "flags") || strstr(ci, "\nflags") != NULL;
+        v->flag = strstr(ci, " hypervisor ") != NULL || strstr(ci, " hypervisor\n") != NULL;
+    }
+    if (read_line("/sys/hypervisor/type", v->hyp, sizeof v->hyp) != 0) v->hyp[0] = 0;
+    if (read_line("/sys/class/dmi/id/sys_vendor", v->vendor, sizeof v->vendor) != 0) v->vendor[0] = 0;
+    if (read_line("/sys/class/dmi/id/product_name", v->product, sizeof v->product) != 0) v->product[0] = 0;
+    rtrim(v->vendor);
+    rtrim(v->product);
+    v->devtree = access("/sys/firmware/devicetree/base/hypervisor", F_OK) == 0 || access("/proc/device-tree/hypervisor", F_OK) == 0;
+    const char *h;
+    if (v->flag) vev(v, "cpuinfo: the hypervisor flag (CPUID leaf 1 ECX bit 31)");
+    if (v->hyp[0]) vev(v, "sys: /sys/hypervisor/type is '%s'", v->hyp);
+    if (v->devtree) vev(v, "devicetree: a hypervisor node");
+    if ((h = name_hit(v->vendor, VM_DMI))) vev(v, "DMI: sys_vendor '%s' names '%s'", v->vendor, h);
+    if ((h = name_hit(v->product, VM_DMI))) vev(v, "DMI: product_name '%s' names '%s'", v->product, h);
+    if (!strcmp(li->driver, "virtio_blk")) vev(v, "leaf: driver virtio_blk (a paravirtual disk)");
+    if ((h = name_hit(li->model, VM_MODEL))) vev(v, "leaf: drive model '%s' names '%s'", li->model, h);
+    if ((h = name_hit(li->sd_host, VM_SCSI_HOST))) vev(v, "leaf: SCSI host '%s' (paravirtual)", li->sd_host);
+    if ((h = name_hit(li->devpath, VM_DEVPATH))) vev(v, "leaf: device path %s has '%s'", li->devpath, h);
+    if (v->nev) {
+        v->vm = 1;
+        snprintf(v->basis, sizeof v->basis, "%d piece(s) of VM evidence", v->nev);
+    } else if (!strcmp(machine, "x86_64") && v->flags_line && v->vendor[0] && v->product[0]) {
+        v->vm = 0;
+        snprintf(v->basis, sizeof v->basis, "x86_64 with the CPUID hypervisor bit clear, DMI naming a system no VM list "
+                 "matches, and no virtual driver, model or host on the leaf");
+    } else {
+        v->vm = -1;
+        snprintf(v->basis, sizeof v->basis, "no VM evidence, and no positive bare-metal evidence: %s",
+                 strcmp(machine, "x86_64") ? "this architecture has no CPUID hypervisor bit"
+                 : !v->flags_line ? "/proc/cpuinfo has no flags line" : "DMI names are unreadable or empty");
+    }
 }
 
 static const char *leaf_checks(const layer *l) {
@@ -947,7 +1088,27 @@ static const char *leaf_checks(const layer *l) {
                     "zram, nbd, dm, md and unknown devices are refused", l->diskname, l->diskdev, l->disk,
                     li->driver[0] ? li->driver : "none");
     snprintf(li->kind, sizeof li->kind, "drive");
+    {
+        char dp[PATH_MAX];
+        pathf(p, sizeof p, "%s/device", l->disk);
+        if (realpath(p, dp)) copy(li->devpath, sizeof li->devpath, dp);
+    }
     if (!strcmp(li->driver, "sd")) {
+        /* the host under sd, an allowlist (fifth review M1, M2): local HBAs and the paravirtual hosts of the VMs the
+         * fire-check runs on. A RAM disk posing as a SCSI drive (scsi_debug) is fire-check only; a LIO loopback
+         * (tcm_loop), iSCSI, FC, SRP, a USB bridge and any host not named here refuse */
+        scsi_host_of(l->disk, li->sd_host, sizeof li->sd_host, li->devpath, sizeof li->devpath);
+        if (!strcmp(li->sd_host, "scsi_debug") || strstr(li->devpath, "/pseudo_")) {
+            if (!firecheck_env())
+                return whyf("the leaf %s is a scsi_debug disk (RAM posing as a SCSI drive, host '%s', %s): scsi_debug is "
+                            "fire-check only (V3FLOOR_FIRECHECK=1), never a measured device", l->diskname, li->sd_host,
+                            li->devpath);
+            snprintf(li->kind, sizeof li->kind, "scsi_debug");
+        } else if (!opt_in(li->sd_host, SD_HOSTS)) {
+            return whyf("the leaf %s is on SCSI host '%s' (%s), not in the allowlist of local HBAs and paravirtual VM "
+                        "hosts: a LIO loopback, iSCSI, FC, SRP, a USB bridge or an unknown host may never put a flush "
+                        "on media", l->diskname, li->sd_host[0] ? li->sd_host : "unreadable", li->devpath);
+        }
         pathf(p, sizeof p, "%s/device/scsi_disk", l->disk);
         DIR *sd = opendir(p);
         if (!sd) return whyf("cannot read the drive's own cache report: no %s", p);
@@ -963,13 +1124,15 @@ static const char *leaf_checks(const layer *l) {
         if (nfound != 1) return whyf("cannot read sd's cache_type: %d cache_type files under %s", nfound, p);
         copy(li->cache_type, sizeof li->cache_type, ct);
         int wce = -1;
-        const char *why = scsi_wce(l, &wce);
+        char hex[192] = "";
+        const char *why = scsi_wce(l, &wce, hex, sizeof hex);
         if (why) return why;
         snprintf(li->report, sizeof li->report, "%s", wce ? "write back" : "write through");
-        snprintf(li->report_source, sizeof li->report_source, "SCSI MODE SENSE(10) caching page WCE=%d via SG_IO on /dev/%s "
-                 "(sd's cache_type, the kernel's copy, reads '%s')", wce, l->diskname, ct);
+        snprintf(li->report_source, sizeof li->report_source, "SCSI MODE SENSE(10) caching page WCE=%d via SG_IO on /dev/%.63s "
+                 "(reply %.191s; sd's cache_type, the kernel's copy, reads '%.63s')", wce, l->diskname, hex, ct);
         pathf(p, sizeof p, "%s/device/model", l->disk);
         if (read_line(p, li->model, sizeof li->model) != 0) li->model[0] = 0;
+        rtrim(li->model);
     } else if (!strcmp(li->driver, "virtio_blk")) {
         char ct[32];
         pathf(li->report_source, sizeof li->report_source, "%s/cache_type", l->disk);
@@ -982,13 +1145,15 @@ static const char *leaf_checks(const layer *l) {
         int first = -1;
         for (int c = 0; c < li->nctrl; c++) {
             int vwc = 0;
-            const char *why = nvme_vwc(li->ctrls[c], &vwc, li->model, sizeof li->model);
+            const char *why = nvme_vwc(li->ctrls[c], &vwc, li->model, sizeof li->model, li->transport[c],
+                                       sizeof li->transport[0]);
             if (why) return why;
             if (first >= 0 && vwc != first) return whyf("the controllers of %s disagree on VWC", l->diskname);
             first = vwc;
         }
         snprintf(li->report, sizeof li->report, "%s", first ? "write back" : "write through");
-        snprintf(li->report_source, sizeof li->report_source, "NVMe Identify Controller VWC bit 0 via /dev/%s%s",
+        /* %.31s: ctrls[0] is char[32]; gcc's truncation analysis otherwise sizes it by the rest of the struct */
+        snprintf(li->report_source, sizeof li->report_source, "NVMe Identify Controller VWC bit 0 via /dev/%.31s%s",
                  li->ctrls[0], li->nctrl > 1 ? " (and every other controller of the subsystem)" : "");
     }
     if (strcmp(l->wc, li->report))
@@ -1033,6 +1198,46 @@ static uint64_t rng = 88172645463325252ULL;
 static uint64_t xs(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 
 static int firecheck_env(void) { const char *e = getenv("V3FLOOR_FIRECHECK"); return e && !strcmp(e, "1"); }
+
+/* What is mapped into the probe (fourth review M4). The build is static, so its own executable is the only file it
+ * maps; anything else came from the dynamic loader (LD_PRELOAD, /etc/ld.so.preload, a dynamic libc) and would run
+ * code exe_sha256 does not cover. Compared by device and inode, not by name. -> the mapped files, '|'-separated;
+ * *other = how many are not the executable. */
+static char MAPPED[8192];
+static int mapped_files(int *other) {
+    struct stat ex;
+    *other = 0;
+    MAPPED[0] = 0;
+    if (stat("/proc/self/exe", &ex) != 0) return -1;
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m) return -1;
+    char line[PATH_MAX + 256], seen[64][512];
+    int nseen = 0, exe_seen = 0;
+    while (fgets(line, sizeof line, m)) {
+        unsigned maj = 0, mnr = 0;
+        unsigned long long ino = 0;
+        int pos = 0;
+        if (sscanf(line, "%*s %*s %*s %x:%x %llu %n", &maj, &mnr, &ino, &pos) < 3 || ino == 0) continue;
+        char *path = line + pos;
+        path[strcspn(path, "\n")] = 0;
+        int dup = 0;
+        for (int k = 0; k < nseen; k++) dup |= !strcmp(seen[k], path);
+        if (dup) continue;
+        if (nseen < 64) copy(seen[nseen++], sizeof seen[0], path);
+        /* the executable, by stat() of the mapped path against stat() of /proc/self/exe (both through stat, so a
+         * btrfs subvolume's or overlayfs's device numbering is the same on both sides; fifth review L4); the inode
+         * the maps line names must be that path's too, so a path replaced since the mapping is not the executable */
+        struct stat ps;
+        int is_exe = stat(path, &ps) == 0 && ps.st_dev == ex.st_dev && ps.st_ino == ex.st_ino &&
+                     (unsigned long long)ps.st_ino == ino;
+        exe_seen |= is_exe;
+        if (!is_exe) (*other)++;
+        size_t h = strlen(MAPPED);
+        snprintf(MAPPED + h, sizeof MAPPED - h, "%s%s", h ? "|" : "", path);
+    }
+    fclose(m);
+    return exe_seen ? 0 : -1; /* no mapping of the executable read: cannot determine what is mapped */
+}
 
 /* after the loop, before teardown: does a copy arm's c0 share its extents with the source (a reflink) or not (a
  * byte copy)? cfr2b is a reflink on xfs/btrfs and a copy on ext4 (fresh review L6). FIEMAP without SYNC. */
@@ -1131,6 +1336,12 @@ int main(int argc, char **argv) {
                 refuse("%s is set: an interposed library could change what the probe does under an unchanged exe_sha256",
                        LDV[k]);
     }
+    int other_maps = 0;
+    if (mapped_files(&other_maps) != 0) refuse("cannot read /proc/self/maps (what is mapped into the probe)");
+    if (other_maps && !firecheck_env())
+        refuse("a file other than the probe's own executable is mapped into it (%s): the probe is built static, so the "
+               "dynamic loader put it there (LD_PRELOAD, /etc/ld.so.preload) or this is not the static build; it could "
+               "change what the probe does under an unchanged exe_sha256", MAPPED);
     if (!DIR_ || !out || (!crash_arm && (!have_n || n == 0))) {
         fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] | --crash-op ARM --dir D --out O\n");
         return 2;
@@ -1325,7 +1536,15 @@ int main(int argc, char **argv) {
     jstr(f, clocksrc);
     if (have_seed) fprintf(f, ",\"seed_arg\":%llu", (unsigned long long)seed);
     else fprintf(f, ",\"seed_arg\":null");
-    fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"dir_flags\":");
+    fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"linkage\":\"%s\","
+            "\"mapped_files\":[", other_maps ? "not static: other files mapped (fire-check only)" : "static");
+    {
+        char tmp[sizeof MAPPED], *sv = NULL;
+        copy(tmp, sizeof tmp, MAPPED);
+        int k = 0;
+        for (char *t = strtok_r(tmp, "|", &sv); t; t = strtok_r(NULL, "|", &sv)) { fprintf(f, "%s", k++ ? "," : ""); jstr(f, t); }
+    }
+    fprintf(f, "],\"dir_flags\":");
     jstr(f, dflags);
     fprintf(f, ",\"barrier\":\"fsync(2)\",\"exe_sha256\":\"%s\",\"dir\":", exe_sha);
     jstr(f, DIR_);
@@ -1393,30 +1612,54 @@ int main(int argc, char **argv) {
         fprintf(f, ",\"dev\":"); jstr(f, LEAF.pathdevs[c]);
         fprintf(f, "}");
     }
-    fprintf(f, "],\"creditable\":%s}", brd ? "false" : "true");
+    fprintf(f, "],\"nvme_transport\":[");
+    for (int c = 0; c < LEAF.nctrl; c++) { fprintf(f, "%s", c ? "," : ""); jstr(f, LEAF.transport[c]); }
+    fprintf(f, "],\"sd_host\":"); jstr(f, LEAF.sd_host);
+    fprintf(f, ",\"device_path\":"); jstr(f, LEAF.devpath);
+    fprintf(f, ",\"creditable\":%s}", brd || strcmp(LEAF.kind, "drive") ? "false" : "true");
     fprintf(f, ",\"leaf_write_cache\":"); jstr(f, wc);
     fprintf(f, ",\"leaf_fua\":"); jstr(f, leaf->fua);
     int wb = !strcmp(wc, "write back");
-    int vm = 0, vflag = 0;
-    char hyp[64], vendor[128], product[128];
-    virt_record(&vm, &vflag, hyp, vendor, product, sizeof vendor < sizeof hyp ? sizeof vendor : sizeof hyp);
-    fprintf(f, ",\"virtualization\":{\"virtualized\":%s,\"cpuinfo_hypervisor_flag\":%s,\"sys_hypervisor_type\":",
-            vm ? "true" : "false", vflag ? "true" : "false");
-    jstr(f, hyp);
-    fprintf(f, ",\"dmi_sys_vendor\":"); jstr(f, vendor);
-    fprintf(f, ",\"dmi_product_name\":"); jstr(f, product);
-    fprintf(f, "}");
+    virt_record(&VIRT, &LEAF, u.machine);
+    const int vm = VIRT.vm;
+    fprintf(f, ",\"virtualization\":{\"virtualized\":%s,\"evidence\":[", vm > 0 ? "true" : vm == 0 ? "false" : "null");
+    for (int k = 0; k < VIRT.nev; k++) { fprintf(f, "%s", k ? "," : ""); jstr(f, VIRT.ev[k]); }
+    fprintf(f, "],\"basis\":"); jstr(f, VIRT.basis);
+    fprintf(f, ",\"cpuinfo_hypervisor_flag\":%s,\"cpuinfo_flags_line\":%s,\"devicetree_hypervisor\":%s,\"sys_hypervisor_type\":",
+            VIRT.flag ? "true" : "false", VIRT.flags_line ? "true" : "false", VIRT.devtree ? "true" : "false");
+    jstr(f, VIRT.hyp);
+    fprintf(f, ",\"dmi_sys_vendor\":"); jstr(f, VIRT.vendor);
+    fprintf(f, ",\"dmi_product_name\":"); jstr(f, VIRT.product);
+    fprintf(f, ",\"blind_spot\":\"a hypervisor that hides the CPUID bit and presents non-virtual DMI and drive identities\"}");
+    /* a VM's "drive" is the hypervisor's: whether its flush (or its "no cache") reaches media is the host's business,
+     * so only positive bare-metal evidence gets the plain labels (fresh review M1; fourth review M1, L2) */
     fprintf(f, ",\"flush_sent_to_device\":\"%s\"",
             brd ? "no: the leaf is brd (RAM, fire-check only), which has no cache"
-            : wb ? "yes: the leaf reports a volatile write cache and the drive agrees, so a flush the filesystem issues "
-                   "reaches it; how many each arm's op issues is the device flush record (device_flushes_per_op)"
-                 : "no: the leaf reports write-through and the drive agrees, so the block layer sends it no flush");
-    /* on a VM the "drive" is the hypervisor's: whether its flush reaches media is the host's business (fresh review M1) */
+            : wb ? (vm == 0 ? "yes: the leaf reports a volatile write cache and the drive agrees, so a flush the filesystem "
+                              "issues reaches it; how many each arm's op issues is the device flush record "
+                              "(device_flushes_per_op)"
+                    : vm > 0 ? "yes, to the virtual device: the leaf reports a volatile write cache and its device report "
+                               "agrees, so a flush the filesystem issues reaches the (virtual) device; whether the host "
+                               "forwards it to media is unknown; how many each arm's op issues is the device flush "
+                               "record (device_flushes_per_op)"
+                             : "yes, to the device (virtualization not ruled out): the leaf reports a volatile write cache "
+                               "and its device report agrees, so a flush the filesystem issues reaches the device; that "
+                               "it is a drive and not a host's emulation is not shown; how many each arm's op issues is "
+                               "the device flush record (device_flushes_per_op)")
+            : vm == 0 ? "no: the leaf reports write-through and the drive agrees, so the block layer sends it no flush"
+            : vm > 0 ? "no: the (virtual) leaf reports write-through and its device report agrees, so the block layer "
+                       "sends it no flush; the host's own caching is unknown"
+                     : "no: the leaf reports write-through and its device report agrees, so the block layer sends it no "
+                       "flush (virtualization not ruled out: a host's own caching would be unknown)");
     fprintf(f, ",\"floor_kind\":\"%s\"", brd ? "brd: no drive (fire-check only, never credited)"
-            : wb ? (vm ? "virtual drive flush: reach to media unknown" : "drive flush") : "no volatile cache: no drive flush");
+            : wb ? (vm > 0 ? "virtual drive flush: reach to media unknown"
+                    : vm == 0 ? "drive flush" : "drive flush, virtualization not ruled out: reach to media unknown")
+                 : (vm > 0 ? "no volatile cache (a virtual drive's report): no drive flush, host caching unknown"
+                    : vm == 0 ? "no volatile cache: no drive flush"
+                              : "no volatile cache (virtualization not ruled out): no drive flush, host caching unknown"));
     /* the review's sentence is for ext4/XFS; btrfs's clean fsync issues no flush at all (run 37476867864), so it gets
      * no bare-flush baseline; batchgate.py writes floor_claim_from_counts from the batch's own device flush counts */
-    fprintf(f, ",\"floor_claim\":\"%s\"",
+    fprintf(f, ",\"floor_claim\":\"%s%s\"",
             brd ? "none: a brd floor backs no sentence"
             : !wb ? "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor "
                     "'above a same-batch drive flush' may be written"
@@ -1424,7 +1667,9 @@ int main(int argc, char **argv) {
                                              "the device flush record shows the clean arm issuing a flush per op "
                                              "(floor_claim_from_counts); never 'one drive flush' without that count"
                                            : "per stack: the measured per-arm device flush counts only; on btrfs a clean "
-                                             "fsync can issue no flush, so no bare-flush baseline is claimed");
+                                             "fsync can issue no flush, so no bare-flush baseline is claimed",
+            brd || vm == 0 ? "" : vm > 0 ? "; on a virtual drive: reach to media unknown"
+                                         : "; virtualization not ruled out: reach to media unknown");
     fprintf(f, ",\"uname\":");
     char un[600];
     snprintf(un, sizeof un, "%s %s %s", u.sysname, u.release, u.machine);

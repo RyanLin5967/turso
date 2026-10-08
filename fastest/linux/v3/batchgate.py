@@ -10,29 +10,36 @@
   batchgate.py leafclass SUMMARY                      wb | wt | brd for a probe summary (exit 2 if it has none)
   batchgate.py fixture OUT CELL ARCH LEAF SHA FSTYPE [MOD]   a PLANTED full-shape verdict for firecheck.sh's F4 plants,
                                                       always "planted": true (MOD: allfail | fail-one | drop-one |
-                                                      cell=<c> | harness)
+                                                      cell=<c> | harness | bindfail: also a failed binding record |
+                                                      pending: also a pending one)
   batchgate.py self-test DATA                         the gates on banked and planted inputs; exit 0 iff all as expected
 
 Binding (item 8): a verdict binds only if it has check.py's whole shape -- a "checks" list whose ids equal
 check.plan(cell, arch, leaf class), every check passing, pass == total, all_pass true -- for this cell, binary sha256,
 arch and fstype, with "unplanted_refusals" listed, a leaf class that is not brd, no "planted" key, and the sha256 of
 every fire-check harness file equal to this run.sh's own copies (a verdict vouches only for the checker that wrote
-it). Each refusal reason starts with its rule's own name. Its sha256 and run id go into binary.txt. Threat model,
-stated: this stops a wrong, failed, truncated, foreign, stale or planted verdict; it does not stop a forged one.
+it), and the fire-check's own binding record next to it (<verdict>.bind.json, check.py --bind) passed for this very
+verdict; a pending record (<verdict>.bind.pending, written with the verdict) binds only firecheck.sh's own bind step,
+which names the verdict's sha256 in V3_BIND_PENDING_SHA (fourth review L3, fifth review L1). Each
+refusal reason starts with its rule's own name. Its sha256 and run id go into binary.txt. Threat model, stated: this
+stops a wrong, failed, truncated, foreign, stale or planted verdict; it does not stop a forged one.
 
 Post-run (item 7 and the fresh reviews): refused if the summary carries mutant_nosync or trace_clock != 0, names
-another binary, another layout, no gated arm ran, or (bound) a brd leaf, another leaf class or another layer stack
-than the verdict's.
+another binary, another layout, has no drive or brd leaf record, no gated arm ran, or (bound) a brd leaf, another
+leaf class, another layer stack, another leaf driver or drive model, or another virtualization verdict than the
+verdict's F3 batch (fourth review M3), or the verdict file no longer hashes to what binary.txt bound (L9).
 Flush gate (item 1): on a write-back leaf, the leaf's FLUSH requests completed in the batch window (diskstats fields
 19-20, from stamp.py) must be >= n x the gated arms run, else the batch is VOID (rc 3). It is a lower bound: other
 processes' flushes pad it. A write-through leaf is labelled "not applicable: no volatile cache: no drive flush" (the
 batch is labelled, not voided, and can never back a drive-flush sentence); a brd leaf, "not applicable: brd". On a
-write-back leaf the blkflush record must also show every gated op issuing a flush request to the leaf. The claim the
-counts allow is written as floor_claim_from_counts: "clean fsync (a bare flush ...) plus the measured delta" only on
-ext4/XFS where the clean arm issued >= 0.95 flush requests per op at the leaf (review 2 item 2); else no bare-flush
-baseline.
+write-back leaf the blkflush record must also show every gated op's window holding a flush-carrying request (flush,
+preflush or preflush+fua; a FUA-only write flushes nothing else) at the leaf. The claim the counts allow is written
+as floor_claim_from_counts: "clean fsync (a bare flush ...) plus the measured delta" only on ext4/XFS where a bare
+flush request (REQ_OP_FLUSH) reached the leaf in >= 95% of the clean arm's windows, each window counted once (review 2
+item 2; fourth review L9); else no bare-flush baseline, saying so when the clean arm did not run (L1). On a leaf that
+is virtual, or not shown bare metal, the claim carries that qualifier on both leaf classes (L2).
 """
-import copy as _copy, glob, hashlib, json, os, sys
+import copy as _copy, glob, hashlib, json, os, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -63,11 +70,61 @@ def harness():
 
 
 def leaf_class(sj):
+    """wb | wt | brd, or None. A leaf record whose kind is not drive or brd (scsi_debug, unknown) has no class. A
+    summary with no leaf record at all is a pre-review-2 one (the self-test's banked cells): classed by its
+    write_cache; post() refuses a batch without a leaf record."""
     lf = sj.get("leaf")
-    if isinstance(lf, dict) and lf.get("kind") == "brd":
-        return "brd"
+    if isinstance(lf, dict):
+        if lf.get("kind") == "brd":
+            return "brd"
+        if lf.get("kind") != "drive":
+            return None
+    elif lf is not None:
+        return None
     wc = sj.get("leaf_write_cache")
     return "wb" if wc == "write back" else "wt" if wc == "write through" else None
+
+
+def bind_path(verdict_path):
+    """The fire-check's own binding record for a verdict (check.py --bind): <verdict minus .json>.bind.json, and
+    .bind.pending between check.py writing the verdict and the binding check finishing."""
+    b = verdict_path[:-5] if verdict_path.endswith(".json") else verdict_path
+    return b + ".bind.json", b + ".bind.pending"
+
+
+def bind_problems(verdict_path, vsha, pending_sha=None):
+    """Fourth review L3: a verdict binds only if the fire-check's own binding check (run.sh bound to this verdict,
+    check.py --bind) passed for THIS verdict. Between check.py writing the verdict (and a pending record for it) and
+    check.py --bind replacing that record with the result, only firecheck.sh's own bind step may bind it: it names the
+    verdict's sha256 in V3_BIND_PENDING_SHA (fifth review L1: a fire-check that dies in that window leaves a pending
+    record that binds nothing). A failed, foreign or missing record refuses."""
+    if pending_sha is None:
+        pending_sha = os.environ.get("V3_BIND_PENDING_SHA", "")
+    bj, bp = bind_path(verdict_path)
+    if os.path.exists(bj):
+        try:
+            b = load(bj)
+        except (OSError, ValueError) as e:
+            return ["bind: the binding record %s is unreadable: %r" % (bj, e)]
+        if not isinstance(b, dict) or b.get("verdict_sha256") != vsha:
+            return ["bind: the binding record %s is for verdict %r, not this one (%s)" %
+                    (bj, b.get("verdict_sha256") if isinstance(b, dict) else None, vsha)]
+        chks = b.get("checks") if isinstance(b.get("checks"), list) else []
+        if b.get("all_pass") is not True or not chks or not all(isinstance(c, dict) and c.get("pass") is True for c in chks):
+            return ["bind: the fire-check's own binding check failed for this verdict (%s)" % bj]
+        return []
+    if os.path.exists(bp):
+        try:
+            pend = load(bp)
+        except (OSError, ValueError) as e:
+            return ["bind: the pending record %s is unreadable: %r" % (bp, e)]
+        if not isinstance(pend, dict) or pend.get("verdict_sha256") != vsha:
+            return ["bind: the pending record %s is for another verdict" % bp]
+        if pending_sha != vsha:
+            return ["bind: pending: the fire-check's own binding check has not finished for this verdict (%s); only "
+                    "firecheck.sh's bind step (V3_BIND_PENDING_SHA naming it) may bind it before it has" % bp]
+        return []
+    return ["bind: no binding record next to the verdict (%s): the fire-check's own binding check never ran for it" % bj]
 
 
 def verdict_problems(v, cell, sha, arch, fstype):
@@ -97,7 +154,7 @@ def verdict_problems(v, cell, sha, arch, fstype):
         bad.append("unplanted_refusals: absent")
     mine = harness()
     theirs = v.get("harness_sha256") if isinstance(v.get("harness_sha256"), dict) else {}
-    diff = sorted(f for f in mine if theirs.get(f) != mine[f] or mine[f] is None)
+    diff = sorted(f for f in set(mine) | set(theirs) if theirs.get(f) != mine.get(f) or mine.get(f) is None)
     if diff:  # a verdict vouches only for the checker that wrote it (fresh review I-M2)
         bad.append("harness: the verdict was made by a different fire-check harness than this run.sh's (%s differ)" %
                    ", ".join(diff[:6]))
@@ -127,8 +184,9 @@ def cmd_verdict(p, cell, sha, arch, fstype):
     except (OSError, ValueError) as e:
         print(json.dumps({"ok": False, "reasons": ["unreadable verdict: %r" % e]}))
         return 2
-    bad = verdict_problems(v, cell, sha, arch, fstype)
-    print(json.dumps({"ok": not bad, "reasons": bad, "verdict_sha256": hashlib.sha256(raw).hexdigest(),
+    vsha = hashlib.sha256(raw).hexdigest()
+    bad = verdict_problems(v, cell, sha, arch, fstype) + bind_problems(p, vsha)
+    print(json.dumps({"ok": not bad, "reasons": bad, "verdict_sha256": vsha,
                       "run_id": v.get("run_id") if isinstance(v, dict) else None,
                       "leaf_class": v.get("leaf_class") if isinstance(v, dict) else None}))
     return 0 if not bad else 2
@@ -204,18 +262,46 @@ def flush_gate(sj, st1):
     return g
 
 
-def claim_from_counts(sj, per_leaf):
+BARE_MIN_FRAC = 0.95  # a bare-flush baseline needs a bare flush request in at least this share of clean's windows
+
+
+def virt_qualifier(sj, lc):
+    """Fourth review L2: the claim carries the VM qualifier on both leaf classes (a virtual drive's flush and its
+    "no cache" are both the hypervisor's)."""
+    vz = (sj.get("virtualization") or {}).get("virtualized")
+    if vz is False:
+        return ""
+    what = "a virtual drive" if vz is True else "virtualization not ruled out"
+    return ("; %s: reach to media unknown" % what) if lc == "wb" else (" (%s: the host's caching is unknown)" % what)
+
+
+def clean_bare(arms, leaf_names):
+    """The clean arm's bare flush requests (REQ_OP_FLUSH, rwbs F) at the leaf: {ops, windows_with_bare_flush}, or
+    None when the clean arm did not run. A window counts once whatever else it holds (fourth review L9: mean events
+    per op let one window's two flushes stand in for another's none, and FUA or preflush writes are not bare)."""
+    c = (arms or {}).get("clean")
+    if not c or not c.get("ops"):
+        return None
+    zero = min([(c.get("devices") or {}).get(x, {}).get("bare_flush_zero_windows", c["ops"]) for x in leaf_names] or [c["ops"]])
+    return {"ops": c["ops"], "windows_with_bare_flush": c["ops"] - zero}
+
+
+def claim_from_counts(sj, clean):
     lc = leaf_class(sj)
     if lc == "brd":
         return "none: a brd floor backs no sentence"
+    q = virt_qualifier(sj, lc)
     if lc != "wb":
-        return "no drive flush: the leaf reports write-through and receives no flush"
-    clean = (per_leaf or {}).get("clean")
-    if isinstance(clean, (int, float)) and clean >= 0.95 and sj.get("fstype") in ("ext4", "xfs"):
-        return ("clean fsync (a bare flush: %.2f flush requests per op at the leaf) plus the measured delta, per stack"
-                % clean)
-    return ("no bare-flush baseline: the clean arm issued %s flush requests per op at the leaf on %s; quote the per-arm "
-            "device flush counts only" % ("no" if clean is None else "%.2f" % clean, sj.get("fstype")))
+        return "no drive flush: the leaf reports write-through and receives no flush" + q
+    if clean is None:
+        return ("no bare-flush baseline: the clean arm did not run or has no device flush record on %s; quote the "
+                "per-arm device flush counts only%s" % (sj.get("fstype"), q))
+    k, n = clean["windows_with_bare_flush"], clean["ops"]
+    if n and k >= BARE_MIN_FRAC * n and sj.get("fstype") in ("ext4", "xfs"):
+        return ("clean fsync (a bare flush: a bare flush request at the leaf in %d of %d clean windows) plus the measured "
+                "delta, per stack%s" % (k, n, q))
+    return ("no bare-flush baseline: a bare flush request at the leaf in %d of %d clean windows on %s; quote the per-arm "
+            "device flush counts only%s" % (k, n, sj.get("fstype"), q))
 
 
 def post(out, cell, sha, mode, verdict_path):
@@ -242,12 +328,25 @@ def post(out, cell, sha, mode, verdict_path):
     if not gated:
         refusals.append("no gated arm ran: a batch must time at least one of %s" % ", ".join(gated_list()))
     lc = leaf_class(sj)
+    if not isinstance(sj.get("leaf"), dict) or sj["leaf"].get("kind") not in ("drive", "brd"):
+        refusals.append("leaf: the summary's leaf record is %r, not a drive or brd" % (sj.get("leaf") or {}).get("kind"))
     if mode == "bound":
         v = {}
         try:
-            v = load(verdict_path) if verdict_path else {}
+            raw = open(verdict_path, "rb").read() if verdict_path else b"{}"
+            v = json.loads(raw)
+            if not isinstance(v, dict):
+                raise ValueError("not a JSON object")
+            # the verdict run.sh bound before the run is the one read now (fourth review L9)
+            with open(os.path.join(out, "binary.txt")) as f:
+                bt = f.read()
+            want = [l.split("=", 1)[1] for l in bt.splitlines() if l.startswith("verdict_sha256=")]
+            now = hashlib.sha256(raw).hexdigest()
+            if want != [now]:
+                refusals.append("verdict: changed during the run (binary.txt names %s, the file now hashes to %s)" % (want, now))
         except (OSError, ValueError) as e:
             refusals.append("verdict: unreadable after the run: %r" % e)
+            v = {}
         if lc == "brd":
             refusals.append("leaf brd: fire-check only, never a bound batch")
         if lc != v.get("leaf_class"):
@@ -258,6 +357,17 @@ def post(out, cell, sha, mode, verdict_path):
         bfs = [l.get("fstype") for l in sj.get("flush_path") or []]
         if bfs != vfs:
             refusals.append("stack: the batch's layer filesystems %s differ from the verdict's %s" % (bfs, vfs))
+        # the drive the verdict fire-checked: an NVMe verdict never binds an sd or virtio_blk batch, nor one drive
+        # model another (fourth review M3)
+        vl = (v.get("F3") or {}).get("leaf") or {}
+        bl = sj.get("leaf") or {}
+        if (bl.get("driver"), bl.get("model")) != (vl.get("driver"), vl.get("model")):
+            refusals.append("leaf drive: the batch's leaf is driver %r model %r, the verdict's driver %r model %r" %
+                            (bl.get("driver"), bl.get("model"), vl.get("driver"), vl.get("model")))
+        vv = ((v.get("F3") or {}).get("virtualization") or {}).get("virtualized", "absent")
+        bv = (sj.get("virtualization") or {}).get("virtualized", "absent")
+        if bv != vv or bv == "absent":
+            refusals.append("virtualization: the batch's virtualized is %r, the verdict's %r" % (bv, vv))
     st1 = None
     try:
         st1 = load(os.path.join(out, "stamp_end.json"))
@@ -287,11 +397,12 @@ def post(out, cell, sha, mode, verdict_path):
                                 / max(1, arms[a].get("ops", 1)), 4)
         if lc == "wb":
             bk["outcome"] = "pass" if gated else "FAIL"
-            for a in gated:
-                zero = min([(arms.get(a, {}).get("devices") or {}).get(x, {}).get("zero_windows", arms.get(a, {}).get("ops", 0))
-                            for x in leaf_names] or [arms.get(a, {}).get("ops", 0)])
-                bk["arms"][a] = {"windows_without_a_leaf_flush_request": zero}
-                if zero:
+            for a in gated:  # a window counts only with a flush-carrying request: a FUA-only write flushes nothing else
+                ops = arms.get(a, {}).get("ops", 0)
+                zero = min([(arms.get(a, {}).get("devices") or {}).get(x, {}).get("flush_carrying_zero_windows", ops)
+                            for x in leaf_names] or [ops])
+                bk["arms"][a] = {"windows_without_a_flush_carrying_request": zero}
+                if zero or not ops:
                     bk["outcome"] = "FAIL"
         merged["device_flushes"] = {"instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests "
                                     "and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",
@@ -303,7 +414,8 @@ def post(out, cell, sha, mode, verdict_path):
         merged["device_flushes"] = None
     merged["device_flushes_per_op"] = per_leaf if rep is not None else None
     merged["layer_device_flushes_per_op"] = per_layer if rep is not None else None
-    merged["floor_claim_from_counts"] = claim_from_counts(sj, per_leaf if rep is not None else None)
+    merged["floor_claim_from_counts"] = claim_from_counts(
+        sj, clean_bare((rep.get("windows") or {}).get("arms"), leaf_names) if rep is not None else None)
     g["blkflush_leaf_gate"] = bk
     merged["flush_gate"] = g
     void = g["outcome"] == "FAIL" or bk["outcome"] == "FAIL"
@@ -337,10 +449,21 @@ def fixture(out, cell, arch, leaf, sha, fstype, mod):
         v["cell"] = mod[5:]
     elif mod == "harness":
         v["harness_sha256"] = dict(v["harness_sha256"], **{"check.py": "0" * 64})
-    elif mod:
+    elif mod and mod not in ("bindfail", "pending"):
         raise SystemExit("batchgate fixture: unknown MOD %r" % mod)
     with open(out, "w") as f:
         json.dump(v, f, indent=1)
+    if mod == "pending":  # a pending record for THIS fixture, outside the bind step (fifth review L1)
+        with open(out, "rb") as f:
+            vs = hashlib.sha256(f.read()).hexdigest()
+        with open(bind_path(out)[1], "w") as f:
+            json.dump({"verdict_sha256": vs, "planted": True}, f)
+    if mod == "bindfail":  # a binding record for THIS fixture whose own binding check failed (fourth review L3)
+        with open(out, "rb") as f:
+            vs = hashlib.sha256(f.read()).hexdigest()
+        with open(bind_path(out)[0], "w") as f:
+            json.dump({"verdict_sha256": vs, "all_pass": False, "planted": True,
+                       "checks": [{"id": "bind:P_runsh_ok", "pass": False, "detail": "planted"}]}, f)
     return 0
 
 
@@ -358,6 +481,69 @@ BANKED = [
     ("37254957355-v3-ubuntu-24.04-ext4", "wt", None, 0),
     ("37254957355-v3-ubuntu-24.04-ext4loop", "wt", None, 0),
 ]
+
+
+def _post_batch(d, sha, mod):
+    """a minimal run.sh OUT for post(): a write-back NVMe ext4 batch, every op's window holding a bare flush."""
+    os.makedirs(os.path.join(d, "blkflush"))
+    sj = {"mutant_nosync": 0, "trace_clock": 0, "exe_sha256": sha, "fstype": "ext4", "mount_source": "/dev/nvme0n1",
+          "flush_path": [{"fstype": "ext4", "source": "/dev/nvme0n1", "loop_backing": "", "disk": "nvme0n1",
+                          "sys": "/sys/block/nvme0n1", "mount": "/d", "write_cache": "write back"}],
+          "leaf": {"kind": "drive", "driver": "nvme", "model": "M1", "multipath": []}, "leaf_write_cache": "write back",
+          "virtualization": {"virtualized": False, "evidence": []}, "n": 5,
+          "arms": {"append25": {}, "nosync25": {}}, "flush_control_arms": {"append25": {"gated": True}}}
+    win = {"events": 5, "zero_windows": 0, "flush_carrying_zero_windows": 0, "bare_flush_zero_windows": 0, "per_op": 1.0}
+    rep = {"proves": "planted", "devices": {}, "windows": {"arms": {"append25": {"ops": 5, "devices": {"nvme0n1": win}},
+                                                                    "nosync25": {"ops": 5, "devices": {}}}}}
+    if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
+        rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
+    if mod == "leafkind":
+        sj["leaf"]["kind"] = "scsi_debug"
+    with open(os.path.join(d, "summary.json"), "w") as f:
+        json.dump(sj, f)
+    with open(os.path.join(d, "stamp_end.json"), "w") as f:
+        json.dump({"diskstats_delta": {"nvme0n1": {"flushes": 50}}}, f)
+    with open(os.path.join(d, "blkflush", "report.json"), "w") as f:
+        json.dump(rep, f)
+    v = {"leaf_class": "wb", "F3": {"flush_path": [["/d", "ext4", "/dev/nvme0n1", "nvme0n1", "write back"]],
+                                    "leaf": dict(sj["leaf"], kind="drive"), "virtualization": {"virtualized": False}}}
+    if mod == "model":
+        v["F3"]["leaf"]["model"] = "M2"
+    raw = json.dumps(v).encode()
+    vp = d + ".verdict.json"
+    with open(vp, "wb") as f:
+        f.write(raw)
+    with open(os.path.join(d, "binary.txt"), "w") as f:
+        f.write("verdict_sha256=%s\n" % hashlib.sha256(raw).hexdigest())
+    return vp
+
+
+def post_selftest(chk):
+    import contextlib, io, tempfile
+    td = tempfile.mkdtemp(prefix="batchgate-post-")
+    sha = "cd" * 32
+    for name, mod, mode, want_rc, want in (("the control, bound", "", "bound", 0, None),
+                                           ("the control, smoke", "", "smoke", 0, None),
+                                           ("a FUA-only window in a gated arm", "fuaonly", "smoke", 3, "VOID"),
+                                           ("a scsi_debug leaf record", "leafkind", "smoke", 2, "leaf: the summary's leaf record"),
+                                           ("another drive model than the verdict's", "model", "bound", 2, "leaf drive:")):
+        d = os.path.join(td, mod or ("control-" + mode))
+        vp = _post_batch(d, sha, mod)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = post(d, "ext4", sha, mode, vp if mode == "bound" else None)
+        g = load(os.path.join(d, "gate.json"))
+        refs = g.get("refusals")
+        if want is None:
+            ok = rc == want_rc and refs == [] and g["flush_gate"]["blkflush_leaf_gate"]["outcome"] == "pass"
+        elif want == "VOID":
+            bk = g["flush_gate"]["blkflush_leaf_gate"]
+            ok = rc == 3 and refs == [] and bk["outcome"] == "FAIL" and \
+                bk["arms"]["append25"]["windows_without_a_flush_carrying_request"] == 1
+        else:
+            ok = rc == want_rc and bool(refs) and all(str(r).startswith(want) for r in refs)
+        chk("fifth review M3: post() on a planted batch, %s -> rc %d%s" % (name, want_rc, "" if want is None else
+                                                                              " (%s)" % want), ok, (rc, g))
+    shutil.rmtree(td)
 
 
 def self_test(data):
@@ -394,17 +580,46 @@ def self_test(data):
             chk("item 1 gate: %s (write-through, %r flushes) does not pass: labelled 'no volatile cache'" % (cell, got),
                 g["outcome"] == "not applicable: no volatile cache: no drive flush" and g["leaf_flushes_completed"] == got, g)
         chk("item 1 red at base: %s's F3 batch was rc 0 (no gate)" % cell, base_rc == "0", base_rc)
-    # item 2: the claim the counts allow (run 37476867864: btrfs clean 0.00, ext4/xfs clean 1.00 on write-back)
-    wb = {"leaf_write_cache": "write back", "leaf": {"kind": "drive"}}
-    chk("item 2 claim: ext4, clean 1.00 per op -> a bare flush plus the delta",
-        claim_from_counts(dict(wb, fstype="ext4"), {"clean": 1.0}).startswith("clean fsync (a bare flush"))
-    chk("item 2 claim: btrfs, clean 0.00 per op -> no bare-flush baseline",
-        claim_from_counts(dict(wb, fstype="btrfs"), {"clean": 0.0}).startswith("no bare-flush baseline"))
-    chk("item 2 claim: xfs with clean not run -> no bare-flush baseline",
-        claim_from_counts(dict(wb, fstype="xfs"), {}).startswith("no bare-flush baseline"))
+    # item 2: the claim the counts allow (run 37476867864: btrfs clean 0.00, ext4/xfs clean 1.00 on write-back); the
+    # clean arm is read per window (fourth review L9) and the VM qualifier rides on both classes (L2)
+    bm = {"virtualized": False}
+    wb = {"leaf_write_cache": "write back", "leaf": {"kind": "drive"}, "virtualization": bm}
+    wt = {"leaf_write_cache": "write through", "leaf": {"kind": "drive"}, "virtualization": bm, "fstype": "ext4"}
+    every = {"ops": 200, "windows_with_bare_flush": 200}
+    chk("item 2 claim: ext4, a bare flush in 200 of 200 clean windows -> a bare flush plus the delta",
+        claim_from_counts(dict(wb, fstype="ext4"), every).startswith("clean fsync (a bare flush"))
+    chk("item 2 claim: btrfs, a bare flush in 0 of 200 clean windows -> no bare-flush baseline",
+        claim_from_counts(dict(wb, fstype="btrfs"), {"ops": 200, "windows_with_bare_flush": 0}).startswith("no bare-flush baseline"))
+    chk("item 2 claim: btrfs even with every window -> no bare-flush baseline (ext4/xfs only)",
+        claim_from_counts(dict(wb, fstype="btrfs"), every).startswith("no bare-flush baseline"))
     chk("item 2 claim: write-through -> no drive flush",
-        claim_from_counts({"leaf_write_cache": "write through", "leaf": {"kind": "drive"}, "fstype": "ext4"},
-                          {"clean": 0.0}).startswith("no drive flush"))
+        claim_from_counts(wt, {"ops": 200, "windows_with_bare_flush": 0}).startswith("no drive flush"))
+    c = claim_from_counts(dict(wb, fstype="xfs"), None)
+    chk("fourth review L1: clean not run -> 'did not run', never 'issued no flush'",
+        c.startswith("no bare-flush baseline") and "did not run" in c and "issued no" not in c, c)
+    chk("fourth review L9: 190 of 200 windows is a bare-flush baseline, 189 is not (95%)",
+        claim_from_counts(dict(wb, fstype="ext4"), {"ops": 200, "windows_with_bare_flush": 190}).startswith("clean fsync")
+        and claim_from_counts(dict(wb, fstype="ext4"), {"ops": 200, "windows_with_bare_flush": 189}).startswith("no bare"))
+    two = {"clean": {"ops": 200, "devices": {"nvme0n1": {"events": 200, "by_kind": {"flush": 200},
+                                                         "bare_flush_zero_windows": 20}}}}
+    cb = clean_bare(two, ["nvme0n1"])
+    chk("fourth review L9: 200 bare flushes packed into 180 of 200 windows are 180 windows, not 1.00 per op",
+        cb == {"ops": 200, "windows_with_bare_flush": 180} and
+        claim_from_counts(dict(wb, fstype="ext4"), cb).startswith("no bare-flush baseline"), cb)
+    chk("fourth review L9: clean_bare with no clean arm -> None", clean_bare({"append25": {"ops": 5}}, ["sda"]) is None)
+    for vz, want in ((True, "; a virtual drive: reach to media unknown"), (None, "; virtualization not ruled out: reach")):
+        cv = claim_from_counts(dict(wb, fstype="ext4", virtualization={"virtualized": vz}), every)
+        chk("fourth review L2: write-back, virtualized %r -> the claim says '%s'" % (vz, want), want in cv, cv)
+        cw = claim_from_counts(dict(wt, virtualization={"virtualized": vz}), None)
+        chk("fourth review L2: write-through, virtualized %r -> the claim carries the qualifier" % vz,
+            cw.startswith("no drive flush") and "the host's caching is unknown" in cw, cw)
+    chk("fourth review L2: bare metal (virtualized false) -> no qualifier on either class",
+        "virtual" not in claim_from_counts(dict(wb, fstype="ext4"), every) and "virtual" not in claim_from_counts(wt, None))
+    # the leaf class: only a drive or brd leaf has one (fourth review M2: a scsi_debug leaf is fire-check only)
+    chk("leaf class: a scsi_debug leaf has none", leaf_class(dict(wb, leaf={"kind": "scsi_debug"})) is None)
+    chk("leaf class: a drive leaf by its write cache; brd as brd; a pre-review-2 summary (no leaf) by its write cache",
+        leaf_class(wb) == "wb" and leaf_class(dict(wb, leaf={"kind": "brd"})) == "brd"
+        and leaf_class({"leaf_write_cache": "write through"}) == "wt")
     # item 4: the cell layout, explicit (the review's red fixture: xfs on /dev/nvme0n1, one layer, must pass)
     one = [{"fstype": "xfs", "source": "/dev/nvme0n1", "loop_backing": ""}]
     chk("item 4: xfs cell, /dev/nvme0n1, 1 layer -> layout ok", v3cell.layout_problems("xfs", "xfs", "/dev/nvme0n1", one) == [])
@@ -456,6 +671,53 @@ def self_test(data):
         b = verdict_problems(v, cell, sha, arch, "xfs")
         chk("item 8: refused: %s, by its own rule ('%s'), and by no other" % (name, prefix),
             [x for x in b if x.startswith(prefix)] and all(x.startswith(prefix) for x in b), b)
+    # fourth review L3: the fire-check's own binding record must have passed for THIS verdict (or be pending for it)
+    import tempfile
+    td = tempfile.mkdtemp(prefix="batchgate-bind-")
+    vp = os.path.join(td, "verdict.json")
+    with open(vp, "w") as f:
+        f.write("{}")
+    vs = hashlib.sha256(b"{}").hexdigest()
+    bj, bp = bind_path(vp)
+    chk("L3 bind: the record names are verdict.bind.json and verdict.bind.pending",
+        (os.path.basename(bj), os.path.basename(bp)) == ("verdict.bind.json", "verdict.bind.pending"), (bj, bp))
+    chk("L3 bind: no record -> refused ('bind: no binding record')",
+        [x for x in bind_problems(vp, vs) if x.startswith("bind: no binding record")], bind_problems(vp, vs))
+    with open(bp, "w") as f:
+        json.dump({"verdict_sha256": vs}, f)
+    chk("L3 bind: pending for this verdict, from the bind step (its sha named) -> binds",
+        bind_problems(vp, vs, pending_sha=vs) == [], bind_problems(vp, vs, pending_sha=vs))
+    b = bind_problems(vp, vs, pending_sha="")
+    chk("fifth review L1: pending for this verdict outside the bind step -> refused ('bind: pending')",
+        bool(b) and all(x.startswith("bind: pending") for x in b), b)
+    chk("L3 bind: pending for another verdict -> refused", bind_problems(vp, "00" * 32, pending_sha="00" * 32) != [])
+    ok_rec = {"verdict_sha256": vs, "all_pass": True, "checks": [{"id": "bind:P_runsh_ok", "pass": True}]}
+    for name, rec, prefix in (("passed for this verdict", ok_rec, None),
+                              ("failed", dict(ok_rec, all_pass=False, checks=[{"id": "bind:P_runsh_ok", "pass": False}]),
+                               "bind: the fire-check's own binding check failed"),
+                              ("all_pass true over a failing check",
+                               dict(ok_rec, checks=[{"id": "bind:P_runsh_ok", "pass": False}]),
+                               "bind: the fire-check's own binding check failed"),
+                              ("for another verdict", dict(ok_rec, verdict_sha256="00" * 32), "bind: the binding record")):
+        with open(bj, "w") as f:
+            json.dump(rec, f)
+        b = bind_problems(vp, vs, pending_sha=vs)  # the pending record is still there: a result, once written, decides
+        chk("L3 bind: a record that %s -> %s" % (name, "binds" if prefix is None else "refused by '%s'" % prefix),
+            b == [] if prefix is None else bool(b) and all(x.startswith(prefix) for x in b), b)
+    shutil.rmtree(td)
+    # fifth review L2: a harness file the verdict names that this tree lacks (or the reverse) is a mismatch
+    v = _copy.deepcopy(good)
+    v["harness_sha256"]["gone.py"] = "0" * 64
+    b = verdict_problems(v, cell, sha, arch, "xfs")
+    chk("fifth review L2: a harness file only in the verdict -> refused by the harness rule",
+        bool(b) and all(x.startswith("harness:") for x in b) and "gone.py" in b[0], b)
+    v = _copy.deepcopy(good)
+    v["harness_sha256"].pop("run.sh")
+    b = verdict_problems(v, cell, sha, arch, "xfs")
+    chk("fifth review L2: a harness file only here -> refused by the harness rule",
+        bool(b) and all(x.startswith("harness:") for x in b), b)
+    # fifth review M3: post() itself on planted batches (a write-back NVMe ext4 batch of append25 + nosync25)
+    post_selftest(chk)
     # item 17: the T3 rule on planted states
     chk("item 17: no cpufreq refuses", t3_problems({"governors": {"cpu0": None}, "clocksource": "tsc"}) != [])
     chk("item 17: powersave refuses", t3_problems({"governors": {"cpu0": "performance", "cpu1": "powersave"}, "clocksource": "tsc"}) != [])

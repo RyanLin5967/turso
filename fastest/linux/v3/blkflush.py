@@ -27,7 +27,11 @@ requests, so it reads 0 too. On an NVMe namespace with native multipath the requ
 too, so a per-window count is an upper bound on the op's own flushes and a zero is exact.
 
 Kinds, from the rwbs field (blk_fill_rwbs): "flush" = a REQ_OP_FLUSH request ("FF" or "F"); "fua" = a write with
-REQ_FUA ("WF..."); "preflush" = a write still carrying REQ_PREFLUSH ("FW..."); "preflush+fua"; "other".
+REQ_FUA ("WF..."); "preflush" = a write still carrying REQ_PREFLUSH ("FW..."); "preflush+fua"; "other". Per arm and
+device the report gives zero_windows (no F request at all), flush_carrying_zero_windows (no flush, preflush or
+preflush+fua request: a FUA-only write makes only itself durable) and bare_flush_zero_windows (no REQ_OP_FLUSH), so a
+window counts once whatever else it holds; and ambiguous_by_device, the events that may belong to the arm's windows
+but cannot be placed in exactly one (every window under 1 us is one such).
 Timestamps: the trace prints mono_raw in microseconds (rounded), so an event's true time is +-500 ns of the printed
 value; an event whose interval is not inside exactly one window is "ambiguous", counted, never attributed.
 """
@@ -307,6 +311,9 @@ def kinds():
     return {"flush": 0, "fua": 0, "preflush": 0, "preflush+fua": 0, "other": 0}
 
 
+CARRYING = ("flush", "preflush", "preflush+fua")  # the kinds that flush the device's cache (a FUA-only write does not)
+
+
 def report_stats_problems(stats):
     probs = []
     if not stats:
@@ -318,6 +325,52 @@ def report_stats_problems(stats):
             elif st.get(k):
                 probs.append("events lost: %s %s = %s" % (c, k, st.get(k)))
     return probs
+
+
+def per_arm(events, w):
+    """-> (per-arm records, ambiguous events, outside events) for windows w (read_windows) and parsed events."""
+    inside, amb, outside = attribute(events, w)
+    arms = {}
+    for k, (t0, t1, a, i) in enumerate(w):
+        r = arms.setdefault(a, {"ops": 0, "devices": {}, "ambiguous": 0, "ambiguous_by_device": {},
+                                "windows_under_1us": 0})
+        r["ops"] += 1
+        r["windows_under_1us"] += (t1 - t0) < 1000  # too short to hold an attributed event (trace prints us)
+    # an event that cannot be placed in exactly one window counts against EVERY arm it may belong to, per device
+    # (fourth review L7: a request in a sub-us window is ambiguous, never attributed, so a no-flush arm's budget on
+    # a shared drive must count these too)
+    for e, poss in amb:
+        for a in sorted(set(w[j][2] for j in poss)):
+            arms[a]["ambiguous"] += 1
+            arms[a]["ambiguous_by_device"][e[2]] = arms[a]["ambiguous_by_device"].get(e[2], 0) + 1
+    for k, es in inside.items():
+        a = w[k][2]
+        for e in es:
+            d = arms[a]["devices"].setdefault(e[2], {"events": 0, "by_kind": kinds(), "windows_hit": set(), "max": 0,
+                                                     "carrying_hit": set(), "bare_hit": set()})
+            d["events"] += 1
+            d["by_kind"][e[4]] += 1
+            d["windows_hit"].add(k)
+            if e[4] in CARRYING:
+                d["carrying_hit"].add(k)
+            if e[4] == "flush":
+                d["bare_hit"].add(k)
+    for a, r in arms.items():
+        for name, d in r["devices"].items():
+            per = {}
+            for k in d["windows_hit"]:
+                per[k] = sum(1 for e in inside[k] if e[2] == name)
+            d["max_in_window"] = max(per.values()) if per else 0
+            d["zero_windows"] = r["ops"] - len(d["windows_hit"])
+            # windows without a request that flushes the cache (flush, preflush, preflush+fua): a FUA-only write
+            # makes only itself durable (fourth review L9); and without a bare REQ_OP_FLUSH
+            d["flush_carrying_zero_windows"] = r["ops"] - len(d["carrying_hit"])
+            d["bare_flush_zero_windows"] = r["ops"] - len(d["bare_hit"])
+            d["per_op"] = round(d["events"] / r["ops"], 4)
+            d["flush_per_op"] = round(d["by_kind"]["flush"] / r["ops"], 4)
+            d["fua_per_op"] = round(d["by_kind"]["fua"] / r["ops"], 4)
+            del d["windows_hit"], d["max"], d["carrying_hit"], d["bare_hit"]
+    return arms, amb, outside
 
 
 def report(out, device=None, windows=None):
@@ -353,33 +406,7 @@ def report(out, device=None, windows=None):
            "devices": dev}
     if windows:
         w = read_windows(windows)
-        inside, amb, outside = attribute(events, w)
-        arms = {}
-        for k, (t0, t1, a, i) in enumerate(w):
-            r = arms.setdefault(a, {"ops": 0, "devices": {}, "ambiguous": 0, "windows_under_1us": 0})
-            r["ops"] += 1
-            r["windows_under_1us"] += (t1 - t0) < 1000  # too short to hold an attributed event (trace prints us)
-        for e, poss in amb:
-            for a in sorted(set(w[j][2] for j in poss)):
-                arms[a]["ambiguous"] += 1
-        for k, es in inside.items():
-            a = w[k][2]
-            for e in es:
-                d = arms[a]["devices"].setdefault(e[2], {"events": 0, "by_kind": kinds(), "windows_hit": set(), "max": 0})
-                d["events"] += 1
-                d["by_kind"][e[4]] += 1
-                d["windows_hit"].add(k)
-        for a, r in arms.items():
-            for name, d in r["devices"].items():
-                per = {}
-                for k in d["windows_hit"]:
-                    per[k] = sum(1 for e in inside[k] if e[2] == name)
-                d["max_in_window"] = max(per.values()) if per else 0
-                d["zero_windows"] = r["ops"] - len(d["windows_hit"])
-                d["per_op"] = round(d["events"] / r["ops"], 4)
-                d["flush_per_op"] = round(d["by_kind"]["flush"] / r["ops"], 4)
-                d["fua_per_op"] = round(d["by_kind"]["fua"] / r["ops"], 4)
-                del d["windows_hit"], d["max"]
+        arms, amb, outside = per_arm(events, w)
         rep["windows"] = {"source": windows, "n_windows": len(w), "arms": arms, "ambiguous": len(amb),
                           "outside": len(outside),
                           "ambiguous_sample": [list(e[:5]) for e, _ in amb[:5]],
@@ -457,6 +484,27 @@ def self_test():
     chk("attribution: w2 holds 2 on loop0 (FWS preflush, FF flush)",
         sorted(e[4] for e in inside.get(2, [])) == ["flush", "preflush"], inside.get(2))
     chk("attribution: 1 ambiguous, 1 outside", len(amb) == 1 and len(outside) == 1, (amb, outside))
+    # per arm (fourth review L7, L9): window kinds, written by hand from the plant above plus one preflush write on
+    # nvme0n1 inside w2 (so nvme0n1 has a FUA-only window w0 and a preflush-only window w2)
+    lines2 = lines + [ev("jbd2/nvme0n1-8", 12, 1, "0.002030", "259:0", "FWS")]
+    events2, _ = parse_trace(HDR % (len(lines2), len(lines2)) + "\n".join(lines2) + "\n", devs)
+    arms, _, _ = per_arm(events2, windows)
+    a25 = arms.get("append25", {}).get("devices", {})
+    lp, nv = a25.get("loop0", {}), a25.get("nvme0n1", {})
+    chk("per arm: append25 on loop0 has a flush-carrying and a bare flush request in both its windows",
+        lp.get("zero_windows") == 0 and lp.get("flush_carrying_zero_windows") == 0 and lp.get("bare_flush_zero_windows") == 0, lp)
+    chk("per arm: append25 on nvme0n1 (w0 a FUA-only write, w2 a preflush write): a request in both windows, a "
+        "flush-carrying one in 1 (w2), a bare flush in none",
+        nv.get("zero_windows") == 0 and nv.get("flush_carrying_zero_windows") == 1 and nv.get("bare_flush_zero_windows") == 2, nv)
+    chk("per arm: the edge event counts as ambiguous for both arms it may belong to, on loop0",
+        arms.get("append25", {}).get("ambiguous_by_device") == {"loop0": 1}
+        and arms.get("nosync25", {}).get("ambiguous_by_device") == {"loop0": 1}, (arms.get("append25"), arms.get("nosync25")))
+    sub = [(5000000, 5000800, "nosync25", 1)]
+    sev, _ = parse_trace(HDR % (1, 1) + ev("jbd2/sda1-8", 7, 0, "0.005000", "8:0", "FF") + "\n", devs)
+    sarms, _, _ = per_arm(sev, sub)
+    chk("per arm: a flush inside an 800 ns window is never attributed and counts as ambiguous for its arm on sda",
+        sarms["nosync25"]["windows_under_1us"] == 1 and sarms["nosync25"]["devices"] == {}
+        and sarms["nosync25"]["ambiguous_by_device"] == {"sda": 1}, sarms)
     bad = text.replace("entries-written: 6/6", "entries-written: 6/9")
     chk("refuses a header that lost events (6/9)", any("lost" in p for p in parse_trace(bad, devs)[1]), "")
     chk("refuses a [LOST n EVENTS] line",
