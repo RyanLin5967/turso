@@ -111,8 +111,14 @@ def block_record(out, fs, plp="no"):
         rec["a14_plants_rederived"] = fired
         if not ok_again or not rec["a14_plants"].get("all_fired"):
             rec["why"].append(f"A16 plants: not every plant was decided as planted (re-derived {fired})")
+    # V3L at every block boundary (gate-6 review 9): b0 before block 1, bK after block K. The plan names the blocks.
+    plan = os.path.join(fsdir, "plan.tsv")
+    ks = sorted({int(l.split("\t")[6]) for l in open(plan).read().splitlines() if len(l.split("\t")) > 6}) \
+        if os.path.exists(plan) else []
+    nb = max(ks) if ks else 1  # no plan (the block failed before planning): the first block's pair is still expected
+    bounds = [f"b{k}" for k in range(0, nb + 1)]
     # V3L's plants likewise, on every measurement that exists
-    for when in ("before", "after"):
+    for when in bounds:
         j = os.path.join(fsdir, f"v3l-{when}", "v3l.json")
         if not os.path.exists(j):
             continue
@@ -131,11 +137,21 @@ def block_record(out, fs, plp="no"):
                                   f"re-derived {rec['v3l_plants'][when]}")
     b, a = rec["v3"]["before"].get("frame_arm_p50_us"), rec["v3"]["after"].get("frame_arm_p50_us")
     rec["v3_frame_arm_drift_us"] = round(a - b, 2) if a is not None and b is not None else None
-    rec["v3l"] = v3l.block(os.path.join(fsdir, "v3l-before", "v3l.json"), os.path.join(fsdir, "v3l-after", "v3l.json"))
-    if rec["v3l"]["verdict"] != "VALID":
-        reasons = [x for k in ("before", "after") for x in (rec["v3l"][k].get("void_reasons") or
-                                                            ([rec["v3l"][k]["why"]] if "why" in rec["v3l"][k] else []))]
-        rec["why"].append(f"V3L {rec['v3l']['verdict']}: " + "; ".join(reasons))
+    pairs = []
+    for k in range(1, nb + 1):
+        pr = v3l.block(os.path.join(fsdir, f"v3l-b{k - 1}", "v3l.json"), os.path.join(fsdir, f"v3l-b{k}", "v3l.json"))
+        pr["k"] = k
+        pairs.append(pr)
+        if pr["verdict"] != "VALID":
+            reasons = [x for side in ("before", "after") for x in (pr[side].get("void_reasons") or
+                                                                    ([pr[side]["why"]] if "why" in pr[side] else []))]
+            rec["why"].append(f"V3L {pr['verdict']} (block {k}): " + "; ".join(reasons))
+    verdicts = [pr["verdict"] for pr in pairs]
+    agg = "VOID" if "VOID" in verdicts else "MISSING" if ("MISSING" in verdicts or not pairs) else "VALID"
+    rec["v3l"] = {"verdict": agg, "blocks": pairs, "before": pairs[0]["before"] if pairs else None,
+                  "after": pairs[-1]["after"] if pairs else None,
+                  "published": pairs[0].get("published") if pairs else None}
+    rec["v3l_pooled_by_block"] = {pr["k"]: (pr.get("published") or {}).get("pooled_fsync_p50_us") for pr in pairs}
     rec["ok"] = not rec["why"]
     return rec
 
@@ -184,8 +200,10 @@ def summarize(out, sha, dry, manifest):
                 if result and "VERDICT PASS" not in text:
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
+        st = os.path.join(d, "settle.txt") if d else None
+        settle = open(st).read().strip() if st and os.path.exists(st) else None
         runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
-                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)"})
+                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)", "settle": settle})
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
     fl = os.path.join(out, "fslist.txt")
@@ -195,6 +213,12 @@ def summarize(out, sha, dry, manifest):
     if os.path.exists(mt0):
         plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
     blocks = [block_record(out, fs, plp) for fs in fslist]
+    # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
+    pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
+    for r in runs:
+        k = r["cell"].rsplit("-r", 1)[-1]
+        r["block_k"] = int(k) if k.isdigit() else None
+        r["v3l_pooled_fsync_p50_us"] = pooled.get(r["fs"], {}).get(r["block_k"])
     failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
@@ -269,17 +293,17 @@ def self_test():
              plants=True, plants_fired=True, plp="no", lie=False, cell="ok"):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
-        crow = {"ok": "xfs\tours-full-c1\tours\t1\t1\t0\tVALID", "na": "xfs\tours-full-c1\tours\t1\t1\t4\tN/A",
-                "compfail": "xfs\tours-full-c1\tdolt\t1\t1\t0\tVALID"}[cell]
+        crow = {"ok": "xfs\tours-full-c1-r1\tours\t1\t1\t0\tVALID", "na": "xfs\tours-full-c1-r1\tours\t1\t1\t4\tN/A",
+                "compfail": "xfs\tours-full-c1-r1\tdolt\t1\t1\t0\tVALID"}[cell]
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + crow + "\n")
         w(f"{out}/fslist.txt", fslist + "\n")
         w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
         f = f"{out}/fs-xfs"
-        w(f"{f}/plan.tsv", "ours-full-c1\t" + ("dolt" if cell == "compfail" else "ours") + "\t1\t200\t1\tfull\n")
-        w(f"{f}/cells/ours-full-c1/a1/result/summary.json", "{}")
-        w(f"{f}/cells/ours-full-c1/a1/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
+        w(f"{f}/plan.tsv", "ours-full-c1-r1\t" + ("dolt" if cell == "compfail" else "ours") + "\t1\t200\t1\tfull\t1\n")
+        w(f"{f}/cells/ours-full-c1-r1/a1/result/summary.json", "{}")
+        w(f"{f}/cells/ours-full-c1-r1/a1/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
         if cell == "compfail":
-            w(f"{f}/cells/ours-full-c1/a1/result/functional.txt", "FAIL F1: something\nVERDICT FAIL\n")
+            w(f"{f}/cells/ours-full-c1-r1/a1/result/functional.txt", "FAIL F1: something\nVERDICT FAIL\n")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
         for when in ("before", "after"):
@@ -290,10 +314,10 @@ def self_test():
         if plants:
             res, ok = blockgate.plants(json.loads(v3sum(0, block)), True, 0, plp)
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
-        w(f"{f}/v3l-before/v3l.json", v3lj(before_v3l, lie))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie))
         if after_v3l:
-            w(f"{f}/v3l-after/v3l.json", v3lj(after_v3l))
-        for when in ("before", "after"):  # what t3run's v3l() writes after each measurement
+            w(f"{f}/v3l-b1/v3l.json", v3lj(after_v3l))
+        for when in ("b0", "b1"):  # what t3run's v3l() writes after each measurement
             if os.path.exists(f"{f}/v3l-{when}/v3l.json"):
                 res, ok = v3l.plants(json.load(open(f"{f}/v3l-{when}/v3l.json")))
                 w(f"{f}/v3l-{when}-plants.json", json.dumps({"plants": res, "all_fired": ok}, default=str))
@@ -328,7 +352,7 @@ def self_test():
             s, ok = summarize(make(root, **kw), "sha", "1", "m")
             good = ok == want_ok
             if "reads VOID" in name:
-                good = good and s["failed_blocks"][0].startswith("xfs: V3L VOID: planted")
+                good = good and s["failed_blocks"][0].startswith("xfs: V3L VOID (block 1): planted")
             if "M2" in name:
                 good = good and "planted refusal text" in s["failed_blocks"][0]
             cases.append((name, good, s["failed_blocks"]))

@@ -295,13 +295,15 @@ v3batch() { # v3batch before|after DIR
   return 0
 }
 
-# V3L before or after a block (review 2 item 6; PREREG line 180): VOID or refused fails the stage.
-v3l() { # v3l before|after MNT
+# V3L at a block boundary (review 2 item 6; PREREG line 180; gate-6 review 9: per section-7 block, not per
+# filesystem): b0 before block 1, then bK after block K, which is also before block K+1 (nothing runs between).
+# VOID or refused fails the stage.
+v3l() { # v3l bK MNT
   local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc lie=""
   local -a env=()
   [ $DRY = 0 ] && env+=(V3L_REAL=1)
-  [ "$PLANT_NOW:$when" = v3l-fsync-half:before ] && env+=(V3L_PLANT=fsync2)
-  if [ "$PLANT_NOW:$when" = v3l-cache-lie:before ]; then
+  [ "$PLANT_NOW:$when" = v3l-fsync-half:b0 ] && env+=(V3L_PLANT=fsync2)
+  if [ "$PLANT_NOW:$when" = v3l-cache-lie:b0 ]; then
     # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
     # (no fsync reaches the drive), or a write-through drive whose kernel queue claims write back
     local lo disk wc
@@ -335,6 +337,7 @@ v3l() { # v3l before|after MNT
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
 FS_NOW="" V3CELL="" PLANT_NOW=""
+RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
   mkdir -p "$o"
@@ -367,17 +370,19 @@ fs_block() {
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
   v3batch before "$mnt/v3b" || return 1
-  v3l before "$mnt" || return 1
+  v3l b0 "$mnt" || return 1
   # flush counter fire-check for the competitor cells on this filesystem (run_system.sh requires its verdict)
   sudo sysctl -w kernel.yama.ptrace_scope=0 > /dev/null
   timeout 900 bash "$L/competitors/firecheck_strace.sh" "$o/strace-firecheck" "$mnt/strace-fc.noindex" \
     > "$o/strace-firecheck.txt" 2>&1 || { echo "strace fire-check failed on $fs"; return 1; }
   python3 -B "$L/t3/cells.py" plan "$MAN" "$fs" "$SEED" > "$o/plan.tsv" || return 1
-  local cell system clients ops runs class
-  while IFS=$'\t' read -r cell system clients ops runs class; do
+  local cell system clients ops runs class blk cur=1
+  # fd 3, so nothing a cell runs can read the plan from stdin
+  while IFS=$'\t' read -r cell system clients ops runs class blk <&3; do
+    if [ "$blk" != "$cur" ]; then v3l "b$cur" "$mnt" || return 1; cur=$blk; fi
     run_cell "$fs" "$mnt" "$o" "$cell" "$system" "$clients" "$ops" "$class"
-  done < "$o/plan.tsv"
-  v3l after "$mnt" || return 1
+  done 3< "$o/plan.tsv"
+  v3l "b$cur" "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
   return 0
 }
@@ -399,6 +404,28 @@ block_cleanup() {
   return 0
 }
 
+# After a run's teardown, before the next run starts (gate-6 review 11): sync the test filesystem, then wait until the
+# block's leaf drive has no request in flight and the page cache holds under 1 MiB dirty, for 2 s running (10 polls of
+# 0.2 s), at most 60 s. The settle time and whether it went quiet are recorded per run (settle.txt), never hidden.
+settle() { # settle MNT RUNDIR
+  local mnt=$1 d=$2 t0 q=0 n=0 inflight dirty leaf
+  leaf=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' \
+    "$OUT/fs-$FS_NOW/v3-before/summary.json" 2>/dev/null)
+  sync -f "$mnt" 2>/dev/null || sync
+  t0=$(date +%s%N)
+  while [ $n -lt 300 ]; do
+    inflight=$(awk '{print $9}' "/sys/block/$leaf/stat" 2>/dev/null)
+    dirty=$(awk '/^Dirty:/ {print $2}' /proc/meminfo)
+    if [ "${inflight:-1}" = 0 ] && [ "${dirty:-999999}" -lt 1024 ]; then q=$((q + 1)); else q=0; fi
+    [ $q -ge 10 ] && break
+    sleep 0.2
+    n=$((n + 1))
+  done
+  printf 'leaf=%s settle_s=%s quiet=%s inflight=%s dirty_kb=%s\n' "$leaf" \
+    "$(awk -v a="$t0" -v b="$(date +%s%N)" 'BEGIN { printf "%.2f", (b - a) / 1e9 }')" \
+    "$([ $q -ge 10 ] && echo yes || echo no)" "$inflight" "$dirty" > "$d/settle.txt"
+}
+
 # One cell run (the plan already holds one row per run): the sampler runs around the adapter, and the
 # void decision is made from its record BEFORE the cell's results are read. A VOID run is replaced once,
 # at most twice per cell (amendment 8); void runs are kept.
@@ -414,8 +441,9 @@ run_cell() {
     export FASTEST_CELL=$id
     case $system in
       ours)
+        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
         timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
-          --ops "$ops" --warmup 20 --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
+          --ops-total "$ops" --warmup "prereg:$RUN_CAP_S" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|pg18-defaults|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
@@ -437,6 +465,7 @@ run_cell() {
       break
     fi
     rm -rf "$mnt/work-$id"
+    settle "$mnt" "$d"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fs" "$cell" "$system" "$clients" "$attempt" "$rc" \
       "$([ $v = 0 ] && echo VALID || echo VOID)" >> "$OUT/cells.tsv"
     [ $v = 3 ] || break
