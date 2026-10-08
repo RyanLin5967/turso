@@ -1,0 +1,225 @@
+name: fastest-profile
+# Lane fastest-linux: profile the engine's branch lifecycle (create, connect_named, first write,
+# delete) on every push, ubuntu x86_64 and arm64. Release build with debug symbols; per op:
+# perf stat (instructions, cycles, context switches, page faults), strace syscall counts, a perf
+# record flame graph of the create window, callgrind instructions. Gates (budget.json):
+#   - D2: create flushes per op in [1, 1.01] at C=1, in [1/C, 1.01] at C>1, all on the branch log;
+#   - async: 0 flushes on the create path (NOT-RUN while the engine has no async class);
+#   - instructions per create (callgrind) <= 1.05 x the previous green run's sha, rebuilt and run on
+#     the same runner in the same job (its stored baseline artifact is the fallback);
+#   - no create-window syscall above the base's + 0.05 per op;
+#   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z), checked in its own job "absolute
+#     syscall budget" (red at 675adbfb3, 10 per create) so the profile job's own status is the regression verdict;
+#     the BASELINE advances on a regression-green run (every gate but this one passes, both regression gates
+#     evaluated), and the base is the newest run that uploaded a baseline, not the newest green one.
+# Smoke sizes; nothing here is a credited latency.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "compare against this sha instead of the previous green run's"
+        default: ""
+      rebaseline:
+        description: "true: upload this run's head as the baseline even if a gate fails"
+        default: "false"
+      plant:
+        description: "fire-check: FASTEST_PROFILE_PLANT for the HEAD side only (e.g. ir:3000,syscall:1); the gates must FAIL"
+        default: ""
+  push:
+    branches: [fastest-branching]
+
+concurrency:
+  # a planted fire-check run has its own group, so it never cancels (or is cancelled by) a real run
+  group: fastest-profile-${{ github.ref }}-${{ inputs.plant || 'real' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_PROFILE_RELEASE_DEBUG: "true"
+  CARGO_PROFILE_RELEASE_STRIP: "none"
+
+jobs:
+  profile:
+    name: profile (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      RAW: ${{ github.workspace }}/profile-raw
+      MNT: /mnt/fastest-ext4
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rust toolchain (rust-toolchain.toml pins it)
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fastest-profile-v1
+          shared-key: ${{ matrix.runner }}
+          cache-on-failure: true
+      - name: Tools (strace, valgrind, perf, fio, FlameGraph)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q strace valgrind fio linux-tools-common
+          sudo apt-get install -y -q "linux-tools-$(uname -r)" || sudo apt-get install -y -q linux-tools-generic
+          if ! perf --version >/dev/null 2>&1; then
+            p=$(ls -d /usr/lib/linux-tools-*/perf /usr/lib/linux-tools/*/perf 2>/dev/null | tail -1)
+            [ -n "$p" ] && sudo ln -sf "$p" /usr/local/bin/perf
+          fi
+          perf --version
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 kernel.perf_event_max_sample_rate=100000
+          git clone -q https://github.com/brendangregg/FlameGraph "$RUNNER_TEMP/FlameGraph"
+          mkdir -p "$RAW"
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
+            echo "flamegraph_sha=$(git -C "$RUNNER_TEMP/FlameGraph" rev-parse HEAD)";
+            perf --version; valgrind --version; strace -V | head -1; rustc -V; } | tee "$RAW/run-info.txt"
+      - name: Find the base (the newest regression-green run of this workflow on this branch, this runner)
+        id: base
+        run: |
+          base="${{ inputs.base_sha }}"
+          prev=""
+          if [ -z "$base" ]; then
+            # The newest unexpired baseline artifact for this runner from fastest-branching: only a regression-green,
+            # unplanted run (or an explicit rebaseline) uploads one. Nothing found prints nothing (run 37242461472
+            # read "null null" and tried to check out "null").
+            row=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="profile-baseline-${{ matrix.runner }}" \
+                    -f per_page=100 -q '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == "fastest-branching")]
+                      | sort_by(.created_at) | reverse
+                      | if length == 0 then "" else (.[0] | "\(.workflow_run.id) \(.workflow_run.head_sha)") end' || true)
+            if [ -n "$row" ]; then prev=${row%% *}; base=${row#* }; fi
+          fi
+          mkdir -p prev
+          if [ -n "$prev" ]; then
+            gh run download "$prev" -R "$GITHUB_REPOSITORY" -n "profile-baseline-${{ matrix.runner }}" -D prev || true
+          fi
+          echo "base=$base prev_run=$prev" | tee "$RAW/base.txt"
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+      - name: Build head (release, debug symbols)
+        run: |
+          set -o pipefail
+          mkdir -p dist/head
+          timeout 6000 cargo build --release --locked -p turso_core --example fastest_profile 2> dist/head/build.stderr \
+            || { tail -50 dist/head/build.stderr; exit 1; }
+          cp target/release/examples/fastest_profile dist/head/
+          sha256sum dist/head/fastest_profile | tee -a "$RAW/run-info.txt"
+      - name: Build base with head's driver (same runner, same flags)
+        if: steps.base.outputs.sha != ''
+        run: |
+          set -o pipefail
+          mkdir -p dist/base
+          if git worktree add -q --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}" 2> dist/base/build.stderr &&
+             mkdir -p "$RUNNER_TEMP/base/core/examples/fastest_profile" &&
+             cp core/examples/fastest_profile/main.rs "$RUNNER_TEMP/base/core/examples/fastest_profile/main.rs" &&
+             (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-base" timeout 6000 \
+                cargo build --release --locked -p turso_core --example fastest_profile) 2>> dist/base/build.stderr; then
+            cp target-base/release/examples/fastest_profile dist/base/
+            sha256sum dist/base/fastest_profile | tee -a "$RAW/run-info.txt"
+          else
+            echo "base build FAILED (analysis falls back to the stored baseline artifact)" | tee -a "$RAW/base.txt"
+            tail -30 dist/base/build.stderr | tee -a "$RAW/base.txt"
+          fi
+      - name: Filesystem and hardware record
+        run: |
+          bash fastest/linux/fs/mkloop.sh ext4 "$MNT" 2>&1 | tee "$RAW/mkloop.txt"
+          bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
+      # Each side's rc goes to a file and the Verdict step reads it, so one failed instrument run never
+      # skips the analysis of everything else (run 37256052378 lost its x86_64 analysis that way).
+      - name: Profile head
+        run: |
+          rc=0
+          echo "plant=[${{ inputs.plant }}]" >> "$RAW/run-info.txt"
+          FASTEST_PROFILE_PLANT="${{ inputs.plant }}" FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" \
+            bash fastest/linux/profile/profile.sh dist/head/fastest_profile head "$RAW" "$MNT/work" || rc=$?
+          echo $rc > "$RAW/head.rc"
+      - name: Profile base
+        if: hashFiles('dist/base/fastest_profile') != ''
+        run: |
+          rc=0
+          FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/base/fastest_profile base "$RAW" "$MNT/work" || rc=$?
+          echo $rc > "$RAW/base.rc"
+      - name: Analyze and gate
+        id: gate
+        run: |
+          export PROFILE_CPU="$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+          set +e
+          python3 -B fastest/linux/profile/analyze.py "$RAW" fastest/linux/profile/budget.json "$RAW/analysis" \
+            --baseline prev/baseline.json
+          rc=$?
+          cat "$RAW/analysis/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # green for the BASELINE means regression-green: every gate but the absolute syscall budget passed
+          green=0
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] &&
+            { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
+          echo "green=$green" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload raw
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-raw-${{ matrix.runner }}
+          path: profile-raw/
+          retention-days: 90
+      - name: Upload the baseline (regression-green runs, or an explicit rebaseline; never a planted run)
+        if: (steps.gate.outputs.green == '1' || inputs.rebaseline == 'true') && inputs.plant == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-baseline-${{ matrix.runner }}
+          path: profile-raw/analysis/baseline.json
+          retention-days: 90
+      - name: Verdict
+        run: |
+          bad=0
+          for side in head base; do
+            [ -f "$RAW/$side.rc" ] || continue
+            r=$(cat "$RAW/$side.rc"); [ "$r" = 0 ] || { echo "profile.sh $side rc=$r (runs.tsv lists the failed instrument runs)"; bad=1; }
+          done
+          [ -f "$RAW/head.rc" ] || { echo "the head was never profiled"; bad=1; }
+          # The REGRESSION verdict (gate-6 review M9): every gate but the absolute syscall budget, both regression gates
+          # evaluated. The absolute budget is its own job below, so a regression shows as a red profile job and the
+          # known budget red as a red budget job; neither hides the other, and both block.
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; grep -v '^budget-syscalls/' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
+          exit $bad
+
+  budget:
+    name: absolute syscall budget (${{ matrix.runner }}; at most 3 per create at C=1, red at 675adbfb3)
+    needs: profile
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: profile-raw-${{ matrix.runner }}
+          path: raw
+      - name: The budget-syscalls rows of verdict.tsv
+        run: |
+          f=raw/analysis/verdict.tsv
+          [ -s "$f" ] || { echo "no verdict.tsv: the profile job produced no analysis"; exit 1; }
+          rows=$(awk -F'\t' '$1 ~ /^budget-syscalls\//' "$f")
+          echo "$rows"
+          echo "$rows" | awk -F'\t' '$4 == "PASS" || $4 == "FAIL"' | grep -q . || { echo "no budget-syscalls row was evaluated"; exit 1; }
+          ! echo "$rows" | awk -F'\t' '$4 == "FAIL"' | grep -q .

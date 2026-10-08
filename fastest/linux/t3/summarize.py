@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""summarize.py OUT SHA DRY MANIFEST -- t3run.sh's closing record: are the raws complete?
+   summarize.py self-test            the completeness rules on synthetic packages; exit 0 iff every case passes
+
+Prints summary.json to stdout: the sha, mode, manifest and its sha256, every stage's seconds, the total
+wall time, per block (one filesystem) its V3 cell and V3/V3L records, and per planned run: its attempts,
+adapter rc, void verdict and whether its result exists.
+A planned run is COMPLETE when its last attempt is VALID and its result is on disk (ours:
+result/summary.json; a competitor: result/functional.txt ending in a VERDICT line), or when the engine
+refused the class (adapter rc 4, 'NOT AVAILABLE' -- a recorded absence, not a result). A complete
+competitor run whose VERDICT is not PASS is listed in failed_checks (complete raws of a failed cell;
+the dry-run workflow fails on any).
+A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5 and ruling A14: rc 0, or a
+brd timing VOID recorded, or on a drive with no volatile cache or PLP a timing VOID recorded with the flush counter
+meeting the sync count; summary.json and raw.tsv present; the write-cache state recorded), the A14 plants on its
+real record all fired (blockgate-plants.json), and its V3L before and after are both VALID with the verdicts
+re-derived from their own arms (items 6, review L5; a VOID V3L voids the block, PREREG line 180). Each
+batch's rc, flush_control, frame-arm p50, D0 ratio, flush_sent_to_device and floor_kind, the before-to-after
+frame-arm drift, and V3L's pooled p50, ratio and drift are copied in (published, not gates).
+Exit 1 if any planned run is not complete, any block is not OK or never ran (fslist.txt names every block), a
+stage failed, or nothing was planned: a run that collected nothing has not passed.
+"""
+import glob
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import blockgate  # noqa: E402
+import v3l  # noqa: E402
+
+
+def read_rcs(path):
+    """'before rc=N' lines -> {'before': N}; the last line for a name wins."""
+    rcs = {}
+    if os.path.exists(path):
+        for line in open(path).read().splitlines():
+            p = line.split()
+            if len(p) == 2 and p[1].startswith("rc="):
+                rcs[p[0]] = int(p[1][3:])
+    return rcs
+
+
+def v3_batch(fsdir, when, rc, block=None, plp="no"):
+    d = os.path.join(fsdir, f"v3-{when}")
+    rec = {"rc": rc, "summary": os.path.exists(os.path.join(d, "summary.json")),
+           "raw": os.path.exists(os.path.join(d, "raw.tsv"))}
+    if rec["summary"]:
+        try:
+            s = json.load(open(os.path.join(d, "summary.json")))
+            fa = s.get("frame_arm")
+            rec.update({"flush_control": s.get("flush_control"), "frame_arm": fa,
+                        "frame_arm_p50_us": (s.get("arms", {}).get(fa) or {}).get("p50_us") if fa else None,
+                        "flush_d0_p50_ratio": s.get("flush_d0_p50_ratio"),
+                        "flush_sent_to_device": s.get("flush_sent_to_device"), "floor_kind": s.get("floor_kind"),
+                        "flush_gate": (s.get("flush_gate") or {}).get("outcome"),
+                        "leaf": (s.get("leaf") or {}).get("disk"), "leaf_kind": (s.get("leaf") or {}).get("kind"),
+                        "virtualization": s.get("virtualization")})
+        except (OSError, ValueError, AttributeError) as e:
+            rec["summary_error"] = f"{type(e).__name__}: {e}"
+    b = os.path.join(d, "binary.txt")
+    if os.path.exists(b):
+        rec["bound"] = next((l[6:] for l in open(b).read().splitlines() if l.startswith("bound=")), None)
+    t = os.path.join(fsdir, f"v3-{when}.txt")
+    rec["run_sh_tail"] = open(t, errors="replace").read().strip().splitlines()[-1:] if os.path.exists(t) else []
+    sj, raw = blockgate.load(d)
+    g = blockgate.decide(sj, raw, rc, block or "loop", plp)
+    rec["blockgate"] = g
+    rec["brd_void_recorded"] = g["decision"] == "RECORDED"
+    rec["ok"] = g["decision"] in ("PASS", "RECORDED") and "summary_error" not in rec
+    return rec
+
+
+def block_record(out, fs, plp="no"):
+    fsdir = os.path.join(out, f"fs-{fs}")
+    if not os.path.isdir(fsdir):
+        return {"fs": fs, "ok": False, "why": ["the block never ran"]}
+    meta = {}
+    bt = os.path.join(fsdir, "block.txt")
+    if os.path.exists(bt):
+        meta = dict(l.split("=", 1) for l in open(bt).read().splitlines() if "=" in l)
+    rcs = read_rcs(os.path.join(fsdir, "v3.rc"))
+    rec = {"fs": fs, "cell": meta.get("cell"), "block": meta.get("block"), "v3": {}, "why": []}
+    for when in ("before", "after"):
+        if when not in rcs:
+            rec["v3"][when] = {"rc": None, "ok": False}
+            rec["why"].append(f"V3 {when}: no batch ran")
+            continue
+        r = v3_batch(fsdir, when, rcs[when], meta.get("block"), plp)
+        rec["v3"][when] = r
+        if not r["ok"]:
+            rec["why"].append(f"V3 {when}: rc {r['rc']}, summary.json {'present' if r['summary'] else 'MISSING'}, "
+                              f"raw.tsv {'present' if r['raw'] else 'MISSING'}; "
+                              + "; ".join(r["blockgate"]["reasons"]) + "; run.sh: " + " ".join(r["run_sh_tail"]))
+    # The A16 plants: the stored record must exist, and the plants are RE-RUN here on the real BEFORE record (lane
+    # review LOW 11: a stored all_fired is not trusted); the two must agree.
+    pl = os.path.join(fsdir, "blockgate-plants.json")
+    try:
+        rec["a14_plants"] = json.load(open(pl))
+    except (OSError, ValueError) as e:
+        rec["a14_plants"] = None
+        if rec["v3"].get("before", {}).get("ok"):
+            rec["why"].append(f"A16 plants: no record ({type(e).__name__})")
+    if rec["a14_plants"] is not None:
+        sj, raw = blockgate.load(os.path.join(fsdir, "v3-before"))
+        again, ok_again = blockgate.plants(sj, raw, rcs.get("before", 0), plp)
+        fired = {p["plant"]: p["fired"] for p in again}
+        rec["a14_plants_rederived"] = fired
+        if not ok_again or not rec["a14_plants"].get("all_fired"):
+            rec["why"].append(f"A16 plants: not every plant was decided as planted (re-derived {fired})")
+    # V3L at every block boundary (gate-6 review 9): b0 before block 1, bK after block K. The plan names the blocks.
+    plan = os.path.join(fsdir, "plan.tsv")
+    ks = sorted({int(l.split("\t")[6]) for l in open(plan).read().splitlines() if len(l.split("\t")) > 6}) \
+        if os.path.exists(plan) else []
+    nb = max(ks) if ks else 1  # no plan (the block failed before planning): the first block's pair is still expected
+    bounds = [f"b{k}" for k in range(0, nb + 1)]
+    # V3L's plants likewise, on every measurement that exists
+    for when in bounds:
+        j = os.path.join(fsdir, f"v3l-{when}", "v3l.json")
+        if not os.path.exists(j):
+            continue
+        try:
+            stored = json.load(open(os.path.join(fsdir, f"v3l-{when}-plants.json")))
+        except (OSError, ValueError):
+            stored = None
+        try:
+            again, ok_again = v3l.plants(json.load(open(j)))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            again, ok_again = [], False
+        rec.setdefault("v3l_plants", {})[when] = {p["plant"]: p["fired"] for p in again}
+        if stored is None or not stored.get("all_fired") or not ok_again:
+            if json.load(open(j)).get("verdict") == "VALID":  # a VOID measurement already fails the block
+                rec["why"].append(f"V3L {when} plants: stored {None if stored is None else stored.get('all_fired')}, "
+                                  f"re-derived {rec['v3l_plants'][when]}")
+    b, a = rec["v3"]["before"].get("frame_arm_p50_us"), rec["v3"]["after"].get("frame_arm_p50_us")
+    rec["v3_frame_arm_drift_us"] = round(a - b, 2) if a is not None and b is not None else None
+    pairs = []
+    for k in range(1, nb + 1):
+        pr = v3l.block(os.path.join(fsdir, f"v3l-b{k - 1}", "v3l.json"), os.path.join(fsdir, f"v3l-b{k}", "v3l.json"))
+        pr["k"] = k
+        pairs.append(pr)
+        if pr["verdict"] != "VALID":
+            reasons = [x for side in ("before", "after") for x in (pr[side].get("void_reasons") or
+                                                                    ([pr[side]["why"]] if "why" in pr[side] else []))]
+            rec["why"].append(f"V3L {pr['verdict']} (block {k}): " + "; ".join(reasons))
+    verdicts = [pr["verdict"] for pr in pairs]
+    agg = "VOID" if "VOID" in verdicts else "MISSING" if ("MISSING" in verdicts or not pairs) else "VALID"
+    rec["v3l"] = {"verdict": agg, "blocks": pairs, "before": pairs[0]["before"] if pairs else None,
+                  "after": pairs[-1]["after"] if pairs else None,
+                  "published": pairs[0].get("published") if pairs else None}
+    rec["v3l_pooled_by_block"] = {pr["k"]: (pr.get("published") or {}).get("pooled_fsync_p50_us") for pr in pairs}
+    rec["ok"] = not rec["why"]
+    return rec
+
+
+def summarize(out, sha, dry, manifest):
+    stages = []
+    sp = os.path.join(out, "stages.tsv")
+    if os.path.exists(sp):
+        for line in open(sp).read().splitlines()[1:]:
+            name, s, e, secs, rc = line.split("\t")
+            stages.append({"stage": name, "start": s, "end": e, "seconds": int(secs), "rc": int(rc)})
+    attempts = {}
+    cp = os.path.join(out, "cells.tsv")
+    if os.path.exists(cp):
+        for line in open(cp).read().splitlines()[1:]:
+            fs, cell, system, clients, attempt, rc, void = line.split("\t")
+            attempts.setdefault((fs, cell), []).append({"attempt": int(attempt), "adapter_rc": int(rc), "void": void,
+                                                        "system": system, "clients": int(clients)})
+    planned = []
+    for plan in sorted(glob.glob(os.path.join(out, "fs-*", "plan.tsv"))):
+        fs = os.path.basename(os.path.dirname(plan))[3:]
+        for line in open(plan).read().splitlines():
+            cell, system = line.split("\t")[:2]
+            planned.append((fs, cell, system))
+    runs, incomplete, failed_checks = [], [], []
+    for fs, cell, system in planned:
+        a = attempts.get((fs, cell), [])
+        last = a[-1] if a else None
+        d = os.path.join(out, f"fs-{fs}", "cells", cell, f"a{last['attempt']}") if last else None
+        result, why = False, "no attempt recorded"
+        if last:
+            adapter = open(os.path.join(d, "adapter.txt"), errors="replace").read() if os.path.exists(os.path.join(d, "adapter.txt")) else ""
+            if last["adapter_rc"] == 4 and any(l.startswith("NOT AVAILABLE") for l in adapter.splitlines()):
+                result, why = True, "NOT AVAILABLE (class absent at this sha)"
+            elif last["void"] != "VALID":
+                why = "last attempt VOID"
+            elif system == "ours":
+                result = os.path.exists(os.path.join(d, "result", "summary.json")) and last["adapter_rc"] == 0
+                why = "ok" if result else f"no result (adapter rc {last['adapter_rc']})"
+            else:
+                f = os.path.join(d, "result", "functional.txt")
+                text = open(f).read() if os.path.exists(f) else ""
+                result = "VERDICT" in text
+                why = (text.strip().splitlines() or ["no functional.txt"])[-1] if result else \
+                    f"no functional VERDICT (adapter rc {last['adapter_rc']})"
+                if result and "VERDICT PASS" not in text:
+                    failed_checks.append(f"{fs}/{cell}: " + "; ".join(
+                        l for l in text.splitlines() if l.startswith("FAIL ")))
+        st = os.path.join(d, "settle.txt") if d else None
+        settle = open(st).read().strip() if st and os.path.exists(st) else None
+        runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
+                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)", "settle": settle})
+        if not result:
+            incomplete.append(f"{fs}/{cell}: {why}")
+    fl = os.path.join(out, "fslist.txt")
+    fslist = open(fl).read().split() if os.path.exists(fl) else []
+    plp = "no"
+    mt0 = os.path.join(out, "mode.txt")
+    if os.path.exists(mt0):
+        plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
+    blocks = [block_record(out, fs, plp) for fs in fslist]
+    # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
+    pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
+    for r in runs:
+        k = r["cell"].rsplit("-r", 1)[-1]
+        r["block_k"] = int(k) if k.isdigit() else None
+        r["v3l_pooled_fsync_p50_us"] = pooled.get(r["fs"], {}).get(r["block_k"])
+    failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
+    if not fslist:
+        failed_blocks.append("fslist.txt missing or empty: no block was planned")
+    mode = {}
+    mt = os.path.join(out, "mode.txt")
+    if os.path.exists(mt):
+        mode = dict(l.split("=", 1) for l in open(mt).read().splitlines() if "=" in l)
+    mp = os.path.join(out, "manifest.tsv")
+    msha = hashlib.sha256(open(mp, "rb").read()).hexdigest() if os.path.exists(mp) else None
+    total = next((s["seconds"] for s in stages if s["stage"] == "TOTAL"), None)
+    failed = [s["stage"] for s in stages if s["rc"] != 0 and s["stage"] != "TOTAL"]
+    summary = {"sha": sha, "dry_run": dry == "1", "block": mode.get("block"), "plant": mode.get("plant") or None,
+               "manifest": manifest, "manifest_sha256": msha,
+               "wall_seconds": total, "stages": stages, "planned_runs": len(planned),
+               "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
+               "failed_checks": failed_checks, "failed_blocks": failed_blocks,
+               "failed_stages": failed, "blocks": blocks, "runs": runs}
+    # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
+    summary["measured_runs"] = sum(r["measured"] for r in runs)
+    ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
+        and summary["measured_runs"] > 0
+    return summary, ok
+
+
+def main(out, sha, dry, manifest):
+    summary, ok = summarize(out, sha, dry, manifest)
+    json.dump(summary, sys.stdout, indent=1)
+    print()
+    print(f"summarize: planned={summary['planned_runs']} complete={summary['complete_runs']} "
+          f"failed_stages={summary['failed_stages']} failed_blocks={summary['failed_blocks']} "
+          f"failed_checks={len(summary['failed_checks'])} wall_s={summary['wall_seconds']}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def self_test():
+    """Synthetic packages: one good block, then each way a block or the package can be incomplete."""
+    def w(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(text)
+
+    N = v3l.N
+
+    def v3lj(verdict="VALID", lie=False):
+        """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
+        over VOID arms (review L5)."""
+        fs = N if verdict == "VALID" and not lie else N // 2
+
+        def arm(fsyncs, syncs):
+            return {"v1l": {"data_writes": N, "data_fsyncs": fsyncs, "other_fsyncs": 0, "failed": 0, "io_uring_setup": 0,
+                            "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0},
+                    "labelling_fio": {"writes": N, "syncs": syncs},
+                    "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": 10.0 if syncs else None,
+                              "fsync_bins_ns": {"10000": 5} if syncs else None, "flush_ios_delta": 2 * N}}
+        r = {"verdict": "VALID" if lie else verdict, "void_reasons": [] if verdict == "VALID" or lie else ["planted"],
+             "floor_kind": "x", "leaf": {"disk": "nvme0n1", "write_cache": "write back", "layers": []},
+             "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
+             "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
+        return json.dumps(r)
+
+    def v3sum(rc, block):
+        brd = block == "brd"
+        return json.dumps({"frame_arm": "append64", "arms": {"append64": {"p50_us": 80.0}}, "floor_kind": "x",
+                           "flush_control": "FAIL: run void (ow4k)" if rc == 3 else "pass",
+                           "leaf": {"kind": "brd" if brd else "drive", "disk": "ram0" if brd else "nvme0n1",
+                                    "write_cache": "write through" if brd else "write back",
+                                    "drive_reports": None if brd else "write back"},
+                           "flush_gate": {"outcome": "not applicable: brd" if brd else "pass", "required_flushes": 1400,
+                                          "leaf_flushes_completed": 0 if brd else 2800,
+                                          "blkflush_leaf_gate": {"outcome": "not applicable" if brd else "pass"}}})
+
+    def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
+             plants=True, plants_fired=True, plp="no", lie=False, cell="ok"):
+        out = os.path.join(root, "out")
+        w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
+        crow = {"ok": "xfs\tours-full-c1-r1\tours\t1\t1\t0\tVALID", "na": "xfs\tours-full-c1-r1\tours\t1\t1\t4\tN/A",
+                "compfail": "xfs\tours-full-c1-r1\tdolt\t1\t1\t0\tVALID"}[cell]
+        w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + crow + "\n")
+        w(f"{out}/fslist.txt", fslist + "\n")
+        w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
+        f = f"{out}/fs-xfs"
+        w(f"{f}/plan.tsv", "ours-full-c1-r1\t" + ("dolt" if cell == "compfail" else "ours") + "\t1\t200\t1\tfull\t1\n")
+        w(f"{f}/cells/ours-full-c1-r1/a1/result/summary.json", "{}")
+        w(f"{f}/cells/ours-full-c1-r1/a1/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
+        if cell == "compfail":
+            w(f"{f}/cells/ours-full-c1-r1/a1/result/functional.txt", "FAIL F1: something\nVERDICT FAIL\n")
+        w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
+        w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
+        for when in ("before", "after"):
+            if not (when == "before" and before_rc == 2):  # a refused batch leaves no out dir
+                w(f"{f}/v3-{when}/summary.json", v3sum(before_rc if when == "before" else 0, block))
+                w(f"{f}/v3-{when}/raw.tsv", "arm\tus\n")
+            w(f"{f}/v3-{when}.txt", "run.sh: REFUSED: planted refusal text\n" if before_rc == 2 and when == "before" else "ok\n")
+        if plants:
+            res, ok = blockgate.plants(json.loads(v3sum(0, block)), True, 0, plp)
+            w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie))
+        if after_v3l:
+            w(f"{f}/v3l-b1/v3l.json", v3lj(after_v3l))
+        for when in ("b0", "b1"):  # what t3run's v3l() writes after each measurement
+            if os.path.exists(f"{f}/v3l-{when}/v3l.json"):
+                res, ok = v3l.plants(json.load(open(f"{f}/v3l-{when}/v3l.json")))
+                w(f"{f}/v3l-{when}-plants.json", json.dumps({"plants": res, "all_fired": ok}, default=str))
+        if drop:
+            os.unlink(f"{f}/{drop}")
+        return out
+
+    cases = []
+    for name, kw, want_ok in [
+        ("a complete package with a good block passes", {}, True),
+        ("item 5 red test: the BEFORE batch refused (rc 2, no out dir) fails the package", {"before_rc": 2}, False),
+        ("an AFTER batch with rc 0 but no raw.tsv fails the package", {"drop": "v3-after/raw.tsv"}, False),
+        ("item 6: a VOID V3L after fails the package", {"after_v3l": "VOID"}, False),
+        ("item 6: a missing V3L after fails the package", {"after_v3l": None}, False),
+        ("item 6: a VOID V3L before with no after (the run stopped) reads VOID, not MISSING",
+         {"before_v3l": "VOID", "after_v3l": None}, False),
+        ("a block named in fslist.txt that never ran fails the package", {"fslist": "xfs btrfs"}, False),
+        ("an empty fslist.txt fails the package", {"fslist": ""}, False),
+        ("a VOID (rc 3) V3 batch with complete raws fails a loop block", {"before_rc": 3}, False),
+        ("a VOID (rc 3) V3 batch with complete raws is recorded on a brd block", {"before_rc": 3, "block": "brd"}, True),
+        ("a refused (rc 2) V3 batch fails a brd block too", {"before_rc": 2, "block": "brd"}, False),
+        ("A14: PLP declared, a timing VOID with the flush counter met passes", {"before_rc": 3, "plp": "yes"}, True),
+        ("A14: the plants record missing fails the block", {"plants": False}, False),
+        ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False),
+        ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False),
+        ("review M2: a refusal's run.sh line reaches the block's why", {"before_rc": 2}, False),
+        ("lane review LOW 10: a package whose only cell is NOT AVAILABLE measured nothing and fails", {"cell": "na"}, False),
+        ("lane review LOW 7: a competitor VERDICT FAIL fails the package", {"cell": "compfail"}, False),
+    ]:
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            s, ok = summarize(make(root, **kw), "sha", "1", "m")
+            good = ok == want_ok
+            if "reads VOID" in name:
+                good = good and s["failed_blocks"][0].startswith("xfs: V3L VOID (block 1): planted")
+            if "M2" in name:
+                good = good and "planted refusal text" in s["failed_blocks"][0]
+            cases.append((name, good, s["failed_blocks"]))
+        finally:
+            shutil.rmtree(root)
+    root = tempfile.mkdtemp(prefix="summarize-st-")
+    try:
+        s, _ = summarize(make(root), "sha", "1", "m")
+        b = s["blocks"][0]
+        cases.append(("the good block carries the batches' frame-arm p50, the drift (0.0) and the pooled V3L p50 (10.0 us)",
+                      b["v3"]["before"]["frame_arm_p50_us"] == 80.0 and b["v3_frame_arm_drift_us"] == 0.0
+                      and b["v3l"]["published"]["pooled_fsync_p50_us"] == 10.0, None))
+    finally:
+        shutil.rmtree(root)
+    bad = [c for c in cases if not c[1]]
+    for n, ok, fb in cases:
+        print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (failed_blocks {fb})" if fb else ""))
+    print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
+    return 0 if not bad else 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["self-test"]:
+        sys.exit(self_test())
+    sys.exit(main(*sys.argv[1:5]))

@@ -1,0 +1,130 @@
+name: fastest-t3-dryrun
+# Lane fastest-linux, T3-READY gate item 6: dry-run the one-command T3 runner end to end on a hosted
+# runner, exactly as a rented box would get it -- the script fetched by URL at this commit and piped to
+# bash, which clones the fork at this commit and runs everything from there. The job must finish with
+# complete raws (summarize.py exit 0) and records its wall time. Numbers from a hosted runner are never
+# credited: its disk is not T3 hardware (frontier/fastest/linux/GATES.md).
+# Five jobs per push (review 2 items 4-6): the loop dry run (<fs>loop V3 cells), the non-loop dry run (xfs and
+# btrfs on brd's /dev/ram0, a block device with no loop: the hosted runners have no spare disk), and three plants
+# that must FAIL the FIRST block for exactly the planted reason, pinned by its own text (gate-6 review M2), while
+# the second block passes (review H1: a failed block does not stop the run): a V3 batch bound to a missing verdict
+# (run.sh's refusal names the planted file), a V3L whose fio syncs every 2nd write (V1L reads 5,000 and v3l.json
+# records the plant), and a write-cache lie under V3L on whichever drive the runner draws (write back: the loop set to
+# write through, so the drive's flush counter gate fires; write through: the drive's queue set to write back, so the
+# kernel/drive cross-check fires). EXPECT is "alt||alt", each alternative "part&&part".
+# The A16 plants (blockgate.py) and the V3L counter plants (v3l.py plants) run inside every block of every job, on
+# copies of the real records, so both drive classes' gates fire on every run whatever drive is drawn.
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "cell manifest path in the repo"
+        default: "fastest/linux/t3/cells-smoke.tsv"
+      runner:
+        description: "ubuntu-24.04 or ubuntu-24.04-arm"
+        default: "ubuntu-24.04"
+  push:
+    # fastest-linux-t3 carries the competitor and V3 sub-lanes the runner calls; fastest-branching joins
+    # once those are merged there.
+    branches: [fastest-linux-t3]
+    paths:
+      - "fastest/linux/t3/**"
+      - "fastest/linux/v3/**"
+      - "fastest/linux/competitors/**"
+      - ".github/workflows/fastest-t3-dryrun.yml"
+
+concurrency:
+  group: fastest-t3-dryrun-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dryrun:
+    name: t3 dry run (${{ inputs.runner || 'ubuntu-24.04' }}, ${{ matrix.block }}${{ matrix.plant && format(', plant {0}', matrix.plant) || '' }})
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {block: loop, plant: ""}
+          - {block: brd, plant: ""}
+          - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
+          - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID (block 1): &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
+          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose||V3L VOID (block 1): &&disagrees with the drive's own report"}
+    env:
+      PLANT: ${{ matrix.plant }}
+      EXPECT: ${{ matrix.expect }}
+      V3LPLANT: ${{ matrix.v3lplant }}
+    steps:
+      - name: The one command, as on a rented box
+        run: |
+          # the step shell is bash -e: a failing pipeline must be caught with ||, or the rc and the wall time are
+          # lost (run 37517239631: every failed job ended before rc=$?, so no t3-wall.txt)
+          set -o pipefail
+          start=$(date +%s)
+          rc=0
+          curl -sSfL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/fastest/linux/t3/t3run.sh" \
+            | bash -s -- --sha "$GITHUB_SHA" --out "$HOME/t3-out" --dry-run --block "${{ matrix.block }}" \
+                ${PLANT:+--plant "$PLANT"} --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}" || rc=$?
+          echo "one-command wall seconds: $(( $(date +%s) - start )) rc=$rc block=${{ matrix.block }} plant=${PLANT:-none}" | tee "$HOME/t3-wall.txt"
+          echo "$rc" > "$HOME/t3-rc.txt"
+          # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason
+          if [ -n "$PLANT" ]; then [ "$rc" = 1 ]; else exit $rc; fi
+      - name: Summary
+        if: always()
+        run: |
+          cat "$HOME/t3-wall.txt" 2>/dev/null || echo "no t3-wall.txt"
+          cat "$HOME/t3-out/stages.tsv" 2>/dev/null || echo "no stages.tsv"
+          { echo '```'; cat "$HOME/t3-out/stages.tsv" "$HOME/t3-wall.txt" 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          # Complete raws are the runner's exit criterion; a dry run also fails on any failed cell check,
+          # because a harness defect found here is one the rental would pay for.
+          python3 - "$HOME/t3-out/summary.json" <<'PY'
+          import json, os, sys
+          s = json.load(open(sys.argv[1]))
+          print("planned", s["planned_runs"], "complete", s["complete_runs"], "incomplete", s["incomplete"],
+                "failed_stages", s["failed_stages"], "failed_blocks", s.get("failed_blocks"),
+                "failed_checks", s.get("failed_checks"))
+          for b in s.get("blocks", []):
+              print("block", b["fs"], b.get("cell"), "ok" if b["ok"] else "NOT OK", json.dumps(
+                  {"v3": {k: {f: v.get(f) for f in ("rc", "flush_control", "frame_arm_p50_us", "flush_sent_to_device",
+                                                       "floor_kind")} for k, v in b.get("v3", {}).items()},
+                   "v3_drift_us": b.get("v3_frame_arm_drift_us"), "v3l": b.get("v3l", {}).get("published"),
+                   "v3l_verdict": b.get("v3l", {}).get("verdict")}))
+          plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
+          if plant:
+              # the plant must be the reason, at the first block; the second block must pass (review H1)
+              blocks = s.get("blocks") or [{}]
+              first, rest = blocks[0], blocks[1:]
+              why = " | ".join(first.get("why", []))
+              v3lp = os.environ.get("V3LPLANT")
+              checks = {
+                  "plant recorded": s.get("plant") == plant,
+                  "only the first block failed": s["failed_stages"] == ["fs-" + first.get("fs", "?")],
+                  "the planted text": any(all(part in why for part in alt.split("&&")) for alt in expect.split("||")),
+                  "a later block ran and passed": bool(rest) and all(b.get("ok") for b in rest),
+                  "v3l.json names the plant": not v3lp or (first.get("v3l", {}).get("before") or {}).get("plant") == v3lp,
+              }
+              ok = all(checks.values())
+              print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
+              sys.exit(0 if ok else 1)
+          sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or s.get("failed_blocks")
+                         or not s["planned_runs"]) else 0)
+          PY
+      - name: Upload the package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-dryrun-${{ inputs.runner || 'ubuntu-24.04' }}-${{ matrix.block }}${{ matrix.plant && format('-plant-{0}', matrix.plant) || '' }}
+          path: |
+            ~/t3-out.tar.gz
+            ~/t3-out.tar.gz.sha256
+            ~/t3-out/summary.json
+            ~/t3-out/stages.tsv
+            ~/t3-out/t3run.log
+            ~/t3-wall.txt
+            ~/t3-rc.txt
+          retention-days: 90
