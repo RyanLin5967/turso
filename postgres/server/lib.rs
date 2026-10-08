@@ -3609,4 +3609,116 @@ mod tests {
         });
         assert_eq!(r.ok(), Some(7), "55 schema changes in a row escaped");
     }
+
+    /// The rows of `id` in t, read on a connection of its own.
+    fn count_id(s: &Session, id: i64) -> i64 {
+        let conn = s.shared.db.connect().unwrap();
+        let rows = conn
+            .prepare(format!("SELECT count(*) FROM t WHERE id = {id}"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        match rows.as_slice() {
+            [row] => match row.first() {
+                Some(Value::Numeric(turso_core::Numeric::Integer(n))) => *n,
+                other => panic!("count: {other:?}"),
+            },
+            other => panic!("count rows: {other:?}"),
+        }
+    }
+
+    /// The engine connection the session runs on holds no write transaction.
+    fn holds_no_write(s: &Session) -> bool {
+        let st = s.state();
+        let conn = match &st.branch {
+            Some((_, conn)) => Some(conn),
+            None => st.trunk.as_ref(),
+        };
+        conn.is_none_or(|c| !c.inner().is_in_write_tx())
+    }
+
+    /// A trunk table with a live child, so the trunk's commit decides the pages it overwrites, and
+    /// the decision pass armed to be refused once (TrunkDecisionBusy).
+    fn busy_commit_fixture(dir: &tempfile::TempDir) -> Session {
+        let s = session(dir);
+        ok(&s, "CREATE TABLE t(id INT, v TEXT)");
+        ok(&s, "INSERT INTO t VALUES (1, 'a')");
+        ok(&s, "SELECT turso_branch_create('c')");
+        s
+    }
+
+    /// A COMMIT refused at the trunk's commit (Busy at the decision pass, a live child) is never
+    /// stepped again or run anew: the block either commits (once the engine resumes a refused
+    /// COMMIT) or answers 40001 with nothing kept, and either way the session is idle and the engine
+    /// holds no write transaction. Never XX000: dropped and run anew, the COMMIT found no
+    /// transaction; stepped again, it was stranded holding the WAL lock (wire review 8 item 1,
+    /// review 7 item 3). The same for a multi-statement query's implicit COMMIT and a pipeline's,
+    /// at Sync.
+    #[test]
+    fn a_refused_commit_is_never_run_again() {
+        let arm = |s: &Session| {
+            s.shared
+                .db
+                .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy))
+        };
+        // Either outcome is the block's alone: committed, or a serialization failure with nothing
+        // kept.
+        let settled = |s: &Session, what: &str, err: Option<&ErrorInfo>, ids: &[i64]| {
+            let kept: Vec<i64> = ids.iter().map(|id| count_id(s, *id)).collect();
+            match err {
+                None => assert!(kept.iter().all(|n| *n == 1), "{what}: ok, kept {kept:?}"),
+                Some(e) => {
+                    assert_eq!(e.code, "40001", "{what}: {}", e.message);
+                    assert!(
+                        kept.iter().all(|n| *n == 0),
+                        "{what}: failed, kept {kept:?}"
+                    );
+                }
+            }
+            assert!(
+                matches!(s.transaction_status(), TransactionStatus::Idle),
+                "{what}: a block is open"
+            );
+            assert!(
+                holds_no_write(s),
+                "{what}: the engine still holds a write transaction"
+            );
+        };
+        // An explicit block's COMMIT.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = busy_commit_fixture(&dir);
+        ok(&s, "BEGIN");
+        ok(&s, "INSERT INTO t VALUES (9, 'x')");
+        arm(&s);
+        let replies = s.simple("COMMIT");
+        let err = match replies.as_slice() {
+            [Response::Error(e)] => Some(&**e),
+            [_] => None,
+            other => panic!("COMMIT answered {} replies", other.len()),
+        };
+        settled(&s, "BEGIN; INSERT; COMMIT", err, &[9]);
+        // A multi-statement query: one implicit block, committed after its last statement.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = busy_commit_fixture(&dir);
+        arm(&s);
+        let replies = s.simple("INSERT INTO t VALUES (9, 'x'); INSERT INTO t VALUES (10, 'y')");
+        let err = replies.iter().find_map(|r| match r {
+            Response::Error(e) => Some(&**e),
+            _ => None,
+        });
+        settled(&s, "two-statement query", err, &[9, 10]);
+        // A pipeline's implicit block, committed at Sync.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = busy_commit_fixture(&dir);
+        let sql = "INSERT INTO t VALUES (9, 'x')";
+        s.begin_implicit(sql, None, true).unwrap();
+        assert!(
+            s.run(sql, None, None, &Format::UnifiedText).is_ok(),
+            "premise: the pipeline's insert runs"
+        );
+        s.after_implicit(sql, false);
+        arm(&s);
+        let r = s.end_implicit();
+        settled(&s, "pipeline at Sync", r.as_ref().err().map(|e| &**e), &[9]);
+    }
 }
