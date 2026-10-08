@@ -3829,6 +3829,90 @@ fn a_bind_postgresql_refuses_is_refused_before_bind_complete() {
     }
 }
 
+/// A Bind that supplies a value count other than the statement's parameters is 08P01 for EVERY
+/// statement, as PostgreSQL's exec_bind_message refuses it, before anything runs: a branch call
+/// (create with two format codes and one value, create with two values, delete of a literal with one
+/// value; `turso_branch_create($2)` with no Describe is 42P18, its $1 untyped), and the statements
+/// the server answers without the engine (CHECKPOINT, BEGIN, COMMIT, ROLLBACK), which no Bind
+/// check reached: one value for a statement of none ran it (wire review 12 item 2).
+#[test]
+fn every_statement_checks_its_bind_arity() {
+    let dir = Scratch::new("bindarity");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('keep')")
+        .ok("a branch to keep");
+    // Parse (no declared types), Bind (the given codes and values, no result codes), Execute, Sync.
+    fn round(w: &mut Wire, sql: &str, pcodes: &[i16], values: &[&[u8]]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    let cases: Vec<(&str, Vec<i16>, Vec<&[u8]>, &str)> = vec![
+        (
+            "SELECT turso_branch_create($1)",
+            vec![0, 0],
+            vec![&b"b1"[..]],
+            "08P01",
+        ),
+        (
+            "SELECT turso_branch_create($1)",
+            vec![],
+            vec![&b"b1"[..], &b"b2"[..]],
+            "08P01",
+        ),
+        (
+            "SELECT turso_branch_delete('keep')",
+            vec![],
+            vec![&b"x"[..]],
+            "08P01",
+        ),
+        (
+            "SELECT turso_branch_create($2)",
+            vec![],
+            vec![&b"b1"[..], &b"b2"[..]],
+            "42P18",
+        ),
+        ("CHECKPOINT", vec![], vec![&b"x"[..]], "08P01"),
+        ("CHECKPOINT", vec![0, 0], vec![], "08P01"),
+        ("BEGIN", vec![], vec![&b"x"[..]], "08P01"),
+        ("COMMIT", vec![], vec![&b"x"[..]], "08P01"),
+        ("ROLLBACK", vec![], vec![&b"x"[..]], "08P01"),
+    ];
+    for (sql, pcodes, values, code) in cases {
+        let what = format!(
+            "{sql} with {} codes and {} values",
+            pcodes.len(),
+            values.len()
+        );
+        let r = round(&mut a, sql, &pcodes, &values);
+        assert_eq!(r.err(&what).code, code, "{what}");
+        assert_eq!(r.status, b'I', "{what}: nothing was begun");
+    }
+    for name in ["b1", "b2"] {
+        let r = a.q(&format!("SELECT turso_branch_switch('{name}')"));
+        assert_eq!(r.err(name).code, "3D000", "branch {name} must not exist");
+    }
+    a.q("SELECT turso_branch_switch('keep')")
+        .ok("keep was not deleted");
+}
+
 /// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
 /// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
 /// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
