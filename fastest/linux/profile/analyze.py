@@ -117,7 +117,7 @@ def analyze_arm(d, arm):
     if os.path.exists(plain):
         p = json.load(open(plain))
         r["clients"] = p["clients"]
-        r["ops"] = p["clients"] * p["ops_per_client"]
+        r["ops"] = p.get("ops_total") or p["clients"] * p["ops_per_client"]  # ops_total: the driver since MED 3
         r["latency_ns"] = {w: {k: p["phases"][w][k] for k in ("p50_ns", "p99_ns", "max_ns")} for w in WINDOWS}
         r["busy_retries_per_op"] = {w["window"]: round(w.get("busy_retries", 0) / r["ops"], 4) for w in p["windows"]}
     srun = os.path.join(d, "strace-run", "summary.json")
@@ -126,7 +126,7 @@ def analyze_arm(d, arm):
         st += ".gz"
     if os.path.exists(st) and os.path.exists(srun):
         s = json.load(open(srun))
-        ops = s["clients"] * s["ops_per_client"]
+        ops = s.get("ops_total") or s["clients"] * s["ops_per_client"]
         opener = gzip.open if st.endswith(".gz") else open
         with opener(st, "rt", errors="replace") as fh:
             win, refusals = parse_strace(fh)
