@@ -3,6 +3,8 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
+use crate::branch::store::{BranchStore, TrunkPending};
+use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
@@ -20,7 +22,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{Mutex, OnceLock, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -81,30 +83,96 @@ impl HeaderRef {
     }
 
     pub fn borrow(&self) -> &DatabaseHeader {
-        // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
         let content = self.0.get_contents();
-        bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes::<DatabaseHeader>(&content.as_slice()[0..DatabaseHeader::SIZE])
+    }
+
+    /// The underlying page.
+    pub fn page(&self) -> &PageRef {
+        &self.0
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct HeaderRefMut(PageRef);
+pub struct HeaderRefMut(PageRef, WriteTicket);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         let page = return_if_io!(pager.read_header_page());
-        pager.add_dirty(&page)?;
-        Ok(IOResult::Done(Self(page)))
+        let wt = pager.add_dirty(&page)?;
+        Ok(IOResult::Done(Self(page, wt)))
     }
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
-        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes_mut::<DatabaseHeader>(
+            &mut content.as_mut(&self.1)[0..DatabaseHeader::SIZE],
+        )
     }
 
     /// Get a reference to the underlying page
     pub fn page(&self) -> &PageRef {
         &self.0
+    }
+}
+
+/// Proof that a copy-on-write decision has been made for the page about to be written.
+///
+/// # What this buys
+///
+/// [`PageInner::as_mut`] — the one door a page write can go through — now *requires* one of
+/// these. The only way to obtain one is [`Pager::add_dirty`], which is where the CoW decision
+/// is made (`subjournal_page_if_required`). So "every page-buffer write was preceded by a
+/// copy-on-write decision" stops being a comment that a sweep has to re-verify and becomes a
+/// property the type checker enforces on every build.
+///
+/// # Why the field is a private `()`
+///
+/// The tuple field is private to this module, so `btree.rs` — or any other caller — *cannot*
+/// mint a ticket. It can only receive one, which means it can only write a page downstream of
+/// an `add_dirty` that actually ran. Making the unsafe state unrepresentable beats documenting
+/// it: there is no way to spell a write without the decision.
+///
+/// # What it deliberately does NOT prove
+///
+/// The ticket is not tied to a *particular* page: holding one for page A permits writing page
+/// B. Closing that gap means a lifetime/branded index, which the probe for this change showed
+/// would turn an additive argument-threading job into a whole-engine borrow refactor. What is
+/// proven is that *a* CoW decision happened on this path, which is the property that was
+/// previously only asserted in prose. The three seams below `as_mut` that it still cannot see
+/// are listed on [`PageInner::as_mut`].
+///
+/// `Clone` is deliberate and does not weaken the guarantee: duplicating a ticket still requires
+/// already holding one, so it cannot be forged — only passed on, which a `&WriteTicket` allows
+/// anyway.
+#[derive(Debug, Clone)]
+pub struct WriteTicket(());
+
+impl WriteTicket {
+    /// Mint a ticket for a write that provably has no prior content to preserve, so there is
+    /// nothing for copy-on-write to decide.
+    ///
+    /// This is the *only* bypass of [`Pager::add_dirty`], and it is private to this module on
+    /// purpose: the complete list of exemptions is `grep -n 'no_cow_required' core/storage/pager.rs`
+    /// and cannot grow outside this file. Every call site must justify itself in a comment.
+    ///
+    /// Two shapes qualify, and nothing else should be added without the same argument:
+    /// - a page constructed locally and not yet published to the page cache (database bootstrap),
+    ///   where no other reference to the buffer exists and its prior bytes are uninitialised;
+    /// - refreshing a cached page's bytes to match a WAL frame that has *already* been durably
+    ///   written, which is a cache update rather than a logical page write.
+    fn no_cow_required() -> Self {
+        Self(())
+    }
+
+    /// Test-only ticket source.
+    ///
+    /// Gated on `cfg(test)`, so it does not exist in a production build: unit tests that build a
+    /// bare page outside any pager can still write it, without widening the exemption list that
+    /// [`WriteTicket::no_cow_required`] documents.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(())
     }
 }
 
@@ -155,9 +223,43 @@ impl PageInner {
         }
     }
     /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+    /// Read the page's bytes. **Cannot write through this.**
+    ///
+    /// # Why this was split
+    ///
+    /// This used to be `as_ptr(&self) -> &mut [u8]` with `#[allow(clippy::mut_from_ref)]`, and that
+    /// single signature is the reason nobody could say what writes a page. Reads and writes were
+    /// indistinguishable at all ~90 call sites, so every attempt to enumerate the writers was a
+    /// grep over names — which is exactly how the equivalent claim about SQLite's
+    /// `sqlite3PagerWrite` came out as 8 sites when the real number was 42.
+    ///
+    /// Splitting it makes the question answerable by the compiler instead of by a sweep: a write
+    /// cannot go through `as_slice`, so every write must name [`PageInner::as_mut`]. That is the
+    /// enumeration, and it is complete by construction rather than believed.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        self.buffer
+            .as_ref()
+            .expect("buffer not loaded")
+            .as_slice()
+    }
+
+    /// Obtain the page's bytes **for writing**. This is the single door a copy-on-write hook needs.
+    ///
+    /// ⚠ **This still returns `&mut` from `&self`, and that is not fixed here.** The whole engine
+    /// passes `&Page` and `&PageInner` around, so removing the unsoundness means changing every
+    /// borrow in the btree, which is a different and much larger change. What IS fixed is that the
+    /// unsoundness now has ONE NAME and one home: `as_slice` cannot write, so any future CoW hook
+    /// placed here sees every write that goes through the accessor, and the compiler proves there
+    /// is no other way through it.
+    ///
+    /// ⚠ **What it still does NOT see**, stated here rather than discovered later: a wholesale
+    /// buffer install (`inner.buffer = Some(..)` on page load), a buffer `take()` on eviction, and
+    /// the checkpoint checksum write-back, which mutates the bytes through a CLONED `Arc<Buffer>`
+    /// after the page is already clean. Those are below this accessor and need their own seams.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub fn as_ptr(&self) -> &mut [u8] {
+    pub fn as_mut(&self, _t: &WriteTicket) -> &mut [u8] {
         self.buffer
             .as_ref()
             .expect("buffer not loaded")
@@ -178,14 +280,14 @@ impl PageInner {
     /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u8(&self, pos: usize) -> u8 {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         buf[self.offset() + pos]
     }
 
     /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u16(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         let offset = self.offset();
         u16::from_be_bytes([buf[offset + pos], buf[offset + pos + 1]])
     }
@@ -193,32 +295,32 @@ impl PageInner {
     /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u32(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         read_u32(buf, self.offset() + pos)
     }
 
     /// Write a u8 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u8(&self, pos: usize, value: u8) {
+    fn write_u8(&self, pos: usize, value: u8, wt: &WriteTicket) {
         tracing::trace!("write_u8(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut(wt);
         buf[self.offset() + pos] = value;
     }
 
     /// Write a u16 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u16(&self, pos: usize, value: u16) {
+    fn write_u16(&self, pos: usize, value: u16, wt: &WriteTicket) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut(wt);
         let offset = self.offset();
         buf[offset + pos..offset + pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u32(&self, pos: usize, value: u32) {
+    fn write_u32(&self, pos: usize, value: u32, wt: &WriteTicket) {
         tracing::trace!("write_u32(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut(wt);
         let offset = self.offset();
         buf[offset + pos..offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
@@ -231,54 +333,54 @@ impl PageInner {
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         u16::from_be_bytes([buf[pos], buf[pos + 1]])
     }
 
     /// Read a u32 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
     }
 
     /// Write a u16 at the given absolute offset (no db header offset).
-    pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
+    pub fn write_u16_no_offset(&self, pos: usize, value: u16, wt: &WriteTicket) {
         tracing::trace!("write_u16_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut(wt);
         buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 at the given absolute offset (no db header offset).
-    pub fn write_u32_no_offset(&self, pos: usize, value: u32) {
+    pub fn write_u32_no_offset(&self, pos: usize, value: u32, wt: &WriteTicket) {
         tracing::trace!("write_u32_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut(wt);
         buf[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 
-    pub fn write_page_type(&self, value: u8) {
-        self.write_u8(BTREE_PAGE_TYPE, value);
+    pub fn write_page_type(&self, value: u8, wt: &WriteTicket) {
+        self.write_u8(BTREE_PAGE_TYPE, value, wt);
     }
 
-    pub fn write_rightmost_ptr(&self, value: u32) {
-        self.write_u32(BTREE_RIGHTMOST_PTR, value);
+    pub fn write_rightmost_ptr(&self, value: u32, wt: &WriteTicket) {
+        self.write_u32(BTREE_RIGHTMOST_PTR, value, wt);
     }
 
-    pub fn write_first_freeblock(&self, value: u16) {
-        self.write_u16(BTREE_FIRST_FREEBLOCK, value);
+    pub fn write_first_freeblock(&self, value: u16, wt: &WriteTicket) {
+        self.write_u16(BTREE_FIRST_FREEBLOCK, value, wt);
     }
 
-    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
-        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0));
-        self.write_freeblock_size(offset, size);
+    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>, wt: &WriteTicket) {
+        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0), wt);
+        self.write_freeblock_size(offset, size, wt);
     }
 
-    pub fn write_freeblock_size(&self, offset: u16, size: u16) {
-        self.write_u16_no_offset(offset as usize + 2, size);
+    pub fn write_freeblock_size(&self, offset: u16, size: u16, wt: &WriteTicket) {
+        self.write_u16_no_offset(offset as usize + 2, size, wt);
     }
 
-    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16) {
-        self.write_u16_no_offset(offset as usize, next_block);
+    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16, wt: &WriteTicket) {
+        self.write_u16_no_offset(offset as usize, next_block, wt);
     }
 
     pub fn read_freeblock(&self, offset: u16) -> (u16, u16) {
@@ -288,18 +390,18 @@ impl PageInner {
         )
     }
 
-    pub fn write_cell_count(&self, value: u16) {
-        self.write_u16(BTREE_CELL_COUNT, value);
+    pub fn write_cell_count(&self, value: u16, wt: &WriteTicket) {
+        self.write_u16(BTREE_CELL_COUNT, value, wt);
     }
 
-    pub fn write_cell_content_area(&self, value: usize) {
+    pub fn write_cell_content_area(&self, value: usize, wt: &WriteTicket) {
         turso_debug_assert!(value <= PageSize::MAX as usize);
         let value = value as u16;
-        self.write_u16(BTREE_CELL_CONTENT_AREA, value);
+        self.write_u16(BTREE_CELL_CONTENT_AREA, value, wt);
     }
 
-    pub fn write_fragmented_bytes_count(&self, value: u8) {
-        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value);
+    pub fn write_fragmented_bytes_count(&self, value: u8, wt: &WriteTicket) {
+        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value, wt);
     }
 
     #[inline]
@@ -361,10 +463,10 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+    pub fn rightmost_pointer_raw(&self, wt: &WriteTicket) -> crate::Result<Option<*mut u8>> {
         match self.page_type()? {
             PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
-                self.as_ptr()
+                self.as_mut(wt)
                     .as_mut_ptr()
                     .add(self.offset() + BTREE_RIGHTMOST_PTR)
             })),
@@ -375,7 +477,7 @@ impl PageInner {
     #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
 
         let ncells = self.cell_count();
         turso_assert_less_than!(idx, ncells,
@@ -393,7 +495,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -411,7 +513,7 @@ impl PageInner {
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -432,7 +534,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -457,7 +559,7 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_offset = self.read_u16(cell_pointer) as usize;
@@ -592,7 +694,7 @@ impl PageInner {
         min_local: usize,
         page_type: PageType,
     ) -> crate::Result<(usize, usize)> {
-        let buf = self.as_ptr();
+        let buf = self.as_slice();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
@@ -671,8 +773,8 @@ impl PageInner {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
     }
 
-    pub fn write_database_header(&self, header: &DatabaseHeader) {
-        let buf = self.as_ptr();
+    pub fn write_database_header(&self, header: &DatabaseHeader, wt: &WriteTicket) {
+        let buf = self.as_mut(wt);
         buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
     }
 
@@ -1410,6 +1512,41 @@ pub struct Pager {
     /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
     /// supplies the BTCF_Multiple fast path (btree.c:9348).
     pub(crate) cursor_registry: Mutex<rustc_hash::FxHashMap<i64, Vec<RegisteredCursor>>>,
+    /// The database's branch store. Every pager built for a database carries it; on a TRUNK
+    /// pager it is what the copy decision in [`Pager::add_dirty`] consults before overwriting a
+    /// page that a live branch can still see.
+    branch_store: OnceLock<Arc<BranchStore>>,
+    /// Set when this pager serves a branch instead of the trunk: reads resolve through the
+    /// branch's page space and commits go to it, never to the WAL.
+    branch: OnceLock<BranchBinding>,
+    /// On a TRUNK pager: the table rows and the tables (written without naming rows) that the write
+    /// transaction in progress wrote while the trunk had a live child. Handed to the branch store at
+    /// commit, which stamps them with the commit's epoch (V3's KeyStamp; r13-compose, the Merger
+    /// port, from b161e861d); dropped at rollback. A savepoint rolled back keeps its entries:
+    /// over-stating a write set can only refuse a merge, never admit one.
+    trunk_pending: Mutex<TrunkPending>,
+    /// On a TRUNK pager, the write set's pre-images: each page as it was before this write
+    /// transaction first touched it, captured while the trunk had a live child. The branch store
+    /// takes the transaction's copy decisions from them at its commit (F-L on the durable store,
+    /// `BranchStore::begin_trunk_commit`), so a branch forked while the transaction is open is seen.
+    /// BLIND SPOT (stated, not bounded): one full page per page the transaction writes while the
+    /// trunk has a live child, held in memory until the commit; a huge trunk transaction with live
+    /// branches holds that many pages.
+    trunk_pre_images: Mutex<HashMap<u32, Box<[u8]>>>,
+    /// This trunk pager's commit holds the branch store's commit gate open: set when its commit
+    /// took its copy decisions, cleared when the gate is closed (after publication, or when the
+    /// write lock is released after a failed commit).
+    trunk_gate_open: AtomicBool,
+    /// How far the branch journal was on the device when this commit issued its WAL F_FULLFSYNC
+    /// (`BranchStore::order_riders`): durable once that flush returns (lead review 1 item 6).
+    trunk_sync_frontier: AtomicU64,
+    /// What this commit's barrier must make durable, fixed at its decisions
+    /// (`BranchStore::begin_trunk_commit`; lead review 1 item 10).
+    trunk_required: AtomicU64,
+    /// This commit's barrier ordered the branch records ahead of its WAL flush (`pending_full` set
+    /// for it): cleared, with the store's `pending_full`, when the commit ends however it ends
+    /// (`close_trunk_gate`; review 3 #9).
+    trunk_ordered: AtomicBool,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1697,7 +1834,50 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
+            branch_store: OnceLock::new(),
+            branch: OnceLock::new(),
+            trunk_pending: Mutex::new(TrunkPending::default()),
+            trunk_pre_images: Mutex::new(HashMap::new()),
+            trunk_gate_open: AtomicBool::new(false),
+            trunk_sync_frontier: AtomicU64::new(0),
+            trunk_required: AtomicU64::new(0),
+            trunk_ordered: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn set_branch_store(&self, store: Arc<BranchStore>) {
+        let _ = self.branch_store.set(store);
+    }
+
+    /// Bind this pager to a branch. Once, before the pager serves anything: a pager that had
+    /// cached trunk pages must have dropped them first (see `Database::connect_branch`).
+    pub(crate) fn bind_branch(&self, binding: BranchBinding) -> Result<()> {
+        self.branch.set(binding).map_err(|_| {
+            LimboError::InternalError("pager is already bound to a branch".to_string())
+        })
+    }
+
+    /// The branch this pager serves, or `None` for the trunk.
+    pub(crate) fn branch_id(&self) -> Option<BranchId> {
+        self.branch.get().map(|b| b.id)
+    }
+
+    /// Paths that rewrite pages WITHOUT going through `add_dirty` take no copy decision, so they
+    /// would change what a branch reads. They refuse while any branch exists, and on a branch.
+    fn refuse_if_branching(&self, what: &str) -> Result<()> {
+        let on_branch = self.branch.get().is_some();
+        let branches_exist = self.branch_store.get().is_some_and(|s| s.has_branches());
+        if on_branch || branches_exist {
+            return Err(LimboError::InvalidArgument(format!(
+                "{what} rewrites pages without a copy-on-write decision, so it is refused {}",
+                if on_branch {
+                    "on a branch connection"
+                } else {
+                    "while branches of this database exist"
+                }
+            )));
+        }
+        Ok(())
     }
 
     /// Add a cursor to the registry. Called from Cursor::new_btree once the
@@ -1923,7 +2103,7 @@ impl Pager {
             let page_id = page.get().id as u32;
             let contents = page.get_contents();
             let buffer = self.buffer_pool.allocate(page_size + 4);
-            let contents_buffer = contents.as_ptr();
+            let contents_buffer = contents.as_slice();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
@@ -2457,7 +2637,7 @@ impl Pager {
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice: &[u8] = page_content.as_ptr();
+                    let full_buffer_slice: &[u8] = page_content.as_slice();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset() within the full_buffer_slice.
@@ -2556,11 +2736,11 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
-                    self.add_dirty(&ptrmap_page)?;
+                    let wt = self.add_dirty(&ptrmap_page)?;
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice = page_content.as_ptr();
+                    let full_buffer_slice = page_content.as_mut(&wt);
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
                         return Err(LimboError::InternalError(format!(
@@ -2603,7 +2783,8 @@ impl Pager {
         };
         #[cfg(not(feature = "autovacuum"))]
         {
-            let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+            let (page, _wt) =
+                return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             Ok(IOResult::Done(page.get().id as u32))
         }
 
@@ -2614,7 +2795,7 @@ impl Pager {
                 AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
             match auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page =
+                    let (page, _wt) =
                         return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     Ok(IOResult::Done(page.get().id as u32))
                 }
@@ -2655,7 +2836,7 @@ impl Pager {
                             }
                             BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
                                 //  root_page_num here is the desired root page
-                                let page = return_if_io!(self.do_allocate_page(
+                                let (page, _wt) = return_if_io!(self.do_allocate_page(
                                     page_type,
                                     0,
                                     BtreePageAllocMode::Exact(root_page_num),
@@ -2710,16 +2891,16 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
-        let page = return_if_io!(self.allocate_page());
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<(PageRef, WriteTicket)>> {
+        let (page, wt) = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
         let contents = page.get_contents();
-        let buf = contents.as_ptr();
+        let buf = contents.as_mut(&wt);
         buf.fill(0);
 
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done((page, wt)))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -2730,21 +2911,21 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<IOResult<PageRef>> {
-        let page = return_if_io!(self.allocate_page());
+    ) -> Result<IOResult<(PageRef, WriteTicket)>> {
+        let (page, wt) = return_if_io!(self.allocate_page());
         #[cfg(debug_assertions)]
         turso_assert_eq!(
             offset,
             page.get_contents().offset(),
             "offset doesn't match computed offset for page"
         );
-        btree_init_page(&page, page_type, offset, self.usable_space());
+        btree_init_page(&page, page_type, offset, self.usable_space(), &wt);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
             page.get_contents().page_type().ok()
         );
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done((page, wt)))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -2808,7 +2989,11 @@ impl Pager {
             inner.buffer = Some(Arc::new(Buffer::new_temporary(size.get() as usize)));
         }
 
-        page.get_contents().write_database_header(&header);
+        // `page` was constructed two statements ago with a fresh temporary buffer and is not in
+        // the page cache: nothing else references it and its prior bytes are uninitialised, so
+        // there is no content for copy-on-write to preserve.
+        let wt = WriteTicket::no_cow_required();
+        page.get_contents().write_database_header(&header, &wt);
         page.set_loaded();
         page.clear_wal_tag();
 
@@ -2817,6 +3002,7 @@ impl Pager {
             PageType::TableLeaf,
             DatabaseHeader::SIZE,
             (size.get() - header.reserved_space as u32) as usize,
+            &wt,
         );
 
         self.init_page_1.store(Some(page));
@@ -3017,10 +3203,23 @@ impl Pager {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
+        if let Some(branch) = self.branch.get() {
+            // A branch's writes go to its own page space, never to the WAL, so it takes the
+            // branch's write lock and leaves the WAL's alone: branches write concurrently with the
+            // trunk and with each other.
+            branch.store.begin_write(branch.id)?;
+            return Ok(IOResult::Done(()));
+        }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
+        // Every path that released the last write lock closed its commit gate (review A-F1).
+        turso_debug_assert!(!self.trunk_gate_open.load(Ordering::Acquire));
         wal.begin_write_tx(allowed_auto_actions)?;
+        // A transaction that rolled back left its merge writes and its captures here; this one
+        // starts from none.
+        *self.trunk_pending.lock() = TrunkPending::default();
+        self.trunk_pre_images.lock().clear();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3055,6 +3254,7 @@ impl Pager {
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+        self.refuse_if_branching("VACUUM")?;
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
@@ -3083,6 +3283,9 @@ impl Pager {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
+        }
+        if let Some(branch) = self.branch.get() {
+            return self.commit_branch_tx(branch, connection, update_transaction_state);
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
@@ -3136,8 +3339,24 @@ impl Pager {
                         _ => false,
                     };
 
+                    // The branch store's merge record: this transaction's writes are committed, and
+                    // are stamped with the trunk's epoch while the commit gate is still open (no
+                    // fork registers inside it, so the epoch is the one the commit's copy decisions
+                    // were taken at) and the WAL write lock is still held (no merge validation, which
+                    // runs inside a trunk write transaction, falls between the commit and its
+                    // stamps). Then the gate closes.
+                    let stamped = self.finish_trunk_write(true);
+                    crate::branch::store::kill_point("trunk.published");
+
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    // Pruned off the WAL write lock (A19 of r11-merge): a prune drops only stamps
+                    // no live or future trunk child can be refused by.
+                    if stamped {
+                        if let Some(store) = self.branch_store.get() {
+                            store.prune_stamps();
+                        }
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3165,6 +3384,59 @@ impl Pager {
         }
     }
 
+    /// Commit a branch transaction: copy each dirty page into the slot its copy decision
+    /// allocated, then publish nothing to the WAL. The pages were decided at their first
+    /// `add_dirty`, so a dirty page with no slot behind it is an error, not a fallback.
+    fn commit_branch_tx(
+        &self,
+        branch: &BranchBinding,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
+        let schema_did_change = matches!(
+            connection.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        let dirty: Vec<PageRef> = {
+            let dirty_pages = self.dirty_pages.read();
+            let mut cache = self.page_cache.write();
+            let mut pages = Vec::with_capacity(dirty_pages.len() as usize);
+            for page_id in dirty_pages.iter() {
+                // Spilling is off on a branch pager, so a dirty page cannot have been evicted.
+                let page = cache
+                    .peek(&PageCacheKey::new(page_id as usize), false)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "dirty branch page {page_id} is not in the page cache"
+                        ))
+                    })?;
+                pages.push(page);
+            }
+            pages
+        };
+        branch.store.commit_pages(branch.id, &dirty)?;
+        if schema_did_change {
+            branch
+                .store
+                .set_schema(branch.id, connection.schema.read().clone())?;
+        }
+        for page in &dirty {
+            page.clear_dirty();
+        }
+        self.dirty_pages.write().clear();
+        branch.store.end_write(branch.id);
+        if let Some(wal) = self.wal.as_ref() {
+            wal.end_read_tx();
+        }
+        if update_transaction_state {
+            connection.set_tx_state(TransactionState::None);
+        }
+        self.clear_savepoints()?;
+        Ok(IOResult::Done(()))
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
         if connection.is_nested_stmt() {
@@ -3180,6 +3452,10 @@ impl Pager {
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
+        if is_write && self.branch.get().is_none() {
+            // A rolled-back trunk transaction stamps nothing.
+            *self.trunk_pending.lock() = TrunkPending::default();
+        }
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
@@ -3187,7 +3463,7 @@ impl Pager {
             // Otherwise, another thread could commit new frames to frame_cache between
             // end_write_tx() and rollback(), and rollback() would incorrectly remove them.
             self.rollback(schema_did_change, connection, is_write);
-            wal.end_write_tx();
+            self.end_write_tx();
         } else {
             self.rollback(schema_did_change, connection, is_write);
         }
@@ -3214,6 +3490,12 @@ impl Pager {
 
     /// End just the write transaction on the WAL, without affecting the read lock.
     pub fn end_write_tx(&self) {
+        if let Some(branch) = self.branch.get() {
+            branch.store.end_write(branch.id);
+            return;
+        }
+        // A commit that failed after its copy decisions left the gate open (F-L).
+        self.close_trunk_gate();
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3229,6 +3511,9 @@ impl Pager {
     }
 
     pub fn holds_write_lock(&self) -> bool {
+        if let Some(branch) = self.branch.get() {
+            return branch.store.holds_writer(branch.id);
+        }
         let Some(wal) = self.wal.as_ref() else {
             return false;
         };
@@ -3251,6 +3536,7 @@ impl Pager {
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
+            self.close_trunk_gate();
             wal.end_write_tx();
         } else {
             self.cleanup_read_tx();
@@ -3270,6 +3556,11 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
+        if let Some(branch) = self.branch.get() {
+            if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
+                return Ok(read);
+            }
+        }
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -3386,6 +3677,45 @@ impl Pager {
         }
     }
 
+    /// Read `page_idx` from the branch's page space, if the branch sees a version that lives there.
+    /// `None` means the branch sees the trunk's current version, which the caller reads through
+    /// the ordinary WAL / database-file path under the branch connection's WAL read snapshot.
+    fn read_branch_page(
+        &self,
+        branch: &BranchBinding,
+        page_idx: i64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<(PageRef, Completion)>> {
+        if frame_watermark.is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager does not read the WAL at an explicit watermark".to_string(),
+            ));
+        }
+        let buf = Arc::new(self.buffer_pool.get_page());
+        if !branch
+            .store
+            .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
+        {
+            return Ok(None);
+        }
+        let page = Arc::new(Page::new(page_idx));
+        page.set_locked();
+        let len = buf.len();
+        let loaded = page.clone();
+        let c = Completion::new_read(buf, move |res| {
+            let Ok((buf, _)) = res else {
+                loaded.clear_locked();
+                return None;
+            };
+            sqlite3_ondisk::finish_read_page(page_idx as usize, buf, loaded.clone());
+            None
+        });
+        // The bytes are already in the buffer: complete the read in place, as an in-memory IO
+        // backend would.
+        c.complete(len as i32);
+        Ok(Some((page, c)))
+    }
+
     fn begin_read_disk_page(
         &self,
         page_idx: usize,
@@ -3489,12 +3819,16 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
-    pub fn add_dirty(&self, page: &Page) -> Result<()> {
+    /// Make the copy-on-write decision for `page` and return the [`WriteTicket`] that permits
+    /// writing it. This is the *only* source of tickets, which is what makes the decision
+    /// unskippable: see [`WriteTicket`].
+    pub fn add_dirty(&self, page: &Page) -> Result<WriteTicket> {
         turso_assert!(
             page.is_loaded(),
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id }
         );
+        self.copy_on_write_decision(page)?;
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
@@ -3509,7 +3843,140 @@ impl Pager {
             self.page_cache.write().notify_page_dirty(key);
         }
         page.set_dirty();
+        Ok(WriteTicket(()))
+    }
+
+    /// The branch copy-on-write decision, taken at a page's FIRST `add_dirty` in a transaction:
+    /// the moment before its first byte changes, and the only place a [`WriteTicket`] is minted,
+    /// so no page write can skip it.
+    ///
+    /// * On a branch: a fresh slot of the branch's own page space is reserved for the page; the
+    ///   commit writes the page there and moves the branch's map to it (the version it replaces is
+    ///   kept for a live child that can still see it, else freed). A rollback returns the slot.
+    /// * On the trunk: the page as it is now — the version this transaction overwrites — is
+    ///   captured while the trunk has a live child, and the decision is taken at the commit, against
+    ///   the epoch there (`BranchStore::begin_trunk_commit`): a live branch that can still see the
+    ///   version gets a durable copy before the commit's first frame is written, so neither the
+    ///   commit nor a later checkpoint reaches it, and a branch forked while the transaction is open
+    ///   is seen (F-L on the durable store).
+    ///
+    /// A page that is already dirty was decided at its first `add_dirty` in this transaction. A page
+    /// dirtied again after a spill or a savepoint rollback keeps its first capture.
+    fn copy_on_write_decision(&self, page: &Page) -> Result<()> {
+        if page.is_dirty() {
+            return Ok(());
+        }
+        let page_no = page.get().id as u32;
+        if let Some(branch) = self.branch.get() {
+            return branch.store.first_write_branch(branch.id, page_no);
+        }
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                // A trunk-only store refuses every trunk page write here, at the first one.
+                store.refuse_if_trunk_only("a trunk page write")?;
+                self.trunk_pre_images
+                    .lock()
+                    .entry(page_no)
+                    .or_insert_with(|| page.get_contents().as_slice().into());
+            }
+        }
         Ok(())
+    }
+
+    /// End a raw WAL session's trunk write transaction (`Connection::wal_insert_end`), before its
+    /// caller releases the WAL write lock: a commit it made is stamped and its commit gate closed,
+    /// as `commit_dirty_pages` does; otherwise its merge writes and captures are dropped and a gate
+    /// a failed commit left open is closed (review A-F1: the session released the lock with the
+    /// gate open). Returns whether stamps were made, for `prune_branch_stamps` once the lock is
+    /// released.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub(crate) fn end_raw_trunk_write(&self, committed: bool) -> bool {
+        // fastest-engine mutant `raw_gate_left_open` (test builds only): as before review A-F1.
+        if crate::branch::store::fe_mutant("raw_gate_left_open") {
+            return false;
+        }
+        self.finish_trunk_write(committed)
+    }
+
+    /// The end of a trunk write transaction, still under its WAL write lock (review 3 #20): a commit
+    /// that `committed` has its merge writes stamped with the trunk's epoch while its commit gate is
+    /// open, then the gate closes; otherwise the pending writes and captures are dropped and a gate
+    /// a failed commit left open is closed. Every trunk commit path ends here: `commit_dirty_pages`,
+    /// a raw WAL session's end, and an attached pager's commit. Returns whether stamps were made,
+    /// for `prune_branch_stamps` once the lock is released.
+    pub(crate) fn finish_trunk_write(&self, committed: bool) -> bool {
+        let tx = std::mem::take(&mut *self.trunk_pending.lock());
+        self.trunk_pre_images.lock().clear();
+        let stamped = match self.branch_store.get() {
+            Some(store) if committed => store.stamp_committed(tx),
+            _ => false,
+        };
+        self.close_trunk_gate();
+        stamped
+    }
+
+    /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
+    /// lock, as `commit_dirty_pages` does).
+    pub(crate) fn prune_branch_stamps(&self) {
+        if let Some(store) = self.branch_store.get() {
+            store.prune_stamps();
+        }
+    }
+
+    /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
+    /// commit's frames are published, or when the write lock is released after a failed commit.
+    pub(crate) fn close_trunk_gate(&self) {
+        let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
+        if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
+            if let Some(store) = self.branch_store.get() {
+                store.end_trunk_commit();
+            }
+        } else if ordered && !crate::branch::store::fe_mutant("ordered_pending_kept") {
+            // A gate-less (childless) commit that ordered its barrier: no `end_trunk_commit` clears
+            // the `pending_full` it set (review 3 #9). Mutant `ordered_pending_kept` (test builds
+            // only).
+            if let Some(store) = self.branch_store.get() {
+                store.release_pending_full();
+            }
+        }
+    }
+
+    /// A table cursor wrote or deleted `rowid` in the b-tree rooted at `root`. On the trunk, while
+    /// it has a live child, the row joins the transaction's pending merge writes, stamped when it
+    /// commits. On a branch nothing is recorded: the Merger DERIVES a branch's writes from its own
+    /// pages at merge time (r13-compose A5), so no second record of them can be lost.
+    pub(crate) fn note_row_write(&self, root: i64, rowid: i64) {
+        if self.branch.get().is_some() {
+            return;
+        }
+        // r13-compose A3.F17: under R13_MERGER=off the -MRG arm records nothing for stamping
+        // (review wf_5c230f31 L: the per-write insert had stayed on).
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() && !crate::branch::store::knob_off("merger") {
+                self.trunk_pending.lock().rows.insert((root, rowid));
+            }
+        }
+    }
+
+    /// A cursor wrote the table rooted at `root` without naming the rows (clear, destroy,
+    /// incremental blob I/O). On the trunk, while it has a live child, the whole table is stamped
+    /// at the commit; on a branch nothing is recorded (see [`Pager::note_row_write`]).
+    pub(crate) fn note_bulk_write(&self, root: i64) {
+        if self.branch.get().is_some() {
+            return;
+        }
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() && !crate::branch::store::knob_off("merger") {
+                self.trunk_pending.lock().tables.insert(root);
+            }
+        }
+    }
+
+    /// Run `f` over what the trunk write transaction in progress has written so far (a merge
+    /// validates later batch members against it).
+    pub(crate) fn with_trunk_pending<T>(&self, f: impl FnOnce(&TrunkPending) -> T) -> T {
+        let pending = self.trunk_pending.lock();
+        f(&pending)
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -3529,6 +3996,12 @@ impl Pager {
     /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cacheflush writes dirty pages to the WAL; a branch's pages never go there"
+                    .to_string(),
+            ));
+        }
         let wal = self
             .wal
             .as_ref()
@@ -3808,6 +4281,13 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
+        if self.branch.get().is_some() {
+            // Spilling writes uncommitted pages to the WAL. A branch's pages never go there, and
+            // writing them into the branch's own slots before commit would make a rollback
+            // unrecoverable, so they stay resident: the capacity is a soft limit (see
+            // `cache_insert`) and the cache admits them over it.
+            return Ok(IOResult::Done(()));
+        }
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -4107,6 +4587,75 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
+        // A branch pager commits to its branch (`commit_wal_inner` refuses it too): refused before
+        // it could open the TRUNK's commit gate without the WAL write lock (review A-F1).
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager must commit to its branch, never to the WAL".to_string(),
+            ));
+        }
+        // The branch store's copy decisions for this commit, once (IO re-entry finds the gate open):
+        // taken now, against the trunk's epoch now, from the pre-images captured at first write, and
+        // the commit gate opened until the frames are published (F-L on the durable store).
+        if let Some(store) = self.branch_store.get() {
+            // A trunk with no live child, now or at any page's first write (the first child needs
+            // this commit's WAL write lock), takes no copy decision and opens no gate (lead review
+            // 1 item 10); its barrier still covers every early-released Release. Mutant
+            // `childless_commit_gated` (test builds only).
+            let childless = !self.trunk_gate_open.load(Ordering::Acquire)
+                && !store.trunk_has_children()
+                && self.trunk_pre_images.lock().is_empty()
+                && !crate::branch::store::fe_mutant("childless_commit_gated");
+            if childless {
+                self.trunk_required.store(store.barrier_floor(), Ordering::Release);
+            } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
+                let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
+                let decided = {
+                    let dirty = self.dirty_pages.read();
+                    store.begin_trunk_commit(
+                        dirty
+                            .iter()
+                            .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
+                    )
+                };
+                if let Ok(required) = decided {
+                    self.trunk_required.store(required, Ordering::Release);
+                }
+                if let Err(e) = decided {
+                    // fastest-engine mutant `decision_retry_skips` (test builds only): as before
+                    // review A-F2, the latch stays set and the retry takes no decision.
+                    if crate::branch::store::fe_mutant("decision_retry_skips") {
+                        return Err(e);
+                    }
+                    // A pass refused part-way (a catalog read's `Busy`, retried by the statement)
+                    // is taken again whole on the retry (review A-F2): the captures go back, and
+                    // the gate the store closed on its way out is no longer this pager's. A page
+                    // decided already is decided again harmlessly (its `written` is this epoch, or
+                    // a child forked since needs the copy too).
+                    let mut images = self.trunk_pre_images.lock();
+                    for (page, bytes) in captured {
+                        images.entry(page).or_insert(bytes);
+                    }
+                    self.trunk_gate_open.store(false, Ordering::Release);
+                    return Err(e);
+                }
+            }
+        }
+        // Durable branches: every pre-image this transaction retained for a live branch must be
+        // durable before the commit that overwrites its page can be, or a crash after this commit
+        // leaves the branch reading the NEW page. Idempotent across IO re-entry.
+        if let Some(store) = self.branch_store.get() {
+            let trunk = crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type());
+            // Whether this commit's WAL flush carries the branch files (ordered mode) is read from
+            // the WAL file it syncs, each time (review 3 #3).
+            if trunk == crate::branch::SyncClass::FullFsync {
+                store.note_trunk_wal(self.wal.as_ref().and_then(|wal| wal.full_fsync_device()));
+            }
+            if store.durability_barrier_ordered(trunk, self.trunk_required.load(Ordering::Acquire))? {
+                self.trunk_ordered.store(true, Ordering::Release);
+            }
+        }
+
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
@@ -4126,6 +4675,11 @@ impl Pager {
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager must commit to its branch, never to the WAL".to_string(),
+            ));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("commit_wal() called without WAL");
             return Err(LimboError::InternalError(
@@ -4356,6 +4910,7 @@ impl Pager {
                 // to ensure durability in the case of partial writes is to ensure the pwritev
                 // completes before the fsync is submitted.
                 CommitState::WaitSync => {
+                    crate::branch::store::kill_point("trunk.wal_written");
                     // A pending completion means a previous entry into this
                     // state already submitted the fsync; wait on it instead
                     // of submitting a second one. At most one fsync is ever in
@@ -4371,6 +4926,16 @@ impl Pager {
                     let sync_c = match pending {
                         Some(c) => Some(c),
                         None if sync_mode == SyncMode::Full && need_fsync => {
+                            // The branch records buffered since this commit's pre-image barrier ride
+                            // its WAL flush (lead review 1 item 6), and how far the branch journal is
+                            // on the device ahead of it is noted, to be marked durable when it returns.
+                            if let Some(store) = self.branch_store.get() {
+                                let frontier = store.order_riders(crate::branch::SyncClass::of_trunk(
+                                    sync_mode,
+                                    self.get_sync_type(),
+                                ));
+                                self.trunk_sync_frontier.store(frontier, Ordering::Release);
+                            }
                             let sync_c = wal.sync(self.get_sync_type())?;
                             self.commit_info.write().completions.push(sync_c.clone());
                             Some(sync_c)
@@ -4394,12 +4959,21 @@ impl Pager {
                                     sync_c.get_error()
                                 );
                             }
+                            self.trunk_sync_frontier.store(0, Ordering::Release);
                             return Err(LimboError::CompletionError(CompletionError::IOError(
                                 std::io::ErrorKind::Other,
                                 "sync",
                             )));
                         }
                         commit_info.completions.clear();
+                        // The WAL's F_FULLFSYNC drained the device: the branch journal noted before
+                        // it is durable too (lead review 1 item 6).
+                        let frontier = self.trunk_sync_frontier.swap(0, Ordering::AcqRel);
+                        if frontier > 0 {
+                            if let Some(store) = self.branch_store.get() {
+                                store.trunk_wal_synced(frontier);
+                            }
+                        }
                     }
                     let mut commit_info = self.commit_info.write();
                     if commit_info.prepared_frames.is_empty() {
@@ -4489,6 +5063,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        self.refuse_if_branching("wal_insert_frame")?;
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -4507,7 +5082,12 @@ impl Pager {
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
-            content.as_ptr().copy_from_slice(raw_page);
+            // The frame is already durably in the WAL (`write_frame_raw` above); this only brings
+            // the cached copy in line with it. Marking the page dirty here would schedule a
+            // spurious write-back of bytes the WAL already owns.
+            content
+                .as_mut(&WriteTicket::no_cow_required())
+                .copy_from_slice(raw_page);
             turso_assert!(
                 page.get().id == header.page_number as usize,
                 "page has unexpected id"
@@ -4659,6 +5239,12 @@ impl Pager {
         clear_page_cache: bool,
         lock_source: CheckpointLockSource,
     ) -> Result<IOResult<CheckpointResult>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint is the trunk's WAL maintenance; run it on a trunk connection"
+                    .to_string(),
+            ));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -5096,6 +5682,11 @@ impl Pager {
         allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
+        if self.branch.get().is_some() {
+            // A branch connection never wrote the WAL; its shutdown leaves WAL maintenance to the
+            // trunk's connections.
+            return Ok(());
+        }
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
@@ -5247,16 +5838,18 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(&trunk_page)?;
+                        let wt = self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                             number_of_leaf_pages + 1,
+                            &wt,
                         );
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
                                 + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
                             page_id as u32,
+                            &wt,
                         );
 
                         // Unpin page before finishing - it's added to freelist
@@ -5270,16 +5863,19 @@ impl Pager {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
-                    self.add_dirty(page)?;
+                    let wt = self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     let contents = page.get_contents();
                     // Point to previous trunk
-                    contents
-                        .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
+                    contents.write_u32_no_offset(
+                        FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+                        trunk_page_id,
+                        &wt,
+                    );
                     // Zero leaf count
-                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
+                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0, &wt);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
@@ -5330,8 +5926,12 @@ impl Pager {
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
                 let page = allocate_new_page(1, &self.buffer_pool);
 
+                // Page 1 was just constructed here and is not in the page cache yet: no other
+                // reference exists and its previous bytes are uninitialised, so there is no
+                // prior content for copy-on-write to preserve.
+                let wt = WriteTicket::no_cow_required();
                 let contents = page.get_contents();
-                contents.write_database_header(&default_header);
+                contents.write_database_header(&default_header, &wt);
 
                 let page1 = page;
                 // Create the sqlite_schema table, for this we just need to create the btree page
@@ -5344,6 +5944,7 @@ impl Pager {
                     DatabaseHeader::SIZE,
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
+                    &wt,
                 );
                 let c = begin_write_btree_page(self, &page1)?;
 
@@ -5415,7 +6016,7 @@ impl Pager {
     ///        or allocate a new page.
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+    pub fn allocate_page(&self) -> Result<IOResult<(PageRef, WriteTicket)>> {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
@@ -5532,14 +6133,14 @@ impl Pager {
                     // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    self.add_dirty(trunk_page)?;
+                    let wt = self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
                         "Freelist trunk page has overflow cells",
                         { "page_id": trunk_page.get().id }
                     );
-                    trunk_page.get_contents().as_ptr().fill(0);
+                    trunk_page.get_contents().as_mut(&wt).fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5553,7 +6154,7 @@ impl Pager {
                     trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(trunk_page));
+                    return Ok(IOResult::Done((trunk_page, wt)));
                 }
                 AllocatePageState::ReuseFreelistLeaf {
                     trunk_page,
@@ -5566,14 +6167,14 @@ impl Pager {
                         { "page_id": leaf_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
-                    self.add_dirty(leaf_page)?;
+                    let leaf_wt = self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
                         "Freelist leaf page has overflow cells",
                         { "page_id": leaf_page.get().id }
                     );
-                    leaf_page.get_contents().as_ptr().fill(0);
+                    leaf_page.get_contents().as_mut(&leaf_wt).fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5585,12 +6186,12 @@ impl Pager {
                     }
 
                     // Mark trunk page dirty BEFORE modifying it so subjournal captures original content
-                    self.add_dirty(trunk_page)?;
+                    let trunk_wt = self.add_dirty(trunk_page)?;
 
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
-                        let buf = page_contents.as_ptr();
+                        let buf = page_contents.as_mut(&trunk_wt);
                         // use copy within the same page
                         let offset_remaining_leaves_start =
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE;
@@ -5605,6 +6206,7 @@ impl Pager {
                     page_contents.write_u32_no_offset(
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
+                        &trunk_wt,
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
@@ -5613,7 +6215,7 @@ impl Pager {
                     leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(leaf_page));
+                    return Ok(IOResult::Done((leaf_page, leaf_wt)));
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
@@ -5643,7 +6245,7 @@ impl Pager {
                     let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                     {
                         // setup page and add to cache
-                        self.add_dirty(&page)?;
+                        let wt = self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
                         self.page_cache
@@ -5651,7 +6253,7 @@ impl Pager {
                             .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
-                        return Ok(IOResult::Done(page));
+                        return Ok(IOResult::Done((page, wt)));
                     }
                 }
             }
@@ -5721,6 +6323,9 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
+            if let Some(branch) = self.branch.get() {
+                branch.store.abort_write(branch.id);
+            }
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -5731,9 +6336,16 @@ impl Pager {
         // Invalidate cached schema cookie since rollback may have restored the database schema cookie
         self.set_schema_cookie(None);
         if schema_did_change {
-            *connection.schema.write() = connection.db.clone_schema();
+            *connection.schema.write() = match self.branch.get() {
+                Some(branch) => branch
+                    .store
+                    .schema(branch.id)
+                    .expect("the branch is open, so it exists"),
+                None => connection.db.clone_schema(),
+            };
         }
-        if is_write {
+        // A branch transaction never appended to the WAL, so there is nothing there to undo.
+        if is_write && self.branch.get().is_none() {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }
@@ -5922,7 +6534,10 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         )));
     }
 
-    page.get_contents().write_database_header(&default_header);
+    // Same as above: a locally constructed page 1 that has not been published to the page
+    // cache, so there are no prior bytes to preserve.
+    let wt = WriteTicket::no_cow_required();
+    page.get_contents().write_database_header(&default_header, &wt);
     page.set_loaded();
     page.clear_wal_tag();
 
@@ -5931,6 +6546,7 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         PageType::TableLeaf,
         DatabaseHeader::SIZE, // offset of 100 bytes
         (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+        &wt,
     );
 
     page
@@ -6258,7 +6874,7 @@ mod tests {
             .collect();
         assert_eq!(held.len(), CAP, "cache should be at capacity");
 
-        let page = pager.io.block(|| pager.allocate_page()).unwrap();
+        let (page, _wt) = pager.io.block(|| pager.allocate_page()).unwrap();
         assert_eq!(page.get().id, 6);
         assert!(
             pager.page_cache.read().len() > CAP,

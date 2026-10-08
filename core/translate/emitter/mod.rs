@@ -206,6 +206,9 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
+    /// Compile with no triggers: the connection is applying a branch merge's row images
+    /// (`Connection::row_image_apply`).
+    pub(crate) triggers_disabled: bool,
 }
 
 #[derive(Clone)]
@@ -320,6 +323,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
+            triggers_disabled: false,
         }
     }
 
@@ -353,6 +357,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            triggers_disabled: self.triggers_disabled,
         }
     }
 
@@ -378,6 +383,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            triggers_disabled: self.triggers_disabled,
         }
     }
 

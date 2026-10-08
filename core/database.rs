@@ -81,6 +81,18 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    /// Whether branches (see [`crate::branch`]) survive the process. Volatile by default.
+    pub branch_durability: crate::branch::BranchDurability,
+    /// The lease every new branch is given; `None` (the default) forks branches that never
+    /// expire unless `Branch::lease` gives them one.
+    pub branch_lease: Option<std::time::Duration>,
+    /// The F7 SPLICE arm of the branch store (r11-ever, UNBUILT): a released branch left with one
+    /// live child is spliced into it. Off by default; a durable store opens only in the arm its
+    /// files were written in.
+    pub branch_splice: bool,
+    /// How a catalog store checkpoints; `None` (the default) lets the open choose (see
+    /// [`crate::branch::BranchCheckpoint::resolve`]).
+    pub branch_checkpoint: Option<crate::branch::BranchCheckpoint>,
 }
 
 impl DatabaseOpts {
@@ -141,6 +153,26 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_branch_durability(mut self, durability: crate::branch::BranchDurability) -> Self {
+        self.branch_durability = durability;
+        self
+    }
+
+    pub fn with_branch_lease(mut self, lease: Option<std::time::Duration>) -> Self {
+        self.branch_lease = lease;
+        self
+    }
+
+    pub fn with_branch_splice(mut self, splice: bool) -> Self {
+        self.branch_splice = splice;
+        self
+    }
+
+    pub fn with_branch_checkpoint(mut self, checkpoint: crate::branch::BranchCheckpoint) -> Self {
+        self.branch_checkpoint = Some(checkpoint);
         self
     }
 
@@ -207,7 +239,8 @@ impl EncryptionOpts {
 pub struct OpenOptions {
     /// Pre-opened database storage for the file at the database path.
     storage: Option<Arc<dyn DatabaseStorage>>,
-    /// WAL file path override. Defaults to `"{path}-wal"`. Only honored by
+    /// WAL file path override. Defaults to `"{name}-wal"`, where `{name}` is the database file's
+    /// resolved path (`sidecar_base`; the path as given when it names no file here). Only honored by
     /// [`Database::do_open`]/[`Database::do_open_async`]; the registry-aware
     /// [`Database::open`]/[`Database::open_async`] reject it, because the
     /// process-wide registry keys on the default WAL for a path.
@@ -222,6 +255,9 @@ pub struct OpenOptions {
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
     dialect: Arc<dyn Dialect>,
+    /// This open is an ATTACH's: the registry's branch-store check exempts it from durability and
+    /// lease matching (see `check_registry_branch_store`).
+    for_attach: bool,
 }
 
 impl OpenOptions {
@@ -238,7 +274,17 @@ impl OpenOptions {
             durable_storage: None,
             allocator: alloc::DynAllocator::default(),
             dialect,
+            for_attach: false,
         }
+    }
+
+    /// Mark this open as an ATTACH's (review 8 F2). Its only caller, `from_uri_attached`, exists
+    /// only with `fs`; gated the same, so a build without `fs` has no dead code (review 9
+    /// finding 8).
+    #[cfg(feature = "fs")]
+    pub(crate) fn for_attach(mut self) -> Self {
+        self.for_attach = true;
+        self
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
@@ -246,7 +292,8 @@ impl OpenOptions {
         self
     }
 
-    /// Override the WAL file path (defaults to `"{path}-wal"`). Only honored
+    /// Override the WAL file path (defaults to `"{name}-wal"`, `{name}` being the database file's
+    /// resolved path: see `sidecar_base`). Only honored
     /// by [`Database::do_open`]/[`Database::do_open_async`]; passing it to the
     /// registry-aware entry points is an error.
     pub fn wal_path(mut self, wal_path: impl Into<String>) -> Self {
@@ -294,6 +341,267 @@ impl OpenOptions {
 /// in-memory database.
 pub(crate) fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
+}
+
+/// The one path every sidecar file of a file-backed database is named from — its WAL (unless the
+/// caller names one), its MVCC logical log (`with_extension("db-log")`), and its branch log, arena
+/// and snapshot — and the one the sync engine names the same files from (`sidecar_wal_path`,
+/// `sidecar_mvcc_log_path`). The open computes it ONCE, after the database file is open, and keeps
+/// it (`Database::sidecar_name`) (review 4 C3, review 5 C3-2 and C3-4): a symlinked open that
+/// named some sidecars from the path it was given and others from the resolved one split one
+/// database's state across two sets of files.
+///
+/// `Ok(None)` means the path names no file on this filesystem (`NotFound`: storage the caller
+/// supplied, such as a `MemoryIO` name). Sidecars then keep the given name, which lives in that
+/// IO's namespace; a DURABLE store's branch files, which are always real files, use
+/// [`absolute_path`] (a volatile store only checks for branch files, and needs no working
+/// directory: review 5 C3-3). Every other failure to resolve REFUSES the open, naming the error
+/// (review 4 C4): falling back to an unresolved name is how a symlinked open missed the real
+/// path's files.
+///
+/// BLIND SPOTS. The names follow the PATH, while the registry knows the file by (dev, ino):
+/// * a hard link, or a bind mount, has no canonical name, so it names other sidecars;
+/// * a database deleted and recreated at the same path inherits the old one's sidecars, and a
+///   renamed database leaves them behind for whatever file takes its old name next;
+/// * the database file is opened BEFORE its path is resolved; a link retargeted in between is
+///   caught only if it moves again before `refuse_sidecars_under_another_name` compares the two
+///   identities — closing the window needs the opened descriptor's identity, which Turso's
+///   `File` trait does not expose;
+/// * on non-unix targets nothing is resolved: an existing file's name is only made absolute.
+///
+/// The `-wal` has always had each of these; SQLite lists hard links and renames among the ways to
+/// corrupt a database.
+pub(crate) fn sidecar_base(path: &str) -> Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        match std::fs::canonicalize(path) {
+            Ok(real) => real.into_os_string().into_string().map(Some).map_err(|_| {
+                LimboError::InvalidArgument(format!(
+                    "{path}: its resolved path is not UTF-8, so its WAL and branch files cannot be \
+                     named from it"
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LimboError::InvalidArgument(format!(
+                "cannot resolve {path} ({e}): refusing to name its WAL and branch files from an \
+                 unresolved path"
+            ))),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if Path::new(path).exists() {
+            absolute_path(path).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The name every sidecar of the database at `path` is derived from: `sidecar_base`, or the path
+/// as given when it names no file on this filesystem or is in memory.
+fn sidecar_name(path: &str) -> Result<String> {
+    if is_memory_like(path) {
+        return Ok(path.to_string());
+    }
+    Ok(sidecar_base(path)?.unwrap_or_else(|| path.to_string()))
+}
+
+/// The WAL the core opens by default for the database at `path` — for code outside the core that
+/// must name the same file, such as the sync engine (review 5 C3-2).
+pub fn sidecar_wal_path(path: &str) -> Result<String> {
+    Ok(format!("{}-wal", sidecar_name(path)?))
+}
+
+/// The MVCC logical log the core opens for the database at `path` (see `sidecar_wal_path`).
+pub fn sidecar_mvcc_log_path(path: &str) -> Result<String> {
+    Path::new(&sidecar_name(path)?)
+        .with_extension("db-log")
+        .into_os_string()
+        .into_string()
+        .map_err(|_| LimboError::InvalidArgument(format!("{path}: its log path is not UTF-8")))
+}
+
+/// `path` made absolute against the working directory NOW, so a later `chdir` cannot move the
+/// files named from it (review 4 C4; the pattern of `stable_lock_path`).
+pub(crate) fn absolute_path(path: &str) -> Result<String> {
+    let given = Path::new(path);
+    let absolute = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| io_error(e, "resolve the working directory"))?
+            .join(given)
+    };
+    absolute.into_os_string().into_string().map_err(|_| {
+        LimboError::InvalidArgument(format!("{path}: its absolute path is not UTF-8"))
+    })
+}
+
+/// Refuse to open past a sidecar left under a name other than the canonical one (review 4 C3): a
+/// WAL, MVCC log or branch file written through a symlink before sidecars were named from `real`.
+/// Opening would silently miss what it holds. Two refinements (review 5):
+/// * only a sidecar that can HOLD something is refused (C3-1). A WAL of at most its 32-byte header
+///   (what a clean close with checkpoints leaves: a Truncate checkpoint never removes the file), an
+///   MVCC log of at most its `LOG_HDR_SIZE` header, and an empty branch file carry nothing to lose:
+///   they are left in place, untouched;
+/// * "the same file" is decided by identity, (dev, ino), not by path string (C3-5), so a sidecar
+///   reached through a symlinked directory or a hard link is recognised as the canonical one.
+///
+/// Every refusal names a remedy that is TRUE for its kind of file, checked against the code that
+/// reads it, and none acted through `given`, which may have been retargeted since the file was
+/// written (review 6 item 4). The earlier advice, "open through the old name and close cleanly,
+/// which checkpoints", was false where close runs no checkpoint (MVCC, the sync engine, a
+/// connection with checkpoints disabled) and replayed one database's frames onto another when the
+/// link had moved.
+///
+/// Unix only: elsewhere `sidecar_base` resolves nothing, so no second name can arise.
+#[cfg(unix)]
+fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool) -> Result<()> {
+    use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+    /// A WAL no longer than its header holds no frame.
+    const WAL_HEADER_LEN: u64 = 32;
+    if given == real {
+        return Ok(());
+    }
+    // The database itself: the name the file was opened by must still reach the file `real`
+    // names, or a link was retargeted during the open.
+    if !same_file(Path::new(given), Path::new(real))? {
+        return Err(LimboError::InvalidArgument(format!(
+            "{given} no longer names the file {real} it resolved to: the link changed while the \
+             database was being opened"
+        )));
+    }
+    let others = crate::branch::journal::BranchFiles::for_db(given);
+    let ours = crate::branch::journal::BranchFiles::for_db(real);
+    let mvcc_log = |base: &str| Path::new(base).with_extension("db-log");
+    // (the name as given, the canonical name, the most bytes that hold nothing, and — for a
+    // sidecar an earlier build named from the path as given — what it holds).
+    let mut sidecars: Vec<(std::path::PathBuf, std::path::PathBuf, u64, Option<&str>)> = vec![
+        // Branch files keep 0: no EARLIER build of this fork named them from the path as given
+        // (every durable-branch commit before 80d88be66, which first named them from the resolved
+        // path, is UNBUILT), and this build does so only for storage that is not a file here (the
+        // `None if durable => absolute_path` arm at open) — so one found under another name was
+        // written that way for real (review 8 F4).
+        (others.log, ours.log, 0, None),
+        (others.snap, ours.snap, 0, None),
+        (others.arena, ours.arena, 0, None),
+        (others.cat, ours.cat, 0, None),
+        // A logical log of at most `LOG_HDR_SIZE` bytes is its header alone and holds no
+        // transaction: recovery returns at once for it, the replay boundary lives in the database
+        // file (`__turso_internal_mvcc_meta`), and the salt regenerates. A FIRST MVCC bootstrap
+        // that commits nothing leaves exactly that; a checkpoint leaves 0 bytes; commits leave
+        // more, and no close truncates them (review 6 §2 corrected an earlier comment here).
+        // An old-name log comes only from the three paths that named the log from the GIVEN path
+        // before review 5 — the existence check at open, the external restore
+        // (`reload_wal_after_external_restore`) and a fresh ATTACH's conversion to MVCC — since
+        // upstream's Init and journal-mode switch already opened it at the canonical path.
+        (
+            mvcc_log(given),
+            mvcc_log(real),
+            LOG_HDR_SIZE as u64,
+            Some("MVCC log records"),
+        ),
+    ];
+    if !custom_wal {
+        sidecars.push((
+            format!("{given}-wal").into(),
+            format!("{real}-wal").into(),
+            WAL_HEADER_LEN,
+            Some("WAL frames"),
+        ));
+    }
+    for (other, ours, holds_nothing_up_to, holds) in sidecars {
+        let len = match std::fs::metadata(&other) {
+            Ok(meta) => meta.len(),
+            // Absent, or a file that cannot exist (review 6 item 5).
+            Err(e) if crate::branch::journal::cannot_exist(&e) => continue,
+            Err(e) => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "cannot inspect {} ({e}), which may hold this database's state",
+                    other.display()
+                )))
+            }
+        };
+        // Nothing in it can be lost: leave it where it is (C3-1).
+        if len <= holds_nothing_up_to {
+            continue;
+        }
+        if same_file(&other, &ours)? {
+            continue;
+        }
+        // Why a rename keeps them: WAL recovery validates frames against the WAL file's own
+        // header (salts and checksum chain), and MVCC recovery replays the log's records above the
+        // database file's replay boundary; neither ties the file to a path. Why only then: frames
+        // written before the database changed under another name would overwrite newer pages.
+        return Err(LimboError::InvalidArgument(match holds {
+            // "Keep them" needs BOTH conditions (review 8 F1, the lead's decision): {ours} does
+            // not exist — any read-write open of {real} by THIS build creates its WAL, and its log
+            // only while the database header says MVCC, even empty (review 7 item 4; review 11
+            // finding 4: a read-only open creates neither; review 12 finding 1: this message also
+            // serves the MVCC log, which a WAL-mode open never creates) — AND nothing has opened
+            // the database since, by ANY name, {real} included (review 9's wording, the lead's),
+            // with NO exemption; condition 3 carries every open that condition 2's reason misses.
+            // A build that names sidecars from the path as given (earlier fork builds; upstream
+            // Turso for the WAL) opening it through a third name writes newer pages and leaves
+            // {ours} absent; so can a program whose open, even of {real} itself, leaves no {ours}
+            // behind — for the WAL copy, SQLite's WAL for {real} IS {ours}, and it deletes it at
+            // its last close, which is why review 10 F8's "except through {ours}" was withdrawn
+            // (review 11 finding 1, the lead's reversal) — and so can THIS build's own open with a
+            // custom `wal_path` (`do_open_async`, the sync engine's revert database; the
+            // test-only `do_open`), which never creates the WAL {ours} (for the log copy, an
+            // MVCC-header open still creates the log at the canonical name). Absence proves
+            // nothing about those opens.
+            Some(what) => format!(
+                "{other} holds {what} that this open would miss: they were written through the \
+                 name {given} before sidecars were named from the resolved path, and this \
+                 database's file of that kind is {ours}. They belong to whichever database {given} \
+                 named when they were written, which may not be this one. To keep them, ALL of \
+                 these must hold: that database was {real}; {ours} does not exist — any \
+                 read-write open of {real} by this build creates its WAL, and, while the database \
+                 is in MVCC mode, its log, even empty; and nothing has opened this database since, \
+                 by any name, {real} included — an open that leaves no {ours} behind can still \
+                 write pages newer than these {what}. Then, with no process using the database, \
+                 rename {other} to {ours}, and the next open reads them. Otherwise, or if you \
+                 cannot tell, move {other} aside: this database then opens without them",
+                other = other.display(),
+                ours = ours.display()
+            ),
+            None => format!(
+                "{} is a branch file under a name this database does not use (its branch files \
+                 are named from {real}, and no earlier build of this fork named them from the \
+                 path as given; this build does so only for storage that is not a file here), so \
+                 it is not this database's branch state. Move it aside; this database's own \
+                 branch files are {}",
+                other.display(),
+                ours.display()
+            ),
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_sidecars_under_another_name(_given: &str, _real: &str, _custom_wal: bool) -> Result<()> {
+    Ok(())
+}
+
+/// Whether `a` and `b` are one file, by (dev, ino). `b` absent is "no".
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
+    let a_id = identity(a).map_err(|e| {
+        LimboError::InvalidArgument(format!("cannot inspect {} ({e})", a.display()))
+    })?;
+    match identity(b) {
+        Ok(b_id) => Ok(a_id == b_id),
+        Err(e) if crate::branch::journal::cannot_exist(&e) => Ok(false),
+        Err(e) => Err(LimboError::InvalidArgument(format!(
+            "cannot inspect {} ({e})",
+            b.display()
+        ))),
+    }
 }
 
 /// Creates a read completion for database header reads that checks for short reads.
@@ -522,6 +830,8 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
+    /// What every sidecar is named from: see `sidecar_base`. Computed once, at open.
+    sidecar_name: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
     pub(crate) buffer_pool: Arc<BufferPool>,
@@ -560,6 +870,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+
+    /// Branch page spaces and the copy-on-write bookkeeping between them. Empty (one allocation,
+    /// no arena) until the first fork; see [`crate::branch`].
+    pub(crate) branches: Arc<crate::branch::store::BranchStore>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -630,6 +944,8 @@ impl Database {
         opts: DatabaseOpts,
         flags: OpenFlags,
         path: impl Into<String>,
+        sidecar_name: &str,
+        branch_base: &str,
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
@@ -638,8 +954,18 @@ impl Database {
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
-        let path = path.into();
+        let path: String = path.into();
         let wal_path = wal_path.into();
+        // Before anything else touches the file: a database whose branches are durable must not
+        // be opened with volatile ones (see `BranchStore::open`), and a durable store recovers here.
+        let branches = Arc::new(crate::branch::store::BranchStore::open_with_checkpoint(
+            opts.branch_durability,
+            opts.branch_lease,
+            opts.branch_splice,
+            opts.branch_checkpoint,
+            branch_base,
+            flags.contains(OpenFlags::ReadOnly),
+        )?);
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -673,6 +999,7 @@ impl Database {
             mv_store,
             mv_store_allocator,
             path,
+            sidecar_name: sidecar_name.to_string(),
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
                 let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
@@ -713,6 +1040,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+            branches,
         };
 
         db.register_global_builtin_extensions()
@@ -745,6 +1073,11 @@ impl Database {
             if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
                 if let Some(db) = weak.upgrade() {
                     Self::check_registry_dialect(&db, dialect.as_ref())?;
+                    // No `check_registry_branch_store` at either hit here: this fn takes no
+                    // options, and every instance under a `SharedMemory` key is made below by
+                    // `open_file`, i.e. with `OpenOptions::new`: volatile and unleased, so a hit
+                    // always matches its caller. If it ever takes options, both hits need the
+                    // check (review 9 finding 9).
                     return Ok(db);
                 }
             }
@@ -855,9 +1188,12 @@ impl Database {
         // The coordination file is derived from the WAL path, so probe the
         // configured WAL (not a hard-coded `{path}-wal`) or a custom-WAL open
         // would check the wrong coordination file and miss a live authority.
-        let wal_path = wal_path
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{path}-wal"));
+        // The default WAL is named from `sidecar_base`, exactly as the open names it, so the probe
+        // finds the coordination file the open will use (review 4 C3).
+        let wal_path = match wal_path {
+            Some(wal_path) => wal_path.to_owned(),
+            None => sidecar_wal_path(path)?,
+        };
         let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
         let Some(authority) =
             MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
@@ -918,6 +1254,118 @@ impl Database {
         _flags: OpenFlags,
         _opts: DatabaseOpts,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// A read-write open must never receive, from the registry, an instance whose branch store is
+    /// not the one it asked for:
+    /// * a trunk-only instance (review 5 C2-1): its connections are read-only and its branch
+    ///   operations refused;
+    /// * an instance of ANOTHER branch durability (review 6 item 6): a durable caller would fork
+    ///   branches that vanish on a crash, and a `sync: true` caller branches that are not synced,
+    ///   both silently;
+    /// * an instance of ANOTHER default lease (review 7 item 2): a caller whose branches must never
+    ///   expire would fork leased ones, reaped when the lease runs out, silently — and the reverse
+    ///   leaks branches meant to be temporary.
+    ///
+    /// A read-only open is exempt from the last two, on the assumption that it forks nothing. That
+    /// is the CALLER's discipline, not something this check enforces: read-only is the instance's
+    /// flag, so a read-only caller that hits a read-write instance receives read-write connections
+    /// (upstream's registry behaviour) and could fork through them.
+    ///
+    /// ATTACH is exempt from the last two as well (review 8 F2, the lead's decision): it opens with
+    /// default options, so it can request neither a durability nor a lease, and it cannot fork the
+    /// attached database — `Connection::fork_branch` forks the connection's MAIN database only.
+    /// Refusing it would refuse an ATTACH its caller has no way to make acceptable.
+    ///
+    /// Known limitations: the exemption covers registry HITS only. For a READ-WRITE ATTACH, both of
+    /// these refuse; neither is a bypass, and both predate it (review 9 finding 5, recorded by the
+    /// lead's decision; scoped to read-write by review 10 F5):
+    /// * a read-write ATTACH that MISSES the registry, of a database whose durable branch files
+    ///   exist, opens it volatile, and `BranchStore::open` refuses it with advice ("open it with
+    ///   branch durability") that an ATTACH has no way to follow;
+    /// * a read-write ATTACH that misses registers a volatile, unleased instance, so while it is
+    ///   attached, its owner's durable or leased open of that database is refused here ("close
+    ///   the other handle first"). So does a READ-ONLY ATTACH that misses a database with no
+    ///   branch files: this check reads the CALLER's flags (review 11 finding 6).
+    ///
+    /// A READ-ONLY ATTACH that misses (URI `mode=ro`, or under a read-only main) opens trunk-only
+    /// when branch files exist and is not refused; while it is attached, its owner's read-write
+    /// open is refused by the trunk-only check above ("close the read-only handle first").
+    fn check_registry_branch_store(
+        db: &Database,
+        flags: OpenFlags,
+        durability: crate::branch::BranchDurability,
+        lease: Option<std::time::Duration>,
+        splice: bool,
+        checkpoint: Option<crate::branch::BranchCheckpoint>,
+        for_attach: bool,
+    ) -> Result<()> {
+        if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process read-only, without its branch store (it has durable \
+                 branches); a read-write open would receive that instance: close the read-only \
+                 handle first",
+                db.path
+            )));
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_durability != durability
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with branch durability {:?}, and this open asks for \
+                 {:?}: it would receive that instance, whose branches are not what it asked for; \
+                 close the other handle first, or open with the same branch durability",
+                db.path, db.opts.branch_durability, durability
+            )));
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_lease != lease
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with default branch lease {:?}, and this open asks \
+                 for {:?}: it would receive that instance, whose forks would be leased otherwise \
+                 than it asked; close the other handle first, or open with the same branch lease",
+                db.path, db.opts.branch_lease, lease
+            )));
+        }
+        // The checkpoint mode (review 4 #8): a catalog store's, resolved as this open would resolve
+        // it. Mutant `registry_ignores_checkpoint` (test builds only).
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && matches!(durability, crate::branch::BranchDurability::Catalog { .. })
+            && !crate::branch::store::fe_mutant("registry_ignores_checkpoint")
+        {
+            let asked = crate::branch::BranchCheckpoint::resolve(checkpoint, splice)?;
+            if db.branches.checkpoint_mode() != asked {
+                return Err(LimboError::InvalidArgument(format!(
+                    "{} is open in this process with {:?} branch checkpoints, and this open asks for \
+                     {asked:?}: it would receive that instance; close the other handle first, or open \
+                     with the same checkpoint mode",
+                    db.path,
+                    db.branches.checkpoint_mode()
+                )));
+            }
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_splice != splice
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with the branch splice arm {}, and this open asks for \
+                 it {}: it would receive that instance, whose releases would be collected by the \
+                 other rule; close the other handle first, or open with the same splice arm",
+                db.path,
+                if db.opts.branch_splice { "on" } else { "off" },
+                if splice { "on" } else { "off" }
+            )));
+        }
         Ok(())
     }
 
@@ -1049,6 +1497,15 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                Self::check_registry_branch_store(
+                    &db,
+                    options.flags,
+                    options.db_opts.branch_durability,
+                    options.db_opts.branch_lease,
+                    options.db_opts.branch_splice,
+                    options.db_opts.branch_checkpoint,
+                    options.for_attach,
+                )?;
                 return Ok(Some(db));
             }
         }
@@ -1207,6 +1664,15 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_branch_store(
+                                &db,
+                                options.flags,
+                                options.db_opts.branch_durability,
+                                options.db_opts.branch_lease,
+                                options.db_opts.branch_splice,
+                                options.db_opts.branch_checkpoint,
+                                options.for_attach,
+                            )?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1393,15 +1859,38 @@ impl Database {
                         None
                     };
 
-                    let wal_path = if let Some(wal_path) = wal_path {
-                        wal_path
+                    // Every sidecar is named from ONE path, computed here, once (review 4 C3).
+                    let (sidecar_name, branch_base) = if is_memory_like(path) {
+                        (path.to_string(), path.to_string())
                     } else {
-                        &format!("{path}-wal")
+                        let base = sidecar_base(path)?;
+                        if let Some(real) = &base {
+                            refuse_sidecars_under_another_name(path, real, wal_path.is_some())?;
+                        }
+                        let durable = matches!(
+                            opts.branch_durability,
+                            crate::branch::BranchDurability::Durable { .. }
+                                | crate::branch::BranchDurability::Catalog { .. }
+                        );
+                        let branch_base = match &base {
+                            Some(real) => real.clone(),
+                            // Only a durable store writes branch files; a volatile one checks for
+                            // them now, and so needs no working directory (review 5 C3-3).
+                            None if durable => absolute_path(path)?,
+                            None => path.to_string(),
+                        };
+                        (base.unwrap_or_else(|| path.to_string()), branch_base)
+                    };
+                    let wal_path = match wal_path {
+                        Some(wal_path) => wal_path.to_string(),
+                        None => format!("{sidecar_name}-wal"),
                     };
                     let mut db = Self::new(
                         opts,
                         flags,
                         path,
+                        &sidecar_name,
+                        &branch_base,
                         wal_path,
                         &io,
                         db_file.clone(),
@@ -1805,7 +2294,7 @@ impl Database {
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
                     let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                        journal_mode::logical_log_exists(std::path::Path::new(&self.sidecar_name));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -1836,33 +2325,39 @@ impl Database {
                         self.open_flags |= OpenFlags::ReadOnly;
                     }
 
-                    let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
-                    let header_mut = header.borrow_mut();
+                    // Validation only READS the header. A mutable header ref marks page 1 dirty,
+                    // and `Pager::add_dirty` is where the branch copy decision is taken: with a live
+                    // child of the trunk, every open used to retain page 1 — read from the database
+                    // FILE, since the WAL is not open yet — as a branch pre-image, for a write that
+                    // never happens (r11-restart lane, PREREG A1 and A5). So the mutable ref is taken
+                    // only below, when the header really is rewritten.
+                    let header: HeaderRef = return_if_io!(HeaderRef::from_pager(pager));
+                    let header_ref = header.borrow();
 
-                    if !header_mut.text_encoding.is_utf8() {
+                    if !header_ref.text_encoding.is_utf8() {
                         return Err(LimboError::UnsupportedEncoding(
-                            header_mut.text_encoding.to_string(),
+                            header_ref.text_encoding.to_string(),
                         ));
                     }
 
                     let (read_version, write_version) =
-                        { (header_mut.read_version, header_mut.write_version) };
+                        { (header_ref.read_version, header_ref.write_version) };
 
-                    if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
+                    if encryption_key.is_none() && header_ref.magic != SQLITE_HEADER {
                         tracing::error!(
                             "invalid value of database header magic bytes: {:?}",
-                            header_mut.magic
+                            header_ref.magic
                         );
                         return Err(LimboError::NotADB);
                     }
                     // when we open fresh db with encryption params - header will be SQLite at this point
                     if encryption_key.is_some()
-                        && (header_mut.magic != SQLITE_HEADER
-                            && !header_mut.magic.starts_with(TURSO_HEADER_PREFIX))
+                        && (header_ref.magic != SQLITE_HEADER
+                            && !header_ref.magic.starts_with(TURSO_HEADER_PREFIX))
                     {
                         tracing::error!(
                             "invalid value of database header magic bytes: {:?}",
-                            header_mut.magic
+                            header_ref.magic
                         );
                         return Err(LimboError::NotADB);
                     }
@@ -1885,25 +2380,25 @@ impl Database {
                     );
 
                     // Validate fixed header fields per SQLite spec
-                    if header_mut.max_embed_frac != 64 {
+                    if header_ref.max_embed_frac != 64 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid max_embed_frac: expected 64, got {}",
-                            header_mut.max_embed_frac
+                            header_ref.max_embed_frac
                         )));
                     }
-                    if header_mut.min_embed_frac != 32 {
+                    if header_ref.min_embed_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid min_embed_frac: expected 32, got {}",
-                            header_mut.min_embed_frac
+                            header_ref.min_embed_frac
                         )));
                     }
-                    if header_mut.leaf_frac != 32 {
+                    if header_ref.leaf_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid leaf_frac: expected 32, got {}",
-                            header_mut.leaf_frac
+                            header_ref.leaf_frac
                         )));
                     }
-                    let schema_format = header_mut.schema_format.get();
+                    let schema_format = header_ref.schema_format.get();
                     // If the database is completely empty, if it has no schema, then the schema format number can be zero.
                     if !(0..=4).contains(&schema_format) {
                         return Err(LimboError::Corrupt(format!(
@@ -1911,7 +2406,7 @@ impl Database {
                         )));
                     }
                     if !matches!(
-                        header_mut.text_encoding,
+                        header_ref.text_encoding,
                         TextEncoding::Unset
                             | TextEncoding::Utf8
                             | TextEncoding::Utf16Le
@@ -1919,16 +2414,16 @@ impl Database {
                     ) {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid text_encoding: {}",
-                            header_mut.text_encoding
+                            header_ref.text_encoding
                         )));
                     }
                     if !matches!(
-                        header_mut.text_encoding,
+                        header_ref.text_encoding,
                         TextEncoding::Unset | TextEncoding::Utf8
                     ) {
                         return Err(LimboError::Corrupt(format!(
                             "Only utf8 text_encoding is supported by tursodb: got={}",
-                            header_mut.text_encoding
+                            header_ref.text_encoding
                         )));
                     }
 
@@ -1965,9 +2460,7 @@ impl Database {
                                 );
                                 false
                             } else {
-                                // Convert Legacy to WAL mode
-                                header_mut.read_version = RawVersion::from(Version::Wal);
-                                header_mut.write_version = RawVersion::from(Version::Wal);
+                                // Convert Legacy to WAL mode (written below, through a mutable ref)
                                 true
                             }
                         }
@@ -1985,7 +2478,16 @@ impl Database {
                         )));
                     }
 
-                    let page = header.page().clone();
+                    let page = if header_modified {
+                        let header_mut: HeaderRefMut =
+                            return_if_io!(HeaderRefMut::from_pager(pager));
+                        let h = header_mut.borrow_mut();
+                        h.read_version = RawVersion::from(Version::Wal);
+                        h.write_version = RawVersion::from(Version::Wal);
+                        header_mut.page().clone()
+                    } else {
+                        header.page().clone()
+                    };
                     // `header` (a cheap Arc<Page> wrapper, no lock) is dropped
                     // here; the page ref carries the (possibly modified) header
                     // buffer forward.
@@ -2159,7 +2661,7 @@ impl Database {
                     pager.set_schema_cookie(None);
 
                     if open_mv_store {
-                        let canonical_path = self.get_database_canonical_path();
+                        let canonical_path = self.mvcc_log_base();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
@@ -2177,6 +2679,25 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// What the MVCC logical log is named from: the sidecar name (review 5 C3-4), except that an
+    /// in-memory database keeps the empty canonical path it always used.
+    pub(crate) fn mvcc_log_base(&self) -> String {
+        if self.is_in_memory_db() {
+            self.get_database_canonical_path()
+        } else {
+            self.sidecar_name.clone()
+        }
+    }
+
+    pub(crate) fn sidecar_name(&self) -> &str {
+        &self.sidecar_name
+    }
+
+    /// The WAL file this database opened (review 5 C3-2: the sync engine names it from here).
+    pub fn wal_path(&self) -> &str {
+        &self.wal_path
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -2240,11 +2761,12 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(std::path::Path::new(&self.sidecar_name))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
-                &self.path,
+                &self.sidecar_name,
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
@@ -2333,6 +2855,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            None,
         )
     }
 
@@ -2342,13 +2865,16 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        // `None`: the database's shared schema. A branch connection passes the branch's own, which
+        // must be in place before `refresh_analyze_stats` below reads through it.
+        schema: Option<Arc<Schema>>,
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(self.schema.lock().clone()),
+            schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
@@ -2391,7 +2917,14 @@ impl Database {
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
-            sync_mode: AtomicSyncMode::new(SyncMode::Full),
+            // D0 (`SyncClass::Off`) opens every connection `synchronous = OFF`; any other class, or
+            // a database without durable branches, the default FULL.
+            sync_mode: AtomicSyncMode::new(
+                self.opts
+                    .branch_durability
+                    .sync_class()
+                    .map_or(SyncMode::Full, |class| class.sync_mode()),
+            ),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
@@ -2403,6 +2936,7 @@ impl Database {
             short_column_names: AtomicBool::new(true),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
+            row_image_apply: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
@@ -2997,6 +3531,12 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;
+        pager.set_branch_store(self.branches.clone());
+        // The durability class governs the trunk as well as the branch store (see
+        // `branch::SyncClass`): every pager of this database syncs its WAL and database file in it.
+        if let Some(class) = self.opts.branch_durability.sync_class() {
+            pager.set_sync_type(class.file_sync_type());
+        }
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);

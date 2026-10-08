@@ -123,6 +123,37 @@ pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
     Ok(FileId::from_path_hash(path))
 }
 
+/// Syncs issued process-wide, `[fsync(2), fcntl(F_FULLFSYNC), fcntl(F_BARRIERFSYNC)]`, by the unix
+/// backend and the branch store's own files (fastest-engine instrument; observing only, read by
+/// `branch::sync_counts`).
+#[doc(hidden)]
+pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 4] = [
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+];
+
+/// Count one `fcntl(F_BARRIERFSYNC)`.
+pub(crate) fn count_barrier() {
+    SYNC_COUNTS[2].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
+}
+
+/// Count one `fcntl(F_BARRIERFSYNC)` the file system refused as unsupported, replaced by a full
+/// sync (counted as that sync too).
+pub(crate) fn count_barrier_fallback() {
+    SYNC_COUNTS[3].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
+pub(crate) fn count_sync(full: bool) {
+    SYNC_COUNTS[usize::from(full)].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
+}
+
 /// Controls which sync mechanism to use for durability.
 /// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
 /// On other platforms, both variants behave the same (regular fsync).
@@ -198,6 +229,15 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
+
+    /// The device (`st_dev`) whose whole write cache `sync(FileSyncType::FullFsync)` drains, if
+    /// that is what it does here: `fcntl(F_FULLFSYNC)` on this file's own OS descriptor. Every
+    /// backend that cannot say so (memory, VFS extensions, wrappers) answers `None`, and then
+    /// nothing may count on this file's flush to make another file durable (fastest-engine
+    /// review 3 #3: a trunk WAL flush carrying the branch files).
+    fn full_fsync_device(&self) -> Option<u64> {
+        None
+    }
 
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code

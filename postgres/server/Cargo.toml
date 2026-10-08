@@ -10,10 +10,16 @@ description = "PostgreSQL wire-protocol server support for Turso"
 [lib]
 path = "lib.rs"
 
+[features]
+# The wire budget's fire-check plant (lanes/wire/budget/budget.py --plant split-reply): never in a credited
+# build.
+budget-plant-split-reply = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
 futures = { workspace = true }
+libc = "0.2.172"
 pgwire = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tracing = { workspace = true }
@@ -21,6 +27,11 @@ turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
 ] }
 turso_pg = { workspace = true }
+turso_pg_parser = { workspace = true }
+turso_parser = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

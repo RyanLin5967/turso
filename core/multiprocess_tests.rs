@@ -566,6 +566,58 @@ fn reject_live_multiprocess_probe_uses_configured_wal_path() {
     );
 }
 
+/// Review 5 T-1 (ferrobranch-arena): the legacy-open probe names the default WAL through
+/// `sidecar_base`, as the open itself does (review 4 C3), so a legacy open through a SYMLINK still
+/// finds the live multiprocess authority that coordinates the real path's WAL. A guard: it holds
+/// since 75cfd942d, and it is here to kill the mutant that reverts the probe to `{path}-wal`.
+#[cfg(unix)]
+#[test]
+fn reject_live_multiprocess_probe_follows_a_symlinked_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("probe-symlink.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let link = dir.path().join("probe-symlink-link.db");
+    std::os::unix::fs::symlink(&db_path, &link).unwrap();
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    let err = Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        link.to_str().unwrap(),
+        None,
+        DatabaseOpts::new(),
+    )
+    .expect_err("a legacy open through a symlink must still see the live multiprocess authority");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from the multiprocess probe, got {err:?}"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "hold-open child should exit cleanly after release"
+    );
+}
+
 #[test]
 fn database_open_selects_shm_wal_backend() {
     let dir = tempfile::tempdir().unwrap();

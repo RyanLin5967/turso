@@ -19,10 +19,13 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "pg_get_statisticsobjdef_columns"
         | "pg_relation_is_publishable"
         | "quote_ident"
-        | "quote_literal" => &[1],
+        | "quote_literal"
+        | "pg_database_size"
+        | "current_schemas" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
-        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
+        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
+        | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         _ => return false,
     };
@@ -54,6 +57,21 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             args.first().unwrap_or(&Value::Null),
             &text_arg(1),
         )),
+        // character(n)'s `=` and `<` (catalog.rs BPCHAR_TYPE_SQL): trailing blanks are not
+        // significant, as PostgreSQL's bpchareq and bpcharlt (wire review 2 item 3). Both sides
+        // are trimmed, so an operand the engine did not encode compares the same.
+        "bpchareq" | "bpcharlt" => {
+            let trimmed = |v: Option<&Value>| match v {
+                None | Some(Value::Null) => None,
+                Some(Value::Text(t)) => Some(t.as_str().trim_end_matches(' ').to_string()),
+                Some(other) => Some(other.to_string().trim_end_matches(' ').to_string()),
+            };
+            Ok(match (trimmed(args.first()), trimmed(args.get(1))) {
+                (Some(a), Some(b)) if name == "bpchareq" => Value::from_i64((a == b) as i64),
+                (Some(a), Some(b)) => Value::from_i64((a < b) as i64),
+                _ => Value::Null,
+            })
+        }
         "booleq" => Ok(Value::from_i64((args.first() == args.get(1)) as i64)),
         "boolne" => Ok(Value::from_i64((args.first() != args.get(1)) as i64)),
         "version" => Ok(exec_version()),
@@ -63,7 +81,21 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // pg_catalog presents every user object under the hardcoded "public"
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
+        // The search path as an array literal, with the implicit pg_catalog first when asked.
+        "current_schemas" => Ok(Value::build_text(
+            match args.first().and_then(|v| v.as_int()) {
+                Some(0) => "{public}",
+                _ => "{pg_catalog,public}",
+            },
+        )),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
+        // The database's files on disk, in bytes, whatever name is asked (a server serves one
+        // database): the database file and its WAL. A branch reports the database's.
+        "pg_database_size" => {
+            let path = conn.db_file_path();
+            let size = |p: &str| std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
+            Ok(Value::from_i64(size(&path) + size(&format!("{path}-wal"))))
+        }
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(

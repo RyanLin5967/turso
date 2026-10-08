@@ -753,6 +753,11 @@ pub trait Wal: Debug + Send + Sync {
     ) -> Result<Option<Completion>>;
     fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+    /// The device `sync(FileSyncType::FullFsync)` drains (`File::full_fsync_device` of the WAL
+    /// file it syncs); `None` when the WAL is not enabled or not open, or its file cannot say.
+    fn full_fsync_device(&self) -> Option<u64> {
+        None
+    }
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
     /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
@@ -3558,6 +3563,7 @@ impl Wal for WalFile {
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Completion> {
+        crate::branch::count_page_io(2, 1);
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
             page.get().id,
@@ -3622,6 +3628,7 @@ impl Wal for WalFile {
         turso_assert!(page_size > 0, "WAL page size must be initialized");
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
         let count = pages.len();
+        crate::branch::count_page_io(2, count as u64);
         let total = frame_size * count;
         let offset = self.frame_offset(start_frame);
         if let Some(buf) = &scratch_buf {
@@ -3764,6 +3771,7 @@ impl Wal for WalFile {
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
+        crate::branch::count_page_io(2, 1);
         tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
@@ -3939,6 +3947,7 @@ impl Wal for WalFile {
             &page_transform,
         )?;
         let c = Completion::new_write(|_| {});
+        crate::branch::count_page_io(3, 1);
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
@@ -4016,6 +4025,21 @@ impl Wal for WalFile {
             }
         );
         self.coordination.publish_backfill(max_frame);
+    }
+
+    fn full_fsync_device(&self) -> Option<u64> {
+        // `wal_file` asserts an enabled WAL; a disabled one has no flush to count on.
+        let enabled = self
+            .coordination
+            .shared_wal_state()
+            .read()
+            .metadata
+            .enabled
+            .load(Ordering::Relaxed);
+        if !enabled {
+            return None;
+        }
+        self.coordination.wal_file().ok()?.full_fsync_device()
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -4344,6 +4368,7 @@ impl Wal for WalFile {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames> {
+        crate::branch::count_page_io(3, pages.len() as u64);
         turso_assert!(
             !pages.is_empty(),
             "prepare_frames requires at least one page"
@@ -4427,7 +4452,7 @@ impl Wal for WalFile {
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
-            let plain = page.get_contents().as_ptr();
+            let plain = page.get_contents().as_slice();
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
             // however it might not be present in this batch so we cannot assert its presence
@@ -4500,6 +4525,7 @@ impl Wal for WalFile {
     /// the commit path should use prepare_frames + commit_prepared_frames instead,
     /// as it prevents prematurely modifing WAL state before durability is ensured.
     fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion> {
+        crate::branch::count_page_io(3, pages.len() as u64);
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
@@ -4535,7 +4561,7 @@ impl Wal for WalFile {
         for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
             let page_id = page.get().id;
-            let plain = page.get_contents().as_ptr();
+            let plain = page.get_contents().as_slice();
 
             let frame_db_size = 0; // this method is not used for the commit path
             let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
@@ -4939,6 +4965,7 @@ impl WalFile {
                         if let Some(cached_page) =
                             pager.cache_get_for_checkpoint(page_id as usize, target_frame, epoch)?
                         {
+                            crate::branch::count_backfill_io(0);
                             let buffer = cached_page
                                 .get_contents()
                                 .buffer
@@ -4959,6 +4986,7 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
+                        crate::branch::count_backfill_io(1);
                         let inflight =
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
                         group.add(&inflight.completion);
@@ -6413,7 +6441,9 @@ pub mod test {
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
         let page = allocate_new_page(page_id, buffer_pool);
-        for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
+        // Fresh page built for this fixture, outside any pager: nothing to copy-on-write.
+        let wt = crate::storage::pager::WriteTicket::for_test();
+        for (idx, byte) in page.get_contents().as_mut(&wt).iter_mut().enumerate() {
             *byte = seed.wrapping_add(idx as u8).wrapping_add(page_id as u8);
         }
         page
@@ -6556,7 +6586,7 @@ pub mod test {
             .unwrap();
         let expected = pages
             .iter()
-            .map(|page| page.get_contents().as_ptr().to_vec())
+            .map(|page| page.get_contents().as_slice().to_vec())
             .collect::<Vec<_>>();
 
         let file = wal.wal_file().unwrap();
@@ -6637,7 +6667,7 @@ pub mod test {
             assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
             assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
-            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.get_contents().as_slice(), expected[idx].as_slice());
         }
     }
 
@@ -6662,7 +6692,7 @@ pub mod test {
         io.wait_for_completion(c).unwrap();
 
         for (idx, page) in target_pages.iter().enumerate() {
-            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.get_contents().as_slice(), expected[idx].as_slice());
         }
     }
 
@@ -6692,7 +6722,7 @@ pub mod test {
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let source_page = page_with_pattern(32, 0x10, &buffer_pool);
-        let expected = source_page.get_contents().as_ptr().to_vec();
+        let expected = source_page.get_contents().as_slice().to_vec();
 
         let completion = wal
             .append_frames_vectored(vec![source_page], PageSize::new(page_size).unwrap())
@@ -6704,7 +6734,7 @@ pub mod test {
             .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
+        assert_eq!(target_page.get_contents().as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -6974,7 +7004,7 @@ pub mod test {
             assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
             assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
             assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
-            assert_eq!(page.get_contents().as_ptr(), expected[idx + 1].as_slice());
+            assert_eq!(page.get_contents().as_slice(), expected[idx + 1].as_slice());
         }
     }
 
@@ -7003,7 +7033,7 @@ pub mod test {
 
         for (idx, page) in target_pages.iter().enumerate() {
             assert_eq!(
-                page.get_contents().as_ptr(),
+                page.get_contents().as_slice(),
                 expected[idx].as_slice(),
                 "frame-order read should preserve page {} contents",
                 page.get().id

@@ -496,6 +496,10 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Statements compile with no triggers while set: a branch merge applies row images, whose
+    /// trigger effects are already rows of their own (PostgreSQL's session_replication_role =
+    /// replica). See `branch::merge` (r13-compose, the Merger port from b161e861d).
+    pub(crate) row_image_apply: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -583,6 +587,9 @@ impl Drop for Connection {
             let pager = self.pager.load();
             if let Some(wal) = &pager.wal {
                 if wal.holds_write_lock() {
+                    // A commit abandoned between its copy decisions and its publication left the
+                    // branch store's commit gate open (review A-F1).
+                    pager.close_trunk_gate();
                     wal.end_write_tx();
                 }
                 if wal.holds_read_lock() {
@@ -1227,7 +1234,13 @@ impl Connection {
             on_disk_schema_version
         };
 
-        let db_schema_version = self.db.schema.lock().schema_version;
+        // A branch compares against, and reparses into, its own schema; it never publishes one.
+        let on_branch = self.branch_id().is_some();
+        let db_schema_version = if on_branch {
+            self.schema.read().schema_version
+        } else {
+            self.db.schema.lock().schema_version
+        };
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
             self.db.path,
@@ -1265,8 +1278,10 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema);
+        if !on_branch {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
         Ok(())
     }
 
@@ -1317,7 +1332,7 @@ impl Connection {
 
         reparse_result?;
 
-        if publish {
+        if publish && self.branch_id().is_none() {
             let schema = self.schema.read().clone();
             self.db.update_schema_if_newer(schema);
         }
@@ -1920,13 +1935,16 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        // `open_file_with_flags`, marked as an ATTACH's, so a registry hit is not refused for a
+        // durability or lease it has no way to request (review 8 F2).
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .for_attach(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -1943,6 +1961,17 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Compile statements with no triggers (see `row_image_apply`). Bumps the prepare generation, so
+    /// a statement prepared under the other setting is reprepared before it runs.
+    pub(crate) fn set_row_image_apply(&self, on: bool) {
+        self.row_image_apply.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn row_image_apply(&self) -> bool {
+        self.row_image_apply.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
@@ -1992,6 +2021,11 @@ impl Connection {
 
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
+            return;
+        }
+        // A branch's schema is the branch's own: the shared one describes the TRUNK's pages, and
+        // adopting it would resolve trunk root pages against the branch's page space.
+        if self.branch_id().is_some() {
             return;
         }
         let current_schema = self.schema.read().clone();
@@ -2074,6 +2108,10 @@ impl Connection {
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        if self.branch_id().is_some() {
+            // See `maybe_update_schema`: the shared schema is the trunk's.
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -2208,7 +2246,7 @@ impl Connection {
         if content.buffer.as_ref().is_none_or(|b| b.is_empty()) {
             return Ok(false);
         }
-        page.copy_from_slice(content.as_ptr());
+        page.copy_from_slice(content.as_slice());
         Ok(true)
     }
 
@@ -2249,6 +2287,14 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
+        // A raw WAL session is the trunk's: a branch's writes never reach the WAL (review A-F1).
+        if pager.branch_id().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a raw WAL session cannot begin on a branch connection: a branch's writes never \
+                 reach the WAL"
+                    .to_string(),
+            ));
+        }
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
         // the WAL header here would invalidate the watermarks the caller has
@@ -2304,8 +2350,13 @@ impl Connection {
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
+            // The commit's stamps and its commit gate, before the WAL write lock goes.
+            let stamped = pager.end_raw_trunk_write(force_commit && commit_err.is_none());
             wal.end_write_tx();
             wal.end_read_tx();
+            if stamped {
+                pager.prune_branch_stamps();
+            }
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
@@ -2465,6 +2516,10 @@ impl Connection {
     /// Publish the connection's current schema snapshot to the shared database
     /// cache after a successful commit so other live connections can refresh.
     pub fn publish_schema_if_newer(&self) {
+        if self.branch_id().is_some() {
+            // A branch's schema describes the branch's pages; the shared one is the trunk's.
+            return;
+        }
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
     }
@@ -2477,6 +2532,11 @@ impl Connection {
     /// monotonically, otherwise new connections can re-adopt stale metadata.
     #[cfg(feature = "conn_raw_api")]
     pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.branch_id().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a branch connection cannot publish its schema as the database's".to_string(),
+            ));
+        }
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -3451,6 +3511,16 @@ impl Connection {
                     if self.is_closed() {
                         return Err(LimboError::InternalError("Connection closed".to_string()));
                     }
+                    // fastest-engine E2 scope rule (PREREG v1 amendments 10-11): an attached file
+                    // is not branched, so a branch that attached one would share its writes with
+                    // every branch and with its parent. Refused here, at the statement.
+                    if self.branch_id().is_some() {
+                        return Err(LimboError::InvalidArgument(
+                            "ATTACH is refused on a branch: an attached database is not branched, \
+                             so its writes would be shared by every branch and its parent"
+                                .to_string(),
+                        ));
+                    }
 
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
@@ -3547,7 +3617,7 @@ impl Connection {
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             init.db.io.clone(),
-                            &init.db.path,
+                            init.db.sidecar_name(),
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,
@@ -3589,6 +3659,7 @@ impl Connection {
                                 bootstrap.pager.clone(),
                                 bootstrap.encryption_key.take(),
                                 default_cache_size,
+                                None,
                             )?);
                     }
 

@@ -18142,6 +18142,17 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
+                // A journal-mode switch rewrites the header outside `add_dirty` and, into MVCC,
+                // moves rows above the pager where no branch can see them (see `crate::branch`).
+                if program.connection.branch_id().is_some()
+                    || program.connection.db.branches.has_branches()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "cannot change journal_mode while branches of this database exist"
+                            .to_string(),
+                    ));
+                }
+
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
@@ -18293,7 +18304,7 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
-                    let db_path = program.connection.get_database_canonical_path();
+                    let db_path = program.connection.db.mvcc_log_base();
                     let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),

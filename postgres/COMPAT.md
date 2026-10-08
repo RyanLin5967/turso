@@ -39,18 +39,18 @@ Basics not enumerated by the official feature matrix.
 |---------|--------|-------|
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
-| UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds |
+| UNION / UNION ALL / INTERSECT / EXCEPT | ✅ Supported | Including ORDER BY/LIMIT on compounds, PostgreSQL's grouping (INTERSECT binds tighter; parentheses group), an arm's own ORDER BY/LIMIT/OFFSET/WITH and a WITH on the whole set operation (non-left-spine and clause-bearing arms run as subqueries) |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
 | INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
-| DELETE | 🟡 Partial | `USING` clause silently dropped |
-| CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
+| DELETE | ✅ Supported | `USING` runs as `WHERE EXISTS (SELECT 1 FROM <using> WHERE <condition>)`, the target's columns correlating |
+| CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions, and DEFERRABLE [INITIALLY DEFERRED], checked at COMMIT); IF NOT EXISTS; tables are created STRICT. A single integer PRIMARY KEY column is the table's rowid: an INSERT of NULL into it takes a new key where PostgreSQL raises 23502 |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP silently ignored; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ADD [CONSTRAINT n] PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works by rebuilding the table (validated against its rows, atomic, indexes and triggers recreated; a table created by CREATE TABLE AS or outside schema public is refused); ADD CONSTRAINT ... USING INDEX, NOT VALID or DEFERRABLE rejected; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased |
+| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
@@ -60,7 +60,7 @@ Basics not enumerated by the official feature matrix.
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
+| generate_series | ✅ Supported | In FROM, with joins, and reading the row it is joined to (`FROM t, generate_series(1, t.x) AS g`); its column is named as in PostgreSQL (the alias, `AS g(x)`'s column, or `generate_series`). WITH ORDINALITY and a second column alias are rejected with an error. In the joined form `SELECT *` names the column `value`. A bare reference to the series column is read as the series only in the SELECT that declares it: in a subquery a bare name is that subquery's own relations' column, and one they lack is an unknown column (42703) where PostgreSQL reads it as the outer series (a correlated reference; write `g.g`). Two series columns of one name make a bare reference ambiguous (42702) |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
 
@@ -104,7 +104,7 @@ implemented.
 | pg_stat_io - I/O metrics view | ❌ Not supported | |
 | pg_wait_events system view | ❌ Not supported | |
 | Server statistics in shared memory | ❌ Not supported | |
-| SQL-standard information schema | ❌ Not supported | Only an `information_schema` row in pg_namespace; no views |
+| SQL-standard information schema | 🟡 Partial | `columns`, `tables`, `table_constraints` and `key_column_usage` for schema public (constraint names as PostgreSQL derives them); no other view |
 | Support for anonymous shared memory | ❌ Not supported | |
 | XML, JSON and YAML output for EXPLAIN | ❌ Not supported | |
 
@@ -114,7 +114,12 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
-numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
+numeric(p,s) keep their type modifiers. char(n) is stored without its trailing
+blanks and padded back on output; its comparisons ignore trailing blanks against
+a column or a literal (by scan and by index seek alike), but not yet against a
+bound parameter (`code = $1` compares as text), and comparing with a literal
+longer than n raises "value too long" where PostgreSQL answers false (both are
+the engine's: it encodes only literals, with the column's length check). interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
@@ -177,7 +182,7 @@ INTEGER. Unknown type names pass through as custom types.
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | ❌ Not supported | Keyword accepted but silently ignored |
+| LATERAL clause | 🟡 Partial | `CROSS JOIN LATERAL (SELECT e1, ...) AS o(n1, ...)` (one row of expressions over the outer row) is inlined when every `ei` is a scalar expression (no aggregate, window, volatile or set-returning function, or subquery) and its columns are read as `o.ni` (`*`, `o.*` and an unqualified `ni` are rejected); a LATERAL join with ON, USING or NATURAL, LEFT JOIN LATERAL, a comma LATERAL and every other LATERAL are rejected with an error |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
@@ -188,7 +193,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
-| Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
+| Row-wise comparison | ✅ Supported | Row constructors compare element-wise, as `(a,b) < (c,d)` does in PostgreSQL |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
@@ -199,7 +204,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
-| WITH ORDINALITY clause | ❌ Not supported | |
+| WITH ORDINALITY clause | ❌ Not supported | Rejected with an error; column aliases on a table function other than generate_series are rejected too |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 

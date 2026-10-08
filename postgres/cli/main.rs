@@ -35,7 +35,7 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -43,7 +43,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
+use turso_core::branch::{BranchDurability, SyncClass};
+use turso_core::{LimboError, OpenFlags, Statement, Value};
 use turso_pg::Connection;
 use turso_pg_server::TursoPgServer;
 
@@ -90,6 +91,71 @@ struct Opts {
         help = "Start PostgreSQL wire protocol server at given address (e.g. 0.0.0.0:5432)"
     )]
     server: Option<String>,
+
+    #[clap(
+        long,
+        default_value_t = turso_pg_server::DEFAULT_MAX_CONNECTIONS,
+        help = "With --server: the most sessions served at once; the next is refused with 53300"
+    )]
+    max_connections: usize,
+
+    #[clap(
+        long,
+        default_value_t = turso_pg_server::DEFAULT_LOCK_WAIT_MS,
+        help = "With --server: how long a branch call waits for a lock another session holds \
+                before it fails with 55P03, in milliseconds"
+    )]
+    lock_timeout_ms: u64,
+
+    #[clap(
+        long,
+        value_enum,
+        default_value_t = BranchStore::Catalog,
+        help = "Where named branches live: a catalog store beside the database (the default), a \
+                snapshot store, or memory only (volatile; always the case for :memory:)"
+    )]
+    branch_store: BranchStore,
+
+    #[clap(
+        long,
+        value_enum,
+        default_value_t = Durability::Full,
+        help = "What an acknowledged commit or branch operation has been flushed with: full \
+                (F_FULLFSYNC on Apple platforms, fsync elsewhere; the default), fsync, or off"
+    )]
+    durability: Durability,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchStore {
+    Catalog,
+    Snapshot,
+    Volatile,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Durability {
+    Full,
+    Fsync,
+    Off,
+}
+
+impl Opts {
+    /// The branch store the database is opened with. Named branches are durable by default; a
+    /// database in memory has nowhere to keep them.
+    fn branch_durability(&self, db_path: &str) -> BranchDurability {
+        let sync = match self.durability {
+            Durability::Full => SyncClass::FullFsync,
+            Durability::Fsync => SyncClass::Fsync,
+            Durability::Off => SyncClass::Off,
+        };
+        match self.branch_store {
+            _ if db_path == ":memory:" => BranchDurability::Volatile,
+            BranchStore::Catalog => BranchDurability::Catalog { sync },
+            BranchStore::Snapshot => BranchDurability::Durable { sync },
+            BranchStore::Volatile => BranchDurability::Volatile,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,15 +166,9 @@ fn open_database(
     db_path: &str,
     vfs: Option<&String>,
     readonly: bool,
-) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
-    let db_opts = DatabaseOpts::new()
-        .with_views(true)
-        .with_custom_types(true)
-        .with_encryption(true)
-        .with_index_method(true)
-        .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true);
+    branches: BranchDurability,
+) -> anyhow::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
+    let db_opts = turso_pg_server::database_opts(branches);
 
     let flags = if readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -118,40 +178,7 @@ fn open_database(
 
     let (io, db) =
         turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect()?);
-    Ok((io, conn))
-}
-
-/// Discover and attach existing PG schema database files in the same directory.
-fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
-        return;
-    }
-    let dir = Path::new(db_file)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(schema) = name
-            .strip_prefix("turso-postgres-schema-")
-            .and_then(|s| s.strip_suffix(".db"))
-        else {
-            continue;
-        };
-        let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
-        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
-            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
-        }
-    }
+    Ok((io, db))
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1037,12 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
+    let (io, db) = open_database(
+        &db_file,
+        opts.vfs.as_ref(),
+        opts.readonly,
+        opts.branch_durability(&db_file),
+    )?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));
     {
@@ -1021,12 +1053,22 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
-    auto_attach_pg_schemas(&conn, &db_file);
-    // Server mode: start PG wire protocol server and exit
+    // Server mode: start PG wire protocol server and exit. Every session opens its own
+    // connection.
     if let Some(ref address) = opts.server {
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        let server = TursoPgServer::new(
+            address.clone(),
+            db_file,
+            db,
+            opts.max_connections,
+            std::time::Duration::from_millis(opts.lock_timeout_ms),
+            interrupt_count,
+        );
         return server.run();
     }
+
+    let conn = Connection::new(db.connect()?);
+    turso_pg::attach_schema_files(&conn, &db_file);
 
     let table_config = TableConfig::adaptive_colors();
 

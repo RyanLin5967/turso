@@ -3,15 +3,67 @@ use thiserror::Error;
 
 pub mod translator;
 
+/// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
+pub use pg_query;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
     ParseError(String),
 }
 
+thread_local! {
+    static LIBPG_QUERY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Calls into libpg_query (parse, split, scan, normalize, fingerprint) made by this thread, for
+/// per-statement work budgets: a wire session runs on one thread, so the difference across a
+/// statement is that statement's count. Observation only.
+pub fn libpg_query_calls() -> u64 {
+    LIBPG_QUERY_CALLS.with(|c| c.get())
+}
+
+fn count_libpg_query_call() {
+    LIBPG_QUERY_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
+    count_libpg_query_call();
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// Deparse a parse tree back to SQL text (libpg_query's deparser).
+pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
+    count_libpg_query_call();
+    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
+/// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
+/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
+/// it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is serialized
+/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N` read off it, a
+/// pattern a string value in the tree cannot hold, since its quotes are escaped. A ParamRef's first
+/// field is its number. Only for a statement whose text holds a '$'.
+pub fn param_numbers(parse: &ParseResult) -> Vec<i32> {
+    const KEY: &str = "\"ParamRef\":{\"number\":";
+    let Ok(json) = serde_json::to_string(&parse.protobuf) else {
+        return Vec::new();
+    };
+    let mut numbers: Vec<i32> = json
+        .match_indices(KEY)
+        .filter_map(|(at, _)| {
+            let rest = &json[at + KEY.len()..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
 }
 
 /// Split a multi-statement SQL string into individual statements.
@@ -19,6 +71,7 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 /// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
+    count_libpg_query_call();
     let parts =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
@@ -36,11 +89,13 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
+    count_libpg_query_call();
     pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
+    count_libpg_query_call();
     pg_query::fingerprint(sql)
         .map(|fp| fp.hex)
         .map_err(|e| ParseError::ParseError(e.to_string()))
@@ -67,6 +122,7 @@ pub fn quote_identifier(ident: &str) -> String {
 /// keyword classification matches server-side quote_identifier().
 fn keyword_requires_quoting(ident: &str) -> bool {
     use pg_query::protobuf::KeywordKind;
+    count_libpg_query_call();
     let scan =
         pg_query::scan(ident).expect("scanning a bare lower-case ASCII identifier cannot fail");
     match scan.tokens.as_slice() {
@@ -131,6 +187,31 @@ mod tests {
         for sql in queries {
             let result = parse(sql);
             assert!(result.is_ok(), "Failed to parse: {sql}");
+        }
+    }
+
+    /// param_numbers finds every $n in the tree, in clauses the engine folds away or the translator
+    /// never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a comment, a
+    /// quoted identifier or a dollar-quoted string that looks like one (wire review 8 item 5).
+    #[test]
+    fn param_numbers_reads_the_whole_tree() {
+        for (sql, want) in [
+            ("SELECT 1", vec![]),
+            ("SELECT v FROM t WHERE false AND id = $1", vec![1]),
+            ("SELECT v FROM t WHERE id = $2 AND (true OR v = $1)", vec![1, 2]),
+            ("SELECT count(*) FROM t HAVING count(*) > $1", vec![1]),
+            ("WITH c AS (SELECT $3 AS x) SELECT x FROM c LIMIT $1", vec![1, 3]),
+            (
+                "INSERT INTO t VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = $4 WHERE t.v <> $5",
+                vec![1, 2, 4, 5],
+            ),
+            ("SELECT $1, $1, $1", vec![1]),
+            ("SELECT '$1', \"$2\", $$ $3 $$ /* $4 */ -- $5\n", vec![]),
+            ("SELECT '\"ParamRef\":{\"number\":7'", vec![]),
+            ("SELECT 1 LIMIT $2147483647", vec![2147483647]),
+        ] {
+            let parsed = parse(sql).unwrap();
+            assert_eq!(param_numbers(&parsed), want, "{sql}");
         }
     }
 }

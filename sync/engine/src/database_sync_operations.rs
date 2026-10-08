@@ -3560,7 +3560,8 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
     if let Some(file) = io.try_open(main_db_path)? {
         io.truncate(ctx.coro, file, 0).await?;
     }
-    if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
+    // The WAL the core will open: named from the resolved path (review 5 C3-2).
+    if let Some(file) = io.try_open(&turso_core::sidecar_wal_path(main_db_path)?)? {
         io.truncate(ctx.coro, file.clone(), 0).await?;
         // Make the WAL reset durable so a stale WAL can't reappear next to the
         // freshly bootstrapped DB after a crash and get replayed onto it.
