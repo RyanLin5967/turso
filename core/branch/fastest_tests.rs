@@ -3756,6 +3756,68 @@ fn a_held_free_survives_a_checkpoint_and_a_reopen_in_a_raised_d0_catalog_store()
     );
 }
 
+/// Engine review 11 MED 1: a raised D0 store's FUZZY checkpoint syncs only the arena
+/// (`settle_arena`) and leads no flight, so with D0-only traffic no sync in the free class ever
+/// came, and a held free never matured: an unbounded slot leak, lost on disk too (a catalog open
+/// has no reachability sweep). The checkpoint must return every held free it covers, with no
+/// raised operation: (a) one released before the capture, which the catalog then lists free, also
+/// after a reopen (mutant `capture_skips_held`); (b) one released after the capture and before the
+/// commit, whose Release the cut's synced rewrite makes durable, so the install's mark in the
+/// rewrite class matures it (mutant `settle_arena_marks_no_durable`).
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_returns_held_frees_with_no_raised_op() {
+    let _s = serial();
+    let wait_arrival = |db: &Arc<Database>| {
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    // (a) released before the capture, then a reopen.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fuzzy-held-a.db");
+    let (slots, incarnation) = {
+        let (db, _trunk, x, slots) = raised_d0_with_a_kept_pre_image(&path, true, false);
+        x.reap().unwrap();
+        for &slot in &slots {
+            assert!(!db.branch_slot_is_free(slot), "(a) premise: slot {slot} is held for a sync");
+        }
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "(a) premise: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        for &slot in &slots {
+            assert!(db.branch_slot_is_free(slot), "(a) slot {slot} is still held after a fuzzy checkpoint covered its Release");
+        }
+        (slots, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    for &slot in &slots {
+        assert!(db.branch_slot_is_free(slot), "(a) slot {slot} is lost after a fuzzy checkpoint and a reopen");
+    }
+    assert_eq!(
+        db.branch_stats().unwrap().arena_slots_in_use as usize,
+        db.branch_slots_in_use().len(),
+        "(a) after the reopen: the in-use count disagrees with the slots in use"
+    );
+    drop(db);
+    // (b) released after the capture, before the commit.
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, _trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("fuzzy-held-b.db"), true, false);
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "(b) premise: a fuzzy checkpoint started");
+    wait_arrival(&db);
+    x.reap().unwrap();
+    for &slot in &slots {
+        assert!(!db.branch_slot_is_free(slot), "(b) premise: slot {slot} is held for a sync");
+    }
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert!(db.branches.rewrite_class_for_test().syncs(), "(b) premise: the log is still raised");
+    for &slot in &slots {
+        assert!(db.branch_slot_is_free(slot), "(b) slot {slot} is still held after the checkpoint's synced cut kept its Release");
+    }
+}
+
 /// Sets `store::HOLD_BOUND_FORCED` for one test, and clears it when dropped.
 struct HoldBound;
 

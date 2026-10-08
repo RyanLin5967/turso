@@ -2686,7 +2686,10 @@ fn run_flight(
         drop(group.quiesce());
         let t = Instant::now();
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
-        if installed.is_ok() {
+        // The cut synced what it kept in the rewrite class: a raised D0 store's held frees mature on
+        // it, with no raised operation (engine review 11 MED 1). Mutant
+        // `settle_arena_marks_no_durable` (test builds only): this site marks nothing.
+        if installed.is_ok() && !fe_mutant("settle_arena_marks_no_durable") {
             if let Some(journal) = guard.journal.as_ref() {
                 group.mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
             }
