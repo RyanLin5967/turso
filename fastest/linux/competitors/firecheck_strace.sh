@@ -52,8 +52,8 @@
 #      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
 #   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
 #      reply in its pipe is skipped; the next top-level calls are served by the coproc; the stamper's fd numbers
-#      reopened onto decoys (a file and /dev/null, both and then each alone, and two FIFOs, the setup proven by /proc)
-#      are refused with nothing written; then one in-order probe after a one-word and a non-ASCII line must get its
+#      reopened onto decoys (a file and /dev/null, both and then each alone, and two anonymous pipes; the setup
+#      proven by /proc) are refused with nothing written; then one in-order probe after a one-word and a non-ASCII line must get its
 #      own reply first (no leaked request, no answer to a malformed line); clock_pair stamps one-shot when the shape
 #      check refuses; the reply-shape check passes the stamper's format and refuses 5 malformed replies.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
@@ -765,13 +765,22 @@ if [ $alive = 1 ] && [ -n "${STAMPER[0]:-}" ] && [ -n "${STAMPER[1]:-}" ]; then
   s7=$( ( eval "exec $R</dev/null $W>&$kw"; setup_is /dev/null "/proc/$STAMPER_SHELL/fd/$W" || exit 3
           clock_pair f14g ) 2>/dev/null )
   exec {kr}<&- {kw}>&-
-  # And decoys that ARE pipes (two FIFOs, held open here so a leaked request stays readable): only an inode check, not
-  # a "this fd is a pipe" one, refuses them (ninth re-review, finding 2). A leaked request would wait in fifoW.
-  fifoR="$OUT/f14.fifoR" fifoW="$OUT/f14.fifoW"; rm -f "$fifoR" "$fifoW"; mkfifo "$fifoR" "$fifoW"
-  exec {fr}<>"$fifoR" {fw}<>"$fifoW"
-  s10=$( ( eval "exec $R<>\"\$fifoR\" $W<>\"\$fifoW\""; setup_is "$fifoR" "$fifoW" || exit 3; clock_pair f14j ) 2>/dev/null )
-  leak=""; IFS= read -r -t 1 leak <&"$fw"
-  exec {fr}>&- {fw}>&-
+  # And decoys that ARE anonymous pipes, like the stamper's own (two fresh ones, opened read-write here through
+  # /dev/fd so a leaked request stays readable): only an inode check refuses them -- not "this fd is a pipe" (-p), not
+  # "its link reads pipe:[...]", not "same device as the stamper's pipe" (ninth re-review, finding 2; tenth, findings
+  # 1-3: the FIFO files this replaces passed the last two mutants and were left in the uploaded raw). No file is made.
+  # The setup proof requires both decoys to be pipes and the stamper's fd numbers to be them. A failed exec leaves the
+  # case unrun (s10 empty, F14 fails) instead of aborting the script under set -u (tenth, finding 4).
+  ar="" aw=""
+  exec {ar}<> <(:) {aw}<> <(:) 2>/dev/null || true
+  if [ -n "$ar" ] && [ -n "$aw" ]; then
+    s10=$( ( eval "exec $R<&$ar $W>&$aw"
+             [ -p "/proc/$BASHPID/fd/$ar" ] && [ -p "/proc/$BASHPID/fd/$aw" ] &&
+               setup_is "/proc/$BASHPID/fd/$ar" "/proc/$BASHPID/fd/$aw" || exit 3
+             clock_pair f14j ) 2>/dev/null )
+    IFS= read -r -t 1 leak <&"$aw"
+    exec {ar}>&- {aw}>&-
+  fi
   dsz=$(wc -c <"$decoy" | tr -d ' '); dsz2=$(wc -c <"$decoy2" | tr -d ' ')
   # One probe, answered in order, proves two things at once (eighth re-review, findings 1 and 3): send a one-word
   # line, a non-ASCII line and a request with a fixed nonce, and the FIRST line back must be the probe's own reply.
@@ -805,9 +814,9 @@ if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" &
   $s10 == "f14j="*" f14j_src=oneshot" && -z $leak &&
   $stray == "f14probe.0.0 f14p="* && $s8 == "f14h="*" f14h_src=coproc" && $s9 == "f14i="*" f14i_src=oneshot" &&
   $alive2 = 1 && $shapes = 6 ]]; then
-  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written, no stray reply), the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused with no leaked request [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
-  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] fifo decoys=[$s10] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
   fails=$((fails + 1))
 fi
 
