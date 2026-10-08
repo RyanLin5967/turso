@@ -57,7 +57,8 @@ def v3_batch(fsdir, when, rc, block=None, plp="no"):
                         "flush_d0_p50_ratio": s.get("flush_d0_p50_ratio"),
                         "flush_sent_to_device": s.get("flush_sent_to_device"), "floor_kind": s.get("floor_kind"),
                         "flush_gate": (s.get("flush_gate") or {}).get("outcome"),
-                        "leaf": (s.get("leaf") or {}).get("disk"), "leaf_kind": (s.get("leaf") or {}).get("kind")})
+                        "leaf": (s.get("leaf") or {}).get("disk"), "leaf_kind": (s.get("leaf") or {}).get("kind"),
+                        "virtualization": s.get("virtualization")})
         except (OSError, ValueError, AttributeError) as e:
             rec["summary_error"] = f"{type(e).__name__}: {e}"
     b = os.path.join(d, "binary.txt")
@@ -94,16 +95,40 @@ def block_record(out, fs, plp="no"):
             rec["why"].append(f"V3 {when}: rc {r['rc']}, summary.json {'present' if r['summary'] else 'MISSING'}, "
                               f"raw.tsv {'present' if r['raw'] else 'MISSING'}; "
                               + "; ".join(r["blockgate"]["reasons"]) + "; run.sh: " + " ".join(r["run_sh_tail"]))
+    # The A16 plants: the stored record must exist, and the plants are RE-RUN here on the real BEFORE record (lane
+    # review LOW 11: a stored all_fired is not trusted); the two must agree.
     pl = os.path.join(fsdir, "blockgate-plants.json")
     try:
         rec["a14_plants"] = json.load(open(pl))
-        if not rec["a14_plants"].get("all_fired"):
-            rec["why"].append("A14 plants: not every plant was decided as planted "
-                              + str({p["plant"]: p["fired"] for p in rec["a14_plants"].get("plants", [])}))
     except (OSError, ValueError) as e:
         rec["a14_plants"] = None
         if rec["v3"].get("before", {}).get("ok"):
-            rec["why"].append(f"A14 plants: no record ({type(e).__name__})")
+            rec["why"].append(f"A16 plants: no record ({type(e).__name__})")
+    if rec["a14_plants"] is not None:
+        sj, raw = blockgate.load(os.path.join(fsdir, "v3-before"))
+        again, ok_again = blockgate.plants(sj, raw, rcs.get("before", 0), plp)
+        fired = {p["plant"]: p["fired"] for p in again}
+        rec["a14_plants_rederived"] = fired
+        if not ok_again or not rec["a14_plants"].get("all_fired"):
+            rec["why"].append(f"A16 plants: not every plant was decided as planted (re-derived {fired})")
+    # V3L's plants likewise, on every measurement that exists
+    for when in ("before", "after"):
+        j = os.path.join(fsdir, f"v3l-{when}", "v3l.json")
+        if not os.path.exists(j):
+            continue
+        try:
+            stored = json.load(open(os.path.join(fsdir, f"v3l-{when}-plants.json")))
+        except (OSError, ValueError):
+            stored = None
+        try:
+            again, ok_again = v3l.plants(json.load(open(j)))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            again, ok_again = [], False
+        rec.setdefault("v3l_plants", {})[when] = {p["plant"]: p["fired"] for p in again}
+        if stored is None or not stored.get("all_fired") or not ok_again:
+            if json.load(open(j)).get("verdict") == "VALID":  # a VOID measurement already fails the block
+                rec["why"].append(f"V3L {when} plants: stored {None if stored is None else stored.get('all_fired')}, "
+                                  f"re-derived {rec['v3l_plants'][when]}")
     b, a = rec["v3"]["before"].get("frame_arm_p50_us"), rec["v3"]["after"].get("frame_arm_p50_us")
     rec["v3_frame_arm_drift_us"] = round(a - b, 2) if a is not None and b is not None else None
     rec["v3l"] = v3l.block(os.path.join(fsdir, "v3l-before", "v3l.json"), os.path.join(fsdir, "v3l-after", "v3l.json"))
@@ -143,7 +168,7 @@ def summarize(out, sha, dry, manifest):
         result, why = False, "no attempt recorded"
         if last:
             adapter = open(os.path.join(d, "adapter.txt"), errors="replace").read() if os.path.exists(os.path.join(d, "adapter.txt")) else ""
-            if last["adapter_rc"] == 4 and "NOT AVAILABLE" in adapter:
+            if last["adapter_rc"] == 4 and any(l.startswith("NOT AVAILABLE") for l in adapter.splitlines()):
                 result, why = True, "NOT AVAILABLE (class absent at this sha)"
             elif last["void"] != "VALID":
                 why = "last attempt VOID"
@@ -159,7 +184,8 @@ def summarize(out, sha, dry, manifest):
                 if result and "VERDICT PASS" not in text:
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
-        runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why})
+        runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
+                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)"})
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
     fl = os.path.join(out, "fslist.txt")
@@ -186,7 +212,10 @@ def summarize(out, sha, dry, manifest):
                "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
                "failed_checks": failed_checks, "failed_blocks": failed_blocks,
                "failed_stages": failed, "blocks": blocks, "runs": runs}
-    ok = bool(planned) and not incomplete and not failed and not failed_blocks
+    # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
+    summary["measured_runs"] = sum(r["measured"] for r in runs)
+    ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
+        and summary["measured_runs"] > 0
     return summary, ok
 
 
@@ -237,16 +266,20 @@ def self_test():
                                           "blkflush_leaf_gate": {"outcome": "not applicable" if brd else "pass"}}})
 
     def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
-             plants=True, plants_fired=True, plp="no", lie=False):
+             plants=True, plants_fired=True, plp="no", lie=False, cell="ok"):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
-        w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\nxfs\tours-full-c1\tours\t1\t1\t0\tVALID\n")
+        crow = {"ok": "xfs\tours-full-c1\tours\t1\t1\t0\tVALID", "na": "xfs\tours-full-c1\tours\t1\t1\t4\tN/A",
+                "compfail": "xfs\tours-full-c1\tdolt\t1\t1\t0\tVALID"}[cell]
+        w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + crow + "\n")
         w(f"{out}/fslist.txt", fslist + "\n")
         w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
         f = f"{out}/fs-xfs"
-        w(f"{f}/plan.tsv", "ours-full-c1\tours\t1\t200\t1\tfull\n")
+        w(f"{f}/plan.tsv", "ours-full-c1\t" + ("dolt" if cell == "compfail" else "ours") + "\t1\t200\t1\tfull\n")
         w(f"{f}/cells/ours-full-c1/a1/result/summary.json", "{}")
-        w(f"{f}/cells/ours-full-c1/a1/adapter.txt", "")
+        w(f"{f}/cells/ours-full-c1/a1/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
+        if cell == "compfail":
+            w(f"{f}/cells/ours-full-c1/a1/result/functional.txt", "FAIL F1: something\nVERDICT FAIL\n")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
         for when in ("before", "after"):
@@ -260,6 +293,10 @@ def self_test():
         w(f"{f}/v3l-before/v3l.json", v3lj(before_v3l, lie))
         if after_v3l:
             w(f"{f}/v3l-after/v3l.json", v3lj(after_v3l))
+        for when in ("before", "after"):  # what t3run's v3l() writes after each measurement
+            if os.path.exists(f"{f}/v3l-{when}/v3l.json"):
+                res, ok = v3l.plants(json.load(open(f"{f}/v3l-{when}/v3l.json")))
+                w(f"{f}/v3l-{when}-plants.json", json.dumps({"plants": res, "all_fired": ok}, default=str))
         if drop:
             os.unlink(f"{f}/{drop}")
         return out
@@ -283,6 +320,8 @@ def self_test():
         ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False),
         ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False),
         ("review M2: a refusal's run.sh line reaches the block's why", {"before_rc": 2}, False),
+        ("lane review LOW 10: a package whose only cell is NOT AVAILABLE measured nothing and fails", {"cell": "na"}, False),
+        ("lane review LOW 7: a competitor VERDICT FAIL fails the package", {"cell": "compfail"}, False),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:
