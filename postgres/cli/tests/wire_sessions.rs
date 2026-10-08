@@ -3440,6 +3440,33 @@ fn a_parameter_number_past_the_limit_is_refused() {
     }
 }
 
+/// A branch call's `$n` past the limit is refused with 42P02 too, at Describe and over the simple
+/// protocol, and the server serves on. Branch calls never reached the prepare-time limit: Describe
+/// sized its parameter list by the number, so `$18446744073709551615` panicked on capacity overflow
+/// and `$2147483647` asked for about 32 GiB, and under the release build's panic=abort one client
+/// ended every session (wire review 9 item 1). The 20-digit case comes first, so at the base the
+/// test fails on its panic before it asks for the 32 GiB.
+#[test]
+fn a_branch_call_parameter_past_the_limit_is_refused() {
+    let dir = Scratch::new("branchparamlimit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "SELECT turso_branch_create($18446744073709551615)",
+        "SELECT turso_branch_create($65536)",
+        "SELECT turso_branch_switch($2147483647)",
+        "SELECT turso_branch_create($99999999999999999999999)",
+    ] {
+        let r = a.describe_statement(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}, extended");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42P02", "{sql}");
+        let mut b = server.connect();
+        assert_eq!(b.q("SELECT 1").single("a second session is served"), "1");
+    }
+}
+
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
 /// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
 /// described and is bound, as in PostgreSQL. They were read from the engine's slots, so
