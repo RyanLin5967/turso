@@ -3765,3 +3765,72 @@ fn delete_using_deletes_only_the_joined_rows() {
         .ok("delete using an empty table");
     assert_eq!(left(&mut a), vec!["1", "4"], "nothing joins an empty table");
 }
+
+/// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
+/// it. Its copy-back ran with foreign keys enforced, so it counted rows again: (i) a block's
+/// deferred orphan was cancelled by a valid child the copy re-inserted, and COMMIT kept the
+/// orphan; (ii) an orphan made from the parent's side was counted twice, so fixing it did not let
+/// COMMIT through; (iii) a rebuild whose own COMMIT failed on such a count left the transaction
+/// open ('T', holding the trunk's write lock). (iv) An added foreign key is still checked against
+/// the rows: 23503 at the ALTER, nothing changed (wire review 6 item 1).
+#[test]
+fn an_alter_rebuild_keeps_the_deferred_foreign_key_count() {
+    let dir = Scratch::new("rebuilddefer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let fresh = |a: &mut Wire| {
+        for sql in [
+            "DROP TABLE IF EXISTS c",
+            "DROP TABLE IF EXISTS p",
+            "CREATE TABLE p(id INT PRIMARY KEY, v INT)",
+            "CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, w INT)",
+            "INSERT INTO p VALUES (1, 0)",
+            "INSERT INTO c VALUES (1, 1, 0)",
+        ] {
+            a.q(sql).ok(sql);
+        }
+    };
+    // (i) A block's orphan survives an ALTER of the parent: COMMIT fails 23503, nothing kept.
+    fresh(&mut a);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO c VALUES (2, 99, 0)")
+        .ok("a deferred orphan");
+    a.q("ALTER TABLE p ADD UNIQUE (v)").ok("alter the parent");
+    let r = a.q("COMMIT");
+    assert_eq!(r.err("(i) commit with an orphan").code, "23503");
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM c WHERE id = 2").single("(i)"),
+        "0"
+    );
+    // (ii) An orphan made from the parent's side, fixed before COMMIT, commits.
+    fresh(&mut a);
+    a.q("BEGIN").ok("begin");
+    a.q("DELETE FROM p WHERE id = 1").ok("orphan the child");
+    a.q("ALTER TABLE c ADD UNIQUE (w)").ok("alter the child");
+    a.q("INSERT INTO p VALUES (1, 0)").ok("the parent back");
+    a.q("COMMIT").ok("(ii) the block commits");
+    // (iii) An orphan the database already holds (made with foreign keys off): the rebuild of its
+    // table commits and the session is idle.
+    fresh(&mut a);
+    a.q("SET foreign_keys = off").ok("premise: keys off");
+    a.q("INSERT INTO c VALUES (3, 98, 0)").ok("an orphan");
+    a.q("SET foreign_keys = on").ok("keys on");
+    let r = a.q("ALTER TABLE c ADD UNIQUE (w)");
+    assert_eq!(
+        r.status, b'I',
+        "(iii) the rebuild left a block open: {:?}",
+        r.error
+    );
+    // (iv) An added foreign key over an orphan: 23503 at the ALTER, the table unchanged.
+    a.q("DROP TABLE IF EXISTS c2").ok("drop c2");
+    a.q("CREATE TABLE c2(id INT PRIMARY KEY, pid INT)").ok("c2");
+    a.q("INSERT INTO c2 VALUES (1, 1), (2, 97)")
+        .ok("c2 rows, one orphan");
+    let r = a.q("ALTER TABLE c2 ADD FOREIGN KEY (pid) REFERENCES p (id)");
+    assert_eq!(r.err("(iv) an added key over an orphan").code, "23503");
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM c2").single("(iv)"), "2");
+    a.q("INSERT INTO c2 VALUES (3, 96)")
+        .ok("(iv) no key was added");
+}
