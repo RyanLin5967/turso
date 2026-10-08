@@ -1564,11 +1564,43 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation);
 
-        // Translate WHERE clause
-        let where_clause = if let Some(where_node) = &delete.where_clause {
-            Some(Box::new(self.translate_expr(where_node)?))
+        // DELETE ... USING u WHERE c deletes the target's rows that join a row of u: the engine has
+        // no USING, so it is DELETE ... WHERE EXISTS (SELECT 1 FROM u WHERE c), c's references to
+        // the target correlating to it. The USING clause was dropped, so the WHERE ran against the
+        // target alone and deleted more (wire review 7 item 18).
+        let where_clause = if delete.using_clause.is_empty() {
+            match &delete.where_clause {
+                Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
+                None => None,
+            }
         } else {
-            None
+            let (from, where_clause) = self.in_select_scope(|| {
+                let from = self.translate_from_items(&delete.using_clause)?;
+                let where_clause = match &delete.where_clause {
+                    Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
+                    None => None,
+                };
+                Ok((from, where_clause))
+            })?;
+            Some(Box::new(ast::Expr::Exists(ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                            None,
+                        )],
+                        from: Some(from),
+                        where_clause,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })))
         };
 
         let returning = self.translate_returning(&delete.returning_list)?;
