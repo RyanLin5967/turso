@@ -5024,6 +5024,34 @@ fn delete_using_deletes_only_the_joined_rows() {
     assert_eq!(left(&mut a), vec!["1", "4"], "nothing joins an empty table");
 }
 
+/// A multi-column foreign key declared MATCH FULL is refused (0A000), in CREATE TABLE and in ALTER
+/// TABLE ADD FOREIGN KEY, the child unchanged: the engine enforces MATCH SIMPLE only, under which a
+/// row with some key columns NULL is exempt where MATCH FULL refuses it. It was accepted, validated
+/// and enforced as MATCH SIMPLE (wire review 11 item 12). One column is the same key under either.
+#[test]
+fn a_multi_column_match_full_key_is_refused() {
+    let dir = Scratch::new("matchfull");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(a INT, b INT, PRIMARY KEY (a, b))")
+        .ok("p");
+    let sql = "CREATE TABLE c(x INT, y INT, FOREIGN KEY (x, y) REFERENCES p(a, b) MATCH FULL)";
+    assert_eq!(a.q(sql).err(sql).code, "0A000");
+    a.q("CREATE TABLE c(x INT, y INT)").ok("c");
+    a.q("INSERT INTO c VALUES (1, NULL)").ok("a half-NULL row");
+    let sql = "ALTER TABLE c ADD FOREIGN KEY (x, y) REFERENCES p(a, b) MATCH FULL";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "0A000");
+    assert_eq!(r.status, b'I');
+    a.q("INSERT INTO c VALUES (2, NULL)")
+        .ok("c is unchanged: no key");
+    a.q("CREATE TABLE q(id INT PRIMARY KEY)").ok("q");
+    a.q("CREATE TABLE d(x INT REFERENCES q(id) MATCH FULL)")
+        .ok("one column: MATCH FULL is MATCH SIMPLE");
+    a.q("ALTER TABLE c ADD FOREIGN KEY (x, y) REFERENCES p(a, b) MATCH SIMPLE")
+        .ok("MATCH SIMPLE");
+}
+
 /// ALTER TABLE ADD FOREIGN KEY refuses a parent key PostgreSQL would: columns no UNIQUE or PRIMARY
 /// KEY constraint covers (42830 "there is no unique constraint matching given keys"), a column
 /// count that differs from the parent key's (42830), and a parent that does not exist (42P01); the
