@@ -4,7 +4,13 @@
 //! C1b tracers stamp (CLOCK_UPTIME_RAW), so their events can be attributed to steps.
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
-//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra] --out FILE
+//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra]
+//!                [--name-prefix P] --out FILE
+//!
+//! `--name-prefix P` (default `b_`) names op k's branch `P<k>`: the budget passes the prefix the wire
+//! side's spec names its branches with (`b_{run}_{c}_{i}`, so `b_w_0_` for run tag w and one
+//! client), as the bytes the two sides write per step include the name (wire review 11 item 17:
+//! `b_<k>` against `b_w_0_<k>` was 4 bytes a create, which the bytes rule then read as a cost).
 //!
 //! `--siblings K` creates K live branches before the ops, so every measured create forks a trunk
 //! that already has children (the path credited cells take; wire review 1 item 18). `--plant extra`
@@ -87,6 +93,7 @@ struct Args {
     ops: u64,
     siblings: u64,
     plant_extra: bool,
+    name_prefix: String,
     out: String,
 }
 
@@ -96,6 +103,7 @@ fn args() -> Args {
     let (mut durability, mut store) = ("full".to_string(), "catalog".to_string());
     let (mut rows, mut warmup, mut ops, mut siblings) = (1000, 20, 200, 0);
     let mut plant_extra = false;
+    let mut name_prefix = "b_".to_string();
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
         match k.as_str() {
@@ -110,6 +118,7 @@ fn args() -> Args {
                 "extra" => plant_extra = true,
                 other => panic!("--plant {other}: extra"),
             },
+            "--name-prefix" => name_prefix = v(),
             "--out" => out = Some(v()),
             other => panic!("unknown argument {other}"),
         }
@@ -133,6 +142,7 @@ fn args() -> Args {
         ops,
         siblings,
         plant_extra,
+        name_prefix,
         out: out.expect("--out"),
     }
 }
@@ -192,7 +202,7 @@ fn main() {
     };
     for seq in 0..a.warmup + a.ops {
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
-        let name = format!("b_{seq}");
+        let name = format!("{}{seq}", a.name_prefix);
         let id = 1 + (seq * 7919) % a.rows;
 
         // Two probes with nothing between: what the probes themselves cost, for the budget to
