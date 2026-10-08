@@ -7,9 +7,13 @@ TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver 
 that serves the timed run (the server's processes, or the embedded clonebench process) at its start and at its end
 into CELLDIR/timed.tracer.tsv ("phase pid tid tracerpid"), and writes the run's exit status to CELLDIR/timed.rc.
 
-  timedrun.py check CELLDIR N   CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
-                                exactly N ops like the labelling run, and every sampled task, at start and at end,
-                                had TracerPid 0 (no sample at either end is not a pass)
+  timedrun.py check CELLDIR N RULE
+                                CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
+                                exactly N ops like the labelling run, every sampled task, at start and at end, had
+                                TracerPid 0 (no sample at either end is not a pass), and both runs recorded the
+                                warm-up RULE
+  timedrun.py rule CAP_S        PREREG :210's warm-up for a run capped at CAP_S seconds, as bbload/clonebench
+                                --warmup OPS:S:MAX_S: min(max(1000 ops, 10 s), 10% of the cap)
   timedrun.py selftest          known-answer fixtures for check; exit 0 only if every verdict is as expected
 """
 import json
@@ -43,7 +47,12 @@ def tracer_rows(path):
         return None
 
 
-def check(celldir, n):
+def rule(cap_s):
+    """STUB (red)."""
+    return ""
+
+
+def check(celldir, n, warm_rule=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
     lab = load(os.path.join(celldir, "bb", "summary.json"))
@@ -85,16 +94,19 @@ def write_verdict(celldir, n, why):
 
 
 # ---------------------------------------------------------------- selftest
-def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None):
+RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
+
+
+def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE):
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     with open(os.path.join(d, "bb", "summary.json"), "w") as f:
-        json.dump({"verdict": "ok", "rc": 0, "measured_ops": n}, f)
+        json.dump({"verdict": "ok", "rc": 0, "measured_ops": n, "warmup_rule": lab_rule}, f)
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         with open(os.path.join(d, "timed", "summary.json"), "w") as f:
             json.dump({"verdict": "ok" if rc == 0 else "fail", "rc": rc,
-                       "measured_ops": n if timed_ops is None else timed_ops}, f)
+                       "measured_ops": n if timed_ops is None else timed_ops, "warmup_rule": timed_rule}, f)
         with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
             f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
         with open(os.path.join(d, "timed.rc"), "w") as f:
@@ -118,23 +130,32 @@ def selftest():
         ("tracer record missing", dict(tracer=None), False),
         ("timed run failed", dict(rc=3, tracer=clean), False),
         ("timed run measured another N", dict(timed_ops=150, tracer=clean), False),
+        # gate-6 review, t3run item 3: one warm-up rule, PREREG :210's, for both runs
+        ("timed run warmed up by another rule", dict(tracer=clean, timed_rule="20:0:0"), False),
+        ("labelling run warmed up by another rule", dict(tracer=clean, lab_rule="1000:10:60"), False),
+        ("no warm-up rule recorded", dict(tracer=clean, lab_rule=None, timed_rule=None), False),
     ]
     bad = 0
     with tempfile.TemporaryDirectory() as root:
         for i, (name, kw, want) in enumerate(cases):
             d = fixture(root, f"c{i}", **kw)
-            why = check(d, 200)
+            why = check(d, 200, RULE)
             got = not why
             print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
             bad += got != want
+    for cap, want in ((1800, "1000:10:180"), (60, "1000:10:6"), (3600, "1000:10:360")):
+        got = rule(cap)
+        print(("PASS" if got == want else "FAIL"), f"rule({cap}) = {got!r}, want {want!r}")
+        bad += got != want
+        cases.append(None)
     print(f"timedrun selftest: {len(cases) - bad}/{len(cases)}")
     return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "check":
+    if len(sys.argv) == 5 and sys.argv[1] == "check":
         n = int(sys.argv[3])
-        why = check(sys.argv[2], n)
+        why = check(sys.argv[2], n, sys.argv[4])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
