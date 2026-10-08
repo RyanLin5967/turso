@@ -3622,6 +3622,29 @@ fn bind_reads_each_parameter_in_its_format() {
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
 }
 
+/// A bytea parameter in text format whose hex holds a non-ASCII character is 22P02, and the server
+/// serves on: the hex was sliced as a &str, inside the character, which panicked the session (and
+/// under the release build's panic=abort every session) from one Bind that declares OID 17 (wire
+/// review 9 item 5).
+#[test]
+fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
+    const BYTEA: u32 = 17;
+    let dir = Scratch::new("byteahex");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE ty(y BYTEA)").ok("ty");
+    for bytes in [&b"\\x0\xc3\xa90"[..], "\\x0\u{1F600}0".as_bytes()] {
+        let r = a.xt("INSERT INTO ty(y) VALUES ($1)", &[(BYTEA, 0, bytes)]);
+        assert_eq!(r.err("a non-ASCII hex digit").code, "22P02", "{bytes:?}");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+        let mut b = server.connect();
+        assert_eq!(b.q("SELECT 1").single("a second session"), "1");
+    }
+    a.xt("INSERT INTO ty(y) VALUES ($1)", &[(BYTEA, 0, b"\\x00ff")])
+        .ok("valid hex");
+    assert_eq!(a.q("SELECT count(*) FROM ty").single("one row"), "1");
+}
+
 /// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
 /// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
 /// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
