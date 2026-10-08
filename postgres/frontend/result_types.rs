@@ -182,6 +182,10 @@ pub struct StatementTypes {
     /// turso_pg_parser::param_numbers): the parameter count and the gaps are read from this, not
     /// from the engine's slots, which a clause it folds away does not get (wire review 8 item 5).
     pub used: Vec<u32>,
+    /// Every $n compared with an expression no context types: refused (42P18) unless the client
+    /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
+    /// 1: refused at prepare from the text alone, a declared one could never run).
+    pub untyped: std::collections::BTreeSet<u32>,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;
@@ -200,13 +204,17 @@ pub use turso_pg_parser::MAX_PARAMETER;
 /// expression (wire review 8 item 7).
 ///
 /// A parameter compared with an expression no context types (a function this walk does not know)
-/// is refused: `Err(n)`, the lowest such $n, which the caller reports as 42P18 rather than compare
-/// it as text (fail closed; review 8 item 7). A parameter compared with a column the walk cannot
-/// resolve (a relation it does not model) is left untyped (text), as before.
+/// is returned apart, in the second set: the server refuses it (42P18) rather than compare it as
+/// text, unless the client declared its type (fail closed; review 8 item 7, review 11 item 1). A
+/// parameter compared with a column the walk cannot resolve (a relation it does not model) is left
+/// untyped (text), as before.
 pub fn parameter_types(
     parse: &ParseResult,
     schema: &Schema,
-) -> Result<std::collections::BTreeMap<u32, u32>, u32> {
+) -> (
+    std::collections::BTreeMap<u32, u32>,
+    std::collections::BTreeSet<u32>,
+) {
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
@@ -218,14 +226,13 @@ pub fn parameter_types(
             infer.statement(stmt);
         }
     }
-    if let Some(n) = infer
+    let untyped = infer
         .compared_untyped
         .iter()
-        .find(|n| !infer.types.contains_key(n))
-    {
-        return Err(*n);
-    }
-    Ok(infer.types)
+        .filter(|n| !infer.types.contains_key(n))
+        .copied()
+        .collect();
+    (infer.types, untyped)
 }
 
 /// A relation a column reference can name, by the name references qualify it by: a table (its

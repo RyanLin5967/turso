@@ -2104,9 +2104,9 @@ fn branch_call_types(call: &PgBranchCall) -> StatementTypes {
     used.sort_unstable();
     used.dedup();
     StatementTypes {
-        columns: Vec::new(),
         params: used.iter().map(|n| (*n, Type::TEXT.oid())).collect(),
         used,
+        ..StatementTypes::default()
     }
 }
 
@@ -2198,11 +2198,6 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
         // A savepoint name that names none (wire review 6 item 6).
         LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
-        LimboError::ParseError(m)
-            if m.starts_with("could not determine data type of parameter") =>
-        {
-            "42P18"
-        }
         LimboError::ParseError(m)
             if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
         {
@@ -3107,7 +3102,11 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
                     return Ok(t.clone());
                 }
             }
-            if types.used.binary_search(&(n as u32)).is_err() {
+            // Undeclared (or UNKNOWN) and compared with something no context types: refused, never
+            // compared as text (wire review 8 item 7). Here, where the declared types are read,
+            // not at prepare (wire review 11 item 1).
+            if types.used.binary_search(&(n as u32)).is_err() || types.untyped.contains(&(n as u32))
+            {
                 return Err(error(
                     "42P18",
                     format!("could not determine data type of parameter ${n}"),
