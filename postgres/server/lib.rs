@@ -1963,7 +1963,7 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<String>>) -> SqlResult<Str
             // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
             // function's text) is its bytes in either format: textrecv reads binary text as is.
             if let Some(Some(ty)) = portal.statement.parameter_types.get(n - 1) {
-                if *ty != Type::TEXT && *ty != Type::VARCHAR {
+                if ![Type::TEXT, Type::VARCHAR, Type::UNKNOWN].contains(ty) {
                     return Err(error(
                         "42804",
                         format!("a branch name is text, and parameter ${n} is {ty}"),
@@ -2397,6 +2397,27 @@ impl ExtendedQueryHandler for Session {
         let Some(statement) = client.portal_store().get_statement(name) else {
             return Err(PgWireError::StatementNotFound(name.to_owned()));
         };
+        check_bind(&message).map_err(PgWireError::UserError)?;
+        // A branch call's parameter count is known from its text: checked here, as PostgreSQL
+        // checks every statement's at Bind. It was never checked, so two values for
+        // turso_branch_create($1) created the branch (wire review 10 item 5). An engine statement's
+        // count is known once it is prepared, and is checked at Execute (E5-QUEUE R2).
+        if let Some(call) = branch_call(&statement.statement) {
+            let types = parameter_types(&branch_call_types(&call), &statement.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            if message.parameters.len() != types.len() {
+                return Err(PgWireError::UserError(error(
+                    "08P01",
+                    format!(
+                        "bind message supplies {} parameters, but prepared statement \"{}\" \
+                         requires {}",
+                        message.parameters.len(),
+                        statement.id,
+                        types.len()
+                    ),
+                )));
+            }
+        }
         let portal = Portal::try_new(&message, statement)?;
         client.portal_store().put_portal(Arc::new(portal));
         client
@@ -3108,20 +3129,8 @@ fn bind_portal_parameters(
             ),
         )));
     }
-    // The format codes: none (all text), one (for all), or one per parameter, else a protocol
-    // violation; pgwire's format_for would index past a short list (wire review 8 item 4).
-    if let Format::Individual(codes) = &portal.parameter_format {
-        if codes.len() != types.len() {
-            return Err(PgWireError::UserError(error(
-                "08P01",
-                format!(
-                    "bind message has {} parameter formats but {} parameters",
-                    codes.len(),
-                    types.len()
-                ),
-            )));
-        }
-    }
+    // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value, and
+    // the values are as many as the statement's parameters (just above).
     for (i, pg_type) in types.iter().enumerate() {
         let value = match &portal.parameters[i] {
             None => Value::Null,
@@ -3137,6 +3146,32 @@ fn bind_portal_parameters(
             stmt.bind_at(index, value)
                 .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
         }
+    }
+    Ok(())
+}
+
+/// PostgreSQL's checks of a Bind message alone, made before BindComplete (exec_bind_message): every
+/// parameter and result format code is 0 (text) or 1 (binary), else 22023 "unsupported format
+/// code: N" (even for a NULL value), and a parameter-format list is empty, one code, or one per value
+/// sent, else 08P01. They were made at Execute, after BindComplete, or for a branch call not at
+/// all, and a single bad code was invisible there: pgwire folds one code into text (wire review 10
+/// item 5). PostgreSQL refuses a bad result code at Execute instead, as it formats the first row
+/// (E5-QUEUE R2).
+fn check_bind(bind: &Bind) -> SqlResult<()> {
+    if let Some(code) = bind
+        .parameter_format_codes
+        .iter()
+        .chain(&bind.result_column_format_codes)
+        .find(|c| !matches!(c, 0 | 1))
+    {
+        return Err(error("22023", format!("unsupported format code: {code}")));
+    }
+    let (codes, values) = (bind.parameter_format_codes.len(), bind.parameters.len());
+    if codes > 1 && codes != values {
+        return Err(error(
+            "08P01",
+            format!("bind message has {codes} parameter formats but {values} parameters"),
+        ));
     }
     Ok(())
 }
