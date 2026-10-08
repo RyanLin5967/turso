@@ -3530,3 +3530,31 @@ fn bind_reads_each_parameter_in_its_format() {
     assert_eq!(r.err("three format codes for two parameters").code, "08P01");
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
 }
+
+/// `col = ANY($1)` and `col <> ALL($1)` give an undeclared $1 the ARRAY of the column's type, as
+/// PostgreSQL does (int4[], 1007), so a client sends '{1,2}' and gets rows 1 and 2. It was given
+/// the element type (int4), so '{1,2}' failed at Bind (wire review 8 item 6).
+#[test]
+fn any_and_all_of_a_parameter_take_an_array() {
+    const INT4_ARRAY: u32 = 1007;
+    let dir = Scratch::new("anyparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, 'b'), (3, 'c')").ok("rows");
+    for (sql, want) in [
+        (
+            "SELECT id FROM t WHERE id = ANY($1) ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM t WHERE id <> ALL($1) ORDER BY id",
+            vec!["3"],
+        ),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(vec![INT4_ARRAY]), "{sql}");
+        let r = a.xt(sql, &[(0, 0, b"{1,2}")]).ok(sql);
+        let got: Vec<String> = r.rows.iter().map(|row| row[0].clone().unwrap()).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
