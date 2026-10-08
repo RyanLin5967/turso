@@ -972,6 +972,20 @@ impl Session {
             TxVerb::Begin if in_tx => return Ok(Response::Execution(Tag::new("BEGIN"))),
             TxVerb::Commit if !in_tx => return Ok(Response::Execution(Tag::new("COMMIT"))),
             TxVerb::Rollback if !in_tx => return Ok(Response::Execution(Tag::new("ROLLBACK"))),
+            // Savepoints exist only in a block: outside one PostgreSQL refuses them (25P01) and
+            // stays idle. They reached the engine, which opened a transaction for SAVEPOINT and
+            // answered XX000 for the others (wire review 6 item 6, review 3 item 24).
+            TxVerb::RollbackTo | TxVerb::Release | TxVerb::Savepoint if !in_tx => {
+                let what = match verb {
+                    TxVerb::RollbackTo => "ROLLBACK TO SAVEPOINT",
+                    TxVerb::Release => "RELEASE SAVEPOINT",
+                    _ => "SAVEPOINT",
+                };
+                return Err(error(
+                    "25P01",
+                    format!("{what} can only be used in transaction blocks"),
+                ));
+            }
             _ => {}
         }
         // Whether a failed engine statement got as far as running (a branch call, a CHECKPOINT
@@ -1541,42 +1555,102 @@ impl Shared {
     }
 }
 
-/// What a statement does to the transaction block, from its leading keywords.
+/// What a statement does to the transaction block, read by the verb's WHOLE grammar (PostgreSQL's
+/// gram.y), after any leading comments:
+/// - Begin: `BEGIN [WORK | TRANSACTION] [modes]`, `START TRANSACTION [modes]`;
+/// - Commit: `COMMIT | END [WORK | TRANSACTION] [AND NO CHAIN]`;
+/// - Rollback: `ROLLBACK | ABORT [WORK | TRANSACTION] [AND NO CHAIN]`;
+/// - RollbackTo: `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name`;
+/// - Release: `RELEASE [SAVEPOINT] name`; Savepoint: `SAVEPOINT name`;
+/// - Other: anything else, malformed spellings of the above included, which go to the engine and
+///   are syntax errors there. Read by two words, `COMMIT garbage` was answered as COMMIT and
+///   `/* c */ ROLLBACK` was not a ROLLBACK (wire review 6 item 4). `AND CHAIN` is Other: the
+///   engine has no chained transactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxVerb {
     Begin,
     Commit,
     Rollback,
     RollbackTo,
+    Release,
+    Savepoint,
     Other,
 }
 
 impl TxVerb {
     fn of(sql: &str) -> Self {
-        let mut words = sql
-            .split(|c: char| c.is_ascii_whitespace() || c == ';')
-            .filter(|w| !w.is_empty());
-        let first = words.next().unwrap_or("");
+        let Some(w) = tx_words(sql) else {
+            return TxVerb::Other;
+        };
         let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
-        if is(first, "BEGIN") || is(first, "START") {
-            TxVerb::Begin
-        } else if is(first, "COMMIT") || is(first, "END") {
-            match words.next() {
-                Some(w) if is(w, "PREPARED") => TxVerb::Other,
-                _ => TxVerb::Commit,
+        let work = |w: &[&str]| -> usize {
+            usize::from(
+                w.first()
+                    .is_some_and(|x| is(x, "WORK") || is(x, "TRANSACTION")),
+            )
+        };
+        let no_chain = |w: &[&str]| -> bool {
+            matches!(w, [])
+                || (w.len() == 3 && is(w[0], "AND") && is(w[1], "NO") && is(w[2], "CHAIN"))
+        };
+        let name = |w: &[&str]| -> bool { w.len() == 1 && !w[0].is_empty() && w[0] != "," };
+        match w.as_slice() {
+            [first, rest @ ..] if is(first, "BEGIN") => {
+                let rest = &rest[work(rest)..];
+                if tx_modes(rest) {
+                    TxVerb::Begin
+                } else {
+                    TxVerb::Other
+                }
             }
-        } else if is(first, "ROLLBACK") || is(first, "ABORT") {
-            let mut next = words.next();
-            if next.is_some_and(|w| is(w, "WORK") || is(w, "TRANSACTION")) {
-                next = words.next();
+            [first, second, rest @ ..] if is(first, "START") && is(second, "TRANSACTION") => {
+                if tx_modes(rest) {
+                    TxVerb::Begin
+                } else {
+                    TxVerb::Other
+                }
             }
-            match next {
-                Some(w) if is(w, "TO") => TxVerb::RollbackTo,
-                Some(w) if is(w, "PREPARED") => TxVerb::Other,
-                _ => TxVerb::Rollback,
+            [first, rest @ ..] if is(first, "COMMIT") || is(first, "END") => {
+                if no_chain(&rest[work(rest)..]) {
+                    TxVerb::Commit
+                } else {
+                    TxVerb::Other
+                }
             }
-        } else {
-            TxVerb::Other
+            [first, rest @ ..] if is(first, "ROLLBACK") || is(first, "ABORT") => {
+                let rest = &rest[work(rest)..];
+                if no_chain(rest) {
+                    TxVerb::Rollback
+                } else if is(first, "ROLLBACK") && rest.first().is_some_and(|x| is(x, "TO")) {
+                    let rest = &rest[1..];
+                    let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
+                        &rest[1..]
+                    } else {
+                        rest
+                    };
+                    if name(rest) {
+                        TxVerb::RollbackTo
+                    } else {
+                        TxVerb::Other
+                    }
+                } else {
+                    TxVerb::Other
+                }
+            }
+            [first, rest @ ..] if is(first, "RELEASE") => {
+                let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
+                    &rest[1..]
+                } else {
+                    rest
+                };
+                if name(rest) {
+                    TxVerb::Release
+                } else {
+                    TxVerb::Other
+                }
+            }
+            [first, rest @ ..] if is(first, "SAVEPOINT") && name(rest) => TxVerb::Savepoint,
+            _ => TxVerb::Other,
         }
     }
 
@@ -1584,6 +1658,138 @@ impl TxVerb {
     fn ends_block(self) -> bool {
         matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
     }
+}
+
+/// The words of a statement for [`TxVerb::of`]: leading `--` and `/* */` comments skipped, a
+/// trailing `;` dropped, a `"quoted"` name one word, `,` a word of its own, each a slice of `sql`.
+/// None for a statement that does not start with a transaction verb (one word's scan, no
+/// allocation), and for text the verbs' grammar cannot hold (a `'` string, `$`, another `;`, a
+/// comment after the start), which is Other.
+fn tx_words(sql: &str) -> Option<Vec<&str>> {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.split_once('\n').map_or("", |(_, r)| r).trim_start();
+        } else if s.starts_with("/*") {
+            let b = s.as_bytes();
+            let (mut depth, mut i) = (0usize, 0usize);
+            while i < b.len() {
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            s = s[i..].trim_start();
+        } else {
+            break;
+        }
+    }
+    let first_end = s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    let first = &s[..first_end];
+    if ![
+        "BEGIN",
+        "START",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "ABORT",
+        "RELEASE",
+        "SAVEPOINT",
+    ]
+    .iter()
+    .any(|k| first.eq_ignore_ascii_case(k))
+    {
+        return None;
+    }
+    let body = s.trim_end();
+    let body = body.strip_suffix(';').unwrap_or(body).trim_end();
+    let b = body.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            c if c.is_ascii_whitespace() => i += 1,
+            b',' => {
+                words.push(&body[i..i + 1]);
+                i += 1;
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        Some(b'"') if b.get(i + 1) == Some(&b'"') => i += 2,
+                        Some(b'"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                        None => return None,
+                    }
+                }
+                words.push(&body[start..i]);
+            }
+            b'\'' | b'$' | b';' => return None,
+            _ if b[i..].starts_with(b"--") || b[i..].starts_with(b"/*") => return None,
+            _ => {
+                let start = i;
+                while i < b.len()
+                    && !b[i].is_ascii_whitespace()
+                    && !matches!(b[i], b',' | b'"' | b'\'' | b'$' | b';')
+                {
+                    i += 1;
+                }
+                words.push(&body[start..i]);
+            }
+        }
+    }
+    Some(words)
+}
+
+/// Whether `w` is a list of transaction modes, as BEGIN and START TRANSACTION take them:
+/// `ISOLATION LEVEL {SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED}`,
+/// `READ WRITE`, `READ ONLY`, `[NOT] DEFERRABLE`, separated by commas or spaces.
+fn tx_modes(mut w: &[&str]) -> bool {
+    let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+    while !w.is_empty() {
+        let taken = match w {
+            [a, b, c, ..] if is(a, "ISOLATION") && is(b, "LEVEL") && is(c, "SERIALIZABLE") => 3,
+            [a, b, c, d, ..]
+                if is(a, "ISOLATION")
+                    && is(b, "LEVEL")
+                    && ((is(c, "REPEATABLE") && is(d, "READ"))
+                        || (is(c, "READ") && (is(d, "COMMITTED") || is(d, "UNCOMMITTED")))) =>
+            {
+                4
+            }
+            [a, b, ..] if is(a, "READ") && (is(b, "WRITE") || is(b, "ONLY")) => 2,
+            [a, b, ..] if is(a, "NOT") && is(b, "DEFERRABLE") => 2,
+            [a, ..] if is(a, "DEFERRABLE") => 1,
+            _ => return false,
+        };
+        w = &w[taken..];
+        // A comma separates modes; one may not end the list.
+        if let Some([",", rest @ ..]) = Some(w) {
+            if rest.is_empty() {
+                return false;
+            }
+            w = rest;
+        }
+    }
+    true
 }
 
 /// A transaction-control statement the client did not send: an implicit block's own.
@@ -1594,8 +1800,6 @@ enum TxStmt {
     Rollback,
 }
 
-/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
-/// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
 /// What a failed COMMIT tells the client, once the engine's transaction is settled: a COMMIT the
 /// engine refused for a lock (Busy at the trunk's commit) ended the block, rolled back, which is a
 /// serialization failure the client retries (40001; PostgreSQL's answer to a commit that cannot
@@ -1626,6 +1830,8 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
     info
 }
 
+/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
+/// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
 fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
     use turso_parser::ast::Stmt;
     let (stmt, text) = match tx {
@@ -1877,6 +2083,8 @@ fn sqlstate(e: &LimboError) -> &'static str {
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
+        // A savepoint name that names none (wire review 6 item 6).
+        LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
         LimboError::ParseError(m)
             if m.starts_with("could not determine data type of parameter") =>
         {
