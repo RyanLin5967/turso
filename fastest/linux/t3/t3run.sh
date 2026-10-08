@@ -163,7 +163,8 @@ NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blo
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
   competitors/fthelp.py competitors/gen_seed.py competitors/reduce.py competitors/trace.sh
   v3/v3floor.c v3/statfs_shim.c v3/noop_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
-  v3/batchgate.py v3/blkflush.py v3/stamp.py v3/crash.sh v3/nsfake.sh v3/postplant.py v3/red.py"
+  v3/batchgate.py v3/blkflush.py v3/stamp.py v3/crash.sh v3/nsfake.sh v3/postplant.py v3/red.py v3/build.sh
+  v3/REGISTERED.tsv v3/testdata"
 preflight() {
   [ -f "$MAN" ] || { echo "no manifest $MAN"; return 2; }
   # the files the run calls must be in the COMMIT (review M8: an untracked leftover satisfied a disk check), and
@@ -245,14 +246,9 @@ build() {
   cp "$SRC/target/release/examples/fastest_profile" "$DIST/" || return 1
   timeout 1800 bash "$L/competitors/build.sh" "$DIST" > "$OUT/build-competitors.txt" 2>&1 || return 1
   timeout 1800 bash "$L/competitors/fetch_dolt.sh" "$DIST/dolt-bin" "$OUT/dolt-fetch.txt" > "$OUT/build-dolt.txt" 2>&1 || return 1
-  # the V3 probe as its own workflow builds it (fastest-v3.yml at the V3 tip): v3floor STATIC (the probe refuses any
-  # mapped file but its own, V3 fourth review M4), a dynamic build of the same source for the fire-check's preload
-  # plants, and the plants' two shims. Dry run 37798270085 failed every fire-check on a dynamic v3floor.
-  { gcc -O2 -std=gnu11 -Wall -Wextra -Werror -static -o "$DIST/v3floor" "$L/v3/v3floor.c" &&
-    gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$DIST/v3floor.dyn" "$L/v3/v3floor.c" &&
-    gcc -O2 -shared -fPIC -o "$DIST/statfs_shim.so" "$L/v3/statfs_shim.c" -ldl &&
-    gcc -O2 -Wall -Wextra -Werror -shared -fPIC -o "$DIST/noop_shim.so" "$L/v3/noop_shim.c" &&
-    file "$DIST/v3floor" "$DIST/v3floor.dyn"; } > "$OUT/build-v3.txt" 2>&1 || return 1
+  # the V3 probe's ONE build (v3/build.sh, which fastest-v3.yml also calls, so the two cannot drift: dry run
+  # 37798270085 failed every fire-check on t3run's own stale copy): v3floor static, v3floor.dyn, both shims
+  bash "$L/v3/build.sh" "$DIST" > "$OUT/build-v3.txt" 2>&1 || return 1
   { echo "sha=$SHA"; rustc -V; gcc --version | head -1; /usr/lib/postgresql/18/bin/postgres --version
     fio --version; strace -V | head -1
     ( cd "$DIST" && sha256sum fastest_profile bbload clonebench sqlite3 v3floor v3floor.dyn statfs_shim.so noop_shim.so ); } > "$OUT/binaries.txt"
@@ -270,8 +266,12 @@ v3fixtures() { bash "$L/v3/mkfixtures.sh" "$V3FX" > "$OUT/v3fixtures.txt" 2>&1; 
 # so summarize.py re-judges every batch, including a refused one. After the BEFORE batch the A14 plants run on
 # copies of its real record (blockgate.py plants): each of (a) and (b) must be decided as planted.
 v3batch() { # v3batch before|after DIR
-  local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc
-  local -a env=(V3_CELL="$V3CELL")
+  local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc frame arms
+  local -a env=(V3_CELL="$V3CELL" V3_PLP="$PLP")
+  # the registered V3 shape (PREREG section 4; V3 gate-6 MED 6; run.sh refuses a bound batch of any other):
+  # N = 10000 and arms append25, fdatasync4k, nosync25 plus the registered frame arm, if one is registered
+  frame=$(awk -F '\t' '$1 == "frame_arm" { v = $2 } END { print v }' "$L/v3/REGISTERED.tsv")
+  arms="append25,fdatasync4k,nosync25${frame:+,$frame}"
   if [ "$BLOCK" = brd ]; then
     env+=(V3_SMOKE=1 V3FLOOR_BRD=1)
   else
@@ -281,7 +281,8 @@ v3batch() { # v3batch before|after DIR
     [ $DRY = 0 ] && env+=(V3_REQUIRE_T3=1)
   fi
   echo "v3 $when: ${env[*]}"
-  env "${env[@]}" timeout 1800 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" 200 > "$o/v3-$when.txt" 2>&1
+  env "${env[@]}" timeout 3600 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" 10000 --arms "$arms" \
+    > "$o/v3-$when.txt" 2>&1
   rc=$?
   echo "$when rc=$rc" >> "$o/v3.rc"
   python3 -B "$L/t3/blockgate.py" batch "$o/v3-$when" "$rc" "$BLOCK" "$PLP" > "$o/v3-$when.blockgate.json"
