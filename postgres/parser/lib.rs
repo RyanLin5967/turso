@@ -41,34 +41,93 @@ pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, Par
 
 /// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
 /// outside 1..=MAX_PARAMETER names no parameter (42P02) on every path, a branch call's included,
-/// before anything is sized by it (wire review 8 item 3, review 9 item 1).
+/// before anything is sized by it (wire review 8 item 3, review 9 item 1); one above i32::MAX is
+/// 42601, as PostgreSQL 18's scanner refuses it ([`checked_param_numbers`]; review 12 item 1).
 pub const MAX_PARAMETER: u32 = 65535;
 
 /// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
 /// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
 /// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
 /// it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is serialized
-/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N` read off it, a
-/// pattern a string value in the tree cannot hold, since its quotes are escaped. A ParamRef's first
-/// field is its number. Only for a statement whose text holds a '$'.
+/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N,"location":L`
+/// read off it, a pattern a string value in the tree cannot hold, since its quotes are escaped.
+/// The numbers are libpg_query's, which wrap above i32::MAX: [`checked_param_numbers`] reads them
+/// as PostgreSQL 18 does. Only for a statement whose text holds a '$'.
 pub fn param_numbers(parse: &ParseResult) -> Vec<i32> {
-    const KEY: &str = "\"ParamRef\":{\"number\":";
-    let Ok(json) = serde_json::to_string(&parse.protobuf) else {
-        return Vec::new();
-    };
-    let mut numbers: Vec<i32> = json
-        .match_indices(KEY)
-        .filter_map(|(at, _)| {
-            let rest = &json[at + KEY.len()..];
-            let end = rest
-                .find(|c: char| !(c.is_ascii_digit() || c == '-'))
-                .unwrap_or(rest.len());
-            rest[..end].parse().ok()
-        })
+    let mut numbers: Vec<i32> = param_refs(parse)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(number, _)| number)
         .collect();
     numbers.sort_unstable();
     numbers.dedup();
     numbers
+}
+
+/// [`param_numbers`], each number read again from `sql` (the text `parse` parsed) at its ParamRef's
+/// location, as PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit
+/// int (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound
+/// the wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
+/// PostgreSQL 18's "parameter number too large" (42601); a tree number that is not the text's, or a
+/// tree whose parameters cannot be read, is refused (fail closed).
+pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
+    let unreadable = || {
+        ParseError::ParseError(
+            "could not read the statement's parameters from its parse tree".to_string(),
+        )
+    };
+    let mut numbers = Vec::new();
+    for (number, location) in param_refs(parse).ok_or_else(unreadable)? {
+        let digits = sql
+            .as_bytes()
+            .get(location..)
+            .and_then(|b| b.strip_prefix(b"$"))
+            .ok_or_else(unreadable)?;
+        let len = digits.iter().take_while(|c| c.is_ascii_digit()).count();
+        let text = &sql[location + 1..location + 1 + len];
+        let value = text.bytes().try_fold(0u64, |v, d| {
+            v.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+        });
+        match value {
+            Some(v) if v <= i32::MAX as u64 => {
+                if v as i32 != number {
+                    return Err(unreadable());
+                }
+                numbers.push(number);
+            }
+            _ => {
+                return Err(ParseError::ParseError(format!(
+                    "parameter number too large at or near \"${text}\""
+                )))
+            }
+        }
+    }
+    numbers.sort_unstable();
+    numbers.dedup();
+    Ok(numbers)
+}
+
+/// Each ParamRef's number and byte location in a parse tree, read off its serialization (see
+/// [`param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
+fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
+    const KEY: &str = "\"ParamRef\":{\"number\":";
+    const LOCATION: &str = ",\"location\":";
+    let json = serde_json::to_string(&parse.protobuf).ok()?;
+    let int = |s: &str| -> (String, usize) {
+        let end = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .unwrap_or(s.len());
+        (s[..end].to_string(), end)
+    };
+    json.match_indices(KEY)
+        .map(|(at, _)| {
+            let rest = &json[at + KEY.len()..];
+            let (number, end) = int(rest);
+            let rest = rest[end..].strip_prefix(LOCATION)?;
+            let (location, _) = int(rest);
+            Some((number.parse().ok()?, location.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Split a multi-statement SQL string into individual statements.

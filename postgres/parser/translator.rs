@@ -5891,6 +5891,8 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             },
             // A number outside 1..=MAX_PARAMETER is no parameter: no call, so the ordinary
             // prepare refuses it (42P02); Describe sized the call's list by it (review 9 item 1).
+            // The number is libpg_query's, which wraps above i32::MAX: the caller checks it
+            // against the text first (checked_param_numbers; review 12 item 1).
             Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
                 Some(PgBranchArg::Param(p.number as usize))
             }

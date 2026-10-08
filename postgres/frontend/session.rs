@@ -191,6 +191,12 @@ pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
         return Some(call);
     }
     let parsed = turso_pg_parser::parse(sql).ok()?;
+    // libpg_query wraps a $n above i32::MAX into a 32-bit int, so its tree's number is not the
+    // text's: such a statement is no call, and the ordinary prepare refuses it with 42601 (wire
+    // review 12 item 1).
+    if sql.contains('$') && turso_pg_parser::checked_param_numbers(&parsed, sql).is_err() {
+        return None;
+    }
     try_extract_branch_call(&parsed)
 }
 
@@ -276,9 +282,11 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
                 while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
-                // More than five digits, or a number outside 1..=MAX_PARAMETER, is for
-                // libpg_query to read: [`try_extract_branch_call`] makes no call of a number out of
-                // range, so the ordinary prepare refuses it (42P02; wire review 9 item 1).
+                // More than five digits, or a number outside 1..=MAX_PARAMETER, is for the slow
+                // path: no call is made of a number out of range, so the ordinary prepare refuses
+                // it (42P02, or 42601 above i32::MAX, which `branch_call` reads from the text
+                // before it trusts libpg_query's 32-bit number; wire review 9 item 1, review 12
+                // item 1).
                 if i - start > 5 {
                     return None;
                 }
@@ -464,7 +472,10 @@ fn prepare_statement_inner(
     // "there is no parameter"); `SELECT 1 LIMIT $2147483647` sized a 16 GiB list (wire review 8
     // item 3). Only a statement whose text holds a '$' pays the walk.
     let used: Vec<u32> = if sql.contains('$') {
-        let numbers = turso_pg_parser::param_numbers(&parse_result);
+        // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
+        // libpg_query's 32-bit wrap (wire review 12 item 1).
+        let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
