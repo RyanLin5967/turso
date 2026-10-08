@@ -394,6 +394,15 @@ impl Infer<'_> {
                 ) {
                     self.set(l, Some(TEXT));
                     self.set(r, Some(TEXT));
+                } else if matches!(kind, AExprKind::AexprOpAny | AExprKind::AexprOpAll) {
+                    // `x op ANY(r)` / `x op ALL(r)`: r is an ARRAY of x's type, as PostgreSQL types
+                    // an undeclared $n there (int4 -> int4[]); it was given the element type, so
+                    // '{1,2}' failed at Bind (wire review 8 item 6). A parameter on the left takes
+                    // the element type of a typed array on the right.
+                    let left = self.type_of(l, tables);
+                    self.set(r, left.and_then(array_of));
+                    let right = self.type_of(r, tables);
+                    self.set(l, right.and_then(element_of));
                 } else if let Some(Node::List(list)) = r.node.as_ref() {
                     // IN (...) and BETWEEN: each item takes the left side's type, and a parameter
                     // on the left the first typed item's.
@@ -486,6 +495,39 @@ impl Infer<'_> {
         }
     }
 }
+
+/// The array type of an element type, for the types a column here can have (pg_type's typarray).
+fn array_of(element: u32) -> Option<u32> {
+    ARRAYS.iter().find(|(e, _)| *e == element).map(|(_, a)| *a)
+}
+
+/// The element type of an array type (the inverse of [`array_of`]).
+fn element_of(array: u32) -> Option<u32> {
+    ARRAYS.iter().find(|(_, a)| *a == array).map(|(e, _)| *e)
+}
+
+/// (element type, its array type) from pg_type: bool, bytea, int2, int4, int8, text, varchar,
+/// bpchar, float4, float8, numeric, json, jsonb, uuid, date, time, timestamp, timestamptz.
+const ARRAYS: [(u32, u32); 18] = [
+    (16, 1000),
+    (17, 1001),
+    (21, 1005),
+    (23, 1007),
+    (20, 1016),
+    (25, 1009),
+    (1043, 1015),
+    (1042, 1014),
+    (700, 1021),
+    (701, 1022),
+    (1700, 1231),
+    (114, 199),
+    (3802, 3807),
+    (2950, 2951),
+    (1082, 1182),
+    (1083, 1183),
+    (1114, 1115),
+    (1184, 1185),
+];
 
 /// The type OID of a cast's target type, by its name (no arrays).
 fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32> {
