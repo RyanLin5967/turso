@@ -775,6 +775,31 @@ def post_selftest(chk):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = drift(sd, ed2)
         chk("drift: %s -> refused (rc 2)" % name, rc == 2, rc)
+    # ninth review L11: drift's identity rules are exact
+    def bt(d, text):
+        with open(os.path.join(d, "binary.txt"), "w") as f:
+            f.write(text)
+    base_bt = "cell=xfs\nshape=bound V3: N=10000, append25,fdatasync4k,nosync25\n"
+    for name, sm, em in (
+            ("binary.txt cell=xfsloop at both ends under a gate for xfs", lambda d: bt(d, base_bt.replace("cell=xfs", "cell=xfsloop")),
+             lambda d: bt(d, base_bt.replace("cell=xfs", "cell=xfsloop"))),
+            ("a bound end and a smoke end", lambda d: bt(d, base_bt + "bound=fire-checked: /v.json\n"),
+             lambda d: bt(d, base_bt + "bound=smoke: V3_SMOKE=1, not bound to a fire-check, never credited\n")),
+            ("ends bound to different verdicts", lambda d: bt(d, base_bt + "verdict_sha256=" + "aa" * 32 + "\n"),
+             lambda d: bt(d, base_bt + "verdict_sha256=" + "bb" * 32 + "\n")),
+            ("a rental end and a dry-run end", lambda d: bt(d, base_bt + "rental=yes\n"), lambda d: bt(d, base_bt + "rental=no\n"))):
+        k = name.split()[0] + name.split()[1] + str(len(name))
+        s2, e2 = os.path.join(td, "drift-s-" + k), os.path.join(td, "drift-e-" + k)
+        shutil.copytree(os.path.join(td, "drift-s-4"), s2)
+        shutil.copytree(os.path.join(td, "drift-e-4"), e2)
+        sm(s2)
+        em(e2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = drift(s2, e2)
+        chk("drift (ninth review L11): %s -> refused (rc 2)" % name, rc == 2, rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = drift(os.path.join(td, "drift-s-4"), os.path.join(td, "drift-s-4"))
+    chk("drift (ninth review L11): the same OUT as both ends -> refused (rc 2)", rc == 2, rc)
     shutil.rmtree(td)
 
 

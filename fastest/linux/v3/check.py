@@ -1061,7 +1061,19 @@ def self_test():
                            ("two fields", "d0_threshold/ext4/wb/bare\t9.5\n", False),
                            ("a CR", "d0_threshold/ext4/wb/bare\t9.5\tref\r\n", False),
                            ("an exponent", "d0_threshold/ext4/wb/bare\t1e1\tref\n", False),
-                           ("inf", "d0_threshold/ext4/wb/bare\tinf\tref\n", False)):
+                           ("inf", "d0_threshold/ext4/wb/bare\tinf\tref\n", False),
+                           # ninth review M7: what C's jstr and check.py's UTF-8 decode would read differently, and
+                           # what C's buffers would split or truncate
+                           ("a non-ASCII ref", "d0_threshold/ext4/wb/bare\t9.5\tDECISIONS \u2026 (PREREG \u00a74)\n", False),
+                           ("a ref of 201 bytes", "d0_threshold/ext4/wb/bare\t9.5\t" + "r" * 201 + "\n", False),
+                           ("a ref of 200 bytes", "d0_threshold/ext4/wb/bare\t9.5\t" + "r" * 200 + "\n", True),
+                           ("a comment line of 1100 bytes", "#" + "c" * 1099 + "\nd0_threshold/ext4/wb/bare\t9.5\tref\n", False),
+                           ("a value of 61 bytes", "frame_arm\t" + "o" * 61 + "\tref\n", False),
+                           ("a NUL byte", "d0_threshold/ext4/wb/bare\t9.5\tref\x00x\n", False),
+                           # ninth review L9: append25 is already in the bound shape; a frame arm append25 names it twice
+                           ("frame_arm append25", "frame_arm\tappend25\tref\n", False),
+                           ("frame_arm ow64k", "frame_arm\tow64k\tref\n", True),
+                           ("frame_arm clean (not an M0 append or overwrite arm)", "frame_arm\tclean\tref\n", False)):
         open(os.path.join(rd_, "r.tsv"), "w").write("# comment\n" + text)
         try:
             registered(rd_, "r.tsv")
@@ -1071,6 +1083,44 @@ def self_test():
         chk("REGISTERED.tsv rule: %s -> %s" % (name, "read" if ok else "refused"), got is ok)
     import shutil as _sh
     _sh.rmtree(rd_)
+    # ninth review H1, L10, M6: the A18 floor reference as the probe picks it -- among append25 (fsync) and
+    # fdatasync4k only (the frame arm runs with fsync and is not a candidate, even when registered), on raw nanosecond
+    # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
+
+    def frp(sj, p50ns):
+        try:
+            return floor_reference_problems(sj, p50ns)
+        except TypeError as e:  # the base takes no raw p50s
+            return [("the floor rule reads no raw p50s", repr(e))]
+
+    def fsj(p50us, fr, frame="ow4k", variant="fdatasync4k (ow4k + fdatasync)"):
+        return {"arms": {a: {"p50_us": v} for a, v in p50us.items()}, "frame_arm": frame, "floor_frame_variant": variant,
+                "floor_reference": fr}
+    cheap_ow4k = {"append25": 875.1, "fdatasync4k": 900.0, "ow4k": 800.3}
+    cheap_ns = {"append25": 875100, "fdatasync4k": 900000, "ow4k": 800300}
+    for name, sj, ns, ok in (
+            ("frame_arm ow4k registered and cheapest, the reference append25 (the probe's pick)",
+             fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}), cheap_ns, True),
+            ("frame_arm ow4k registered and cheapest, the reference ow4k (fsync, not a candidate)",
+             fsj(cheap_ow4k, {"arm": "ow4k", "barrier": "fsync", "p50_us": 800.3}), cheap_ns, False),
+            ("a near tie: fdatasync4k 181151 ns, append25 181249 ns (both 181.2 us), the reference fdatasync4k",
+             fsj({"append25": 181.2, "fdatasync4k": 181.2}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 181.2},
+                 None, "no frame arm registered"), {"append25": 181249, "fdatasync4k": 181151}, True),
+            ("the same near tie, the reference append25 (not the raw minimum)",
+             fsj({"append25": 181.2, "fdatasync4k": 181.2}, {"arm": "append25", "barrier": "fsync", "p50_us": 181.2},
+                 None, "no frame arm registered"), {"append25": 181249, "fdatasync4k": 181151}, False),
+            ("frame_arm ow64k registered: its variant recorded missing",
+             fsj({"append25": 400.0, "fdatasync4k": 200.0, "ow64k": 500.0}, {"arm": "fdatasync4k", "barrier": "fdatasync",
+                 "p50_us": 200.0}, "ow64k", "none in this probe: the registered frame arm has no fdatasync variant arm "
+                 "(A18 needs one)"), {"append25": 400000, "fdatasync4k": 200000, "ow64k": 500000}, True),
+            ("frame_arm ow4k registered, the variant label saying none registered",
+             fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}, "ow4k", "no frame arm registered"),
+             cheap_ns, False),
+            ("no frame arm registered, the variant label missing",
+             fsj({"append25": 400.0, "fdatasync4k": 200.0}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 200.0},
+                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False)):
+        got = frp(sj, ns)
+        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), (got == []) is ok, got)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
     # sixth review H1: the box and the plan it selects
@@ -1107,6 +1157,25 @@ def self_test():
                 (vm is False or [t[0] for t in label_problems(unq, lc, vm)] == ["flush_sent_to_device"]),
                 (label_problems(good, lc, vm), label_problems(swapped, lc, vm)))
     chk("labels: virtualized 1 is not an answer", label_problems({}, "wb", 1) != [])
+    # ninth review L12: stamp.py end compares the write cache of the flush path's devices only, and an unreadable one
+    # is a problem of its own, never "a change"
+    import importlib.util as _ilu
+    _sp = _ilu.spec_from_file_location("v3stamp", os.path.join(HERE, "stamp.py"))
+    _st = _ilu.module_from_spec(_sp)
+    _sp.loader.exec_module(_st)
+    wcp = getattr(_st, "write_cache_problems", None)
+    a0 = {"nvme0n1": {"write_cache": "write back"}, "loop0": {"write_cache": "write back"}, "sdb": {"write_cache": "write back"}}
+    for name, b1, devs, want in (
+            ("the leaf flipped write back -> write through", dict(a0, nvme0n1={"write_cache": "write through"}),
+             ["loop0", "nvme0n1"], "changed"),
+            ("a device off the flush path flipped", dict(a0, sdb={"write_cache": "write through"}), ["loop0", "nvme0n1"], None),
+            ("the leaf unreadable at the end", dict(a0, nvme0n1={"write_cache": ""}), ["loop0", "nvme0n1"], "unreadable"),
+            ("the leaf gone at the end", {k: v for k, v in a0.items() if k != "nvme0n1"}, ["loop0", "nvme0n1"], "unreadable"),
+            ("no flush-path devices named", a0, [], "no flush-path devices"),
+            ("nothing changed", a0, ["loop0", "nvme0n1"], None)):
+        got = wcp(a0, b1, devs) if wcp else ["(no write_cache_problems in stamp.py)"]
+        ok = (got == []) if want is None else (bool(got) and all(want in x for x in got))
+        chk("stamp write cache (ninth review L12): %s -> %s" % (name, "no problem" if want is None else want), ok, got)
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
@@ -1211,8 +1280,34 @@ def real_selftest(chk):
             ("a window without the probe's fsync", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_without_a_sync=1)},
              "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
             ("PLP declared yes to the fire-check", {"kvmut": lambda k: k.update(plp="yes")}, "F3:record", ["plp"]),
+            # amended at the ninth review (M4): the plant now also trips F3's own untraced rule, beside the D0 rule
             ("traced, the D0 control still judged", both(lambda j: j.update(traced=True)), "F3:complete",
-             ["d0_control disagrees with raw"]),
+             ["d0_control disagrees with raw", "F3 ran traced or did not record it"]),
+            # ninth review M4: F3 runs untraced, and says so
+            ("traced not recorded", both(lambda j: j.pop("traced")), "F3:complete", ["F3 ran traced or did not record it"]),
+            # ninth review M5: F3:gate derives the gated set, the requirement and the blkflush gate's arms by hand
+            ("the gate without fdatasync4k (the old post)", {
+                "files": {"gate.json": lambda j: j["flush_gate"].update(
+                    gated_arms_run=[a for a in j["flush_gate"]["gated_arms_run"] if a != "fdatasync4k"],
+                    required_flushes=j["flush_gate"]["n"] * (len(j["flush_gate"]["gated_arms_run"]) - 1),
+                    blkflush_leaf_gate=dict(j["flush_gate"]["blkflush_leaf_gate"], arms={
+                        a: v for a, v in j["flush_gate"]["blkflush_leaf_gate"]["arms"].items() if a != "fdatasync4k"}))},
+                "merged": lambda j: j["flush_gate"].update(
+                    gated_arms_run=[a for a in j["flush_gate"]["gated_arms_run"] if a != "fdatasync4k"],
+                    required_flushes=j["flush_gate"]["n"] * (len(j["flush_gate"]["gated_arms_run"]) - 1),
+                    blkflush_leaf_gate=dict(j["flush_gate"]["blkflush_leaf_gate"], arms={
+                        a: v for a, v in j["flush_gate"]["blkflush_leaf_gate"]["arms"].items() if a != "fdatasync4k"}))},
+             "F3:gate", ["gated_arms_run", "required_flushes", "blkflush gate arms"]),
+            ("a miscounted requirement", {"files": {"gate.json": lambda j: j["flush_gate"].update(required_flushes=1399)},
+                                          "merged": lambda j: j["flush_gate"].update(required_flushes=1399)},
+             "F3:gate", ["required_flushes"]),
+            # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate
+            ("fdatasync4k: a window without a flush-carrying request",
+             {"report": lambda j: j["windows"]["arms"]["fdatasync4k"]["devices"]["nvme0n1"].update(flush_carrying_zero_windows=1)},
+             "F3:devflush", ["a gated op's window holds no flush-carrying request to a write-back layer"]),
+            ("fdatasync4k: a window without the probe's fdatasync",
+             {"report": lambda j: j["syscalls"]["arms"]["fdatasync4k"].update(windows_without_a_sync=1)},
+             "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
         ]
         for name, muts, cid, want in cases:
             g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"))

@@ -606,6 +606,29 @@ def self_test():
     swe = sync_windows(ee[0], edge, 99)
     chk("sync windows: a sync whose +-500 ns interval overlaps only its own window's start is attributed to it",
         swe.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 0, "ambiguous": 0}, swe)
+    # ninth review M3: real batches leave 20-80 ns between windows (testdata raw.tsv, round 0), so a sync entering
+    # 300 ns after its window opened has an interval reaching back into the previous window; it is the later window's
+    # (a sync never enters within 500 ns of its own window's end: the window closes after the sync returns)
+    tight = [(1000000, 1099920, "append25", 0), (1100000, 1199920, "append25", 1), (1200000, 1299960, "append25", 2)]
+    te, _ = parse_trace_all(HDR % (3, 3) + "\n".join([sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001100"),
+                                                     sev("v3floor", 99, "0.001200")]) + "\n", devs)[1:], None
+    swt = sync_windows(te[0], tight, 99)
+    chk("sync windows: gaps of 80 and 40 ns, syncs printed at each later window's start -> every window holds one",
+        (swt.get("append25") or {}).get("windows_without_a_sync") == 0 and (swt.get("append25") or {}).get("syncs") == 3,
+        swt)
+    # ... and a probe that drops the second window's sync still leaves a window without one (the shift cannot hide it)
+    te2, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001200")])
+                             + "\n", devs)[1:], None
+    swt2 = sync_windows(te2[0], tight, 99)
+    chk("sync windows: the same windows with the second window's sync missing -> a window without a sync",
+        (swt2.get("append25") or {}).get("windows_without_a_sync", 0) >= 1, swt2)
+    # ... and a clean op whose fsync returned within 0.5 us of its window's end (its interval straddling into the next
+    # window) never fills a following gated window that issued no sync: clean expects its own sync and has none
+    cw = [(1000000, 1000900, "clean", 0), (1000950, 1100000, "append25", 0)]
+    ce, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001001") + "\n", devs)[1:], None
+    swc = sync_windows(ce[0], cw, 99)
+    chk("sync windows: clean's fast fsync straddling into an append25 window with no sync -> append25 still lacks one",
+        (swc.get("append25") or {}).get("windows_without_a_sync") == 1, swc)
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
