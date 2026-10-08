@@ -4133,6 +4133,28 @@ fn an_array_parameter_is_read_by_its_element_type() {
     }
 }
 
+/// A recursive CTE's self-reference is typed by its non-recursive term, as PostgreSQL types it, so
+/// `x < $1` in the recursive term compares x (int4, from `SELECT 1`) with an int4 and the recursion
+/// stops at 10. The CTE was walked before it was in scope, so x was untyped, $1 bound as text, and
+/// the engine's self-reference (Blob affinity) made `x < '10'` true for every x: the recursion never
+/// ended, buffering without bound (wire review 11 item 2). The outer LIMIT keeps the base from
+/// running away: there it returns 20 rows, here 10.
+#[test]
+fn a_recursive_ctes_self_reference_types_its_parameter() {
+    const INT4: u32 = 23;
+    let dir = Scratch::new("recursivecte");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < $1) \
+               SELECT x FROM cnt LIMIT 20";
+    let r = a.describe_statement(sql).ok("describe");
+    assert_eq!(r.params, Some(vec![INT4]));
+    let r = a.xt(sql, &[(0, 0, b"10")]).ok("execute");
+    let got: Vec<String> = r.rows.iter().map(|row| row[0].clone().unwrap()).collect();
+    let want: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+    assert_eq!(got, want);
+}
+
 /// The 42P18 refusal of a parameter compared with something no context types applies only to a
 /// parameter the client left untyped (OID 0, or none declared): one declared in Parse has its
 /// declared type, at Describe and at Execute, as in PostgreSQL. The refusal was made at prepare,
