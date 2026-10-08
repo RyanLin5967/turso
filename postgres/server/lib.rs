@@ -259,10 +259,13 @@ impl Shared {
         uses
     }
 
-    /// Claim `name` for a session about to connect to it. A branch another session is on is
-    /// refused at once (one session per branch); one being deleted is waited for.
+    /// Claim `name` for a session about to connect to it. One session per branch: a branch another
+    /// session is on, or that a delete is releasing, is waited for, up to the wait, as begin_delete
+    /// waits, then refused with 55006. Refused at once, a reconnect right after a close met 55006
+    /// whenever the closed session's thread had not yet released the branch (wire review 6 item
+    /// 5); only a refusal pays the wait (lead ruling).
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Deleting]);
+        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
         if let Some(u) = uses.get(name) {
             let mut e = in_use_error(name, *u);
             e.severity = severity.to_string();
