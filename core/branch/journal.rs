@@ -872,9 +872,19 @@ impl Scanned {
                 } else if class.syncs() {
                     // What is kept is synced before anything follows it: the last whole flight
                     // may have been written and never synced by the process that died, and a
-                    // later flight's frames will prove it was.
+                    // later flight's frames will prove it was. So is its directory: that process
+                    // may have died between a cut's rename and the flight that would have synced
+                    // it, and `dir_dirty` died with it (engine review 10 #4). Mutant
+                    // `open_forgets_unsynced_rename` (test builds only): not synced, as before.
                     fsync_file(&journal.file, class)?;
+                    if !super::store::fe_mutant("open_forgets_unsynced_rename") {
+                        fsync_dir_of(&files.log, class)?;
+                    }
                     confirmable = proves_stable(class);
+                } else if !super::store::fe_mutant("open_forgets_unsynced_rename") {
+                    // Nothing here syncs: the next flight that does (a raised one) syncs the
+                    // directory first, as after a cut in this process.
+                    journal.dir_dirty = true;
                 }
             }
             End::Reset => journal.reset_log(generation)?,
