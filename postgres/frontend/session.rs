@@ -1353,6 +1353,13 @@ mod tests {
             "$1",
             "$1::text",
             "$0",
+            "$0001",
+            "$65535",
+            "$65536",
+            "$2147483647",
+            "$2147483648",
+            "$4294967297",
+            "$18446744073709551615",
             "$1x",
             "E'x'",
             "$$x$$",
@@ -1400,6 +1407,38 @@ mod tests {
             fast_hits > n / 20,
             "the fast path read only {fast_hits} of {n}"
         );
+    }
+
+    /// A `$n` outside 1..=MAX_PARAMETER names no parameter, so no branch call holds one: on both
+    /// paths the statement is no call, and the ordinary prepare refuses it (42P02). Both paths took
+    /// any n above 0, and Describe sized the call's parameter list by it: a capacity-overflow panic
+    /// for `$18446744073709551615`, about 32 GiB for `$2147483647` (wire review 9 item 1). Leading
+    /// zeros change nothing: `$0001` is $1 to both.
+    #[test]
+    fn a_parameter_past_the_limit_is_no_branch_call() {
+        use PgBranchArg::Param;
+        let create = "turso_branch_create";
+        for n in [
+            "0",
+            "65536",
+            "2147483647",
+            "2147483648",
+            "18446744073709551615",
+            "99999999999999999999999",
+        ] {
+            let sql = format!("SELECT turso_branch_create(${n})");
+            assert_eq!(fast_branch_call(&sql), None, "fast path, {sql:?}");
+            assert_eq!(slow(&sql), None, "libpg_query, {sql:?}");
+            assert_eq!(branch_call(&sql), None, "branch_call, {sql:?}");
+        }
+        for (sql, n) in [
+            ("SELECT turso_branch_create($65535)", 65535),
+            ("SELECT turso_branch_create($0001)", 1),
+            ("SELECT turso_branch_create($000001)", 1),
+        ] {
+            assert_eq!(branch_call(sql), call(create, vec![Param(n)]), "{sql:?}");
+            assert_eq!(slow(sql), call(create, vec![Param(n)]), "libpg_query, {sql:?}");
+        }
     }
 
     /// Every PostgreSQL keyword (libpg_query's kwlist.h, PostgreSQL 17: 491 words) as the cast of a
