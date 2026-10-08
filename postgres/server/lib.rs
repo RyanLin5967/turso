@@ -553,6 +553,11 @@ async fn serve_session(
             PgWireConnectionState::CopyInProgress(extended) => extended,
             _ => msg.is_extended_query(),
         };
+        // A Sync or a simple query can end the transaction; its named portals go with it.
+        let may_end_transaction = matches!(
+            msg,
+            PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Query(_)
+        );
         if let Err(mut e) = pgwire::tokio::server::process_message(
             msg,
             &mut socket,
@@ -590,6 +595,13 @@ async fn serve_session(
             .await
             {
                 break Err(io);
+            }
+        }
+        // As PostgreSQL drops a transaction's portals when it ends, so a named portal is not run
+        // after its transaction (wire review 12 item 5).
+        if may_end_transaction {
+            for name in session.ended_portals() {
+                socket.portal_store().rm_portal(&name);
             }
         }
     };
@@ -705,6 +717,12 @@ struct SessionState {
     /// Notices the session's statements raised and the client has not been sent yet: the simple
     /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
     notices: Vec<Box<ErrorInfo>>,
+    /// The named portals bound in the current transaction, dropped when it ends, as PostgreSQL
+    /// drops a transaction's portals (see `serve_session`; wire review 12 item 5).
+    portals: Vec<String>,
+    /// The named portals that ran to completion without rows, or failed: a second Execute of one
+    /// is 55000, never a second run (wire review 12 item 5).
+    done_portals: std::collections::HashSet<String>,
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -764,6 +782,24 @@ impl Session {
 
     /// ReadyForQuery's status, read from the session's state rather than inferred from the
     /// statements it ran.
+    /// A named portal's statement ran to completion without rows, or failed: it does not run again.
+    fn portal_done(&self, name: &str) {
+        if name != DEFAULT_NAME {
+            self.state().done_portals.insert(name.to_string());
+        }
+    }
+
+    /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
+    /// a block is open (wire review 12 item 5).
+    fn ended_portals(&self) -> Vec<String> {
+        if !matches!(self.transaction_status(), TransactionStatus::Idle) {
+            return Vec::new();
+        }
+        let mut st = self.state();
+        st.done_portals.clear();
+        std::mem::take(&mut st.portals)
+    }
+
     fn transaction_status(&self) -> TransactionStatus {
         let st = self.state();
         if st.aborted {
@@ -2216,6 +2252,13 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
     ))
 }
 
+/// PostgreSQL's answer to a portal that does not exist (34000, invalid_cursor_name; pgwire's own
+/// PortalNotFound is 26000, a statement's code).
+fn portal_not_found(name: &str) -> Box<ErrorInfo> {
+    let name = if name == DEFAULT_NAME { "" } else { name };
+    error("34000", format!("portal \"{name}\" does not exist"))
+}
+
 /// A statement with nothing in it (whitespace, or a lone `;`): PostgreSQL's empty query, answered
 /// with EmptyQueryResponse on both protocols.
 fn is_blank(sql: &str) -> bool {
@@ -2526,6 +2569,13 @@ impl ExtendedQueryHandler for Session {
                 .map_err(PgWireError::UserError)?;
         }
         let portal = Portal::try_new(&message, statement)?;
+        if portal.name != DEFAULT_NAME {
+            let mut st = self.state();
+            st.done_portals.remove(&portal.name);
+            if !st.portals.contains(&portal.name) {
+                st.portals.push(portal.name.clone());
+            }
+        }
         client.portal_store().put_portal(Arc::new(portal));
         client
             .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
@@ -2551,7 +2601,7 @@ impl ExtendedQueryHandler for Session {
             }
             TARGET_TYPE_BYTE_PORTAL => {
                 let Some(portal) = client.portal_store().get_portal(name) else {
-                    return Err(PgWireError::PortalNotFound(name.to_owned()));
+                    return Err(PgWireError::UserError(portal_not_found(name)));
                 };
                 (None, self.do_describe_portal(client, &portal).await?.fields)
             }
@@ -2589,8 +2639,17 @@ impl ExtendedQueryHandler for Session {
         }
         let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         let Some(portal) = client.portal_store().get_portal(name) else {
-            return Err(PgWireError::PortalNotFound(name.to_owned()));
+            return Err(PgWireError::UserError(portal_not_found(name)));
         };
+        // A portal that ran without rows, or failed, does not run again (PostgreSQL's
+        // PortalRun refuses one that is not ready); it ran again and wrote twice (wire review 12
+        // item 5).
+        if self.state().done_portals.contains(name) {
+            return Err(PgWireError::UserError(error(
+                "55000",
+                format!("portal \"{name}\" cannot be run"),
+            )));
+        }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let max_rows = message.max_rows.max(0) as usize;
         let state = portal.state();
@@ -2608,11 +2667,13 @@ impl ExtendedQueryHandler for Session {
                     Response::Execution(tag)
                     | Response::TransactionStart(tag)
                     | Response::TransactionEnd(tag) => {
+                        self.portal_done(name);
                         client
                             .feed(PgWireBackendMessage::CommandComplete(tag.into()))
                             .await?;
                     }
                     Response::EmptyQuery => {
+                        self.portal_done(name);
                         client
                             .feed(PgWireBackendMessage::EmptyQueryResponse(
                                 EmptyQueryResponse::new(),
@@ -2620,6 +2681,7 @@ impl ExtendedQueryHandler for Session {
                             .await?;
                     }
                     Response::Error(e) => {
+                        self.portal_done(name);
                         client
                             .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                             .await?;
@@ -2638,9 +2700,13 @@ impl ExtendedQueryHandler for Session {
                     *state = PortalExecutionState::Finished;
                 }
             }
+            // A query portal that returned all its rows returns none more: "SELECT 0", as in
+            // PostgreSQL (it answered NoData; wire review 12 item 5).
             PortalExecutionState::Finished => {
                 client
-                    .feed(PgWireBackendMessage::NoData(NoData::new()))
+                    .feed(PgWireBackendMessage::CommandComplete(
+                        Tag::new("SELECT").with_rows(0).into(),
+                    ))
                     .await?;
             }
         }
