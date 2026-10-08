@@ -1069,8 +1069,9 @@ fn array_of(element: u32) -> Option<u32> {
     ARRAYS.iter().find(|(e, _)| *e == element).map(|(_, a)| *a)
 }
 
-/// The element type of an array type (the inverse of [`array_of`]).
-fn element_of(array: u32) -> Option<u32> {
+/// The element type of an array type (the inverse of [`array_of`]); Bind reads an array
+/// parameter's elements by it, so Bind and Describe use one table.
+pub fn element_of(array: u32) -> Option<u32> {
     ARRAYS.iter().find(|(_, a)| *a == array).map(|(e, _)| *e)
 }
 

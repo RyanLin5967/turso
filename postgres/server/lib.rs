@@ -37,8 +37,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, split_statements, PgBranchArg, PgBranchCall, PgConnection,
-    StatementTypes,
+    attach_schema_files, branch_call, element_of, split_statements, PgBranchArg, PgBranchCall,
+    PgConnection, StatementTypes,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -3228,6 +3228,9 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             "invalid UTF-8 in parameter: {e}"
         ))))
     })?;
+    if let Some(element) = element_of(pg_type.oid()).and_then(Type::from_oid) {
+        return pg_array_to_value(text, &element);
+    }
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -3268,6 +3271,103 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         // types is text, as in PostgreSQL; wire review 4 item 3).
         _ => Ok(Value::from_text(text.to_owned())),
     }
+}
+
+/// A text-format array parameter, read as PostgreSQL's array_in reads a one-dimensional array:
+/// `{` elements `}` separated by commas, each double-quoted or not (a backslash escapes the next
+/// character in either; an unquoted element loses its surrounding whitespace, and `NULL` in any
+/// case is NULL); `{}` is empty. Each element is read by the element type's own text rule
+/// ([`pg_bytes_to_value`]), and the array is bound as the engine's record-format array blob (as
+/// core's values_to_record_blob builds it, from its public parts). The text was bound as is and the
+/// engine guessed each element's type from its spelling, so bool[] '{t}' matched no true row,
+/// text[] '{1,2}' no text '1', and int4[] '{1.0}' matched 1 (wire review 10 item 4). Bad input is
+/// 22P02; a multidimensional or dimension-decorated array is refused (0A000).
+fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
+    let malformed = || {
+        PgWireError::UserError(error(
+            "22P02",
+            format!("malformed array literal: \"{text}\""),
+        ))
+    };
+    let s = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    if s.starts_with('[') {
+        return Err(PgWireError::UserError(error(
+            "0A000",
+            "array parameters with dimension information are not supported".to_string(),
+        )));
+    }
+    let inner = s
+        .strip_prefix('{')
+        .and_then(|r| r.strip_suffix('}'))
+        .ok_or_else(malformed)?;
+    let mut values = Vec::new();
+    if !inner
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .is_empty()
+    {
+        let mut chars = inner.chars().peekable();
+        loop {
+            while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+            let mut item = String::new();
+            let quoted = chars.next_if_eq(&'"').is_some();
+            if quoted {
+                loop {
+                    match chars.next().ok_or_else(malformed)? {
+                        '"' => break,
+                        '\\' => item.push(chars.next().ok_or_else(malformed)?),
+                        c => item.push(c),
+                    }
+                }
+                while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+            } else {
+                // Trailing whitespace is dropped, but not an escaped character's.
+                let mut kept = 0;
+                while let Some(c) = chars.next_if(|c| *c != ',') {
+                    match c {
+                        '{' | '}' => {
+                            return Err(PgWireError::UserError(error(
+                                "0A000",
+                                "multidimensional array parameters are not supported".to_string(),
+                            )))
+                        }
+                        '"' => return Err(malformed()),
+                        '\\' => {
+                            item.push(chars.next().ok_or_else(malformed)?);
+                            kept = item.len();
+                        }
+                        c => {
+                            item.push(c);
+                            if !c.is_ascii_whitespace() {
+                                kept = item.len();
+                            }
+                        }
+                    }
+                }
+                item.truncate(kept);
+                if item.is_empty() {
+                    return Err(malformed());
+                }
+            }
+            values.push(if !quoted && item.eq_ignore_ascii_case("null") {
+                Value::Null
+            } else {
+                pg_bytes_to_value(item.as_bytes(), element).map_err(|_| {
+                    PgWireError::UserError(error(
+                        "22P02",
+                        format!("invalid input syntax for type {element}: \"{item}\""),
+                    ))
+                })?
+            });
+            match chars.next() {
+                None => break,
+                Some(',') => {}
+                Some(_) => return Err(malformed()),
+            }
+        }
+    }
+    let record = turso_core::types::ImmutableRecord::from_values(values.as_slice(), values.len())
+        .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
+    Ok(Value::Blob(record.into_payload()))
 }
 
 /// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
