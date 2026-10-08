@@ -549,6 +549,40 @@ async fn serve_session(
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
             break Ok(());
         }
+        // A Sync or simple Query whose body is malformed ends any skip, fails the block it arrives
+        // in, and is answered with its ERROR and ReadyForQuery carrying the session's real state,
+        // as PostgreSQL answers them (it clears the skip and the extended flag before it reads
+        // either body). A malformed Sync got no ReadyForQuery, so the client hung; a malformed
+        // Query's error never reached the session's block, so COMMIT committed (wire review 12
+        // items 6 and 7). A malformed CopyFail outside COPY is ignored, as PostgreSQL ignores a
+        // stray CopyFail.
+        if let PgWireFrontendMessage::Malformed(kind, fault) = msg {
+            let copying = matches!(socket.state(), PgWireConnectionState::CopyInProgress(_));
+            if matches!(kind, b'S' | b'Q') && !copying {
+                session.fail_block();
+                let info = ErrorInfo::from(PgWireError::MalformedMessage(fault));
+                socket.set_state(PgWireConnectionState::ReadyForQuery);
+                let status = session.transaction_status();
+                let sent = async {
+                    socket
+                        .feed(PgWireBackendMessage::ErrorResponse(info.into()))
+                        .await?;
+                    socket
+                        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                            status,
+                        )))
+                        .await
+                }
+                .await;
+                if let Err(e) = sent {
+                    break Err(std::io::Error::other(e));
+                }
+                continue;
+            }
+            if kind == b'f' && !copying {
+                continue;
+            }
+        }
         let is_extended_query = match socket.state() {
             PgWireConnectionState::CopyInProgress(extended) => extended,
             _ => msg.is_extended_query(),

@@ -36,3 +36,6 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
      ends the stream after a decoder error; `is_extended_query` is true for the extended types.
    - `tokio/server.rs` `process_message`: a `Malformed` message is discarded while awaiting Sync
      and otherwise answered with its ERROR.
+2. A malformed Sync is not an extended message (`is_extended_query` covers P, B, C, D, E, H):
+   PostgreSQL ends a skip at any Sync before it reads the body, so the server answers it (and a
+   malformed simple Query) itself, with ReadyForQuery (wire review 12 items 6 and 7).

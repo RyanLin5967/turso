@@ -198,7 +198,7 @@ impl PgWireFrontendMessage {
                 | Self::PortalSuspended(_)
                 | Self::Flush(_)
                 | Self::Sync(_)
-        ) || matches!(self, Self::Malformed(t, _) if b"PBCDEHS".contains(t))
+        ) || matches!(self, Self::Malformed(t, _) if b"PBCDEH".contains(t))
     }
 
     pub fn encode(&self, buf: &mut BytesMut) -> PgWireResult<()> {
