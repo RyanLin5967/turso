@@ -737,6 +737,33 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        // The engine has no read-only transaction and no chain: refused, never run as a plain
+        // BEGIN or COMMIT, which wrote under READ ONLY and committed without chaining (wire review
+        // 11 item 7).
+        let read_only = txn.options.iter().any(|o| match o.node.as_ref() {
+            Some(pg_query::protobuf::node::Node::DefElem(d))
+                if d.defname == "transaction_read_only" =>
+            {
+                match d.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    Some(pg_query::protobuf::node::Node::AConst(c)) => !matches!(
+                        c.val,
+                        Some(pg_query::protobuf::a_const::Val::Ival(
+                            pg_query::protobuf::Integer { ival: 0 }
+                        ))
+                    ),
+                    _ => true,
+                }
+            }
+            _ => false,
+        });
+        if read_only {
+            return Err(ParseError::ParseError(
+                "READ ONLY transactions are not supported".into(),
+            ));
+        }
+        if txn.chain {
+            return Err(ParseError::ParseError("AND CHAIN is not supported".into()));
+        }
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
                 Ok(ast::Stmt::Begin {

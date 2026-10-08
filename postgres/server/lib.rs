@@ -1010,6 +1010,20 @@ impl Session {
                 }
                 return Ok(Response::Execution(Tag::new("BEGIN")));
             }
+            // AND CHAIN outside a block is PostgreSQL's error, not its warning; inside one the
+            // chain is not supported (below). It was read as an ordinary COMMIT, which committed
+            // and left the session idle (wire review 11 item 7).
+            TxVerb::Chain { commit } if !in_tx => {
+                let what = if commit {
+                    "COMMIT AND CHAIN"
+                } else {
+                    "ROLLBACK AND CHAIN"
+                };
+                return Err(error(
+                    "25P01",
+                    format!("{what} can only be used in transaction blocks"),
+                ));
+            }
             TxVerb::Commit | TxVerb::Rollback if !in_tx => {
                 st.notices
                     .push(warning("25P01", "there is no transaction in progress"));
@@ -1050,6 +1064,13 @@ impl Session {
                 self.branch(&mut st, &conn, &call, portal, format)
             }
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
+            // A chain in a block: refused, which fails the block, as any error in it does.
+            None if matches!(verb, TxVerb::Chain { .. }) => Err(error(
+                "0A000",
+                "AND CHAIN is not supported: end the block with COMMIT or ROLLBACK, then BEGIN a \
+                 new one"
+                    .to_string(),
+            )),
             None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
                 Err(error(
                     "0A000",
@@ -1644,6 +1665,10 @@ enum TxVerb {
     Begin,
     Commit,
     Rollback,
+    /// COMMIT AND CHAIN or ROLLBACK AND CHAIN (`commit`: which), which the server does not run.
+    Chain {
+        commit: bool,
+    },
     RollbackTo,
     Release,
     Savepoint,
@@ -1667,6 +1692,7 @@ impl TxVerb {
                 || (w.len() == 3 && is(w[0], "AND") && is(w[1], "NO") && is(w[2], "CHAIN"))
         };
         let name = |w: &[&str]| -> bool { w.len() == 1 && !w[0].is_empty() && w[0] != "," };
+        let chain = |w: &[&str]| -> bool { w.len() == 2 && is(w[0], "AND") && is(w[1], "CHAIN") };
         match w.as_slice() {
             [first, rest @ ..] if is(first, "BEGIN") => {
                 let rest = &rest[work(rest)..];
@@ -1684,8 +1710,11 @@ impl TxVerb {
                 }
             }
             [first, rest @ ..] if is(first, "COMMIT") || is(first, "END") => {
-                if no_chain(&rest[work(rest)..]) {
+                let rest = &rest[work(rest)..];
+                if no_chain(rest) {
                     TxVerb::Commit
+                } else if chain(rest) {
+                    TxVerb::Chain { commit: true }
                 } else {
                     TxVerb::Other
                 }
@@ -1694,6 +1723,8 @@ impl TxVerb {
                 let rest = &rest[work(rest)..];
                 if no_chain(rest) {
                     TxVerb::Rollback
+                } else if chain(rest) {
+                    TxVerb::Chain { commit: false }
                 } else if is(first, "ROLLBACK") && rest.first().is_some_and(|x| is(x, "TO")) {
                     let rest = &rest[1..];
                     let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
