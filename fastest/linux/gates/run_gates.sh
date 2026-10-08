@@ -184,9 +184,15 @@ for s in $steps; do
     # schema changed", mismatches=1, about 1 in 200 executions): the rate per arch and arm, with every
     # failing rep's whole output kept. Default size (FE_C0_OPS 3000, class fsync), as in the suite arms.
     reps=${GATE_C0_REPS:-40}
-    for arm in all splice cat; do
+    # DIAGNOSTIC (fastest-c0diag only): every arm twice, the harness's own retry (200 yields) and a 2 s
+    # time-based retry (FE_C0_RETRY_MS=2000). Escapes in the first and none in the second say the window is
+    # transient; escapes in both say the schema never catches up (an engine defect).
+    for armv in all:y200 splice:y200 cat:y200 all:ms2000 splice:ms2000 cat:ms2000; do
+      arm=${armv%%:*} variant=${armv#*:}
       envs=()
       case $arm in splice) envs=(R11_SPLICE=1) ;; cat) envs=(R11_BRANCH_CATALOG=1) ;; esac
+      [ "$variant" = ms2000 ] && envs+=(FE_C0_RETRY_MS=2000)
+      arm=$arm-$variant
       f="$out/c0rep-$arm.txt"
       : > "$f"
       fails=0 escapes=0 runs=0

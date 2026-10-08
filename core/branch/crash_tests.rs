@@ -347,12 +347,29 @@ fn writer_loop(db: Arc<Database>, shared: Arc<Shared>, seed: u64, quota: u64, ch
 
 /// Retry a fork that lost to a DDL commit in flight (`SchemaUpdated`) or to the WAL write lock.
 fn retrying<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut tries = 0;
+    // DIAGNOSTIC (fastest-linux, not for landing): FE_C0_RETRY_MS=<ms> retries for that long (100 us sleeps)
+    // instead of 200 yields, and every give-up prints its count and elapsed time, to tell a transient window
+    // (a DDL commit between publishing its pages and its schema, preempted longer than 200 yields) from a schema
+    // that never catches up. Run 37518195105: all 24 escapes were create_branch/fork_branch on the trunk.
+    let deadline = std::env::var("FE_C0_RETRY_MS").ok().and_then(|v| v.parse::<u64>().ok());
+    let start = std::time::Instant::now();
+    let mut tries = 0u64;
     loop {
         match f() {
-            Err(LimboError::SchemaUpdated) | Err(LimboError::Busy) if tries < 200 => {
+            Err(e @ (LimboError::SchemaUpdated | LimboError::Busy)) => {
+                let more = match deadline {
+                    Some(ms) => start.elapsed() < std::time::Duration::from_millis(ms),
+                    None => tries < 200,
+                };
+                if !more {
+                    println!("C0 retrying gave up: {e} after {tries} tries in {:?} (deadline {deadline:?} ms)", start.elapsed());
+                    return Err(e);
+                }
                 tries += 1;
-                std::thread::yield_now();
+                match deadline {
+                    Some(_) => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    None => std::thread::yield_now(),
+                }
             }
             other => return other,
         }
@@ -421,6 +438,9 @@ fn driver_loop(
     let trunk = db.connect().unwrap();
     let mut rng = Rng(seed | 1);
     let mut serial_name = 0u64;
+    // DIAGNOSTIC (fastest-linux, not for landing): the driver op an error came from, named in the mismatch line,
+    // so the C0 "Database schema changed" escape (16/720 reps at 675adbfb3, run 37398623241) names its op.
+    let mut step: &'static str = "start";
     while !shared.stop.load(O::Acquire) && shared.ops.load(O::Acquire) < quota {
         let roll = rng.below(100);
         let result: Result<()> = (|| {
@@ -431,6 +451,7 @@ fn driver_loop(
                 let name = format!("d{driver}-{seed}-{serial_name}");
                 if owned.is_empty() || rng.below(3) != 0 {
                     let lo = shared.acked.load(O::Acquire);
+                    step = if named { "create_branch on the trunk" } else { "fork_branch on the trunk" };
                     let id = retrying(|| {
                         if named {
                             trunk.create_branch(&name)
@@ -445,7 +466,11 @@ fn driver_loop(
                         model: State::default(),
                         depth: 1,
                     };
-                    let got = read_state(&connect(&db, &b)?)?;
+                    step = "connect to the new trunk child";
+                    let bc = connect(&db, &b)?;
+                    step = "read_state of the new trunk child";
+                    let got = read_state(&bc)?;
+                    drop(bc);
                     let k = got.seq;
                     if k < lo || k > hi {
                         shared.mismatch(format!(
@@ -468,7 +493,9 @@ fn driver_loop(
                 } else {
                     let i = rng.below(owned.len() as u64) as usize;
                     let parent = owned[i].clone();
+                    step = "connect to the parent branch";
                     let pc = connect(&db, &parent)?;
+                    step = if named { "create_branch on a branch" } else { "fork_branch on a branch" };
                     let id = retrying(|| {
                         if named {
                             pc.create_branch(&name)
@@ -483,7 +510,11 @@ fn driver_loop(
                         model: parent.model.clone(),
                         depth: parent.depth + 1,
                     };
-                    let got = read_state(&connect(&db, &b)?)?;
+                    step = "connect to the new branch child";
+                    let bc = connect(&db, &b)?;
+                    step = "read_state of the new branch child";
+                    let got = read_state(&bc)?;
+                    drop(bc);
                     check(&shared, &format!("create {} from branch {}", id.0, parent.id.0), &got, &b.model);
                     shared.created.fetch_add(1, O::Relaxed);
                     shared.created_named.fetch_add(named as u64, O::Relaxed);
@@ -493,8 +524,10 @@ fn driver_loop(
             } else if roll < 65 && !owned.is_empty() {
                 // Write an owned branch: 1-3 statements in one transaction.
                 let i = rng.below(owned.len() as u64) as usize;
+                step = "connect for a write";
                 let c = connect(&db, &owned[i])?;
                 let mut ops = Vec::new();
+                step = "BEGIN";
                 c.execute("BEGIN")?;
                 for j in 0..=rng.below(3) {
                     let op = match rng.below(100) {
@@ -503,22 +536,33 @@ fn driver_loop(
                         90..=97 => Op::Del(1 + rng.below(ROWS as u64) as i64),
                         _ => Op::Table(format!("e{}x{}", owned[i].id.0, rng.below(1_000_000))),
                     };
+                    step = match op {
+                        Op::Set(..) => "a write statement (Set)",
+                        Op::Del(..) => "a write statement (Del)",
+                        Op::Table(..) => "a write statement (CREATE TABLE)",
+                    };
                     c.execute(sql(&op))?;
                     ops.push(op);
                 }
+                step = "COMMIT";
                 c.execute("COMMIT")?;
                 owned[i].model.apply(&ops);
                 shared.branch_writes.fetch_add(1, O::Relaxed);
             } else if roll < 90 && !owned.is_empty() {
                 // Read an owned branch whole against its model.
                 let i = rng.below(owned.len() as u64) as usize;
-                let got = read_state(&connect(&db, &owned[i])?)?;
+                step = "connect for a read";
+                let rc = connect(&db, &owned[i])?;
+                step = "read_state for a read";
+                let got = read_state(&rc)?;
+                drop(rc);
                 check(&shared, &format!("read {}", owned[i].id.0), &got, &owned[i].model);
                 shared.reads.fetch_add(1, O::Relaxed);
             } else if !owned.is_empty() {
                 // Delete an owned branch (its children, if any, stay live).
                 let i = rng.below(owned.len() as u64) as usize;
                 let b = owned.swap_remove(i);
+                step = if b.name.is_some() { "drop_branch" } else { "reap" };
                 release(&db, &b)?;
                 shared.deleted.fetch_add(1, O::Relaxed);
                 gone.lock().unwrap().push(b);
@@ -526,7 +570,7 @@ fn driver_loop(
             Ok(())
         })();
         if let Err(e) = result {
-            shared.mismatch(format!("driver {driver}: {e}"));
+            shared.mismatch(format!("driver {driver}: {e} [at: {step}]"));
             break;
         }
         shared.ops.fetch_add(1, O::AcqRel);
