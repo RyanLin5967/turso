@@ -3558,3 +3558,108 @@ fn any_and_all_of_a_parameter_take_an_array() {
         assert_eq!(got, want, "{sql}");
     }
 }
+
+/// An undeclared parameter is typed by every context PostgreSQL types it by, so a value sent as
+/// text compares as PostgreSQL compares it: a scalar function's result (length() is int4), COALESCE,
+/// CASE, a scalar subquery and sum() take their arms' or arguments' types; a bare $n in WHERE or OR
+/// is boolean; a derived table's and a CTE's columns have their sources' types; ON CONFLICT DO
+/// UPDATE and a set operation's LIMIT are read. Each was text (no context typed it), so '3' never
+/// equalled length('abc') and a derived count never exceeded '1'. A parameter compared with
+/// something no context types is refused (42P18) rather than compared as text (wire review 8
+/// item 7). Expected values: PostgreSQL's by these fixtures' semantics; the PG18 re-recording is
+/// owed with item 17.
+#[test]
+fn untyped_contexts_type_their_parameters() {
+    const BOOL: u32 = 16;
+    const INT8: u32 = 20;
+    const INT4: u32 = 23;
+    let dir = Scratch::new("untypedctx");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, name TEXT, n INT)")
+        .ok("p");
+    a.q("INSERT INTO p VALUES (1, 'abc', 10), (2, 'de', NULL), (3, 'fghi', 30)")
+        .ok("rows");
+    for (sql, want_type, bind, want_rows) in [
+        (
+            "SELECT id FROM p WHERE length(name) = $1",
+            INT4,
+            "3",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM p WHERE coalesce(n, 0) = $1",
+            INT4,
+            "0",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM p WHERE CASE WHEN n IS NULL THEN 0 ELSE n END = $1",
+            INT4,
+            "30",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM p WHERE (SELECT max(n) FROM p) = $1 ORDER BY id",
+            INT4,
+            "30",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT 1 FROM p HAVING sum(n * 2) > $1",
+            INT8,
+            "79",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id",
+            BOOL,
+            "false",
+            vec!["1"],
+        ),
+        (
+            "SELECT c FROM (SELECT count(*) AS c FROM p) AS d WHERE c > $1",
+            INT8,
+            "2",
+            vec!["3"],
+        ),
+        (
+            "WITH w AS (SELECT n FROM p) SELECT count(*) FROM w WHERE n > $1",
+            INT4,
+            "10",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM p UNION ALL SELECT id FROM p ORDER BY 1 LIMIT $1",
+            INT8,
+            "2",
+            vec!["1", "1"],
+        ),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(vec![want_type]), "{sql}");
+        let r = a.xt(sql, &[(0, 0, bind.as_bytes())]).ok(sql);
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect();
+        assert_eq!(got, want_rows, "{sql} with {bind}");
+    }
+    // ON CONFLICT DO UPDATE: its SET takes the column's type and its WHERE is boolean.
+    let sql = "INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = $1 WHERE $2";
+    let r = a.describe_statement(sql).ok(sql);
+    assert_eq!(r.params, Some(vec![INT4, BOOL]), "{sql}");
+    a.xt(sql, &[(0, 0, b"11"), (0, 0, b"true")]).ok(sql);
+    assert_eq!(a.q("SELECT n FROM p WHERE id = 1").single("n"), "11");
+    // Compared with something no context types: refused, not compared as text.
+    let sql = "SELECT id FROM p WHERE no_such_typing(name) = $1";
+    let r = a.describe_statement(sql);
+    assert!(
+        r.error
+            .as_ref()
+            .is_some_and(|e| e.code == "42P18" || e.code == "42883"),
+        "{sql}: {:?}",
+        r.error
+    );
+}
