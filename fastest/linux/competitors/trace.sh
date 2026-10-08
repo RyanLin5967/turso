@@ -58,9 +58,11 @@ import sys, time
 # an undefined reference point and on macOS CPython it starts near zero in each process (measured on the Mac).
 def mono():
     return time.clock_gettime(time.CLOCK_MONOTONIC)
-for req in sys.stdin:
-    try:  # a malformed line is skipped, not a crash that leaves every later stamp to the one-shot path
-        nonce, name = req.split()
+for raw in sys.stdin.buffer:
+    # A malformed line -- not two words, or not ASCII (UnicodeDecodeError is a ValueError) -- is skipped, not a crash
+    # that leaves every later stamp to the one-shot path (sixth and seventh re-reviews).
+    try:
+        nonce, name = raw.decode("ascii").split()
     except ValueError:
         continue
     best = None
@@ -87,6 +89,17 @@ stamper_fds_ok() { # the coproc's two fds are open in THIS shell and, where /pro
     if [ -d "/proc/$STAMPER_SHELL/fd" ]; then [ "/proc/$BASHPID/fd/$f" -ef "/proc/$STAMPER_SHELL/fd/$f" ] || return 1; fi
   done
 }
+# stamp_reply_ok REPLY NAME -> 0 when REPLY (a stamper line, nonce removed) has the stamper's exact shape for NAME:
+# "NAME=<10 digits>.<9> NAME_mono=<digits>.<9> NAME_err=<digits>.<9>". Bash reads a pipe a byte at a time, so a
+# concurrent reader (a process substitution runs beside its parent) could splice two replies; most spliced lines fail
+# the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a digit of the monotonic integer
+# part is refused downstream by the realtime-vs-monotonic check (sixth re-review, finding 1). The realtime field has
+# exactly 10 integer digits until 2286. Callers must not stamp concurrently in any case. F14 tests it directly.
+stamp_reply_ok() {
+  local d='[0-9]+\.[0-9]{9}'
+  local want="^$2=[0-9]{10}\.[0-9]{9} ${2}_mono=$d ${2}_err=$d\$"
+  [[ $1 =~ $want ]]
+}
 clock_pair() {
   local name=$1 line="" src=oneshot nonce
   STAMP_SEQ=$((STAMP_SEQ + 1))
@@ -98,17 +111,10 @@ clock_pair() {
     # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
     line=$( {
       printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
-      # The whole reply must have the stamper's exact shape, not just this call's nonce: bash reads a pipe a byte at a
-      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; most
-      # spliced lines fail the shape and fall back to one-shot (fifth re-review, finding 3), and one that loses a
-      # digit of the monotonic integer part is refused downstream by the realtime-vs-monotonic check (sixth re-review,
-      # finding 1). The realtime field has exactly 10 integer digits (until 2286). Callers must not stamp
-      # concurrently in any case.
-      d='[0-9]+\.[0-9]{9}'
-      want="^$nonce $name=[0-9]{10}\.[0-9]{9} ${name}_mono=$d ${name}_err=$d\$"
+      # This call's reply (its nonce, literally) with the stamper's exact shape (stamp_reply_ok), else one-shot.
       for ((k = 0; k < 8; k++)); do
         IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
-        case $l in "$nonce "*) [[ $l =~ $want ]] && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
+        case $l in "$nonce "*) stamp_reply_ok "${l#"$nonce "}" "$name" && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
       done
       exit 1
     } 2>/dev/null )
