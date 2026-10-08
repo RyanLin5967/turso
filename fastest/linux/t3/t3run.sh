@@ -400,6 +400,28 @@ block_cleanup() {
   return 0
 }
 
+# After a run's teardown, before the next run starts (gate-6 review 11): sync the test filesystem, then wait until the
+# block's leaf drive has no request in flight and the page cache holds under 1 MiB dirty, for 2 s running (10 polls of
+# 0.2 s), at most 60 s. The settle time and whether it went quiet are recorded per run (settle.txt), never hidden.
+settle() { # settle MNT RUNDIR
+  local mnt=$1 d=$2 t0 q=0 n=0 inflight dirty leaf
+  leaf=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' \
+    "$OUT/fs-$FS_NOW/v3-before/summary.json" 2>/dev/null)
+  sync -f "$mnt" 2>/dev/null || sync
+  t0=$(date +%s%N)
+  while [ $n -lt 300 ]; do
+    inflight=$(awk '{print $9}' "/sys/block/$leaf/stat" 2>/dev/null)
+    dirty=$(awk '/^Dirty:/ {print $2}' /proc/meminfo)
+    if [ "${inflight:-1}" = 0 ] && [ "${dirty:-999999}" -lt 1024 ]; then q=$((q + 1)); else q=0; fi
+    [ $q -ge 10 ] && break
+    sleep 0.2
+    n=$((n + 1))
+  done
+  printf 'leaf=%s settle_s=%s quiet=%s inflight=%s dirty_kb=%s\n' "$leaf" \
+    "$(awk -v a="$t0" -v b="$(date +%s%N)" 'BEGIN { printf "%.2f", (b - a) / 1e9 }')" \
+    "$([ $q -ge 10 ] && echo yes || echo no)" "$inflight" "$dirty" > "$d/settle.txt"
+}
+
 # One cell run (the plan already holds one row per run): the sampler runs around the adapter, and the
 # void decision is made from its record BEFORE the cell's results are read. A VOID run is replaced once,
 # at most twice per cell (amendment 8); void runs are kept.
@@ -439,6 +461,7 @@ run_cell() {
       break
     fi
     rm -rf "$mnt/work-$id"
+    settle "$mnt" "$d"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fs" "$cell" "$system" "$clients" "$attempt" "$rc" \
       "$([ $v = 0 ] && echo VALID || echo VOID)" >> "$OUT/cells.tsv"
     [ $v = 3 ] || break

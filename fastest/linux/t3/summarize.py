@@ -184,8 +184,10 @@ def summarize(out, sha, dry, manifest):
                 if result and "VERDICT PASS" not in text:
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
+        st = os.path.join(d, "settle.txt") if d else None
+        settle = open(st).read().strip() if st and os.path.exists(st) else None
         runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
-                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)"})
+                     "measured": result and why != "NOT AVAILABLE (class absent at this sha)", "settle": settle})
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
     fl = os.path.join(out, "fslist.txt")
