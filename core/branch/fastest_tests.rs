@@ -4027,9 +4027,9 @@ impl Drop for HoldBound {
 }
 
 /// Engine review 8 #5's bound: a raised D0 store that then runs D0 alone held its frees for ever
-/// (no sync ever came). Past the bound of held slots (forced to 1 here; 4096 in a build), the next
-/// operation leads one upgrade flight in the rewrite class, and the held slots are free after it.
-/// Mutant `hold_unbounded`.
+/// (no sync ever came). Past the bound of held slots (forced to 1 here; 4096 in a build), one
+/// upgrade flight in the rewrite class is owed, led by the store's background writer (engine
+/// review 13 MED 2), and the held slots are free after it. Mutant `hold_unbounded`.
 #[test]
 fn a_raised_d0_store_holds_no_more_than_its_bound_for_a_sync() {
     let _s = serial();
@@ -4043,7 +4043,9 @@ fn a_raised_d0_store_holds_no_more_than_its_bound_for_a_sync() {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
         for &slot in &slots {
-            assert!(db.branch_slot_is_free(slot), "catalog={catalog}: slot {slot} is still held past the bound");
+            eventually(&format!("catalog={catalog}: slot {slot} is still held past the bound"), || {
+                db.branch_slot_is_free(slot)
+            });
         }
     }
 }
