@@ -53,6 +53,14 @@ def rule(cap_s):
     return "1000:10:%s" % (("%d" % m) if m == int(m) else ("%.3f" % m))
 
 
+def ops(c, n1, n4, total=""):
+    """STUB (red)."""
+    return n1
+
+
+CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 measured ops is complete, reduced n
+
+
 def check(celldir, n, warm_rule=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
@@ -103,16 +111,20 @@ def write_verdict(celldir, n, why):
 RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 
 
-def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE):
+def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
+            lab_ops=None, capped=False):
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
+    lo = n if lab_ops is None else lab_ops
     with open(os.path.join(d, "bb", "summary.json"), "w") as f:
-        json.dump({"verdict": "ok", "rc": 0, "measured_ops": n, "warmup_rule": lab_rule}, f)
+        json.dump({"verdict": "ok", "rc": 0, "measured_ops": lo, "measured_ok": lo, "warmup_rule": lab_rule,
+                   "capped": capped}, f)
     if timed:
         os.makedirs(os.path.join(d, "timed"))
+        to = n if timed_ops is None else timed_ops
         with open(os.path.join(d, "timed", "summary.json"), "w") as f:
-            json.dump({"verdict": "ok" if rc == 0 else "fail", "rc": rc,
-                       "measured_ops": n if timed_ops is None else timed_ops, "warmup_rule": timed_rule}, f)
+            json.dump({"verdict": "ok" if rc == 0 else "fail", "rc": rc, "measured_ops": to, "measured_ok": to,
+                       "warmup_rule": timed_rule, "capped": capped}, f)
         with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
             f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
         with open(os.path.join(d, "timed.rc"), "w") as f:
@@ -140,15 +152,27 @@ def selftest():
         ("timed run warmed up by another rule", dict(tracer=clean, timed_rule="20:0:0"), False),
         ("labelling run warmed up by another rule", dict(tracer=clean, lab_rule="1000:10:60"), False),
         ("no warm-up rule recorded", dict(tracer=clean, lab_rule=None, timed_rule=None), False),
+        # gate-6 review, t3run item 16: a run that hit the registered cap with >= 1000 ops is complete with reduced n
+        ("both runs capped with >= 1000 ops: complete, reduced n",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1500), True),
+        ("a capped run with < 1000 ops", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800), False),
+        ("an uncapped run short of N", dict(tracer=clean, lab_ops=1200, timed_ops=1500), False),
     ]
     bad = 0
     with tempfile.TemporaryDirectory() as root:
         for i, (name, kw, want) in enumerate(cases):
             d = fixture(root, f"c{i}", **kw)
-            why = check(d, 200, RULE)
+            why = check(d, 5000 if "capped" in name or "short of N" in name else 200, RULE)
             got = not why
             print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
             bad += got != want
+    # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
+    for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
+                       ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
+        got = ops(*args)
+        print(("PASS" if got == want else "FAIL"), f"ops{args} = {got!r}, want {want!r}")
+        bad += got != want
+        cases.append(None)
     for cap, want in ((1800, "1000:10:180"), (60, "1000:10:6"), (3600, "1000:10:360")):
         got = rule(cap)
         print(("PASS" if got == want else "FAIL"), f"rule({cap}) = {got!r}, want {want!r}")
