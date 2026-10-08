@@ -3851,6 +3851,56 @@ fn read_raw_reply(w: &mut Wire) -> (Vec<u8>, Vec<WireError>, u8) {
     }
 }
 
+/// A message string that is not valid UTF-8 is 22021 "invalid byte sequence for encoding \"UTF8\"",
+/// as PostgreSQL refuses it on every path, and names no branch: a branch name 0xFF sent as a simple
+/// query's literal, as an extended Parse's literal, and as a bound text parameter. The decoder read
+/// strings lossily, so the literals '\xff' and '\xfe' both became U+FFFD and named one branch, while
+/// the same bytes bound as a parameter were 22021 (wire review 12 item 8).
+#[test]
+fn invalid_utf8_names_no_branch() {
+    let dir = Scratch::new("badutf8");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    let literal = b"SELECT turso_branch_create('\xff')";
+    let mut query = literal.to_vec();
+    query.push(0);
+    a.s.write_all(&frame(b'Q', &query)).unwrap();
+    let (_, errors, status) = read_raw_reply(&mut a);
+    assert_eq!(
+        errors.first().map(|e| e.code.as_str()),
+        Some("22021"),
+        "simple: {errors:?}"
+    );
+    assert_eq!(status, b'I');
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(literal);
+    parse.extend_from_slice(&[0, 0, 0]);
+    let round = [
+        frame(b'P', &parse),
+        frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
+        frame(b'E', &[0, 0, 0, 0, 0]),
+        frame(b'S', &[]),
+    ]
+    .concat();
+    a.s.write_all(&round).unwrap();
+    let (_, errors, _) = read_raw_reply(&mut a);
+    assert_eq!(
+        errors.first().map(|e| e.code.as_str()),
+        Some("22021"),
+        "extended: {errors:?}"
+    );
+    let r = a.xt("SELECT turso_branch_create($1)", &[(0, 0, b"\xfe")]);
+    assert_eq!(r.err("a bound parameter").code, "22021");
+    let r = a.q("SELECT turso_branch_switch('\u{FFFD}')");
+    assert_eq!(r.err("no branch U+FFFD").code, "3D000");
+}
+
 /// A simple Query whose body is malformed (a string with no terminator) fails the block it arrives
 /// in, as any error there does: inside BEGIN the block is failed (25P02 until its end, which
 /// answers ROLLBACK), and in a pipeline its implicit block is rolled back. The malformed message's
