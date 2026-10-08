@@ -8057,6 +8057,7 @@ impl StoreInner {
             ));
         }
         let now = self.lease.now_ms();
+        let commit_class = self.commit_class();
         let (Some(journal), Some(arena), Some(cat)) =
             (self.journal.as_mut(), self.arena.as_mut(), self.cat.as_mut())
         else {
@@ -8106,7 +8107,7 @@ impl StoreInner {
         // review 6 #3 (b). Mutant `checkpoint_settles_by_flight` (test builds only): a raised D0
         // one waits in Fsync instead, leading a flight of the group that syncs the arena and the
         // log, as before engine review 9 #8.
-        let rewrite_syncs = journal.rewrite_class().syncs();
+        let rewrite_syncs = commit_class.syncs();
         let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
         let raised_d0 = rewrite_syncs && !own_sync && !journal.sync_class().syncs();
         let by_flight = raised_d0 && fe_mutant("checkpoint_settles_by_flight");
@@ -8287,7 +8288,7 @@ impl StoreInner {
             child_removed: self.children.removed.keys().copied().collect(),
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
-            arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
+            arena_sync: commit_class,
             settle_class,
             settle_arena,
             fail_stop: self.fail_stop.clone(),
@@ -8513,11 +8514,31 @@ impl StoreInner {
     /// (test builds only): the store's class.
     fn free_class(&self) -> SyncClass {
         let rewrite = self.journal.as_ref().map_or(self.sync, Journal::rewrite_class);
-        if !self.sync.syncs() && rewrite.syncs() && !fe_mutant("d0_frees_at_written") {
-            rewrite
+        // Or opened over a log an earlier run synced (engine review 13 MED 4): its records stay
+        // durable after the first rewrite carries them. Mutant `free_class_ignores_synced_open`
+        // (test builds only): not counted, as before.
+        let base = if fe_mutant("free_class_ignores_synced_open") {
+            SyncClass::Off
+        } else {
+            self.journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
+        };
+        let held = rewrite.max(base);
+        if !self.sync.syncs() && held.syncs() && !fe_mutant("d0_frees_at_written") {
+            held
         } else {
             self.sync
         }
+    }
+
+    /// The class a catalog checkpoint's commit syncs in: the log's rewrite class, or the free class
+    /// when stronger (engine review 13 MED 4): the capture lists the held frees free, so the commit
+    /// that lists them is as durable as their Releases must be before a slot is reused, and the
+    /// arena is settled before it (a raised D0 store's path). Without it, an Off commit listed a
+    /// held free that a refill could hand out, and a power cut that lost the commit brought the
+    /// released branch back, from the earlier synced catalog, over the reused slot.
+    fn commit_class(&self) -> SyncClass {
+        let rewrite = self.journal.as_ref().map_or(self.sync, Journal::rewrite_class);
+        rewrite.max(self.free_class())
     }
 
     /// Return to the arena every deferred free whose Release is `durable` (in the free class).

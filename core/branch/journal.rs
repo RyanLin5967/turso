@@ -985,6 +985,12 @@ impl Scanned {
                 {
                     journal.inherited = class;
                 }
+                // Sticky for this open (engine review 13 MED 4): those records stay durable in a
+                // snapshot or the catalog after that rewrite, so a free a later Release makes is
+                // held until a sync covers the Release (`StoreInner::free_class`).
+                if class.syncs() {
+                    journal.synced_base = journal.synced_base.max(class);
+                }
             }
             End::Reset => journal.reset_log(generation)?,
         }
@@ -1107,6 +1113,10 @@ pub(crate) struct Journal {
     /// catalog or a new log synced in it. Not kept in the header: a later run's records are only
     /// as durable as that run's class.
     inherited: SyncClass,
+    /// The class recovery decided the kept log was synced in, when it syncs (engine review 13 MED
+    /// 4): never cleared in this process. Blind spot: an open whose log was reset (nothing newer
+    /// than the snapshot or catalog) decides no class, so a synced snapshot alone does not set it.
+    synced_base: SyncClass,
     /// This incarnation of the log's nonce (format 11): in its header, and seeding every end
     /// frame's checksums, so recovery never takes an older incarnation's flight for one of this.
     nonce: u32,
@@ -1230,6 +1240,7 @@ impl Journal {
             pending_class: SyncClass::Off,
             raised: SyncClass::Off,
             inherited: SyncClass::Off,
+            synced_base: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1430,6 +1441,7 @@ impl Journal {
             pending_class: SyncClass::Off,
             raised,
             inherited: SyncClass::Off,
+            synced_base: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1996,6 +2008,11 @@ impl Journal {
             return self.sync;
         }
         self.sync.max(self.raised).max(self.inherited)
+    }
+
+    /// The class recovery decided the kept log was synced in, when it syncs (see `synced_base`).
+    pub(crate) fn synced_base(&self) -> SyncClass {
+        self.synced_base
     }
 
     /// A write in `class` is about to make records durable: remember a class stronger than any so
