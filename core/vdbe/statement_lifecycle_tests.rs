@@ -1775,3 +1775,60 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
         "the kept row's FTS document must survive the interrupt request"
     );
 }
+
+/// fastest-engine 4b (LEAD-ORDER 5; wire review 3 #10, engine half): a READ statement that fails
+/// at run time inside an explicit transaction ends only itself. The transaction, its writes and
+/// its savepoints survive, so ROLLBACK TO undoes only the work after the savepoint, as in
+/// PostgreSQL (Django's atomic and SQLAlchemy's begin_nested rely on it) and in SQLite, whose
+/// sqlite3VdbeHalt rolls a transaction back for a read only on an I/O, NOMEM or FULL error.
+/// Before the fix a read had no statement savepoint (`auto_txn_cleanup` None) and abort() rolled
+/// back the whole transaction, so ROLLBACK TO had no savepoint left and id=1 was lost. WAL and
+/// MVCC.
+#[test]
+fn a_failed_read_in_an_explicit_transaction_ends_only_itself() {
+    for mvcc in [false, true] {
+        let (conn, observer) = if mvcc {
+            let env = SameConnectionMvcc::new(":memory:failed-read-mvcc");
+            (env.conn, env.observer)
+        } else {
+            let env = SameConnectionWal::new(":memory:failed-read-wal");
+            (env.conn, env.observer)
+        };
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+            .unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+        let failed = conn
+            .prepare("SELECT sum(v) FROM t")
+            .unwrap()
+            .run_collect_rows();
+        assert!(
+            matches!(failed, Err(LimboError::IntegerOverflow)),
+            "mvcc={mvcc}: premise: the read fails at run time: {failed:?}"
+        );
+        assert!(
+            !conn.get_auto_commit(),
+            "mvcc={mvcc}: CLAIM: the failed read ended the whole transaction"
+        );
+        assert_eq!(
+            scalar_i64(&conn, "SELECT count(*) FROM t"),
+            2,
+            "mvcc={mvcc}: the transaction is usable after the failed read and keeps both rows"
+        );
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert_eq!(
+            ids_from_query(&conn, "SELECT id FROM t ORDER BY id"),
+            vec![1],
+            "mvcc={mvcc}: ROLLBACK TO undid only the work after the savepoint"
+        );
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            ids_from_query(&observer, "SELECT id FROM t ORDER BY id"),
+            vec![1],
+            "mvcc={mvcc}: id=1 is committed and id=2 is not"
+        );
+    }
+}
