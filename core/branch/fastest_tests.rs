@@ -5774,6 +5774,64 @@ fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
     }
 }
 
+/// Engine review 11 MED 8: a raised D0 store's fuzzy checkpoint settles in the store's class
+/// (Off), so it took an ORDERED flight in the air (landed, its trunk commit's WAL F_FULLFSYNC still
+/// to come) as settled, and committed the catalog over records whose callers may yet be told they
+/// failed (review 4 #1's rule). It waits for that flush first: here the flush fails, the store
+/// fail-stops, and the catalog does not commit. Mutant `settle_ignores_ordered`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_waits_out_an_ordered_flight_in_the_air() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, armed) = open_failing_wal(&dir.path().join("settle-ordered.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+    let _x = trunk.fork_branch().unwrap().into_id();
+    write_v(&trunk, 3, "raised");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    let installed = db.branch_checkpoint_counters()[0];
+    // A trunk commit keeping a pre-image for x: its flight ordered and landed, its WAL flush to come.
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_BARRIER_DONE, O::Release);
+    let committing = std::thread::spawn(move || {
+        armed.store(1, O::Release);
+        let got = trunk.execute("UPDATE t SET v = 'ordered' WHERE id = 40").map(|_| ());
+        (got, armed.load(O::Acquire))
+    });
+    wait_hold(&hold, super::store::HOLD_TRUNK_BARRIER_DONE);
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    let mut committed = false;
+    while t.elapsed() < std::time::Duration::from_secs(2) {
+        if db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
+            committed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    hold.store(0, O::Release);
+    let (got, armed_left) = committing.join().unwrap();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(armed_left, 0, "premise: the trunk commit's WAL sync was reached");
+    assert!(got.is_err(), "premise: its failed WAL sync failed the commit");
+    assert!(
+        !committed,
+        "a fuzzy checkpoint committed the catalog while an ordered flight's WAL flush was still to come"
+    );
+    assert_eq!(
+        db.branch_checkpoint_counters()[0],
+        installed,
+        "a fuzzy checkpoint installed over an ordered flight whose WAL flush failed"
+    );
+}
+
 // ---- engine review 9 #3: a flush under the store mutex honours a refused landing ----
 
 /// Engine review 9 #3: a flush made under the store mutex (`flush_locked`: a lease, an expiry, a
