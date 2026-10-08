@@ -93,10 +93,11 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// flight's length, and its crc32c, both the end frame's own checksum and the flight's seeded with
 /// the nonce. A 9 or 10 log ("written before the log nonce") is refused, never reinterpreted.
 ///
-/// 13 and 14 (fastest-engine, engine review 10 #2): the end frame says how its writer synced it,
-/// per flight: not at all, by a writer whose own class syncs (every flight before it was synced
-/// before it was written), or raised by a writer whose class does not (`EndKind`). An 11 or 12 log
-/// tagged both kinds of synced flight alike, so it is refused, never reinterpreted.
+/// 13 and 14 (fastest-engine, engine review 10 #2 and review 6 #7): the end frame says how its
+/// writer synced it, per flight: not at all, by a writer whose own class syncs (every flight
+/// before it was synced before it was written), raised by a writer whose class does not, or
+/// ORDERED ahead of a trunk commit's flush by either (`EndKind`). An 11 or 12 log tagged every
+/// synced or ordered flight alike, so it is refused, never reinterpreted.
 const FORMAT_VERSION: u32 = 13;
 const SPLICE_FORMAT_VERSION: u32 = 14;
 
@@ -114,12 +115,14 @@ pub(crate) fn format_version(splice: bool) -> u32 {
 /// reserved bytes.
 const LOG_HEADER_LEN: usize = 40;
 const FRAME_HEADER_LEN: usize = 8;
-/// The end frame's tags (`EndKind`): a flight written in a class that does not sync; one synced (or
-/// ordered ahead of a trunk commit's flush) by a writer whose own class syncs; and one synced the
-/// same way by a writer whose class does not (raised). No record tag takes any of these values.
+/// The end frame's tags (`EndKind`): a flight written in a class that does not sync; one synced by
+/// a writer whose own class syncs, or by one whose class does not (raised); and one ordered ahead
+/// of a trunk commit's flush by either. No record tag takes any of these values.
 const END_TAG: u8 = 0xE0;
 const END_SYNCED_TAG: u8 = 0xE1;
 const END_RAISED_TAG: u8 = 0xE2;
+const END_ORDERED_TAG: u8 = 0xE3;
+const END_ORDERED_RAISED_TAG: u8 = 0xE4;
 
 /// What a flight's end frame says about how its writer synced it (engine review 10 #2: per flight,
 /// not per incarnation, since a reopen in another class keeps the incarnation).
@@ -133,10 +136,18 @@ enum EndKind {
     /// Synced by a writer whose class does not (a raised D0 flight): durable itself, it proves
     /// nothing about the flights before it.
     Raised,
+    /// ORDERED ahead of a trunk commit's F_FULLFSYNC (barriered, never confirmed), by a writer
+    /// whose class syncs (review 6 #7): its slots were barriered ahead of its records, so its
+    /// records on the device prove its slots are.
+    Ordered,
+    /// `Ordered`, by a writer whose class does not sync: it proves nothing about the flights
+    /// before it.
+    OrderedRaised,
 }
 
 impl EndKind {
-    /// The kind of a flight synced or not (`syncs`) by a writer whose class syncs or not.
+    /// The kind of a flight synced or not (`syncs`), ordered or not, by a writer whose class syncs
+    /// or not.
     fn of(syncs: bool, base_syncs: bool) -> Self {
         match (syncs, base_syncs) {
             (false, _) => EndKind::Unsynced,
@@ -145,11 +156,21 @@ impl EndKind {
         }
     }
 
+    fn ordered_by(base_syncs: bool) -> Self {
+        if base_syncs {
+            EndKind::Ordered
+        } else {
+            EndKind::OrderedRaised
+        }
+    }
+
     fn tag(self) -> u8 {
         match self {
             EndKind::Unsynced => END_TAG,
             EndKind::Synced => END_SYNCED_TAG,
             EndKind::Raised => END_RAISED_TAG,
+            EndKind::Ordered => END_ORDERED_TAG,
+            EndKind::OrderedRaised => END_ORDERED_RAISED_TAG,
         }
     }
 
@@ -158,12 +179,24 @@ impl EndKind {
             END_TAG => Some(EndKind::Unsynced),
             END_SYNCED_TAG => Some(EndKind::Synced),
             END_RAISED_TAG => Some(EndKind::Raised),
+            END_ORDERED_TAG => Some(EndKind::Ordered),
+            END_ORDERED_RAISED_TAG => Some(EndKind::OrderedRaised),
             _ => None,
         }
     }
 
+    /// Synced, or ordered ahead of a flush: the flight was durable once its trunk commit was.
     fn synced(self) -> bool {
         self != EndKind::Unsynced
+    }
+
+    /// Written by a writer that synced (or ordered) every flight before writing the next.
+    fn by_syncing_writer(self) -> bool {
+        matches!(self, EndKind::Synced | EndKind::Ordered)
+    }
+
+    fn ordered(self) -> bool {
+        matches!(self, EndKind::Ordered | EndKind::OrderedRaised)
     }
 }
 /// tag(1) flight length(4) the flight's crc32c, seeded with the nonce(4).
@@ -341,6 +374,8 @@ const _: () = {
         END_TAG,
         END_SYNCED_TAG,
         END_RAISED_TAG,
+        END_ORDERED_TAG,
+        END_ORDERED_RAISED_TAG,
     ];
     let mut i = 0;
     while i < tags.len() {
@@ -1546,13 +1581,18 @@ impl Journal {
                 }
                 // A last flight confirmed in the header (its sync returned) keeps its records whatever
                 // its slots hold: a slot failing then is damage, refused when read, never a silently
-                // older page. An unconfirmed one is the store's to check once it has replayed it
+                // older page. So does an ordered one (review 6 #7): its slots were barriered ahead
+                // of its records, so its records being here proves its slots reached the device.
+                // An unconfirmed one is the store's to check once it has replayed it
                 // (`Scanned::last_flight_slots`).
                 let confirmed = bytes
                     .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
                     .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+                let ordered_last = whole.0 >= END_PAYLOAD_LEN
+                    && EndKind::from_tag(bytes[whole.0 - END_PAYLOAD_LEN]).is_some_and(EndKind::ordered);
                 let last = last_flight.filter(|&(start, _)| {
                     start < whole.0
+                        && !ordered_last
                         && confirmed
                             != Some(confirm_word(
                                 u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap()),
@@ -2732,7 +2772,15 @@ impl Flight {
         }
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
-            let end = end_frame(self.nonce, EndKind::of(self.class.syncs(), self.base_syncs), &self.bytes);
+            // An ordered flight says so (review 6 #7): recovery takes its slots as there whenever
+            // its records are. Mutant `ordered_tag_ignored` (test builds only): tagged as a synced
+            // flight, as before.
+            let kind = if self.ordered && self.class.syncs() && !super::store::fe_mutant("ordered_tag_ignored") {
+                EndKind::ordered_by(self.base_syncs)
+            } else {
+                EndKind::of(self.class.syncs(), self.base_syncs)
+            };
+            let end = end_frame(self.nonce, kind, &self.bytes);
             self.bytes.extend_from_slice(&end);
             write_at(&log, &self.bytes, self.at)?;
         }
@@ -2881,7 +2929,9 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
         TAG_TRUNK_RETAIN => len == 29,
         TAG_RELEASE | TAG_RELEASE_OPEN | TAG_CLOSE | TAG_CLOCK | TAG_CHECKPOINT => len == 9,
         TAG_LEASE => len == 25,
-        END_TAG | END_SYNCED_TAG | END_RAISED_TAG => len == END_PAYLOAD_LEN,
+        END_TAG | END_SYNCED_TAG | END_RAISED_TAG | END_ORDERED_TAG | END_ORDERED_RAISED_TAG => {
+            len == END_PAYLOAD_LEN
+        }
         _ => false,
     };
     (ok && p + len <= bytes.len()).then_some(len)
@@ -2964,7 +3014,7 @@ fn synced_flight_over(
             } else if whole_incarnation {
                 !unsynced_seen || confirms
             } else {
-                kind == EndKind::Synced || confirms
+                kind.by_syncing_writer() || confirms
             };
             let whole_later = writer_syncs
                 && found.checked_sub(flight_len).is_some_and(|start| {
