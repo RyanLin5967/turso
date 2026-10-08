@@ -2180,9 +2180,19 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
         LimboError::ParseError(m)
-            if m.starts_with("no such table") || m.starts_with("no such view") =>
+            if m.starts_with("no such table")
+                || m.starts_with("no such view")
+                || (m.starts_with("relation \"") && m.ends_with("\" does not exist")) =>
         {
             "42P01"
+        }
+        // A foreign key's parent key is not one (an ALTER's added key; wire review 11 item 5).
+        LimboError::ParseError(m)
+            if m.starts_with("there is no unique constraint matching given keys")
+                || m.starts_with("there is no primary key for referenced table")
+                || m.starts_with("number of referencing and referenced columns") =>
+        {
+            "42830"
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",

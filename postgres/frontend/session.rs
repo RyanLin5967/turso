@@ -739,11 +739,13 @@ fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Resul
 
 /// `ALTER TABLE t ADD <constraint>...` ([`PgAddConstraints`]): the engine adds no constraint to an
 /// existing table, so the table is rebuilt from its own PostgreSQL definition with the
-/// constraints appended, atomically (in the session's transaction, or in one of its own):
-/// its rows are copied aside, the table is dropped and created anew, the rows are inserted back
-/// with foreign keys enforced (so a row that breaks a new constraint fails the ALTER, as
-/// PostgreSQL validates it), and its indexes and triggers are created again. Foreign keys are not
-/// enforced while the old table is dropped, so its children are untouched. A table created by
+/// constraints appended, atomically (in the session's transaction, or in one of its own): its
+/// rows are copied aside, the table is dropped and created anew, the rows are inserted back (each
+/// checked against the new PRIMARY KEY, UNIQUE and CHECK constraints), and its indexes and
+/// triggers are created again, all with foreign keys off, so its children and the connection's
+/// deferred-key count are untouched. Then each foreign key the ALTER adds is checked as
+/// PostgreSQL checks it: its parent exists (42P01), its parent key is the parent's primary key or
+/// a unique one with as many columns (42830), and no row is an orphan (23503). A table created by
 /// CREATE TABLE AS, or not through this frontend, has no definition to rebuild from: refused.
 fn handle_pg_add_constraints(
     pg_conn: &Arc<PgConnectionInner>,
@@ -913,17 +915,43 @@ fn handle_pg_add_constraints(
         // constraints. It runs with foreign keys off, as the DROP does, so neither half touches
         // the connection's pending deferred-key count: with keys on it counted the rows again, and
         // a block's deferred orphan was cancelled, or a fixed one counted twice (wire review 6
-        // item 1). The keys the ALTER adds are then checked by one query each.
+        // item 1).
         execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
-        for key in add.constraints.iter().filter_map(added_foreign_key) {
-            check_added_foreign_key(conn, &quoted, &key)?;
-        }
         execute_root(conn, format!("DROP TABLE {aside}"))?;
         for sql in &dependents {
             match catalog::decode_stored_pg_schema_sql(sql) {
                 Some(pg_sql) => run_pg_statement(pg_conn, pg_sql)?,
                 None => execute_root(conn, sql)?,
             }
+        }
+        // The keys the ALTER adds are checked last, once the table's indexes are back (a unique
+        // index re-created above can be a self-reference's parent key, and the orphan query can
+        // use the indexes): the parent and its key (42P01, 42830), the engine's own resolution of
+        // every key of the table with unique parent keys required (with keys off, a non-unique
+        // parent key was accepted, and every later INSERT into the table failed 'foreign key
+        // mismatch'; wire review 11 item 5), then the orphans (23503).
+        let keys: Vec<AddedForeignKey> = add
+            .constraints
+            .iter()
+            .filter_map(added_foreign_key)
+            .collect();
+        let mut parent_keys = Vec::with_capacity(keys.len());
+        for key in &keys {
+            parent_keys.push(added_key_parent_columns(conn, &quoted, key)?);
+        }
+        if let Some(first) = keys.first() {
+            conn.current_schema()
+                .resolved_fks_for_child(table)
+                .map_err(|_| {
+                    LimboError::ParseError(format!(
+                        "there is no unique constraint matching given keys for referenced table \
+                         \"{}\"",
+                        first.parent
+                    ))
+                })?;
+        }
+        for (key, parent_columns) in keys.iter().zip(&parent_keys) {
+            check_added_foreign_key(conn, &quoted, key, parent_columns)?;
         }
         Ok(())
     })();
@@ -1009,34 +1037,57 @@ fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option
     })
 }
 
-/// The check PostgreSQL makes when it adds a foreign key, as one query: a row of `table` whose key
-/// columns are all non-NULL (MATCH SIMPLE) and match no parent row fails the ALTER with 23503.
-fn check_added_foreign_key(
+/// The parent key of a foreign key an ALTER adds, as PostgreSQL resolves it: the columns named,
+/// or the parent's primary key; a parent that does not exist is 42P01, one with no primary key to
+/// default to, or a key of another column count, 42830 (both were 42601).
+fn added_key_parent_columns(
     conn: &Arc<Connection>,
     table: &str,
     key: &AddedForeignKey,
-) -> Result<()> {
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let parent_columns = if key.parent_columns.is_empty() {
-        conn.current_schema()
-            .get_btree_table(&key.parent)
-            .map(|t| {
-                t.primary_key_columns
-                    .iter()
-                    .map(|(c, _)| c.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+) -> Result<Vec<String>> {
+    let schema = conn.current_schema();
+    let Some(parent) = schema.get_btree_table(&key.parent) else {
+        return Err(LimboError::ParseError(format!(
+            "relation \"{}\" does not exist",
+            key.parent
+        )));
+    };
+    let parent_columns: Vec<String> = if key.parent_columns.is_empty() {
+        parent
+            .primary_key_columns
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect()
     } else {
         key.parent_columns.clone()
     };
+    if parent_columns.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "there is no primary key for referenced table \"{}\"",
+            key.parent
+        )));
+    }
     if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
         return Err(LimboError::ParseError(format!(
-            "the foreign key on {table} names {} columns and its parent key {}",
+            "number of referencing and referenced columns for foreign key disagree (the key on \
+             {table} names {}, its parent key {})",
             key.columns.len(),
             parent_columns.len()
         )));
     }
+    Ok(parent_columns)
+}
+
+/// The check PostgreSQL makes when it adds a foreign key, as one query: a row of `table` whose key
+/// columns are all non-NULL (MATCH SIMPLE) and match no row of the parent key
+/// ([`added_key_parent_columns`]) fails the ALTER with 23503.
+fn check_added_foreign_key(
+    conn: &Arc<Connection>,
+    table: &str,
+    key: &AddedForeignKey,
+    parent_columns: &[String],
+) -> Result<()> {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let not_null = key
         .columns
         .iter()
@@ -1046,7 +1097,7 @@ fn check_added_foreign_key(
     let matches = key
         .columns
         .iter()
-        .zip(&parent_columns)
+        .zip(parent_columns)
         .map(|(c, p)| format!("p.{} = c.{}", quote(p), quote(c)))
         .collect::<Vec<_>>()
         .join(" AND ");
