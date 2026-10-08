@@ -1,0 +1,18 @@
+{
+ "disk": "sda",
+ "dev": "8:0",
+ "driver": "sd",
+ "kind": "drive",
+ "write_cache": "write through",
+ "fua": "0",
+ "drive_reports": "write through",
+ "drive_report_source": "SCSI MODE SENSE(10) caching page WCE=0 via SG_IO on /dev/sda (reply header 00 12 00 10 00 00 00 00; page at 8 08 0a 00 00 00 00 00 00 00 00 00 00; sd's cache_type, the kernel's copy, reads 'write through')",
+ "model": "Virtual Disk",
+ "sd_cache_type": "write through",
+ "nvme_controllers": [],
+ "multipath": [],
+ "nvme_transport": [],
+ "sd_host": "storvsc_host",
+ "device_path": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/f8b3781a-1e82-4818-a1c3-63d806ec15bb/host0/target0:0:0/0:0:0:0",
+ "creditable": true
+}

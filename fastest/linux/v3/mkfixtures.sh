@@ -13,6 +13,8 @@
 #         file is made at the path sysfs now shows for L2's backing                     R_lazy (10, 12)
 #   del   an ext4 loop whose backing file was deleted                                    R_deleted (12a)
 #   n3/n4 3 and 4 nested loops (ext4 in ext4 ...): 4 layers accepted, 5 refused          P_nest3, R_nest4 (12b)
+#         (the first image on V3_NEST_DIR when set: a dir on the filesystem that holds the cell's leaf, i.e. the
+#         cell's mount for a block cell, the directory of its loop backing file for a loop cell; else on /)
 #   ds    an ext4 loop mounted -o dirsync (an option outside the allowlist)              R_dirsync (15)
 #   ld    XFS with an external log (-l logdev=, mounted -o logdev=)                      R_logdev (15)
 #   ej    ext4 with an external journal (mkfs -J device=)                                R_extjournal (15)
@@ -105,7 +107,9 @@ f_del() {
   case "$(cat "/sys/block/${d##*/}/loop/backing_file")" in *"(deleted)"*) ok del "$(cat "/sys/block/${d##*/}/loop/backing_file")" ;; *) bad del "backing not shown deleted" ;; esac
 }
 f_nest() {
-  local prev=/v3fx-n1.img size=1200M d k
+  # the chain starts on the CELL's filesystem when V3_NEST_DIR names it (seventh review M3: P_nest3 must be accepted,
+  # so its leaf must be the cell's drive, not a root on md or LVM, which the probe refuses)
+  local prev=${V3_NEST_DIR:-}/v3fx-n1.img size=1200M d k
   for k in 1 2 3 4; do
     sudo mkdir -p "$base/n$k"
     if [ $k = 1 ]; then d=$(newloop "$prev" $size); else sudo truncate -s $size "$prev" && d=$(sudo losetup --find --show "$prev"); fi
