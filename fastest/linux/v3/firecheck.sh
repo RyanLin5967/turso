@@ -14,6 +14,9 @@
 #   V3_SHIM       DIST/statfs_shim.so, for the R_statfs_shim and R_ldpreload plants
 #   V3_NOOP       DIST/noop_shim.so, the library the /etc/ld.so.preload plants name
 #   V3_FX         the base dir mkfixtures.sh made (a fixture it could not make: that fixture's plants FAIL in check.py)
+#   V3_PLP        yes|no: the leaf drive's power-loss protection, the operator's declaration (annex A14; a hosted
+#                 runner and a dry run say no). It reaches the probe (F2b), run.sh (F3, the plants) and check.py (the
+#                 plan: F2b:discriminates only for a write-back leaf without PLP).
 # OPTIONAL (informational columns, never part of the verdict):
 #   V3_BASE, V3_BASE_SHA   the base (df4b39e53) v3floor and run.sh/stamp.py/check.py: the red column (OUT/red/,
 #                          red.json)
@@ -52,6 +55,7 @@ KIND=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell
   || { echo "firecheck: '$CELL' is not a cell (v3cell.py)" >&2; exit 2; }
 LOOPCELL=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print(int(v3cell.is_loop(sys.argv[2])))' "$HERE" "$CELL")
 [ -x "$V3" ] || { echo "firecheck: $V3 is not executable" >&2; exit 2; }
+case ${V3_PLP:-} in yes|no) export V3_PLP ;; *) echo "firecheck: V3_PLP='${V3_PLP:-}' is not yes or no (see the header)" >&2; exit 2 ;; esac
 for need in V3_DYN V3_SHIM V3_NOOP V3_FX; do
   [ -n "${!need:-}" ] && [ -e "${!need}" ] || { echo "firecheck: $need is unset or missing (see the header; build.sh DIST makes the binaries)" >&2; exit 2; }
 done
@@ -84,7 +88,7 @@ disk_of() {
   if [ -n "$s" ]; then disk_of "$(cat "/sys/class/block/$s/dev")"; return; fi
   basename "$p"
 }
-ROOTSRC=$(findmnt -n -o SOURCE /)
+ROOTSRC=$(findmnt -n --nofsroot -o SOURCE /)
 ROOTDISK=$(disk_of "$(findmnt -n -o MAJ:MIN /)")
 [ -n "$ROOTDISK" ] || ROOTDISK=$(lsblk -no PKNAME "$ROOTSRC" 2>/dev/null | head -1)
 [ -n "$ROOTDISK" ] || ROOTDISK=$(basename "$ROOTSRC")
@@ -126,6 +130,7 @@ grant
   for d in /dev/loop[0-9]* /dev/nvme[0-9] /dev/sd[a-z]; do [ -e "$d" ] && echo "acl $d $(getfacl -cp "$d" 2>/dev/null | grep "^user:$ME" | xargs)"; done
   # an instrument outside the probe for its virtualization verdict (fourth review M1)
   echo "detect_virt=$(systemd-detect-virt 2>/dev/null)"
+  echo "plp=$V3_PLP"
   echo "scsi_hosts=$(for h in /sys/class/scsi_host/host*; do printf '%s:%s ' "${h##*/}" "$(cat "$h/proc_name" 2>/dev/null)"; done)"
   echo "v3dyn_sha256=$(sha256sum "$V3DYN" 2>/dev/null | cut -d' ' -f1) noop_sha256=$(sha256sum "$NOOP" 2>/dev/null | cut -d' ' -f1)"
   echo "prev_sha=${V3_PREV_SHA:-}"
@@ -177,7 +182,7 @@ else
 fi
 echo "leafdisk=${LEAFDISK:-?} write_cache=[$(cat "/sys/block/$LEAFDISK/queue/write_cache" 2>/dev/null)] scsi=$([ -d "/sys/block/$LEAFDISK/device/scsi_disk" ] && echo 1 || echo 0)" >> "$OUT/info.txt"
 BOX=$(python3 -B "$HERE/check.py" --box "$OUT")
-BOXSPEC=$(python3 -B -c 'import json, sys; b = json.loads(sys.argv[1]); print("virt=%s,flip=%s" % (b["virt"], b["flip"]))' "$BOX")
+BOXSPEC=$(python3 -B -c 'import json, sys; b = json.loads(sys.argv[1]); print("virt=%s,flip=%s,plp=%s" % (b["virt"], b["flip"], b["plp"]))' "$BOX")
 echo "box=$BOXSPEC" >> "$OUT/info.txt"
 echo "== F1b: strace -f -y --trace-clock, real probe"
 sequenced real-all "$ALL" 300
@@ -189,11 +194,17 @@ done
 echo "== F2d: strace -f -y --trace-clock, --mutant-nosync"
 sequenced mutant-all "$ALL" 40 --mutant-nosync
 echo "== F2b: the mutant unwatched, n=200"
-FC timeout 900 "$V3" --dir "$W" --out "$OUT/F2b.out" --n 200 --arms "$ALL" --seed 11 --mutant-nosync > "$OUT/F2b.txt" 2>&1
+FC timeout 900 "$V3" --dir "$W" --out "$OUT/F2b.out" --n 200 --arms "$ALL" --seed 11 --mutant-nosync --plp "$V3_PLP" \
+  --registered "$HERE/REGISTERED.tsv" > "$OUT/F2b.txt" 2>&1
 echo $? > "$OUT/F2b.rc"
 echo "== F3: the real probe, n=200, through run.sh"
 V3_SMOKE=1 timeout 900 bash "$RS" "$V3" "$W" "$OUT/F3" 200 --arms "$ALL" --seed 11 > "$OUT/F3.txt" 2>&1
 echo $? > "$OUT/F3.rc"
+# gate-6 review LOW 10: what the device-flush tracing costs. The same arms, n and seed with nothing traced (the probe
+# directly, no run.sh, no tracefs), recorded beside F3's traced p50s in the verdict; descriptive, never a gate
+timeout 900 "$V3" --dir "$W" --out "$OUT/T.out" --n 200 --arms "$ALL" --seed 11 --plp "$V3_PLP" \
+  --registered "$HERE/REGISTERED.tsv" > "$OUT/T.txt" 2>&1
+echo $? > "$OUT/T.rc"
 
 if [ "$LOOPCELL" = 1 ]; then
   echo "== C: crash arms ($KIND)"
@@ -356,7 +367,12 @@ refuse R_leftover "$V3" --dir "$W" --out "$(o R_leftover)" --n 5 --arms clone1b,
 rmdir "$W/clone1b.clones"
 ROOTW=$(cat "$FX/root.dir" 2>/dev/null || echo /var/tmp/v3fx-root/w)
 LEAFW=$ROOTW
-if [ "$BRD" = 0 ]; then LEAFW="$(dirname "$W")/v3leaf-work"; mkdir -p "$LEAFW"; fi
+if [ "$BRD" = 0 ]; then
+  LEAFW="$(dirname "$W")/v3leaf-work"
+  mkdir -p "$LEAFW"
+  # the leaf plants' dir must be on the cell's own filesystem (W's), or they test another disk (seventh review L2)
+  [ "$(stat -c %d "$LEAFW")" = "$(stat -c %d "$W")" ] || { echo "firecheck: $LEAFW is not on W's filesystem" >&2; exit 2; }
+fi
 echo "leafw=$LEAFW" >> "$OUT/info.txt"
 # item 1(b): the kernel's view of the root disk's cache made to disagree with the drive, then restored. A write-back
 # disk: queue/write_cache set to write through. A write-through sd disk (the hosted runners' sda): sd's
@@ -420,16 +436,28 @@ if [ -f "$FX/sdbg.ok" ] && [ -n "$SDBG" ]; then
   nsrun "$OUT/F4/P_virt_bare" "${HIDE[@]}" -- env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o P_virt_bare)" --n 5 --arms append25,nosync25
   nsrun "$OUT/F4/R_virt_planted" "$FAKE/cpuinfo-hv:/proc/cpuinfo" "$FAKE/sys_vendor-vm:/sys/class/dmi/id/sys_vendor" \
     "$FAKE/product_name-vm:/sys/class/dmi/id/product_name" -- env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o R_virt_planted)" --n 5 --arms append25,nosync25
+  # gate-6 review v3 #1 (A14): the no-fsync mutant (the fastest "fsync" there is) on the write-back scsi_debug leaf:
+  # without PLP the timing control voids it, declared PLP it is not applicable
+  tcrun() { # tag plp
+    timeout 300 env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o "$1")" --n 100 --arms append25,nosync25 \
+      --mutant-nosync --plp "$2" --registered "$HERE/REGISTERED.tsv" > "$OUT/F4/$1.txt" 2>&1
+    echo $? > "$OUT/F4/$1.rc"
+  }
+  tcrun R_tc_wb no
+  tcrun P_tc_plp yes
   sct=$(ls /sys/block/"$SDBG"/device/scsi_disk/*/cache_type 2>/dev/null | head -1)
   echo "write through" | sudo tee "$sct" > /dev/null
   sudo udevadm settle 2>/dev/null
   [ "$(cat "$sct")" = "write through" ] && [ "$(cat "/sys/block/$SDBG/queue/write_cache")" = "write through" ] \
     && echo "changed=1 $SDBG cache_type and write_cache 'write through' (MODE SELECT WCE=0)" > "$OUT/F4/P_virt_bare_wt.state"
   nsrun "$OUT/F4/P_virt_bare_wt" "${HIDE[@]}" -- env V3FLOOR_FIRECHECK=1 "$V3" --dir "$FX/sdbg/w" --out "$(o P_virt_bare_wt)" --n 5 --arms append25,nosync25
+  # ... and on the write-through leaf the timing control is not applicable (A14), the state read back again
+  [ "$(cat "$sct")" = "write through" ] && echo "changed=1 $SDBG cache_type 'write through'" > "$OUT/F4/P_tc_wt.state"
+  tcrun P_tc_wt no
   echo "write back" | sudo tee "$sct" > /dev/null
   echo "$SDBG cache_type after restore: $(cat "$sct")" > "$OUT/F4/P_virt_bare_wt.restore"
 else
-  for t in P_virt_bare R_virt_planted P_virt_bare_wt; do echo "fixture sdbg missing" > "$OUT/F4/$t.txt"; echo missing > "$OUT/F4/$t.rc"; done
+  for t in P_virt_bare R_virt_planted P_virt_bare_wt R_tc_wb P_tc_plp P_tc_wt; do echo "fixture sdbg missing" > "$OUT/F4/$t.txt"; echo missing > "$OUT/F4/$t.rc"; done
 fi
 # the leaf disk made remote: an sd leaf's SCSI host named tcm_loopback, or an NVMe controller's transport tcp
 # (fifth review M1, M2: both outside their allowlists). An NVMe multipath head's device link is its subsystem: its
@@ -447,6 +475,7 @@ elif [ -n "$rctrl" ] && [ -f "/sys/class/nvme/$rctrl/transport" ]; then
 else
   echo "the leaf disk $LEAFDISK is neither sd nor nvme" > "$OUT/F4/R_leaf_remote.txt"; echo missing > "$OUT/F4/R_leaf_remote.rc"
 fi
+ls -A "$LEAFW" > "$OUT/leafw-leftover.txt" 2>&1
 # fourth review M4: /etc/ld.so.preload names the noop library for one run, then is restored
 ldso() { # tag binary dir
   local tag=$1 bin=$2 dir=$3
@@ -510,6 +539,7 @@ refuse R_runsh_n env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_n)" 5 --arms 
 refuse R_runsh_fcenv env V3_SMOKE=1 V3FLOOR_FIRECHECK=1 bash "$RS" "$V3" "$W" "$(o R_runsh_fcenv)" 5 --arms append25,nosync25
 refuse R_runsh_nocell env -u V3_CELL V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nocell)" 5 --arms append25,nosync25
 refuse R_runsh_badcell env V3_CELL=bogus V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_badcell)" 5 --arms append25,nosync25
+refuse R_runsh_noplp env -u V3_PLP V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_noplp)" 5 --arms append25,nosync25
 # item 17: V3_REQUIRE_T3=1 on a box where the T3 rule is false. Some x86 runners expose cpufreq with every CPU on
 # "performance" (run 37475543956), where the rule holds: there it is shown accepting (P_runsh_t3, recorded) and then
 # made false for the plant by moving cpu0 to another governor, restored after.
@@ -551,9 +581,14 @@ cp -r "$HERE" "$GH" && printf 'import sys\nsys.exit(1 if sys.argv[1:2] == ["post
 refuse R_runsh_gatecrash env V3_SMOKE=1 bash "$GH/run.sh" "$V3" "$W" "$(o R_runsh_gatecrash)" 5 --arms append25,nosync25
 # fresh review I-M5, fourth review M3/M5/L9: batchgate.py post on copies of the F3 batch, each with one field
 # planted (bound mode), and the control with nothing planted
-for p in traceclock cell leaf brd stack driver virt verdictswap verdictbad nostamp noblk blkrefused leafkind model; do
+for p in traceclock cell leaf brd stack driver virt verdictswap verdictbad nostamp noblk blkrefused leafkind model \
+         nofsync wtflush wtmismatch plp unregistered; do
   refuse "R_post_$p" python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/R_post_$p" "$CELL" "$SHA" "$p"
 done
+# MED 3: a write-back layer 0 (a loop cell's loop, or a write-back leaf) that lost one window's flush-carrying request
+if [ "$LOOPCELL" = 1 ] || [ "$LEAF" = wb ]; then
+  refuse R_post_layerflush python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/R_post_layerflush" "$CELL" "$SHA" layerflush
+fi
 refuse P_post_none python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/P_post_none" "$CELL" "$SHA" none
 # after the run: a wrapper "binary" that runs the real probe with the mutant (summary names another binary)
 printf '#!/bin/sh\nV3FLOOR_FIRECHECK=1 exec "%s" "$@" --mutant-nosync\n' "$V3" > "$OUT/F4/wrapper.sh"
@@ -577,7 +612,10 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   }
   rfx red_1a_brd brd
   rfx red_1a_driver dm
-  flip "$R/red_1b_leafflip" red red_1b_leafflip "$BB" --dir "$LEAFW" --out "$R/red_1b_leafflip.out" --n 5 --arms append25,nosync25
+  RLW="$(dirname "$W")/v3red-leaf"
+  [ "$BRD" = 1 ] && RLW="$(dirname "$ROOTW")/v3red-leaf"
+  mkdir -p "$RLW"
+  flip "$R/red_1b_leafflip" red red_1b_leafflip "$BB" --dir "$RLW" --out "$R/red_1b_leafflip.out" --n 5 --arms append25,nosync25
   red red_2_devflush env -u V3FLOOR_BRD V3_SMOKE=1 bash "$BR" "$BB" "$WR" "$R/red_2_devflush.out" 20
   if [ "$KIND" = ext4 ]; then
     echo "ext4: clone1b is refused at base too" > "$R/red_3_clone1b_gated.na"
@@ -636,7 +674,10 @@ if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
   R2=$OUT/prev PB=$V3_PREV/v3floor
   mkdir -p "$R2"
   pv() { local tag=$1; shift; timeout 300 "$@" > "$R2/$tag.txt" 2>&1; echo $? > "$R2/$tag.rc"; }
-  nsrun "$R2/prev_M1_virt" "${HIDE[@]}" -- "$PB" --dir "$LEAFW" --out "$R2/prev_M1_virt.out" --n 5 --arms append25,nosync25
+  PLW="$(dirname "$W")/v3prev-leaf"
+  [ "$BRD" = 1 ] && PLW="$(dirname "$ROOTW")/v3prev-leaf"
+  mkdir -p "$PLW"
+  nsrun "$R2/prev_M1_virt" "${HIDE[@]}" -- "$PB" --dir "$PLW" --out "$R2/prev_M1_virt.out" --n 5 --arms append25,nosync25
   if [ -f "$FX/sdbg.ok" ]; then
     pv prev_M2_sdbg env -u V3FLOOR_FIRECHECK "$PB" --dir "$FX/sdbg/w" --out "$R2/prev_M2_sdbg.out" --n 5 --arms append25,nosync25
   else
@@ -654,8 +695,7 @@ if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
 fi
 
 sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null
-ls -A "$LEAFW" > "$OUT/leafw-leftover.txt" 2>&1
-[ "$LEAFW" != "$ROOTW" ] && rmdir "$LEAFW" 2>/dev/null
+[ "$LEAFW" != "$ROOTW" ] && rm -rf "$LEAFW"
 ls -A "$W" > "$OUT/work-leftover.txt"
 python3 -B "$HERE/check.py" "$OUT" "$CELL"
 crc=$?
@@ -664,7 +704,12 @@ VSHA=$(sha256sum "$OUT/verdict.json" 2>/dev/null | cut -d' ' -f1)
 if [ "$BRD" = 1 ]; then
   refuse P_runsh_brd env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_brd)" 5 --arms append25,nosync25
 else
-  refuse P_runsh_ok env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 5 --arms append25,nosync25
+  BSHAPE=append25,fdatasync4k,nosync25
+  bframe=$(awk -F '\t' '$1 == "frame_arm" { v = $2 } END { print v }' "$HERE/REGISTERED.tsv")
+  [ -n "$bframe" ] && BSHAPE="$BSHAPE,$bframe"
+  timeout 1800 env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 10000 --arms "$BSHAPE" > "$OUT/F4/P_runsh_ok.txt" 2>&1
+  echo $? > "$OUT/F4/P_runsh_ok.rc"
+  refuse R_runsh_boundshape env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o R_runsh_boundshape)" 5 --arms "$BSHAPE"
 fi
 python3 -B "$HERE/check.py" --bind "$OUT" "$CELL"
 brc=$?

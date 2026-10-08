@@ -1,6 +1,6 @@
 /* v3floor.c -- V3 device-floor probe, Linux port of frontier/fastest/tools/v3/floor.c (PREREG §4 V3, §11 M0 exit 1).
  *
- *   v3floor --dir D --out O --n N [--arms a,b,...] [--seed S]
+ *   v3floor --dir D --out O --n N [--arms a,b,...] [--seed S] [--plp yes|no] [--registered REGISTERED.tsv]
  *   v3floor ... --mutant-nosync | --trace-clock                  (fire-check only, see "Fire-check flags")
  *   v3floor --crash-op ARM --dir D --out O [--crash-aim] [--mutant-nosync]   (fire-check only: one op, no teardown)
  *
@@ -19,7 +19,8 @@
  *   clean        fsync of a file with nothing dirty (the dirty/clean control; never mutated)
  *   nosync25     the append25 write with no flush (D0): the flush control's reference
  *   Report-only extra: fdatasync4k (ow4k with fdatasync in place of fsync).
- * Gated arms (the flush control voids the run on them): append25, append64, ow4k, ow64k, ow1m, clone2b, cfr2b.
+ * Flush-gated arms (every op must issue a device flush, run.sh's gates): append25, append64, ow4k, ow64k, ow1m, clone2b,
+ *   cfr2b. The timing control gates append25 only (A17, below).
  * Frame arm: PREREG §4 picks, among the M0 append and overwrite arms, the smallest bytes per flush >= the M1 build's
  *   median create frame. Review 2 item 11 puts a named create's flight at about 56-60 B (unverified here), so
  *   without append64 the rule would pick ow4k, an overwrite; append64 is that append. summary.json names it.
@@ -52,10 +53,21 @@
  *
  * Output (raw first, then the summary computed from it): O/raw.tsv (arm, i, ns, t0_ns), O/summary.json.
  * Exit: 0 ok | 2 usage or refused setup | 1 an operation failed | 3 VOID: the flush control failed.
- * Flush control (D0, per arm, tools review 1 item 6): for EVERY selected gated arm, p50(arm) / p50(nosync25) must be
- *   > 10, else the run is void (rc 3). The report-only ratios are reported, never gated. flush_d0_p50_ratio keeps the
- *   Mac's headline (append25 / nosync25). The threshold 10 is provisional for T3: check.py records the separation of
- *   the mutant (F2b) and real (F3) ratios on every cell, and the first T3 fire-check's record re-derives it.
+ * Timing control (D0; annex rulings A14 and A17; summary "timing_control", mirrored in "flush_control"): it gates
+ *   append25 ONLY, as PREREG section 4 registers: p50(append25) / p50(nosync25) must exceed the threshold, else the
+ *   run is void (rc 3). The threshold is read from the registered file (--registered REGISTERED.tsv, key
+ *   d0_threshold/<fstype>/<wb|wt|brd>/<vm|bare|nr>, value, registration ref); with no entry it is a provisional 10,
+ *   recorded as such (run.sh refuses that in rental mode). Every other arm's ratio is descriptive (ow1m, clone2b,
+ *   cfr2b and the frame arm are left to the flush gate). NOT APPLICABLE (A14), recorded with its reason and never a
+ *   void: a leaf with no volatile cache ("not applicable: no volatile cache"), a drive the operator declares
+ *   power-loss protected (--plp yes: "not applicable: PLP"), brd. --plp absent is "not given": the control applies.
+ * D0 control (PREREG section 4, gate-6 review MED 6): nosync25's p50 >= 50 us voids the run (rc 3), "a foreign
+ *   writer on the device"; summary "d0_control". The start-to-end drift rule is batchgate.py drift's (two batches).
+ * Floor reference (annex ruling A18): the cheapest durable barrier on the cell, min p50 over append25 (fsync),
+ *   fdatasync4k (ow4k + fdatasync) and the registered frame arm, each named; summary "floor_reference".
+ * Frame arm (gate-6 review MED 5): the registered one (REGISTERED.tsv key frame_arm), else none, with the rule's
+ *   candidate recorded (ow4k: the registered M0 arm with the smallest bytes per flush >= a ~60 B create frame,
+ *   unverified); append64 is descriptive until registered.
  *   What the control can and cannot see (run 37245757924, 8 cells): the no-flush mutant read <= 5.1 for append25,
  *   ow4k and fdatasync4k on every cell, but 2.7-12.2 for ow64k, 25-197 for ow1m and 8.8-24.3 for the clones, so for
  *   those arms a missing flush can pass it. It shows that a flush cost something, never that it reached the device.
@@ -180,7 +192,7 @@ enum { APPEND25, APPEND64, OW4K, OW64K, OW1M, CLONE2B, CFR2B, CLONE1B, FDATASYNC
 static const char *NAMES[NARMS] = {"append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b", "clone1b",
                                    "fdatasync4k", "clean", "nosync25"};
 #define MIB (1u << 20)
-static int gated(int a) { return a <= CFR2B; }                       /* the control gates them */
+static int gated(int a) { return a <= CFR2B; }                       /* flush-gated: a device flush per op */
 static int flushed(int a) { return a <= FDATASYNC4K; }               /* a flush the mutant removes */
 static int is_ficlone(int a) { return a == CLONE1B || a == CLONE2B; } /* refused on ext4 */
 static int is_copy(int a) { return a == CLONE1B || a == CLONE2B || a == CFR2B; }
@@ -198,6 +210,34 @@ static const char *report_only_why(int a) {
 static const char *DIR_;
 static dev_t DIR_DEV;
 static int MUTANT, TRACE_CLOCK, CRASH_AIM;
+static const char *PLP = NULL;     /* --plp yes|no: the operator's power-loss-protection declaration (A14) */
+static const char *REGPATH = NULL; /* --registered: the registered thresholds and frame arm (A17, MED 5) */
+
+/* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. -> 0 when key was found (the last line
+ * with it wins), 1 when absent, -1 when the file cannot be read. */
+static int reg_lookup(const char *path, const char *key, char *val, size_t vcap, char *ref, size_t rcap) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[1024];
+    int found = 1;
+    while (fgets(line, sizeof line, fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        line[strcspn(line, "\n")] = 0;
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1++ = 0;
+        char *t2 = strchr(t1, '\t');
+        if (!t2) continue;
+        *t2++ = 0;
+        if (!strcmp(line, key)) {
+            snprintf(val, vcap, "%s", t1);
+            snprintf(ref, rcap, "%s", t2);
+            found = 0;
+        }
+    }
+    fclose(fp);
+    return found;
+}
 static char buf[MIB];
 
 typedef struct {
@@ -1095,7 +1135,7 @@ static const char *leaf_checks(const layer *l) {
         if (realpath(p, dp)) copy(li->devpath, sizeof li->devpath, dp);
     }
     if (!strcmp(li->driver, "sd")) {
-        /* the host under sd, an allowlist (fifth review M1, M2): local HBAs and the paravirtual hosts of the VMs the
+        /* the host under sd, an allowlist (fifth and sixth reviews): local SATA and the paravirtual hosts of the VMs the
          * fire-check runs on. A RAM disk posing as a SCSI drive (scsi_debug) is fire-check only; a LIO loopback
          * (tcm_loop), iSCSI, FC, SRP, a USB bridge and any host not named here refuse */
         scsi_host_of(l->disk, li->sd_host, sizeof li->sd_host, li->devpath, sizeof li->devpath);
@@ -1330,6 +1370,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace-clock")) TRACE_CLOCK = 1;
         else if (!strcmp(argv[i], "--crash-op") && i + 1 < argc) crash_arm = argv[++i];
         else if (!strcmp(argv[i], "--crash-aim")) CRASH_AIM = 1;
+        else if (!strcmp(argv[i], "--plp") && i + 1 < argc) {
+            PLP = argv[++i];
+            if (strcmp(PLP, "yes") && strcmp(PLP, "no")) { fprintf(stderr, "v3floor: REFUSED: --plp %s is not yes or no\n", PLP); return 2; }
+        } else if (!strcmp(argv[i], "--registered") && i + 1 < argc) REGPATH = argv[++i];
         else { fprintf(stderr, "v3floor: bad argument %s\n", argv[i]); return 2; }
     }
     if ((MUTANT || TRACE_CLOCK || crash_arm || CRASH_AIM) && !firecheck_env())
@@ -1351,7 +1395,8 @@ int main(int argc, char **argv) {
                "dynamic loader put it there (LD_PRELOAD, /etc/ld.so.preload) or this is not the static build; it could "
                "change what the probe does under an unchanged exe_sha256", MAPPED);
     if (!DIR_ || !out || (!crash_arm && (!have_n || n == 0))) {
-        fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] | --crash-op ARM --dir D --out O\n");
+        fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] [--plp yes|no] "
+                "[--registered FILE] | --crash-op ARM --dir D --out O\n");
         return 2;
     }
     if (strlen(DIR_) > PATH_MAX - 128 || strlen(out) > PATH_MAX - 128)
@@ -1405,6 +1450,34 @@ int main(int argc, char **argv) {
                    "driver, so no flush reaches its backing file", k, L[k].diskname, L[k].wc);
     const layer *leaf = &L[NL - 1];
     if ((why = leaf_checks(leaf))) refuse("%s", why);
+    /* the box facts the timing control and the registered file key on, read before anything runs */
+    {
+        struct utsname u0;
+        if (uname(&u0) != 0) die("uname");
+        virt_record(&VIRT, &LEAF, u0.machine);
+    }
+    const int leaf_brd = !strcmp(LEAF.kind, "brd"), leaf_wb = !strcmp(leaf->wc, "write back");
+    char d0key[192], d0val[64] = "", d0ref[256] = "", frame_reg[64] = "", frame_ref[256] = "";
+    snprintf(d0key, sizeof d0key, "d0_threshold/%s/%s/%s", top->fstype, leaf_brd ? "brd" : leaf_wb ? "wb" : "wt",
+             VIRT.vm > 0 ? "vm" : VIRT.vm == 0 ? "bare" : "nr");
+    double d0_t = 10.0;
+    int d0_registered = 0, frame_registered = 0;
+    if (REGPATH) {
+        int r = reg_lookup(REGPATH, d0key, d0val, sizeof d0val, d0ref, sizeof d0ref);
+        if (r < 0) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
+        if (r == 0) {
+            char *e;
+            d0_t = strtod(d0val, &e);
+            if (*e || !(d0_t > 1.0)) refuse("%s: %s = '%s' is not a threshold above 1", REGPATH, d0key, d0val);
+            d0_registered = 1;
+        }
+        if (reg_lookup(REGPATH, "frame_arm", frame_reg, sizeof frame_reg, frame_ref, sizeof frame_ref) == 0) {
+            int known = 0;
+            for (int a = 0; a < NARMS; a++) known |= !strcmp(frame_reg, NAMES[a]);
+            if (!known) refuse("%s: frame_arm '%s' is not an arm", REGPATH, frame_reg);
+            frame_registered = 1;
+        }
+    }
     dir_identity();
     if (DIR_MNT != top->id) refuse("D's mount changed between the lookup (mount id %llu) and now (%llu)",
                                    (unsigned long long)top->id, (unsigned long long)DIR_MNT);
@@ -1544,6 +1617,8 @@ int main(int argc, char **argv) {
     jstr(f, clocksrc);
     if (have_seed) fprintf(f, ",\"seed_arg\":%llu", (unsigned long long)seed);
     else fprintf(f, ",\"seed_arg\":null");
+    fprintf(f, ",\"pid\":%d,\"plp\":\"%s\",\"registered_file\":", (int)getpid(), PLP ? PLP : "not given");
+    if (REGPATH) jstr(f, REGPATH); else fprintf(f, "null");
     fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"linkage\":\"%s\","
             "\"mapped_files\":[", other_maps ? "not static: other files mapped (fire-check only)" : "static");
     {
@@ -1628,7 +1703,6 @@ int main(int argc, char **argv) {
     fprintf(f, ",\"leaf_write_cache\":"); jstr(f, wc);
     fprintf(f, ",\"leaf_fua\":"); jstr(f, leaf->fua);
     int wb = !strcmp(wc, "write back");
-    virt_record(&VIRT, &LEAF, u.machine);
     const int vm = VIRT.vm;
     fprintf(f, ",\"virtualization\":{\"virtualized\":%s,\"evidence\":[", vm > 0 ? "true" : vm == 0 ? "false" : "null");
     for (int k = 0; k < VIRT.nev; k++) { fprintf(f, "%s", k ? "," : ""); jstr(f, VIRT.ev[k]); }
@@ -1701,13 +1775,15 @@ int main(int argc, char **argv) {
             "a filesystem-level crash on loops, which cannot see a missing device flush\",\"clone1b\":\"not guaranteed on "
             "Linux (report-only): crash.sh loses it on btrfs and on XFS when the log was forced between the create and the "
             "FICLONE; it survived plain XFS by checkpoint batching\"}");
-    int frame_ran = 0;
-    for (int j = 0; j < na; j++) frame_ran |= sel[j] == APPEND64;
-    if (frame_ran)
-        fprintf(f, ",\"frame_arm\":\"append64\",\"frame_bytes\":64,\"frame_rule\":\"PREREG section 4: the smallest bytes "
-                "per flush >= the M1 build's median create frame; review 2 item 11 puts a named create's flight at about "
-                "56-60 B (unverified here)\"");
-    else fprintf(f, ",\"frame_arm\":null");
+    /* the frame arm: the registered one, or none with the rule's candidate (gate-6 review MED 5) */
+    fprintf(f, ",\"frame_rule\":\"PREREG section 4: among the M0 append and overwrite arms, the smallest bytes per flush "
+            ">= the M1 build's median create frame, fixed in the Registration annex\",\"frame_candidate\":\"ow4k (a named "
+            "create's flight is about 56-60 B, unverified: the smallest registered M0 arm at or above it); append64 is "
+            "descriptive until registered\"");
+    if (frame_registered) {
+        fprintf(f, ",\"frame_arm\":"); jstr(f, frame_reg);
+        fprintf(f, ",\"frame_arm_ref\":"); jstr(f, frame_ref);
+    } else fprintf(f, ",\"frame_arm\":null,\"frame_arm_ref\":null");
     fprintf(f, ",\"refused_arms\":{");
     for (int a = 0, k = 0; a < NARMS; a++)
         if (refused[a]) { fprintf(f, "%s\"%s\":", k++ ? "," : "", NAMES[a]); jstr(f, reason); }
@@ -1741,33 +1817,66 @@ int main(int argc, char **argv) {
     } else {
         fprintf(f, ",\"dirty_clean_m0\":\"not run (needs append25 and clean)\"");
     }
+    char tc[256];
+    fprintf(f, ",\"d0_threshold\":%.2f,\"d0_threshold_key\":", d0_t);
+    jstr(f, d0key);
+    fprintf(f, ",\"d0_threshold_ref\":");
+    if (d0_registered) jstr(f, d0ref); else fprintf(f, "null");
+    fprintf(f, ",\"d0_threshold_source\":\"%s\",\"timing_gated_arms\":[\"append25\"]",
+            d0_registered ? "registered (REGISTERED.tsv)" : REGPATH ? "provisional 10: no registered entry for this key"
+                                                                    : "provisional 10: no registered file given");
     if (have_d0 >= 0) {
         if (have_app >= 0)
             fprintf(f, ",\"flush_d0_p50_ratio\":%.1f", p50[have_d0] ? (double)p50[have_app] / (double)p50[have_d0] : 1e18);
         fprintf(f, ",\"flush_control_arms\":{");
-        int ngated = 0, nfail = 0, k = 0;
-        char failed[256] = "";
+        int k = 0;
         for (int j = 0; j < na; j++) {
             if (sel[j] == NOSYNC25) continue;
             double ratio = p50[have_d0] ? (double)p50[j] / (double)p50[have_d0] : 1e18;
-            int g = gated(sel[j]), ok = ratio > 10.0;
-            fprintf(f, "%s\"%s\":{\"ratio\":%.1f,\"gated\":%s,\"pass\":%s}", k++ ? "," : "", NAMES[sel[j]], ratio,
-                    g ? "true" : "false", ok ? "true" : "false");
-            if (g) {
-                ngated++;
-                if (!ok) {
-                    nfail++;
-                    size_t l = strlen(failed);
-                    snprintf(failed + l, sizeof failed - l, "%s%s", l ? "," : "", NAMES[sel[j]]);
-                }
-            }
+            fprintf(f, "%s\"%s\":{\"ratio\":%.1f,\"gated\":%s,\"timing_gated\":%s,\"pass\":%s}", k++ ? "," : "",
+                    NAMES[sel[j]], ratio, gated(sel[j]) ? "true" : "false", sel[j] == APPEND25 ? "true" : "false",
+                    ratio > d0_t ? "true" : "false");
         }
         fprintf(f, "}");
-        if (ngated == 0) fprintf(f, ",\"flush_control\":\"not applicable (no gated arm ran)\"");
-        else if (nfail) { fprintf(f, ",\"flush_control\":\"FAIL: run void (%s)\"", failed); rc = 3; }
-        else fprintf(f, ",\"flush_control\":\"pass\"");
+        /* A14: no volatile cache, declared PLP or brd -> not applicable, never a void */
+        if (leaf_brd) snprintf(tc, sizeof tc, "not applicable: brd (no drive)");
+        else if (!leaf_wb) snprintf(tc, sizeof tc, "not applicable: no volatile cache");
+        else if (PLP && !strcmp(PLP, "yes")) snprintf(tc, sizeof tc, "not applicable: PLP");
+        else if (have_app < 0) snprintf(tc, sizeof tc, "not run: append25 not selected");
+        else {
+            double r25 = p50[have_d0] ? (double)p50[have_app] / (double)p50[have_d0] : 1e18;
+            if (r25 > d0_t) snprintf(tc, sizeof tc, "pass");
+            else {
+                snprintf(tc, sizeof tc, "FAIL: run void (append25 ratio %.1f <= threshold %.2f)", r25, d0_t);
+                rc = 3;
+            }
+        }
+        /* the D0 control's own validity: a foreign writer on the device (PREREG section 4, gate-6 review MED 6) */
+        double d0us = p50[have_d0] / 1e3;
+        if (d0us >= 50.0) {
+            fprintf(f, ",\"d0_control\":\"FAIL: run void (nosync25 p50 %.1f us >= 50 us: a foreign writer on the device)\"", d0us);
+            rc = 3;
+        } else fprintf(f, ",\"d0_control\":\"pass (nosync25 p50 %.1f us < 50 us)\"", d0us);
     } else {
-        fprintf(f, ",\"flush_control\":\"not applicable (no flushed arm selected)\"");
+        snprintf(tc, sizeof tc, "not applicable: no flushed arm selected");
+        fprintf(f, ",\"d0_control\":\"not run: nosync25 not selected\"");
+    }
+    fprintf(f, ",\"timing_control\":"); jstr(f, tc);
+    fprintf(f, ",\"flush_control\":"); jstr(f, tc); /* the same verdict, under its old name */
+    /* the floor reference (A18): the cheapest durable barrier measured here */
+    {
+        int best = -1;
+        for (int j = 0; j < na; j++) {
+            int cand = sel[j] == APPEND25 || sel[j] == FDATASYNC4K;
+            if (frame_registered && !strcmp(NAMES[sel[j]], frame_reg)) cand = 1;
+            if (cand && !(MUTANT && flushed(sel[j])) && (best < 0 || p50[j] < p50[best])) best = j;
+        }
+        fprintf(f, ",\"floor_reference\":");
+        if (best < 0) fprintf(f, "null");
+        else
+            fprintf(f, "{\"arm\":\"%s\",\"barrier\":\"%s\",\"p50_us\":%.1f,\"rule\":\"annex A18: min p50 over append25 "
+                    "(fsync), fdatasync4k (ow4k + fdatasync) and the registered frame arm, among the arms run\"}",
+                    NAMES[sel[best]], sel[best] == FDATASYNC4K ? "fdatasync" : "fsync", p50[best] / 1e3);
     }
     fprintf(f, "}\n");
     if (fclose(f) != 0) die("summary.json close");

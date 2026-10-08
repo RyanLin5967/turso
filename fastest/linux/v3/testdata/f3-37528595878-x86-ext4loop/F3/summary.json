@@ -1,4 +1,15 @@
 {
+ "app_syncs_per_op": {
+  "append25": 1.0,
+  "append64": 1.0,
+  "cfr2b": 2.0,
+  "clean": 1.0,
+  "fdatasync4k": 1.0,
+  "nosync25": 0.0,
+  "ow1m": 1.0,
+  "ow4k": 1.0,
+  "ow64k": 1.0
+ },
  "arms": {
   "append25": {
    "max_us": 27217.3,
@@ -139,6 +150,11 @@
  "copy_extents": {
   "cfr2b": "not shared (a byte copy)"
  },
+ "d0_control": "pass (nosync25 p50 4.2 us < 50 us)",
+ "d0_threshold": 10.0,
+ "d0_threshold_key": "d0_threshold/ext4/wb/vm",
+ "d0_threshold_ref": null,
+ "d0_threshold_source": "provisional 10: no registered entry for this key",
  "dev": "7:0",
  "device_flushes": {
   "ambiguous": 0,
@@ -254,47 +270,61 @@
  "floor_claim": "per stack: a clean fsync (a bare flush) plus the measured delta, only where the device flush record shows the clean arm issuing a flush per op (floor_claim_from_counts); never 'one drive flush' without that count; on a virtual drive: reach to media unknown",
  "floor_claim_from_counts": "clean fsync (a bare flush: a bare flush request at the leaf in 200 of 200 clean windows) plus the measured delta, per stack; a virtual drive: reach to media unknown",
  "floor_kind": "virtual drive flush: reach to media unknown",
+ "floor_reference": {
+  "arm": "fdatasync4k",
+  "barrier": "fdatasync",
+  "p50_us": 202.8,
+  "rule": "annex A18: min p50 over append25 (fsync), fdatasync4k (ow4k + fdatasync) and the registered frame arm, among the arms run"
+ },
  "flush_control": "pass",
  "flush_control_arms": {
   "append25": {
    "gated": true,
    "pass": true,
-   "ratio": 95.9
+   "ratio": 95.9,
+   "timing_gated": true
   },
   "append64": {
    "gated": true,
    "pass": true,
-   "ratio": 94.5
+   "ratio": 94.5,
+   "timing_gated": false
   },
   "cfr2b": {
    "gated": true,
    "pass": true,
-   "ratio": 746.7
+   "ratio": 746.7,
+   "timing_gated": false
   },
   "clean": {
    "gated": false,
    "pass": true,
-   "ratio": 18.8
+   "ratio": 18.8,
+   "timing_gated": false
   },
   "fdatasync4k": {
    "gated": false,
    "pass": true,
-   "ratio": 48.3
+   "ratio": 48.3,
+   "timing_gated": false
   },
   "ow1m": {
    "gated": true,
    "pass": true,
-   "ratio": 671.8
+   "ratio": 671.8,
+   "timing_gated": false
   },
   "ow4k": {
    "gated": true,
    "pass": true,
-   "ratio": 95.5
+   "ratio": 95.5,
+   "timing_gated": false
   },
   "ow64k": {
    "gated": true,
    "pass": true,
-   "ratio": 121.2
+   "ratio": 121.2,
+   "timing_gated": false
   }
  },
  "flush_d0_p50_ratio": 95.9,
@@ -336,7 +366,8 @@
   "leaf_flushes_completed": 2820,
   "n": 200,
   "outcome": "pass",
-  "required_flushes": 1200
+  "required_flushes": 1200,
+  "voids": []
  },
  "flush_path": [
   {
@@ -389,9 +420,10 @@
   }
  ],
  "flush_sent_to_device": "yes, to the virtual device: the leaf reports a volatile write cache and its device report agrees, so a flush the filesystem issues reaches the (virtual) device; whether the host forwards it to media is unknown; how many each arm's op issues is the device flush record (device_flushes_per_op)",
- "frame_arm": "append64",
- "frame_bytes": 64,
- "frame_rule": "PREREG section 4: the smallest bytes per flush >= the M1 build's median create frame; review 2 item 11 puts a named create's flight at about 56-60 B (unverified here)",
+ "frame_arm": null,
+ "frame_arm_ref": null,
+ "frame_candidate": "ow4k (a named create's flight is about 56-60 B, unverified: the smallest registered M0 arm at or above it); append64 is descriptive until registered",
+ "frame_rule": "PREREG section 4: among the M0 append and overwrite arms, the smallest bytes per flush >= the M1 build's median create frame, fixed in the Registration annex",
  "fsid": "73328de47995f304",
  "fstype": "ext4",
  "ioprio_class": 0,
@@ -459,6 +491,8 @@
  "mutant_nosync": 0,
  "n": 200,
  "nice": 0,
+ "pid": 4242,
+ "plp": "no",
  "probe": "v3floor-linux",
  "probe_rev": "review2",
  "realpath": "/mnt/fastest-v3-ext4loop/work",
@@ -466,11 +500,16 @@
   "clone1b": "ext4 at /mnt/fastest-v3-ext4loop has no reflink: a trial ioctl(FICLONE) returned EOPNOTSUPP (Operation not supported); FICLONE arms run on xfs and btrfs only",
   "clone2b": "ext4 at /mnt/fastest-v3-ext4loop has no reflink: a trial ioctl(FICLONE) returned EOPNOTSUPP (Operation not supported); FICLONE arms run on xfs and btrfs only"
  },
+ "registered_file": "REGISTERED.tsv",
  "sched_policy": 0,
  "seed": 11,
  "seed_arg": 11,
  "statfs_magic": "0xef53",
  "super_opts": "rw,noinit_itable",
+ "timing_control": "pass",
+ "timing_gated_arms": [
+  "append25"
+ ],
  "trace_clock": 0,
  "uname": "Linux 6.17.0-1022-azure x86_64",
  "virtualization": {

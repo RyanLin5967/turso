@@ -6,10 +6,14 @@
                                             trace_clock mono_raw; write OUT/start.json
   blkflush.py stop OUT                      stop it; keep OUT/trace.txt.gz, OUT/stats.json (per-CPU ring buffer
                                             stats), OUT/stop.json; remove the instance
-  blkflush.py report OUT [--device D] [--windows RAW.tsv]
+  blkflush.py report OUT [--device D] [--windows RAW.tsv [--pid P]]
                                             print JSON: per device the F requests by kind, and with --windows (a
                                             v3floor raw.tsv: arm, i, ns, t0_ns) per arm the requests inside its ops'
-                                            CLOCK_MONOTONIC_RAW windows
+                                            CLOCK_MONOTONIC_RAW windows; with --pid, per arm the windows in which
+                                            process P entered no fsync or fdatasync (syscalls:sys_enter_fsync and
+                                            sys_enter_fdatasync, traced in the same instance: annex ruling A16, the
+                                            app's own sync per op, which a write-through drive's zero flush count
+                                            cannot show)
   blkflush.py gen DEV OUT.tsv N             fire-check generator (not a measurement): N fsync(2)s of the raw block
                                             device DEV, then N buffered 4 KiB writes, then N empty windows, each
                                             window recorded as a raw.tsv row (arms devfsync, devwrite, idle)
@@ -39,6 +43,9 @@ import bisect, gzip, json, os, re, subprocess, sys, time
 
 FILTER = 'rwbs ~ "*F*"'
 EVENT = "events/block/block_rq_issue"
+SYSEVENTS = ["events/syscalls/sys_enter_fsync", "events/syscalls/sys_enter_fdatasync"]
+SYSLINE = re.compile(r"^\s*(?P<comm>.+?)-(?P<pid>\d+)\s+\[(?P<cpu>\d+)\]\s+(?:(?P<flags>\S+)\s+)?(?P<ts>\d+\.\d+):\s+"
+                     r"sys_(?P<sc>fsync|fdatasync)\((?P<args>[^)]*)\)\s*$")
 LINE = re.compile(r"^\s*(?P<comm>.+?)-(?P<pid>\d+)\s+\[(?P<cpu>\d+)\]\s+(?:(?P<flags>\S+)\s+)?(?P<ts>\d+\.\d+):\s+"
                   r"(?P<ev>[a-z_]+):\s+(?P<body>.*)$")
 BODY = re.compile(r"^(?P<maj>\d+),(?P<min>\d+)\s+(?P<rwbs>[A-Z]+)\s+(?P<bytes>\d+)\s+\((?P<cmd>[^)]*)\)\s+"
@@ -140,6 +147,14 @@ def start(out, buffer_kb):
         swrite(ip + "/" + EVENT + "/enable", "1")
         if sread(ip + "/" + EVENT + "/enable").strip() != "1":
             raise Refuse("the event did not enable")
+        for se in SYSEVENTS:  # the app's own syncs, per op (A16)
+            if subprocess.run(["sudo", "-n", "test", "-e", ip + "/" + se + "/enable"], capture_output=True,
+                              timeout=30).returncode != 0:
+                raise Refuse("no %s tracepoint (CONFIG_FTRACE_SYSCALLS): the per-op sync count cannot be taken" % se)
+            swrite(ip + "/" + se + "/enable", "1")
+            if sread(ip + "/" + se + "/enable").strip() != "1":
+                raise Refuse("%s did not enable" % se)
+        rec["syscall_events"] = [x.split("/")[-1] for x in SYSEVENTS]
         swrite(ip + "/trace", "")  # opened O_TRUNC: clears the buffer
         rec["start_mono_raw_ns"] = time.clock_gettime_ns(MONO_RAW)  # before tracing_on: every event is later
         swrite(ip + "/tracing_on", "1")
@@ -183,7 +198,9 @@ def stop(out):
         for c in sudo(["ls", ip + "/per_cpu"]).split():
             stats[c] = parse_stats(sread(ip + "/per_cpu/%s/stats" % c))
     finally:  # the instance is removed whatever failed above
-        subprocess.run(["sudo", "-n", "tee", ip + "/" + EVENT + "/enable"], input="0", capture_output=True, text=True, timeout=30)
+        for ev in [EVENT] + SYSEVENTS:
+            subprocess.run(["sudo", "-n", "tee", ip + "/" + ev + "/enable"], input="0", capture_output=True, text=True,
+                           timeout=30)
         subprocess.run(["sudo", "-n", "rmdir", ip], capture_output=True, timeout=30)
     if subprocess.run(["sudo", "-n", "test", "-e", ip], capture_output=True, timeout=30).returncode == 0:
         raise Refuse("tracefs instance %s could not be removed" % ip)
@@ -223,8 +240,15 @@ def ts_ns(ts):
 
 
 def parse_trace(text, devices):
-    """-> (events, problems). An event: (ts_ns, half_width_ns, device name, rwbs, kind, comm, pid)."""
-    events, probs, entries = [], [], None
+    """-> (block events, problems): parse_trace_all without the syscall events."""
+    events, _, probs = parse_trace_all(text, devices)
+    return events, probs
+
+
+def parse_trace_all(text, devices):
+    """-> (block events, syscall events, problems). A block event: (ts_ns, half_width_ns, device name, rwbs, kind,
+    comm, pid); a syscall event: (ts_ns, half_width_ns, "sys", name, name, comm, pid) for fsync and fdatasync."""
+    events, sysev, probs, entries = [], [], [], None
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -239,6 +263,11 @@ def parse_trace(text, devices):
             continue
         m = LINE.match(line)
         if not m:
+            sm = SYSLINE.match(line)
+            if sm:
+                t, hw = ts_ns(sm.group("ts"))
+                sysev.append((t, hw, "sys", sm.group("sc"), sm.group("sc"), sm.group("comm"), int(sm.group("pid"))))
+                continue
             probs.append("unparsed line: " + line[:160])
             continue
         if m.group("ev") != "block_rq_issue":
@@ -262,9 +291,9 @@ def parse_trace(text, devices):
         probs.append("no entries-in-buffer/entries-written header")
     elif entries[0] != entries[1]:
         probs.append("events lost: entries-in-buffer/entries-written %d/%d" % entries)
-    elif entries[0] != len(events):
-        probs.append("the header counts %d entries, %d parsed" % (entries[0], len(events)))
-    return events, probs
+    elif entries[0] != len(events) + len(sysev):
+        probs.append("the header counts %d entries, %d parsed" % (entries[0], len(events) + len(sysev)))
+    return events, sysev, probs
 
 
 def read_windows(path):
@@ -373,7 +402,24 @@ def per_arm(events, w):
     return arms, amb, outside
 
 
-def report(out, device=None, windows=None):
+def sync_windows(sysev, w, pid):
+    """per arm: windows in which process pid entered no fsync or fdatasync (and the count it entered)."""
+    mine = [e for e in sysev if e[6] == pid]
+    inside, amb, _ = attribute(mine, w)
+    res = {}
+    for k, (t0, t1, a, i) in enumerate(w):
+        r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0, "ambiguous": 0})
+        r["ops"] += 1
+        got = len(inside.get(k, []))
+        r["syncs"] += got
+        r["windows_without_a_sync"] += got == 0
+    for e, poss in amb:
+        for a in sorted(set(w[j][2] for j in poss)):
+            res[a]["ambiguous"] += 1
+    return res
+
+
+def report(out, device=None, windows=None, pid=None):
     try:
         with open(os.path.join(out, "start.json")) as f:
             s = json.load(f)
@@ -385,7 +431,7 @@ def report(out, device=None, windows=None):
             text = f.read()
     except (OSError, ValueError) as e:
         raise Refuse("%s is not a stopped blkflush record: %r" % (out, e))
-    events, probs = parse_trace(text, s.get("devices", {}))
+    events, sysev, probs = parse_trace_all(text, s.get("devices", {}))
     probs += report_stats_problems(stats)
     lo, hi = s.get("start_mono_raw_ns", 0), stp.get("stop_mono_raw_ns", 0)
     early = [e for e in events if e[0] + e[1] < lo or e[0] - e[1] > hi]
@@ -403,9 +449,16 @@ def report(out, device=None, windows=None):
         d["comms"][e[5]] = d["comms"].get(e[5], 0) + 1
     rep = {"tool": "blkflush.py", "proves": PROVES, "instance": s.get("instance"), "filter": s.get("filter"),
            "trace_clock": "mono_raw", "window_s": (hi - lo) / 1e9, "events": len(events), "device_filter": device,
-           "devices": dev}
+           "devices": dev, "syscalls": rep_sys}
+    rep_sys = {"traced": s.get("syscall_events") or [], "events": len(sysev),
+               "by_pid": {}}
+    for e in sysev:
+        rep_sys["by_pid"][str(e[6])] = rep_sys["by_pid"].get(str(e[6]), 0) + 1
     if windows:
         w = read_windows(windows)
+        if pid is not None and s.get("syscall_events"):
+            rep_sys["pid"] = pid
+            rep_sys["arms"] = sync_windows(sysev, w, pid)
         arms, amb, outside = per_arm(events, w)
         rep["windows"] = {"source": windows, "n_windows": len(w), "arms": arms, "ambiguous": len(amb),
                           "outside": len(outside),
@@ -520,6 +573,19 @@ def self_test():
     chk("refuses per-CPU stats without the overrun keys", report_stats_problems({"cpu0": {"entries": 3}}) != [], "")
     chk("accepts per-CPU stats with zero overruns",
         report_stats_problems({"cpu0": {"overrun": 0, "commit overrun": 0, "dropped events": 0}}) == [], "")
+    # A16: the app's own syncs per window, from syscall tracepoints, by pid (expectations by hand)
+    def sev(comm, pid, ts, sc="fsync"):
+        return "%16s-%-7d [%03d] .....  %s: sys_%s(fd: 0x00000003)" % (comm, pid, 0, ts, sc)
+    slines = [sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001080", "fdatasync"),  # both in w0
+              sev("other", 7, "0.002010"),                                                 # w2, another pid
+              ev("kworker/0:1H", 10, 0, "0.001050", "7:0", "FF")]
+    be, se, sp = parse_trace_all(HDR % (len(slines), len(slines)) + "\n".join(slines) + "\n", devs)
+    chk("syscall lines parse: 3 syscall events and 1 block event, the header count matching both",
+        len(se) == 3 and len(be) == 1 and not sp and [x[3] for x in se] == ["fsync", "fdatasync", "fsync"], (se, sp))
+    sw = sync_windows(se, windows, 99)
+    chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
+        sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
+        and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
     tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "blkflush-selftest-%d.tsv" % os.getpid())
     with open(tmp, "w") as f:
         f.write("arm\ti\tns\tt0_ns\nappend25\t0\t100\t1000\nnosync25\t0\t100\t1050\n")
@@ -548,23 +614,25 @@ def main(argv):
             print(json.dumps(stop(argv[1])))
             return 0
         if len(argv) >= 2 and argv[0] == "report":
-            dev = win = None
+            dev = win = pid = None
             rest = argv[2:]
             while rest:
                 if rest[0] == "--device" and len(rest) >= 2:
                     dev, rest = rest[1], rest[2:]
                 elif rest[0] == "--windows" and len(rest) >= 2:
                     win, rest = rest[1], rest[2:]
+                elif rest[0] == "--pid" and len(rest) >= 2 and rest[1].isdigit():
+                    pid, rest = int(rest[1]), rest[2:]
                 else:
-                    raise Refuse("usage: report OUT [--device D] [--windows RAW.tsv]")
-            print(json.dumps(report(argv[1], dev, win), indent=1, sort_keys=True))
+                    raise Refuse("usage: report OUT [--device D] [--windows RAW.tsv [--pid P]]")
+            print(json.dumps(report(argv[1], dev, win, pid), indent=1, sort_keys=True))
             return 0
         if len(argv) == 4 and argv[0] == "gen" and argv[3].isdigit():
             gen(argv[1], argv[2], int(argv[3]))
             return 0
         if argv == ["self-test"]:
             return self_test()
-        raise Refuse("usage: blkflush.py start OUT [--buffer-kb K] | stop OUT | report OUT [--device D] [--windows RAW.tsv]"
+        raise Refuse("usage: blkflush.py start OUT [--buffer-kb K] | stop OUT | report OUT [--device D] [--windows RAW.tsv [--pid P]]"
                      " | gen DEV OUT.tsv N | self-test")
     except Refuse as e:
         print(json.dumps({"refused": str(e)}))

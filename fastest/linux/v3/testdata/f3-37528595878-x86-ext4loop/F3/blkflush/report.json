@@ -80,6 +80,73 @@
  "filter": "rwbs ~ \"*F*\"",
  "instance": "v3blk_9629_776429657",
  "proves": "flush requests and FUA writes ISSUED to each device's driver (tracefs block:block_rq_issue), never persistence; on a device reporting write-through the block layer strips flushes before issue, so 0 there by construction; other processes' requests inside a window are counted too, and a request an op causes after its window closes is not, so a window's count is neither a strict upper nor lower bound on the op's own; a zero is exact only for windows longer than 1 us (the trace prints microseconds)",
+ "syscalls": {
+  "arms": {
+   "append25": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "append64": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "cfr2b": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 400,
+    "windows_without_a_sync": 0
+   },
+   "clean": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "fdatasync4k": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "nosync25": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 0,
+    "windows_without_a_sync": 200
+   },
+   "ow1m": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "ow4k": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   },
+   "ow64k": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_without_a_sync": 0
+   }
+  },
+  "by_pid": {
+   "4242": 1800
+  },
+  "events": 1800,
+  "pid": 4242,
+  "traced": [
+   "sys_enter_fsync",
+   "sys_enter_fdatasync"
+  ]
+ },
  "tool": "blkflush.py",
  "trace_clock": "mono_raw",
  "window_s": 2.981619296,

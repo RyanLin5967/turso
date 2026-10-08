@@ -1,5 +1,6 @@
 {
  "cell": "ext4loop",
+ "d0_control": "pass (nosync25 p50 4.2 us < 50 us)",
  "flush_gate": {
   "blkflush_leaf_gate": {
    "arms": {
@@ -38,10 +39,13 @@
   "leaf_flushes_completed": 2820,
   "n": 200,
   "outcome": "pass",
-  "required_flushes": 1200
+  "required_flushes": 1200,
+  "voids": []
  },
  "mode": "smoke",
  "rc": 0,
  "refusals": [],
- "verdict": null
+ "timing_control": "pass",
+ "verdict": null,
+ "voids": []
 }

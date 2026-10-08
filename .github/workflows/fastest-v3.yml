@@ -85,6 +85,8 @@ jobs:
       V3_DYN: ${{ github.workspace }}/dist/v3floor.dyn
       V3_NOOP: ${{ github.workspace }}/dist/noop_shim.so
       V3_PREV: ${{ github.workspace }}/prev
+      # a hosted runner's disk is not declared power-loss protected (annex A14)
+      V3_PLP: "no"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -129,7 +131,7 @@ jobs:
       - name: Refusal fixtures
         run: |
           # a fixture that fails is recorded and its plant then fails in check.py; the fire-check still runs
-          rc=0; bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?
+          rc=0; V3_NEST_DIR="$MNT" bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?
           echo "mkfixtures rc=$rc" >> "$RAW/fixtures.txt"
           cat "$RAW/fixtures.txt"
       - name: Hardware record (fio on the cell)

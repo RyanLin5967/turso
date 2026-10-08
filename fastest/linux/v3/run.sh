@@ -22,7 +22,13 @@
 #   V3_SMOKE=1                           an explicitly unbound smoke batch, recorded as such, never credited
 # Neither, or both: refused (rc 2) before anything runs.
 # V3_REQUIRE_T3=1: also refuse before anything runs unless the registered T3 preconditions hold (every CPU on the
-# "performance" governor, clocksource tsc or arch_sys_counter: review 2 items 16-17; batchgate.py t3pre).
+# "performance" governor, clocksource tsc or arch_sys_counter: review 2 items 16-17; batchgate.py t3pre), and after
+# the run unless the registered values it used exist (A17: the cell class's d0 threshold, the frame arm).
+# V3_PLP=yes|no is required: the operator's power-loss-protection declaration for the leaf drive (annex A14; a
+# hosted runner or a dry run says no). The probe gets --plp and --registered REGISTERED.tsv (this directory's).
+# A bound batch has the registered V3 shape (PREREG section 4; gate-6 review MED 6): N = 10000 and arms exactly
+# append25, fdatasync4k (A18's ow4k + fdatasync), nosync25 and the registered frame arm when there is one; anything
+# else refuses ("bound shape:"). A smoke batch may run any shape and records it.
 # LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH in the environment refuses (an interposer would not change the sha256).
 # After the probe (batchgate.py post): refused (rc 2) if the summary carries mutant_nosync or trace_clock != 0, names
 # another binary (exe_sha256), another layout, has no drive or brd leaf record, no gated arm ran, or (bound) a brd
@@ -53,6 +59,9 @@ CELL=${V3_CELL:-}
 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(0 if sys.argv[2] in v3cell.CELLS else 1)' "$HERE" "$CELL" \
   || refuse "V3_CELL='$CELL' is not a cell (ext4, xfs, btrfs on a block device; ext4loop, xfsloop, btrfsloop on a loop)"
 [ -z "${V3FLOOR_FIRECHECK:-}" ] || refuse "V3FLOOR_FIRECHECK is set: the probe's fire-check flags never pass through run.sh"
+case ${V3_PLP:-} in yes|no) ;; *) refuse "V3_PLP='${V3_PLP:-}' is not yes or no (the leaf drive's power-loss protection, the operator's declaration: annex A14)" ;; esac
+REG="$HERE/REGISTERED.tsv"
+[ -f "$REG" ] || refuse "no registered file $REG"
 for v in LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH; do
   [ -z "${!v:-}" ] || refuse "$v is set: an interposed library could change what the probe does under an unchanged sha256"
 done
@@ -77,6 +86,18 @@ elif [ "${V3_SMOKE:-}" = 1 ]; then
 else
   refuse "set V3_FIRECHECK_VERDICT=<a passing fire-check verdict.json for this binary and cell> or V3_SMOKE=1"
 fi
+if [ "$mode" = bound ]; then
+  frame=$(awk -F '\t' '$1 == "frame_arm" { v = $2 } END { print v }' "$REG")
+  want="append25,fdatasync4k,nosync25${frame:+,$frame}"
+  got=""
+  for ((k = 0; k < ${#args[@]}; k++)); do [ "${args[$k]}" = --arms ] && got=${args[$((k + 1))]}; done
+  norm() { tr ',' '\n' <<< "$1" | sort | paste -sd, -; }
+  { [ "$N" = 10000 ] && [ -n "$got" ] && [ "$(norm "$got")" = "$(norm "$want")" ]; } \
+    || refuse "bound shape: a bound batch runs N=10000 with arms {$want} (the registered V3 shape; frame arm ${frame:-unregistered}); this one is N=$N arms '${got:-the probe default}'"
+  shape="bound V3: N=10000, $want"
+else
+  shape="smoke: N=$N arms ${args[*]:-default}"
+fi
 if [ "${V3_REQUIRE_T3:-}" = 1 ]; then
   tj=$(python3 -B "$GATE" t3pre) || refuse "V3_REQUIRE_T3=1 and the registered T3 preconditions do not hold: $tj"
 fi
@@ -87,7 +108,7 @@ python3 -B "$BLK" start "$BLKD" > /dev/null || { rm -f "$TMP"; rm -rf "$BLKD"; r
 # a killed run.sh must not leave the tracefs instance tracing (fresh review B-L6)
 stopped=0
 trap '[ "$stopped" = 1 ] || python3 -B "$BLK" stop "$BLKD" > /dev/null 2>&1' EXIT
-env -u V3FLOOR_FIRECHECK "$BIN" --dir "$DIR" --out "$OUT" --n "$N" "${args[@]}"
+env -u V3FLOOR_FIRECHECK "$BIN" --dir "$DIR" --out "$OUT" --n "$N" "${args[@]}" --plp "$V3_PLP" --registered "$REG"
 prc=$?
 python3 -B "$BLK" stop "$BLKD" > /dev/null
 brc=$?
@@ -99,11 +120,16 @@ if [ -d "$OUT" ]; then
   python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json"
   src=$?
   if [ -f "$OUT/raw.tsv" ]; then
-    python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
+    ppid=$(python3 -B -c 'import json, sys; print(int(json.load(open(sys.argv[1]))["pid"]))' "$OUT/summary.json" 2>/dev/null)
+    if [ -n "$ppid" ]; then
+      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" --pid "$ppid" > "$OUT/blkflush/report.json"
+    else
+      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
+    fi
     rrc=$?
   fi
-  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\n' \
-    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" > "$OUT/binary.txt"
+  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\nplp=%s\nshape=%s\n' \
+    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" "$V3_PLP" "$shape" > "$OUT/binary.txt"
   if [ -f "$OUT/summary.json" ]; then
     if [ "$mode" = bound ]; then
       python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" "$V3_FIRECHECK_VERDICT"

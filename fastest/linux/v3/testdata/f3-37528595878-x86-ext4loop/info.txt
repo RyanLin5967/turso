@@ -105,3 +105,6 @@ chattr_dir=/mnt/fastest-v3-ext4loop/v3chattr-work --S-----------e------- /mnt/fa
 ficlone_ioctl_index=5
 ldso_preload_after=
 t3_rule_holds=0
+plp=no
+leafdisk=nvme0n1 write_cache=[write back] scsi=0
+box=virt=vm,flip=yes,plp=no
