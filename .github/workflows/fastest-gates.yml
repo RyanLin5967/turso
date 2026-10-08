@@ -1,0 +1,172 @@
+name: fastest-gates
+# Lane fastest-linux: the engine lane's correctness gates on Linux -- the four branch:: suite arms,
+# the C1 SIGKILL fire-checks with simulated power loss, E3 and C0 -- on ubuntu x86_64 and arm64,
+# each on ext4 (the runner's own), XFS and btrfs (loop devices), with a hardware record per job.
+# Smoke sizes until the lead registers PREREG v1 + T3; nothing here is timed or credited.
+# Raw output is uploaded per job (artifact gates-<runner>-<fs>).
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "run_gates.sh steps, in order"
+        default: "list scope suite fc e3 c0"
+      c0_ops:
+        default: "20000"
+      e3_trials:
+        default: "100"
+      fc_scale:
+        description: "multiplier on every C1 fire-check's trial count"
+        default: "1"
+  push:
+    branches: [fastest-branching]
+    paths:
+      - "core/**"
+      - "Cargo.lock"
+      - "fastest/linux/gates/**"
+      - "fastest/linux/hw/**"
+      - "fastest/linux/fs/**"
+      - ".github/workflows/fastest-gates.yml"
+
+concurrency:
+  group: fastest-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build:
+    name: build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (rust-toolchain.toml pins it)
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup show active-toolchain || rustup toolchain install
+          rustc -Vv
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fastest-gates-v1
+          shared-key: ${{ matrix.runner }}
+          cache-on-failure: true
+      - name: Build the turso_core lib test binary (debug, as the engine lane runs its gates)
+        run: |
+          set -o pipefail
+          mkdir -p dist
+          timeout 6000 cargo test -p turso_core --lib --no-run --locked --message-format=json \
+            > dist/build.json 2> dist/build.stderr || { tail -50 dist/build.stderr; exit 1; }
+          exe=$(python3 fastest/linux/gates/find_test_exe.py dist/build.json) || exit 1
+          cp "$exe" dist/turso_core-lib-test
+          { echo "git_sha=$GITHUB_SHA"; echo "runner=${{ matrix.runner }}"; echo "image=${ImageOS:-?} ${ImageVersion:-?}";
+            rustc -V; sha256sum dist/turso_core-lib-test; } | tee dist/build-info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turso-core-lib-test-${{ matrix.runner }}
+          path: |
+            dist/turso_core-lib-test
+            dist/build-info.txt
+            dist/build.stderr
+          retention-days: 30
+
+  release:
+    name: release build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (rust-toolchain.toml pins it)
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fastest-release-v1
+          shared-key: ${{ matrix.runner }}
+          cache-on-failure: true
+      - name: Build the engine in release (turso_core and its branch example drivers)
+        run: |
+          set -o pipefail
+          mkdir -p dist
+          timeout 6000 cargo build --release --locked -p turso_core --examples 2> dist/release.stderr \
+            || { tail -50 dist/release.stderr; exit 1; }
+          for e in core/examples/*/; do n=$(basename "$e"); cp "target/release/examples/$n" dist/ ; done
+          { echo "git_sha=$GITHUB_SHA"; echo "runner=${{ matrix.runner }}"; rustc -V;
+            (cd dist && sha256sum branch_*); } | tee dist/release-info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-release-${{ matrix.runner }}
+          path: dist/
+          retention-days: 30
+
+  gates:
+    name: gates (${{ matrix.runner }}, ${{ matrix.fs }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        fs: [ext4, xfs, btrfs]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    env:
+      MNT: /mnt/fastest-${{ matrix.fs }}
+      RAW: ${{ github.workspace }}/fastest-raw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: turso-core-lib-test-${{ matrix.runner }}
+          path: dist
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xfsprogs btrfs-progs fio strace
+      - name: Filesystem under test
+        run: |
+          mkdir -p "$RAW"
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME"; cat dist/build-info.txt; } > "$RAW/run-info.txt"
+          bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 16G 2>&1 | tee "$RAW/mkloop.txt"
+      - name: Hardware record (fio on the filesystem under test)
+        run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
+      - name: Gates
+        env:
+          TMPDIR: /mnt/fastest-${{ matrix.fs }}/tmp
+          GATE_STEPS: ${{ inputs.steps || 'list scope suite fc e3 c0' }}
+          GATE_C0_OPS: ${{ inputs.c0_ops || '20000' }}
+          GATE_E3_TRIALS: ${{ inputs.e3_trials || '100' }}
+          GATE_FC_SCALE: ${{ inputs.fc_scale || '1' }}
+        run: |
+          chmod +x dist/turso_core-lib-test
+          bash fastest/linux/gates/run_gates.sh dist/turso_core-lib-test "$RAW/gates" core
+      - name: Upload raw
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gates-${{ matrix.runner }}-${{ matrix.fs }}
+          path: fastest-raw/
+          retention-days: 90
