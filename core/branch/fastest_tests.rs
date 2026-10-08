@@ -5480,6 +5480,32 @@ fn a_failed_wal_sync_with_nothing_undrained_leaves_a_d2_store_running() {
     }
 }
 
+/// Engine review 10 #6: a raised D0 store relies on its Releases being durable before a trunk
+/// commit (the barrier asks for max(store class, trunk class)), and they are at best plain-fsynced
+/// (a settle, a rewrite): on Apple not drained. A failed drain of the device then may lose a
+/// Release the next commit promotes as durable, so the store fail-stops; the at-risk test counted
+/// undrained records only in a store whose own class syncs. Raised outside a flight, as a failed
+/// trunk WAL F_FULLFSYNC raises it. Mutant `drain_risk_by_store_class`.
+#[test]
+fn a_failed_drain_fail_stops_a_raised_d0_store_with_an_undrained_release() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _trunk, x, _slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("d0-drain.db"), catalog, false);
+        x.reap().unwrap();
+        assert!(db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the log is raised");
+        db.connect()
+            .unwrap()
+            .fork_branch()
+            .unwrap_or_else(|e| panic!("catalog={catalog}: premise: the store runs before the failed drain: {e}"));
+        db.branches.trunk_wal_sync_failed(true);
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("catalog={catalog}: the next fork after a failed drain of an undrained Release"),
+        );
+    }
+}
+
 // ---- engine review 9 #3: a flush under the store mutex honours a refused landing ----
 
 /// Engine review 9 #3: a flush made under the store mutex (`flush_locked`: a lease, an expiry, a
