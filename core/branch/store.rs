@@ -2649,7 +2649,8 @@ fn run_flight(
             )
             .and_then(|()| {
                 if cap.settle_arena {
-                    BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync)
+                    BranchStore::settle_ordered(&group, cap.deferred_lsn)
+                        .and_then(|()| BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
                 } else {
                     Ok(())
                 }
@@ -4140,6 +4141,41 @@ impl BranchStore {
             }
             group.land(end, flight_class, true, confirm);
             kill_point("flight.landed");
+        }
+    }
+
+    /// A raised D0 store's fuzzy checkpoint, once what its capture covers is written (engine
+    /// review 11 MED 8): an ORDERED flight carrying records the capture covers is acknowledged
+    /// only once its trunk commit's WAL F_FULLFSYNC returns (`trunk_wal_synced`), so its callers
+    /// may still be told they failed, and the catalog must not hold their records before that
+    /// (review 4 #1). While such a flush is still to come (`pending_full`), this waits for it and
+    /// leads nothing: it lands, or it fails and fail-stops the store, which refuses the commit. An
+    /// ordered flight whose flush will not come (its commit ended without one) is left to the
+    /// waiters it covers, which lead their own flush. The wait is bounded as a rider's is
+    /// (`pending_full_wait`): the trunk commit can itself be waiting on this checkpoint's install
+    /// (`Backpressure`, after its barrier), so past the bound the checkpoint fails, which releases
+    /// that wait, and a later one retries. Mutant `settle_ignores_ordered` (test builds only): no
+    /// wait, as before.
+    fn settle_ordered(group: &Group, lsn: u64) -> Result<()> {
+        if fe_mutant("settle_ignores_ordered") {
+            return Ok(());
+        }
+        let full = class_index(SyncClass::FullFsync);
+        let started = Instant::now();
+        let mut g = group.lock();
+        loop {
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if g.durable[full] >= lsn.min(g.ordered) || g.pending_full.is_none() {
+                return Ok(());
+            }
+            let Some(left) = pending_full_wait().checked_sub(started.elapsed()) else {
+                return Err(LimboError::Busy);
+            };
+            #[cfg(test)]
+            note_wait();
+            g = group.cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
