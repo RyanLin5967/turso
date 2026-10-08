@@ -1875,6 +1875,11 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
         LimboError::ParseError(m)
+            if m.starts_with("could not determine data type of parameter") =>
+        {
+            "42P18"
+        }
+        LimboError::ParseError(m)
             if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
         {
             "42702"
