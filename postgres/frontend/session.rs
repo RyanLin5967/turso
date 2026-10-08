@@ -1445,7 +1445,11 @@ mod tests {
             ("SELECT turso_branch_create($000001)", 1),
         ] {
             assert_eq!(branch_call(sql), call(create, vec![Param(n)]), "{sql:?}");
-            assert_eq!(slow(sql), call(create, vec![Param(n)]), "libpg_query, {sql:?}");
+            assert_eq!(
+                slow(sql),
+                call(create, vec![Param(n)]),
+                "libpg_query, {sql:?}"
+            );
         }
     }
 
