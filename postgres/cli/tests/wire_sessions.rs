@@ -3923,6 +3923,65 @@ fn a_parameter_against_an_array_column_takes_its_element_type() {
     }
 }
 
+/// An array parameter is read at Bind as PostgreSQL's array_in reads it, each element by the array's
+/// element type: bool[] '{t}' is {true}, text[] '{1,2}' is two texts, a quoted element keeps its
+/// comma, NULL is NULL, and an element its type cannot read ('1.0' for int4) is 22P02. The text was
+/// bound as is and the engine guessed each element's type from its spelling (an integer, then a
+/// float, then text), so '{t}' matched no true row, '{1,2}' no text '1', and int4 '{1.0}' matched 1
+/// (wire review 10 item 4).
+#[test]
+fn an_array_parameter_is_read_by_its_element_type() {
+    let dir = Scratch::new("arrayparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE b(id INT PRIMARY KEY, flag BOOLEAN, v TEXT)")
+        .ok("b");
+    a.q("INSERT INTO b VALUES (1, true, '1'), (2, false, '007'), (3, false, 'x,y')")
+        .ok("rows");
+    for (sql, value, want) in [
+        (
+            "SELECT id FROM b WHERE flag = ANY($1) ORDER BY id",
+            "{t}",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM b WHERE v = ANY($1) ORDER BY id",
+            "{1,2}",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM b WHERE v = ANY($1) ORDER BY id",
+            "{007}",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM b WHERE v = ANY($1) ORDER BY id",
+            "{\"x,y\", NULL}",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM b WHERE id = ANY($1) ORDER BY id",
+            "{ 1 , 3 }",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM b WHERE id = ANY($1) ORDER BY id",
+            "{}",
+            vec![],
+        ),
+    ] {
+        let r = a.xt(sql, &[(0, 0, value.as_bytes())]).ok(sql);
+        let got: Vec<String> = r.rows.iter().map(|row| row[0].clone().unwrap()).collect();
+        assert_eq!(got, want, "{sql} with {value}");
+    }
+    for value in ["{1.0}", "{1,x}", "1,2", "{1,2"] {
+        let sql = "SELECT id FROM b WHERE id = ANY($1)";
+        let r = a.xt(sql, &[(0, 0, value.as_bytes())]);
+        assert_eq!(r.err(value).code, "22P02", "{value}");
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    }
+}
+
 /// An undeclared parameter is typed by every context PostgreSQL types it by, so a value sent as
 /// text compares as PostgreSQL compares it: a scalar function's result (length() is int4), COALESCE,
 /// CASE, a scalar subquery and sum() take their arms' or arguments' types; a bare $n in WHERE or OR
