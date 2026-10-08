@@ -4950,6 +4950,40 @@ fn set_operations_keep_their_grouping_and_clauses() {
     }
 }
 
+/// DELETE ... USING ... RETURNING that names a USING relation, or returns `*`, is refused (0A000)
+/// and deletes nothing: the delete returns only its target's columns, so `RETURNING k.flag` was
+/// 42703 and `RETURNING *` lacked the USING columns PostgreSQL returns (wire review 11 item 13). A
+/// RETURNING over the target's own columns runs.
+#[test]
+fn delete_using_returning_a_using_column_is_refused() {
+    let dir = Scratch::new("deleteusingret");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b')").ok("d rows");
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true)").ok("k row");
+    for sql in [
+        "DELETE FROM d USING k WHERE d.id = k.id RETURNING k.flag",
+        "DELETE FROM d USING k AS j WHERE d.id = j.id RETURNING d.v, j.*",
+        "DELETE FROM d USING k WHERE d.id = k.id RETURNING *",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+        assert_eq!(
+            a.q("SELECT count(*) FROM d").single(sql),
+            "2",
+            "{sql}: nothing deleted"
+        );
+    }
+    let r = a
+        .q("DELETE FROM d USING k WHERE d.id = k.id RETURNING d.id, v")
+        .ok("the target's columns");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("2".to_string()), Some("b".to_string())]]
+    );
+}
+
 /// DELETE ... USING reads its target and its USING items in ONE namespace, as PostgreSQL does: an
 /// unqualified name both have is ambiguous (42702) and nothing is deleted, and the target named
 /// again in USING is 42712 ("table name specified more than once"). Translated as EXISTS over the
