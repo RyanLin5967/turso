@@ -1702,12 +1702,17 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // Flatten the left-deep tree of set operations into a list.
-        // pg_query represents A UNION B UNION C as:
-        //   SetOp(SetOp(A, B), C)
+        // The left spine of the tree flattens into a list the engine runs left to right, which is
+        // PostgreSQL's order for it: pg_query represents A UNION B UNION C, and A INTERSECT B UNION
+        // C, as SetOp(SetOp(A, B), C). Anything else is an arm of its own, a subquery
+        // `SELECT * FROM (...)`: a set operation as a right arm (INTERSECT binding tighter than
+        // UNION, `A UNION (B UNION C)`), and an arm with its own ORDER BY, LIMIT, OFFSET or WITH.
+        // Flattened, `SELECT 1 UNION SELECT 2 INTERSECT SELECT 2` ran as (1 UNION 2) INTERSECT 2,
+        // and an arm's clauses were dropped (wire review 7 items 1 and 2).
         let mut parts: Vec<(
             Option<ast::CompoundOperator>,
             &pg_query::protobuf::SelectStmt,
+            bool,
         )> = Vec::new();
         Self::flatten_set_operation(select, &mut parts);
 
@@ -1716,25 +1721,28 @@ impl PostgreSQLTranslator {
         }
 
         // First part becomes the primary select
-        let (_, first_stmt) = &parts[0];
-        let first_select = self.translate_one_select(first_stmt)?;
+        let (_, first_stmt, wrap) = &parts[0];
+        let first_select = self.translate_set_arm(first_stmt, *wrap)?;
 
         // Remaining parts become compounds
         let mut compounds = Vec::new();
-        for (op, stmt) in parts.iter().skip(1) {
+        for (op, stmt, wrap) in parts.iter().skip(1) {
             let operator =
                 op.ok_or_else(|| ParseError::ParseError("Missing compound operator".to_string()))?;
             compounds.push(ast::CompoundSelect {
                 operator,
-                select: self.translate_one_select(stmt)?,
+                select: self.translate_set_arm(stmt, *wrap)?,
             });
         }
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        // The whole set operation's WITH, in scope for every arm (it was dropped, so a CTE named
+        // like a table read the table).
+        let with = self.translate_with_clause(&select.with_clause)?;
 
         Ok(ast::Select {
-            with: None,
+            with,
             body: ast::SelectBody {
                 select: first_select,
                 compounds,
@@ -1744,11 +1752,50 @@ impl PostgreSQLTranslator {
         })
     }
 
+    /// One arm of a flattened set operation: a plain SELECT, or (`wrap`) a subquery
+    /// `SELECT * FROM (<arm>)` keeping the arm's own grouping and clauses.
+    fn translate_set_arm(
+        &self,
+        stmt: &pg_query::protobuf::SelectStmt,
+        wrap: bool,
+    ) -> Result<ast::OneSelect, ParseError> {
+        if !wrap {
+            return self.translate_one_select(stmt);
+        }
+        let select = self.translate_select(stmt)?;
+        Ok(ast::OneSelect::Select {
+            distinctness: None,
+            columns: vec![ast::ResultColumn::Star],
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select(select, None)),
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: None,
+            window_clause: vec![],
+        })
+    }
+
+    /// Whether a set operation's arm is one the engine can run in place in the flattened list: no
+    /// ORDER BY, LIMIT, OFFSET or WITH of its own, and (`left`) a nested set operation only on the
+    /// left spine.
+    fn arm_in_place(stmt: &pg_query::protobuf::SelectStmt, left: bool) -> bool {
+        use pg_query::protobuf::SetOperation;
+        let set_op = stmt.op();
+        let is_set_op = set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined;
+        let own_clauses = !stmt.sort_clause.is_empty()
+            || stmt.limit_count.is_some()
+            || stmt.limit_offset.is_some()
+            || stmt.with_clause.is_some();
+        !own_clauses && (left || !is_set_op)
+    }
+
     fn flatten_set_operation<'a>(
         stmt: &'a pg_query::protobuf::SelectStmt,
         parts: &mut Vec<(
             Option<ast::CompoundOperator>,
             &'a pg_query::protobuf::SelectStmt,
+            bool,
         )>,
     ) {
         use pg_query::protobuf::SetOperation;
@@ -1756,7 +1803,7 @@ impl PostgreSQLTranslator {
         let set_op = stmt.op();
         if set_op == SetOperation::SetopNone || set_op == SetOperation::Undefined {
             // Leaf select
-            parts.push((None, stmt));
+            parts.push((None, stmt, false));
             return;
         }
 
@@ -1769,12 +1816,20 @@ impl PostgreSQLTranslator {
         };
 
         if let Some(larg) = &stmt.larg {
-            Self::flatten_set_operation(larg, parts);
+            if Self::arm_in_place(larg, true) {
+                Self::flatten_set_operation(larg, parts);
+            } else {
+                parts.push((None, larg, true));
+            }
         }
         if let Some(rarg) = &stmt.rarg {
             // The first element pushed from rarg gets the operator
             let prev_len = parts.len();
-            Self::flatten_set_operation(rarg, parts);
+            if Self::arm_in_place(rarg, false) {
+                Self::flatten_set_operation(rarg, parts);
+            } else {
+                parts.push((None, rarg, true));
+            }
             if parts.len() > prev_len {
                 parts[prev_len].0 = Some(operator);
             }
