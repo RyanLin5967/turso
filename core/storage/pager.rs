@@ -3365,6 +3365,7 @@ impl Pager {
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
+                        crate::branch::store::pause_schema_publish();
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }

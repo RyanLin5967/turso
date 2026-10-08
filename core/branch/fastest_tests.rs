@@ -5641,3 +5641,58 @@ fn a_sharp_checkpoint_whose_cut_fails_still_acknowledges_what_it_committed() {
     assert!(got.is_ok(), "a fork the checkpoint's catalog commit made durable was reported failed: {:?}", got.err());
     assert_fail_stopped(trunk.fork_branch().map(|x| x.into_id()), "the next fork after the failed cut");
 }
+
+// ---- engine 2b: a trunk fork inside a DDL commit's schema window ----
+
+/// Clears `store::SCHEMA_PUBLISH_HOLD` when dropped, so a failed assertion releases the DDL commit.
+struct SchemaPublishDisarm;
+
+impl Drop for SchemaPublishDisarm {
+    fn drop(&mut self) {
+        super::store::SCHEMA_PUBLISH_HOLD.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Engine 2b (lead ruling 2026-10-08; fastest-linux C0 run 37518195105: 24 of 1,440 creates;
+/// fastest-wire's branch_creates_racing_trunk_ddl_all_succeed: XX000): a DDL commit publishes its
+/// pages, with the new schema cookie, before it publishes its schema (`Pager::commit_tx`). A trunk
+/// fork in that window found neither its connection's schema nor the shared one at the cookie its
+/// snapshot reads, and returned SchemaUpdated for the caller to retry. The fork must succeed, with
+/// the schema its pages need: on its first-child path (under the WAL write lock) and lock-free.
+/// Mutant `fork_refuses_schema_window`.
+#[test]
+fn a_trunk_fork_inside_a_ddl_commits_schema_window_succeeds() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for (catalog, first) in [(false, true), (false, false), (true, true), (true, false)] {
+        let what = format!("catalog={catalog} first={first}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("schema-window.db"), opts(catalog, SyncClass::Fsync));
+        let ddl = db.connect().unwrap();
+        seed(&ddl);
+        let forker = db.connect().unwrap();
+        // A live child already: the fork registers lock-free. None: it is the trunk's first child.
+        let _live = (!first).then(|| forker.fork_branch().unwrap().into_id());
+        let _disarm = SchemaPublishDisarm;
+        super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+        let alter = std::thread::spawn(move || {
+            ddl.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7").map(|_| ())
+        });
+        let t = std::time::Instant::now();
+        while super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "{what}: premise: the DDL commit never reached its schema publication");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let name = format!("window-{catalog}-{first}");
+        let forked = forker.create_branch(&name);
+        super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+        alter.join().unwrap().unwrap();
+        forked.unwrap_or_else(|e| panic!("{what}: a fork inside a DDL commit's schema window failed: {e}"));
+        let branch = db.connect_named(&name).unwrap();
+        let rows = branch
+            .prepare("SELECT c FROM t WHERE id = 1")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| panic!("{what}: the branch's schema is not the one its pages need: {e}"));
+        assert_eq!(rows[0][0].as_int(), Some(7), "{what}: the branch read the new column wrong");
+    }
+}
