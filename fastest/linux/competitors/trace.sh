@@ -174,13 +174,15 @@ task_check() {
 }
 
 tracer_sample() { # tracer_sample PHASE PID... -> "PHASE pid tid tracerpid" for every live task of each PID
-  local ph=$1 p t tp
+  # Builtins only (no fork per task), since it also runs beside a TIMED run.
+  local ph=$1 p t k v
   shift
   for p in "$@"; do
     for t in /proc/"$p"/task/*; do
       [ -e "$t" ] || continue
-      tp=$(awk '/^TracerPid:/ {print $2}' "$t/status" 2>/dev/null)
-      [ -n "$tp" ] && echo "$ph $p ${t##*/} $tp"
+      while read -r k v _; do
+        [ "$k" = TracerPid: ] && { echo "$ph $p ${t##*/} $v"; break; }
+      done 2>/dev/null <"$t/status"
     done
   done
   return 0

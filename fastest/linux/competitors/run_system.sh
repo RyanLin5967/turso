@@ -200,12 +200,16 @@ timed_run() {
   "$@" >"$out.txt" 2>&1 &
   pid=$!
   { tracer_sample start "$pid"; tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
+  # CMD's latest sample, every 0.5 s while it runs: builtins and a redirection only (one `sleep` fork per sample),
+  # so the sampler adds no measurable load beside the timed run.
+  : >"$out.tracer.last"
   while kill -0 "$pid" 2>/dev/null; do
-    last=$(tracer_sample end "$pid")
-    sleep 0.05
+    tracer_sample end "$pid" >"$out.tracer.last.new" && mv -f "$out.tracer.last.new" "$out.tracer.last"
+    sleep 0.5
   done
   wait "$pid" || rc=$?
-  { [ -n "$last" ] && printf '%s\n' "$last"; tracer_sample end $(server_tree "$spid"); } >>"$out.tracer.tsv"
+  { cat "$out.tracer.last"; tracer_sample end $(server_tree "$spid"); } >>"$out.tracer.tsv"
+  rm -f "$out.tracer.last" "$out.tracer.last.new"
   echo "$rc" >"$out.rc"
   cat "$out.txt"
   return $rc
