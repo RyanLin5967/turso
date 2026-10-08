@@ -351,6 +351,9 @@ def self_test():
                   {g: v for g, _, _, v in rows}.get("budget-syscalls/full-snap-c1") == "FAIL" and regression_green(rows)))
     rows = gates({"full-snap-c1": arm_of(trace(2), 20)}, None, budget, None)
     cases.append(("a flush-budget FAIL makes regression_green false", not regression_green(rows)))
+    rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
+    cases.append(("review L3: no base (syscalls-vs-base and instructions not evaluated) makes regression_green false",
+                  not regression_green(rows)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
@@ -358,11 +361,14 @@ def self_test():
 
 
 def regression_green(rows):
-    """Every gate but the absolute syscall budget passes. That budget is red at 675adbfb3 (10 per create) and
-    stays red until the engine meets it; if it blocked the baseline, no run would ever be green, and the
-    instruction and syscalls-vs-base regression gates would have no base at all. So the baseline advances on
-    regression-green runs while the job stays red (PROFILE.md)."""
-    return not [r for r in rows if r[3] == "FAIL" and not r[0].startswith("budget-syscalls/")]
+    """Every gate but the absolute syscall budget passes, AND the two regression gates were actually evaluated
+    (gate-6 review L3: a run with every row INFO or a base that failed to build must not advance the baseline).
+    The absolute budget is red at 675adbfb3 (10 per create) and stays red until the engine meets it; if it blocked
+    the baseline, no run would ever be green, and the instruction and syscalls-vs-base regression gates would have
+    no base at all. So the baseline advances on regression-green runs while the budget job stays red (PROFILE.md)."""
+    v = {g: verdict for g, _, _, verdict in rows}
+    evaluated = v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") == "PASS"
+    return evaluated and not [r for r in rows if r[3] == "FAIL" and not r[0].startswith("budget-syscalls/")]
 
 
 def main(argv):
@@ -414,7 +420,7 @@ def main(argv):
         print("\t".join(r))
     rg = regression_green(rows)
     open(os.path.join(out, "regression_green"), "w").write("1\n" if rg else "0\n")
-    print(f"analyze: regression_green={int(rg)} (every gate but budget-syscalls/*)")
+    print(f"analyze: regression_green={int(rg)} (every gate but budget-syscalls/*, and both regression gates evaluated)")
     fails = [r for r in rows if r[3] == "FAIL"]
     counted = [r for r in rows if r[3] in ("PASS", "FAIL")]
     if not counted:

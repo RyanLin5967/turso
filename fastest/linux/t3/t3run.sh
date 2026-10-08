@@ -2,8 +2,8 @@
 # ONE-COMMAND T3 RUNNER (FASTEST T3-READY gate item 6): a fresh Ubuntu 24.04 box -> finished raws.
 #
 #   curl -sSfL https://raw.githubusercontent.com/RyanLin5967/turso/<SHA>/fastest/linux/t3/t3run.sh \
-#     | bash -s -- --sha <SHA> --out ~/t3-out [--dry-run [--block loop|brd] [--plant NAME]] \
-#                  [--manifest <path in repo>] [--fs "xfs btrfs"] [--device /dev/nvmeXnY --destroy /dev/nvmeXnY] [--seed N]
+#     | bash -s -- --sha <SHA> --out ~/t3-out [--dry-run [--block loop|brd] [--plant NAME] [--fs "xfs btrfs"]] \
+#                  [--manifest <path in repo>] [--device /dev/nvmeXnY --destroy /dev/nvmeXnY --plp yes|no] [--seed N]
 #
 # Run from outside a checkout, it clones github.com/RyanLin5967/turso at --sha into <out>.src and runs
 # its own copy from there, so the script, the engine, the tools and the cell manifest are all one commit.
@@ -20,8 +20,11 @@
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, V3L BEFORE, every manifest cell for
 #              that fs in a seeded shuffle (each with the foreign-CPU sampler and its void decision made before
 #              any result of the cell is read; a void run is replaced once, at most twice per cell), V3L AFTER,
-#              a V3 batch AFTER. A V3 batch with rc != 0 or without summary.json and raw.tsv, and a V3L that is
-#              not VALID (v3l.py: VOID voids the block), fail the stage (review 2 items 5 and 6).
+#              a V3 batch AFTER. Each batch is judged by blockgate.py (review 2 item 5, ruling A14), and the A14
+#              plants run on copies of the BEFORE batch's real record; a batch blockgate fails, a plant that does
+#              not fire, or a V3L that is not VALID (v3l.py) fails the block's stage (items 5 and 6). A failed block
+#              is recorded, its filesystem torn down, and the NEXT block runs (gate-6 review H1: one block's void
+#              must not lose the rest of a rental); the run exits 1 at the end.
 #   package    <out>.tar.gz + SHA256SUMS + summary.json (stages, blocks with their V3/V3L records, cells,
 #              verdicts, wall time)
 #
@@ -31,19 +34,27 @@
 #                                     loop, as a rental's data disk; brd is fire-check only, so its V3 batches run
 #                                     V3_SMOKE=1 (run.sh's bound mode refuses brd)
 #   real run                          <fs> on --device, V3 batches bound to the block's fire-check verdict, with
-#                                     V3_REQUIRE_T3=1 (the governor is set to performance in deps)
+#                                     V3_REQUIRE_T3=1 (the governor is set to performance in deps, and the T3
+#                                     preconditions are checked there, before the build is paid for: review L1);
+#                                     --plp yes|no is required: the operator's declaration of power-loss protection
+#                                     (a fact of the rental), which puts the drive in A14's "no volatile cache" class
 # Modes. --dry-run: smoke manifest allowed, loop or brd filesystems, the root remounted with barrier, results
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
 #   v3l-fsync-half      the BEFORE V3L's fio syncs every 2nd write (V3L_PLANT=fsync2: V1L and fio must VOID it)
+#   v3l-wt-layer        the block's loop is set to write through before V3L BEFORE: fsyncs stop reaching the drive,
+#                       and the drive's flush counter gate must VOID it (review M3, forced on real hardware)
+# A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
-# name the same unmounted block device that is not the root disk, and every target mounts with barriers.
+# name the same device and devguard.py allows it (an allowlist: a whole NVMe/SCSI/virtio disk, not the root disk,
+# nothing mounted or held; review M4), --plp is given, --fs is not (the manifest names the blocks; review M5), and
+# every target mounts with barriers.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18).
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
-SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT=""
+SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP=""
 while [ $# -gt 0 ]; do
   case $1 in
     --sha) SHA=$2; shift ;;
@@ -56,6 +67,7 @@ while [ $# -gt 0 ]; do
     --seed) SEED=$2; shift ;;
     --block) BLOCK=$2; shift ;;
     --plant) PLANT=$2; shift ;;
+    --plp) PLP=$2; shift ;;
     *) echo "t3run: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
@@ -79,19 +91,23 @@ if [ -z "${T3RUN_INSIDE:-}" ]; then
   T3RUN_INSIDE=1 exec bash "$SRC/fastest/linux/t3/t3run.sh" --sha "$SHA" --out "$OUT" \
     $([ $DRY = 1 ] && echo --dry-run) ${MANIFEST:+--manifest "$MANIFEST"} ${FSLIST:+--fs "$FSLIST"} \
     ${DEVICE:+--device "$DEVICE"} ${DESTROY:+--destroy "$DESTROY"} --seed "$SEED" \
-    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"}
+    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"} ${PLP:+--plp "$PLP"}
 fi
 
 SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
 if [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
-  case $PLANT in ''|v3-verdict-missing|v3l-fsync-half) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
-  # brd batches are smoke (unbound), so a verdict plant there would plant nothing
-  [ "$PLANT:$BLOCK" != v3-verdict-missing:brd ] || { echo "t3run: REFUSED: plant v3-verdict-missing needs --block loop" >&2; exit 2; }
+  case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-wt-layer) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
+  # brd batches are smoke (unbound) and brd has no loop, so these plants would plant nothing there
+  case $PLANT:$BLOCK in v3-verdict-missing:brd|v3l-wt-layer:brd)
+    echo "t3run: REFUSED: plant $PLANT needs --block loop" >&2; exit 2 ;; esac
+  case ${PLP:=no} in no) ;; *) echo "t3run: REFUSED: --plp is for real runs (a dry run's drives are what they are)" >&2; exit 2 ;; esac
 else
   [ -z "$BLOCK" ] || { echo "t3run: REFUSED: --block is for dry runs; a real run uses --device" >&2; exit 2; }
   [ -z "$PLANT" ] || { echo "t3run: REFUSED: --plant is for dry runs only" >&2; exit 2; }
+  [ -z "$FSLIST" ] || { echo "t3run: REFUSED: --fs is for dry runs; a real run runs every block its manifest names" >&2; exit 2; }
+  case $PLP in yes|no) ;; *) echo "t3run: REFUSED: a real run needs --plp yes|no (the drive's power-loss protection, per the rental)" >&2; exit 2 ;; esac
   BLOCK=device
 fi
 [ -z "$MANIFEST" ] && MANIFEST=fastest/linux/t3/cells-smoke.tsv
@@ -104,7 +120,7 @@ DIST=$OUT/dist
 mkdir -p "$DIST" "$OUT/cells"
 exec > >(tee -a "$OUT/t3run.log") 2>&1
 echo "# t3run sha=$SHA src=$SRC out=$OUT dry=$DRY block=$BLOCK plant=${PLANT:-none} manifest=$MANIFEST seed=$SEED start=$(date -u +%FT%TZ)"
-printf 'dry=%s\nblock=%s\nplant=%s\n' "$DRY" "$BLOCK" "$PLANT" > "$OUT/mode.txt"
+printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" > "$OUT/mode.txt"
 
 stage() { # stage <name> <function>: time it, record rc; a failed stage ends the run (rc 1)
   local name=$1 s e rc
@@ -137,15 +153,20 @@ finish() {
 
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
-NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py hw/record.sh fs/mkloop.sh
+NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   v3/v3floor.c v3/statfs_shim.c v3/v3cell.py v3/firecheck.sh v3/run.sh v3/mkfixtures.sh v3/mkbrd.sh v3/check.py
   v3/batchgate.py v3/blkflush.py v3/stamp.py"
 preflight() {
   [ -f "$MAN" ] || { echo "no manifest $MAN"; return 2; }
-  local f miss=""
-  for f in $NEEDS; do [ -f "$L/$f" ] || miss="$miss fastest/linux/$f"; done
-  [ -z "$miss" ] || { echo "REFUSED: this commit lacks files the run calls:$miss"; return 2; }
+  # the files the run calls must be in the COMMIT (review M8: an untracked leftover satisfied a disk check), and
+  # the tree they run from must be that commit, unmodified
+  local f miss="" head dirty
+  head=$(git -C "$SRC" rev-parse HEAD) || { echo "REFUSED: $SRC is not a git checkout"; return 2; }
+  for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
+  [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
+  dirty=$(git -C "$SRC" status --porcelain --untracked-files=all -- fastest .github)
+  [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head under fastest/ or .github/: $dirty"; return 2; }
   grep -q 'Ubuntu 24' /etc/os-release || { echo "not Ubuntu 24.04"; return 2; }
   sudo -n true || { echo "needs passwordless sudo"; return 2; }
   local msha; msha=$(sha256sum "$MAN" | cut -c1-64)
@@ -158,10 +179,7 @@ preflight() {
     [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
-    case $(basename "$DEVICE") in loop*|ram*|zram*) echo "REFUSED: $DEVICE is not a physical device"; return 2 ;; esac
-    if lsblk -n -o MOUNTPOINTS "$DEVICE" | grep -q .; then echo "REFUSED: $DEVICE (or a partition) is mounted"; return 2; fi
-    local rootdisk; rootdisk=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null)
-    [ "/dev/$rootdisk" != "$DEVICE" ] || { echo "REFUSED: $DEVICE holds the root filesystem"; return 2; }
+    python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -195,6 +213,8 @@ deps() {
       [ -e "$g" ] && echo performance | sudo tee "$g" > /dev/null
     done
     grep -H . /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > "$OUT/governors.txt" 2>&1 || true
+    # the registered T3 preconditions now, before the build and fire-checks are paid for (review L1)
+    python3 -B "$L/v3/batchgate.py" t3pre > "$OUT/t3pre.json" 2>&1 || { echo "T3 preconditions do not hold:"; cat "$OUT/t3pre.json"; return 1; }
   fi
   return 0
 }
@@ -221,8 +241,9 @@ hwid() { bash "$L/t3/hwid.sh" "$OUT/hwid" /; }
 V3FX=/mnt/t3-v3fx
 v3fixtures() { bash "$L/v3/mkfixtures.sh" "$V3FX" > "$OUT/v3fixtures.txt" 2>&1; }
 
-# One V3 batch of a block (review 2 item 5): rc != 0, or no summary.json or raw.tsv, fails the stage. The rc
-# goes to v3.rc whatever happens, so summarize.py reads every batch's outcome, including a refused one.
+# One V3 batch of a block, judged by blockgate.py (review 2 item 5, ruling A14). The rc goes to v3.rc whatever happens,
+# so summarize.py re-judges every batch, including a refused one. After the BEFORE batch the A14 plants run on
+# copies of its real record (blockgate.py plants): each of (a) and (b) must be decided as planted.
 v3batch() { # v3batch before|after DIR
   local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc
   local -a env=(V3_CELL="$V3CELL")
@@ -230,7 +251,7 @@ v3batch() { # v3batch before|after DIR
     env+=(V3_SMOKE=1 V3FLOOR_BRD=1)
   else
     local verdict=$o/v3-firecheck/verdict.json
-    [ "$PLANT:$when" = v3-verdict-missing:before ] && verdict=$o/v3-firecheck/planted-missing-verdict.json
+    [ "$PLANT_NOW:$when" = v3-verdict-missing:before ] && verdict=$o/v3-firecheck/planted-missing-verdict.json
     env+=(V3_FIRECHECK_VERDICT="$verdict")
     [ $DRY = 0 ] && env+=(V3_REQUIRE_T3=1)
   fi
@@ -238,16 +259,14 @@ v3batch() { # v3batch before|after DIR
   env "${env[@]}" timeout 1800 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" 200 > "$o/v3-$when.txt" 2>&1
   rc=$?
   echo "$when rc=$rc" >> "$o/v3.rc"
-  # brd only (dry runs): a VOID batch with complete raws is recorded, not a failed stage. brd has no drive, so the
-  # probe's timing control (fsync vs no-sync p50 ratio) cannot discriminate there: dry run 37517239631 read ow4k
-  # 9.5 against its threshold of 10 on xfs/brd. Every other block, and any other rc, keeps item 5's rule.
-  if [ $rc = 3 ] && [ "$BLOCK" = brd ] && [ -f "$o/v3-$when/summary.json" ] && [ -f "$o/v3-$when/raw.tsv" ]; then
-    echo "V3 $when batch on $V3CELL (brd): VOID recorded, not a stage failure (smoke; no drive behind brd)"
-    return 0
+  python3 -B "$L/t3/blockgate.py" batch "$o/v3-$when" "$rc" "$BLOCK" "$PLP" > "$o/v3-$when.blockgate.json"
+  local g=$?
+  echo "V3 $when batch on $V3CELL: rc $rc, blockgate $(cat "$o/v3-$when.blockgate.json")"
+  [ $g = 0 ] || { echo "V3 $when batch on $V3CELL FAILS its block (run.sh: $(tail -1 "$o/v3-$when.txt"))"; return 1; }
+  if [ "$when" = before ]; then
+    python3 -B "$L/t3/blockgate.py" plants "$o/v3-$when" "$rc" "$PLP" "$o/blockgate-plants.json" ||
+      { echo "A14 plants on $V3CELL: not every plant was decided as planted"; return 1; }
   fi
-  [ $rc = 0 ] || { echo "V3 $when batch on $V3CELL: rc $rc (run.sh: $(tail -1 "$o/v3-$when.txt"))"; return 1; }
-  [ -f "$o/v3-$when/summary.json" ] && [ -f "$o/v3-$when/raw.tsv" ] ||
-    { echo "V3 $when batch on $V3CELL: rc 0 but no summary.json or raw.tsv"; return 1; }
   return 0
 }
 
@@ -255,8 +274,15 @@ v3batch() { # v3batch before|after DIR
 v3l() { # v3l before|after MNT
   local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc
   local -a env=()
-  [ "$PLANT:$when" = v3l-fsync-half:before ] && env=(V3L_PLANT=fsync2)
-  env "${env[@]}" timeout 1800 python3 -B "$L/t3/v3l.py" measure "$mnt/v3l-$when" "$o/v3l-$when" > "$o/v3l-$when.txt" 2>&1
+  [ "$PLANT_NOW:$when" = v3l-fsync-half:before ] && env=(V3L_PLANT=fsync2)
+  if [ "$PLANT_NOW:$when" = v3l-wt-layer:before ]; then
+    local lo; lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
+    case $lo in loop*) echo "write through" | sudo tee "/sys/block/$lo/queue/write_cache" > /dev/null &&
+      echo "plant v3l-wt-layer: /sys/block/$lo/queue/write_cache = $(cat "/sys/block/$lo/queue/write_cache")" ;;
+      *) echo "plant v3l-wt-layer: $mnt is not on a loop ($lo)"; return 1 ;; esac
+  fi
+  env "${env[@]}" timeout 1800 python3 -B "$L/t3/v3l.py" measure "$mnt/v3l-$when" "$o/v3l-$when" \
+    "$o/v3-before/summary.json" > "$o/v3l-$when.txt" 2>&1
   rc=$?
   echo "$when rc=$rc" >> "$o/v3l.rc"
   [ $rc = 0 ] || { echo "V3L $when on $FS_NOW: rc $rc ($(tail -1 "$o/v3l-$when.txt"))"; return 1; }
@@ -265,7 +291,7 @@ v3l() { # v3l before|after MNT
 
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
-FS_NOW="" V3CELL=""
+FS_NOW="" V3CELL="" PLANT_NOW=""
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
   mkdir -p "$o"
@@ -309,10 +335,17 @@ fs_block() {
   done < "$o/plan.tsv"
   v3l after "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
-  local dev; dev=$(findmnt -n -o SOURCE "$mnt")
-  sudo umount "$mnt" || return 1
+  return 0
+}
+
+# After every block, passed or failed (review H1): unmount and detach, so the next block can make its filesystem.
+block_cleanup() {
+  local mnt=/mnt/t3-$FS_NOW dev back
+  findmnt -n "$mnt" > /dev/null 2>&1 || return 0
+  dev=$(findmnt -n -o SOURCE "$mnt")
+  sudo umount "$mnt" || sudo umount -l "$mnt" || { echo "cleanup: cannot unmount $mnt"; return 1; }
   case $BLOCK:$dev in loop:/dev/loop*)
-    local back; back=$(losetup -n -O BACK-FILE "$dev" | xargs)
+    back=$(losetup -n -O BACK-FILE "$dev" | xargs)
     sudo losetup -d "$dev" && sudo rm -f "$back" ;;
   esac
   return 0
@@ -369,9 +402,16 @@ stage build build
 stage hwid hwid
 stage v3fixtures v3fixtures
 selftests() {
-  python3 -B "$L/t3/foreign_cpu.py" self-test > "$OUT/foreign_cpu-selftest.txt" 2>&1 || return 1
-  python3 -B "$L/t3/v3l.py" self-test > "$OUT/v3l-selftest.txt" 2>&1 || return 1
-  python3 -B "$L/t3/summarize.py" self-test > "$OUT/summarize-selftest.txt" 2>&1
+  local t
+  for t in foreign_cpu v3l summarize blockgate devguard; do
+    python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
+  done
+  # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
+  local rd; rd=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1)
+  if [ -n "$rd" ] && python3 -B "$L/t3/devguard.py" check "/dev/$rd" > "$OUT/devguard-root.txt" 2>&1; then
+    echo "devguard ALLOWED the root disk /dev/$rd"; return 1
+  fi
+  return 0
 }
 stage selftests selftests
 if [ $DRY = 1 ]; then
@@ -381,7 +421,19 @@ fi
 printf 'fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n' > "$OUT/cells.tsv"
 [ -z "$FSLIST" ] && FSLIST=$(python3 -B "$L/t3/cells.py" fslist "$MAN")
 echo $FSLIST > "$OUT/fslist.txt"
+# Blocks (review H1): a failed block is recorded and torn down, and the next block runs; the run's rc is 1 at the end.
+BLOCKS_FAILED=0 BLOCKNO=0
 for FS_NOW in $FSLIST; do
-  stage "fs-$FS_NOW" fs_block
+  BLOCKNO=$((BLOCKNO + 1))
+  PLANT_NOW=""; [ $BLOCKNO = 1 ] && PLANT_NOW=$PLANT
+  s=$(date +%s)
+  echo "== stage fs-$FS_NOW $(date -u +%FT%TZ)${PLANT_NOW:+ (plant $PLANT_NOW)}"
+  fs_block
+  rc=$?
+  block_cleanup || rc=1
+  e=$(date +%s)
+  printf '%s\t%s\t%s\t%s\t%s\n' "fs-$FS_NOW" "$(date -u -d @"$s" +%FT%TZ)" "$(date -u -d @"$e" +%FT%TZ)" $((e - s)) $rc >> "$STAGES"
+  [ $rc = 0 ] || { echo "t3run: block fs-$FS_NOW FAILED rc=$rc; the next block runs"; BLOCKS_FAILED=$((BLOCKS_FAILED + 1)); }
 done
-finish 0
+[ $BLOCKS_FAILED = 0 ] && finish 0
+finish 1

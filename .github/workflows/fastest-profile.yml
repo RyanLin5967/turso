@@ -8,9 +8,10 @@ name: fastest-profile
 #   - instructions per create (callgrind) <= 1.05 x the previous green run's sha, rebuilt and run on
 #     the same runner in the same job (its stored baseline artifact is the fallback);
 #   - no create-window syscall above the base's + 0.05 per op;
-#   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z). Red at 675adbfb3 (10 per create),
-#     so the job is red until the engine meets it; the BASELINE still advances on a regression-green run (every
-#     gate but this one passes), and the base is the newest run that uploaded a baseline, not the newest green one.
+#   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z), checked in its own job "absolute
+#     syscall budget" (red at 675adbfb3, 10 per create) so the profile job's own status is the regression verdict;
+#     the BASELINE advances on a regression-green run (every gate but this one passes, both regression gates
+#     evaluated), and the base is the newest run that uploaded a baseline, not the newest green one.
 # Smoke sizes; nothing here is a credited latency.
 
 on:
@@ -193,5 +194,32 @@ jobs:
             r=$(cat "$RAW/$side.rc"); [ "$r" = 0 ] || { echo "profile.sh $side rc=$r (runs.tsv lists the failed instrument runs)"; bad=1; }
           done
           [ -f "$RAW/head.rc" ] || { echo "the head was never profiled"; bad=1; }
-          [ "${{ steps.gate.outputs.rc }}" = 0 ] || { echo "profile gates FAILED: see verdict.tsv"; cat "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
+          # The REGRESSION verdict (gate-6 review M9): every gate but the absolute syscall budget, both regression gates
+          # evaluated. The absolute budget is its own job below, so a regression shows as a red profile job and the
+          # known budget red as a red budget job; neither hides the other, and both block.
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; grep -v '^budget-syscalls/' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
           exit $bad
+
+  budget:
+    name: absolute syscall budget (${{ matrix.runner }}; at most 3 per create at C=1, red at 675adbfb3)
+    needs: profile
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: profile-raw-${{ matrix.runner }}
+          path: raw
+      - name: The budget-syscalls rows of verdict.tsv
+        run: |
+          f=raw/analysis/verdict.tsv
+          [ -s "$f" ] || { echo "no verdict.tsv: the profile job produced no analysis"; exit 1; }
+          rows=$(awk -F'\t' '$1 ~ /^budget-syscalls\//' "$f")
+          echo "$rows"
+          echo "$rows" | awk -F'\t' '$4 == "PASS" || $4 == "FAIL"' | grep -q . || { echo "no budget-syscalls row was evaluated"; exit 1; }
+          ! echo "$rows" | awk -F'\t' '$4 == "FAIL"' | grep -q .

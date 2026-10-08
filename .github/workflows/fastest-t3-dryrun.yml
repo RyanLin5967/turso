@@ -4,10 +4,13 @@ name: fastest-t3-dryrun
 # bash, which clones the fork at this commit and runs everything from there. The job must finish with
 # complete raws (summarize.py exit 0) and records its wall time. Numbers from a hosted runner are never
 # credited: its disk is not T3 hardware (frontier/fastest/linux/GATES.md).
-# Four jobs per push (review 2 items 4-6): the loop dry run (<fs>loop V3 cells), the non-loop dry run (xfs and
-# btrfs on brd's /dev/ram0, a block device with no loop: the hosted runners have no spare disk), and two plants
-# that must FAIL the run at the first block with the planted reason: a V3 batch bound to a missing verdict
-# (run.sh rc 2) and a V3L whose fio syncs every 2nd write (V3L VOID).
+# Five jobs per push (review 2 items 4-6): the loop dry run (<fs>loop V3 cells), the non-loop dry run (xfs and
+# btrfs on brd's /dev/ram0, a block device with no loop: the hosted runners have no spare disk), and three plants
+# that must FAIL the FIRST block for exactly the planted reason, pinned by its own text (gate-6 review M2), while
+# the second block passes (review H1: a failed block does not stop the run): a V3 batch bound to a missing verdict
+# (run.sh's refusal names the planted file), a V3L whose fio syncs every 2nd write (V1L reads 5,000 and v3l.json
+# records the plant), and a loop set to write through under V3L (the drive's flush counter gate fires; review M3).
+# The A14 plants (blockgate.py) run inside every block of every job, on copies of the real batch record.
 
 on:
   workflow_dispatch:
@@ -46,11 +49,13 @@ jobs:
         include:
           - {block: loop, plant: ""}
           - {block: brd, plant: ""}
-          - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2"}
-          - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID: V1L fsync: &&fsync of the data file, registered 10000"}
+          - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
+          - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID: &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
+          - {block: loop, plant: v3l-wt-layer, expect: "V3L VOID: &&write-back drive &&: its flush counter rose"}
     env:
       PLANT: ${{ matrix.plant }}
       EXPECT: ${{ matrix.expect }}
+      V3LPLANT: ${{ matrix.v3lplant }}
     steps:
       - name: The one command, as on a rented box
         run: |
@@ -88,12 +93,20 @@ jobs:
                    "v3l_verdict": b.get("v3l", {}).get("verdict")}))
           plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
           if plant:
-              # the plant must be the reason, at the first block, and nothing else may have failed
-              first = s["blocks"][0] if s.get("blocks") else {}
+              # the plant must be the reason, at the first block; the second block must pass (review H1)
+              blocks = s.get("blocks") or [{}]
+              first, rest = blocks[0], blocks[1:]
               why = " | ".join(first.get("why", []))
-              ok = (s.get("plant") == plant and s["failed_stages"] == ["fs-" + first.get("fs", "?")]
-                    and all(part in why for part in expect.split("&&")))
-              print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", "-", why)
+              v3lp = os.environ.get("V3LPLANT")
+              checks = {
+                  "plant recorded": s.get("plant") == plant,
+                  "only the first block failed": s["failed_stages"] == ["fs-" + first.get("fs", "?")],
+                  "the planted text": all(part in why for part in expect.split("&&")),
+                  "a later block ran and passed": bool(rest) and all(b.get("ok") for b in rest),
+                  "v3l.json names the plant": not v3lp or (first.get("v3l", {}).get("before") or {}).get("plant") == v3lp,
+              }
+              ok = all(checks.values())
+              print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
               sys.exit(0 if ok else 1)
           sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or s.get("failed_blocks")
                          or not s["planned_runs"]) else 0)
