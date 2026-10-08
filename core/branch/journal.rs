@@ -92,8 +92,13 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// frame-layer marker, no longer a record): a tag saying whether the flight was synced, the
 /// flight's length, and its crc32c, both the end frame's own checksum and the flight's seeded with
 /// the nonce. A 9 or 10 log ("written before the log nonce") is refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 11;
-const SPLICE_FORMAT_VERSION: u32 = 12;
+///
+/// 13 and 14 (fastest-engine, engine review 10 #2): the end frame says how its writer synced it,
+/// per flight: not at all, by a writer whose own class syncs (every flight before it was synced
+/// before it was written), or raised by a writer whose class does not (`EndKind`). An 11 or 12 log
+/// tagged both kinds of synced flight alike, so it is refused, never reinterpreted.
+const FORMAT_VERSION: u32 = 13;
+const SPLICE_FORMAT_VERSION: u32 = 14;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -109,10 +114,58 @@ pub(crate) fn format_version(splice: bool) -> u32 {
 /// reserved bytes.
 const LOG_HEADER_LEN: usize = 40;
 const FRAME_HEADER_LEN: usize = 8;
-/// The end frame's tags: a flight written in a class that does not sync, and one that does (or is
-/// ordered ahead of a trunk commit's flush). No record tag takes either value.
+/// The end frame's tags (`EndKind`): a flight written in a class that does not sync; one synced (or
+/// ordered ahead of a trunk commit's flush) by a writer whose own class syncs; and one synced the
+/// same way by a writer whose class does not (raised). No record tag takes any of these values.
 const END_TAG: u8 = 0xE0;
 const END_SYNCED_TAG: u8 = 0xE1;
+const END_RAISED_TAG: u8 = 0xE2;
+
+/// What a flight's end frame says about how its writer synced it (engine review 10 #2: per flight,
+/// not per incarnation, since a reopen in another class keeps the incarnation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EndKind {
+    /// Written in a class that does not sync: its slots may never have reached the device.
+    Unsynced,
+    /// Synced by a writer whose own class syncs: it synced every flight before writing the next,
+    /// so this flight being written proves the one before it was synced.
+    Synced,
+    /// Synced by a writer whose class does not (a raised D0 flight): durable itself, it proves
+    /// nothing about the flights before it.
+    Raised,
+}
+
+impl EndKind {
+    /// The kind of a flight synced or not (`syncs`) by a writer whose class syncs or not.
+    fn of(syncs: bool, base_syncs: bool) -> Self {
+        match (syncs, base_syncs) {
+            (false, _) => EndKind::Unsynced,
+            (true, true) => EndKind::Synced,
+            (true, false) => EndKind::Raised,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            EndKind::Unsynced => END_TAG,
+            EndKind::Synced => END_SYNCED_TAG,
+            EndKind::Raised => END_RAISED_TAG,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            END_TAG => Some(EndKind::Unsynced),
+            END_SYNCED_TAG => Some(EndKind::Synced),
+            END_RAISED_TAG => Some(EndKind::Raised),
+            _ => None,
+        }
+    }
+
+    fn synced(self) -> bool {
+        self != EndKind::Unsynced
+    }
+}
 /// tag(1) flight length(4) the flight's crc32c, seeded with the nonce(4).
 const END_PAYLOAD_LEN: usize = 9;
 /// An end frame: its frame header, whose checksum is seeded with the nonce too, and its payload.
@@ -287,6 +340,7 @@ const _: () = {
         TAG_FORK_NAMED,
         END_TAG,
         END_SYNCED_TAG,
+        END_RAISED_TAG,
     ];
     let mut i = 0;
     while i < tags.len() {
@@ -1438,7 +1492,7 @@ impl Journal {
                         if records.len() > whole.1 {
                             last_flight = Some(whole);
                         }
-                        if payload[0] == END_SYNCED_TAG {
+                        if EndKind::from_tag(payload[0]).is_some_and(EndKind::synced) {
                             synced_end = true;
                         } else {
                             unsynced_end = true;
@@ -1982,7 +2036,7 @@ impl Journal {
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
-        frames.extend_from_slice(&end_frame(self.nonce, class.syncs(), &self.pending));
+        frames.extend_from_slice(&end_frame(self.nonce, EndKind::of(class.syncs(), self.sync.syncs()), &self.pending));
         let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -2116,6 +2170,7 @@ impl Journal {
                 ordered: false,
                 dir: None,
                 nonce: self.nonce,
+                base_syncs: self.sync.syncs(),
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -2187,6 +2242,7 @@ impl Journal {
             ordered: false,
             dir,
             nonce: self.nonce,
+            base_syncs: self.sync.syncs(),
         })
     }
 
@@ -2627,6 +2683,9 @@ pub(crate) struct Flight {
     dir: Option<File>,
     /// The log incarnation's nonce, for the end frame `write` builds.
     nonce: u32,
+    /// The writer's own class syncs (`Journal::sync`): its end frame says whether it was synced as
+    /// every flight of this writer is, or raised (`EndKind`; engine review 10 #2).
+    base_syncs: bool,
 }
 
 impl Flight {
@@ -2673,7 +2732,7 @@ impl Flight {
         }
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
-            let end = end_frame(self.nonce, self.class.syncs(), &self.bytes);
+            let end = end_frame(self.nonce, EndKind::of(self.class.syncs(), self.base_syncs), &self.bytes);
             self.bytes.extend_from_slice(&end);
             write_at(&log, &self.bytes, self.at)?;
         }
@@ -2788,12 +2847,12 @@ fn scan_crc_seeded(seed: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 pub(crate) static SCAN_CRC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A flight's end frame (format 11): the tag (synced or not), the flight's length, and its crc32c,
-/// the frame's own checksum and the flight's both seeded with the incarnation's `nonce`.
-fn end_frame(nonce: u32, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
+/// A flight's end frame (format 13): the tag (`EndKind`), the flight's length, and its crc32c, the
+/// frame's own checksum and the flight's both seeded with the incarnation's `nonce`.
+fn end_frame(nonce: u32, kind: EndKind, flight: &[u8]) -> [u8; END_FRAME_LEN] {
     let mut frame = [0u8; END_FRAME_LEN];
     let p = FRAME_HEADER_LEN;
-    frame[p] = if synced { END_SYNCED_TAG } else { END_TAG };
+    frame[p] = kind.tag();
     frame[p + 1..p + 5].copy_from_slice(&(flight.len() as u32).to_le_bytes());
     frame[p + 5..p + 9].copy_from_slice(&crc32c::crc32c_append(nonce, flight).to_le_bytes());
     frame[0..4].copy_from_slice(&(END_PAYLOAD_LEN as u32).to_le_bytes());
@@ -2804,7 +2863,7 @@ fn end_frame(nonce: u32, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
 
 /// Whether a frame of `len` payload bytes whose tag is `tag` is an end frame.
 fn is_end(len: usize, tag: u8) -> bool {
-    len == END_PAYLOAD_LEN && (tag == END_TAG || tag == END_SYNCED_TAG)
+    len == END_PAYLOAD_LEN && EndKind::from_tag(tag).is_some()
 }
 
 /// Whether the bytes at `at` could begin a whole frame, from its length, its tag and the count a
@@ -2822,7 +2881,7 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
         TAG_TRUNK_RETAIN => len == 29,
         TAG_RELEASE | TAG_RELEASE_OPEN | TAG_CLOSE | TAG_CLOCK | TAG_CHECKPOINT => len == 9,
         TAG_LEASE => len == 25,
-        END_TAG | END_SYNCED_TAG => len == END_PAYLOAD_LEN,
+        END_TAG | END_SYNCED_TAG | END_RAISED_TAG => len == END_PAYLOAD_LEN,
         _ => false,
     };
     (ok && p + len <= bytes.len()).then_some(len)
@@ -2832,8 +2891,8 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
 /// frame is whole only under this incarnation's `nonce`; a record frame by its own checksum and
 /// decoding.
 /// The next whole frame of this incarnation at or after `from`: its offset, payload length, and
-/// for an end frame whether it is tagged synced (`None` for a record frame).
-fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, Option<bool>)> {
+/// for an end frame its kind (`None` for a record frame).
+fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, Option<EndKind>)> {
     let last = bytes.len().checked_sub(FRAME_HEADER_LEN + 1)?;
     (from..=last).find_map(|at| {
         let len = plausible_frame(bytes, at)?;
@@ -2842,7 +2901,7 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
         if is_end(len, payload[0]) {
             scan_crc_seeded(nonce, payload)
                 .eq(&crc)
-                .then_some((at, len, Some(payload[0] == END_SYNCED_TAG)))
+                .then_some((at, len, EndKind::from_tag(payload[0])))
         } else {
             (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, None))
         }
@@ -2856,14 +2915,17 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
 /// so either proves that sync returned: an acknowledged write was lost. Returns that end frame's
 /// offset.
 ///
-/// The second form proves the damaged flight's sync returned only if its WRITER synced every
-/// flight before writing the next (engine review 7 #2), decided from the log's own evidence, not
-/// the opener's class: no whole flight of this incarnation is tagged unsynced, before the damage
-/// (`unsynced_before`) or after it — a D0 writer leaves such flights, and its unsynced flight can
-/// be followed by a raised, synced one — or the header confirms the later flight itself
-/// (`confirmed`: its sync returned, so every byte before it was durable). The writer's base class
-/// in the header, at the next format bump, makes this exact. Mutant `writer_syncs_by_opener` (test
-/// builds only): the writer taken to sync iff the opener's class does (`opener_syncs`), as before.
+/// The second form proves the damaged flight's sync returned only if the later flight's WRITER
+/// synced every flight before writing the next (engine review 7 #2), decided from the log's own
+/// evidence, not the opener's class: the later flight's own end frame says its writer's class
+/// synced (`EndKind::Synced`; engine review 10 #2: per flight, since a reopen in another class
+/// keeps the incarnation, so a whole-incarnation reading was wrong both ways), or the header
+/// confirms the later flight itself (`confirmed`: its sync returned, so every byte before it was
+/// durable). A raised flight (`EndKind::Raised`) proves nothing about the flights before it.
+/// Mutants (test builds only): `writer_syncs_by_opener` (the writer taken to sync iff the opener's
+/// class does, `opener_syncs`, as before engine review 7 #2) and
+/// `writer_evidence_whole_incarnation` (no whole flight of the incarnation tagged unsynced, before
+/// the damage, `unsynced_before`, or after it, as before engine review 10 #2).
 fn synced_flight_over(
     bytes: &[u8],
     damage: usize,
@@ -2877,6 +2939,7 @@ fn synced_flight_over(
         return None;
     }
     let by_opener = super::store::fe_mutant("writer_syncs_by_opener");
+    let whole_incarnation = super::store::fe_mutant("writer_evidence_whole_incarnation");
     let mut unsynced_seen = unsynced_before;
     // From the damage itself: an end frame whose own checksum holds but whose flight's does not
     // is where the scan stopped, and it is a synced flight covering the damage.
@@ -2886,19 +2949,22 @@ fn synced_flight_over(
         if synced_end.is_some() {
             return synced_end;
         }
-        if end == Some(false) {
+        if end == Some(EndKind::Unsynced) {
             unsynced_seen = true;
         }
-        if end == Some(true) {
+        if let Some(kind) = end.filter(|k| k.synced()) {
             // Mutant `whole_later_flight_ignored` (test builds only): as before review 5 #26.
             let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
             let flight_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
             let flight_crc = u32::from_le_bytes(payload[5..9].try_into().unwrap());
             let flight_end = (found + FRAME_HEADER_LEN + len) as u64;
+            let confirms = confirmed == Some(confirm_word(flight_crc, flight_end));
             let writer_syncs = if by_opener {
                 opener_syncs
+            } else if whole_incarnation {
+                !unsynced_seen || confirms
             } else {
-                !unsynced_seen || confirmed == Some(confirm_word(flight_crc, flight_end))
+                kind == EndKind::Synced || confirms
             };
             let whole_later = writer_syncs
                 && found.checked_sub(flight_len).is_some_and(|start| {
@@ -2949,7 +3015,7 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
             } else {
                 len > 0 && crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
             };
-            ok.then_some((len, end, end && payload[0] == END_SYNCED_TAG))
+            ok.then_some((len, end, end && EndKind::from_tag(payload[0]).is_some_and(EndKind::synced)))
         });
         let Some((len, end, was_synced)) = whole else {
             return Err(corrupt(&format!(
@@ -2962,7 +3028,10 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
         } else if out.len() > flight_at {
             let tag_synced = synced && (was_synced || super::store::fe_mutant("reframe_retags_by_class"));
             all_synced &= tag_synced;
-            let frame = end_frame(new, tag_synced, &out[flight_at..]);
+            // A synced rewrite syncs every kept flight before anything follows them, as a writer
+            // whose class syncs does: a kept flight raised or synced is Synced in the new log
+            // (engine review 10 #2).
+            let frame = end_frame(new, EndKind::of(tag_synced, true), &out[flight_at..]);
             last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
             flight_at = out.len();
@@ -3049,6 +3118,8 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
         " (written before flight framing; recreate the branch files)".to_string()
     } else if version < 11 {
         " (written before the log nonce; recreate the branch files)".to_string()
+    } else if version < 13 {
+        " (written before per-flight writer evidence; recreate the branch files)".to_string()
     } else {
         String::new()
     }
@@ -3841,9 +3912,10 @@ mod tests {
         u32::from_le_bytes(bytes[HEADER_NONCE_AT..HEADER_NONCE_AT + 4].try_into().unwrap())
     }
 
-    /// An end frame for the record frames `flight`, as the log at `path` would write it.
+    /// An end frame for the record frames `flight`, as the log at `path` would write it (a synced
+    /// one as a writer whose class syncs tags it).
     pub(super) fn forged_end(path: &Path, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
-        end_frame(log_nonce(path), synced, flight)
+        end_frame(log_nonce(path), EndKind::of(synced, true), flight)
     }
 
     /// Two whole SYNCED flights of `frames` each, as the log at `path` would write them: what proves,
