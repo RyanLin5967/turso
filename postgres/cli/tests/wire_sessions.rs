@@ -3440,6 +3440,46 @@ fn a_parameter_number_past_the_limit_is_refused() {
     }
 }
 
+/// A `$n` sent over the simple protocol names no parameter (nothing binds one there): 42P02 "there
+/// is no parameter $1", before the statement runs, as PostgreSQL answers. It ran with the parameter
+/// unbound, which the engine reads as NULL: `UPDATE t SET v = $1` set every row's v to NULL,
+/// `DELETE ... WHERE id = $1` answered DELETE 0, and a branch call answered 08P01 (wire review 9
+/// item 3).
+#[test]
+fn a_parameter_over_the_simple_protocol_is_refused() {
+    let dir = Scratch::new("simpleparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "UPDATE t SET v = $1",
+        "DELETE FROM t WHERE id = $1",
+        "INSERT INTO t VALUES (2, $1)",
+        "SELECT v FROM t WHERE id = $1",
+        "SELECT turso_branch_create($1)",
+    ] {
+        let r = a.q(sql);
+        let e = r.err(sql);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("42P02", "there is no parameter $1"),
+            "{sql}"
+        );
+        assert_eq!(
+            a.q("SELECT id, v FROM t ORDER BY id").ok(sql).rows,
+            vec![vec![Some("1".to_string()), Some("trunk".to_string())]],
+            "{sql}: nothing changed"
+        );
+    }
+    // The same statement in a multi-statement query fails it there, and the statements before it
+    // are rolled back with the implicit block.
+    let r = a.q("INSERT INTO t VALUES (3, 'x'); UPDATE t SET v = $1");
+    assert_eq!(r.err("in a multi-statement query").code, "42P02");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("the block rolled back"),
+        "1"
+    );
+}
+
 /// A branch call's `$n` past the limit is refused with 42P02 too, at Describe and over the simple
 /// protocol, and the server serves on. Branch calls never reached the prepare-time limit: Describe
 /// sized its parameter list by the number, so `$18446744073709551615` panicked on capacity overflow
