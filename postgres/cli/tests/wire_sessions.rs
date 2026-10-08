@@ -3457,3 +3457,76 @@ fn every_parameter_in_the_text_is_a_parameter() {
         assert_eq!(r.rows.len(), rows, "{sql}");
     }
 }
+
+/// Bind decodes each parameter in the format its code names: a binary int4, int8, float8, bool,
+/// bytea and jsonb (whose first byte is its version) as PostgreSQL's binary receive functions read
+/// them, the text format as text. A format-code list that is neither 0, 1 nor one per parameter is
+/// a protocol violation (08P01). Every parameter was decoded as UTF-8 text: a binary int4 2 failed
+/// XX000, the bytes "0001" bound 1, a jsonb kept its version byte and a non-UTF-8 bytea failed
+/// (wire review 8 item 4; drivers send binary once Describe names a type).
+#[test]
+fn bind_reads_each_parameter_in_its_format() {
+    let dir = Scratch::new("bindformat");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, '007')").ok("row 2");
+    let r = a
+        .xt(
+            "SELECT v FROM t WHERE id = $1",
+            &[(0, 1, &2i32.to_be_bytes())],
+        )
+        .ok("binary int4");
+    assert_eq!(r.rows, vec![vec![Some("007".to_string())]]);
+    // "0001" as a binary int4 is 808464433, not 1.
+    let r = a
+        .xt("SELECT v FROM t WHERE id = $1", &[(0, 1, b"0001")])
+        .ok("binary int4 of text bytes");
+    assert!(
+        r.rows.is_empty(),
+        "the bytes 0001 bound as text: {:?}",
+        r.rows
+    );
+    a.q("CREATE TABLE ty(i BIGINT, f DOUBLE PRECISION, b BOOLEAN, y BYTEA, j JSONB)")
+        .ok("ty");
+    let mut jsonb = vec![1u8];
+    jsonb.extend_from_slice(br#"{"a": 1}"#);
+    a.xt(
+        "INSERT INTO ty VALUES ($1, $2, $3, $4, $5)",
+        &[
+            (0, 1, &(-5i64).to_be_bytes()),
+            (0, 1, &2.5f64.to_be_bytes()),
+            (0, 1, &[1u8]),
+            (0, 1, &[0xff, 0x00, 0xfe]),
+            (0, 1, &jsonb),
+        ],
+    )
+    .ok("binary int8, float8, bool, bytea, jsonb");
+    let r = a
+        .q("SELECT i, f, b, encode(y, 'hex'), j->>'a' FROM ty")
+        .ok("read back");
+    let row =
+        |v: [&str; 5]| -> Vec<Option<String>> { v.iter().map(|x| Some(x.to_string())).collect() };
+    assert_eq!(r.rows, vec![row(["-5", "2.5", "t", "ff00fe", "1"])]);
+    // Two parameters, three format codes.
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"SELECT $1::int4 + $2::int4");
+    parse.extend_from_slice(&[0, 0, 0]);
+    a.send(b'P', &parse);
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&3i16.to_be_bytes());
+    for _ in 0..3 {
+        bind.extend_from_slice(&0i16.to_be_bytes());
+    }
+    bind.extend_from_slice(&2i16.to_be_bytes());
+    for v in [b"1", b"2"] {
+        bind.extend_from_slice(&1i32.to_be_bytes());
+        bind.extend_from_slice(v);
+    }
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    a.send(b'B', &bind);
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err("three format codes for two parameters").code, "08P01");
+    assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+}
