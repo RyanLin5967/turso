@@ -1092,7 +1092,7 @@ struct StoreInner {
     /// release.
     live_ids: Option<IdSet>,
     /// V4 base reads (r11-merge PREREG A20; observing only).
-    v4: V4Counters,
+    v4: V4Work,
     /// V3's row and table stamps (r13-compose, the Merger port), under this one mutex.
     stamps: RowStamps,
     /// The Merger's work since open (observing only).
@@ -1251,7 +1251,7 @@ pub(crate) struct MergeView {
 /// A V4 merge's base reads since open: `base_page_into` calls, those answered from the arena (a
 /// retained trunk version) and those refused, and the retained versions compared (r11-merge A20).
 #[derive(Debug, Default, Clone, Copy)]
-struct V4Counters {
+struct V4Work {
     base_reads: u64,
     base_arena: u64,
     base_refused: u64,
@@ -6235,16 +6235,31 @@ impl BranchStore {
         read.map(|()| true)
     }
 
-    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
-    /// trunk rows)` since open (r11-merge A20). Does not settle, so reading it moves nothing.
-    pub(crate) fn v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    /// V4's counters since open (r11-merge A20/A20c). Does not settle, so reading it moves nothing.
+    pub(crate) fn v4_counters(&self) -> super::V4Counters {
         let inner = self.inner.lock();
         let v = inner.v4;
-        let (probes, rows) = inner
-            .cat
-            .as_ref()
-            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows));
-        (v.base_reads, v.base_arena, v.base_refused, v.base_examined, probes, rows)
+        let mut out = super::V4Counters {
+            base_reads: v.base_reads,
+            base_arena: v.base_arena,
+            base_refused: v.base_refused,
+            base_examined: v.base_examined,
+            ..Default::default()
+        };
+        if let Some(c) = inner.cat.as_ref() {
+            out.cp_probes = c.trunk_probes;
+            out.cp_rows = c.trunk_rows;
+            let k = c.catalog.counters;
+            out.probe_calls = k.probe_calls;
+            out.probe_found = k.probe_found;
+            out.probe_seeks = k.probe_seeks;
+            out.probe_steps = k.probe_steps;
+            out.probe_page_gets = k.probe_page_gets;
+            out.found_seeks = k.found_seeks;
+            out.found_steps = k.found_steps;
+            out.found_page_gets = k.found_page_gets;
+        }
+        out
     }
 
     /// `(probes, rows)` of `trunk_written_known`'s once-per-page catalog probe since open
@@ -6958,7 +6973,7 @@ impl StoreInner {
             pending_holders: HashSet::new(),
             resident_cap: None,
             live_ids: None,
-            v4: V4Counters::default(),
+            v4: V4Work::default(),
             stamps: RowStamps::default(),
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),

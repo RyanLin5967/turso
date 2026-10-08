@@ -119,6 +119,21 @@ pub fn backfill_io() -> [u64; 2] {
 pub(crate) fn count_backfill_io(which: usize) {
     BACKFILL_IO[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
+
+/// Process-wide count of `Pager::read_page` calls, cache hit or miss, across every database in the
+/// process: pages a B-tree descent fetched (r11-merge PREREG A20c/A20d instrument, observing only;
+/// one shared atomic on every page fetch, so no timed run is made with it). A re-entry through
+/// `pending_reads` is not counted again, but a seek that restarts from its root after an I/O yield,
+/// and a retry of a cached page whose read is still in flight, are: about one extra fetch per cold
+/// root, never on a warm descent.
+#[doc(hidden)]
+pub static PAGE_GETS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+/// A snapshot of [`PAGE_GETS`].
+#[doc(hidden)]
+pub fn page_gets() -> u64 {
+    PAGE_GETS.load(crate::sync::atomic::Ordering::Relaxed)
+}
 pub(crate) mod catalog;
 pub(crate) mod derive;
 #[doc(hidden)]
@@ -541,6 +556,30 @@ pub struct Reaped {
     /// spliced out (its only live child now holds what it read through it): it has left the store's
     /// branch states, but its pages live on in that child.
     pub deferred: bool,
+}
+
+/// V4's base reads since open (r11-merge PREREG A20/A20c instrument, observing only): calls,
+/// those answered from the arena (a retained trunk version), those refused, and retained versions
+/// examined; the catalog's C-P trunk probes and the version rows they returned; and, inside
+/// `Catalog::trunk_pred` alone, its calls, those that found a version, and B-tree seeks, cursor
+/// steps (next + prev) and pages fetched, in total and for the probes that found a version.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct V4Counters {
+    pub base_reads: u64,
+    pub base_arena: u64,
+    pub base_refused: u64,
+    pub base_examined: u64,
+    pub cp_probes: u64,
+    pub cp_rows: u64,
+    pub probe_calls: u64,
+    pub probe_found: u64,
+    pub probe_seeks: u64,
+    pub probe_steps: u64,
+    pub probe_page_gets: u64,
+    pub found_seeks: u64,
+    pub found_steps: u64,
+    pub found_page_gets: u64,
 }
 
 /// What the last open of the branch store read and rebuilt (r11-restart lane). An observing
@@ -1297,10 +1336,9 @@ impl Database {
         self.branches.base_page_into(id, page, out)
     }
 
-    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
-    /// trunk rows)` since open (r11-merge A20 instrument).
+    /// V4's base-read counters since open (r11-merge A20/A20c instrument).
     #[doc(hidden)]
-    pub fn branch_v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub fn branch_v4_counters(&self) -> V4Counters {
         self.branches.v4_counters()
     }
 
