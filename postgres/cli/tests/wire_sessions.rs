@@ -3834,3 +3834,34 @@ fn an_alter_rebuild_keeps_the_deferred_foreign_key_count() {
     a.q("INSERT INTO c2 VALUES (3, 96)")
         .ok("(iv) no key was added");
 }
+
+/// The ADD CONSTRAINT rebuild's aside table keeps a serial column's values whatever its spelling:
+/// SMALLSERIAL and BIGSERIAL are integers there, as SERIAL is. smallserial became the engine's
+/// smallint, whose encoding refuses anything past 32767, so a table holding 40000 could no longer
+/// take any constraint; bigserial became bigint, no longer the table's rowid key (wire review 6
+/// item 2).
+#[test]
+fn an_alter_rebuild_keeps_every_serial_spellings_values() {
+    let dir = Scratch::new("serialspell");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for ty in ["SMALLSERIAL", "SERIAL2", "BIGSERIAL", "SERIAL8"] {
+        let t = format!("s_{}", ty.to_lowercase());
+        a.q(&format!("CREATE TABLE {t}(id {ty}, v INT)"))
+            .ok("table");
+        a.q(&format!("INSERT INTO {t} VALUES (40000, 1), (5, 2)"))
+            .ok("a value past smallint");
+        a.q(&format!("ALTER TABLE {t} ADD PRIMARY KEY (id)"))
+            .ok(&format!("{ty}: add a key"));
+        assert_eq!(
+            a.q(&format!("SELECT count(*) FROM {t} WHERE id = 40000"))
+                .single("row"),
+            "1",
+            "{ty}"
+        );
+        let e = a
+            .q(&format!("INSERT INTO {t} VALUES (40000, 3)"))
+            .err("dup");
+        assert_eq!(e.code, "23505", "{ty}: the key is enforced");
+    }
+}
