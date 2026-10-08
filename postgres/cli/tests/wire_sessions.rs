@@ -4489,6 +4489,48 @@ fn a_reconnect_right_after_a_close_is_not_refused() {
     );
 }
 
+/// SAVEPOINT, RELEASE and ROLLBACK TO in an IMPLICIT block (a multi-statement query, or a pipeline
+/// before its Sync) are 25P01, as PostgreSQL refuses them there: the block is rolled back, the
+/// session is idle, and nothing is kept or held. They ran, and ended the implicit block's
+/// bookkeeping while the engine's transaction stayed open with nobody to commit it: every statement
+/// answered success, ReadyForQuery said 'T', and the rows the client was told were written went
+/// with the connection (wire review 11 item 6, a regression from e8d402e6e for SAVEPOINT and
+/// RELEASE).
+#[test]
+fn a_savepoint_verb_in_an_implicit_block_is_25p01() {
+    let dir = Scratch::new("implicitsavepoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let ids = |a: &mut Wire| -> Vec<String> {
+        a.q("SELECT id FROM t ORDER BY id")
+            .ok("ids")
+            .rows
+            .iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect()
+    };
+    for verb in ["SAVEPOINT s", "RELEASE s", "ROLLBACK TO s"] {
+        let sql = format!("INSERT INTO t VALUES (2, 'x'); {verb}; INSERT INTO t VALUES (3, 'y')");
+        let r = a.q(&sql);
+        assert_eq!(r.err(&sql).code, "25P01", "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+        assert_eq!(ids(&mut a), vec!["1"], "{sql}: nothing kept");
+        let r = a.pipeline(&[
+            "INSERT INTO t VALUES (2, 'x')",
+            verb,
+            "INSERT INTO t VALUES (3, 'y')",
+        ]);
+        assert_eq!(r.err(verb).code, "25P01", "pipeline {verb}");
+        assert_eq!(r.status, b'I', "pipeline {verb}");
+        assert_eq!(ids(&mut a), vec!["1"], "pipeline {verb}: nothing kept");
+        // Nothing is held: another session writes at once.
+        let mut b = server.connect();
+        b.q("INSERT INTO t VALUES (9, 'z')")
+            .ok("another session writes");
+        b.q("DELETE FROM t WHERE id = 9").ok("undo");
+    }
+}
+
 /// A savepoint that does not exist is 3B001 wherever it is named, and ROLLBACK TO or RELEASE
 /// outside a block is 25P01, as in PostgreSQL. Only an engine-dropped failed block answered 3B001;
 /// a mistyped ROLLBACK TO in a live block, RELEASE of an unknown name and either verb in autocommit
