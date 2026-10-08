@@ -308,6 +308,12 @@
       "layer 1 (nvme0n1)": 0
      }
     },
+    "fdatasync4k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
     "ow1m": {
      "windows_without_a_flush_carrying_request": {
       "layer 0 (loop0)": 0,
@@ -333,6 +339,7 @@
    "append25",
    "append64",
    "cfr2b",
+   "fdatasync4k",
    "ow1m",
    "ow4k",
    "ow64k"
@@ -343,7 +350,7 @@
   "leaf_flushes_completed": 2813,
   "n": 200,
   "outcome": "pass",
-  "required_flushes": 1200,
+  "required_flushes": 1400,
   "voids": []
  },
  "flush_path": [

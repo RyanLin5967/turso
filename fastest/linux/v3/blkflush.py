@@ -402,12 +402,20 @@ def per_arm(events, w):
     return arms, amb, outside
 
 
+NO_SYNC_ARMS = ("nosync25",)  # the one arm that issues no fsync or fdatasync of its own
+
+
 def sync_windows(sysev, w, pid):
     """per arm: windows in which process pid entered no fsync or fdatasync (and the count it entered)."""
-    mine = [e for e in sysev if e[6] == pid]
-    # the probe is single-threaded and enters its sync inside its op's window, so a sync event belongs to the one
-    # window its +-500 ns interval OVERLAPS (eighth review M4: requiring the interval wholly inside a window left a
-    # sync within 0.5 us of the op's start ambiguous, and fast hardware puts it there)
+    mine = sorted((e for e in sysev if e[6] == pid), key=lambda e: e[0])
+    # the probe is single-threaded and enters its sync inside its op's window, so a sync event belongs to the window
+    # its +-500 ns interval overlaps (eighth review M4). Windows are 20-80 ns apart on real batches (ninth review M3),
+    # so a sync entering within 0.5 us of its window's start also overlaps the previous window's end. Such an event
+    # is the LATER window's when the earlier one needs no sync (nosync25) or already holds its own (events in time
+    # order): a window closes only after its sync returns, so a sync never enters within 0.5 us of its own window's
+    # end unless that call returned in under 0.5 us -- a clean fsync can -- and then the earlier window still lacks
+    # its own, and the event stays ambiguous: attributed to neither, so a missing sync can never be covered by a
+    # neighbour's (fail closed).
     starts = [x[0] for x in w]
     inside, amb = {}, []
     for e in mine:
@@ -418,8 +426,12 @@ def sync_windows(sysev, w, pid):
         while j >= 0 and w[j][1] >= lo and len(poss) < 3:
             poss.append(j)
             j -= 1
+        poss.sort()
         if len(poss) == 1:
             inside.setdefault(poss[0], []).append(e)
+        elif len(poss) == 2 and poss[1] == poss[0] + 1 and (w[poss[0]][2] in NO_SYNC_ARMS or inside.get(poss[0])):
+            inside.setdefault(poss[1], []).append(e)
+            amb.append((e, poss))  # counted as ambiguous (informational), attributed to the later window
         elif poss:
             amb.append((e, poss))
     res = {}

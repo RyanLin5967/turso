@@ -67,6 +67,11 @@ for v in LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH; do
 done
 sha=$(sha256sum "$BIN" | cut -d' ' -f1) && [ -n "$sha" ] || refuse "cannot hash $BIN"
 fstype=$(findmnt -n -o FSTYPE -T "$DIR") || refuse "cannot find the filesystem of $DIR"
+# the cell's layout before any op (ninth review L13): a loop cell's D is on a loop device, a block cell's is not; the
+# whole layout is post's (v3cell.layout_problems), this only stops a mislabelled batch before it runs 10000 ops
+msrc=$(findmnt -n -o SOURCE -T "$DIR") || refuse "cannot find the mount source of $DIR"
+python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(0 if v3cell.is_loop(sys.argv[2]) == sys.argv[3].startswith("/dev/loop") else 1)' "$HERE" "$CELL" "$msrc" \
+  || refuse "cell layout: V3_CELL=$CELL is a $(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print("loop" if v3cell.is_loop(sys.argv[2]) else "block")' "$HERE" "$CELL") cell, but $DIR is on $msrc"
 arch=$(uname -m)
 vsha="" vrun="" vleaf="" vbasis=""
 if [ -n "${V3_FIRECHECK_VERDICT:-}" ] && [ -n "${V3_SMOKE:-}" ]; then
@@ -124,7 +129,12 @@ src=2 rrc=2 grc=2
 if [ -d "$OUT" ]; then
   mv "$TMP" "$OUT/stamp_start.json"
   mv "$BLKD" "$OUT/blkflush"
-  python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json"
+  # the flush path's devices, from the probe's own summary (ninth review L12); none read is stamp end's own problem
+  devs=$(python3 -B -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+d = [l.get("disk") for l in s.get("flush_path") or []] + [p.get("disk") for p in (s.get("leaf") or {}).get("multipath") or []]
+print(",".join(x for x in d if x))' "$OUT/summary.json" 2>/dev/null)
+  python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json" --devices "${devs:-}"
   src=$?
   if [ -f "$OUT/raw.tsv" ]; then
     ppid=$(python3 -B -c 'import json, sys; print(int(json.load(open(sys.argv[1]))["pid"]))' "$OUT/summary.json" 2>/dev/null)

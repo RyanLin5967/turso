@@ -297,6 +297,20 @@ rm -f "$W/ow1m" "$tgt"
 echo leftover > "$W/append25"
 refuse R_leftover_file "$V3" --dir "$W" --out "$(o R_leftover_file)" --n 5 --arms append25,nosync25
 rm -f "$W/append25"
+# ninth review L13, M6, M7, L9: the probe's own registration and rental refusals, each on a planted --registered file
+printf '# planted: a threshold, no frame arm\nd0_threshold/planted/wb/vm\t9.5\tplanted\n' > "$OUT/F4/reg_noframe.tsv"
+printf 'frame_arm\tow64k\tplanted\n' > "$OUT/F4/reg_ow64k.tsv"
+printf 'frame_arm\tappend25\tplanted\n' > "$OUT/F4/reg_frame25.tsv"
+printf 'frame_arm\tow4k\tDECISIONS \xe2\x80\xa6 (PREREG \xc2\xa74)\n' > "$OUT/F4/reg_nonascii.tsv"
+{ printf '#%.0s' $(seq 600); printf '\nframe_arm\tow4k\tplanted\n'; } > "$OUT/F4/reg_longline.tsv"
+refuse R_rental_noreg "$V3" --dir "$W" --out "$(o R_rental_noreg)" --n 5 --arms append25,nosync25 --plp no --require-registered
+for t in noframe:reg_noframe novariant:reg_ow64k; do
+  refuse "R_rental_${t%%:*}" "$V3" --dir "$W" --out "$(o "R_rental_${t%%:*}")" --n 5 --arms append25,nosync25 --plp no \
+    --registered "$OUT/F4/${t#*:}.tsv" --require-registered
+done
+for t in frame25 nonascii longline; do
+  refuse "R_reg_$t" "$V3" --dir "$W" --out "$(o "R_reg_$t")" --n 5 --arms append25,nosync25 --plp no --registered "$OUT/F4/reg_$t.tsv"
+done
 # items 9, 10, 12, 15, 1(a): fixtures
 fx R_hidden_tmpfs ht
 fx R_hidden_nobarrier hn
@@ -540,6 +554,9 @@ refuse R_runsh_fcenv env V3_SMOKE=1 V3FLOOR_FIRECHECK=1 bash "$RS" "$V3" "$W" "$
 refuse R_runsh_nocell env -u V3_CELL V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nocell)" 5 --arms append25,nosync25
 refuse R_runsh_badcell env V3_CELL=bogus V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_badcell)" 5 --arms append25,nosync25
 refuse R_runsh_noplp env -u V3_PLP V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_noplp)" 5 --arms append25,nosync25
+# ninth review L13: this cell's own kind under the other layout's name (block <-> loop) refuses before the probe runs
+if [ "${CELL%loop}" != "$CELL" ]; then otherlayout=${CELL%loop}; else otherlayout=${CELL}loop; fi
+refuse R_runsh_celllayout env V3_CELL="$otherlayout" V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_celllayout)" 5 --arms append25,nosync25
 # item 17: V3_REQUIRE_T3=1 on a box where the T3 rule is false. Some x86 runners expose cpufreq with every CPU on
 # "performance" (run 37475543956), where the rule holds: there it is shown accepting (P_runsh_t3, recorded) and then
 # made false for the plant by moving cpu0 to another governor, restored after.

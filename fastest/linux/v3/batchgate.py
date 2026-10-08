@@ -379,6 +379,9 @@ def post(out, cell, sha, mode, verdict_path):
                             "one)" % sj.get("d0_threshold_key"))
         if not sj.get("frame_arm"):
             refusals.append("registration: no registered frame arm (PREREG section 4: fixed in the Registration annex)")
+        elif sj.get("frame_arm") != "ow4k":  # A18 needs the frame arm's fdatasync variant; only ow4k has one (M6)
+            refusals.append("registration: the registered frame arm %s has no fdatasync variant arm in this probe (A18 "
+                            "needs one; only ow4k has one, fdatasync4k)" % sj.get("frame_arm"))
     if mode == "bound":
         v = {}
         try:
@@ -535,6 +538,8 @@ def drift(start_out, end_out):
         print(json.dumps({"outcome": "REFUSED", "why": "unreadable: %r" % e}))
         return 2
     why = []
+    if os.path.realpath(start_out) == os.path.realpath(end_out):  # ninth review L11
+        why.append("the start and the end are the same OUT (%s)" % os.path.realpath(start_out))
     if a.get("frame_arm") != b.get("frame_arm"):
         why.append("the frame arm differs: %r then %r" % (a.get("frame_arm"), b.get("frame_arm")))
     # the same kind of batch at both ends, each passed by its own gate (eighth review L3)
@@ -552,15 +557,17 @@ def drift(start_out, end_out):
             continue
         if g.get("rc") != 0:
             why.append("%s: its own gate gave rc %r" % (side, g.get("rc")))
-        if "cell=%s" % (g.get("cell"),) not in bt:
-            why.append("%s: binary.txt does not name the gate's cell" % side)
+        if [l for l in bt.splitlines() if l.startswith("cell=")] != ["cell=%s" % (g.get("cell"),)]:  # exact (ninth review L11)
+            why.append("%s: binary.txt does not name exactly the gate's cell %r" % (side, g.get("cell")))
+    # the same binding at both ends (ninth review L11): cell, shape, what it is bound to, the verdict, rental mode
+    keys = ("cell=", "shape=", "bound=", "verdict_sha256=", "rental=")
     try:
-        sa = [l for l in open(os.path.join(start_out, "binary.txt")).read().splitlines() if l.startswith(("cell=", "shape="))]
-        sb = [l for l in open(os.path.join(end_out, "binary.txt")).read().splitlines() if l.startswith(("cell=", "shape="))]
+        sa = [l for l in open(os.path.join(start_out, "binary.txt")).read().splitlines() if l.startswith(keys)]
+        sb = [l for l in open(os.path.join(end_out, "binary.txt")).read().splitlines() if l.startswith(keys)]
         if sa != sb:
-            why.append("cell or shape differs: %r then %r" % (sa, sb))
-    except OSError:
-        pass
+            why.append("cell, shape, binding, verdict or rental mode differs: %r then %r" % (sa, sb))
+    except OSError as e:
+        why.append("binary.txt unreadable: %r" % e)
     arms = ["append25"] + ([a["frame_arm"]] if a.get("frame_arm") else [])
     rec, void = {}, []
     for arm in arms:

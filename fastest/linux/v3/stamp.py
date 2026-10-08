@@ -2,7 +2,8 @@
 """stamp.py -- Linux batch stamps around a V3 batch (Linux port of frontier/fastest/tools/common/stamp.py).
 
   stamp.py start OUT.json --dir D
-  stamp.py end START.json OUT.json
+  stamp.py end START.json OUT.json --devices DEV[,DEV...]   (the flush path's devices: run.sh reads them from the
+                                                             probe's summary; ninth review L12)
 
 RECORD ONLY. The Mac stamp's void rules (battery, ~/.claude/QUIET, fan-guard SIGSTOPs, end load) describe that box;
 no void rule for a Linux batch is registered, so this stamp never voids: `end` exits 0 when every required record
@@ -120,6 +121,23 @@ def snapshot(d):
     return s
 
 
+def write_cache_problems(a_block, b_block, devices):
+    """The flush path's devices (ninth review L12): a write cache that changed between the stamps, or one unreadable
+    at either stamp, is a problem; devices off the flush path are not judged. No device named is a problem too."""
+    if not devices:
+        return ["no flush-path devices named: the write cache during the batch cannot be judged"]
+    out = []
+    for dev in devices:
+        w0 = ((a_block or {}).get(dev) or {}).get("write_cache")
+        w1 = ((b_block or {}).get(dev) or {}).get("write_cache")
+        if not w0 or not w1:
+            out.append("%s's write_cache is unreadable at %s: %r -> %r" % (dev, "both stamps" if not w0 and not w1 else
+                                                                          "the start" if not w0 else "the end", w0, w1))
+        elif w0 != w1:
+            out.append("%s's write_cache changed during the batch: %r -> %r" % (dev, w0, w1))
+    return out
+
+
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "start":
         d = sys.argv[sys.argv.index("--dir") + 1] if "--dir" in sys.argv else None
@@ -127,7 +145,8 @@ def main():
         with open(sys.argv[2], "w") as f:
             json.dump(s, f, indent=1)
         return 2 if s["problems"] else 0
-    if len(sys.argv) == 4 and sys.argv[1] == "end":
+    if len(sys.argv) in (4, 6) and sys.argv[1] == "end" and (len(sys.argv) == 4 or sys.argv[4] == "--devices"):
+        devices = [d for d in sys.argv[5].split(",") if d] if len(sys.argv) == 6 else []
         with open(sys.argv[2]) as f:
             a = json.load(f)
         b = snapshot(a.get("dir"))
@@ -140,11 +159,9 @@ def main():
         if a.get("diskstats") and b.get("diskstats"):
             b["diskstats_delta"] = {dev: {k: row[k] - a["diskstats"][dev].get(k, 0) for k in row}
                                     for dev, row in b["diskstats"].items() if dev in a["diskstats"]}
-        for dev, w0 in (a.get("block") or {}).items():  # a write cache flipped during the batch (eighth review L8)
-            w1 = (b.get("block") or {}).get(dev)
-            if w1 is not None and w0.get("write_cache") != w1.get("write_cache"):
-                b["problems"].append("%s's write_cache changed during the batch: %r -> %r" % (dev, w0.get("write_cache"),
-                                                                                         w1.get("write_cache")))
+        # a write cache flipped during the batch (eighth review L8), on the flush path's devices only (ninth L12)
+        b["write_cache_devices"] = devices
+        b["problems"] += write_cache_problems(a.get("block"), b.get("block"), devices)
         if a.get("clocksource") != b.get("clocksource"):
             b["problems"].append("the clocksource changed during the batch: %r -> %r" % (a.get("clocksource"), b.get("clocksource")))
         b["problems"] = a.get("problems", []) + b["problems"]

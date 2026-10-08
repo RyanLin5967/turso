@@ -18,7 +18,7 @@
  *                when the log was forced between the create and the FICLONE; it survives plain XFS by batching)
  *   clean        fsync of a file with nothing dirty (the dirty/clean control; never mutated)
  *   nosync25     the append25 write with no flush (D0): the flush control's reference
- *   Report-only extra: fdatasync4k (ow4k with fdatasync in place of fsync).
+ *   fdatasync4k  ow4k with fdatasync in place of fsync: flush-gated, an A18 floor candidate (eighth review M1)
  * Flush-gated arms (every op must issue a device flush and its own sync, run.sh's gates): append25, append64, ow4k,
  *   ow64k, ow1m, clone2b, cfr2b, and fdatasync4k (an A18 floor candidate: eighth review M1). The timing control gates
  *   append25 only (A17, below).
@@ -64,8 +64,10 @@
  *   power-loss protected (--plp yes: "not applicable: PLP"), brd. --plp absent is "not given": the control applies.
  * D0 control (PREREG section 4, gate-6 review MED 6): nosync25's p50 >= 50 us voids the run (rc 3), "a foreign
  *   writer on the device"; summary "d0_control". The start-to-end drift rule is batchgate.py drift's (two batches).
- * Floor reference (annex ruling A18): the cheapest durable barrier on the cell, min p50 over append25 (fsync),
- *   fdatasync4k (ow4k + fdatasync) and the registered frame arm, each named; summary "floor_reference".
+ * Floor reference (annex ruling A18): the cheapest durable barrier on the cell, min p50 (raw nanoseconds) over
+ *   append25 (fsync) and fdatasync4k (ow4k + fdatasync, the registered frame arm's fdatasync variant when the frame
+ *   arm is ow4k; no other frame arm has a variant here, so rental mode refuses one: ninth review M6); summary
+ *   "floor_reference" and "floor_frame_variant". The frame arm itself runs with fsync and is not a candidate.
  * Frame arm (gate-6 review MED 5): the registered one (REGISTERED.tsv key frame_arm), else none, with the rule's
  *   candidate recorded (ow4k: the registered M0 arm with the smallest bytes per flush >= a ~60 B create frame,
  *   unverified); append64 is descriptive until registered.
@@ -203,7 +205,6 @@ static const char *report_only_why(int a) {
     return a == CLONE1B ? "report-only: on Linux a directory fsync does not guarantee a FICLONE durable (PREREG crash "
                           "model; review 2 item 3; crash.sh loses it on btrfs and on XFS-aimed); clone2b is the clone arm "
                           "that survived every crash case"
-         : a == FDATASYNC4K ? "report-only extra: ow4k with fdatasync in place of fsync"
          : a == CLEAN ? "the dirty/clean control, never mutated"
          : NULL;
 }
@@ -216,33 +217,44 @@ static const char *REGPATH = NULL; /* --registered: the registered thresholds an
 static int REQREG = 0;             /* --require-registered: rental mode refuses before any op without them (L7) */
 
 /* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. -> 0 when key was found (the last line
- * with it wins), 1 when absent, -1 when the file cannot be read. */
+ * with it wins), 1 when absent, -1 when the file cannot be read, -2 when any line breaks the one strict rule. */
+#define REG_LINE_MAX 512 /* every line, comments included (ninth review M7): one cap, the same in check.py */
+#define REG_KEY_MAX 120
+#define REG_VAL_MAX 60   /* < d0val's and frame_reg's 64 */
+#define REG_REF_MAX 200  /* < d0ref's and frame_ref's 256: a ref is never truncated */
 static int reg_lookup(const char *path, const char *key, char *val, size_t vcap, char *ref, size_t rcap) {
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
-    char line[1024];
-    int found = 1;
-    while (fgets(line, sizeof line, fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        line[strcspn(line, "\n")] = 0;
-        /* one strict rule, the same as check.py's (eighth review L5): exactly three non-empty tab-separated fields,
-         * no CR; anything else in the file refuses the run (-2) rather than being skipped */
+    char *line = NULL;
+    size_t lcap = 0;
+    ssize_t len;
+    int found = 1, bad = 0;
+    while (!bad && (len = getline(&line, &lcap, fp)) != -1) {
+        if (len > 0 && line[len - 1] == '\n') line[--len] = 0;
+        /* one strict rule, the same as check.py's (eighth review L5, ninth review M7): printable ASCII and TAB only
+         * (no CR, no NUL, no byte >= 0x7f, which jstr would write as one \u00XX per byte while check.py decodes
+         * UTF-8), at most REG_LINE_MAX bytes on every line; data lines exactly three non-empty tab-separated fields
+         * within their caps. Anything else refuses the run (-2) rather than being skipped or truncated. */
+        if ((size_t)len != strlen(line) || len > REG_LINE_MAX) { bad = 1; break; }
+        for (ssize_t k = 0; k < len; k++)
+            if (!(line[k] == '\t' || (line[k] >= 0x20 && line[k] <= 0x7e))) { bad = 1; break; }
+        if (bad || len == 0 || line[0] == '#') continue;
         char *t1 = strchr(line, '\t');
         char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
-        if (!t1 || !t2 || strchr(t2 + 1, '\t') || strchr(line, '\r') || t1 == line || t2 == t1 + 1 || !t2[1]) {
-            fclose(fp);
-            return -2;
-        }
+        if (!t1 || !t2 || strchr(t2 + 1, '\t') || t1 == line || t2 == t1 + 1 || !t2[1]) { bad = 1; break; }
         *t1++ = 0;
         *t2++ = 0;
+        if (strlen(line) > REG_KEY_MAX || strlen(t1) > REG_VAL_MAX || strlen(t2) > REG_REF_MAX ||
+            strlen(t1) >= vcap || strlen(t2) >= rcap) { bad = 1; break; }
         if (!strcmp(line, key)) {
             snprintf(val, vcap, "%s", t1);
             snprintf(ref, rcap, "%s", t2);
             found = 0;
         }
     }
+    free(line);
     fclose(fp);
-    return found;
+    return bad ? -2 : found;
 }
 static char buf[MIB];
 
@@ -304,6 +316,21 @@ static void jstr(FILE *f, const char *s) { /* a JSON string */
         else fputc(*p, f);
     }
     fputc('"', f);
+}
+
+/* the ptrace tracer's pid (ninth review M4): /proc/self/status read whole, its TracerPid line required; an
+ * unreadable status or a missing line refuses (rc 2), never reads as "not traced" */
+static int read_all(const char *p, char *out, size_t cap);
+static int tracer_pid(void) {
+    static char st[8192];
+    if (read_all("/proc/self/status", st, sizeof st) != 0)
+        refuse("/proc/self/status cannot be read whole: whether a tracer is attached is unknown");
+    const char *t = strstr(st, "\nTracerPid:");
+    if (!t) refuse("/proc/self/status has no TracerPid line: whether a tracer is attached is unknown");
+    t += 11;
+    while (*t == ' ' || *t == '\t') t++;
+    if (*t < '0' || *t > '9') refuse("/proc/self/status's TracerPid is not a number");
+    return atoi(t);
 }
 
 static int parse_u64(const char *s, uint64_t *out) { /* a whole decimal number, nothing else */
@@ -1466,14 +1493,7 @@ int main(int argc, char **argv) {
     const int leaf_brd = !strcmp(LEAF.kind, "brd"), leaf_wb = !strcmp(leaf->wc, "write back");
     /* traced? (eighth review H2): a ptrace tracer stops every syscall, so the D0 control's p50 then measures the tracer,
      * not a foreign writer; recorded, and run.sh's gate refuses a traced batch */
-    int traced = 0;
-    {
-        static char st[8192];
-        if (read_all("/proc/self/status", st, sizeof st) == 0) {
-            const char *t = strstr(st, "\nTracerPid:");
-            traced = t && atoi(t + 11) != 0;
-        }
-    }
+    int traced = tracer_pid() != 0; /* and again after the timed ops, below: a tracer attached mid-run counts */
     char d0key[192], d0val[64] = "", d0ref[256] = "", frame_reg[64] = "", frame_ref[256] = "";
     snprintf(d0key, sizeof d0key, "d0_threshold/%s/%s/%s", top->fstype, leaf_brd ? "brd" : leaf_wb ? "wb" : "wt",
              VIRT.vm > 0 ? "vm" : VIRT.vm == 0 ? "bare" : "nr");
@@ -1482,7 +1502,9 @@ int main(int argc, char **argv) {
     if (REGPATH) {
         int r = reg_lookup(REGPATH, d0key, d0val, sizeof d0val, d0ref, sizeof d0ref);
         if (r == -1) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
-        if (r == -2) refuse("%s has a line that is not 'key<TAB>value<TAB>ref' (a comment starts with '#')", REGPATH);
+        if (r == -2) refuse("%s breaks the one strict rule: every line printable ASCII and TAB, at most %d bytes; data "
+                            "lines 'key<TAB>value<TAB>ref' within %d/%d/%d bytes (a comment starts with '#')", REGPATH,
+                            REG_LINE_MAX, REG_KEY_MAX, REG_VAL_MAX, REG_REF_MAX);
         if (r == 0) {
             /* a plain decimal above 1 (no exponent, inf, nan or hex: the same rule as check.py's) */
             int ok = d0val[0] >= '0' && d0val[0] <= '9', dots = 0;
@@ -1495,11 +1517,12 @@ int main(int argc, char **argv) {
             d0_registered = 1;
         }
         if (reg_lookup(REGPATH, "frame_arm", frame_reg, sizeof frame_reg, frame_ref, sizeof frame_ref) == 0) {
-            /* the M0 append and overwrite arms only (PREREG section 4; eighth review L1) */
-            if (strcmp(frame_reg, "append25") && strcmp(frame_reg, "append64") && strcmp(frame_reg, "ow4k") &&
-                strcmp(frame_reg, "ow64k") && strcmp(frame_reg, "ow1m"))
-                refuse("%s: frame_arm '%s' is not an M0 append or overwrite arm (append25, append64, ow4k, ow64k, ow1m)",
-                       REGPATH, frame_reg);
+            /* the M0 append and overwrite arms other than append25 (PREREG section 4; eighth review L1): append25 is
+             * already in the bound shape, which a frame arm append25 would name twice (ninth review L9) */
+            if (strcmp(frame_reg, "append64") && strcmp(frame_reg, "ow4k") && strcmp(frame_reg, "ow64k") &&
+                strcmp(frame_reg, "ow1m"))
+                refuse("%s: frame_arm '%s' is not an M0 append or overwrite arm other than append25 (append64, ow4k, "
+                       "ow64k, ow1m)", REGPATH, frame_reg);
             frame_registered = 1;
         }
     }
@@ -1508,6 +1531,11 @@ int main(int argc, char **argv) {
     if (REQREG) {
         if (!REGPATH) refuse("--require-registered without --registered");
         if (!frame_registered) refuse("rental mode: no registered frame arm in %s", REGPATH);
+        /* A18's floor needs the registered frame arm's fdatasync variant; this probe has one only for ow4k
+         * (fdatasync4k), so a rental with another frame arm would publish a floor missing a candidate (ninth review M6) */
+        if (strcmp(frame_reg, "ow4k"))
+            refuse("rental mode: the registered frame arm %s has no fdatasync variant arm in this probe (A18 needs one; "
+                   "only ow4k has one, fdatasync4k)", frame_reg);
         if (!leaf_brd && leaf_wb && !(PLP && !strcmp(PLP, "yes")) && !d0_registered)
             refuse("rental mode: no registered d0 threshold %s in %s (A17)", d0key, REGPATH);
     }
@@ -1635,6 +1663,7 @@ int main(int argc, char **argv) {
     if (fclose(f) != 0) die("raw.tsv close");
     free(rawbuf);
 
+    if (tracer_pid() != 0) traced = 1; /* ninth review M4: read again after the timed ops */
     pathf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     if (!f) die("summary.json");
@@ -1650,8 +1679,9 @@ int main(int argc, char **argv) {
     jstr(f, clocksrc);
     if (have_seed) fprintf(f, ",\"seed_arg\":%llu", (unsigned long long)seed);
     else fprintf(f, ",\"seed_arg\":null");
-    fprintf(f, ",\"pid\":%d,\"traced\":%s,\"plp\":\"%s\",\"registered_file\":", (int)getpid(), traced ? "true" : "false",
-            PLP ? PLP : "not given");
+    fprintf(f, ",\"pid\":%d,\"traced\":%s,\"traced_by\":\"ptrace only: TracerPid in /proc/self/status, before and after the "
+            "timed ops; kernel tracepoints (blkflush's tracefs instance) are not a tracer\",\"plp\":\"%s\",\"registered_file\":",
+            (int)getpid(), traced ? "true" : "false", PLP ? PLP : "not given");
     if (REGPATH) jstr(f, REGPATH); else fprintf(f, "null");
     fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"linkage\":\"%s\","
             "\"mapped_files\":[", other_maps ? "not static: other files mapped (fire-check only)" : "static");
