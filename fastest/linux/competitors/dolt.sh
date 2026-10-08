@@ -9,7 +9,7 @@
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
 #   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
 #                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS         bench.t(ROWS rows) through the MariaDB client, then DOLT_COMMIT on main
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
@@ -46,8 +46,19 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | my bench
+  AGE=${4:-0}
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
+  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each its own autocommitted
+  # statement, then Dolt's documented maintenance: dolt_commit, then dolt_gc.
+  if [ "$AGE" -gt 0 ]; then
+    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | my bench
+    my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
+    my -N bench -e "CALL DOLT_GC()" >/dev/null 2>&1 || my -N bench -e "SELECT 1" >/dev/null
+    echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
+  else
+    echo "maintenance: DOLT_COMMIT seed"
+  fi
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)

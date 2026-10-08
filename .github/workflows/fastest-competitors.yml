@@ -27,6 +27,12 @@ on:
       cap_s:
         description: "per-run cap in seconds; the warm-up is PREREG :210's min(max(1000 ops, 10 s), 10% of the cap)"
         default: "20"
+      age:
+        description: "aging UPDATEs applied to the parent (PREREG §7: 1e5; 0 = fresh)"
+        default: "200"
+      prebranch:
+        description: "live branches made before the cells, each with one private write"
+        default: "20"
   push:
     branches: [fastest-branching, fastest-linux-comp]
     paths:
@@ -103,6 +109,10 @@ jobs:
       # SMOKE: a 20 s cap, so the registered warm-up rule ends each run's warm-up within 2 s (10% of the cap); the
       # registered T3 cap is 1800 s (1000 ops and 10 s, at most 180 s). Every run records the rule it used.
       FT_CAP_S: ${{ inputs.cap_s || '20' }}
+      # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
+      # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
+      FT_AGE: ${{ inputs.age || '200' }}
+      FT_PREBRANCH: ${{ inputs.prebranch || '20' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -131,7 +141,7 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S age=$FT_AGE prebranch=$FT_PREBRANCH";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries

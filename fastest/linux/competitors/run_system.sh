@@ -49,6 +49,14 @@ CLIENTS=${FT_CLIENTS:-1 4}
 # registered per-run cap (default 1800 s). Recorded in run-info.txt and in every run's summary.json warmup_rule.
 CAP_S=${FT_CAP_S:-1800}
 WARMUP=${FT_WARMUP:-$(python3 "$HERE/timedrun.py" rule "$CAP_S")}
+# One parent fixture for every system (gate-6 review, t3run item 4): gen_seed.py's t at ROWS rows, aged by AGE
+# committed single-row UPDATEs (0 = fresh; PREREG §7 ages with 1e5) and the system's documented maintenance, with
+# PREBRANCH live branches made before the cells, each with one private write (the system's own M1 op, untimed and
+# untraced). RAW/fixture.json records it (fixture.py write); reduce.py refuses a run whose systems' fixtures differ.
+AGE=${FT_AGE:-0}
+PREBRANCH=${FT_PREBRANCH:-0}
+[[ $AGE =~ ^[0-9]+$ && $PREBRANCH =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_AGE [$AGE] / FT_PREBRANCH [$PREBRANCH] not counts" >&2; exit 2; }
+PSUM=$(python3 "$HERE/gen_seed.py" sum --rows "$ROWS" --updates "$AGE")  # the parent's sum(v) after the aging
 [[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
 SC="$HERE/stracecount.py"
 FH="$HERE/fthelp.py"
@@ -112,7 +120,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
   echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 
@@ -313,6 +321,44 @@ run_server_cell() { # run_server_cell SPEC C
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
 
+# server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
+# parent's own files, the size as the engine reports it (or why it cannot), the extent count of its data files.
+server_fixture() {
+  local du=() ext=() eb="" why="" maint
+  maint=$(sed -n 's/^maintenance: //p' "$RAW/seed.txt" | tail -1)
+  case $KIND in
+    pg)
+      du=("$DATA/base/$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")")
+      eb=$(sqlq "SELECT pg_database_size('p')")
+      ext=("$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")") ;;
+    dolt)
+      du=("$DATA/dbs/bench")
+      why="Dolt has no SQL function for a database's size; du only"
+      ext=("$DATA"/dbs/bench/.dolt/noms/*) ;;
+    doltgres)
+      du=("$DATA/databases")
+      why="Doltgres has no working pg_database_size; du only"
+      ext=("$DATA"/databases/*/.dolt/noms/*) ;;
+  esac
+  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+    --prebranch "$PREBRANCH" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} ${why:+--engine-why "$why"} \
+    --extents "${ext[@]}" --maintenance "$maint" >/dev/null || fail "fixture.json"
+}
+# prebranch_server -- PREBRANCH live branches before the cells, each with one private write: the system's own M1 op
+# (bbload, C=4, no warm-up, untraced, untimed); their creates join the branch-count check (RAW/prebranch.ops.txt).
+prebranch_server() {
+  [ "$PREBRANCH" -gt 0 ] || return 0
+  local sp
+  case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
+  bbload "$sp" 4 "$PREBRANCH" "$RAW/prebranch" nowarm >/dev/null || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
+  if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
+  python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || { fail "prebranch ops reader"; echo "0 0 0" >"$RAW/prebranch.ops.txt"; }
+  local created
+  created=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")
+  [ "$created" -ge "$PREBRANCH" ] 2>/dev/null && pass "prebranch: $created live branches with one private write each" ||
+    fail "prebranch: $created branches made, want >= $PREBRANCH"
+}
+
 server_main() {
   local spec c rc
   case $KIND in
@@ -332,7 +378,9 @@ server_main() {
     fi
   fi
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
-  srv seed "$DATA" "$ROWS" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  server_fixture
+  prebranch_server
   if [ "$KIND" = pg ]; then
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
@@ -356,8 +404,9 @@ server_main() {
   fun "## functional checks ($SYSTEM on $(findmnt -n -o FSTYPE -T "$MNT"))"
   # The clone proof first: a later read of the template could dirty a page whose write-back un-shares its extent.
   if [ "$KIND" = pg ]; then pg_clone_proof; fi
-  expect "isolation: parent/main count|sum(v)" "$(sqlp "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+  expect "isolation: parent/main count|sum(v)" "$(sqlp "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
   local want=0 m1 br
+  [ -f "$RAW/prebranch.ops.txt" ] && want=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")  # the live branches made first
   for d in "$RAW"/cells/*; do
     case $(basename "$d") in *select1*) continue ;; esac
     [ -f "$d/ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/ops.txt")))
@@ -372,7 +421,7 @@ server_main() {
     nm1=$((nm1 + 1))
     br=$(python3 "$FH" branch "$d/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
     expect "isolation: $m1 branch $br count|sum(v) after one UPDATE" \
-      "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|1"
+      "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|$((PSUM + 1))"
   done
   [ $nm1 -gt 0 ] || fail "isolation: no M1 cell to read a branch from"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
@@ -414,7 +463,23 @@ b1_main() {
   local cell spec op sync c n d rc total ok created bdir
   DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/<cell>/...
   mkdir -p "$ROOT/branches"
-  "$CB" mkparent --db "$ROOT/parent.db" --rows "$ROWS" | tee "$RAW/mkparent.json" || { fail "mkparent"; return; }
+  # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
+  # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
+  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" | tee "$RAW/mkparent.json" ||
+    { fail "parent (fixture.py sqlite)"; return; }
+  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+    --prebranch "$PREBRANCH" --du "$ROOT/parent.db" \
+    --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
+    --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
+    >/dev/null || fail "fixture.json"
+  if [ "$PREBRANCH" -gt 0 ]; then  # PREBRANCH live branches first, each with one private write (untraced, untimed)
+    mkdir -p "$ROOT/branches/prebranch"
+    "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" --clients 4 \
+      --max-ops "$PREBRANCH" --rows "$ROWS" --out "$RAW/prebranch" >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
+    python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || echo "0 0 0" >"$RAW/prebranch.ops.txt"
+    expect "prebranch: live branch files" "$(find "$ROOT/branches/prebranch" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" \
+      "$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")"
+  fi
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}
@@ -449,17 +514,17 @@ b1_main() {
     done
   done
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
-  expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+  expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
   local f
   for spec in m1-d2 m1-d0; do
     f=$(find "$ROOT/branches/$spec-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
     [ -n "$f" ] || { fail "isolation $spec: no branch b_*_0_0.db"; continue; }
     expect "isolation: $spec branch $(basename "$f") integrity|count|sum(v)" \
-      "$("$SQ3" "$f" "PRAGMA integrity_check; SELECT count(*), sum(v) FROM t;" | tr '\n' '|' | sed 's/|$//')" "ok|$ROWS|1"
+      "$("$SQ3" "$f" "PRAGMA integrity_check; SELECT count(*), sum(v) FROM t;" | tr '\n' '|' | sed 's/|$//')" "ok|$ROWS|$((PSUM + 1))"
   done
   f=$(find "$ROOT/branches/m1c-d2-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
   if [ -n "$f" ]; then
-    expect "isolation: m1c-d2 branch $(basename "$f") count|sum(v)" "$("$SQ3" "$f" "SELECT count(*), sum(v) FROM t")" "$ROWS|0"
+    expect "isolation: m1c-d2 branch $(basename "$f") count|sum(v)" "$("$SQ3" "$f" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
     sync -f "$MNT"
     python3 "$FH" cloneproof "$ROOT/parent.db" "$f" >"$RAW/cloneproof-m1c.json"
     expect "clone proof (filefrag, parent vs $(basename "$f")): verdict" \

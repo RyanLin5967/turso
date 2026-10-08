@@ -13,6 +13,8 @@ SQLite; INSERTs in batches of 1000 rows.
   gen_seed.py digest --rows R [--updates K] [--seed S]
                                           sha256 of the exact SQL stream (parent, then aging): fixture.json's
                                           gen_seed_sha256, the same for every system that loaded it
+  gen_seed.py sum --rows R [--updates K] [--seed S]
+                                          sum(v) over t after the aging (0 fresh): what isolation checks expect
   gen_seed.py rows-for --bytes B          the row count for a parent of about B bytes (128 logical bytes a row:
                                           id 4 + v 4 + pad 120), so every system is sized by one rule
   gen_seed.py selftest
@@ -23,24 +25,59 @@ import sys
 ALPHA = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 
+def xorshift32(x):
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= x >> 17
+    x ^= (x << 5) & 0xFFFFFFFF
+    return x
+
+
 def sql_lines(rows):
-    """STUB (red)."""
-    return iter(())
+    """The parent: byte for byte what gen_seed.py ROWS has always printed (one pad stream across batches)."""
+    yield "CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+    x = 2463534242
+    for start in range(1, rows + 1, 1000):
+        vals = []
+        for i in range(start, min(start + 1000, rows + 1)):
+            chars = []
+            for _ in range(100):
+                x = xorshift32(x)
+                chars.append(ALPHA[x % 36])
+            vals.append("(%d,0,'%s')" % (i, "".join(chars)))
+        yield "INSERT INTO t (id, v, pad) VALUES " + ",".join(vals) + ";"
 
 
 def age_lines(rows, updates, seed=1):
-    """STUB (red)."""
-    return iter(())
+    """K random single-row UPDATEs, each its own statement (autocommit commits each): a uniform id in 1..rows and a
+    value from the same stream, so every system applies the same writes in the same order."""
+    x = (0x9E3779B9 ^ (seed * 2654435761)) & 0xFFFFFFFF or 1
+    for _ in range(updates):
+        x = xorshift32(x)
+        i = 1 + x % rows
+        x = xorshift32(x)
+        yield "UPDATE t SET v = %d WHERE id = %d;" % (x % 1000000, i)
+
+
+def aged_sum(rows, updates=0, seed=1):
+    """sum(v) over t after the aging: the isolation checks' expected parent value (0 when fresh)."""
+    last = {}
+    for ln in age_lines(rows, updates, seed):
+        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
+        last[int(i)] = int(v)
+    return sum(last.values())
 
 
 def digest(rows, updates=0, seed=1):
-    """STUB (red)."""
-    return ""
+    h = hashlib.sha256()
+    for ln in sql_lines(rows):
+        h.update(ln.encode() + b"\n")
+    for ln in age_lines(rows, updates, seed):
+        h.update(ln.encode() + b"\n")
+    return h.hexdigest()
 
 
 def rows_for(nbytes):
-    """STUB (red)."""
-    return 0
+    return max(1, -(-int(nbytes) // 128))
 
 
 def selftest():
@@ -68,7 +105,11 @@ def selftest():
     ok("digest covers the row count", d0 != digest(2501))
     ok("rows-for: 1 MB, 100 MB, 1 GB", (rows_for(1 << 20), rows_for(100 << 20), rows_for(1 << 30)) ==
        (8192, 819200, 8388608))
-    print(f"gen_seed selftest: {12 - bad}/12")
+    # The value SQLite itself reported after loading this stream (fixture.py sqlite, 2500 rows, 300 updates, seed 1,
+    # SQLite 3.53 on the Mac, 2026-10-08): count|sum = 2500|131727070. Not computed by the subject.
+    ok("aged sum(v) = what SQLite read back after the same stream", aged_sum(2500, 300, 1) == 131727070)
+    ok("a fresh parent sums to 0", aged_sum(2500, 0, 1) == 0)
+    print(f"gen_seed selftest: {14 - bad}/14")
     return 1 if bad else 0
 
 
@@ -104,5 +145,7 @@ if __name__ == "__main__":
         print(digest(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     elif cmd == "rows-for":
         print(rows_for(arg(av, "--bytes")))
+    elif cmd == "sum":
+        print(aged_sum(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     else:
         sys.exit(__doc__)

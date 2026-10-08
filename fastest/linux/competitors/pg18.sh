@@ -16,7 +16,7 @@
 #   pg18.sh init  DATA MODE PORT      initdb into DATA (must not exist; *.noindex), MODE = d2 | default | d1clone
 #   pg18.sh start DATA [V1RUN]        exec `postgres -D DATA` directly (never pg_ctl: its /bin/sh would strip the
 #                                     V1 shim), detached; pid -> DATA.ftpid, log -> DATA.log; waits until ready
-#   pg18.sh seed  DATA ROWS           CREATE DATABASE p (the template) with t(ROWS rows), VACUUM ANALYZE, CHECKPOINT
+#   pg18.sh seed  DATA ROWS [AGE]     CREATE DATABASE p (the template) with t(ROWS rows) [aged], VACUUM ANALYZE, CHECKPOINT
 #   pg18.sh sql   DATA DB SQL         one statement through psql (prints rows unaligned)
 #   pg18.sh stop  DATA                SIGINT (fast shutdown) to the recorded pid only; waits for exit
 #
@@ -76,9 +76,15 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: pg18.sh seed DATA ROWS"
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
+  AGE=${4:-0}
   psqlc -d postgres -c "CREATE DATABASE p"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc -d p
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | psqlc -d p
+  psqlc -d p -c "CHECKPOINT"
+  # Aged parent (gate-6 review, t3run item 4; PREREG §7 / amendment 52): AGE committed single-row UPDATEs (psql
+  # autocommits each statement), the same stream for every system, then PG's documented maintenance.
+  [ "$AGE" -gt 0 ] && { "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc -d p; }
   psqlc -d p -c "VACUUM ANALYZE t" -c "CHECKPOINT"
+  echo "maintenance: CHECKPOINT; aged $AGE; VACUUM ANALYZE; CHECKPOINT"
   echo "seeded p.t rows=$(psqlc -d p -At -c 'SELECT count(*) FROM t') size=$(psqlc -d p -At -c "SELECT pg_size_pretty(pg_database_size('p'))")"
   ;;
 settings)
