@@ -245,15 +245,18 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
     summary = parse_summary(text)
     problems, blind = [], []
     stray = []  # strace's own stderr, minus a summary table: attach/ptrace errors and warnings land here
-    win = open(window).read() if window and os.path.exists(window) else ""
+    raw_win = open(window).read() if window and os.path.exists(window) else ""
+    launched = re.search(r"^cmd=", raw_win, re.M) is not None
+    # LOW 16: every field below is read from the window's own lines, never from a launch window's cmd= line, whose
+    # text is the traced command's (a 'strace_rc=0' or ' t0=...' token there used to mask or fake the real field)
+    win = "\n".join(ln for ln in raw_win.splitlines() if not ln.startswith("cmd="))
     attached = "attached_after_polls=" in win
-    launched = re.search(r"^cmd=", win, re.M) is not None
     if attached == launched:
         problems.append("window record missing or unrecognized (neither a proven attach nor a launch)")
     mm = re.search(r"^main=(\d+) ", win, re.M)
     main = mm.group(1) if mm else None
     detach = {k: v for k, v in re.findall(r"\b(strace_alive_at_detach|main_alive_at_detach)=(\d)", win)}
-    rc = re.search(r"\bstrace_rc=(\d+)", win)
+    rc = re.search(r"^strace_rc=(\d+)", win, re.M)  # it starts its line in both window kinds
     # strace exits 130 when the SIGINT detach ends an attach (616 of 616 attach windows, runs 37242277040 and
     # 37244177784); a launch window's strace exits with its command's status, which must be 0 (second review, 7).
     want_rc = "130" if attached else "0"
