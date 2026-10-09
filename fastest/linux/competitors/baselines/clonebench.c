@@ -538,6 +538,7 @@ static int cmp_rec(const void *a, const void *b) {
 
 static int cmd_run(int argc, char **argv) {
     const char *out = NULL, *v1run = NULL;
+    int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops may not be mixed */
     MODE_B0 = -1;
     OP_M1 = -1;
     for (int i = 0; i < argc; i++) {
@@ -552,7 +553,7 @@ static int cmd_run(int argc, char **argv) {
         else if (!strcmp(a, "--max-ops") && v) MAX_OPS = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-ops") && v) WARM_OPS = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
         else if (!strcmp(a, "--max-window-s") && v) MAXWIN_S = atof(argv[++i]);
         else if (!strcmp(a, "--warmup") && v) {
             unsigned long long wo; double ws, wm; char extra;
@@ -560,7 +561,7 @@ static int cmd_run(int argc, char **argv) {
                 fprintf(stderr, "clonebench run: --warmup OPS:S:MAX_S (got %s)\n", v); return 2;
             }
             WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
-            snprintf(WARM_RULE, sizeof WARM_RULE, "%s", v);
+            warm_rule_flag = 1;
             i++;
         }
         else if (!strcmp(a, "--hold-us") && v) HOLD_US = strtoull(argv[++i], NULL, 10);
@@ -576,6 +577,11 @@ static int cmd_run(int argc, char **argv) {
     }
     if (MODE_B0 < 0 || OP_M1 < 0 || SYNC_D0 < 0 || !PARENT || !BDIR || !out || C < 1 || (!MAX_OPS && DUR_S <= 0 && !MIN_OPS)) {
         fprintf(stderr, "usage: clonebench run --mode b1|b0 --op m1c|m1 --parent DB --dir D --clients C --out O (--max-ops N | --duration-s S)\n");
+        return 2;
+    }
+    if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
+        fprintf(stderr, "clonebench: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops (the effective warm-up and "
+                        "the recorded rule would differ)\n");
         return 2;
     }
     if (OP_M1 && ROWS < 1) { fprintf(stderr, "clonebench: --op m1 needs --rows (the parent's row count)\n"); return 2; }
@@ -747,7 +753,8 @@ static int cmd_run(int argc, char **argv) {
         fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
                 tm0 / 1e9 + off, tm1 / 1e9 + off, tp_tm0, tp_tm1);
     }
-    if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:0:0", (unsigned long long)WARM_OPS);
+    /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
+    snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_ops\":%llu,\"warmup_s\":%.6f,", WARM_RULE, (unsigned long long)g_warm,
             tm0 > t_start ? (tm0 - t_start) / 1e9 : 0.0);
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"

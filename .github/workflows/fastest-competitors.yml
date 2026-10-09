@@ -134,7 +134,9 @@ jobs:
       # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used. An empty input also gives
       # 1000:10:2 (the `||` default); pass 1000:10:180 for the registered rule. That cap is accepted for SMOKE only
       # (lead ruling, artie DECISIONS 6b0bef481b): these jobs say so with FT_DRY=1, and run_system.sh refuses the cap
-      # on a real run (FT_DRY=0, its default; the build job's plant proves it).
+      # on a real run (FT_DRY=0, its default; the build job's plant proves it). A clean cell warmed up by any rule but
+      # rule(FT_CAP_S) gets timed.json verdict 'ok-smoke-warmup', never 'ok', and reduce.py accepts it only from a
+      # dry=1 job (lead review 62430d8bf..b49fb656a MED 7).
       FT_CAP_S: ${{ inputs.cap_s || '1800' }}
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
       FT_DRY: "1"

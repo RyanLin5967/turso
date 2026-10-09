@@ -16,7 +16,9 @@ What SHOULD be there is never taken from what is there (review finding 11):
 A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
   JOBS     artifact, firecheck verdict, functional verdict, failed functional lines
-  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok)
+  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok; 'ok-smoke-warmup' is ok
+           only in a smoke job, run-info dry=1)
+  PARAMS   one line: the run's one cap_s and warm-up rule, or why the jobs differ (MED 7)
   FIXTURE  one line: the run's one parent fixture, or why the jobs' fixtures differ
   DRIVES   artifact, drive class (drive.py CLASSES), whether a flush reaches the drive (no filesystem in the chain
            mounted nobarrier), disks, device chain
@@ -73,6 +75,16 @@ def refuse(msg):
     """The expectation itself cannot be determined: say why and exit 2 (the docstring's promise; sys.exit(str) is 1)."""
     print(msg, file=sys.stderr)
     sys.exit(2)
+
+
+def run_param(job_dir, key):
+    """KEY=VALUE from the job's run/run-info.txt first line (run_system.sh's), or None."""
+    try:
+        first = open(os.path.join(job_dir, "run", "run-info.txt")).readline()
+    except OSError:
+        return None
+    m = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", first)
+    return m.group(1) if m else None
 
 
 def last_line(path, prefix):
@@ -206,9 +218,23 @@ def main(argv):
                 tv = json.load(open(tj)).get("verdict")
             except (OSError, ValueError) as e:
                 tv = f"MISSING ({e.__class__.__name__})"
-            if tv != "ok":
+            # MED 7: 'ok-smoke-warmup' (a clean cell warmed up by the CI smoke cap, not the registered rule) stands
+            # only in a smoke job (run-info dry=1); a real run needs 'ok'
+            if tv != "ok" and not (tv == "ok-smoke-warmup" and run_param(a, "dry") == "1"):
                 print(f"TIMED\t{name}\t{cell}\t{tv}")
                 bad += 1
+    # MED 7: one cap and one warm-up rule for every job of the run (each job's run/run-info.txt)
+    params = {}
+    for name in names:
+        if name in present:
+            params.setdefault((run_param(os.path.join(d, name), "cap_s"), run_param(os.path.join(d, name), "warmup")),
+                              []).append(name)
+    if len(params) != 1 or None in {v for k in params for v in k}:
+        print("PARAMS\tall jobs\tREFUSED: the jobs ran with different (cap_s, warmup) or recorded none: "
+              + "; ".join(f"{k} on {len(v)} job(s)" for k, v in params.items()))
+        bad += 1
+    else:
+        print(f"PARAMS\tall jobs\tone cap and rule: cap_s={next(iter(params))[0]} warmup={next(iter(params))[1]}")
     # One parent fixture for every system of the run (gate-6 review, t3run item 4): every present job's
     # run/fixture.json must name the same rows, aging, live branches and generator digest (fixture.py compare).
     fxs = []

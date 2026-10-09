@@ -119,7 +119,8 @@ def tracer_problems(path, summary):
 def rule(cap_s):
     """PREREG :210: warm-up = min(max(1000 ops, 10 s), 10% of the cap), as "OPS:S:MAX_S" for --warmup."""
     m = float(cap_s) / 10
-    return "1000:10:%s" % (("%d" % m) if m == int(m) else ("%.3f" % m))
+    # %g, as bbload and clonebench format their recorded warmup_rule from the effective values (MED 7)
+    return "1000:10:%s" % (("%d" % m) if m == int(m) else ("%g" % m))
 
 
 def ops(c, n1, n4, total=""):
@@ -257,14 +258,22 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
 
 
 def final_verdict(why, warm_rule=None, cap=None):
-    """RED stub: ignores the rule."""
-    return "ok" if not why else "REFUSED: " + "; ".join(why)
+    """MED 7: 'ok' only for a clean cell whose rule is the REGISTERED one at its cap, rule(CAP), compared as an exact
+    string; a clean cell warmed up by any other rule (the CI smoke cap) is 'ok-smoke-warmup', never 'ok'."""
+    if why:
+        return "REFUSED: " + "; ".join(why)
+    try:
+        registered = rule(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        registered = None
+    return "ok" if registered is not None and warm_rule == registered else "ok-smoke-warmup"
 
 
-def write_verdict(celldir, n, why):
+def write_verdict(celldir, n, why, warm_rule=None, cap=None):
     lab = load(os.path.join(celldir, "bb", "summary.json")) or {}
     t = load(os.path.join(celldir, "timed", "summary.json")) or {}
-    out = {"verdict": "ok" if not why else "REFUSED: " + "; ".join(why), "latency_file": "timed/raw.tsv",
+    out = {"verdict": final_verdict(why, warm_rule, cap), "latency_file": "timed/raw.tsv", "warmup_rule": warm_rule,
+           "registered_rule": rule(cap) if cap is not None else None,
            "labelling_dir": "bb", "ops_total": n,
            "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
            "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)},
@@ -523,8 +532,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 7 and sys.argv[1] == "check":
         n = int(sys.argv[3])
         why = check(sys.argv[2], n, sys.argv[4], sys.argv[5], sys.argv[6])
-        print(json.dumps(write_verdict(sys.argv[2], n, why)))
-        sys.exit(0 if not why else 1)
+        print(json.dumps(write_verdict(sys.argv[2], n, why, sys.argv[4], sys.argv[6])))
+        sys.exit(0 if not why else 1)  # ok and ok-smoke-warmup both exit 0; reduce.py tells them apart
     if len(sys.argv) == 3 and sys.argv[1] == "tier":  # SUMMARY.JSON: run_system.sh's cap plants (MED 5)
         print(tier(load(sys.argv[2])) or "failed")
         sys.exit(0)

@@ -436,6 +436,15 @@ cap_plants() {
   expect "warm-up plant --warmup 1000:1:0: rc|warmup_ops >= 1000|warmup_s >= 1" \
     "$rc|$(python3 -B -c 'import json, sys; s = json.load(open(sys.argv[1])); print(s.get("warmup_ops", -1) >= 1000, s.get("warmup_s", -1) >= 1.0)' "$d/summary.json" 2>/dev/null | tr ' ' '|')" \
     "0|True|True"
+  # MED 7: --warmup with a legacy flag is refused (rc 2), and the recorded rule is the EFFECTIVE one
+  d="$RAW/plants/warmup-mixed" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
+    --warmup 1000:10:180 --warmup-ops 20 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant --warmup 1000:10:180 --warmup-ops 20: refused (rc)" "$rc" 2
+  d="$RAW/plants/warmup-legacy" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
+    --warmup-ops 20 --warmup-s 0 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant --warmup-ops 20 alone: rc|recorded warmup_rule" "$rc|$(jf "$d/summary.json" warmup_rule)" "0|20:0:0"
 }
 # designate SPEC -- after the cells: ONE op of SPEC (C=1, no warm-up) with its after-steps skipped, so its branch
 # stays for the functional checks to read (the isolation read, the clone proof); prints the branch name. Untraced,

@@ -5,7 +5,9 @@
  *          [--warmup-s S] [--warmup-ops N]           warm-up ends when both are reached (default 0, 0)
  *          [--warmup OPS:S:MAX_S]                    the same, ending at MAX_S at the latest (0: no limit); PREREG
  *                                                    :210 is min(max(1000 ops, 10 s), 10% of the cap), e.g. 1000:10:180
- *                                                    at an 1800 s cap. Recorded verbatim as summary.json warmup_rule.
+ *                                                    at an 1800 s cap. summary.json warmup_rule is formatted from
+ *                                                    the effective values (%llu:%g:%g); mixing it with --warmup-ops
+ *                                                    or --warmup-s is refused (rc 2; MED 7)
  *          [--duration-s S] [--min-ops N]            the measured window ends when both are reached
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
  *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
@@ -678,6 +680,7 @@ static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) 
 
 int main(int argc, char **argv) {
     const char *specp = NULL, *out = NULL, *v1run = NULL;
+    int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops/--warmup-s may not be mixed */
 #ifdef __APPLE__
     mach_timebase_info(&TB);
 #endif
@@ -689,15 +692,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
         else if (!strcmp(a, "--mode") && v) { OPEN_LOOP = !strcmp(v, "open"); if (strcmp(v, "open") && strcmp(v, "closed")) { fprintf(stderr, "bbload: --mode closed|open\n"); return 2; } i++; }
         else if (!strcmp(a, "--rate") && v) RATE = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-s") && v) WARM_S = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-ops") && v) WARM_OPS = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warmup-s") && v) { WARM_S = atof(argv[++i]); warm_legacy = 1; }
+        else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
         else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S */
             unsigned long long wo; double ws, wm; char extra;
             if (sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || ws < 0 || wm < 0) {
                 fprintf(stderr, "bbload: --warmup OPS:S:MAX_S (got %s)\n", v); return 2;
             }
             WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
-            snprintf(WARM_RULE, sizeof WARM_RULE, "%s", v);
+            warm_rule_flag = 1;
             i++;
         }
         else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
@@ -736,6 +739,11 @@ int main(int argc, char **argv) {
         } else { fprintf(stderr, "bbload: bad argument %s (see the header of bbload.c)\n", a); return 2; }
     }
     if (!specp || !out || C < 1) { fprintf(stderr, "usage: bbload --spec FILE --out DIR --clients C ...\n"); return 2; }
+    if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
+        fprintf(stderr, "bbload: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops/--warmup-s (the effective "
+                        "warm-up and the recorded rule would differ)\n");
+        return 2;
+    }
     if (OPEN_LOOP && RATE <= 0) { fprintf(stderr, "bbload: open loop needs --rate > 0\n"); return 2; }
     if (OPEN_LOOP && MAX_OPS) { fprintf(stderr, "bbload: --max-ops is closed-loop only\n"); return 2; }
     if (DUR_S <= 0 && MIN_OPS == 0 && MAX_OPS == 0) { fprintf(stderr, "bbload: set --duration-s, --min-ops or --max-ops\n"); return 2; }
@@ -928,7 +936,8 @@ int main(int argc, char **argv) {
         fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
                 g_tm0 / 1e9 + off, g_tm1 / 1e9 + off, g_tp_tm0, g_tp_tm1);
     }
-    if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:0", (unsigned long long)WARM_OPS, WARM_S);
+    /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
+    snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
