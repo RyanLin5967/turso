@@ -713,6 +713,24 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<()>;
 
+    /// `write_frame_raw`, the WAL header's sync (after a truncation) reporting a failure to
+    /// `pager`'s branch store at once, as every other WAL-internal sync does (engine review 17 LOW
+    /// 10; `Pager::wal_insert_frame`). The default reports nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn write_frame_raw_watched(
+        &self,
+        pager: &Pager,
+        buffer_pool: Arc<BufferPool>,
+        frame_id: u64,
+        page_id: u64,
+        db_size: u64,
+        page: &[u8],
+        sync_type: FileSyncType,
+    ) -> Result<()> {
+        let _ = pager;
+        self.write_frame_raw(buffer_pool, frame_id, page_id, db_size, page, sync_type)
+    }
+
     /// Prepare WAL header for the future append
     /// Most of the time this method will return Ok(None)
     fn prepare_wal_start(&self, page_sz: PageSize) -> Result<Option<Completion>>;
@@ -3874,6 +3892,36 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
+    }
+
+    /// The WAL's header written and synced first when the WAL was truncated, its sync watched
+    /// (engine review 17 LOW 10): a failure at issue goes through `watched`, a failed completion to
+    /// the same at-risk decision; then `write_frame_raw`, which finds the header in place. Mutant
+    /// `raw_header_sync_unwatched` (test builds only): neither reported, as before.
+    #[allow(clippy::too_many_arguments)]
+    fn write_frame_raw_watched(
+        &self,
+        pager: &Pager,
+        buffer_pool: Arc<BufferPool>,
+        frame_id: u64,
+        page_id: u64,
+        db_size: u64,
+        page: &[u8],
+        sync_type: FileSyncType,
+    ) -> Result<()> {
+        if let Some(page_size) = PageSize::new(page.len() as u32) {
+            if let Some(c) = self.prepare_wal_start(page_size)? {
+                self.io.wait_for_completion(c)?;
+                let c = self.watched("raw_header_sync_unwatched", pager, self.prepare_wal_finish(sync_type))?;
+                if let Err(e) = self.io.wait_for_completion(c) {
+                    if !crate::branch::store::fe_mutant("raw_header_sync_unwatched") {
+                        pager.trunk_wal_sync_failed();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.write_frame_raw(buffer_pool, frame_id, page_id, db_size, page, sync_type)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

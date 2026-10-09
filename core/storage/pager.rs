@@ -5170,7 +5170,10 @@ impl Pager {
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
 
-        wal.write_frame_raw(
+        // The WAL header's sync, after a truncation, is a trunk-file sync like any other: watched
+        // (engine review 17 LOW 10).
+        wal.write_frame_raw_watched(
+            self,
             self.buffer_pool.clone(),
             frame_no,
             header.page_number as u64,
