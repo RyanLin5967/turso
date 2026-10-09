@@ -20,12 +20,15 @@
 #   pg18.sh sql   DATA DB SQL         one statement through psql (prints rows unaligned)
 #   pg18.sh stop  DATA                SIGINT (fast shutdown) to the recorded pid only; waits for exit
 #
-# MODE d2      : wal_sync_method=fsync_writethrough (F_FULLFSYNC), fsync=on, full_page_writes=on,
-#                synchronous_commit=on, file_copy_method=clone  (PREREG §4 "Competitor D2 settings")
-# MODE default : PostgreSQL's own defaults (wal_sync_method=open_datasync = D1 on macOS, file_copy_method=copy)
-# MODE d1clone : defaults plus file_copy_method=clone (isolates durability from the copy method; report only)
-# All modes: listen 127.0.0.1:PORT, no Unix socket (the scratch path exceeds sun_path), max_connections=1100
-# (C up to 1024 plus spare), trust auth for user postgres. Branch op: CREATE DATABASE b TEMPLATE p STRATEGY=FILE_COPY.
+# MODE d2      : (the Linux port, LOW 23: the Mac's fsync_writethrough does not exist here) wal_sync_method=fdatasync,
+#                fsync=on, full_page_writes=on, synchronous_commit=on, file_copy_method=clone (PREREG §4 "Competitor
+#                D2 settings")
+# MODE default : PostgreSQL's own defaults for the settings above (on Linux wal_sync_method=fdatasync already;
+#                file_copy_method=copy); not a Linux run system (pg18-defaults is dropped, ruling 6b0bef481b)
+# MODE d1clone : defaults plus file_copy_method=clone (on Linux the same server as d2; report only)
+# All modes: shared_buffers = 25% of MemTotal (gate-6 item 15; initdb's 128 MB is NOT a default here), listen
+# 127.0.0.1:PORT, no Unix socket (the scratch path exceeds sun_path), max_connections=1100 (C up to 1024 plus spare),
+# trust auth for user postgres. Branch op: CREATE DATABASE b TEMPLATE p STRATEGY=FILE_COPY.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 cmd=${1:-}; DATA=${2:-}

@@ -123,6 +123,19 @@ def main(rundir, c):
                 b = fmt(load(rundir, system, runner, fs, wspec, c), key) if wspec else "—"
                 cells.append(f"{a} / {b}")
             print(f"| {sysl} | {var} | " + " | ".join(cells) + " |")
+    # LOW 23: the PG rows' buffer pool, per job (pg_settings.tsv: shared_buffers in 8kB pages, the server's NBuffers)
+    print(f"\n#### PostgreSQL 18 shared_buffers per job (pg_settings; 25% of MemTotal since gate-6 item 15)\n")
+    print("| Job | " + " | ".join(h for _, _, h in COLS) + " |")
+    print("|---|" + "---|" * len(COLS))
+    vals = []
+    for runner, fs, _ in COLS:
+        p = os.path.join(rundir, f"competitors-pg18-d2-{runner}-{fs}", "run", "pg_settings.tsv")
+        try:
+            row = next(ln.rstrip("\n").split("\t") for ln in open(p) if ln.startswith("shared_buffers\t"))
+            vals.append(f"{row[1]} x 8 kB = {int(row[1]) * 8 // 1024} MB")
+        except (OSError, StopIteration, ValueError, IndexError):
+            vals.append("MISSING")
+    print("| pg18-d2 | " + " | ".join(vals) + " |")
     print(f"\n#### PostgreSQL 18 deferred flushes per cycle at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
     print("| Job | Spec | " + " | ".join(h for _, _, h in COLS) + " |")
     print("|---|---|" + "---|" * len(COLS))
