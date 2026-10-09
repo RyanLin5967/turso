@@ -371,6 +371,81 @@ def self_test():
                   "PASS, nothing FAILs: regression_green false",
                   v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") != "PASS"
                   and "FAIL" not in v.values() and not regression_green(rows)))
+
+    def guarded(fn):
+        """A case whose subject raises is that case's FAIL, never a crash of the whole self-test."""
+        try:
+            return fn()
+        except Exception as e:
+            print(f"self-test note: {type(e).__name__}: {e}")
+            return False
+
+    def by_id(rows):
+        return {r[0]: r for r in rows}
+
+    # review 7b: only a base built in this job produced syscalls-vs-base, so a base sha that would not build (or a lost
+    # base run) left the premise unevaluated on every later push and the baseline never advanced. With no in-job base,
+    # both regression gates compare against the baseline artifact's own numbers, which name the sha and cpu they came
+    # from (artifact 11570831049: sha 60753525a, cpu "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz").
+    art_sha = "60753525a41446b4c67209397a596cf014a20be0"
+    art = {"sha": art_sha, "cpu": "cpu-A", "ir_create": 1000.0,
+           "create_syscalls_per_op": {"fsync": 1.0, "futex": 1.0, "pwrite64": 1.0}}
+
+    def case_artifact_runs():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art, cpu="cpu-A")
+        r = by_id(rows)
+        sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
+        return (sv is not None and sv[3] == "PASS" and art_sha in sv[1]
+                and ins is not None and ins[3] == "PASS" and art_sha in ins[1] and regression_green(rows))
+    cases.append(("review 7b: no in-job base, the artifact present: syscalls-vs-base/full-snap-c1 and instructions both "
+                  "compare against it (PASS, labelled with its sha) and regression_green is true",
+                  guarded(case_artifact_runs)))
+
+    def case_artifact_catches():
+        hb = arm_of(trace(1), 10)
+        hb["strace"]["windows"]["create"]["syscalls_per_op"]["fstat"] = 1.0
+        sv = by_id(gates({"full-snap-c1": hb}, None, budget, art, cpu="cpu-A")).get("syscalls-vs-base/full-snap-c1")
+        return sv is not None and sv[3] == "FAIL" and "fstat" in sv[2]
+    cases.append(("review 7b: a new syscall per create against the artifact FAILs (the comparison runs)",
+                  guarded(case_artifact_catches)))
+
+    def case_artifact_other_cpu():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art, cpu="cpu-B")
+        r = by_id(rows)
+        sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
+        return (sv is not None and sv[3] == "FAIL" and "cpu" in sv[2] and "cpu-B" in sv[2]
+                and ins is not None and ins[3] == "FAIL" and "cpu" in ins[2] and not regression_green(rows))
+    cases.append(("review 7b: an artifact from a different cpu is refused: both regression gates FAIL naming the cpu, "
+                  "regression_green false", guarded(case_artifact_other_cpu)))
+
+    def case_artifact_unlabelled():
+        out = []
+        for a, cpu in ((dict(art, cpu=None), "cpu-A"), (art, None), (dict(art, sha=None), "cpu-A"),
+                       ({k: x for k, x in art.items() if k != "cpu"}, "cpu-A")):
+            r = by_id(gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, a, cpu=cpu))
+            out.append(r.get("syscalls-vs-base/full-snap-c1", ("", "", "", "absent"))[3] == "FAIL"
+                       and r.get("instructions/create", ("", "", "", "absent"))[3] == "FAIL")
+        return all(out) and len(out) == 4
+    cases.append(("review 7b: an artifact without a cpu or a sha, or a runner without a cpu, is refused (both FAIL)",
+                  guarded(case_artifact_unlabelled)))
+
+    def case_artifact_no_syscalls():
+        a = {k: x for k, x in art.items() if k != "create_syscalls_per_op"}
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, a, cpu="cpu-A")
+        sv = by_id(rows).get("syscalls-vs-base/full-snap-c1")
+        return sv is not None and sv[3] == "FAIL" and not regression_green(rows)
+    cases.append(("review 7b: an artifact without create_syscalls_per_op is refused, regression_green false",
+                  guarded(case_artifact_no_syscalls)))
+
+    def case_injob_outranks():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": arm_of(trace(1), 10)}, budget,
+                     dict(art, cpu="cpu-B"), cpu="cpu-A")
+        r = by_id(rows)
+        sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
+        return (sv is not None and sv[3] == "PASS" and "base built in this job" in sv[1] and art_sha not in sv[1]
+                and ins is not None and ins[3] == "PASS" and "base built in this job" in ins[1] and regression_green(rows))
+    cases.append(("review 7b: an in-job base outranks the artifact (a different-cpu artifact is never consulted)",
+                  guarded(case_injob_outranks)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
