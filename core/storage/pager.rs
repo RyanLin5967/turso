@@ -3514,8 +3514,6 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        #[cfg(test)]
-        crate::branch::budget_probe::wal_write_unlocked();
         wal.end_write_tx();
     }
 

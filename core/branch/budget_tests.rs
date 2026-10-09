@@ -707,7 +707,8 @@ impl Drop for SchemaHoldDisarm {
 ///   `*_control`: the same ALTER has finished first.
 ///
 /// The fork runs on a thread of its own, so a fork that waits for the parked commit is released
-/// after 30 s instead of hanging the cell (`waited_for_ddl`). Each sample also carries the
+/// after 30 s instead of hanging the cell (`waited_for_ddl`); the store's own condition-variable
+/// waits on that thread are counted too (`store_waits`, `store::thread_waits`). Each sample also carries the
 /// reference for one scan: the schema's row count (`schema_table_rows`) and the pages one plain
 /// `SELECT * FROM sqlite_schema` reads on a fresh connection (`ref_scan_page_reads`).
 fn schema_window(cell: &str, tables: u64, out: &mut String) {
@@ -761,10 +762,12 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                 let fork = {
                     let forker = forker.clone();
                     std::thread::spawn(move || {
-                        let c0 = probe::sql_counts();
+                        let (c0, w0) = (probe::sql_counts(), super::store::thread_waits());
                         let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
-                        let c1 = probe::sql_counts();
-                        (made, sql_sample(&c0, &c1))
+                        let (c1, w1) = (probe::sql_counts(), super::store::thread_waits());
+                        let mut s = sql_sample(&c0, &c1);
+                        s.insert("store_waits", delta(w0, w1));
+                        (made, s)
                     })
                 };
                 let t = std::time::Instant::now();
@@ -1499,7 +1502,7 @@ fn the_budget_counters_count_exactly_what_was_done() {
     let rows = get("fc_sql_reparse", "schema_table_rows");
     assert!(rows >= 2, "premise: sqlite_schema has rows ({rows})");
     assert_eq!(get("fc_sql_reparse", "schema_rows"), rows, "a schema re-read parses every sqlite_schema row once");
-    assert!(get("fc_sql_reparse", "prepares") >= 1, "a schema re-read prepared no statement");
+    assert_eq!(get("fc_sql_reparse", "prepares"), 1, "a schema re-read prepares its one sqlite_schema scan");
     assert_eq!(get("fc_sql_reparse", "wal_locks"), 0, "a schema re-read under a read transaction took the WAL write lock");
     assert_eq!(get("fc_sql_insert", "wal_locks"), 1, "an autocommit INSERT took the WAL write lock once");
     assert!(get("fc_sql_insert", "wal_page_reads") >= 1, "an INSERT read no page under the WAL write lock");
@@ -2406,6 +2409,17 @@ fn schema_min(c: &CellData, op: &str, key: &str) -> u64 {
     values(c, op, &quiet(c, op), key).into_iter().min().unwrap()
 }
 
+/// Each schema-window sample's premise of its path: a `first_*` fork took a WAL write lock once (the
+/// trunk's first child forks under it), a `lockfree_*` one none. A failure line per sample that is not
+/// the path its op names.
+fn schema_path_premise(c: &CellData, op: &str, failures: &mut String) {
+    let want = u64::from(op.starts_with("first"));
+    let v = values(c, op, &quiet(c, op), "wal_locks");
+    if v.iter().any(|&x| x != want) {
+        let _ = writeln!(failures, "  {}: {op}.wal_locks = {v:?}; premise: {want} (the path the op names)", c.name);
+    }
+}
+
 /// Engine 2b (00340537c's own claim: "Cost: one sqlite_schema scan, only on a fork that meets the
 /// window ...; 0 otherwise"): a fork that meets no DDL commit's schema window re-reads nothing — no
 /// statement prepared and no schema row parsed, on the first-child path and the lock-free one, at
@@ -2420,6 +2434,7 @@ fn a_fork_outside_a_schema_window_rereads_nothing() {
         let mut pages = Vec::new();
         for (spec, _) in SCHEMA_TABLES {
             let c = cell(spec);
+            schema_path_premise(&c, op, &mut failures);
             let samples = quiet(&c, op);
             for k in ["prepares", "schema_rows"] {
                 let v = values(&c, op, &samples, k);
@@ -2454,11 +2469,17 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
         let (op, control) = (format!("{path}_window"), format!("{path}_control"));
         for (spec, _) in SCHEMA_TABLES {
             let c = cell(spec);
+            schema_path_premise(&c, &op, &mut failures);
+            schema_path_premise(&c, &control, &mut failures);
             let base = |k: &str| schema_min(&c, &control, k);
+            let control_waits = values(&c, &control, &quiet(&c, &control), "store_waits").into_iter().max().unwrap();
             for (i, s) in quiet(&c, &op).into_iter().enumerate() {
                 let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
                 if s["waited_for_ddl"] != 0 {
                     let _ = writeln!(failures, "  {spec}: {op} #{i}: the fork waited for the parked DDL commit (released after 30 s)");
+                }
+                if s["store_waits"] > control_waits {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {} store waits against the control's at most {control_waits}; budget no more", s["store_waits"]);
                 }
                 if s["prepares"] != base("prepares") + 1 {
                     let _ = writeln!(failures, "  {spec}: {op} #{i}: prepares {} against the control's {}; budget control + 1", s["prepares"], base("prepares"));
@@ -2477,10 +2498,11 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
 
 /// Engine 2b ("the re-read runs under the WAL write lock on the first-child path"): the first-child
 /// fork takes the trunk's WAL write lock once and the lock-free one never does (each sample's
-/// premise of its path); inside the window, the work added under the lock is the re-read alone —
-/// one statement and the schema's rows — and outside it the work under the lock does not grow with
-/// the tables. The re-read under the lock is O(tables) by construction: this budget bounds it to
-/// one scan, it does not forbid it (no ruling covers the WAL write lock's hold).
+/// premise of its path); inside the window, the work added under the lock is at most the re-read —
+/// one statement and the schema's rows, or nothing if the re-read moves off the lock — and outside
+/// it the work under the lock does not grow with the tables. The re-read under the lock is
+/// O(tables) by construction: this budget bounds it to one scan, it does not forbid it (no ruling
+/// covers the WAL write lock's hold).
 #[test]
 fn a_schema_window_reread_runs_under_the_wal_write_lock_only_on_the_first_child_path() {
     if in_child() {
@@ -2506,11 +2528,11 @@ fn a_schema_window_reread_runs_under_the_wal_write_lock_only_on_the_first_child_
         }
         let base = |k: &str| schema_min(&c, "first_control", k);
         for (i, s) in quiet(&c, "first_window").into_iter().enumerate() {
-            if s["wal_prepares"] != base("wal_prepares") + 1 {
-                let _ = writeln!(failures, "  {spec}: first_window #{i}: prepares under the WAL write lock {} against the control's {}; budget control + 1", s["wal_prepares"], base("wal_prepares"));
+            if s["wal_prepares"] > base("wal_prepares") + 1 {
+                let _ = writeln!(failures, "  {spec}: first_window #{i}: prepares under the WAL write lock {} against the control's {}; budget <= control + 1", s["wal_prepares"], base("wal_prepares"));
             }
-            if s["wal_schema_rows"] != base("wal_schema_rows") + s["schema_table_rows"] {
-                let _ = writeln!(failures, "  {spec}: first_window #{i}: schema rows under the WAL write lock {} against the control's {}; budget control + {}", s["wal_schema_rows"], base("wal_schema_rows"), s["schema_table_rows"]);
+            if s["wal_schema_rows"] > base("wal_schema_rows") + s["schema_table_rows"] {
+                let _ = writeln!(failures, "  {spec}: first_window #{i}: schema rows under the WAL write lock {} against the control's {}; budget <= control + {}", s["wal_schema_rows"], base("wal_schema_rows"), s["schema_table_rows"]);
             }
         }
         control_under_lock.push((spec, base("wal_page_reads"), base("wal_prepares"), base("wal_schema_rows")));
