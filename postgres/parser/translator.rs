@@ -5471,6 +5471,9 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
 /// Extracted COPY FROM statement info for use by the connection layer.
 #[derive(Debug, Clone)]
 pub struct PgCopyFromStmt {
+    /// The statement has a WHERE, which this COPY does not read: it is refused (wire review 13
+    /// item 9: every row was imported).
+    pub has_where: bool,
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
@@ -5549,6 +5552,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     }
 
     Some(PgCopyFromStmt {
+        has_where: copy.where_clause.is_some(),
         table_name,
         schema_name,
         columns,

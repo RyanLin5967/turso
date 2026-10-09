@@ -1536,7 +1536,7 @@ impl Session {
         let (mut stmt, types) = match described {
             Some(kept) => kept,
             None => conn
-                .prepare_typed(sql)
+                .prepare_typed(sql, portal.is_some())
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);

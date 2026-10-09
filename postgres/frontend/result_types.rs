@@ -173,6 +173,10 @@ const TEXT: u32 = 25;
 /// parameters' (see [`parameter_types`]).
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
+    /// Set by the caller, not the parse: whether a Bind supplies this statement's parameters (the
+    /// extended protocol). A statement performed at prepare is refused when it holds a parameter,
+    /// 42P02 without a Bind and 0A000 with one (wire review 13 item 9).
+    pub bound: bool,
     pub columns: Vec<Option<u32>>,
     /// The type OID of each $n its context types, by n; one missing is untyped (text, as
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
