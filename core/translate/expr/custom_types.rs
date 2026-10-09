@@ -1105,4 +1105,102 @@ mod tests {
             assert!(matches!(got, Ok(0)), "{sql} bound NULL gave {got:?}");
         }
     }
+
+    /// Engine review 16 MED 10: since 2fa04254c an operand qualifies for a custom type's operator
+    /// if it is a compatible literal or ANY constant, so only a bare literal is type-checked:
+    /// `v = ('abc')`, `v = CAST('abc' AS TEXT)` and `v = 'ab' || 'c'` reach numeric_eq on an
+    /// integer-valued type and raise, where `v = 'abc'` (a text literal, not the type's value
+    /// input) takes the plain comparison and answers no row; and `w = 'ABC' COLLATE NOCASE` reaches
+    /// the type's operator, which drops the collation. An operand is checked through its
+    /// parentheses, its sign and a CAST's target type; a COLLATE operand takes the plain
+    /// comparison, which honours it. Mutant `operand_any_constant`.
+    #[test]
+    fn an_operand_qualifies_for_a_types_operator_by_its_own_type() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pint(value integer) BASE integer ENCODE value DECODE value OPERATOR '=' \
+             numeric_eq",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v pint, w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5, 'abc')").unwrap();
+        let plain = count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None);
+        assert!(
+            matches!(plain, Ok(0)),
+            "premise: a text literal takes the plain comparison: {plain:?}"
+        );
+        for operand in ["('abc')", "(('abc'))", "CAST('abc' AS TEXT)", "'ab' || 'c'"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE v = {operand}"),
+                None,
+            );
+            assert!(
+                matches!(got, Ok(0)),
+                "v = {operand} answered {got:?}, where v = 'abc' answers Ok(0)"
+            );
+        }
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE w = 'b'", None), Ok(1)),
+            "premise: a text literal reaches tag's '=' (instr), which finds 'b' in 'abc'"
+        );
+        let collated = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE w = 'ABC' COLLATE NOCASE",
+            None,
+        );
+        assert!(
+            matches!(collated, Ok(1)),
+            "w = 'ABC' COLLATE NOCASE answered {collated:?}: the collation was dropped"
+        );
+    }
+
+    /// Engine review 16 MED 10's other half: the type check must not shut out an operand of the
+    /// type's value input type that is not a bare literal. A signed literal (`v = -1`, `v = (+7)`)
+    /// and a CAST to the value input type reach the type's operator; here '=' is `max`, which a
+    /// plain comparison is not (5 = -1 is false; max(5, -1) is 5, true). And numeric's operator
+    /// still compares `x = -1.5` with -1.50.
+    #[test]
+    fn a_signed_or_cast_operand_still_reaches_a_types_operator() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pmax(value integer) BASE integer ENCODE value DECODE value OPERATOR '=' \
+             max",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v pmax, x numeric(10, 2)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5, -1.50)").unwrap();
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE v = 1", None), Ok(1)),
+            "premise: a bare literal reaches pmax's '=' (max(5, 1) is true)"
+        );
+        for operand in ["-1", "(-1)", "(+7)", "- 3", "CAST(7 AS INTEGER)"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE v = {operand}"),
+                None,
+            );
+            assert!(
+                matches!(got, Ok(1)),
+                "v = {operand} answered {got:?}: it did not reach pmax's operator"
+            );
+        }
+        for (pred, want) in [("x = -1.5", 1), ("x = -1.509", 0), ("x = (-1.50)", 1)] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {pred}"), None);
+            assert!(
+                matches!(got, Ok(n) if n == want),
+                "{pred} on -1.50 answered {got:?}, not {want}"
+            );
+        }
+    }
 }
