@@ -4787,6 +4787,53 @@ fn a_parameter_is_typed_through_views_subqueries_and_stars() {
     );
 }
 
+/// A circular view is answered with an error and the server serves on. The inference walk opened a
+/// view by walking its query, which reached the view again: with no visited set it recursed until
+/// the session thread's 8 MiB stack overflowed, which aborts the process, every session with it,
+/// from one unauthenticated query with a parameter. The walk runs before translation, so the
+/// engine's own "circularly defined" refusal never ran (wire review 14 item 1). Three cycles: a
+/// view over itself, a pair, and a chain closed by dropping and re-creating its middle; each queried
+/// with an undeclared $1 by simple query, by Parse/Describe statement, and by Parse/Bind/Describe
+/// portal/Execute. The server is a spawned process, so an abort fails this test, not the harness.
+#[test]
+fn a_circular_view_is_an_error_and_the_server_serves_on() {
+    let dir = Scratch::new("circularview");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x INT)").ok("t");
+    a.q("INSERT INTO t VALUES (1)").ok("t row");
+    for sql in [
+        "CREATE VIEW s AS SELECT * FROM s",
+        "CREATE VIEW p1 AS SELECT * FROM p2",
+        "CREATE VIEW p2 AS SELECT * FROM p1",
+        "CREATE VIEW c1 AS SELECT x FROM t",
+        "CREATE VIEW c2 AS SELECT x FROM c1",
+        "DROP VIEW c1",
+        "CREATE VIEW c1 AS SELECT x FROM c2",
+    ] {
+        a.q(sql).ok(&format!("premise: {sql}"));
+    }
+    for view in ["s", "p1", "c1"] {
+        let sql = format!("SELECT * FROM {view} WHERE x = $1");
+        let replies = [
+            ("simple", a.q(&sql)),
+            ("Describe", a.describe_statement(&sql)),
+            ("Execute", a.xt(&sql, &[(0, 0, b"1")])),
+        ];
+        for (how, r) in replies {
+            assert!(r.error.is_some(), "{sql} by {how}: no error: {:?}", r.rows);
+            let mut b = server
+                .connect_to("postgres")
+                .unwrap_or_else(|e| panic!("{sql} by {how}: the server is gone: {e:?}"));
+            assert_eq!(
+                b.q("SELECT 1").single("a second session"),
+                "1",
+                "{sql} by {how}"
+            );
+        }
+    }
+}
+
 /// A recursive CTE's self-reference is typed by its non-recursive term, as PostgreSQL types it, so
 /// `x < $1` in the recursive term compares x (int4, from `SELECT 1`) with an int4 and the recursion
 /// stops at 10. The CTE was walked before it was in scope, so x was untyped, $1 bound as text, and
