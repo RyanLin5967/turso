@@ -227,6 +227,7 @@ pub use turso_pg_parser::MAX_PARAMETER;
 pub fn parameter_types(
     parse: &ParseResult,
     schema: &Schema,
+    search_path: &[String],
 ) -> (
     std::collections::BTreeMap<u32, u32>,
     std::collections::BTreeSet<u32>,
@@ -238,6 +239,7 @@ pub fn parameter_types(
         ctes: Vec::new(),
         views: Vec::new(),
         subselects: Default::default(),
+        search_path: search_path.to_vec(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -316,6 +318,9 @@ struct Infer<'a> {
     /// walks the subquery's FROM, which can hold scalar subqueries of its own, so unshared the
     /// walks would double with each level of nesting.
     subselects: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, Option<u32>>>>,
+    /// The session's search path, as SET search_path left it; empty is public alone
+    /// ([`Infer::main_relname`]).
+    search_path: Vec<String>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -414,6 +419,13 @@ impl Infer<'_> {
         }
     }
 
+    /// `node`, if it is a parameter, is one no context types: refused (42P18) unless declared.
+    fn refuse_untyped(&mut self, node: &PgNode) {
+        if let Some(n) = param(node) {
+            self.compared_untyped.insert(n);
+        }
+    }
+
     /// `node` stands where a condition stands: a bare parameter there is boolean.
     fn qual(&mut self, node: Option<&PgNode>, scope: &Scope) {
         if let Some(node) = node {
@@ -463,10 +475,11 @@ impl Infer<'_> {
             Some(Node::UpdateStmt(u)) => {
                 let ctes = self.with(u.with_clause.as_ref(), &scope);
                 if let Some(rel) = u.relation.as_ref() {
-                    let mut level = vec![self.range_var(rel)];
+                    let mut level = vec![self.target(rel)];
                     level.extend(self.from_items(&u.from_clause, &scope));
                     let inner = vec![level];
-                    self.set_targets(&u.target_list, &rel.relname, &inner);
+                    let relname = self.main_relname(&rel.schemaname, &rel.relname);
+                    self.set_targets(&u.target_list, relname.as_deref(), &inner);
                     self.qual(u.where_clause.as_deref(), &inner);
                     self.targets(&u.returning_list, &inner);
                 }
@@ -475,7 +488,7 @@ impl Infer<'_> {
             Some(Node::DeleteStmt(d)) => {
                 let ctes = self.with(d.with_clause.as_ref(), &scope);
                 if let Some(rel) = d.relation.as_ref() {
-                    let mut level = vec![self.range_var(rel)];
+                    let mut level = vec![self.target(rel)];
                     level.extend(self.from_items(&d.using_clause, &scope));
                     let inner = vec![level];
                     self.qual(d.where_clause.as_deref(), &inner);
@@ -543,6 +556,50 @@ impl Infer<'_> {
     /// relation of any other schema is not one this walk can open. The schema was dropped, so `s.t`
     /// was typed as public's t (wire review 11 item 3).
     fn range_var(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Rel {
+        self.relation(rv, true)
+    }
+
+    /// The table an INSERT, UPDATE or DELETE writes: a range variable read with no CTE lookup, as
+    /// PostgreSQL never resolves a DML target to a CTE; one of a CTE's name was typed from the CTE
+    /// (wire review 14 item 3).
+    fn target(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Rel {
+        self.relation(rv, false)
+    }
+
+    /// The main schema's name for the relation `schemaname.relname` names, as the engine resolves
+    /// it: public's and pg_catalog's relations keep their names and information_schema's views are
+    /// information_schema_<view>; an unqualified name is read along the session's search path,
+    /// public's relation of the name if public comes before any other schema there, or the name as
+    /// is when no path schema has it. None for a relation of any other schema, and for an
+    /// unqualified name a schema other than public would be searched for first: that is an
+    /// attached schema, which this walk cannot read, so the relation is one it cannot open. Every
+    /// relation was read in public alone, so a parameter into s.t, or into t after `SET
+    /// search_path TO s, public`, was typed from public.t and stored as public's type (wire review
+    /// 14 item 3).
+    fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
+        match schemaname.to_lowercase().as_str() {
+            "public" | "pg_catalog" => Some(relname.to_string()),
+            "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
+            "" => {
+                for entry in &self.search_path {
+                    if entry.eq_ignore_ascii_case("public") {
+                        if self.schema.get_table(relname).is_some()
+                            || self.schema.get_view(relname).is_some()
+                        {
+                            return Some(relname.to_string());
+                        }
+                    } else if !entry.eq_ignore_ascii_case("pg_catalog") {
+                        return None;
+                    }
+                }
+                Some(relname.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Infer::range_var`] and [`Infer::target`]: `ctes` false skips the CTE lookup.
+    fn relation(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar, ctes: bool) -> Rel {
         let name = rv
             .alias
             .as_ref()
@@ -551,16 +608,13 @@ impl Infer<'_> {
             Some(a) => rename(columns, &a.colnames),
             None => columns,
         };
-        let relname = match rv.schemaname.to_lowercase().as_str() {
-            "" => {
-                if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
-                    return Rel::derived(name, aliased(columns.clone()));
-                }
-                rv.relname.clone()
+        if ctes && rv.schemaname.is_empty() {
+            if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
+                return Rel::derived(name, aliased(columns.clone()));
             }
-            "public" | "pg_catalog" => rv.relname.clone(),
-            "information_schema" => format!("information_schema_{}", rv.relname.to_lowercase()),
-            _ => return Rel::Unknown { name },
+        }
+        let Some(relname) = self.main_relname(&rv.schemaname, &rv.relname) else {
+            return Rel::Unknown { name };
         };
         if self.schema.get_table(&relname).is_some() {
             return Rel::Table { name, relname };
@@ -605,6 +659,7 @@ impl Infer<'_> {
             ctes: Vec::new(),
             views,
             subselects: Default::default(),
+            search_path: self.search_path.clone(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -723,21 +778,46 @@ impl Infer<'_> {
         let Some(rel) = insert.relation.as_ref() else {
             return;
         };
-        let columns: Vec<Option<u32>> = if insert.cols.is_empty() {
-            self.schema
-                .get_btree_table(&rel.relname)
+        // The table written, as the engine resolves it; one this walk cannot read (another
+        // schema's) types nothing, and every value parameter is refused untyped (42P18) rather
+        // than typed from public's table of the name (wire review 14 item 3).
+        let relname = self.main_relname(&rel.schemaname, &rel.relname);
+        let columns: Vec<Option<u32>> = match &relname {
+            None => Vec::new(),
+            Some(relname) if insert.cols.is_empty() => self
+                .schema
+                .get_btree_table(relname)
                 .map(|t| t.columns().iter().map(column_oid).collect())
-                .unwrap_or_default()
-        } else {
-            insert
+                .unwrap_or_default(),
+            Some(relname) => insert
                 .cols
                 .iter()
                 .map(|c| match c.node.as_ref() {
-                    Some(Node::ResTarget(t)) => declared_type(self.schema, &rel.relname, &t.name),
+                    Some(Node::ResTarget(t)) => declared_type(self.schema, relname, &t.name),
                     _ => None,
                 })
-                .collect()
+                .collect(),
         };
+        if relname.is_none() {
+            if let Some(Node::SelectStmt(s)) =
+                insert.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+            {
+                for row in &s.values_lists {
+                    if let Some(Node::List(l)) = row.node.as_ref() {
+                        for item in &l.items {
+                            self.refuse_untyped(item);
+                        }
+                    }
+                }
+                for target in &s.target_list {
+                    if let Some(Node::ResTarget(t)) = target.node.as_ref() {
+                        if let Some(val) = t.val.as_deref() {
+                            self.refuse_untyped(val);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(Node::SelectStmt(s)) =
             insert.select_stmt.as_deref().and_then(|s| s.node.as_ref())
         {
@@ -759,15 +839,18 @@ impl Infer<'_> {
             }
             self.select(s, scope);
         }
-        let target = vec![vec![
-            self.range_var(rel),
-            Rel::Table {
+        let excluded = match &relname {
+            Some(relname) => Rel::Table {
                 name: "excluded".to_string(),
-                relname: rel.relname.clone(),
+                relname: relname.clone(),
             },
-        ]];
+            None => Rel::Unknown {
+                name: "excluded".to_string(),
+            },
+        };
+        let target = vec![vec![self.target(rel), excluded]];
         if let Some(c) = &insert.on_conflict_clause {
-            self.set_targets(&c.target_list, &rel.relname, &target);
+            self.set_targets(&c.target_list, relname.as_deref(), &target);
             self.qual(c.where_clause.as_deref(), &target);
         }
         self.targets(&insert.returning_list, &target);
@@ -775,12 +858,30 @@ impl Infer<'_> {
 
     /// UPDATE-style SET targets of `relname`: each value takes its column's type, a multi-column
     /// `SET (a, b) = ($1, $2)` element by element.
-    fn set_targets(&mut self, targets: &[PgNode], relname: &str, scope: &Scope) {
+    fn set_targets(&mut self, targets: &[PgNode], relname: Option<&str>, scope: &Scope) {
         for target in targets {
             let Some(Node::ResTarget(t)) = target.node.as_ref() else {
                 continue;
             };
             let Some(val) = t.val.as_deref() else {
+                continue;
+            };
+            // A table the walk cannot read (another schema's): its columns type nothing, and a
+            // parameter assigned to one is refused untyped (wire review 14 item 3).
+            let Some(relname) = relname else {
+                match val.node.as_ref() {
+                    Some(Node::MultiAssignRef(m)) => {
+                        if let Some(Node::RowExpr(row)) =
+                            m.source.as_deref().and_then(|s| s.node.as_ref())
+                        {
+                            for item in &row.args {
+                                self.refuse_untyped(item);
+                            }
+                        }
+                    }
+                    _ => self.refuse_untyped(val),
+                }
+                self.expr(val, scope);
                 continue;
             };
             let column = declared_type(self.schema, relname, &t.name);
@@ -1177,7 +1278,18 @@ impl Infer<'_> {
                 }
                 None
             }
-            _ => None,
+            // `public.t.c` is t's c; a reference through any other schema (or deeper) names a
+            // relation this walk cannot read: found, untyped, so a parameter compared with it is
+            // refused (42P18). It was not found, which fell to text (wire review 14 item 3).
+            [schema, table, column] if schema.eq_ignore_ascii_case("public") => {
+                for level in scope.iter().rev() {
+                    if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
+                        return of(rel, column);
+                    }
+                }
+                None
+            }
+            _ => Some(None),
         }
     }
 
@@ -1302,6 +1414,7 @@ impl Infer<'_> {
             ctes: self.ctes.clone(),
             views: self.views.clone(),
             subselects: self.subselects.clone(),
+            search_path: self.search_path.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();

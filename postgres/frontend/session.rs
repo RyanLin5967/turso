@@ -560,8 +560,11 @@ fn prepare_statement_checked(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            (types.params, types.untyped) =
-                crate::result_types::parameter_types(&parse_result, &schema);
+            (types.params, types.untyped) = crate::result_types::parameter_types(
+                &parse_result,
+                &schema,
+                &pg_conn.session_state.lock().unwrap().search_path,
+            );
         }
         types.used = used;
     }
