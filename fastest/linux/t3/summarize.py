@@ -381,7 +381,7 @@ def self_test():
     def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
              plants=True, plants_fired=True, plp="no", lie=False, cell="ok", void=None, drift="pass", a25_after=300.0,
              rule=RULE, ours_rule=RULE, ours_ops=(200, 200), comp_ops=200, adapter_rc=0, k=1, settle="quiet=yes",
-             plan_ops=None, plan_cols=7, drift_json_us=None, bound=False):
+             plan_ops=None, plan_cols=7, drift_json_us=None, bound=False, timed=None):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         system = {"ok": "ours", "na": "ours", "compfail": "dolt", "comp": "dolt"}[cell]
@@ -410,8 +410,12 @@ def self_test():
                 verdict = "FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail" else "PASS F1\nVERDICT PASS\n"
                 w(f"{a1}/result/functional.txt", verdict)
                 for cc in ("c1-create", "c1-m1"):
+                    # timed: None (an uncapped run of comp_ops), or (measured_ops, capped, timedrun's verdict)
+                    mo, cap, tv = timed if timed else (comp_ops, False, "ok")
                     w(f"{a1}/result/cells/{cc}/timed/summary.json",
-                      json.dumps({"warmup_rule": RULE, "measured_ops": comp_ops, "verdict": "ok", "rc": 0}))
+                      json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}))
+                    if tv is not None:
+                        w(f"{a1}/result/cells/{cc}/timed.json", json.dumps({"verdict": tv, "ops": comp_ops}))
                 w(f"{a1}/adapter.txt", "")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
@@ -504,7 +508,18 @@ def self_test():
         ("MED 3: ours recorded another warm-up rule fails (parity)", {"ours_rule": "cycles_per_client:20"}, False,
          lambda s: "warm-up rule 'cycles_per_client:20'" in first(s, "parity_refusals")),
         ("MED 3: a competitor's timed run at other than the planned ops fails (parity)", {"cell": "comp", "comp_ops": 199},
-         False, lambda s: "measured 199 ops" in first(s, "parity_refusals")),
+         False, lambda s: "199" in first(s, "parity_refusals")),
+        ("MED 4: a competitor run ended by the cap (150 of 200 ops) that timedrun ok'd is complete, with reduced n",
+         {"cell": "comp", "timed": (150, True, "ok")}, True,
+         lambda s: s["runs"][0].get("reduced_n") == {"c1-create": 150, "c1-m1": 150}),
+        ("MED 4: a capped run timedrun refused (fewer than 1000 ok ops) fails",
+         {"cell": "comp", "timed": (80, True, "REFUSED: capped with 80 ok ops (< 1000)")}, False,
+         lambda s: "timedrun verdict" in first(s, "parity_refusals")),
+        ("MED 4: an uncapped short run timedrun refused fails",
+         {"cell": "comp", "timed": (150, False, "REFUSED: timed run measured 150 ops, not N=200")}, False,
+         lambda s: "timedrun verdict" in first(s, "parity_refusals")),
+        ("MED 4: a timed run with no timed.json fails", {"cell": "comp", "timed": (200, False, None)}, False,
+         lambda s: "no timed.json" in first(s, "parity_refusals")),
         ("MED 3: no package warm-up rule (warmup.txt) fails (parity)", {"rule": None}, False,
          lambda s: "the package's None" in first(s, "parity_refusals")),
         ("MED 3: ours planned 150 ops, asked and measured 150 passes", {"plan_ops": [150], "ours_ops": (150, 150)}, True, None),
