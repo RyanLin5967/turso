@@ -1096,29 +1096,35 @@ mod tests {
     /// `code = $1` shape). The UNIQUE v arm of
     /// `an_over_length_comparison_operand_compares_instead_of_raising` (a user type, t) and of
     /// `a_built_in_length_checked_type_compares_an_over_length_operand` (registered built-in, u).
-    /// Mutant `seek_key_encodes_raising`.
+    /// Mutant `seek_key_encodes_raising`. FLAGGED TEST EDIT (engine review 20 HIGH 3, as review 14
+    /// MED 6 prescribed): both types gained a bare `OPERATOR '<'`, without which no index can be
+    /// created on them (index.rs refuses it), so the test panicked at its CREATE INDEX at its
+    /// parent and at its fix alike; the CREATE INDEX is now an asserted premise.
     #[test]
     fn an_indexed_length_checked_type_compares_an_over_length_operand() {
         let conn = open();
         conn.execute(
             "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
              THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
-             for type tag') END DECODE value OPERATOR '=' instr",
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
         )
         .unwrap();
         register_built_in(
             &conn,
             "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) \
              <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type bpc') END DECODE \
-             value OPERATOR '=' instr",
+             value OPERATOR '<' OPERATOR '=' instr",
         );
         for (table, ty, index) in [("t", "tag(3)", "tv"), ("u", "bpc(3)", "uv")] {
             conn.execute(format!(
                 "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v {ty}) STRICT"
             ))
             .unwrap();
-            conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"))
-                .unwrap();
+            let indexed = conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"));
+            assert!(
+                indexed.is_ok(),
+                "premise: {ty} takes an index (a bare OPERATOR '<' orders it): {indexed:?}"
+            );
             conn.execute(format!("INSERT INTO {table} VALUES (1, 'abc')"))
                 .unwrap();
             assert!(
