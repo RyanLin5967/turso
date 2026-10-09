@@ -185,9 +185,10 @@ def warm_problems(nm, sm, warm_rule):
     the ending one), warmup_end_ns (the ending claim), warmup_capped, and warmup_last_claim_ns (the last warm-up claim,
     null with none) and warmup_backsteps (claims judged with an older time than the one before them). Exactly what the
     rule implies, nothing within a slack: the ending claim ends it as recorded, the last warm-up claim did not (it came
-    before MAX_S, and did not already meet OPS and S), warmup_s is the ending claim's time, and, in CLOSED loop (the
-    record's loop field), every claim was judged in time order: no backstep, and no warm-up claim after the ending
-    one. In open loop those two order checks do not apply: each client's own Poisson schedule makes them expected. (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
+    before MAX_S, and did not already meet OPS and S), warmup_s is the ending claim's time, the record names its loop
+    mode, and every claim was judged in time order in either mode: no backstep, and no warm-up claim after the ending
+    one (closed loop reads each claim's time under the claim lock; open loop takes the next arrival of the run's one
+    arrival stream under it, as the macOS claim_op does). (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
     try:
         o_r, s_r, m_r = warm_rule.split(":")
         o_r, s_r, m_r = int(o_r), float(s_r), float(m_r)
@@ -201,14 +202,13 @@ def warm_problems(nm, sm, warm_rule):
         return [f"{nm} run has no A23 warm-up record (warmup_ops {wo!r}, warmup_end_ns {end!r}, warmup_capped "
                 f"{capped!r}, warmup_last_claim_ns {last!r}, warmup_s {ws!r})"]
     why = []
-    # The loop mode decides which order checks apply (the lead's correction on 0138d2128): a closed-loop claim's time
-    # is read under the claim lock, so its claims are judged in time order and any step back is a defect; an open-loop
-    # claim carries its own client's intended time (one Poisson schedule per client), so claims reach the lock out of
-    # intended order and steps back are expected. Every other check holds in both, being about the judged values.
+    # The loop mode is recorded, and the order checks hold in BOTH modes (the lead's reversal of its correction on
+    # 0138d2128): a closed-loop claim's time is read under the claim lock, and an open-loop claim takes the next
+    # arrival of the run's one arrival stream under the same lock (the macOS claim_op at 4010ff3b06), so in either mode
+    # claims are judged in time order and a step back is a defect.
     loop = sm.get("loop")
     if loop not in ("closed", "open"):
         why.append(f"{nm} run's loop mode {loop!r} is neither closed nor open")
-    closed = loop == "closed"
     done = wo >= o_r and end >= s_ns
     if capped and done:
         why.append(f"{nm} run says its warm-up ended capped, but OPS and S were met at the ending claim "
@@ -220,7 +220,7 @@ def warm_problems(nm, sm, warm_rule):
     if (wo == 0) != (last is None):
         why.append(f"{nm} run's warm-up record is inconsistent: {wo} warm-up ops, last claim {last!r}")
     elif last is not None:
-        if closed and last > end:  # open loop: an ending claim with an older intended time is a step back, expected
+        if last > end:
             why.append(f"{nm} run's last warm-up claim ({last} ns) is after its ending claim ({end} ns)")
         if last >= m_ns:
             why.append(f"{nm} run claimed a warm-up op at {last} ns, at or after MAX_S ({m_ns} ns)")
@@ -236,9 +236,8 @@ def warm_problems(nm, sm, warm_rule):
     bs = sm.get("warmup_backsteps")
     if not _count(bs):
         why.append(f"{nm} run has no warmup_backsteps record ({bs!r})")
-    elif bs and closed:
-        why.append(f"{nm} run judged {bs} closed-loop warm-up claim(s) with an older time than the claim judged "
-                   f"before them")
+    elif bs:
+        why.append(f"{nm} run judged {bs} warm-up claim(s) with an older time than the claim judged before them")
     return why
 
 
