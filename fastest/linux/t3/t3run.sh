@@ -223,10 +223,6 @@ preflight() {
     fsl=$(python3 -B "$L/t3/cells.py" fslist "$MAN") && fslist_ok "$fsl" ||
       { echo "REFUSED: the manifest names no filesystem block (cells.py fslist: '$fsl')"; return 2; }
     registered_ok /sys "$L/v3/REGISTERED.tsv" "$dn" "$PLP" "$fsl" || return 2
-    # P_nest3 must start on --device's own filesystem, which exists only per block (V3 ninth review HIGH)
-    echo "REFUSED: a real run's V3 nest fixture cannot be placed on $DEVICE yet (needs mkfixtures.sh's per-block nest"
-    echo "  and teardown modes from the V3 lane); on an md or LVM root the fire-check's P_nest3 would fail every block"
-    return 2
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -320,8 +316,8 @@ fcenv_check() {
 # so the backing directory is chosen ONCE here (mkloop.sh's own rule: / or /mnt, whichever has more free space) and
 # passed to both: mkfixtures.sh as V3_NEST_DIR and every mkloop.sh as LOOP_BACKING_DIR. A brd block keeps the default
 # (the root fs; brd is fire-check only). A real run's leaf is --device, whose filesystem exists only inside its
-# block, so its nest chain has to be made per block and torn down before the block's umount; mkfixtures.sh has no
-# nest-only or teardown mode yet (asked of the V3 lane), so preflight REFUSES a real run until it does.
+# block, so fs_block re-makes the nest chain per block on it (mkfixtures.sh V3_FIXTURES=nest) and block_cleanup tears
+# it down (--teardown-nest) before the umount.
 LOOPDIR=""
 v3fixtures() {
   local nest=""
@@ -446,6 +442,13 @@ fs_block() {
     echo "REFUSED: $mnt has a nobarrier layer on its flush path"; return 1
   fi
   bash "$L/hw/record.sh" "$o/hw" "$mnt/hw" 15 > "$o/hw.stdout" 2>&1 || return 1
+  # a real run's P_nest3 must start on THIS block's filesystem (the cell's leaf is --device; on an md or LVM root a
+  # chain on / is refused by the probe: V3 ninth review HIGH): made here, per block, by mkfixtures.sh's nest mode
+  # (V3 lane f99ff6546; any older chain under V3FX is torn down first), and torn down in block_cleanup
+  if [ "$BLOCK" = device ]; then
+    V3_FIXTURES=nest V3_NEST_DIR="$mnt" timeout 600 bash "$L/v3/mkfixtures.sh" "$V3FX" > "$o/v3nest.txt" 2>&1 ||
+      { echo "fs-$fs: the per-block nest fixture failed: $(tail -2 "$o/v3nest.txt")"; return 1; }
+  fi
   env "${V3ENV[@]}" timeout 3900 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$V3CELL" \
     "$mnt/v3fc" "$o/v3-firecheck" > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $V3CELL"; return 1; }
   mkdir -p "$mnt/v3b" "$mnt/v3a"
@@ -478,14 +481,28 @@ fs_block() {
 
 # After every block, passed or failed (review H1): unmount and detach, so the next block can make its filesystem.
 block_cleanup() {
-  local mnt=/mnt/t3-$FS_NOW dev back
+  local mnt=/mnt/t3-$FS_NOW dev back t0 k
   findmnt -n "$mnt" > /dev/null 2>&1 || return 0
   dev=$(findmnt -n -o SOURCE "$mnt")
-  # a process still holding the test filesystem (a competitor server under setsid, a stray cell) is ours: kill it,
-  # then a plain umount; a lazy umount would report success over a live filesystem (lane review LOW 9)
+  # a real run's nest chain lives on this filesystem (its first image under $mnt): unmount and detach it first, or
+  # the umount below is busy (mkfixtures.sh --teardown-nest, V3 lane f99ff6546)
+  if [ "$BLOCK" = device ]; then
+    timeout 300 bash "$L/v3/mkfixtures.sh" --teardown-nest "$V3FX" > "$OUT/fs-$FS_NOW/v3nest-teardown.txt" 2>&1 ||
+      { echo "cleanup: the nest chain on $mnt did not tear down: $(tail -2 "$OUT/fs-$FS_NOW/v3nest-teardown.txt")"; return 1; }
+  fi
+  # a process still holding the test filesystem (a competitor server under setsid, a stray cell) is ours: kill it, wait
+  # until no holder is left (at most 60 s; a holder still exiting made a single umount fail with EBUSY: T3 runner
+  # review item 8), then a plain umount, retried; a lazy umount would report success over a live filesystem
   sudo fuser -k -m "$mnt" > /dev/null 2>&1
-  sleep 1
-  sudo umount "$mnt" || { echo "cleanup: cannot unmount $mnt: $(sudo fuser -v -m "$mnt" 2>&1 | tail -3)"; return 1; }
+  t0=$(date +%s)
+  while sudo fuser -m "$mnt" > /dev/null 2>&1; do
+    [ $(( $(date +%s) - t0 )) -ge 60 ] && break
+    sleep 1
+  done
+  for k in 1 2 3; do sudo umount "$mnt" 2>/dev/null && break; sleep 2; done
+  echo "cleanup fs-$FS_NOW: holders gone after $(( $(date +%s) - t0 )) s, umount attempts $k" >> "$OUT/cleanup.txt"
+  findmnt -n "$mnt" > /dev/null 2>&1 &&
+    { echo "cleanup: cannot unmount $mnt: $(sudo fuser -v -m "$mnt" 2>&1 | tail -3)"; return 1; }
   case $BLOCK:$dev in loop:/dev/loop*)
     back=$(losetup -n -O BACK-FILE "$dev" | xargs)
     sudo losetup -d "$dev" && sudo rm -f "$back" ;;
@@ -597,10 +614,16 @@ for FS_NOW in $FSLIST; do
   echo "== stage fs-$FS_NOW $(date -u +%FT%TZ)${PLANT_NOW:+ (plant $PLANT_NOW)}"
   fs_block
   rc=$?
-  block_cleanup || rc=1
+  cleaned=1
+  block_cleanup || { rc=1; cleaned=0; }
   e=$(date +%s)
   printf '%s\t%s\t%s\t%s\t%s\n' "fs-$FS_NOW" "$(date -u -d @"$s" +%FT%TZ)" "$(date -u -d @"$e" +%FT%TZ)" $((e - s)) $rc >> "$STAGES"
   [ $rc = 0 ] || { echo "t3run: block fs-$FS_NOW FAILED rc=$rc; the next block runs"; BLOCKS_FAILED=$((BLOCKS_FAILED + 1)); }
+  # every device block runs mkfs on the same --device: a block that could not be torn down would fail every later one
+  # at mkfs, so the run stops here with that reason (T3 runner review item 8)
+  if [ $cleaned = 0 ] && [ "$BLOCK" = device ]; then
+    echo "t3run: STOPPED: fs-$FS_NOW could not be torn down, so $DEVICE cannot be re-made for the next block"; break
+  fi
 done
 [ $BLOCKS_FAILED = 0 ] && finish 0
 finish 1
