@@ -13,8 +13,10 @@ the load generator records its own TracerPid at the window's start and end (summ
                                 exactly N ops like the labelling run, the tracer record shows it untraced throughout
                                 (tracer_problems: no TracerPid, no gap over GAP_S, sweeps bracketing the window, both
                                 roles swept; MED 4), both runs recorded the warm-up RULE AND did it (run_problems,
-                                MED 6: the effective warm-up meets OPS and S or ran to MAX_S, the window bound is CAP,
-                                capped only with a window at its bound), and the live-branch count held at LIVE: CELLDIR/live.tsv's four
+                                MED 6: the warm-up as decided at each claim by PREREG annex A23's rule, checked exactly
+                                from the record warmup_ops / warmup_end_ns / warmup_capped / warmup_last_claim_ns
+                                (warm_problems); the window bound is CAP, capped only with a window at its bound), and
+                                the live-branch count held at LIVE: CELLDIR/live.tsv's four
                                 counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
                                 review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
                                 so N is the same before and after each run and the same for every cell)
@@ -169,27 +171,61 @@ def real_problem(cap_s, warmup):
 
 
 LIVE_KEYS = ("label_before", "label_after", "timed_before", "timed_after")
-WARM_SLACK_S = 0.05  # a warm-up may overrun MAX_S by the load generator's 1 ms tick plus scheduling slack
 
 
-def run_problems(nm, sm, warm_rule, cap):
-    """MED 6: what the run DID against what it was told -- its effective warm-up (warmup_ops, warmup_s) must satisfy
-    the rule OPS:S:MAX_S ((ops >= OPS and s >= S) or s >= MAX_S, and s <= MAX_S + slack), its window bound must be
-    the cap, and a run that says capped must have a window at least its bound."""
-    why = []
+def _count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def warm_problems(nm, sm, warm_rule):
+    """PREREG annex A23 / A23-AM1: the warm-up is decided at each claim by warm_ends (the macOS bbload's claim_op):
+    it ends at the first claim with OPS warm-up ops claimed before it and S since t0 (done), or with MAX_S since t0
+    (capped, and only when not done), in integer ns with seconds truncated as (uint64_t)(S * 1e9) -- Python's float
+    product is the same IEEE double and int() truncates the same way. The binaries record warmup_ops (the claims before
+    the ending one), warmup_end_ns (the ending claim), warmup_capped, and warmup_last_claim_ns (the last warm-up claim,
+    null with none). Exactly what the rule implies, nothing within a slack: the ending claim ends it as recorded, the
+    last warm-up claim did not (it came before MAX_S, and did not already meet OPS and S), and warmup_s is the ending
+    claim's time. (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
     try:
         o_r, s_r, m_r = warm_rule.split(":")
         o_r, s_r, m_r = int(o_r), float(s_r), float(m_r)
     except (AttributeError, ValueError):
         return [f"{nm} run: warm-up rule {warm_rule!r} unreadable"]
-    wo, ws = sm.get("warmup_ops"), sm.get("warmup_s")
-    if not isinstance(wo, int) or isinstance(wo, bool) or not isinstance(ws, (int, float)) or isinstance(ws, bool):
-        why.append(f"{nm} run has no effective warm-up record (warmup_ops {wo!r}, warmup_s {ws!r})")
-    else:
-        if not ((wo >= o_r and ws >= s_r) or (m_r > 0 and ws >= m_r)):
-            why.append(f"{nm} run left its warm-up early: {wo} ops in {ws:.3f} s against {warm_rule}")
-        if m_r > 0 and ws > m_r + WARM_SLACK_S:
-            why.append(f"{nm} run's warm-up overran MAX_S: {ws:.3f} s against {m_r:g} s")
+    s_ns, m_ns = int(s_r * 1e9), int(m_r * 1e9)
+    wo, ws, end, last, capped = (sm.get(k) for k in ("warmup_ops", "warmup_s", "warmup_end_ns", "warmup_last_claim_ns",
+                                                     "warmup_capped"))
+    if (not _count(wo) or not _count(end) or not isinstance(capped, bool) or not (last is None or _count(last))
+            or not isinstance(ws, (int, float)) or isinstance(ws, bool)):
+        return [f"{nm} run has no A23 warm-up record (warmup_ops {wo!r}, warmup_end_ns {end!r}, warmup_capped "
+                f"{capped!r}, warmup_last_claim_ns {last!r}, warmup_s {ws!r})"]
+    why = []
+    done = wo >= o_r and end >= s_ns
+    if capped and done:
+        why.append(f"{nm} run says its warm-up ended capped, but OPS and S were met at the ending claim "
+                   f"({wo} ops at {end} ns against {warm_rule}): done wins")
+    elif capped and end < m_ns:
+        why.append(f"{nm} run says its warm-up ended capped at {end} ns, before MAX_S ({m_ns} ns)")
+    elif not capped and not done:
+        why.append(f"{nm} run left its warm-up early: {wo} ops at {end} ns against {warm_rule}")
+    if (wo == 0) != (last is None):
+        why.append(f"{nm} run's warm-up record is inconsistent: {wo} warm-up ops, last claim {last!r}")
+    elif last is not None:
+        if last > end:
+            why.append(f"{nm} run's last warm-up claim ({last} ns) is after its ending claim ({end} ns)")
+        if last >= m_ns:
+            why.append(f"{nm} run claimed a warm-up op at {last} ns, at or after MAX_S ({m_ns} ns)")
+        if wo - 1 >= o_r and last >= s_ns:
+            why.append(f"{nm} run's warm-up should have ended at its last claim ({wo - 1} ops claimed before it, at "
+                       f"{last} ns, met OPS and S of {warm_rule})")
+    if abs(ws - end / 1e9) > 1e-6:
+        why.append(f"{nm} run's warmup_s {ws} is not its ending claim's time {end / 1e9:.9f} s")
+    return why
+
+
+def run_problems(nm, sm, warm_rule, cap):
+    """MED 6: what the run DID against what it was told -- its warm-up as decided (warm_problems, PREREG annex A23),
+    its window bound must be the cap, and a run that says capped must have a window at least its bound."""
+    why = warm_problems(nm, sm, warm_rule)
     if cap is not None:
         mw, w = sm.get("max_window_s"), sm.get("window_s")
         try:

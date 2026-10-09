@@ -2,12 +2,24 @@
  *
  *   bbload --spec FILE --out DIR --clients C
  *          [--mode closed|open] [--rate R]          open loop: Poisson arrivals, R ops/s in total
- *          [--warmup-s S] [--warmup-ops N]           warm-up ends when both are reached (default 0, 0)
- *          [--warmup OPS:S:MAX_S]                    the same, ending at MAX_S at the latest (0: no limit); PREREG
- *                                                    :210 is min(max(1000 ops, 10 s), 10% of the cap), e.g. 1000:10:180
- *                                                    at an 1800 s cap. summary.json warmup_rule is formatted from
- *                                                    the effective values (%llu:%g:%g); mixing it with --warmup-ops
- *                                                    or --warmup-s is refused (rc 2; MED 7)
+ *          [--warmup OPS:S:MAX_S]                    the warm-up rule (PREREG annex A23, the macOS bbload's claim_op):
+ *                                                    decided AT EACH CLAIM of an op by warm_ends, the warm-up ends at
+ *                                                    the first claim with OPS warm-up ops claimed before it and S
+ *                                                    seconds since t0 (done), or with MAX_S seconds since t0 (capped);
+ *                                                    the ending claim is the first measured op. Integer ns, seconds
+ *                                                    truncated as (uint64_t)(S * 1e9). MAX_S is a bound, never "no
+ *                                                    limit" (A23-AM1): MAX_S 0 ends the warm-up at the first claim.
+ *                                                    PREREG :210 is min(max(1000 ops, 10 s), 10% of the cap), e.g.
+ *                                                    1000:10:180 at an 1800 s cap. summary.json warmup_rule is
+ *                                                    formatted from the effective values (%llu:%g:%g); mixing it with
+ *                                                    --warmup-ops or --warmup-s is refused (rc 2; MED 7)
+ *          [--warmup-s S] [--warmup-ops N]           the legacy form: OPS and S, with MAX_S 0.1 x --max-window-s (as the
+ *                                                    macOS bbload takes 0.1 x its run cap; refused without a window
+ *                                                    bound)
+ *   bbload --warmup-replay OPS:S:MAX_S < TRACE       warm_ends replayed on claim times (integer ns since t0, one per
+ *                                                    line, non-decreasing): one line, "stop_at=I warm_ops=N capped=0|1"
+ *                                                    or "stop_at=none warm_ops=N capped=none" (the shared cross-driver
+ *                                                    test fastest/linux/gates/warmup_conformance.py; A23)
  *          [--duration-s S] [--min-ops N]            the measured window ends when both are reached
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
  *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
@@ -17,7 +29,9 @@
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
  *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
  *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
- *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to).
+ *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to); A23 gives 0:0:0 the same 0 warm-up ops.
+ *   summary.json records the warm-up as decided: warmup_ops (the claims before the ending one), warmup_end_ns (the
+ *   ending claim, ns since t0), warmup_capped, and warmup_last_claim_ns (the last warm-up claim; null with none).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
  * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
@@ -171,6 +185,13 @@ static int HAVE_C1B;
 static volatile int g_phase = PH_INIT;
 static volatile uint64_t g_t0, g_tm0, g_tm1; /* run start, window start, window end (0 = not yet) */
 static volatile uint64_t g_warm_claimed, g_meas_claimed, g_completed;
+/* PREREG annex A23: the warm-up is decided at each claim under g_claim_mu (claim_warm), as the macOS claim_op decides
+ * under g_claim. WARM_S_NS and WARM_MAX_NS are the rule's seconds truncated to ns once, as (uint64_t)(S * 1e9). */
+static pthread_mutex_t g_claim_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t WARM_S_NS, WARM_MAX_NS;
+static int g_warm_capped, g_warm_any; /* g_warm_any: a warm-up op was claimed, so g_warm_last_ns is set */
+static uint64_t g_warm_end_ns, g_warm_last_ns;
+static struct rusage g_ru0; /* the process's usage at the window's start (the ending claim, or t0 with no warm-up) */
 static int g_nready, g_nfailed;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_serial_mu = PTHREAD_MUTEX_INITIALIZER; /* one sql-serial statement at a time, all clients */
@@ -561,6 +582,84 @@ static void reconnect_home(client_t *c) {
     __atomic_fetch_add(&g_reconnects, 1, __ATOMIC_RELAXED);
 }
 
+/* The warm-up rule, the definition every load driver matches (the lead's ruling on fastest-linux's fourth lane review
+ * LOW 14; PREREG annex A23): at a claim, with CLAIMED warm-up ops claimed before it and EL ns since t0, the warm-up
+ * ends at this claim when CLAIMED >= OPS and EL >= S_NS (done) or EL >= MAX_NS (capped). 0: go on, this claim is a
+ * warm-up op; 1: it ends done; 2: it ends capped. Verbatim from the macOS bbload (artie 4010ff3b06), whose claim_op
+ * is the validated implementation (A23-AM1); claim_warm decides with it, and --warmup-replay replays it. */
+static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
+    int done = claimed >= ops && el >= s_ns;
+    return done ? 1 : el >= max_ns ? 2 : 0;
+}
+
+/* --warmup-replay OPS:S:MAX_S < TRACE: warm_ends on claim times read from stdin (integer ns since t0, one per line,
+ * non-decreasing). Prints "stop_at=I warm_ops=N capped=0|1", or "stop_at=none warm_ops=N capped=none" when the trace
+ * ends first; seconds become ns as claim_warm makes them, (uint64_t)(S * 1e9). Verbatim from the macOS bbload (artie
+ * 4010ff3b06), so the shared harness (fastest/linux/gates/warmup_conformance.py) feeds every driver the same claims. */
+static int warmup_replay(const char *rule) {
+    unsigned long long ops;
+    double s, m;
+    char tail;
+    if (rule[0] < '0' || rule[0] > '9' || sscanf(rule, "%llu:%lf:%lf%c", &ops, &s, &m, &tail) != 3 || !isfinite(s) ||
+        !isfinite(m) || !(s >= 0) || !(m > 0)) {
+        fprintf(stderr, "bbload: --warmup-replay OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds, MAX_S > 0): %s\n", rule);
+        return 2;
+    }
+    uint64_t claimed = 0, prev = 0;
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        if (line[0] == '\n') continue;
+        char *e;
+        errno = 0;
+        unsigned long long el = strtoull(line, &e, 10);
+        if (line[0] < '0' || line[0] > '9' || (*e != '\n' && *e != '\0') || errno || el < prev) {
+            fprintf(stderr, "bbload: --warmup-replay: bad trace line: %s", line);
+            return 2;
+        }
+        prev = el;
+        int end = warm_ends(claimed, el, ops, (uint64_t)(s * 1e9), (uint64_t)(m * 1e9));
+        if (end) {
+            printf("stop_at=%llu warm_ops=%llu capped=%d\n", (unsigned long long)claimed, (unsigned long long)claimed,
+                   end == 2);
+            return 0;
+        }
+        claimed++;
+    }
+    printf("stop_at=none warm_ops=%llu capped=none\n", (unsigned long long)claimed);
+    return 0;
+}
+
+/* claim_warm T -- the warm-up decision of one claim whose time is T (closed loop: now; open loop: the op's intended
+ * time, as the macOS claim_op takes it), serialized under g_claim_mu as claim_op serializes under g_claim (A23; this
+ * port used to decide on a 1 ms main-thread poll of the claimed count, comparing seconds as doubles, with MAX_S 0 as
+ * no limit). Returns PH_WARM when this claim is a warm-up op, else the phase now in force: the claim that ends the
+ * warm-up opens the window at T and is its first measured op. Open loop: claims are decided in the order they reach
+ * the lock, each with its own intended time (every client keeps its own Poisson schedule). */
+static int claim_warm(uint64_t t) {
+    pthread_mutex_lock(&g_claim_mu);
+    int ph = g_phase;
+    if (ph == PH_WARM) {
+        uint64_t el = t > g_t0 ? t - g_t0 : 0;
+        int end = warm_ends(g_warm_claimed, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
+        if (end) {
+            g_warm_capped = end == 2;
+            g_warm_end_ns = el;
+            getrusage(RUSAGE_SELF, &g_ru0);
+            __atomic_store_n(&g_tm0, t, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
+            if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
+            g_tp_tm0 = self_tracerpid();
+            ph = PH_MEAS;
+        } else {
+            g_warm_last_ns = el;
+            g_warm_any = 1;
+            g_warm_claimed++;
+        }
+    }
+    pthread_mutex_unlock(&g_claim_mu);
+    return ph;
+}
+
 static void *client_main(void *arg) {
     client_t *c = arg;
     if (S.proto == P_MYSQL) mysql_thread_init();
@@ -595,17 +694,21 @@ static void *client_main(void *arg) {
                 if (n >= intended) break;
                 sleep_until(intended - n > 10000000 ? n + 10000000 : intended);
             }
-            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
-            ph = (!tm0 || intended < tm0) ? PH_WARM : PH_MEAS;
-            if (ph == PH_WARM) __atomic_fetch_add(&g_warm_claimed, 1, __ATOMIC_RELAXED);
-            else __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
+            /* A23: the warm-up is decided at this claim, at its intended time. An op intended before the window's end
+             * is measured even when it is claimed after the window closed (AG9), so DRAIN reads as measured here. */
+            int cur = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+            if (cur == PH_ABORT) goto done;
+            if (cur == PH_WARM) cur = claim_warm(intended);
+            ph = cur == PH_WARM ? PH_WARM : PH_MEAS;
+            if (ph == PH_MEAS) __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
         } else {
             ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+            if (ph == PH_WARM) ph = claim_warm(now_ns()); /* A23: decided at this claim, under g_claim_mu */
             if (ph >= PH_DRAIN) goto done;
             if (ph == PH_MEAS) {
                 uint64_t k = __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
                 if (MAX_OPS && k >= MAX_OPS) goto done;
-            } else __atomic_fetch_add(&g_warm_claimed, 1, __ATOMIC_RELAXED);
+            }
         }
         ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar};
         char vbuf[MAXLIST][1024];
@@ -679,6 +782,7 @@ static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) 
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--warmup-replay")) return warmup_replay(argv[2]); /* PREREG annex A23 */
     const char *specp = NULL, *out = NULL, *v1run = NULL;
     int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops/--warmup-s may not be mixed */
 #ifdef __APPLE__
@@ -694,10 +798,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rate") && v) RATE = atof(argv[++i]);
         else if (!strcmp(a, "--warmup-s") && v) { WARM_S = atof(argv[++i]); warm_legacy = 1; }
         else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
-        else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S */
+        else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S; PREREG annex A23 */
             unsigned long long wo; double ws, wm; char extra;
-            if (sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || ws < 0 || wm < 0) {
-                fprintf(stderr, "bbload: --warmup OPS:S:MAX_S (got %s)\n", v); return 2;
+            /* S and MAX_S finite (A23-AM1: MAX_S is a bound, 0 ends the warm-up at the first claim) and at most 1e7 s,
+             * so (uint64_t)(x * 1e9) is defined; OPS starts with a digit (%llu would wrap "-1") */
+            if (v[0] < '0' || v[0] > '9' || sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || !isfinite(ws) ||
+                !isfinite(wm) || !(ws >= 0) || !(wm >= 0) || ws > 1e7 || wm > 1e7) {
+                fprintf(stderr, "bbload: --warmup OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds in [0, 1e7]) "
+                                "(got %s)\n", v);
+                return 2;
             }
             WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
             warm_rule_flag = 1;
@@ -744,6 +853,18 @@ int main(int argc, char **argv) {
                         "warm-up and the recorded rule would differ)\n");
         return 2;
     }
+    if (warm_legacy) {
+        /* PREREG annex A23-AM1: MAX_S is a bound, never "no limit" (a rule with MAX_S 0 ends at the first claim). The
+         * legacy flags therefore take MAX_S = 0.1 x the window bound, as the macOS bbload takes 0.1 x its run cap. */
+        if (!isfinite(WARM_S) || !(WARM_S >= 0) || WARM_S > 1e7 || !isfinite(MAXWIN_S) || !(MAXWIN_S > 0) || MAXWIN_S > 1e8) {
+            fprintf(stderr, "bbload: REFUSED: --warmup-s/--warmup-ops need S in [0, 1e7] s and a window bound "
+                            "(--max-window-s > 0), whose tenth is their MAX_S (A23-AM1)\n");
+            return 2;
+        }
+        WARM_MAX_S = 0.1 * MAXWIN_S;
+    }
+    WARM_S_NS = (uint64_t)(WARM_S * 1e9);
+    WARM_MAX_NS = (uint64_t)(WARM_MAX_S * 1e9);
     if (OPEN_LOOP && RATE <= 0) { fprintf(stderr, "bbload: open loop needs --rate > 0\n"); return 2; }
     if (OPEN_LOOP && MAX_OPS) { fprintf(stderr, "bbload: --max-ops is closed-loop only\n"); return 2; }
     if (DUR_S <= 0 && MIN_OPS == 0 && MAX_OPS == 0) { fprintf(stderr, "bbload: set --duration-s, --min-ops or --max-ops\n"); return 2; }
@@ -793,27 +914,23 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (V1 && C > 1) v1_set_mark(V1, MARKB + (nowarm ? PH_MEAS : PH_WARM));
-    struct rusage ru0, ru1;
-    memset(&ru0, 0, sizeof ru0);
-    if (nowarm) { getrusage(RUSAGE_SELF, &ru0); g_tp_tm0 = self_tracerpid(); }
+    struct rusage ru1;
+    if (nowarm) { getrusage(RUSAGE_SELF, &g_ru0); g_tp_tm0 = self_tracerpid(); }
     uint64_t last_done = 0, last_progress = now_ns();
     int stalled = 0, short_window = 0;
     for (;;) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
+        /* The phase first, then the clock: a claim that ended the warm-up stored g_tm0 before PH_MEAS (release), so a
+         * clock read after this acquire is not before it (the guard below keeps a cross-CPU read from going negative). */
+        int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
         uint64_t n = now_ns(), done = __atomic_load_n(&g_completed, __ATOMIC_ACQUIRE);
         if (done != last_done) { last_done = done; last_progress = n; }
         else if ((n - last_progress) / 1e9 > STALL_S) { stalled = 1; break; }
-        int ph = g_phase;
-        double wel = (n - g_t0) / 1e9;
-        if (ph == PH_WARM && ((g_warm_claimed >= WARM_OPS && wel >= WARM_S) || (WARM_MAX_S > 0 && wel >= WARM_MAX_S))) {
-            getrusage(RUSAGE_SELF, &ru0);
-            __atomic_store_n(&g_tm0, n, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
-            if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
-            g_tp_tm0 = self_tracerpid();
-        } else if (ph == PH_MEAS) {
-            double el = (n - g_tm0) / 1e9;
+        /* the warm-up is no longer decided here: claim_warm decides it at each claim (PREREG annex A23) */
+        if (ph == PH_MEAS) {
+            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
+            double el = n > tm0 ? (n - tm0) / 1e9 : 0;
             /* The duration/min-ops clause applies only when one of them was asked for: with --max-ops alone,
              * "el >= 0 && claimed >= 0" held at once and closed the window before any op was measured. */
             int timed = DUR_S > 0 || MIN_OPS > 0;
@@ -902,8 +1019,8 @@ int main(int argc, char **argv) {
     hdr_out(ht, out, "hdr_total.txt");
     for (int s = 0; s < S.nstep; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_step%d.txt", s + 1); hdr_out(hs[s], out, nm); }
     double win = (g_tm1 - g_tm0) / 1e9;
-    double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) / 1e6 +
-                 (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
+    double cpu = (ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
+                 (ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = 0;
     const char *verdict = "ok";
     if (meas_ok == 0) { rc = 3; verdict = "REFUSED: no measured operation succeeded"; }
@@ -939,6 +1056,13 @@ int main(int argc, char **argv) {
     /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
     snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
+    /* PREREG annex A23: the warm-up as claim_warm decided it -- the ending claim (ns since t0; 0 with no warm-up),
+     * whether it ended capped, and the last warm-up claim (null when none was claimed) -- so timedrun.py can check
+     * the decision exactly instead of within a poll's slack */
+    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm_capped ? "true" : "false");
+    if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_last_claim_ns\":");
+    if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",
