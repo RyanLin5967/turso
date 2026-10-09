@@ -2104,6 +2104,42 @@ fn a_checkpoint_checkpoints_the_branch_store() {
         .ok("a branch created before the checkpoint");
 }
 
+/// The failure triggers the failure-path tests use do fail, each with its code, so a test that
+/// fails a statement or a block takes its failure path: a missing relation at prepare (42P01; in a
+/// block the block fails) and a duplicate key at execution (23505). `SELECT 1/0`, which they used,
+/// is one row holding NULL on this engine, so those tests never failed anything (wire review 16
+/// item 2; the divergence itself is integer_division_by_zero_is_22012).
+#[test]
+fn the_failure_triggers_fail() {
+    let dir = Scratch::new("triggers");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "SELECT * FROM nosuch";
+    assert_eq!(a.q(sql).err(sql).code, "42P01");
+    a.q("BEGIN").ok("begin");
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "42P01");
+    assert_eq!(r.status, b'E', "{sql} did not fail the block");
+    a.q("ROLLBACK").ok("rollback");
+    let sql = "INSERT INTO t VALUES (1, 'dup')";
+    assert_eq!(a.q(sql).err(sql).code, "23505");
+}
+
+/// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer division by zero is 22012 "division by zero"
+/// in PostgreSQL. This engine answers one row holding NULL: core's exec_divide sends an integer /0
+/// to the float path, whose checked division answers None, and the PostgreSQL frontend maps `/` to
+/// the engine's Divide (wire review 16 item 2). Green when the engine, or a frontend override of
+/// `/`, raises it.
+#[test]
+fn integer_division_by_zero_is_22012() {
+    let dir = Scratch::new("div0");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT 1/0";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "22012", "rows {:?}", r.rows);
+}
+
 /// Engine errors carry PostgreSQL's SQLSTATE, so a driver raises the right exception class
 /// (psycopg's IntegrityError, not InternalError): at 472023b72 every one but Busy and
 /// BusySnapshot was XX000 (wire review 1 item 7). The codes are PostgreSQL's (errcodes.txt).
