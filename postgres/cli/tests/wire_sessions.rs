@@ -291,6 +291,60 @@ impl Wire {
         self.read_reply()
     }
 
+    /// Parse (no declared types), Bind (the given parameter codes, values and result codes),
+    /// Execute, Sync; then every message type byte up to ReadyForQuery, and the first error. The
+    /// type bytes show whether BindComplete ('2') came before a refusal (wire review 17 item 20:
+    /// one helper for the nested copies of it).
+    fn bind_round(
+        &mut self,
+        sql: &str,
+        pcodes: &[i16],
+        values: &[Option<&[u8]>],
+        rcodes: &[i16],
+    ) -> (Vec<u8>, Option<WireError>) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            match v {
+                Some(v) => {
+                    bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(v);
+                }
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        self.send(b'B', &bind);
+        self.send(b'E', &[0, 0, 0, 0, 0]);
+        self.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            self.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            self.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error);
+            }
+        }
+    }
+
     /// Parse with no declared parameter types, Describe the statement, Sync: what asyncpg,
     /// tokio-postgres and pgx send to learn a statement's parameters.
     fn describe_statement(&mut self, sql: &str) -> Reply {
@@ -7637,6 +7691,62 @@ fn a_commented_transaction_verb_is_its_verb() {
         let codes: Vec<&str> = r.notices.iter().map(|n| n.code.as_str()).collect();
         assert_eq!(codes, vec!["25P01"], "{end}: {:?}", r.notices);
     }
+}
+
+/// Coverage for 84c32da85 and 3067f87d8, whose reds passed at their own base (wire review 17 item
+/// 7; these are pins at the tip, red at 84c32da85 by reading): `\vCOMMIT` by Parse ends a failed
+/// block with ROLLBACK (a vertical tab is whitespace); `;COMMIT` commits an open block, tagged
+/// COMMIT; `CHECKPOINT -- $1` with one value is 08P01 before any BindComplete (its `$1` is in a
+/// comment, and CHECKPOINT takes the parameters Parse declared, none); and `CHECKPOINT -- x` in a
+/// block while another session pins the WAL is the server's CHECKPOINT, skipped with a NOTICE
+/// and counted, the block going on, where the engine's text checkpoint failed the block.
+#[test]
+fn a_commented_verb_is_the_servers_verb() {
+    let dir = Scratch::new("commentverb");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    a.q("BEGIN").ok("begin");
+    assert_eq!(
+        a.q("SELECT * FROM nosuch").status,
+        b'E',
+        "premise: the block failed"
+    );
+    let r = a.x("\u{b}COMMIT", &[]).ok("\\vCOMMIT");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (3, 'three')").ok("a write");
+    let r = a.x(";COMMIT", &[]).ok(";COMMIT");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 3").single("kept"),
+        "1"
+    );
+    let (types, error) = a.bind_round("CHECKPOINT -- $1", &[], &[Some(b"v")], &[]);
+    assert_eq!(error.map(|e| e.code), Some("08P01".to_string()));
+    assert!(
+        !types.contains(&b'2'),
+        "BindComplete came before the refusal: {:?}",
+        String::from_utf8_lossy(&types)
+    );
+    let before = checkpoints_skipped(&mut a);
+    a.q("CHECKPOINT").ok("checkpoint outside a block");
+    assert_eq!(wal_bytes(&dir.db()), 0, "premise: the WAL is empty");
+    b.q("BEGIN").ok("b begin");
+    b.q("SELECT count(*) FROM t").ok("b reads");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (4, 'four')")
+        .ok("insert in block");
+    let r = a
+        .q("CHECKPOINT -- x")
+        .ok("a commented CHECKPOINT in a block");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert_eq!(r.notices.len(), 1, "notices {:?}", r.notices);
+    assert_eq!(r.status, b'T', "the block goes on");
+    a.q("COMMIT").ok("commit");
+    b.q("COMMIT").ok("b commit");
+    assert_eq!(checkpoints_skipped(&mut a), before + 1);
 }
 
 /// A transaction verb or CHECKPOINT is read as PostgreSQL's lexer reads it: runs of `;` before

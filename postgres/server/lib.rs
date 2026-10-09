@@ -4941,6 +4941,22 @@ mod tests {
         );
     }
 
+    /// Wire review 17 item 7: a CHECKPOINT with a comment is the server's CHECKPOINT, read with no
+    /// libpg_query call (is_checkpoint reads a comment as whitespace). Before 3067f87d8 `CHECKPOINT
+    /// -- x` and `/* c */ CHECKPOINT` went to the engine as text, one parse each. A pin at the tip;
+    /// the mutant is_checkpoint split on whitespace must turn it red.
+    #[test]
+    fn a_commented_checkpoint_makes_no_libpg_query_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        for sql in ["CHECKPOINT -- x", "/* c */ CHECKPOINT"] {
+            let before = turso_pg_parser::libpg_query_calls();
+            ok(&s, sql);
+            assert_eq!(turso_pg_parser::libpg_query_calls() - before, 0, "{sql}");
+        }
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
