@@ -274,8 +274,6 @@ pub fn parse_schema_rows(
             materialized_view_info,
         } = inner;
         crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
-            #[cfg(test)]
-            crate::branch::budget_probe::schema_row_parsed();
             let ty = row.get::<&str>(0)?;
             let name = row.get::<&str>(1)?;
             let table_name = row.get::<&str>(2)?;

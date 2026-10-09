@@ -14,8 +14,8 @@
 //!   [`store_unlocked`] (two `cfg(test)` hook lines in `store.rs`), per thread and process-wide.
 //! * **SQL-layer counts** (engine 2b's schema re-read), per thread: statements prepared, pages read
 //!   through the pager, schema rows parsed, and a WAL write lock with what was done while it was
-//!   held: five `cfg(test)` hook lines in `connection.rs`, `util.rs`, `pager.rs` and `wal.rs`
-//!   ([`sql_counts`]).
+//!   held: six `cfg(test)` hook lines in `connection.rs`, `statement.rs`, `schema.rs`, `pager.rs` and
+//!   `wal.rs` ([`sql_counts`]).
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
 //!   `TASK_EVENTS_INFO`, `syscalls_unix`: incremented at every BSD syscall entry by any thread of
 //!   the process, so nothing the engine does can bypass it). Reading it is a Mach trap, which that
@@ -103,12 +103,14 @@ fn note_alloc(bytes: usize) {
 }
 
 // The SQL layer's counters (engine 2b: a trunk fork's schema re-read), per thread only: statements
-// prepared (`Connection::prepare_with_origin`), pages read through the pager (`Pager::read_page`
+// compiled (`Connection::compile_cmd`, which prepare, execute, query and batches all reach, and
+// `Statement::reprepare`; review 2 M4), pages read through the pager (`Pager::read_page`
 // calls that find no read of that page pending: a cache hit, or a miss's first call; a call
-// re-entered on a page still loading counts again), schema rows parsed (`util::parse_schema_rows`),
+// re-entered on a page still loading counts again), schema rows parsed (`Schema::handle_schema_row`,
+// which a reparse and the ParseSchema opcode both reach; review 2 M4),
 // and a WAL write lock (from `Pager::begin_write_tx` once `Wal::begin_write_tx` succeeded, to
 // `WalFile::end_write_tx`, which every release path calls: the commit's, a rollback's, a close's),
-// with what this thread did while it held one. Five `cfg(test)` hook lines in the engine's files.
+// with what this thread did while it held one. Six `cfg(test)` hook lines in the engine's files.
 // BLIND SPOTS: a page read without the pager's `read_page` (`read_page_no_cache`) is not counted;
 // the lock is ANY database's WAL write lock, the trunk's or the branch catalog's own (a separate
 // Turso database); a thread holding two at once reads as holding one until either is released.
@@ -200,6 +202,17 @@ pub(crate) fn sql_counts() -> SqlCounts {
 thread_local! {
     static T_WINDOWS_MET: Cell<u64> = const { Cell::new(0) };
     static T_FUTILE_LEADS: Cell<u64> = const { Cell::new(0) };
+    static T_SLEEPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// This thread slept through `crate::thread::sleep` (test builds' wrapper, review 2 M3).
+pub(crate) fn slept() {
+    bump(&T_SLEEPS, 1);
+}
+
+/// This thread's count of `slept`.
+pub(crate) fn sleeps() -> u64 {
+    T_SLEEPS.with(|c| c.get())
 }
 
 /// A flight waiter on this thread took the store mutex and the group lock to lead, and led no flight:

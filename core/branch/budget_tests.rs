@@ -1077,11 +1077,12 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                 let fork = {
                     let forker = forker.clone();
                     std::thread::spawn(move || {
-                        let (c0, w0, m0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met());
+                        let (c0, w0, m0, z0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps());
                         let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
-                        let (c1, w1, m1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met());
+                        let (c1, w1, m1, z1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps());
                         let mut s = sql_sample(&c0, &c1);
                         s.insert("store_waits", delta(w0, w1));
+                        s.insert("sleeps", delta(z0, z1));
                         s.insert("windows_met", delta(m0, m1));
                         s.insert("held_after", u64::from(probe::wal_write_held()));
                         (made, s)
@@ -1380,6 +1381,21 @@ fn run_instruments(cell: &str) -> String {
         sql_sample(&a, &b)
     };
     put("fc_sql_nothing", &sql(&mut || {}));
+    // Review 2 M4: execute and query reach the compiler too; review 2 M3: the sleep counter counts
+    // crate::thread::sleep and (its blind spot, shown) not std's.
+    put("fc_sql_execute", &sql(&mut || exec(&trunk, "SELECT 1")));
+    put(
+        "fc_sql_query",
+        &sql(&mut || {
+            std::hint::black_box(trunk.query("SELECT 1").unwrap());
+        }),
+    );
+    let z0 = probe::sleeps();
+    crate::thread::sleep(std::time::Duration::from_millis(1));
+    let z1 = probe::sleeps();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let z2 = probe::sleeps();
+    put("fc_sleeps", &Sample::from([("crate_sleep", delta(z0, z1)), ("std_sleep", delta(z1, z2))]));
     put(
         "fc_sql_prepare_3",
         &sql(&mut || {
@@ -1855,6 +1871,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_sql_nothing", k), 0, "an empty window moved {k}");
     }
     assert_eq!(get("fc_sql_prepare_3", "prepares"), 3, "three statements prepared");
+    assert_eq!(get("fc_sql_execute", "prepares"), 1, "an execute compiled no statement (review 2 M4)");
+    assert_eq!(get("fc_sql_query", "prepares"), 1, "a query compiled no statement (review 2 M4)");
+    assert_eq!(get("fc_sleeps", "crate_sleep"), 1, "crate::thread::sleep not counted (review 2 M3)");
+    assert_eq!(get("fc_sleeps", "std_sleep"), 0, "std::thread::sleep counted: the blind spot the docs state is gone");
     assert_eq!(get("fc_sql_prepare_3", "wal_locks"), 0, "preparing took the WAL write lock");
     assert_eq!(get("fc_sql_scan", "prepares"), 1, "one query, one statement");
     assert!(get("fc_sql_scan", "page_reads") >= 1, "a scan of t read no page through the pager");
@@ -2893,8 +2913,10 @@ fn a_fork_outside_a_schema_window_rereads_nothing() {
 ///   +1 statement, at most + every `sqlite_schema` row once, page reads at most + one plain scan + 1
 ///   (bounds, not requirements: an engine that publishes the schema with the pages may read less,
 ///   review 2 M2);
-/// * the fork does not wait for the parked commit: not released at 30 s, and no more store waits
-///   than the control's.
+/// * the fork does not wait for the parked commit: not released at 30 s, and no more store waits and
+///   no more sleeps (`crate::thread::sleep`, review 2 M3) than the control's. BLIND SPOT: a direct
+///   `std::thread::sleep`, or a wait on a condition variable outside `Group::wait`, is not counted;
+///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet.
 /// On both paths, at 10 and at 10^3 tables. Mutants `schema_reread_twice`,
 /// `schema_window_waits_for_publish`, env `fork_rereads_schema_window`. WRITTEN NOT RUN.
 #[test]
@@ -2911,6 +2933,7 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
             schema_premises(&c, &control, &mut failures);
             let base = |k: &str| schema_min(&c, &control, k);
             let control_waits = values(&c, &control, &schema_samples(&c, &control), "store_waits").into_iter().max().unwrap();
+            let control_sleeps = values(&c, &control, &schema_samples(&c, &control), "sleeps").into_iter().max().unwrap();
             for (i, s) in schema_samples(&c, &op).into_iter().enumerate() {
                 let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
                 for k in ["prepares", "schema_rows"] {
@@ -2934,6 +2957,9 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
                 }
                 if s["store_waits"] > control_waits {
                     let _ = writeln!(failures, "  {spec}: {op} #{i}: {} store waits against the control's at most {control_waits}; budget no more", s["store_waits"]);
+                }
+                if s["sleeps"] > control_sleeps {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {} sleeps against the control's at most {control_sleeps}; budget no more (review 2 M3: a bounded wait for the publication)", s["sleeps"]);
                 }
             }
         }
