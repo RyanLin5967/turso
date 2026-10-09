@@ -5,9 +5,13 @@ name: fastest-profile
 # record flame graph of the create window, callgrind instructions. Gates (budget.json):
 #   - D2: create flushes per op in [1, 1.01] at C=1, in [1/C, 1.01] at C>1, all on the branch log;
 #   - async: 0 flushes on the create path (NOT-RUN while the engine has no async class);
-#   - instructions per create (callgrind) <= 1.05 x the previous green run's sha, rebuilt and run on
-#     the same runner in the same job (its stored baseline artifact is the fallback);
-#   - no create-window syscall above the base's + 0.05 per op;
+#   - instructions per create (callgrind) <= 1.05 x the base's, and no create-window syscall above the base's + 0.05
+#     per op. The base is the sha of the newest baseline artifact for this runner, rebuilt with the head's driver and
+#     run on the same runner in this job. When that base cannot be built or run, BOTH regression gates compare
+#     full-snap-c1 against the artifact's own numbers (ir_create, create_syscalls_per_op), labelled with its sha, and
+#     FAIL as refused when the artifact names no sha or cpu or ran on another cpu model (PROFILE_CPU); other arms are
+#     then not compared. With no artifact at all nothing is compared, the run cannot be regression-green, and only a
+#     rebaseline dispatch restarts the chain (T3 review 4bdb3a042..2d42982a0 item 7b);
 #   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z), checked in its own job "absolute
 #     syscall budget" (red at 675adbfb3, 10 per create) so the profile job's own status is the regression verdict;
 #     the BASELINE advances on a regression-green run (every gate but this one passes, both regression gates
@@ -134,7 +138,7 @@ jobs:
             cp target-base/release/examples/fastest_profile dist/base/
             sha256sum dist/base/fastest_profile | tee -a "$RAW/run-info.txt"
           else
-            echo "base build FAILED (analysis falls back to the stored baseline artifact)" | tee -a "$RAW/base.txt"
+            echo "base build FAILED (both regression gates fall back to the baseline artifact's full-snap-c1 numbers, refused unless it ran on this cpu)" | tee -a "$RAW/base.txt"
             tail -30 dist/base/build.stderr | tee -a "$RAW/base.txt"
           fi
       - name: Filesystem and hardware record

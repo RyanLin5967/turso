@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """fastest-linux profiling analysis: per-op syscall, flush, perf-stat and instruction counts from
-profile.sh's raw output, gated against budget.json and against the base build.
+profile.sh's raw output, gated against budget.json and against the base build; with no base built in this job,
+against the baseline artifact's own numbers for full-snap-c1 (refused unless it names its sha and ran on this
+runner's cpu, PROFILE_CPU).
 
 usage: analyze.py <raw-dir> <budget.json> <out-dir> [--baseline prev-baseline.json] [--rebaseline]
        analyze.py --self-test
@@ -170,7 +172,31 @@ def analyze_arm(d, arm):
     return r
 
 
-def gates(head, base, budget, baseline):
+BASELINE_ARM = "full-snap-c1"  # the arm baseline.json records; both regression premises bind to it
+
+
+def artifact_refusal(baseline, cpu, field):
+    """None when the baseline artifact may stand in for an in-job base on `field`, else why it may not (T3 review
+    item 7b). It must name the sha it measured and the cpu it ran on, that cpu must be this runner's, and it must
+    hold the field; a missing label is a refusal, never a match of None to None."""
+    sha = baseline.get("sha")
+    if not sha:
+        return "the baseline artifact names no sha"
+    if not baseline.get("cpu"):
+        return f"the baseline artifact of {sha} records no cpu"
+    if not cpu:
+        return "this runner's cpu is unknown (PROFILE_CPU unset)"
+    if baseline["cpu"] != cpu:
+        return f"the baseline artifact of {sha} ran on cpu {baseline['cpu']!r}, this runner is cpu {cpu!r}"
+    if not baseline.get(field):
+        return f"the baseline artifact of {sha} holds no {field}"
+    return None
+
+
+def gates(head, base, budget, baseline, cpu=None):
+    """baseline: the stored artifact (baseline.json of the run that uploaded it) or None; cpu: this runner's
+    PROFILE_CPU. A base built in this job outranks the artifact; without one, both regression gates compare
+    the baseline arm against the artifact's own numbers, refused unless artifact_refusal() passes it."""
     rows = []
 
     def row(g, exp, got, v):
@@ -222,8 +248,19 @@ def gates(head, base, budget, baseline):
             v = ("PASS" if tot <= sb["max"] else "FAIL") if c == 1 else "INFO"
             row(f"budget-syscalls/{arm}", f"<= {sb['max']} syscalls per create" + ("" if c == 1 else " (C>1: INFO)"),
                 f"{tot:g}/op: {top}", v)
-        if base and arm in base and (base[arm].get("strace") or {}).get("windows", {}).get("create"):
-            bx = base[arm]["strace"]["windows"]["create"]["syscalls_per_op"]
+        bx = src = None
+        bw = (((base or {}).get(arm) or {}).get("strace") or {}).get("windows", {}).get("create")
+        if bw:
+            bx, src = bw["syscalls_per_op"], "base built in this job"
+        elif arm == BASELINE_ARM and baseline is not None:
+            # review 7b: without this, only an in-job base produced the row, so a base sha that would not build left
+            # the premise unevaluated on every later push and the baseline never advanced.
+            why = artifact_refusal(baseline, cpu, "create_syscalls_per_op")
+            if why:
+                row(f"syscalls-vs-base/{arm}", "an in-job base, or the baseline artifact of this cpu", f"refused: {why}", "FAIL")
+            else:
+                bx, src = baseline["create_syscalls_per_op"], f"baseline artifact of {baseline['sha']}"
+        if bx is not None:
             hx = x["syscalls_per_op"]
             sv = budget["syscalls_vs_base"]
             excl = set(sv["timing_dependent_excluded"])
@@ -234,20 +271,24 @@ def gates(head, base, budget, baseline):
             # loop runs as often as the flight takes). So the gate binds at C=1, where counts are exact
             # (getpid 4.005, run 37255309860), and C > 1 is recorded as INFO.
             verdict = ("FAIL" if worse else "PASS") if h.get("clients", 1) == 1 else "INFO"
-            row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op"
+            row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op vs {src}"
                 + ("" if h.get("clients", 1) == 1 else " (C>1: contention-dependent, INFO)"),
                 worse or "ok", verdict)
     ins = budget["instructions"]
-    arm = "full-snap-c1"
+    arm = BASELINE_ARM
     h = head.get(arm, {}).get("ir_per_op", {}).get("create")
-    b = None
-    src = None
-    if base and base.get(arm, {}).get("ir_per_op", {}).get("create"):
+    b = src = why = None
+    if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
         b, src = base[arm]["ir_per_op"]["create"], "base built in this job"
-    elif baseline and baseline.get("ir_create"):
-        b, src = baseline["ir_create"], f"baseline artifact of {baseline.get('sha')}"
+    elif baseline is not None:
+        why = artifact_refusal(baseline, cpu, "ir_create")
+        if why is None:
+            b, src = baseline["ir_create"], f"baseline artifact of {baseline['sha']}"
     if h is None:
         row("instructions/create", "a callgrind count", "none", "FAIL")
+    elif why:
+        row("instructions/create", f"growth <= {ins['create_growth_max']:.0%} vs an in-job base or the baseline artifact of this cpu",
+            f"refused: {why}", "FAIL")
     elif b is None:
         row("instructions/create", f"<= base x {1 + ins['create_growth_max']}", f"head {h} Ir/op; no baseline (first run)", "INFO")
     else:
@@ -485,15 +526,16 @@ def main(argv):
     if not sides.get("head"):
         print("analyze: no head arms: nothing was measured", file=sys.stderr)
         return 1
-    rows = gates(sides["head"], sides.get("base"), budget, baseline)
+    cpu = os.environ.get("PROFILE_CPU")
+    rows = gates(sides["head"], sides.get("base"), budget, baseline, cpu=cpu)
     os.makedirs(out, exist_ok=True)
     json.dump(sides, open(os.path.join(out, "summary.json"), "w"), indent=1)
     with open(os.path.join(out, "verdict.tsv"), "w") as f:
         for r in rows:
             f.write("\t".join(r) + "\n")
-    h = sides["head"].get("full-snap-c1", {})
+    h = sides["head"].get(BASELINE_ARM, {})
     json.dump({"sha": os.environ.get("GITHUB_SHA"), "ir_create": h.get("ir_per_op", {}).get("create"),
-               "ir_per_op": h.get("ir_per_op"), "cpu": os.environ.get("PROFILE_CPU"),
+               "ir_per_op": h.get("ir_per_op"), "cpu": cpu,
                "create_syscalls_per_op": ((h.get("strace") or {}).get("windows", {}).get("create") or {}).get("syscalls_per_op")},
               open(os.path.join(out, "baseline.json"), "w"), indent=1)
     with open(os.path.join(out, "summary.md"), "w") as f:
