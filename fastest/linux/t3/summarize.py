@@ -13,8 +13,9 @@ failed_checks (complete raws of a failed cell; the dry-run workflow fails on any
 Parity (gate-6 review 3 and 12; third lane review MED 3), every measured run: its warm-up rule is the package's one
 rule (warmup.txt, OPS:S:MAX_S) as the run itself recorded it (ours: result/summary.json warmup_rule; a competitor:
 warmup_rule of every timed run, result/cells/*/timed/summary.json), its measured op total is its plan row's (ours:
-ops_total == ops_total_asked == the plan's ops; a competitor: every timed run's measured_ops), and the runs of one
-block at one client count were planned the same total. Any difference is listed in parity_refusals and fails.
+ops_total == ops_total_asked == the plan's ops; a competitor: every timed run's measured_ops). Totals are NOT
+compared across systems: the PREREG sizes n_run per system (fourth lane review HIGH 2 overrides gate-6 item 12).
+Any difference is listed in parity_refusals and fails.
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
 VOID fails), the A16 plants re-derived on its real BEFORE record all fire (blockgate-plants.json stored and
 re-run), the before-to-after drift was taken (batchgate.py drift; REFUSED fails; a VOID is published, not a gate on
@@ -275,13 +276,8 @@ def summarize(out, sha, dry, manifest):
         runs.append(r)
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
-    # one block at one client count: every system was planned the same total (gate-6 review 12)
-    groups = {}
-    for (fs, cell), pr in prow.items():
-        groups.setdefault((fs, pr["block_k"], pr["clients"]), set()).add(pr["ops"])
-    for k, v in sorted(groups.items(), key=str):
-        if len(v) != 1:
-            parity.append(f"{k[0]} block {k[1]} C={k[2]}: planned op totals differ across systems: {sorted(v, key=str)}")
+    # No cross-system equal-total rule (fourth lane review HIGH 2; the PREREG sizes n_run per system from that
+    # system's own t-hat, overriding gate-6 item 12): each run is held to its own plan row above, nothing more.
     fl = os.path.join(out, "fslist.txt")
     fslist = open(fl).read().split() if os.path.exists(fl) else []
     plp = "no"
@@ -546,8 +542,10 @@ def self_test():
         w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
         w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300}))
         s, ok = summarize(out, "sha", "1", "m")
-        cases.append(("MED 3: ours (200 ops) beside a competitor (300 ops) in one block at C=1 fails (parity)",
-                      not ok and any("planned op totals differ" in x for x in s["parity_refusals"]), s["parity_refusals"]))
+        # TEST EDIT, flagged (fourth lane review HIGH 2): this case pinned the withdrawn cross-system rule (it
+        # required a refusal); per-system n_run means ours at 200 beside a competitor at 300 is NOT a refusal
+        cases.append(("HIGH 2: ours (200 ops) beside a competitor (300 ops) in one block at C=1 is no parity refusal",
+                      s["parity_refusals"] == [], s["parity_refusals"]))
     finally:
         shutil.rmtree(root)
     # fourth lane review HIGH 2: the repo's own smoke manifest, planned by cells.py, gives no parity refusal (the
