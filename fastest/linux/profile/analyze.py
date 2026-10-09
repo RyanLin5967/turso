@@ -628,6 +628,10 @@ def self_test():
                 and regression_green(clean + [("planted-info/x", "p", "p", "NOT-RUN", "info")]))
     cases.append(("review 29: regression_green reads kinds, not ids: a regression row that is not PASS blocks it under "
                   "any id; a budget FAIL or an info row under any id does not", guarded(case_green_reads_kinds)))
+    # mutant-kill (re-plant M4: drop `bool(reg) and`): gates() always emits a regression row, so only a hand-built
+    # list reaches the empty case; vacuous truth there would make an analysis that produced nothing green
+    cases.append(("review 29: regression_green of no rows, or of rows with no regression-kind row, is false",
+                  guarded(lambda: not regression_green([]) and not regression_green([("x", "e", "g", "PASS", "budget")]))))
 
     def case_budget_reads_kinds():
         rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
