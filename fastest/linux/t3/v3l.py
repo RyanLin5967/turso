@@ -1017,6 +1017,13 @@ def self_test():
         ("A24: sync_record() on a sync that exits 1 refuses the measurement",
          _ok(lambda: _raises(lambda: sync_record(lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "boom")),
                              "sync before a V3L run failed"))),
+        # review 5 MED 4: the write rule's labelling half gets its own plant, matched on its own text
+        ("MED 4: plant wt-unwritten-lab fires on a write-back record, on the labelling half's text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:", "in the labelling fsync run",
+                                                                  "did not reach the drive"))(
+             _plant(plants(rec(delta=20003))[0], "wt-unwritten-lab")))),
+        ("MED 4: plant wt-unwritten-lab fires on a write-through record carrying labelling count 0",
+         _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten-lab").get("fired") is True)),
         ("item 10: plants() on a ram record runs no wt-unwritten plant and is still ok",
          _ok(lambda: (lambda res: res[1] is True and _plant(res[0], "wt-unwritten") == {})(
              plants(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0))))),
