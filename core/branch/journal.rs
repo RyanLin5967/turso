@@ -5499,6 +5499,24 @@ mod format_tests {
         );
     }
 
+    /// Engine review 16 LOW 11: a syncing open of a whole log made two device flushes, the log's
+    /// and its directory's, both in the open's class. A flush drains the device, so the directory
+    /// is synced in Fsync first and the log's sync drains both, as `Flight::write` does: one
+    /// FullFsync-class sync. Mutant `open_dir_sync_in_class`.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_fsync_open_of_a_whole_log_makes_one_device_flush() {
+        let full = || CLASS_SYNCS.with(|c| c[1].get());
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::FullFsync);
+        let before = full();
+        let recovered = Journal::recover(&files, SyncClass::FullFsync).unwrap().expect("state");
+        let synced = full() - before;
+        assert!(!recovered.records.is_empty(), "premise: the whole log was kept");
+        assert_eq!(synced, 1, "a FullFsync open of a whole log made {synced} FullFsync syncs, not one");
+    }
+
     /// Engine review 16 MED 7 (2): a D0 open promoted any log holding a synced flight to FullFsync,
     /// so a log a D1 run acknowledged only at fsync paid F_FULLFSYNCs at the open and its first
     /// rewrite. Its flights' own class decides: Fsync, and no FullFsync sync. Mutant
