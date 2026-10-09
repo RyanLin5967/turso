@@ -65,6 +65,7 @@ PINNED_FIRECHECK = (
     "F7-threads-before-attach", "F8-rwf_dsync-refused", "F9-libaio-refused", "F10a-untraced-descendant-detected",
     "F10b-descendants-attached", "F10c-storm-control-misses", "F10d-storm-attach-complete", "F11-split-pre",
     "F11-split-post", "F12-t1-cut", "F13-clock-step-refused", "F14-stamper-subshell-safe",
+    "F15-timed-run-tracer-seen",
 )
 
 

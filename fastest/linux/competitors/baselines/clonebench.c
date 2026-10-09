@@ -141,6 +141,22 @@ static int clonefile(const char *src, const char *dst, int flags) {
     return 0;
 }
 #endif
+/* Its own TracerPid (lead review 62430d8bf..b49fb656a MED 4), read at the measured window's start and end into
+ * summary.json tracerpid_tm0/tm1: -1 when it cannot be read (no /proc: not Linux), which timedrun.py refuses. */
+static int self_tracerpid(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char ln[256];
+    int tp = -1;
+    while (fgets(ln, sizeof ln, f))
+        if (sscanf(ln, "TracerPid: %d", &tp) == 1) break;
+    fclose(f);
+    return tp;
+#else
+    return -1;
+#endif
+}
 static void die(const char *w) { fprintf(stderr, "clonebench: %s: %s\n", w, strerror(errno)); exit(2); }
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 
@@ -618,12 +634,14 @@ static int cmd_run(int argc, char **argv) {
     struct rusage ru0, ru1;
     memset(&ru0, 0, sizeof ru0);
     uint64_t fl0 = 0, fl1 = 0;
+    int tp_tm0 = -2, tp_tm1 = -2; /* MED 4: own TracerPid at the window's start and end (-2: never reached) */
     /* No warm-up asked for (OPS, S and MAX_S all 0): start in the measured window, so --max-ops N makes exactly N ops
      * (the B1 prebranch; lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1), as bbload does. */
     if (WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0) {
         getrusage(RUSAGE_SELF, &ru0);
         tm0 = t_start;
         g_phase = PH_MEAS;
+        tp_tm0 = self_tracerpid();
     } else g_phase = PH_WARM;
     if (V1 && C > 1) v1_set_mark(V1, MARKB + (g_phase == PH_MEAS ? 2 : 1));
     for (;;) {
@@ -637,6 +655,7 @@ static int cmd_run(int argc, char **argv) {
             tm0 = n;
             g_phase = PH_MEAS;
             if (V1 && C > 1) v1_set_mark(V1, MARKB + 2);
+            tp_tm0 = self_tracerpid();
         } else if (g_phase == PH_MEAS) {
             double el = (n - tm0) / 1e9;
             int timed = DUR_S > 0 || MIN_OPS > 0;
@@ -648,6 +667,7 @@ static int cmd_run(int argc, char **argv) {
                 tm1 = n;
                 g_phase = PH_DRAIN;
                 if (V1 && C > 1) v1_set_mark(V1, MARKB + 3);
+                tp_tm1 = self_tracerpid();
                 break;
             }
         }
@@ -719,6 +739,14 @@ static int cmd_run(int argc, char **argv) {
     f = fopen(p, "w");
     fprintf(f, "{\"clock\":\"%s\",\"b1_barrier\":\"%s\",", BB_CLOCK_NAME, SYNC_D0 ? "none" : B1_BARRIER); /* Linux port */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", CAPPED ? "true" : "false", MAXWIN_S);
+    {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), through one offset read now, and the
+         * process's own TracerPid at its start and end */
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        double off = (double)rt.tv_sec + rt.tv_nsec / 1e9 - now_ns() / 1e9;
+        fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
+                tm0 / 1e9 + off, tm1 / 1e9 + off, tp_tm0, tp_tm1);
+    }
     if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:0:0", (unsigned long long)WARM_OPS);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_ops\":%llu,\"warmup_s\":%.6f,", WARM_RULE, (unsigned long long)g_warm,
             tm0 > t_start ? (tm0 - t_start) / 1e9 : 0.0);

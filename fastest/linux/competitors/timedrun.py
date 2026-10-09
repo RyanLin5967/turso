@@ -3,18 +3,22 @@
 
 PREREG :173: timed T3 runs carry no tracer. Every cell therefore has TWO runs of the identical bbload/clonebench
 command: the traced LABELLING run (CELLDIR/bb/, strace attached: the flush counts, never a latency) and the untraced
-TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver samples the TracerPid of every task
-that serves the timed run (the server's processes, or the embedded clonebench process) at its start and at its end
-into CELLDIR/timed.tracer.tsv ("phase pid tid tracerpid"), and writes the run's exit status to CELLDIR/timed.rc.
+TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver (trace.sh timed_run) sweeps the
+TracerPid of every task of the command's process tree and the server's at the start, every 0.05 s and at the end,
+appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), and writes the run's exit status to CELLDIR/timed.rc;
+the load generator records its own TracerPid at the window's start and end (summary.json tracerpid_tm0/tm1).
 
   timedrun.py check CELLDIR N RULE LIVE
                                 CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
-                                exactly N ops like the labelling run, every sampled task, at start and at end, had
-                                TracerPid 0 (no sample at either end is not a pass), both runs recorded the
+                                exactly N ops like the labelling run, the tracer record shows it untraced throughout
+                                (tracer_problems: no TracerPid, no gap over GAP_S, sweeps bracketing the window, both
+                                roles swept; MED 4), both runs recorded the
                                 warm-up RULE, and the live-branch count held at LIVE: CELLDIR/live.tsv's four
                                 counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
                                 review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
                                 so N is the same before and after each run and the same for every cell)
+  timedrun.py tracer-check TRACER.TSV SUMMARY.JSON
+                                tracer_problems alone (firecheck_strace.sh F15); exit 0 only when it finds none
   timedrun.py ops C N1 N4 [TOTAL]
                                 the run's ops total: TOTAL (FT_OPS_TOTAL) for every C when given, else N1 at C=1 and
                                 N4 otherwise (gate-6 review, t3run item 12). A run capped by the registered window
@@ -41,21 +45,72 @@ def load(path):
         return None
 
 
-def tracer_rows(path):
-    """[(phase, pid, tid, tracerpid)] or None if the record is missing or unreadable."""
+GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.05 s)
+
+
+def tracer_problems(path, summary):
+    """Why trace.sh's tracer record (timed_run's OUT.tracer.tsv) and the timed run's own summary cannot show the timed
+    run untraced ([] = they can; lead review 62430d8bf..b49fb656a MED 4). Refused: no record or no roles header; trees
+    that could not be walked (tree=none); any TRACED line or a sweep with a nonzero TracerPid; no start sweep of the
+    command's tasks; for a server, no start or no end sweep of its tasks; a gap between sweeps over GAP_S; no sweep at
+    or before the measured window's start (tm0) or at or after its end (tm1), so every stretch of the window longer
+    than GAP_S holds a sweep and a shorter window is bracketed; and the load generator's own TracerPid at tm0 or tm1
+    not recorded as 0."""
     try:
-        with open(path) as f:
-            out = []
-            for ln in f:
-                p = ln.split()
-                if not p:
-                    continue
-                if len(p) != 4 or p[0] not in ("start", "end") or not all(x.isdigit() for x in p[1:]):
-                    return None
-                out.append((p[0], p[1], p[2], int(p[3])))
-            return out
+        lines = open(path).read().splitlines()
     except OSError:
-        return None
+        return ["tracer record timed.tracer.tsv missing or unreadable"]
+    roles = next((ln.split() for ln in lines if ln.startswith("roles ")), None)
+    if roles is None:
+        return ["tracer record has no roles header"]
+    why = []
+    if "tree=children" not in roles:
+        why.append(f"the process trees could not be walked ({' '.join(roles[1:])})")
+    srv = "srv=none" not in roles
+    sweeps, traced = [], []
+    for ln in lines:
+        p = ln.split()
+        if p and p[0] == "SWEEP":
+            try:
+                cn, cm = (int(x) for x in p[3].split("=", 1)[1].split(":"))
+                sn, sm = (int(x) for x in p[4].split("=", 1)[1].split(":"))
+                sweeps.append((p[1], float(p[2]), cn, cm, sn, sm))
+            except (IndexError, ValueError):
+                return why + [f"unreadable sweep line {ln!r}"]
+        elif p and p[0] == "TRACED":
+            traced.append(ln)
+    if not sweeps:
+        return why + ["no tracer sweeps"]
+    if traced:
+        why.append(f"traced during the timed run: {traced[:5]}")
+    hot = [s for s in sweeps if s[3] or s[5]]
+    if hot:
+        why.append(f"a sweep saw a TracerPid: {hot[:3]}")
+    st = [s for s in sweeps if s[0] == "start"]
+    en = [s for s in sweeps if s[0] == "end"]
+    if not st or st[0][2] == 0:
+        why.append("no start sweep of the command's tasks")
+    if srv and (not st or st[0][4] == 0):
+        why.append("no start sweep of the server's tasks")
+    if srv and (not en or en[-1][4] == 0):
+        why.append("no end sweep of the server's tasks")
+    ts = sorted(s[1] for s in sweeps)
+    gap = max((b - a for a, b in zip(ts, ts[1:])), default=0.0)
+    if gap > GAP_S:
+        why.append(f"a {gap:.3f} s stretch with no sweep (over {GAP_S} s): a tracer could have come and gone unseen")
+    sm = summary or {}
+    t0, t1 = sm.get("tm0_realtime_s"), sm.get("tm1_realtime_s")
+    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+        why.append("the timed run's summary has no measured window (tm0_realtime_s, tm1_realtime_s)")
+    else:
+        if ts[0] > t0:
+            why.append(f"no sweep before the window opened: first {ts[0]:.6f}, tm0 {t0:.6f}")
+        if ts[-1] < t1:
+            why.append(f"no sweep after the window closed: last {ts[-1]:.6f}, tm1 {t1:.6f}")
+    for k in ("tracerpid_tm0", "tracerpid_tm1"):
+        if sm.get(k) != 0:
+            why.append(f"the load generator's own {k} is {sm.get(k)!r}, not 0")
+    return why
 
 
 def rule(cap_s):
@@ -130,16 +185,7 @@ def check(celldir, n, warm_rule=None, live=None):
             got = (sm or {}).get("warmup_rule")
             if got != warm_rule:
                 why.append(f"{nm} run warm-up rule {got!r}, not the registered {warm_rule!r}")
-    rows = tracer_rows(os.path.join(celldir, "timed.tracer.tsv"))
-    if rows is None:
-        why.append("tracer record timed.tracer.tsv missing or unreadable")
-    else:
-        for ph in ("start", "end"):
-            if not any(r[0] == ph for r in rows):
-                why.append(f"no TracerPid sample at the timed run's {ph}")
-        traced = [r for r in rows if r[3] != 0]
-        if traced:
-            why.append(f"traced during the timed run: {traced[:5]}")
+    why += tracer_problems(os.path.join(celldir, "timed.tracer.tsv"), t)  # MED 4
     if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
         got = {}
         try:
@@ -343,6 +389,10 @@ if __name__ == "__main__":
         n = int(sys.argv[3])
         why = check(sys.argv[2], n, sys.argv[4], sys.argv[5])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
+        sys.exit(0 if not why else 1)
+    if len(sys.argv) == 4 and sys.argv[1] == "tracer-check":  # TRACER.TSV SUMMARY.JSON: the fire-check's F15
+        why = tracer_problems(sys.argv[2], load(sys.argv[3]))
+        print("ok" if not why else "REFUSED: " + "; ".join(why))
         sys.exit(0 if not why else 1)
     if len(sys.argv) in (5, 6) and sys.argv[1] == "ops":
         v = ops(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else "")

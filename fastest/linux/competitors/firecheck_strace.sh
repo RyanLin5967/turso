@@ -56,6 +56,8 @@
 #      proven by /proc) are refused with nothing written; then one in-order probe after a one-word and a non-ASCII line must get its
 #      own reply first (no leaked request, no answer to a malformed line); clock_pair stamps one-shot when the shape
 #      check refuses; the reply-shape check passes the stamper's format and refuses 5 malformed replies.
+#   F15 the timed run's tracer record (trace.sh timed_run, timedrun.py tracer-check): a clean run passes; a strace
+#      attached to the server mid-run and detached before the end is seen (TRACED lines) and refused.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -63,7 +65,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=23
+NCHECK=24
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -843,6 +845,38 @@ if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" &
   log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused together and one at a time with no leaked request (leak detector control read back) [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
   log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] [$s11] [$s12] control=[$ctl] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
+  fails=$((fails + 1))
+fi
+
+# F15 (lead review 62430d8bf..b49fb656a MED 4): the timed run's tracer record must SEE a tracer that attaches to the
+# server mid-run and detaches before the end, and a clean run must pass. A dummy server (python, 4 s) and a dummy
+# command (python, 2 s) run under trace.sh's timed_run; in the attach case strace -p attaches to the server 0.6 s in and
+# is detached (SIGINT) 0.6 s later. The window handed to timedrun.py tracer-check is [start + 0.3 s, start + 1.5 s], as
+# a load generator's summary would give it, with its own TracerPid 0.
+f15() { # f15 OUT ATTACH(0|1) -> tracer-check's verdict line; its rc
+  local o=$1 srv t0 att=""
+  python3 -c 'import time; time.sleep(4)' &
+  srv=$!
+  if [ "$2" = 1 ]; then
+    ( sleep 0.6; strace -p "$srv" -o /dev/null 2>"$o.strace.err" & s=$!; sleep 0.6; kill -INT "$s"; wait "$s" ) &
+    att=$!
+  fi
+  timed_run "$o" "$srv" -- python3 -c 'import time; time.sleep(2)' >/dev/null
+  [ -n "$att" ] && wait "$att"
+  kill "$srv" 2>/dev/null
+  wait "$srv" 2>/dev/null
+  t0=$(awk '$1 == "SWEEP" && $2 == "start" {print $3; exit}' "$o.tracer.tsv")
+  python3 -B -c 'import json, sys; t = float(sys.argv[1]); json.dump({"tm0_realtime_s": t + 0.3, "tm1_realtime_s": t + 1.5, "tracerpid_tm0": 0, "tracerpid_tm1": 0}, open(sys.argv[2], "w"))' \
+    "${t0:-0}" "$o.summary.json"
+  python3 -B "$HERE/timedrun.py" tracer-check "$o.tracer.tsv" "$o.summary.json"
+}
+v15c=$(f15 "$OUT/f15-clean" 0); rc15c=$?
+v15a=$(f15 "$OUT/f15-attach" 1); rc15a=$?
+n15=$(grep -c '^TRACED ' "$OUT/f15-attach.tracer.tsv" 2>/dev/null)
+if [ "$rc15c" = 0 ] && [ "$v15c" = ok ] && [ "$rc15a" != 0 ] && [[ $v15a == *"traced during the timed run"* ]] && [ "${n15:-0}" -gt 0 ]; then
+  log "PASS F15-timed-run-tracer-seen: a clean timed run passes the tracer check; a strace attached mid-run and detached before the end is seen in $n15 TRACED line(s) and refused"
+else
+  log "FAIL F15-timed-run-tracer-seen: clean rc=$rc15c [$v15c]; attached rc=$rc15a [$v15a]; TRACED lines ${n15:-0}"
   fails=$((fails + 1))
 fi
 

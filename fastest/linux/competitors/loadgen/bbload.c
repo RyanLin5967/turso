@@ -207,6 +207,23 @@ static void sleep_until(uint64_t t_ns) {
     while (clock_nanosleep(BB_CLOCK, TIMER_ABSTIME, &ts, NULL) == EINTR) { }
 }
 #endif
+/* The load generator's own TracerPid (lead review 62430d8bf..b49fb656a MED 4), read at the measured window's start and
+ * end into summary.json tracerpid_tm0/tm1: -1 when it cannot be read (no /proc: not Linux), which timedrun.py refuses. */
+static int self_tracerpid(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char ln[256];
+    int tp = -1;
+    while (fgets(ln, sizeof ln, f))
+        if (sscanf(ln, "TracerPid: %d", &tp) == 1) break;
+    fclose(f);
+    return tp;
+#else
+    return -1;
+#endif
+}
+static int g_tp_tm0 = -2, g_tp_tm1 = -2; /* -2: the window never opened / closed */
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 static double unif(uint64_t *s) { return ((xs(s) >> 11) + 0.5) / 9007199254740992.0; }
 
@@ -770,7 +787,7 @@ int main(int argc, char **argv) {
     if (V1 && C > 1) v1_set_mark(V1, MARKB + (nowarm ? PH_MEAS : PH_WARM));
     struct rusage ru0, ru1;
     memset(&ru0, 0, sizeof ru0);
-    if (nowarm) getrusage(RUSAGE_SELF, &ru0);
+    if (nowarm) { getrusage(RUSAGE_SELF, &ru0); g_tp_tm0 = self_tracerpid(); }
     uint64_t last_done = 0, last_progress = now_ns();
     int stalled = 0, short_window = 0;
     for (;;) {
@@ -786,6 +803,7 @@ int main(int argc, char **argv) {
             __atomic_store_n(&g_tm0, n, __ATOMIC_RELEASE);
             __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
             if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
+            g_tp_tm0 = self_tracerpid();
         } else if (ph == PH_MEAS) {
             double el = (n - g_tm0) / 1e9;
             /* The duration/min-ops clause applies only when one of them was asked for: with --max-ops alone,
@@ -798,6 +816,7 @@ int main(int argc, char **argv) {
                 __atomic_store_n(&g_tm1, n, __ATOMIC_RELEASE);
                 __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
                 if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_DRAIN);
+                g_tp_tm1 = self_tracerpid();
                 break;
             }
         }
@@ -901,6 +920,14 @@ int main(int argc, char **argv) {
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
+    {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
+         * and the load generator's own TracerPid at its start and end */
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        double off = (double)rt.tv_sec + rt.tv_nsec / 1e9 - now_ns() / 1e9;
+        fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
+                g_tm0 / 1e9 + off, g_tm1 / 1e9 + off, g_tp_tm0, g_tp_tm1);
+    }
     if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:0", (unsigned long long)WARM_OPS, WARM_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",

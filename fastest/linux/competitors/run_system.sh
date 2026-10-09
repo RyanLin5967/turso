@@ -254,34 +254,8 @@ bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
   cat "$4.txt"
   return $rc
 }
-server_tree() { [ -n "${1:-}" ] && { echo "$1"; descendants "$1"; }; }  # server_tree PID -> PID and its live descendants
-# timed_run OUT SERVERPID -- CMD...: the UNTRACED timed run (PREREG :173; gate-6 review, t3run item 2). CMD runs with
-# no strace anywhere; the TracerPid of every task of CMD's process and of the server's processes is sampled at its
-# start and at its end into OUT.tracer.tsv ("phase pid tid tracerpid"; CMD's end sample is its last one while alive),
-# CMD's output into OUT.txt and its exit status into OUT.rc. timedrun.py check refuses the cell unless every sample is
-# 0 at both ends. SERVERPID is empty for the embedded B1.
-timed_run() {
-  local out=$1 spid=$2 rc=0 pid last=""
-  shift 3
-  "$@" >"$out.txt" 2>&1 &
-  pid=$!
-  sleep 0.2  # let CMD's own process (under its `timeout` wrapper) start, so the start sample sees it
-  { tracer_sample start $(server_tree "$pid"); tracer_sample start $(server_tree "$spid"); } >"$out.tracer.tsv"
-  # CMD's process tree's latest sample, every 0.5 s while it runs (CMD runs under `timeout`, so the tree is the
-  # wrapper and the driver): builtins for the reads, one `ps` and one `sleep` per sample, so the sampler adds no
-  # measurable load beside the timed run.
-  : >"$out.tracer.last"
-  while kill -0 "$pid" 2>/dev/null; do
-    tracer_sample end $(server_tree "$pid") >"$out.tracer.last.new" && mv -f "$out.tracer.last.new" "$out.tracer.last"
-    sleep 0.5
-  done
-  wait "$pid" || rc=$?
-  { cat "$out.tracer.last"; tracer_sample end $(server_tree "$spid"); } >>"$out.tracer.tsv"
-  rm -f "$out.tracer.last" "$out.tracer.last.new"
-  echo "$rc" >"$out.rc"
-  cat "$out.txt"
-  return $rc
-}
+# timed_run OUT SERVERPID -- CMD...: trace.sh's (lead review 62430d8bf..b49fb656a MED 4: append-only whole-tree sweeps
+# every 0.05 s; the old sampler kept only the last sample, every 0.5 s, and forked ps per sample).
 
 # count OUT -- stracecount over one window. A refused or crashed count FAILS the job (review finding 1: it used to
 # end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
