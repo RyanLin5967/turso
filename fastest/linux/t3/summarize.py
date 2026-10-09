@@ -12,8 +12,10 @@ killed after writing VERDICT is not complete), or when the engine refused the cl
 failed_checks (complete raws of a failed cell; the dry-run workflow fails on any).
 Parity (gate-6 review 3 and 12; third lane review MED 3), every measured run: its warm-up rule is the package's one
 rule (warmup.txt, OPS:S:MAX_S) as the run itself recorded it (ours: result/summary.json warmup_rule; a competitor:
-warmup_rule of every timed run, result/cells/*/timed/summary.json), its measured op total is its plan row's (ours:
-ops_total == ops_total_asked == the plan's ops; a competitor: every timed run's measured_ops). Totals are NOT
+warmup_rule of every timed run, result/cells/*/timed/summary.json), its op total is its plan row's (ours:
+ops_total == ops_total_asked == the plan's ops; a competitor: every timed run's timed.json, timedrun.py's verdict ok
+and its N == the plan's ops; a run ended by the registered cap is complete with reduced n, in runs[].reduced_n,
+fourth lane review MED 4). Totals are NOT
 compared across systems: the PREREG sizes n_run per system (fourth lane review HIGH 2 overrides gate-6 item 12).
 Any difference is listed in parity_refusals and fails.
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
@@ -195,15 +197,26 @@ def run_parity(d, system):
             j = {}
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
                 "ops_total_asked": j.get("ops_total_asked")}
-    rules, ops = [], []
+    # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
+    # the validated rule that also accepts a run ended by the registered cap with >= 1000 ok ops (PREREG :212,
+    # "completed with reduced n"; fourth lane review MED 4); summarize compares the warm-up rule and N to the plan.
+    rules, ops, verdicts, reduced = [], [], [], {}
     for t in sorted(glob.glob(os.path.join(d, "result", "cells", "*", "timed", "summary.json"))):
+        cell = os.path.basename(os.path.dirname(os.path.dirname(t)))
         try:
             j = json.load(open(t))
         except (OSError, ValueError):
             j = {}
+        try:
+            tj = json.load(open(os.path.join(os.path.dirname(os.path.dirname(t)), "timed.json")))
+        except (OSError, ValueError):
+            tj = None
         rules.append(j.get("warmup_rule"))
-        ops.append(j.get("measured_ops"))
-    return {"warmup_rules": rules, "ops_measured": ops}
+        ops.append((tj or {}).get("ops"))
+        verdicts.append((cell, "no timed.json" if tj is None else tj.get("verdict")))
+        if j.get("capped") and isinstance(j.get("measured_ops"), int):
+            reduced[cell] = j["measured_ops"]
+    return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None}
 
 
 def summarize(out, sha, dry, manifest):
@@ -265,6 +278,11 @@ def summarize(out, sha, dry, manifest):
         if measured:
             r.update(run_parity(d, system))
             want = (prow.get((fs, cell)) or {}).get("ops")
+            # timedrun.py's own verdict first: it names why a competitor's timed run cannot stand
+            for tcell, v in r.get("timed_verdicts") or []:
+                if v != "ok":
+                    what = v if v == "no timed.json" else f"timedrun verdict {v!r}"
+                    parity.append(f"{fs}/{cell}: timed run {tcell}: {what}")
             for x in r["warmup_rules"] or [None]:
                 if x is None or x != rule:
                     parity.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
