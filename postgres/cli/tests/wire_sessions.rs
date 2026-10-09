@@ -4609,6 +4609,59 @@ fn an_empty_extended_statement_is_an_empty_query() {
     );
 }
 
+/// A statement of nothing but semicolons and comments (`;;`, `-- c`, `/* c */`) is PostgreSQL's
+/// empty query on both protocols: EmptyQueryResponse, no error, and a pipeline it sits in commits
+/// its earlier INSERT at Sync. A lone U+00A0 is not whitespace to PostgreSQL's lexer: 42601. Read
+/// by a text test (whitespace or a lone `;`), these reached the translator's "No statements
+/// found", an ERROR that rolled the pipeline back (wire review 15 item 6).
+#[test]
+fn a_comment_only_statement_is_an_empty_query() {
+    let dir = Scratch::new("commentonly");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let blanks: [&[u8]; 3] = [b";;", b"-- c", b"/* c */"];
+    for sql in blanks {
+        let text = std::str::from_utf8(sql).unwrap();
+        let r = a.q(text);
+        assert!(r.error.is_none(), "{text:?} by simple query: {:?}", r.error);
+    }
+    let r = a.q("\u{a0}");
+    assert_eq!(r.err("a lone U+00A0").code, "42601");
+    let mut out = Vec::new();
+    let mut put = |tag: u8, body: &[u8]| {
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+    };
+    put(b'P', b"\0INSERT INTO t VALUES (7, 'seven')\0\0\0");
+    put(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+    put(b'E', &[0, 0, 0, 0, 0]);
+    for sql in blanks {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql);
+        parse.extend_from_slice(&[0, 0, 0]);
+        put(b'P', &parse);
+        put(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        put(b'D', b"P\0");
+        put(b'E', &[0, 0, 0, 0, 0]);
+    }
+    put(b'S', &[]);
+    a.s.write_all(&out).unwrap();
+    let (tags, errors, status) = read_raw_reply(&mut a);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+    assert_eq!(
+        tags.iter().filter(|t| **t == b'I').count(),
+        3,
+        "an EmptyQueryResponse per blank statement: {tags:?}"
+    );
+    assert_eq!(status, b'I');
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 7")
+            .single("the pipeline committed"),
+        "seven"
+    );
+}
+
 /// A named portal of an empty statement executed twice answers EmptyQueryResponse both times, and
 /// the pipeline it sits in commits at Sync, as PostgreSQL answers it (exec_execute_message's empty
 /// command, before any portal-state check). The first Execute marked the portal done, so the second
