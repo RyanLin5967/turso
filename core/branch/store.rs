@@ -732,9 +732,11 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             return;
         }
         // The held-free upgrade a raised D0 store owes (engine review 13 MED 2): led here, off
-        // every acknowledgement path, holding no lock while it runs.
+        // every acknowledgement path, holding no lock while it runs. Under mutant
+        // `upgrade_on_ack_path` (test builds only) not here, as before: only the next waiter leads
+        // it, so the mutant's create leads it every time rather than when it wins a race.
         let due = group.upgrade_due.load(Ordering::Acquire);
-        if due != 0 && due != UPGRADE_IN_AIR && !group.poisoned() {
+        if due != 0 && due != UPGRADE_IN_AIR && !group.poisoned() && !fe_mutant("upgrade_on_ack_path") {
             drop(g);
             BranchStore::lead_upgrade(&store, &group);
             g = group.lock();
