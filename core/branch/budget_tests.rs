@@ -662,6 +662,138 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
     hold_word(false);
 }
 
+/// The schema-window cells' table counts (`schema_t10`, `schema_t1e3`), and the samples per path and
+/// mode.
+const SCHEMA_TABLES: [(&str, u64); 2] = [("schema_t10", 10), ("schema_t1e3", 1000)];
+const SCHEMA_ROUNDS: u64 = 3;
+
+/// The calling thread's SQL-layer counters between two moments.
+fn sql_sample(a: &probe::SqlCounts, b: &probe::SqlCounts) -> Sample {
+    Sample::from([
+        ("prepares", delta(a.prepares, b.prepares)),
+        ("page_reads", delta(a.page_reads, b.page_reads)),
+        ("schema_rows", delta(a.schema_rows, b.schema_rows)),
+        ("wal_locks", delta(a.wal_locks, b.wal_locks)),
+        ("wal_prepares", delta(a.wal_prepares, b.wal_prepares)),
+        ("wal_page_reads", delta(a.wal_page_reads, b.wal_page_reads)),
+        ("wal_schema_rows", delta(a.wal_schema_rows, b.wal_schema_rows)),
+        ("wal_allocs", delta(a.wal_allocs, b.wal_allocs)),
+        ("wal_alloc_bytes", delta(a.wal_alloc_bytes, b.wal_alloc_bytes)),
+        ("allocs", delta(a.allocs, b.allocs)),
+        ("alloc_bytes", delta(a.alloc_bytes, b.alloc_bytes)),
+    ])
+}
+
+/// Clears `store::SCHEMA_PUBLISH_HOLD` when dropped, so a failed sample releases its DDL commit.
+struct SchemaHoldDisarm;
+
+impl Drop for SchemaHoldDisarm {
+    fn drop(&mut self) {
+        super::store::SCHEMA_PUBLISH_HOLD.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Engine 2b (fastest-engine 00340537c, red 4f9f83ece; its request of 2026-10-09): a trunk fork
+/// whose snapshot's schema cookie matches neither its connection's schema nor the shared one — a DDL
+/// commit between publishing its pages and its schema, parked there by `store::SCHEMA_PUBLISH_HOLD`
+/// — re-reads the schema from its snapshot (`Connection::reparse_schema`). This arm counts that
+/// re-read on the forking thread with the SQL-layer counters (`probe::sql_counts`).
+///
+/// Every sample is a fresh database of `tables` tables (`t` with one row, then fillers, in one
+/// transaction; the WAL checkpointed), forked once by a fresh connection (`m-0000`):
+/// * `first_*`: the trunk has no live child, so the fork takes the WAL write lock;
+///   `lockfree_*`: one live child first (`anchor`), so it registers without it;
+/// * `*_window`: the fork runs while an `ALTER TABLE t ADD COLUMN` commit is parked in the window;
+///   `*_control`: the same ALTER has finished first.
+///
+/// The fork runs on a thread of its own, so a fork that waits for the parked commit is released
+/// after 30 s instead of hanging the cell (`waited_for_ddl`). Each sample also carries the
+/// reference for one scan: the schema's row count (`schema_table_rows`) and the pages one plain
+/// `SELECT * FROM sqlite_schema` reads on a fresh connection (`ref_scan_page_reads`).
+fn schema_window(cell: &str, tables: u64, out: &mut String) {
+    use std::sync::atomic::Ordering as O;
+    for i in 0..SCHEMA_ROUNDS {
+        for first in [true, false] {
+            for window in [false, true] {
+                let op = match (first, window) {
+                    (true, false) => "first_control",
+                    (true, true) => "first_window",
+                    (false, false) => "lockfree_control",
+                    (false, true) => "lockfree_window",
+                };
+                let dir = tempfile::TempDir::new().unwrap();
+                let db = open_at(&dir.path().join("schema-window.db"));
+                let ddl = db.connect().unwrap();
+                exec(&ddl, "BEGIN");
+                exec(&ddl, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+                exec(&ddl, "INSERT INTO t VALUES (1, 'trunk-1')");
+                for f in 1..tables {
+                    exec(&ddl, &format!("CREATE TABLE f{f}(id INTEGER PRIMARY KEY, v TEXT)"));
+                }
+                exec(&ddl, "COMMIT");
+                let _ = ddl
+                    .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .and_then(|mut s| s.run_collect_rows())
+                    .unwrap();
+                let forker = db.connect().unwrap();
+                if !first {
+                    forker.create_branch("anchor").unwrap();
+                }
+                let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7";
+                let _disarm = SchemaHoldDisarm;
+                let parked = if window {
+                    super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+                    let ddl = ddl.clone();
+                    let commit = std::thread::spawn(move || ddl.execute(alter).map(|_| ()).map_err(|e| e.to_string()));
+                    let t = std::time::Instant::now();
+                    while super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+                        assert!(
+                            t.elapsed() < std::time::Duration::from_secs(10),
+                            "{cell}: {op}: premise: the DDL commit never reached its schema publication"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Some(commit)
+                } else {
+                    exec(&ddl, alter);
+                    None
+                };
+                let fork = {
+                    let forker = forker.clone();
+                    std::thread::spawn(move || {
+                        let c0 = probe::sql_counts();
+                        let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
+                        let c1 = probe::sql_counts();
+                        (made, sql_sample(&c0, &c1))
+                    })
+                };
+                let t = std::time::Instant::now();
+                while !fork.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let waited = !fork.is_finished();
+                super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+                let (made, mut s) = fork.join().unwrap();
+                if let Some(commit) = parked {
+                    commit.join().unwrap().unwrap_or_else(|e| panic!("{cell}: {op}: the parked ALTER failed: {e}"));
+                }
+                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed: {e}"));
+                // The branch has the schema its pages need (the engine's own test's check).
+                let branch = db.connect_named("m-0000").unwrap();
+                assert_eq!(query_int(&branch, "SELECT c FROM t WHERE id = 1"), 7, "{cell}: {op}: the branch read the new column wrong");
+                s.insert("waited_for_ddl", u64::from(waited));
+                s.insert("schema_table_rows", query_int(&ddl, "SELECT count(*) FROM sqlite_schema") as u64);
+                let fresh = db.connect().unwrap();
+                let r0 = probe::sql_counts();
+                fresh.prepare("SELECT * FROM sqlite_schema").and_then(|mut s| s.run_collect_rows()).unwrap();
+                let r1 = probe::sql_counts();
+                s.insert("ref_scan_page_reads", delta(r0.page_reads, r1.page_reads));
+                line(out, cell, op, i, &s);
+            }
+        }
+    }
+}
+
 /// A named create on `db`, so a checkpoint has a dirty branch to write.
 fn trunk_for_fc(db: &Arc<Database>) {
     db.connect().unwrap().create_branch("fc-dirty").unwrap();
@@ -880,6 +1012,46 @@ fn run_instruments(cell: &str) -> String {
     let trunk = db.connect().unwrap();
     let (_, s) = measure(&db, base, || trunk.create_branch("fc-new").unwrap());
     put("fc_create_logs", &s);
+    // The SQL-layer counters (engine 2b), on this thread: three statements prepared count three;
+    // a scan of `t` reads its page through the pager, and an empty window reads nothing; a schema
+    // re-read under a read transaction (the 2b fix's own sequence) parses every `sqlite_schema` row
+    // once; an autocommit INSERT takes the trunk's WAL write lock once and reads and allocates under
+    // it, and lets it go; a SELECT after it reads pages, none of them under the lock.
+    let sql = |f: &mut dyn FnMut()| {
+        let a = probe::sql_counts();
+        f();
+        let b = probe::sql_counts();
+        sql_sample(&a, &b)
+    };
+    put("fc_sql_nothing", &sql(&mut || {}));
+    put(
+        "fc_sql_prepare_3",
+        &sql(&mut || {
+            for _ in 0..3 {
+                std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+            }
+        }),
+    );
+    put("fc_sql_scan", &sql(&mut || {
+        std::hint::black_box(query_int(&trunk, "SELECT count(*) FROM t"));
+    }));
+    let mut s = sql(&mut || {
+        let pager = trunk.pager.load();
+        pager.begin_read_tx().unwrap();
+        trunk.set_tx_state(TransactionState::Read);
+        let reread = trunk.reparse_schema();
+        trunk.set_tx_state(TransactionState::None);
+        pager.end_read_tx();
+        reread.unwrap();
+    });
+    s.insert("schema_table_rows", query_int(&trunk, "SELECT count(*) FROM sqlite_schema") as u64);
+    put("fc_sql_reparse", &s);
+    let mut s = sql(&mut || exec(&trunk, "INSERT INTO t VALUES (1000, 'fc')"));
+    s.insert("held_after", u64::from(probe::wal_write_held()));
+    put("fc_sql_insert", &s);
+    put("fc_sql_select_after", &sql(&mut || {
+        std::hint::black_box(query_int(&trunk, "SELECT count(*) FROM t"));
+    }));
     out
 }
 
@@ -899,6 +1071,8 @@ fn budget_child() {
     let mut text = String::new();
     if spec == "instruments" {
         text = run_instruments(&spec);
+    } else if let Some(&(_, tables)) = SCHEMA_TABLES.iter().find(|(c, _)| *c == spec) {
+        schema_window(&spec, tables, &mut text);
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
@@ -1314,6 +1488,25 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "bg_hold_alloc_bytes"), 16, "the background maximum: the spawned thread's 16 B hold, not the foreground's 64 B");
     assert_eq!(get("fc_live_and_hold", "all_hold_alloc_bytes"), 64, "the all-threads maximum: the foreground's 64 B hold");
     assert_eq!(get("fc_live_and_hold", "hold_thread_left"), 1, "the hold arm's joined thread never left the thread count");
+    for k in ["prepares", "page_reads", "schema_rows", "wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs"] {
+        assert_eq!(get("fc_sql_nothing", k), 0, "an empty window moved {k}");
+    }
+    assert_eq!(get("fc_sql_prepare_3", "prepares"), 3, "three statements prepared");
+    assert_eq!(get("fc_sql_prepare_3", "wal_locks"), 0, "preparing took the WAL write lock");
+    assert_eq!(get("fc_sql_scan", "prepares"), 1, "one query, one statement");
+    assert!(get("fc_sql_scan", "page_reads") >= 1, "a scan of t read no page through the pager");
+    assert_eq!(get("fc_sql_scan", "schema_rows"), 0, "a scan of t parsed schema rows");
+    let rows = get("fc_sql_reparse", "schema_table_rows");
+    assert!(rows >= 2, "premise: sqlite_schema has rows ({rows})");
+    assert_eq!(get("fc_sql_reparse", "schema_rows"), rows, "a schema re-read parses every sqlite_schema row once");
+    assert!(get("fc_sql_reparse", "prepares") >= 1, "a schema re-read prepared no statement");
+    assert_eq!(get("fc_sql_reparse", "wal_locks"), 0, "a schema re-read under a read transaction took the WAL write lock");
+    assert_eq!(get("fc_sql_insert", "wal_locks"), 1, "an autocommit INSERT took the WAL write lock once");
+    assert!(get("fc_sql_insert", "wal_page_reads") >= 1, "an INSERT read no page under the WAL write lock");
+    assert!(get("fc_sql_insert", "wal_allocs") >= 1, "an INSERT allocated nothing under the WAL write lock");
+    assert_eq!(get("fc_sql_insert", "held_after"), 0, "the WAL write lock still read as held after the commit");
+    assert!(get("fc_sql_select_after", "page_reads") >= 1, "a SELECT read no page");
+    assert_eq!(get("fc_sql_select_after", "wal_page_reads"), 0, "a SELECT after the commit read under the WAL write lock");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
@@ -2203,4 +2396,128 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
         let _ = writeln!(failures, "  syscalls: held {h}, written {w}; budget held + 2 (one pwrite, one wait)");
     }
     assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
+}
+
+// ---- engine 2b: a trunk fork inside a DDL commit's schema window (fastest-engine 00340537c) ----
+
+/// The smallest value of `key` over `op`'s samples in `c` (every sample: the SQL-layer counters are
+/// the forking thread's own, so no other thread's work enters them).
+fn schema_min(c: &CellData, op: &str, key: &str) -> u64 {
+    values(c, op, &quiet(c, op), key).into_iter().min().unwrap()
+}
+
+/// Engine 2b (00340537c's own claim: "Cost: one sqlite_schema scan, only on a fork that meets the
+/// window ...; 0 otherwise"): a fork that meets no DDL commit's schema window re-reads nothing — no
+/// statement prepared and no schema row parsed, on the first-child path and the lock-free one, at
+/// 10 and at 10^3 tables — and the pages it reads do not grow with the tables.
+#[test]
+fn a_fork_outside_a_schema_window_rereads_nothing() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for op in ["first_control", "lockfree_control"] {
+        let mut pages = Vec::new();
+        for (spec, _) in SCHEMA_TABLES {
+            let c = cell(spec);
+            let samples = quiet(&c, op);
+            for k in ["prepares", "schema_rows"] {
+                let v = values(&c, op, &samples, k);
+                if v.iter().any(|&x| x != 0) {
+                    let _ = writeln!(failures, "  {spec}: {op}.{k} = {v:?}; budget 0");
+                }
+            }
+            let v = values(&c, op, &samples, "page_reads");
+            pages.push((spec, *v.iter().min().unwrap(), *v.iter().max().unwrap()));
+        }
+        let (a, b) = (pages[0], pages[1]);
+        if (a.1, a.2) != (b.1, b.2) {
+            let _ = writeln!(failures, "  {op}.page_reads: {}..{} at {}, {}..{} at {}; budget equal", a.1, a.2, a.0, b.1, b.2, b.0);
+        }
+    }
+    assert!(failures.is_empty(), "a fork outside a schema window re-read something [engine 2b]:\n{failures}");
+}
+
+/// Engine 2b (00340537c: "one sqlite_schema scan, only on a fork that meets the window"; "no wait or
+/// retry bound is needed and no Busy can come of it"): a fork inside a DDL commit's schema window
+/// re-reads the schema once — beyond the same path's control, exactly one statement prepared, every
+/// `sqlite_schema` row parsed once, and at most one plain scan's pages plus the header page (the
+/// cookie read) — on both paths, at 10 and at 10^3 tables; and it does not wait for the parked
+/// commit to publish its schema.
+#[test]
+fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for path in ["first", "lockfree"] {
+        let (op, control) = (format!("{path}_window"), format!("{path}_control"));
+        for (spec, _) in SCHEMA_TABLES {
+            let c = cell(spec);
+            let base = |k: &str| schema_min(&c, &control, k);
+            for (i, s) in quiet(&c, &op).into_iter().enumerate() {
+                let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
+                if s["waited_for_ddl"] != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the fork waited for the parked DDL commit (released after 30 s)");
+                }
+                if s["prepares"] != base("prepares") + 1 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: prepares {} against the control's {}; budget control + 1", s["prepares"], base("prepares"));
+                }
+                if s["schema_rows"] != base("schema_rows") + rows {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: schema rows {} against the control's {}; budget control + {rows} (each row once)", s["schema_rows"], base("schema_rows"));
+                }
+                if s["page_reads"] > base("page_reads") + scan + 1 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: page reads {} against the control's {}; budget control + one scan ({scan}) + 1", s["page_reads"], base("page_reads"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "a fork inside a schema window re-read more than the schema once [engine 2b]:\n{failures}");
+}
+
+/// Engine 2b ("the re-read runs under the WAL write lock on the first-child path"): the first-child
+/// fork takes the trunk's WAL write lock once and the lock-free one never does (each sample's
+/// premise of its path); inside the window, the work added under the lock is the re-read alone —
+/// one statement and the schema's rows — and outside it the work under the lock does not grow with
+/// the tables. The re-read under the lock is O(tables) by construction: this budget bounds it to
+/// one scan, it does not forbid it (no ruling covers the WAL write lock's hold).
+#[test]
+fn a_schema_window_reread_runs_under_the_wal_write_lock_only_on_the_first_child_path() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut control_under_lock = Vec::new();
+    for (spec, _) in SCHEMA_TABLES {
+        let c = cell(spec);
+        for op in ["first_control", "first_window"] {
+            let v = values(&c, op, &quiet(&c, op), "wal_locks");
+            if v.iter().any(|&x| x != 1) {
+                let _ = writeln!(failures, "  {spec}: {op}.wal_locks = {v:?}; premise: the first-child fork takes the WAL write lock once");
+            }
+        }
+        for op in ["lockfree_control", "lockfree_window"] {
+            for k in ["wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs"] {
+                let v = values(&c, op, &quiet(&c, op), k);
+                if v.iter().any(|&x| x != 0) {
+                    let _ = writeln!(failures, "  {spec}: {op}.{k} = {v:?}; budget 0 (the lock-free fork takes no WAL write lock)");
+                }
+            }
+        }
+        let base = |k: &str| schema_min(&c, "first_control", k);
+        for (i, s) in quiet(&c, "first_window").into_iter().enumerate() {
+            if s["wal_prepares"] != base("wal_prepares") + 1 {
+                let _ = writeln!(failures, "  {spec}: first_window #{i}: prepares under the WAL write lock {} against the control's {}; budget control + 1", s["wal_prepares"], base("wal_prepares"));
+            }
+            if s["wal_schema_rows"] != base("wal_schema_rows") + s["schema_table_rows"] {
+                let _ = writeln!(failures, "  {spec}: first_window #{i}: schema rows under the WAL write lock {} against the control's {}; budget control + {}", s["wal_schema_rows"], base("wal_schema_rows"), s["schema_table_rows"]);
+            }
+        }
+        control_under_lock.push((spec, base("wal_page_reads"), base("wal_prepares"), base("wal_schema_rows")));
+    }
+    let (a, b) = (control_under_lock[0], control_under_lock[1]);
+    if (a.1, a.2, a.3) != (b.1, b.2, b.3) {
+        let _ = writeln!(failures, "  first_control under the WAL write lock (page reads, prepares, schema rows): {:?} at {}, {:?} at {}; budget equal", (a.1, a.2, a.3), a.0, (b.1, b.2, b.3), b.0);
+    }
+    assert!(failures.is_empty(), "the schema window's re-read under the WAL write lock [engine 2b]:\n{failures}");
 }

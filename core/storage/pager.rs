@@ -3228,6 +3228,8 @@ impl Pager {
         // Every path that released the last write lock closed its commit gate (review A-F1).
         turso_debug_assert!(!self.trunk_gate_open.load(Ordering::Acquire));
         wal.begin_write_tx(allowed_auto_actions)?;
+        #[cfg(test)]
+        crate::branch::budget_probe::wal_write_locked();
         // A transaction that rolled back left its merge writes and its captures here; this one
         // starts from none.
         *self.trunk_pending.lock() = TrunkPending::default();
@@ -3512,6 +3514,8 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
+        #[cfg(test)]
+        crate::branch::budget_probe::wal_write_unlocked();
         wal.end_write_tx();
     }
 
@@ -3629,6 +3633,10 @@ impl Pager {
             io_yield_one!(crate::Completion::new_yield());
         }
         let pending = self.pending_reads.read().get(&page_idx).cloned();
+        #[cfg(test)]
+        if pending.is_none() {
+            crate::branch::budget_probe::page_read();
+        }
         let (page, c_disk) = if let Some(pending) = pending {
             // Re-entry: previous call yielded on spill before completing
             // `cache_insert`. Reuse the same PageRef and in-flight disk read

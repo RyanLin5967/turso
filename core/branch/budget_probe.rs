@@ -11,7 +11,11 @@
 //! * **Live heap bytes** (requested sizes of every live allocation), and the largest allocation
 //!   and catalog-row count inside one store-mutex hold (`take_hold_maxima`).
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
-//!   [`store_unlocked`] (the only two edits to the engine's files), per thread and process-wide.
+//!   [`store_unlocked`] (two `cfg(test)` hook lines in `store.rs`), per thread and process-wide.
+//! * **SQL-layer counts** (engine 2b's schema re-read), per thread: statements prepared, pages read
+//!   through the pager, schema rows parsed, and the trunk's WAL write lock with what was done while
+//!   it was held: five `cfg(test)` hook lines in `connection.rs`, `util.rs` and `pager.rs`
+//!   ([`sql_counts`]).
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
 //!   `TASK_EVENTS_INFO`, `syscalls_unix`: incremented at every BSD syscall entry by any thread of
 //!   the process, so nothing the engine does can bypass it). Reading it is a Mach trap, which that
@@ -92,6 +96,108 @@ fn note_alloc(bytes: usize) {
         bump(&T_HELD_ALLOCS, 1);
         bump(&T_HELD_ALLOC_BYTES, bytes as u64);
     }
+    if wal_held() {
+        bump(&T_WAL_ALLOCS, 1);
+        bump(&T_WAL_ALLOC_BYTES, bytes as u64);
+    }
+}
+
+// The SQL layer's counters (engine 2b: a trunk fork's schema re-read), per thread only: statements
+// prepared (`Connection::prepare_with_origin`), pages read through the pager (`Pager::read_page`,
+// once per page per call, a cache hit or a miss alike), schema rows parsed
+// (`util::parse_schema_rows`), and the trunk's WAL write lock (`Pager::begin_write_tx` once
+// `Wal::begin_write_tx` succeeded, to `Pager::end_write_tx`), with what this thread did while it
+// held it. Five `cfg(test)` hook lines in the engine's files. BLIND SPOTS: a page read without the
+// pager's `read_page` (`read_page_no_cache`) is not counted; a thread holding two trunks' WAL
+// write locks at once (an attached database) reads as holding one, until either is released.
+thread_local! {
+    static T_PREPARES: Cell<u64> = const { Cell::new(0) };
+    static T_PAGE_READS: Cell<u64> = const { Cell::new(0) };
+    static T_SCHEMA_ROWS: Cell<u64> = const { Cell::new(0) };
+    static WAL_HELD: Cell<bool> = const { Cell::new(false) };
+    static T_WAL_LOCKS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_PREPARES: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_PAGE_READS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_SCHEMA_ROWS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn wal_held() -> bool {
+    WAL_HELD.try_with(|h| h.get()).unwrap_or(false)
+}
+
+/// A statement was prepared on this thread.
+pub(crate) fn statement_prepared() {
+    bump(&T_PREPARES, 1);
+    if wal_held() {
+        bump(&T_WAL_PREPARES, 1);
+    }
+}
+
+/// A page was read through the pager on this thread.
+pub(crate) fn page_read() {
+    bump(&T_PAGE_READS, 1);
+    if wal_held() {
+        bump(&T_WAL_PAGE_READS, 1);
+    }
+}
+
+/// A `sqlite_schema` row was parsed into a schema on this thread.
+pub(crate) fn schema_row_parsed() {
+    bump(&T_SCHEMA_ROWS, 1);
+    if wal_held() {
+        bump(&T_WAL_SCHEMA_ROWS, 1);
+    }
+}
+
+/// This thread took a trunk's WAL write lock.
+pub(crate) fn wal_write_locked() {
+    let _ = WAL_HELD.try_with(|h| h.set(true));
+    bump(&T_WAL_LOCKS, 1);
+}
+
+/// This thread let a trunk's WAL write lock go (or ended a write transaction it never began).
+pub(crate) fn wal_write_unlocked() {
+    let _ = WAL_HELD.try_with(|h| h.set(false));
+}
+
+/// The SQL-layer counters of the calling thread at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SqlCounts {
+    pub(crate) prepares: u64,
+    pub(crate) page_reads: u64,
+    pub(crate) schema_rows: u64,
+    pub(crate) wal_locks: u64,
+    pub(crate) wal_prepares: u64,
+    pub(crate) wal_page_reads: u64,
+    pub(crate) wal_schema_rows: u64,
+    pub(crate) wal_allocs: u64,
+    pub(crate) wal_alloc_bytes: u64,
+    pub(crate) allocs: u64,
+    pub(crate) alloc_bytes: u64,
+}
+
+pub(crate) fn sql_counts() -> SqlCounts {
+    let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+    SqlCounts {
+        prepares: get(&T_PREPARES),
+        page_reads: get(&T_PAGE_READS),
+        schema_rows: get(&T_SCHEMA_ROWS),
+        wal_locks: get(&T_WAL_LOCKS),
+        wal_prepares: get(&T_WAL_PREPARES),
+        wal_page_reads: get(&T_WAL_PAGE_READS),
+        wal_schema_rows: get(&T_WAL_SCHEMA_ROWS),
+        wal_allocs: get(&T_WAL_ALLOCS),
+        wal_alloc_bytes: get(&T_WAL_ALLOC_BYTES),
+        allocs: get(&T_ALLOCS),
+        alloc_bytes: get(&T_ALLOC_BYTES),
+    }
+}
+
+/// Whether this thread holds a trunk's WAL write lock now (the fire-check's).
+pub(crate) fn wal_write_held() -> bool {
+    wal_held()
 }
 
 // SAFETY: every call is forwarded unchanged to `System`; the counting touches only atomics and
