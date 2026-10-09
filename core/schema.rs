@@ -3411,6 +3411,13 @@ impl BTreeTable {
         &self.columns
     }
 
+    /// Whether an explicit NULL into this table's rowid alias raises the NOT NULL constraint
+    /// instead of taking a new rowid (`rowid_alias_not_null`, fastest-engine 4c). Mutant
+    /// `null_key_takes_rowid` (test builds only): never, as before.
+    pub fn rowid_alias_refuses_null(&self) -> bool {
+        self.rowid_alias_not_null && !crate::branch::store::fe_mutant("null_key_takes_rowid")
+    }
+
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
         ColumnsMut { table: self }
     }
