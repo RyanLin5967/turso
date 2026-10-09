@@ -7407,6 +7407,86 @@ fn an_implicit_block_follows_the_engines_transaction() {
     assert_eq!(r.err("no branch y").code, "3D000");
 }
 
+/// A simple Query inside an unsynced pipeline is part of the pipeline's implicit block, as in
+/// PostgreSQL, whatever form the Query takes: a lone BEGIN makes the block the client's (status T),
+/// so its ROLLBACK drops the pipeline's write and its own; a branch call refused there (25001)
+/// rolls the block back and leaves the session idle, so the next Query runs before any Sync; and
+/// turso_branch_current() or an empty Query ends the block like any other Query, committing it
+/// (status I). A lone BEGIN committed the pipeline's write and answered I; the refused call left
+/// the session failed (E, then 25P02); and the fast path and the empty Query left the block open
+/// (T) (wire review 16 item 6).
+#[test]
+fn a_query_in_an_unsynced_pipeline_takes_part_in_its_block() {
+    let dir = Scratch::new("pipequery");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    // Parse, Bind and Execute an INSERT of `id`, with no Sync: the pipeline's implicit block.
+    fn insert(w: &mut Wire, id: i32) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(format!("INSERT INTO t VALUES ({id}, 'p')").as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        w.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+    }
+    let kept = |b: &mut Wire, id: i32| {
+        b.q(&format!("SELECT count(*) FROM t WHERE id = {id}"))
+            .single("kept")
+    };
+    insert(&mut a, 2);
+    let r = a.q("BEGIN");
+    assert!(r.error.is_none(), "BEGIN: {:?}", r.error);
+    assert_eq!(r.status, b'T', "BEGIN makes the block the client's");
+    a.q("UPDATE t SET v = 'u' WHERE id = 1")
+        .ok("update in the block");
+    a.q("ROLLBACK").ok("the client's rollback");
+    a.send(b'S', &[]);
+    a.read_reply();
+    assert_eq!(kept(&mut b, 2), "0", "the pipeline's insert was kept");
+    assert_eq!(
+        b.q("SELECT v FROM t WHERE id = 1").single("v"),
+        "trunk",
+        "the UPDATE was kept"
+    );
+    insert(&mut a, 3);
+    let r = a.q("SELECT turso_branch_create('y')");
+    assert!(r.error.is_some(), "a branch call inside the block");
+    assert_eq!(r.status, b'I', "the refused call rolled the block back");
+    assert_eq!(a.q("SELECT 1").single("a Query before Sync"), "1");
+    a.send(b'S', &[]);
+    a.read_reply();
+    assert_eq!(kept(&mut b, 3), "0", "the rolled-back insert");
+    insert(&mut a, 4);
+    let r = a.q("SELECT turso_branch_current()");
+    assert!(r.error.is_none(), "turso_branch_current(): {:?}", r.error);
+    assert_eq!(r.status, b'I', "turso_branch_current() ends the block");
+    assert_eq!(kept(&mut b, 4), "1", "committed by the Query");
+    insert(&mut a, 5);
+    let r = a.q("");
+    assert_eq!(r.status, b'I', "an empty Query ends the block");
+    assert_eq!(kept(&mut b, 5), "1", "committed by the empty Query");
+    a.send(b'S', &[]);
+    assert_eq!(a.read_reply().status, b'I');
+}
+
+/// An empty statement takes no value at Bind: one value is 08P01 before any BindComplete, as
+/// PostgreSQL counts it (its parameters are the ones Parse declared, none). It got BindComplete,
+/// then EmptyQueryResponse (wire review 16 item 5; a pin of 745585f27's Bind-time count).
+#[test]
+fn an_empty_statement_takes_no_value_at_bind() {
+    let dir = Scratch::new("emptybind");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let (types, error) = a.bind_round("", &[], &[Some(b"v")], &[]);
+    assert_eq!(error.map(|e| e.code), Some("08P01".to_string()));
+    assert!(
+        !types.contains(&b'2'),
+        "BindComplete came before the refusal: {:?}",
+        String::from_utf8_lossy(&types)
+    );
+}
+
 /// SAVEPOINT, RELEASE and ROLLBACK TO in an IMPLICIT block (a multi-statement query, or a pipeline
 /// before its Sync) are 25P01, as PostgreSQL refuses them there: the block is rolled back, the
 /// session is idle, and nothing is kept or held. They ran, and ended the implicit block's
