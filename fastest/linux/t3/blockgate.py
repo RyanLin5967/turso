@@ -72,6 +72,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -112,9 +113,13 @@ def app_sync_evidence(outdir):
             return ev
         v = json.loads(raw)
         got = {c["id"]: c.get("pass") for c in v.get("checks") or []}
-        ev["f1b_real"] = all(got.get(k) is True for k in F1B_REAL) and v.get("v3floor_sha256") == kv.get("v3floor_sha256")
+        # the binary's sha must BE a sha256 and the verdict's must equal it: two absent fields, or two equal non-sha
+        # strings, are no binding (T3 runner review item 15)
+        exe = kv.get("v3floor_sha256")
+        exe_ok = isinstance(exe, str) and re.fullmatch(r"[0-9a-f]{64}", exe) is not None and v.get("v3floor_sha256") == exe
+        ev["f1b_real"] = all(got.get(k) is True for k in F1B_REAL) and exe_ok
         if not ev["f1b_real"]:
-            ev["why"] = f"F1b real checks {[got.get(k) for k in F1B_REAL]}, verdict sha matches {v.get('v3floor_sha256') == kv.get('v3floor_sha256')}"
+            ev["why"] = f"F1b real checks {[got.get(k) for k in F1B_REAL]}, binary sha {exe!r} bound and matching: {exe_ok}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         ev["f1b_real"], ev["why"] = False, f"verdict unreadable: {type(e).__name__}"
     return ev

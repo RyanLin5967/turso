@@ -6,7 +6,8 @@
                                 files; exit 0 VALID, 3 VOID (a registered gate failed), 2 refused (nothing measured).
                                 LEAFREC: the block's V3 batch summary.json, whose leaf record carries the drive's own
                                 cache report (the probe's NVMe VWC / SCSI WCE / virtio read): V3L refuses another disk,
-                                and VOIDs a kernel write_cache that disagrees with the drive (gate-6 review M6)
+                                and VOIDs a kernel write_cache that disagrees with the drive (gate-6 review M6). A real
+                                run (V3L_REAL=1) without it is refused (T3 runner review item 14)
   v3l.py block BEFORE AFTER     one block's record from its two v3l.json files: the pooled fsync p50 (the block's
                                 normaliser), the ratio and the drift (published, never gates); exit 0 when both are
                                 VALID, 3 when either is VOID, 2 when either is missing or unreadable
@@ -331,13 +332,27 @@ def counter_gate(what, wc, timed, lab):
     return bad
 
 
+def real_mode_problem(real, chain, disk, leafrec):
+    """Why a measurement may not run, or None. A real run (V3L_REAL=1; t3run sets it when not --dry-run) is on a
+    drive only, never a loop or ram disk (A16), and carries the V3 batch's leaf record (LEAFREC), so the drive's own
+    cache report is always there for gates() to cross-check (T3 runner review item 14). A dry run needs neither."""
+    if real != "1":
+        return None
+    if any(c.startswith("loop") for c in chain) or disk.startswith("ram"):
+        return f"a real run on {chain} -> {disk}: loop and ram devices are dry-run only (A16)"
+    if not leafrec:
+        return "a real run needs the V3 batch's leaf record (LEAFREC): the drive's own cache report is cross-checked"
+    return None
+
+
 def measure(d, out, leafrec=None):
     if os.path.exists(out):
         raise RuntimeError(f"{out} exists")
     os.makedirs(d, exist_ok=True)
     chain, disk = resolve_leaf(d)
-    if os.environ.get("V3L_REAL") == "1" and (any(c.startswith("loop") for c in chain) or disk.startswith("ram")):
-        raise RuntimeError(f"a real run on {chain} -> {disk}: loop and ram devices are dry-run only (A16)")
+    why = real_mode_problem(os.environ.get("V3L_REAL"), chain, disk, leafrec)
+    if why:
+        raise RuntimeError(why)
     drive_reports, virt = None, None
     if leafrec:
         lj = json.load(open(leafrec))

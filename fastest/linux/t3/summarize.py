@@ -371,10 +371,12 @@ def summarize(out, sha, dry, manifest):
     blocks = [block_record(out, fs, plp) for fs in fslist]
     # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
     pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
+    verdicts = {b["fs"]: {pr["k"]: pr["verdict"] for pr in (b.get("v3l") or {}).get("blocks") or []} for b in blocks}
     normaliser = []
     for r in runs:
         r["block_k"] = (r.get("plan") or {}).get("block_k")
         r["v3l_pooled_fsync_p50_us"] = pooled.get(r["fs"], {}).get(r["block_k"])
+        r["v3l_block_verdict"] = verdicts.get(r["fs"], {}).get(r["block_k"])  # T3 runner review item 20
         if r["measured"] and r["v3l_pooled_fsync_p50_us"] is None:  # third lane review LOW 11
             normaliser.append(f"{r['fs']}/{r['cell']}: no pooled V3L p50 for its block {r['block_k']}")
     # every measured run settled before it started, and went quiet (fourth lane review MED 5; T3 runner review item 9)
