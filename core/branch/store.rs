@@ -4180,12 +4180,16 @@ impl BranchStore {
                 };
                 let mut g = group.lock();
                 if g.durable[need] >= lsn {
+                    #[cfg(test)]
+                    super::budget_probe::futile_lead();
                     return Ok(());
                 }
                 if group.poisoned() {
                     return Err(group_poisoned());
                 }
                 if g.flushing || g.cutting {
+                    #[cfg(test)]
+                    super::budget_probe::futile_lead();
                     continue;
                 }
                 if g.arena_syncing

@@ -199,6 +199,19 @@ pub(crate) fn sql_counts() -> SqlCounts {
 
 thread_local! {
     static T_WINDOWS_MET: Cell<u64> = const { Cell::new(0) };
+    static T_FUTILE_LEADS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A flight waiter on this thread took the store mutex and the group lock to lead, and led no flight:
+/// it was covered meanwhile, or another flight was already in the air (review 1 #9's herd; review 2
+/// H5). Two `cfg(test)` hook lines in `BranchStore::wait_durable_on`.
+pub(crate) fn futile_lead() {
+    bump(&T_FUTILE_LEADS, 1);
+}
+
+/// This thread's count of `futile_lead`.
+pub(crate) fn futile_leads() -> u64 {
+    T_FUTILE_LEADS.with(|c| c.get())
 }
 
 /// A trunk fork on this thread found no schema in hand at its snapshot's cookie (engine 2b's DDL

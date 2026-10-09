@@ -558,9 +558,12 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let s0 = sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
-        // counts again), its store-mutex acquisitions, and the creates refused Busy or
-        // SchemaUpdated and retried (the population's `fork_one` retries them silently).
-        let per: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
+        // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
+        // and hides one convoyed acknowledgement); its store-mutex acquisitions; the creates
+        // refused Busy or SchemaUpdated and retried (the population's `fork_one` retries them
+        // silently); and its futile leads (`probe::futile_leads`: the store mutex and the group
+        // lock taken to lead, and no flight led; review 1 #9).
+        let per: Vec<(u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             for t in 0..c {
                 let go = &go;
@@ -570,10 +573,11 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                         std::thread::yield_now();
                     }
                     let trunk = trunk.unwrap();
-                    let (w0, l0) = (super::store::thread_waits(), probe::thread_locks());
-                    let mut retries = 0u64;
+                    let (w0, l0, f0) = (super::store::thread_waits(), probe::thread_locks(), probe::futile_leads());
+                    let (mut retries, mut max_ack) = (0u64, 0u64);
                     for i in 0..rounds {
                         let name = format!("{arm}-{t}-{i:04}");
+                        let a0 = super::store::thread_waits();
                         loop {
                             match trunk.create_branch(&name) {
                                 Ok(_) => break,
@@ -581,12 +585,21 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                                 Err(e) => panic!("{arm}: create {name}: {e}"),
                             }
                         }
+                        max_ack = max_ack.max(delta(a0, super::store::thread_waits()));
                         if cfw {
                             let b = db.connect_named(&name).unwrap();
+                            let a1 = super::store::thread_waits();
                             exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                            max_ack = max_ack.max(delta(a1, super::store::thread_waits()));
                         }
                     }
-                    (delta(w0, super::store::thread_waits()), delta(l0, probe::thread_locks()), retries)
+                    (
+                        delta(w0, super::store::thread_waits()),
+                        delta(l0, probe::thread_locks()),
+                        retries,
+                        max_ack,
+                        delta(f0, probe::futile_leads()),
+                    )
                 });
                 match spawned {
                     Ok(h) => clients.push(h),
@@ -609,8 +622,10 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         m.insert("barrier", s1.barrier - s0.barrier);
         m.insert("store_waits", per.iter().map(|p| p.0).sum());
         m.insert("store_waits_max_client", per.iter().map(|p| p.0).max().unwrap_or(0));
+        m.insert("store_waits_max_ack", per.iter().map(|p| p.3).max().unwrap_or(0));
         m.insert("store_locks", per.iter().map(|p| p.1).sum());
         m.insert("retries", per.iter().map(|p| p.2).sum());
+        m.insert("futile_leads", per.iter().map(|p| p.4).sum());
         line(out, cell, arm, 0, &m);
     }
 }
@@ -2663,9 +2678,14 @@ fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
     lines
 }
 
-/// Engine review 4 (the retry storm) and the trunk fork's own contract (`BranchStore::fork_trunk`:
-/// "The fork itself waits for no trunk commit and never retries"): at every C from 1 to 1,024, no
-/// create is refused Busy or SchemaUpdated and retried. WRITTEN NOT RUN (2026-10-09, QUIET).
+/// Refusals a caller sees under contention (review 2 M5 narrowed this budget's citation): at every C
+/// from 1 to 1,024, no create is refused Busy or SchemaUpdated and retried by its caller. The fork's
+/// own contract (`BranchStore::fork_trunk`: "The fork itself waits for no trunk commit and never
+/// retries"). BLIND SPOTS: the shared arm makes no trunk commit and no DDL, so it reaches no refusal
+/// path the engine has today, and retries inside the engine (begin_read_tx's loop,
+/// fork_trunk_locked's BusySnapshot retries, wait_durable's `continue`) are not counted here: the
+/// futile-lead budget below counts the last; engine review 4's re-capture storm inside creates that
+/// succeed is not counted at all. Mutant `lockfree_fork_refuses_every_other`. WRITTEN NOT RUN.
 #[test]
 fn contention_no_create_is_refused_and_retried_at_any_client_count() {
     if in_child() {
@@ -2680,14 +2700,18 @@ fn contention_no_create_is_refused_and_retried_at_any_client_count() {
     assert!(failures.is_empty(), "creates refused under contention:\n{failures}");
 }
 
-/// Review 1 #9 (futile wake-ups) and group commit's shape (DESIGN §3; PREREG M2: a create buffered
-/// while a flight is in progress rides the next one): at every C from 1 to 1,024, the clients' store
-/// waits number at most two per acknowledgement — the flight in progress, then its own. The count is
-/// one per condition-variable wait call (`store::thread_waits`), so a waiter woken for a flight that
-/// does not carry it, and waiting again, counts again: a convoy, or one condition variable woken for
-/// every flight, shows here as more. Store-mutex acquisitions per acknowledgement are reported with
-/// it (no budget: a flight leader's count per flight is not stated anywhere). WRITTEN NOT RUN
-/// (2026-10-09, QUIET).
+/// Group commit's shape (DESIGN §3; PREREG M2): one flight in the air at a time, and it takes
+/// everything buffered, so an acknowledgement waits for at most two flights — the one in progress,
+/// then its own. At every C from 1 to 1,024 no single acknowledgement (a create, or a first write)
+/// makes more than 2 store waits (`store::thread_waits`, one per condition-variable wait call, so a
+/// waiter woken and waiting again counts again). This holds by construction today (review 2 H5): it
+/// guards the shape, against a waiter that polls on timed waits or a flight that takes part of the
+/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A line at C >= 8 with
+/// no store wait at all is refused: some waiter must sleep, and a wait outside `Group::wait` (a
+/// sleep-and-relock poll, or creates serialised on the store mutex) would read as none. Reported per
+/// line: the mean per acknowledgement, the worst acknowledgement, and the worst client's waits per
+/// its own acknowledgements (the lead's condition, DECISIONS 2026-10-09). Mutants
+/// `group_wait_polls`, `poll_outside_group_wait`, `flush_under_mutex`. WRITTEN NOT RUN.
 #[test]
 fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_count() {
     if in_child() {
@@ -2697,17 +2721,42 @@ fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_cou
     let mut seen = String::new();
     for (spec, c, arm, s) in shared_lines() {
         let (acks, waits, locks) = (s["acks"], s["store_waits"], s["store_locks"]);
-        assert!(acks > 0, "{spec}: {arm}: no acknowledgement counted");
+        let per_client_acks = acks / c;
         let _ = write!(
             seen,
-            " C={c}/{arm} {:.2} waits, {:.2} locks per ack (worst client {});",
+            " C={c}/{arm}: {:.2} waits per ack (worst ack {}, worst client {:.2} per its ack), {:.2} locks per ack;",
             waits as f64 / acks as f64,
+            s["store_waits_max_ack"],
+            s["store_waits_max_client"] as f64 / per_client_acks as f64,
             locks as f64 / acks as f64,
-            s["store_waits_max_client"]
         );
-        if waits > 2 * acks {
-            let _ = writeln!(failures, "  {spec}: {arm}: {waits} store waits over {acks} acknowledgements by {c} clients; budget <= 2 per acknowledgement");
+        if s["store_waits_max_ack"] > 2 {
+            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2", s["store_waits_max_ack"]);
+        }
+        if c >= 8 && waits == 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere (refused)");
         }
     }
-    assert!(failures.is_empty(), "acknowledgements wait through more than two flights (all:{seen}):\n{failures}");
+    assert!(failures.is_empty(), "acknowledgements under contention (all:{seen}):\n{failures}");
+}
+
+/// Review 1 #9 (no leader flag, one condition variable: every landing wakes every waiter, and an
+/// uncovered one takes the store mutex and the group lock only to find a flight in the air, or a
+/// covered one only to return): at every C from 1 to 1,024, no flight waiter takes the store mutex to
+/// lead and leads no flight (`probe::futile_leads`, two `cfg(test)` hook lines in
+/// `BranchStore::wait_durable_on`, review 2 H5). Expected RED at base: #9 is live. Its engine fix (a
+/// leader flag, or waiters woken only when their flight lands) turns it green; mutant
+/// `herd_relead` scores only after that fix. WRITTEN NOT RUN.
+#[test]
+fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        if s["futile_leads"] != 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} futile leads over {} acknowledgements by {c} clients; budget 0", s["futile_leads"], s["acks"]);
+        }
+    }
+    assert!(failures.is_empty(), "flight waiters took the store mutex to lead and led nothing [review 1 #9]:\n{failures}");
 }
