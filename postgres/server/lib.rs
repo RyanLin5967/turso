@@ -4205,6 +4205,204 @@ mod tests {
         );
     }
 
+    type Stmt = <Session as ExtendedQueryHandler>::Statement;
+
+    /// A client of the extended-protocol handlers in memory: pgwire's DefaultClient holds the
+    /// connection state and the portal store, and every reply is kept, in order.
+    struct MemClient {
+        info: pgwire::api::DefaultClient<Stmt>,
+        replies: Vec<PgWireBackendMessage>,
+    }
+
+    impl MemClient {
+        fn new() -> Self {
+            let mut info = pgwire::api::DefaultClient::new(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                false,
+            );
+            info.state = PgWireConnectionState::ReadyForQuery;
+            Self {
+                info,
+                replies: Vec::new(),
+            }
+        }
+    }
+
+    impl ClientInfo for MemClient {
+        fn socket_addr(&self) -> std::net::SocketAddr {
+            self.info.socket_addr()
+        }
+        fn is_secure(&self) -> bool {
+            self.info.is_secure()
+        }
+        fn protocol_version(&self) -> pgwire::messages::ProtocolVersion {
+            self.info.protocol_version()
+        }
+        fn set_protocol_version(&mut self, version: pgwire::messages::ProtocolVersion) {
+            self.info.set_protocol_version(version)
+        }
+        fn pid_and_secret_key(&self) -> (i32, pgwire::messages::startup::SecretKey) {
+            self.info.pid_and_secret_key()
+        }
+        fn set_pid_and_secret_key(
+            &mut self,
+            pid: i32,
+            secret_key: pgwire::messages::startup::SecretKey,
+        ) {
+            self.info.set_pid_and_secret_key(pid, secret_key)
+        }
+        fn state(&self) -> PgWireConnectionState {
+            self.info.state()
+        }
+        fn set_state(&mut self, new_state: PgWireConnectionState) {
+            self.info.set_state(new_state)
+        }
+        fn transaction_status(&self) -> TransactionStatus {
+            self.info.transaction_status()
+        }
+        fn set_transaction_status(&mut self, new_status: TransactionStatus) {
+            self.info.set_transaction_status(new_status)
+        }
+        fn metadata(&self) -> &std::collections::HashMap<String, String> {
+            self.info.metadata()
+        }
+        fn metadata_mut(&mut self) -> &mut std::collections::HashMap<String, String> {
+            self.info.metadata_mut()
+        }
+        fn sni_server_name(&self) -> Option<&str> {
+            None
+        }
+        fn client_certificates<'a>(
+            &self,
+        ) -> Option<&[pgwire::tokio::tokio_rustls::rustls::pki_types::CertificateDer<'a>]> {
+            None
+        }
+    }
+
+    impl ClientPortalStore for MemClient {
+        type PortalStore = pgwire::api::store::MemPortalStore<Stmt>;
+
+        fn portal_store(&self) -> &Self::PortalStore {
+            &self.info.portal_store
+        }
+    }
+
+    impl Sink<PgWireBackendMessage> for MemClient {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            item: PgWireBackendMessage,
+        ) -> Result<(), Self::Error> {
+            self.replies.push(item);
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One execution of the unnamed statement through the session's own handlers: Bind (with
+    /// `param`, if any), Describe of the statement and of the portal when asked, Execute and Sync.
+    /// Returns the libpg_query calls it made; an ErrorResponse fails the test.
+    async fn execute_unnamed(
+        s: &Session,
+        c: &mut MemClient,
+        param: Option<&str>,
+        describe: bool,
+    ) -> u64 {
+        let parameters = param
+            .map(|p| vec![Some(p.as_bytes().to_vec().into())])
+            .unwrap_or_default();
+        let before = turso_pg_parser::libpg_query_calls();
+        s.on_bind(c, Bind::new(None, None, vec![], parameters, vec![]))
+            .await
+            .unwrap();
+        if describe {
+            s.on_describe(c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                .await
+                .unwrap();
+            s.on_describe(c, Describe::new(TARGET_TYPE_BYTE_PORTAL, None))
+                .await
+                .unwrap();
+        }
+        s.on_execute(c, Execute::new(None, 0)).await.unwrap();
+        s.on_sync(c, PgSync::new()).await.unwrap();
+        let calls = turso_pg_parser::libpg_query_calls() - before;
+        for reply in c.replies.drain(..) {
+            if let PgWireBackendMessage::ErrorResponse(e) = reply {
+                panic!("an error in the round: {e:?}");
+            }
+        }
+        calls
+    }
+
+    /// Wire review 13 items 6 and 7: an extended-protocol statement is classified as a branch call
+    /// or not once, at Parse, through the session's own on_parse, on_bind, on_describe, on_execute
+    /// and on_sync. A fast form (`turso_branch_create($1)`, `$1::text`) makes no libpg_query call
+    /// at Parse or in any execution (DECISIONS L5); a slow form (a comment) makes at most one at
+    /// Parse and none per execution, Describes included; an ordinary statement whose text mentions
+    /// the prefix makes at most one at Parse and exactly one per execution (the engine's prepare).
+    /// Bind, each Describe and Execute read the text again, one call each: 4 per execution of the
+    /// slow form with both Describes, 3 for the ordinary statement (Bind, Execute's reading, the
+    /// engine's prepare). The L5 counter had been read only through the simple protocol and a
+    /// hand-built portal.
+    #[test]
+    fn an_extended_statement_is_classified_once_at_parse() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (n, (sql, param, parse_at_most, per_execution)) in [
+                ("SELECT turso_branch_create($1)", true, 0, 0),
+                ("SELECT turso_branch_create($1::text)", true, 0, 0),
+                ("SELECT turso_branch_current() /* c */", false, 1, 0),
+                ("SELECT 'turso_branch_' AS s", false, 1, 1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let at_parse = turso_pg_parser::libpg_query_calls() - before;
+                assert!(
+                    at_parse <= parse_at_most,
+                    "{sql:?}: {at_parse} libpg_query calls at Parse"
+                );
+                for round in 0..3 {
+                    let name = format!("x{n}_{round}");
+                    let describe = per_execution == 0;
+                    let calls =
+                        execute_unnamed(&s, &mut c, param.then_some(name.as_str()), describe).await;
+                    assert_eq!(
+                        calls, per_execution,
+                        "{sql:?}: libpg_query calls in execution {round}"
+                    );
+                }
+            }
+        });
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
