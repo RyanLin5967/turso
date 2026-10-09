@@ -5463,6 +5463,41 @@ mod format_tests {
         }
     }
 
+    /// Engine review 16 MED 5: flights go one at a time, so a whole raised flight written after a
+    /// synced or raised one proves that one's sync returned, whatever the writer's own class. Per
+    /// writer class (43895116d), the later raised flight proved nothing, and damage under the
+    /// earlier one was cut silently, dropping acknowledged records (review 5 #26's hazard): raised
+    /// flights A, B, C in a D0 store, B's end frame lost, C whole. Refused at a D0 and a syncing
+    /// open. Mutant `prev_synced_ignored`.
+    #[test]
+    fn damage_under_a_raised_flight_followed_by_a_whole_raised_flight_is_refused() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let b_end;
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                let mut arena = Arena::new(512);
+                let mut ends = Vec::new();
+                for child in 1..=3 {
+                    journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                    journal.raise_pending_class(SyncClass::FullFsync);
+                    journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                    ends.push(journal.len);
+                }
+                b_end = ends[1];
+            }
+            // B's end frame is lost; C, after it, is whole.
+            overwrite(&files.log, b_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+            let got = Journal::recover(&files, opener);
+            assert!(
+                matches!(got, Err(LimboError::Corrupt(_))),
+                "{opener:?}: an acknowledged raised flight lost under a whole later raised flight was cut: {:?}",
+                got.map(|r| r.map(|r| forks(&r.records)))
+            );
+        }
+    }
+
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
     /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
     /// stays synced only when the rewrite syncs too.
