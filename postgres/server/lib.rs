@@ -49,7 +49,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireConnectionState,
@@ -729,7 +729,46 @@ impl StartupHandler for Refusal {
 struct Session {
     shared: Arc<Shared>,
     state: Mutex<SessionState>,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<ParsedQueryParser>,
+}
+
+/// A statement as Parse stored it: its text, and the branch call the text is, read once, at Parse
+/// ([`branch_call`]). Bind, Describe and Execute read the call from here: each read the text
+/// again, so a slow-form call (a comment, a quoted name) cost a libpg_query parse at Bind, at each
+/// Describe and at Execute, and an ordinary statement mentioning the prefix up to 3 beside its own
+/// prepare (wire review 13 item 6).
+#[derive(Debug, Clone)]
+struct Parsed {
+    sql: String,
+    call: Option<PgBranchCall>,
+}
+
+impl Parsed {
+    fn new(sql: String) -> Self {
+        let call = branch_call(&sql);
+        Self { sql, call }
+    }
+}
+
+/// pgwire's query parser for [`Parsed`] statements. This server overrides every handler that
+/// calls one (Parse among them), so it is pgwire's type requirement only.
+struct ParsedQueryParser;
+
+#[async_trait]
+impl QueryParser for ParsedQueryParser {
+    type Statement = Parsed;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(Parsed::new(sql.to_owned()))
+    }
 }
 
 #[derive(Default)]
@@ -792,7 +831,7 @@ impl Session {
         Self {
             shared,
             state: Mutex::new(SessionState::default()),
-            query_parser: Arc::new(NoopQueryParser::new()),
+            query_parser: Arc::new(ParsedQueryParser),
         }
     }
 
@@ -905,7 +944,9 @@ impl Session {
         // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let multi = statements.len() > 1;
         for sql in &statements {
-            let call = branch_call(sql);
+            // A query of one statement was read above as a whole and is no call: it is not read
+            // again (wire review 13 item 6).
+            let call = if multi { branch_call(sql) } else { None };
             let result = if multi {
                 self.begin_implicit(sql, call.as_ref(), false)
             } else {
@@ -1054,7 +1095,7 @@ impl Session {
         &self,
         sql: &str,
         call: Option<PgBranchCall>,
-        portal: Option<&Portal<String>>,
+        portal: Option<&Portal<Parsed>>,
         format: &Format,
     ) -> SqlResult<Response> {
         let verb = TxVerb::of(sql);
@@ -1377,7 +1418,7 @@ impl Session {
         conn: &PgConnection,
         sql: &str,
         verb: TxVerb,
-        portal: Option<&Portal<String>>,
+        portal: Option<&Portal<Parsed>>,
         format: &Format,
     ) -> Result<Response, StatementFailure> {
         let in_tx = !conn.inner().get_auto_commit();
@@ -1425,7 +1466,7 @@ impl Session {
         &self,
         conn: &PgConnection,
         sql: &str,
-        portal: Option<&Portal<String>>,
+        portal: Option<&Portal<Parsed>>,
         format: &Format,
         backoff: &mut Backoff,
     ) -> Result<Response, StatementFailure> {
@@ -1494,7 +1535,7 @@ impl Session {
         st: &mut SessionState,
         conn: &PgConnection,
         call: &PgBranchCall,
-        portal: Option<&Portal<String>>,
+        portal: Option<&Portal<Parsed>>,
         format: &Format,
     ) -> SqlResult<Response> {
         let f = call.function.as_str();
@@ -2166,7 +2207,7 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
 }
 
 /// A branch name argument: a string literal, or a `$n` bound to text.
-fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<String>>) -> SqlResult<String> {
+fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<String> {
     match arg {
         PgBranchArg::Text(s) => Ok(s.clone()),
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
@@ -2603,8 +2644,8 @@ impl SimpleQueryHandler for Session {
 
 #[async_trait]
 impl ExtendedQueryHandler for Session {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = Parsed;
+    type QueryParser = ParsedQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
@@ -2623,7 +2664,7 @@ impl ExtendedQueryHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // NoopQueryParser keeps the text as it is; so does this.
+        // The text as it is, and the branch call it is, read here once (wire review 13 item 6).
         let types = message
             .type_oids
             .iter()
@@ -2632,7 +2673,11 @@ impl ExtendedQueryHandler for Session {
         let id = message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
         client
             .portal_store()
-            .put_statement(Arc::new(StoredStatement::new(id, message.query, types)));
+            .put_statement(Arc::new(StoredStatement::new(
+                id,
+                Parsed::new(message.query),
+                types,
+            )));
         client
             .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
@@ -2658,10 +2703,10 @@ impl ExtendedQueryHandler for Session {
         // turso_branch_create($1) created the branch (wire review 10 item 5) and a value for
         // CHECKPOINT or BEGIN ran it (wire review 12 item 2). An engine statement's count is known
         // once it is prepared, and is checked at Execute (E5-QUEUE R2).
-        let sql = &statement.statement;
-        let required = if let Some(call) = branch_call(sql) {
+        let sql = &statement.statement.sql;
+        let required = if let Some(call) = &statement.statement.call {
             Some(
-                parameter_types(&branch_call_types(&call), &statement.parameter_types)
+                parameter_types(&branch_call_types(call), &statement.parameter_types)
                     .map_err(PgWireError::UserError)?
                     .len(),
             )
@@ -2853,14 +2898,14 @@ impl ExtendedQueryHandler for Session {
         C: ClientInfo + Unpin + Send + Sync,
     {
         // Executes up to Sync are one implicit transaction, as in PostgreSQL (wire review 1 item 8).
-        let sql = &portal.statement.statement;
+        let sql = &portal.statement.statement.sql;
         // An empty statement is EmptyQueryResponse and joins no block, as over the simple
         // protocol; it failed ("contains no statements") after joining the pipeline's implicit
         // block, which rolled the pipeline back (wire review 12 item 4).
         if is_blank(sql) {
             return Ok(Response::EmptyQuery);
         }
-        let call = branch_call(sql);
+        let call = portal.statement.statement.call.clone();
         let result = self
             .begin_implicit(sql, call.as_ref(), true)
             .and_then(|()| self.run(sql, call, Some(portal), &portal.result_column_format));
@@ -2876,9 +2921,10 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        self.refuse_describe_if_aborted(&target.statement)?;
+        let sql = &target.statement.sql;
+        self.refuse_describe_if_aborted(sql)?;
         // An empty statement returns no rows: NoData (wire review 12 item 4).
-        if is_blank(&target.statement) {
+        if is_blank(sql) {
             let declared = target
                 .parameter_types
                 .iter()
@@ -2886,17 +2932,17 @@ impl ExtendedQueryHandler for Session {
                 .collect();
             return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
-        if let Some(call) = branch_call(&target.statement) {
+        if let Some(call) = &target.statement.call {
             let fields =
-                branch_call_fields(&call, &Format::UnifiedText).map_err(PgWireError::UserError)?;
-            let params = parameter_types(&branch_call_types(&call), &target.parameter_types)
+                branch_call_fields(call, &Format::UnifiedText).map_err(PgWireError::UserError)?;
+            let params = parameter_types(&branch_call_types(call), &target.parameter_types)
                 .map_err(PgWireError::UserError)?;
             return Ok(DescribeStatementResponse::new(params, fields));
         }
         // The special statements return no rows: NoData, from the text (their prepared stand-ins
         // have a dummy column). That their prepare is never what performs them is describe_prepare's
         // job, from the parse, so a form this text test misses is still not performed.
-        if is_pg_non_query(&target.statement) {
+        if is_pg_non_query(sql) {
             // The parameters the client declared, as declared, the rest as text (wire review 1
             // item 13).
             let declared = target
@@ -2906,7 +2952,7 @@ impl ExtendedQueryHandler for Session {
                 .collect();
             return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
-        self.describe_prepare(&target.statement)?;
+        self.describe_prepare(sql)?;
         let fields = self
             .described_fields(&Format::UnifiedText)
             .map_err(PgWireError::UserError)?;
@@ -2924,21 +2970,22 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        self.refuse_describe_if_aborted(&portal.statement.statement)?;
+        let sql = &portal.statement.statement.sql;
+        self.refuse_describe_if_aborted(sql)?;
         // An empty statement returns no rows: NoData, its result formats ignored (wire review 12
         // item 4).
-        if is_blank(&portal.statement.statement) {
+        if is_blank(sql) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
-        if let Some(call) = branch_call(&portal.statement.statement) {
-            let fields = branch_call_fields(&call, &portal.result_column_format)
+        if let Some(call) = &portal.statement.statement.call {
+            let fields = branch_call_fields(call, &portal.result_column_format)
                 .map_err(PgWireError::UserError)?;
             return Ok(DescribePortalResponse::new(fields));
         }
-        if is_pg_non_query(&portal.statement.statement) {
+        if is_pg_non_query(sql) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
-        self.describe_prepare(&portal.statement.statement)?;
+        self.describe_prepare(sql)?;
         let fields = self
             .described_fields(&portal.result_column_format)
             .map_err(PgWireError::UserError)?;
@@ -3471,7 +3518,7 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
 /// engine numbers PostgreSQL's $n as its parameter n.
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
-    portal: &Portal<String>,
+    portal: &Portal<Parsed>,
     statement_types: &StatementTypes,
 ) -> PgWireResult<()> {
     let types = parameter_types(statement_types, &portal.statement.parameter_types)
@@ -4190,7 +4237,11 @@ mod tests {
         ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
         ok(&s, "INSERT INTO t VALUES (1, 7)");
         let sql = "SELECT v FROM t WHERE id = 1";
-        let stored = Arc::new(StoredStatement::new(String::new(), sql.to_string(), vec![]));
+        let stored = Arc::new(StoredStatement::new(
+            String::new(),
+            Parsed::new(sql.to_string()),
+            vec![],
+        ));
         let bind = pgwire::messages::extendedquery::Bind::new(None, None, vec![], vec![], vec![]);
         let portal = Portal::try_new(&bind, stored).unwrap();
         let before = turso_pg_parser::libpg_query_calls();
