@@ -110,6 +110,14 @@ expect() { # expect NAME GOT WANT
 # nops C -> the run's ops TOTAL (all clients together): FT_OPS_TOTAL for every C and system when set, else N1 at C=1
 # and N4 otherwise (gate-6 review, t3run item 12); timedrun.py check refuses a run that measured another total.
 nops() { python3 "$HERE/timedrun.py" ops "$1" "$N1" "$N4" "${FT_OPS_TOTAL:-}"; }
+# LOW 13: every C's ops total is a positive count, checked once before anything runs (a non-count used to fail inside
+# each cell, after its conncheck and idle window), and recorded in run-info.txt
+OPS_TOTALS=""
+for c in $CLIENTS; do
+  t=$(nops "$c" 2>&1) && [[ $t =~ ^[0-9]+$ ]] ||
+    { echo "REFUSED: the ops total for C=$c is not a positive count (FT_N1 [$N1] FT_N4 [$N4] FT_OPS_TOTAL [${FT_OPS_TOTAL:-}]; FT_CLIENTS [$CLIENTS]): $t" >&2; exit 2; }
+  OPS_TOTALS+="${OPS_TOTALS:+,}c$c=$t"
+done
 # The registered per-run cap bounds every measured window (bbload/clonebench --max-window-s CAP_S: a run it ends with
 # >= 1000 ok ops is complete with reduced n), and one outer timeout above it, the same for every system, bounds each
 # invocation (gate-6 review, t3run item 16).
@@ -176,7 +184,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY ops_total=$OPS_TOTALS age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
   [ "$KIND" = pg ] && echo "pg_systems=pg18-d2 (with pg18-create-copy) pg18-defaults=DROPPED on Linux (lead ruling artie 6b0bef481b)"
   echo "$DRIVE"
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"

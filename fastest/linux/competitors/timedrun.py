@@ -126,9 +126,13 @@ def rule(cap_s):
 def ops(c, n1, n4, total=""):
     """The run's ops TOTAL (all clients together, as bbload/clonebench --max-ops count them): FT_OPS_TOTAL when set
     (one number for every C and every system), else N1 at C=1 and N4 otherwise; None for a non-count."""
+    def count(x):  # a positive decimal count, else None (LOW 13: int("0x10") raised and N=0 passed)
+        return int(x) if str(x).isdigit() and int(x) > 0 else None
     if total not in ("", None):
-        return int(total) if str(total).isdigit() and int(total) > 0 else None
-    return int(n1) if int(c) == 1 else int(n4)
+        return count(total)
+    if count(c) is None:
+        return None
+    return count(n1) if int(c) == 1 else count(n4)
 
 
 # PREREG FINAL-CANDIDATE :214, a run the registered window capped (lead review 62430d8bf..b49fb656a MED 5): the ONE
