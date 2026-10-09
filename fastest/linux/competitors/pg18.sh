@@ -44,6 +44,12 @@ init)
   mkdir -p "$(dirname "$DATA")"
   "$FT_PG18/initdb" -D "$DATA" -U postgres -A trust --encoding=UTF8 --locale=C >"$DATA.initdb.log" 2>&1 ||
     { tail -20 "$DATA.initdb.log" >&2; die "initdb failed"; }
+  # LOW 22: shared_buffers is computed BEFORE the config is written, from a copy of /proc/meminfo kept beside the data
+  # dir (DATA.meminfo; run_system.sh checks against that same read), and a failed or empty value stops the init
+  # instead of writing "shared_buffers = "
+  cp /proc/meminfo "$DATA.meminfo" || die "cannot read /proc/meminfo"
+  SB=$("$FT_PY" -B "$FT_HERE/pins.py" shared-buffers "$DATA.meminfo") || die "pins.py shared-buffers failed"
+  [[ $SB =~ ^[0-9]+MB$ ]] || die "shared_buffers [$SB] is not <N>MB"
   {
     echo ""
     echo "# ---- fastest-tools pg18.sh, mode $MODE ----"
@@ -53,7 +59,7 @@ init)
     echo "max_connections = 1100"
     # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15; initdb's default is 128 MB); run_system.sh
     # refuses a server whose pg_settings value differs (pins.py check-pg)
-    echo "shared_buffers = $("$FT_PY" -B "$FT_HERE/pins.py" shared-buffers /proc/meminfo)"
+    echo "shared_buffers = $SB"
     if [ "$MODE" = d2 ]; then
       echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"

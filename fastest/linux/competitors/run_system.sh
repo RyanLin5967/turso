@@ -567,8 +567,9 @@ server_main() {
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
     expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
-    # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15), recorded in pg_settings.tsv and meminfo.txt
-    cp /proc/meminfo "$RAW/meminfo.txt"
+    # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15), recorded in pg_settings.tsv and meminfo.txt --
+    # the meminfo pg18.sh init computed it from (LOW 22: a second read of /proc/meminfo could differ), banked
+    cp "$DATA.meminfo" "$RAW/meminfo.txt" 2>/dev/null || fail "server shared_buffers: init's meminfo copy is missing"
     if python3 -B "$HERE/pins.py" check-pg "$RAW/pg_settings.tsv" "$RAW/meminfo.txt" >"$RAW/shared_buffers-check.txt" 2>&1; then
       pass "server shared_buffers = 25% of MemTotal ($(awk -F'\t' '$1 == "shared_buffers" {print $2}' "$RAW/pg_settings.tsv") x 8 kB)"
     else
