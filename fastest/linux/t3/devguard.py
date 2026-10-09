@@ -486,6 +486,36 @@ def self_test():
                            text=True, timeout=60, env=dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", "")))
         return r.returncode, r.stdout, r.stderr
 
+    def fake_box():
+        """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to two
+        controllers (nvme0 carries the root disk nvme0n1 and a second namespace nvme0n2; nvme1 carries the spare
+        nvme1n1), lsblk's JSON, blkid's answers and an O_EXCL opener that finds the root disk claimed"""
+        top = tempfile.mkdtemp(dir=tmp)
+        droot, sroot = os.path.join(top, "dev"), os.path.join(top, "sys")
+        os.makedirs(droot)
+        for d in ("nvme0n1", "nvme0n1p1", "nvme0n2", "nvme1n1"):
+            open(os.path.join(droot, d), "w").close()
+        os.symlink(os.path.join(droot, "nvme1n1"), os.path.join(droot, "by-id-spare"))
+        for c in ("nvme0", "nvme1"):
+            os.makedirs(os.path.join(sroot, "devices", "pci", c))
+        for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1")):
+            os.makedirs(os.path.join(sroot, "block", d, "holders"))
+            os.symlink(os.path.join("..", "..", "devices", "pci", c), os.path.join(sroot, "block", d, "device"))
+        os.makedirs(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "holders"))
+        lsblk = json.dumps({"blockdevices": [N("nvme0n1", "disk", children=[N("nvme0n1p1", "part", "nvme0n1", ["/"])]),
+                                             N("nvme0n2", "disk"), N("nvme1n1", "disk")]})
+        answers = {"nvme0n1": (0, "DEVNAME=/dev/nvme0n1\nPTTYPE=gpt\n"), "nvme0n1p1": (0, "TYPE=ext4\n")}
+
+        def excl(path):
+            if os.path.basename(path) in ("nvme0n1", "nvme0n1p1"):
+                raise OSError(16, "Device or resource busy")
+
+        def run(dev):
+            return check(os.path.join(droot, dev) if not os.path.isabs(dev) else dev, sys_root=sroot, dev_root=droot,
+                         lsblk=lsblk, blkid=lambda k: answers.get(k, (2, "")), excl=excl)
+        return run
+
+    box = fake_box()
     pci = {"pci/nvme0n1": "disk", "pci/nvme0n1/nvme0n1p1": "part", "pci/nvme0n1/nvme0n1p2": "part",
            "pci/nvme0n1/nvme0n1p3": "part", "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
     # round-2 attack LOW 2: an NVMe multipath head whose slaves are its path devices (the 4.15-era layout)
@@ -630,6 +660,19 @@ def self_test():
             "cannot read nvme1n1's controller", "nvme1n1", devs, [], [], {}, {}, {"nvme0n1": c0})),
         ("LOW 3: a root disk whose controller cannot be read refuses every device", lambda: refuses(
             "cannot read nvme0n1's controller", "nvme1n1", devs, [], [], {}, {}, {"nvme1n1": c1})),
+        # review 5 MED 1: check() itself, on a whole fake box, so its allow path runs before a paid one does
+        ("MED 1: check() allows a blank spare on another controller (no reason at all)",
+         lambda: (lambda r: (r == ("nvme1n1", []), r))(box("nvme1n1"))),
+        ("MED 1: check() follows a symlink under the dev root to the spare and allows it",
+         lambda: (lambda r: (r == ("nvme1n1", []), r))(box("by-id-spare"))),
+        ("MED 1: check() refuses nvme0n2, a second namespace on the root drive's controller, by the controller rule",
+         lambda: (lambda r: (any("nvme0n2 shares its controller" in b for b in r[1]), r))(box("nvme0n2"))),
+        ("MED 1: check() on the root disk gives the root, O_EXCL and signature texts and no 'cannot read' line",
+         lambda: (lambda r: (all(any(t in b for b in r[1]) for t in (f"nvme0n1 {ROOT}", "nvme0n1 cannot be opened "
+                                                                     "exclusively", f"nvme0n1 {SIG}"))
+                             and not any("cannot read" in b for b in r[1]), r))(box("nvme0n1"))),
+        ("MED 1: check() refuses a path that does not resolve under the dev root",
+         lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("/etc/hosts"))),
     ]
     bad = []
     try:
