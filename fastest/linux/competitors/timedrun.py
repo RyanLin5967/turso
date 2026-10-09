@@ -131,6 +131,11 @@ CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 
 REGISTERED_CAP_S = 1800  # PREREG's per-run cap (30 min; t3run.sh RUN_CAP_S)
 
 
+def tier(sm):
+    """RED stub."""
+    return None
+
+
 def real_problem(cap_s, warmup):
     """Why a REAL run (run_system.sh FT_DRY=0; the T3 runner) may not use CAP_S and WARMUP; None when it may. The lead's
     ruling (artie DECISIONS 6b0bef481b) accepts the CI smoke warm-up cap for smoke runs only: a real run takes the
@@ -253,12 +258,14 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
             f.write("".join(f"{k}\t{v}\n" for k, v in live.items()))
     lo = n if lab_ops is None else lab_ops
     with open(os.path.join(d, "bb", "summary.json"), "w") as f:
-        json.dump({"verdict": "ok", "rc": 0, "measured_ops": lo, "measured_ok": lo, "warmup_rule": lab_rule,
-                   "capped": capped}, f)
+        json.dump({"verdict": "capped" if capped else "ok", "rc": 0, "measured_ops": lo, "measured_ok": lo,
+                   "warmup_rule": lab_rule, "capped": capped}, f)
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         to = n if timed_ops is None else timed_ops
-        sm = {"verdict": "ok" if rc == 0 else "fail", "rc": rc, "measured_ops": to, "measured_ok": to,
+        # MED 5: a run the registered window capped exits 0 with verdict "capped"; timedrun.py alone judges its tier
+        sm = {"verdict": ("capped" if capped else "ok") if rc == 0 else "fail", "rc": rc, "measured_ops": to,
+              "measured_ok": to,
               "warmup_rule": timed_rule, "capped": capped, "tm0_realtime_s": window[0], "tm1_realtime_s": window[1]}
         if self_tp is not None:  # the load generator's own TracerPid at tm0 and tm1 (MED 4)
             sm["tracerpid_tm0"], sm["tracerpid_tm1"] = self_tp
@@ -317,9 +324,18 @@ def selftest():
         ("labelling run warmed up by another rule", dict(tracer=clean, lab_rule="1000:10:60"), False),
         ("no warm-up rule recorded", dict(tracer=clean, lab_rule=None, timed_rule=None), False),
         # gate-6 review, t3run item 16: a run that hit the registered cap with >= 1000 ops is complete with reduced n
+        # MED 5: PREREG FINAL-CANDIDATE :214's three tiers for a run the registered window capped, applied here alone
+        # (the binaries report capped, rc 0, verdict "capped"): >= 1000 ok ops complete; 100-999 complete with p50
+        # only; < 100 failed with cause 'cap'. (The case "a capped run with < 1000 ops" refused 800 ops; under the
+        # registered tiers 800 is p50-only, so it is now an accepted case below.)
         ("both runs capped with >= 1000 ops: complete, reduced n",
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1500), True),
-        ("a capped run with < 1000 ops", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800), False),
+        ("capped at 1000 ok ops: complete", dict(tracer=clean, capped=True, lab_ops=1000, timed_ops=1000), True),
+        ("capped at 999 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=999), True),
+        ("capped at 800 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800), True),
+        ("capped at 100 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=100), True),
+        ("capped at 99 ok ops: failed, cause cap", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=99), False),
+        ("the labelling run capped at 99 ok ops", dict(tracer=clean, capped=True, lab_ops=99, timed_ops=1200), False),
         ("an uncapped run short of N", dict(tracer=clean, lab_ops=1200, timed_ops=1500), False),
         # lead review 62430d8bf..b49fb656a HIGH 1: the live-branch count N is held fixed and recorded around both runs
         ("N held at 21 around both runs", dict(tracer=clean), True),
@@ -349,6 +365,13 @@ def selftest():
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
         got = ops(*args)
         print(("PASS" if got == want else "FAIL"), f"ops{args} = {got!r}, want {want!r}")
+        bad += got != want
+        cases.append(None)
+    # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
+    for ok_ops, capped, want in ((1000, True, "complete"), (999, True, "p50_only"), (100, True, "p50_only"),
+                                 (99, True, None), (0, True, None), (200, False, "complete")):
+        got = tier({"capped": capped, "measured_ok": ok_ops, "measured_ops": ok_ops})
+        print(("PASS" if got == want else "FAIL"), f"tier(capped={capped}, ok={ok_ops}) = {got!r}, want {want!r}")
         bad += got != want
         cases.append(None)
     for cap, want in ((1800, "1000:10:180"), (60, "1000:10:6"), (3600, "1000:10:360")):
