@@ -226,6 +226,9 @@ def plants(sj, raw, rc, plp, outdir=None):
     outdir (the real batch's run.sh OUT) enables wt-tampered."""
     out = []
     bound = bool(sj) and bool((sj.get("_app_sync") or {}).get("bound"))
+    # where the real batch's verdict was actually read (on the runner: the bound path; off it: beside the batch), so
+    # the tampered copy differs from the real binding in verdict_sha256 ONLY (fourth lane review MED 7)
+    read_at = ((sj or {}).get("_app_sync") or {}).get("verdict_read_at") or ((sj or {}).get("_app_sync") or {}).get("verdict")
     if sj is not None:
         sj = copy.deepcopy(sj)
         if (sj.get("leaf") or {}).get("kind") == "brd":
@@ -308,12 +311,20 @@ def plants(sj, raw, rc, plp, outdir=None):
             sub = os.path.join(tmp, os.path.basename(os.path.normpath(outdir)))
             os.makedirs(sub)
             lines = open(os.path.join(outdir, "binary.txt")).read().splitlines()
-            lines = [("verdict_sha256=" + "0" * 64) if l.startswith("verdict_sha256=") else l for l in lines]
+            lines = [("verdict_sha256=" + "0" * 64) if l.startswith("verdict_sha256=")
+                     else ("bound=fire-checked: " + os.path.abspath(read_at)) if l.startswith("bound=") and read_at
+                     else l for l in lines]
             open(os.path.join(sub, "binary.txt"), "w").write("\n".join(lines) + "\n")
             ev = app_sync_evidence(sub)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        arm("wt-tampered", wt, lambda s: s.update(_app_sync=ev), "(write through)")
+        s_ = copy.deepcopy(sj)
+        wt(s_)
+        s_["_app_sync"] = ev
+        r = decide(s_, raw, 0, "device", plp)
+        # fired only by the sha256 binding itself: a verdict the copy could not find is not the defect planted
+        fired = r["decision"] == "FAIL" and any(x.startswith("(write through)") and "sha256" in x for x in r["reasons"])
+        out.append({"plant": "wt-tampered", "want": "FAIL (write through) ... sha256", "got": r, "fired": fired})
     else:
         out.append({"plant": "wt-tampered", "want": "-", "got": None, "fired": None, "counted": False,
                     "why": "not applicable: " + ("an unbound batch has no binding to tamper" if not bound
