@@ -609,6 +609,85 @@ fn a_crash_before_a_fuzzy_commit_replays_the_whole_log() {
     check(&db, &model);
 }
 
+/// F-FZ: a generation is never reused. An S0 crash leaves the failed attempt's marker
+/// `Checkpoint { g + 1 }` in the log. After the reopen, the next fuzzy checkpoint commits the
+/// catalog, and the image is taken before its own marker reached the log (nothing is written after
+/// its capture). That image must replay nothing. Were the new checkpoint numbered `g + 1` again,
+/// recovery would cut at the old attempt's marker and replay records the catalog already holds
+/// (PREREG A15's M-REUSE-GEN, A26).
+#[test]
+fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let first;
+    let mut model;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 40);
+        db.branch_compact_now().unwrap();
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        for &id in ids.iter().step_by(2) {
+            let v = format!("c{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        db.branch_checkpoint_hold(store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy checkpoint started");
+        wait_held(&db, store::HOLD_BEFORE_COMMIT);
+        // Writes after the capture flush the attempt's marker with their own records.
+        for &id in ids.iter().step_by(5) {
+            let v = format!("s{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        first = crash_image(&path, dir.path());
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+    }
+    let second_dir = dir.path().join("second");
+    std::fs::create_dir(&second_dir).unwrap();
+    let second;
+    {
+        let db = open_at(&first, catalog()).unwrap();
+        // Premise: the S0 image replayed its whole log, the failed attempt's marker included: the
+        // 20 writes before its capture, the 8 after, and the marker (the S0 test's count).
+        let s = db.branch_open_stats();
+        assert_eq!(s.records, 20 + 8 + 1, "premise: the S0 image did not replay its whole log: {s:?}");
+        check(&db, &model);
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        for &id in ids.iter().skip(1).step_by(4) {
+            let v = format!("t{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        let log = std::path::PathBuf::from(format!("{}-branch-log", first.display()));
+        let log_len = std::fs::metadata(&log).unwrap().len();
+        db.branch_checkpoint_hold(store::HOLD_AFTER_COMMIT);
+        let mut calls = 0;
+        while !db.branch_checkpoint_fuzzy_now().unwrap() {
+            calls += 1;
+            assert!(calls < 10, "no fuzzy checkpoint after {calls} settle batches");
+        }
+        wait_held(&db, store::HOLD_AFTER_COMMIT);
+        // Premise: nothing reached the log after this capture, so its own marker is not there.
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            log_len,
+            "premise: the log grew across the second capture"
+        );
+        second = crash_image(&first, &second_dir);
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+    }
+    let db = open_at(&second, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!(s.records, 0, "replayed records the committed catalog already holds: {s:?}");
+    check(&db, &model);
+}
+
 /// F-FZ's log bound: with fuzzy checkpoints the log may pass the threshold while one is in flight,
 /// but an operation that finds it past twice the threshold waits for the install, so the log never
 /// exceeds twice the threshold plus one operation's records. (The sharp checkpoint's bound, the
