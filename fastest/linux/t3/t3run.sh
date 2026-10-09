@@ -459,11 +459,11 @@ fs_block() {
   timeout 900 bash "$L/competitors/firecheck_strace.sh" "$o/strace-firecheck" "$mnt/strace-fc.noindex" \
     > "$o/strace-firecheck.txt" 2>&1 || { echo "strace fire-check failed on $fs"; return 1; }
   python3 -B "$L/t3/cells.py" plan "$MAN" "$fs" "$SEED" > "$o/plan.tsv" || return 1
-  local cell system clients ops runs class blk cur=1
+  local cell system clients ops runs class blk age live cur=1
   # fd 3, so nothing a cell runs can read the plan from stdin
-  while IFS=$'\t' read -r cell system clients ops runs class blk <&3; do
+  while IFS=$'\t' read -r cell system clients ops runs class blk age live <&3; do
     if [ "$blk" != "$cur" ]; then v3l "b$cur" "$mnt" || return 1; cur=$blk; fi
-    run_cell "$fs" "$mnt" "$o" "$cell" "$system" "$clients" "$ops" "$class"
+    run_cell "$fs" "$mnt" "$o" "$cell" "$system" "$clients" "$ops" "$class" "$age" "$live"
   done 3< "$o/plan.tsv"
   v3l "b$cur" "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
@@ -515,7 +515,7 @@ block_cleanup() {
 # void decision is made from its record BEFORE the cell's results are read. A VOID run is replaced once,
 # at most twice per cell (amendment 8); void runs are kept.
 run_cell() {
-  local fs=$1 mnt=$2 o=$3 cell=$4 system=$5 clients=$6 ops=$7 class=$8 attempt d id rc v
+  local fs=$1 mnt=$2 o=$3 cell=$4 system=$5 clients=$6 ops=$7 class=$8 age=$9 live=${10} attempt d id rc v
   for attempt in 1 2 3; do
     id="$fs-$cell-a$attempt"
     d="$o/cells/$cell/a$attempt"
@@ -532,11 +532,13 @@ run_cell() {
         # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
         timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
           --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
-      pg18-d2|pg18-defaults|dolt|doltgres|b1)
+      pg18-d2|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
         mkdir -p "$mnt/work-$id"
-        FT_CLIENTS=$clients FT_N1=$ops FT_N4=$ops FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
+        # the plan's run total, fixture (age, live branches) and mode: comp's run_system.sh refuses a real run
+        # (FT_DRY=0, its default) given any of them by default (comp d8fef669b, 76242a76a)
+        FT_CLIENTS=$clients FT_OPS_TOTAL=$ops FT_AGE=$age FT_PREBRANCH=$live FT_DRY=$DRY FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
           FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
           FT_SQLITE3=$DIST/sqlite3 FT_FIRECHECK=$o/strace-firecheck/firecheck.txt FT_BIN=$DIST/dolt-bin \
           timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt/work-$id" "$d/result" > "$d/adapter.txt" 2>&1 ;;

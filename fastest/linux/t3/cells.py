@@ -2,20 +2,24 @@
 """T3 cell manifest: validate it, list its filesystems, and plan one filesystem's runs.
 
   cells.py fslist MANIFEST          the filesystems, in manifest order, one per line
-  cells.py plan MANIFEST FS SEED    one row per run: cell-rK, system, clients, ops, runs, class, K
+  cells.py plan MANIFEST FS SEED    one row per run: cell-rK, system, clients, ops, runs, class, K, age, live
                                     (every run of every cell on FS, in a seeded shuffle of blocks:
                                     block k holds run k of every cell, amendment 34's interleaving; K is
                                     the block, so the runner can take V3L at every block boundary)
 
-Manifest: TSV with a header row `cell system fs clients ops runs class`, '#' comments allowed.
-system: ours | pg18-d2 | pg18-defaults | dolt | doltgres | b1. class: the engine's sync class for
-ours (full | fsync | off | async), '-' for competitors. Any other value refuses (exit 2), so a typo
-can never shrink the grid silently.
+Manifest: TSV with a header row `cell system fs clients ops runs class age live`, '#' comments allowed.
+system: ours | pg18-d2 | dolt | doltgres | b1 (pg18-defaults is dropped on Linux: the lead's ruling, artie 6b0bef481b;
+it was the same server as pg18-d2). class: the engine's sync class for ours (full | fsync | off | async), '-' for
+competitors. ops: the run's TOTAL ops, every system (gate-6 review 12; per-system n_run, PREREG). age: the committed
+single-row UPDATEs aging the parent (gen_seed.py's; PREREG section 7 ages with 1e5); live: the live branches held
+before the cells (the PREREG's N), one private write each. Every system builds the same parent from them (gate-6
+t3run HIGH 4). Any other value refuses (exit 2), so a typo can never shrink the grid silently.
 """
 import random
 import sys
 
-SYSTEMS = {"ours", "pg18-d2", "pg18-defaults", "dolt", "doltgres", "b1"}
+SYSTEMS = {"ours", "pg18-d2", "dolt", "doltgres", "b1"}
+HEADER = ["cell", "system", "fs", "clients", "ops", "runs", "class", "age", "live"]
 CLASSES = {"full", "fsync", "off", "async"}
 FS = {"ext4", "xfs", "btrfs"}
 
@@ -29,10 +33,10 @@ def load(path):
         f = line.split("\t")
         if header is None:
             header = f
-            if header != ["cell", "system", "fs", "clients", "ops", "runs", "class"]:
-                sys.exit(f"cells: line {n}: header must be cell system fs clients ops runs class, got {f}")
+            if header != HEADER:
+                sys.exit(f"cells: line {n}: header must be {' '.join(HEADER)}, got {f}")
             continue
-        if len(f) != 7:
+        if len(f) != len(HEADER):
             sys.exit(f"cells: line {n}: {len(f)} fields")
         r = dict(zip(header, f))
         bad = []
@@ -44,6 +48,9 @@ def load(path):
             bad.append("class")
         for k in ("clients", "ops", "runs"):
             if not r[k].isdigit() or int(r[k]) < 1:
+                bad.append(k)
+        for k in ("age", "live"):
+            if not r[k].isdigit():
                 bad.append(k)
         if bad:
             sys.exit(f"cells: line {n}: bad {bad}: {line}")
@@ -66,7 +73,8 @@ def plan(path, fs, seed):
         block = [r for r in rows if int(r["runs"]) >= k]
         rng.shuffle(block)
         for r in block:
-            out.append([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"], str(k)])
+            out.append([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"], str(k),
+                        r["age"], r["live"]])
     return out
 
 
