@@ -5774,6 +5774,9 @@ impl BranchStore {
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
+        // Mutant `drain_risk_ignores_held_frees` (test builds only) reads the newest fork's mark,
+        // under the store mutex and so before the group's lock (the order `mature` takes them in).
+        let fork = if fe_mutant("drain_risk_ignores_held_frees") { self.inner.lock().last_fork_lsn } else { 0 };
         let mut g = self.group.lock();
         let full = g.durable[class_index(SyncClass::FullFsync)];
         let drained = if cfg!(target_vendor = "apple") {
@@ -5786,8 +5789,10 @@ impl BranchStore {
         // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
         // Mutants (test builds only): `drain_risk_by_store_class` (only in a store whose class
         // syncs, as before engine review 10 #6), `drain_risk_release_only` (or when the newest
-        // Release is undrained, as before this) and `drain_risk_barrier_floor_only` (or the newest
-        // Release or TrunkRetain).
+        // Release is undrained, as before this), `drain_risk_barrier_floor_only` (or the newest
+        // Release or TrunkRetain) and `drain_risk_ignores_held_frees` (or the newest Release,
+        // TrunkRetain or fork: every record kind with a mark of its own, a branch Commit holding a
+        // free left out). Marks are not the rule: `durable[Off]` past the drain covers every kind.
         let release = self.last_release_lsn.load(Ordering::Acquire);
         let retain = self.retain_floor.load(Ordering::Acquire);
         let undrained_counts = if fe_mutant("drain_risk_by_store_class") {
@@ -5796,6 +5801,8 @@ impl BranchStore {
             self.class.syncs() || release > drained
         } else if fe_mutant("drain_risk_barrier_floor_only") {
             self.class.syncs() || release.max(retain) > drained
+        } else if fe_mutant("drain_risk_ignores_held_frees") {
+            self.class.syncs() || release.max(retain).max(fork) > drained
         } else {
             true
         };
