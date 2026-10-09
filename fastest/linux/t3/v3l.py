@@ -23,6 +23,10 @@ write", and every block VOIDs. end_fsync supplies the last one. The registered c
              (line 173: timed T3 runs carry no tracer);
   timed      untraced: the latencies, and the drive's flush counter (/sys/block/<disk>/stat field 16, flush requests
              completed) read just before and just after.
+Every run also reads the drive's sectors-written counter (stat field 7) just before and just after (gated on the
+fsync arm's two runs), and every run is preceded by a sync(2) of every filesystem, outside its window, so dirty data
+written earlier (the labelling run's, through a buffered loop) is not written back inside a later window and does not
+pad its count.
 Gates (any failure makes the measurement VOID, and the block with it):
   - V1L: exactly 10,000 writes to the data file on each arm; 10,000 fsync of the data file on the fsync arm and no
     fsync on the control; no fdatasync, sync_file_range, syncfs or msync on either; no failed write or fsync; no
@@ -35,6 +39,12 @@ Gates (any failure makes the measurement VOID, and the block with it):
     flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, provisional until
     registered); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
     counter (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
+  - the drive's sectors-written counter rises by at least the fsynced data, N x 4 KiB = N x 8 sectors, across EACH
+    fsync run, timed and labelling (T3 runner review item 10): over a write-through drive the flush counter reads 0
+    whether or not an fsync reached the drive (a write-through loop above it sends no flush either, so its writes can
+    sit in the backing file's page cache), and only the write count tells. A lower bound: another writer on the same
+    drive (on a loop block, the runner's root disk) can pad it, never shrink it. A missing or non-int count VOIDs. A
+    ram disk is exempt (brd: dry runs only, never credited);
   - the timed fsync run carries fio's own sync count (N-1 or N; fio 3.36 does not count the end_fsync), a p50 and
     the histogram bins (review M1: no measurement, no normaliser, no VALID).
 Published, not gates (lines 180 and 553): both runs' drive flushes per fsync and every loop layer's, with the slack
@@ -115,12 +125,25 @@ def disk_attr(disk, rel):
         return None
 
 
-def flush_ios(disk):
-    """Field 16 of /sys/block/<disk>/stat: flush requests completed (Documentation/block/stat.rst)."""
+def disk_stat(disk):
+    """/sys/block/<disk>/stat's fields (Documentation/block/stat.rst); refuses a kernel that keeps no flush counter."""
     f = open(f"/sys/block/{disk}/stat").read().split()
     if len(f) < 17:
         raise RuntimeError(f"/sys/block/{disk}/stat has {len(f)} fields: this kernel keeps no flush counter")
-    return int(f[15])
+    return f
+
+
+def flush_ios(disk):
+    """Field 16 of /sys/block/<disk>/stat: flush requests completed."""
+    return int(disk_stat(disk)[15])
+
+
+def sectors_written(disk):
+    """Field 7 of /sys/block/<disk>/stat: sectors written (512-byte units, whatever the logical block size)."""
+    return int(disk_stat(disk)[6])
+
+
+SECTORS_PER_WRITE = 4096 // 512  # fio --bs=4k
 
 
 LINE = re.compile(r"^(?:\d+\s+)?\d+\.\d+\s+(?:(\w+)\((.*)|<\.\.\. (\w+) resumed>(.*))$")
@@ -242,6 +265,24 @@ def gates(rec):
                             rec["arms"]["fsync"]["timed"].get("lab_flush_ios_delta"))
     else:
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
+    if not str(rec["leaf"].get("disk") or "").startswith("ram"):
+        bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
+    return bad
+
+
+def write_gate(disk, t):
+    """T3 runner review item 10: the fsynced data, N x 4 KiB, reached the drive inside each fsync run, by its
+    sectors-written counter (a lower bound; see the module docstring). Exact integers, so N x 8 itself passes."""
+    bad, need = [], N * SECTORS_PER_WRITE
+    for run, key in (("timed", "sectors_written_delta"), ("labelling", "lab_sectors_written_delta")):
+        v = t.get(key)
+        if not isinstance(v, int) or isinstance(v, bool):
+            bad.append(f"drive {disk}: no sectors-written count in the {run} fsync run ({v!r}): whether the fsynced "
+                       "data reached the drive is unmeasured")
+        elif v < need:
+            bad.append(f"drive {disk}: its sectors-written counter rose {v} in the {run} fsync run, below the {need} "
+                       f"its {N} fsynced 4 KiB writes need: the data did not reach the drive inside the run (a "
+                       "write-through layer or a cache above it)")
     return bad
 
 
@@ -326,10 +367,11 @@ def measure(d, out, leafrec=None):
         tr, lj = os.path.join(out, f"{arm}.v1l"), os.path.join(out, f"{arm}-labelling.json")
         cmd = V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj)
         rec["argv"][f"{arm}/labelling"] = cmd
+        os.sync()  # outside the window: earlier dirty data cannot pad this run's counts
         k0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
-        g0 = flush_ios(disk)
+        g0, gs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        g1 = flush_ios(disk)
+        g1, gs1 = flush_ios(disk), sectors_written(disk)
         k1 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         if r.returncode != 0:
             raise RuntimeError(f"labelling {arm} run rc {r.returncode}: {r.stderr[-400:]}")
@@ -340,10 +382,11 @@ def measure(d, out, leafrec=None):
         tj = os.path.join(out, f"{arm}-timed.json")
         cmd = fio_cmd(f"v3l-{arm}", f, fs, tj)
         rec["argv"][f"{arm}/timed"] = cmd
+        os.sync()
         l0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
-        f0 = flush_ios(disk)
+        f0, fs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        f1 = flush_ios(disk)
+        f1, fs1 = flush_ios(disk), sectors_written(disk)
         l1 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         if arm == "fsync":
             for lay in rec["leaf"]["layers"]:
@@ -354,6 +397,8 @@ def measure(d, out, leafrec=None):
         a["timed"] = fio_numbers(tj)
         a["timed"]["flush_ios_delta"] = f1 - f0
         a["timed"]["lab_flush_ios_delta"] = g1 - g0
+        a["timed"]["sectors_written_delta"] = fs1 - fs0
+        a["timed"]["lab_sectors_written_delta"] = gs1 - gs0
         os.unlink(f)
         rec["arms"][arm] = a
     rec["published"] = publish(rec)
@@ -542,6 +587,12 @@ def plants(rec):
     arm("wb-layer-half", "write back",
         lambda r: r["leaf"]["layers"][-1].__setitem__("flush_ios_delta", 3 * N // 2),
         ("write-back loop layer loop-plant:", "per fsync the labelling run showed"), extra=plant_layer)
+    # item 10: the write rule, on a write-through base (the state whose flush counter cannot see an fsync that never
+    # reached the drive); a ram disk is exempt from the rule, so it gets no such plant
+    if not str(disk or "").startswith("ram"):
+        arm("wt-unwritten", "write through",
+            lambda r: r["arms"]["fsync"]["timed"].__setitem__("sectors_written_delta", N * SECTORS_PER_WRITE // 2),
+            (f"drive {disk}:", "did not reach the drive"))
     arm("timed-half-syncs", rec["leaf"]["write_cache"],
         lambda r: r["arms"]["fsync"]["timed"].__setitem__("syncs", r["arms"]["fsync"]["timed"]["syncs"] // 2),
         "they must agree")

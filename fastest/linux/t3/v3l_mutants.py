@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""v3l.py's mutants (T3 runner review items 3, 4, 18, 19; fourth lane review HIGH 3): each one deletes or weakens one
-check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
+"""v3l.py's mutants (T3 runner review items 3, 4, 10, 18, 19; fourth lane review HIGH 3): each one deletes or weakens
+one check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
 
   v3l_mutants.py [NAME...]   run every mutant (or the named ones); exit 0 iff each is KILLED, 1 if any SURVIVED or
                              BROKE, 2 if refused (the unmutated self-test is not green, an unknown name, or a target
@@ -71,6 +71,18 @@ MUTANTS = [
      '    r["leaf"]["drive_reports"] = wc', "UNRUN (QUIET)"),
     ("H3b-no-ram-exception", "lane review 4 HIGH 3 / LOW 7: a ram disk's agreeing report is 'none (RAM)'",
      '    return "none (RAM)" if str(disk or "").startswith("ram") else wc', '    return wc', "UNRUN (QUIET)"),
+    ("10a-delete-write-rule", "T3 runner review item 10: the sectors-written gate",
+     '        bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])\n', '', "UNRUN (QUIET)"),
+    ("10b-labelling-run-not-judged", "item 10: the labelling fsync run is judged as well as the timed one",
+     '(("timed", "sectors_written_delta"), ("labelling", "lab_sectors_written_delta"))',
+     '(("timed", "sectors_written_delta"),)', "UNRUN (QUIET)"),
+    ("10c-half-threshold", "item 10: the threshold is the whole fsynced data, N x 8 sectors",
+     '        elif v < need:', '        elif v < need // 2:', "UNRUN (QUIET)"),
+    ("10d-ram-exemption-for-all", "item 10: only a ram disk is exempt",
+     '    if not str(rec["leaf"].get("disk") or "").startswith("ram"):', '    if False:', "UNRUN (QUIET)"),
+    ("10e-no-wt-unwritten-plant", "item 10: the write rule is forced to fire on the real record (plant)",
+     '        arm("wt-unwritten", "write through",', '        (lambda *a: None)("wt-unwritten", "write through",',
+     "UNRUN (QUIET)"),
 ]
 
 
