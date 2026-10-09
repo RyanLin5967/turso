@@ -281,6 +281,10 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
+    /// While an expression is translated inside a catch region ([Insn::CatchBegin]), the region's
+    /// target: a RAISE(ABORT|FAIL|ROLLBACK) jumps there instead of halting, so the refusal it
+    /// stands for leaves the statement running, as a function's refused value does.
+    pub catch_raise_target: Option<BranchOffset>,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -730,6 +734,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
+            catch_raise_target: None,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -1691,6 +1696,9 @@ impl ProgramBuilder {
                 }
                 Insn::ResetOnce { region_end, .. } => {
                     resolve(region_end, "ResetOnce")?;
+                }
+                Insn::CatchBegin { target_pc } => {
+                    resolve(target_pc, "CatchBegin")?;
                 }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
