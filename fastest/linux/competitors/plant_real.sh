@@ -72,6 +72,9 @@ case_ "FT_DRY neither 0 nor 1" 2 "REFUSED: FT_DRY [yes] is neither 0" FT_DRY=yes
 case_ "a non-numeric cap on a smoke run" 2 "REFUSED: FT_CAP_S [1.8e3] is not a number of seconds" \
   FT_DRY=1 FT_CAP_S=1.8e3 -- pg18-d2
 case_ "pg18-defaults (dropped on Linux, item 18)" 2 "REFUSED: pg18-defaults is dropped on Linux" FT_DRY=1 -- pg18-defaults
+# LOW 13: a non-count ops total refuses before the first cell (it used to cost each cell its conncheck and idle window)
+case_ "an ops total that is not a count (FT_OPS_TOTAL=x)" 2 "REFUSED: the ops total" FT_DRY=1 FT_OPS_TOTAL=x -- pg18-d2
+case_ "an N1 that is not a count (FT_N1=0x10)" 2 "REFUSED: the ops total" FT_DRY=1 FT_N1=0x10 -- b1
 if [ -d /dev/shm ]; then DMNT=/dev/shm/plant-real-$$; else DMNT=$S/mnt-drive; fi
 case_ "a drive class that cannot be determined (MNT $DMNT)" 2 "REFUSED: the drive class under" \
   FT_DRY=1 FT_FIRECHECK="$S/firecheck-pass.txt" -- b1 "$DMNT"
