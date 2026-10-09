@@ -1403,7 +1403,18 @@ impl Database {
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
-        // branch is never touched (its id differs).
+        // branch is never touched (its id differs). A connect between the lookup and the release
+        // is refused by the release's own open check, made under the same store-mutex hold as the
+        // release (engine review 14 MED 7). Mutant `drop_check_separate_hold` (test builds only):
+        // the open check in a hold of its own before that window, the release unchecked after it.
+        let separate = crate::branch::store::fe_mutant("drop_check_separate_hold");
+        if separate {
+            self.branches.refuse_if_open(id)?;
+        }
+        self.branches.pause_drop_looked_up();
+        if separate {
+            return self.branches.release_handle(id);
+        }
         self.branches.release_named(id)
     }
 
