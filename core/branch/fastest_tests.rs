@@ -6712,12 +6712,31 @@ fn a_sharp_checkpoint_whose_cut_fails_still_acknowledges_what_it_committed() {
 
 // ---- engine 2b: a trunk fork inside a DDL commit's schema window ----
 
-/// Clears `store::SCHEMA_PUBLISH_HOLD` when dropped, so a failed assertion releases the DDL commit.
-struct SchemaPublishDisarm;
+/// A DDL commit on `db`'s trunk parked at `HOLD_SCHEMA_PUBLISH`, its pages published and its schema
+/// not (engine review 16 #14: per store, on `trunk_commit_hold`, where the process-wide
+/// `SCHEMA_PUBLISH_HOLD` could catch any test's DDL commit). Released when dropped, so a failed
+/// assertion releases the DDL commit too.
+struct SchemaPublishHold(Arc<std::sync::atomic::AtomicU8>);
 
-impl Drop for SchemaPublishDisarm {
+impl SchemaPublishHold {
+    fn arm(db: &Database) -> Self {
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_SCHEMA_PUBLISH, std::sync::atomic::Ordering::Release);
+        Self(hold)
+    }
+
+    fn arrived(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == super::store::HOLD_SCHEMA_PUBLISH | super::store::HOLD_ARRIVED
+    }
+
+    fn release(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for SchemaPublishHold {
     fn drop(&mut self) {
-        super::store::SCHEMA_PUBLISH_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        self.release();
     }
 }
 
@@ -6730,7 +6749,6 @@ impl Drop for SchemaPublishDisarm {
 /// Mutant `fork_refuses_schema_window`.
 #[test]
 fn a_trunk_fork_inside_a_ddl_commits_schema_window_succeeds() {
-    use std::sync::atomic::Ordering as O;
     let _s = serial();
     for (catalog, first) in [(false, true), (false, false), (true, true), (true, false)] {
         let what = format!("catalog={catalog} first={first}");
@@ -6741,20 +6759,18 @@ fn a_trunk_fork_inside_a_ddl_commits_schema_window_succeeds() {
         let forker = db.connect().unwrap();
         // A live child already: the fork registers lock-free. None: it is the trunk's first child.
         let _live = (!first).then(|| forker.fork_branch().unwrap().into_id());
-        let _disarm = SchemaPublishDisarm;
-        super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+        let published = db.clone_schema().schema_version;
+        let window = SchemaPublishHold::arm(&db);
         let alter = std::thread::spawn(move || {
             ddl.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7").map(|_| ())
         });
-        let t = std::time::Instant::now();
-        while super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
-            assert!(t.elapsed() < std::time::Duration::from_secs(10), "{what}: premise: the DDL commit never reached its schema publication");
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        eventually(&format!("{what}: premise: the DDL commit never reached its schema publication"), || window.arrived());
+        assert_eq!(db.clone_schema().schema_version, published, "{what}: premise: the DDL's schema is not yet published at the fork");
         let name = format!("window-{catalog}-{first}");
         let forked = forker.create_branch(&name);
-        super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+        window.release();
         alter.join().unwrap().unwrap();
+        assert_ne!(db.clone_schema().schema_version, published, "{what}: premise: the DDL commit published its schema after the fork");
         forked.unwrap_or_else(|e| panic!("{what}: a fork inside a DDL commit's schema window failed: {e}"));
         let branch = db.connect_named(&name).unwrap();
         let rows = branch
@@ -6774,7 +6790,6 @@ fn a_trunk_fork_inside_a_ddl_commits_schema_window_succeeds() {
 /// (`budget_probe::sql_counts`). Mutant `fork_rereads_schema_window`.
 #[test]
 fn a_fork_inside_a_ddl_commits_schema_window_parses_no_schema() {
-    use std::sync::atomic::Ordering as O;
     let _s = serial();
     for (catalog, first) in [(false, true), (false, false), (true, true), (true, false)] {
         let what = format!("catalog={catalog} first={first}");
@@ -6785,21 +6800,21 @@ fn a_fork_inside_a_ddl_commits_schema_window_parses_no_schema() {
         let forker = db.connect().unwrap();
         let _live = (!first).then(|| forker.fork_branch().unwrap().into_id());
         let version = forker.schema.read().schema_version;
-        let _disarm = SchemaPublishDisarm;
-        super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+        let published = db.clone_schema().schema_version;
+        let window = SchemaPublishHold::arm(&db);
         let alter = std::thread::spawn(move || {
             ddl.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7").map(|_| ())
         });
-        eventually(&format!("{what}: premise: the DDL commit never reached its schema publication"), || {
-            super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) == 1 | super::store::HOLD_ARRIVED
-        });
+        eventually(&format!("{what}: premise: the DDL commit never reached its schema publication"), || window.arrived());
+        assert_eq!(db.clone_schema().schema_version, published, "{what}: premise: the DDL's schema is not yet published at the fork");
         let name = format!("window-cost-{catalog}-{first}");
         let parsed = super::budget_probe::sql_counts().schema_rows;
         let forked = forker.create_branch(&name);
         let parsed = super::budget_probe::sql_counts().schema_rows - parsed;
         let kept = forker.schema.read().schema_version;
-        super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+        window.release();
         alter.join().unwrap().unwrap();
+        assert_ne!(db.clone_schema().schema_version, published, "{what}: premise: the DDL commit published its schema after the fork");
         forked.unwrap_or_else(|e| panic!("{what}: premise: the fork inside the window succeeded: {e}"));
         assert_eq!(parsed, 0, "{what}: the fork parsed {parsed} schema rows inside the window");
         assert_eq!(kept, version, "{what}: the fork replaced its forker's schema");

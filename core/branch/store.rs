@@ -1470,10 +1470,16 @@ pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
 #[cfg(test)]
 pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
 
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a DDL commit on this
+/// store's trunk waits here after publishing its pages and before publishing its schema
+/// (`Pager::commit_tx`; engine 2b: a trunk fork in that window). Per store (engine review 16 #14:
+/// the process-wide `SCHEMA_PUBLISH_HOLD` it replaces could catch any test's DDL commit).
+#[cfg(test)]
+pub(crate) const HOLD_SCHEMA_PUBLISH: u8 = 10;
+
 /// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): `Database::drop_branch`
 /// waits here, the name looked up, before its release takes the store mutex (engine review 14
-/// MED 7: the open check and the release are one hold). 10 is left for review 16 #14's
-/// schema-publish stage.
+/// MED 7: the open check and the release are one hold).
 #[cfg(test)]
 pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
 
@@ -1497,25 +1503,6 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 #[cfg(test)]
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Test builds: while it holds 1, a DDL commit on the trunk waits after publishing its pages and
-/// before publishing its schema (`Pager::commit_tx`), having marked its arrival (`| HOLD_ARRIVED`);
-/// stored 0 to release it (engine 2b: a trunk fork in that window). Process-wide.
-#[cfg(test)]
-pub(crate) static SCHEMA_PUBLISH_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// A DDL commit waits at `SCHEMA_PUBLISH_HOLD` (test builds only).
-pub(crate) fn pause_schema_publish() {
-    #[cfg(test)]
-    {
-        use std::sync::atomic::Ordering as O;
-        let arrived = 1 | HOLD_ARRIVED;
-        if SCHEMA_PUBLISH_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
-            while SCHEMA_PUBLISH_HOLD.load(O::Acquire) == arrived {
-                crate::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-}
 
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
@@ -6691,6 +6678,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn settle_syncs_for_test(&self) -> u64 {
         self.group.lock().settle_syncs
+    }
+
+    /// Test builds: a DDL commit on this store's trunk, its pages published, waits at
+    /// `HOLD_SCHEMA_PUBLISH` before publishing its schema (`Pager::commit_tx`).
+    #[cfg(test)]
+    pub(crate) fn pause_schema_publish(&self) {
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_SCHEMA_PUBLISH);
     }
 
     pub(crate) fn wait_name_filter(&self) {
