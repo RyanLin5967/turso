@@ -7559,6 +7559,7 @@ version = "0.8.0-pre.7"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
+ "libc",
  "parking_lot",
  "tempfile",
  "tracing",
