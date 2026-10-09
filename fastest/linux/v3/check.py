@@ -1273,8 +1273,22 @@ def real_selftest(chk):
     saved = (CELL, KIND, W, OUT, results)
     td = tempfile.mkdtemp(prefix="check-selftest-")
 
-    def run(name, probe=None, merged=None, report=None, files=None, kvmut=None):
+    def put_f1b(out, srcd, f1b):
+        """eleventh review MED 2: OUT/F1b/real-all.trace.gz as a real verdict's OUT holds it: the same cell and run's
+        F1b strace (testdata/<cell>/F1b, copied unchanged from artie), planted by f1b(text), or removed ("absent")."""
+        fb = os.path.join(out, "F1b", "real-all.trace.gz")
+        os.makedirs(os.path.dirname(fb), exist_ok=True)
+        if os.path.exists(fb):
+            os.remove(fb)
+        if f1b == "absent":
+            return
+        t = rd(os.path.join(srcd, "F1b", "real-all.trace.gz"))
+        with gzip.open(fb, "wt") as fh:
+            fh.write(f1b(t) if f1b else t)
+
+    def run(name, probe=None, merged=None, report=None, files=None, kvmut=None, f1b=None):
         global CELL, KIND, W, OUT, results
+        put_f1b(td, src, f1b)
         d = os.path.join(td, name)
         shutil.copytree(os.path.join(src, "F3"), d)
         muts = [("summary.probe.json", probe), ("summary.json", merged), (os.path.join("blkflush", "report.json"), report)]
@@ -1311,6 +1325,25 @@ def real_selftest(chk):
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
             return {"probe": f, "merged": f}
+
+        # eleventh review MED 2's F1b plants, on the banked strace text (expectations by hand)
+        def f1b_fd99(t):  # the first in-loop cfr2b clone fsync names fd 99 (the other 299 keep the real fd)
+            return re.sub(r"fsync\(\d+<([^>]*/cfr2b\.clones/c\d+)>\)", r"fsync(99<\1>)", t, count=1)
+
+        def f1b_lines(t):
+            ls = t.split("\n")
+            return ls, next(k for k, l in enumerate(ls) if "clock_gettime(CLOCK_MONOTONIC_RAW" in l)
+
+        def f1b_nosync(t):  # an fsync of nosync25's own file right after its first in-loop pwrite64 (inside its window)
+            ls, c0 = f1b_lines(t)
+            j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(\d+<[^>]*/nosync25>", ls[k]))
+            m = re.match(r"^(\d+)\s+pwrite64\((\d+)<([^>]*)>", ls[j])
+            return "\n".join(ls[:j + 1] + ["%s  fsync(%s<%s>) = 0" % m.groups()] + ls[j + 1:])
+
+        def f1b_setup(t):  # an fsync on fd 42 of append25's file BEFORE the first timed window (setup)
+            ls, c0 = f1b_lines(t)
+            m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\(\d+<([^>]*/append25)>\)", l) for l in ls[:c0]) if mm)
+            return "\n".join(ls[:c0] + ["%s  fsync(42<%s>) = 0" % m.groups()] + ls[c0:])
 
         cases = [
             ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
@@ -1388,13 +1421,36 @@ def real_selftest(chk):
             ("fdatasync4k: a window without the probe's fdatasync",
              {"report": lambda j: j["syscalls"]["arms"]["fdatasync4k"].update(windows_without_a_sync=1)},
              "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
+            # eleventh review MED 1: the pid's syncs lying wholly inside a window, counted on ANY fd: nosync25's must be
+            # 0, and none may lie wholly inside a window on an fd that window's arm does not own (the review's plant: an
+            # fsync on fd 7 inside a nosync25 window, which the fd rule alone gives to no window)
+            ("an fsync on fd 7 wholly inside a nosync25 window",
+             {"report": lambda j: (j["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1),
+                                   j["syscalls"].setdefault("unattributed", {}).update(inside_foreign_fd=1))},
+             "F3:devflush", ["nosync25's windows hold a sync by the probe on some fd",
+                             "a sync by the probe lies wholly inside a window on an fd its arm does not own, or on none"]),
+            # eleventh review MED 2: the F1b cross-check refuses without its trace, and compares the probe's sync_fds
+            # with the fds strace saw synced INSIDE each arm's timed windows, as sets (setup syncs excluded)
+            ("no F1b real-all trace", {"f1b": "absent"}, "F3:devflush",
+             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+            ("an F1b trace whose first cfr2b clone fsync names fd 99", {"f1b": f1b_fd99}, "F3:devflush",
+             ["sync_fds disagrees with F1b's strace"]),
+            ("an F1b trace whose nosync25 window fsyncs nosync25's own file", {"f1b": f1b_nosync}, "F3:devflush",
+             ["sync_fds disagrees with F1b's strace"]),
         ]
         for name, muts, cid, want in cases:
-            g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"))
+            g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"),
+                    muts.get("f1b"))
             t = tags(g.get(cid, {}))
             others = [i for i in F3IDS if i != cid and g.get(i, {}).get("pass") is not True]
             chk("real: planted %s -> %s fails with %s only, the other F3 checks pass" % (name, cid, want),
                 g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
+        # eleventh review MED 2: a sync outside every timed window (setup) on another fd is not the arm's (the old
+        # whole-trace rule counted setup syncs); all five F3 checks pass
+        g = run("f1b-setup-fsync", f1b=f1b_setup)
+        chk("real (MED 2): an F1b fsync of append25's file on fd 42 before the first timed window is not counted -> all "
+            "five F3 checks pass", [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [],
+            {i: tags(g.get(i, {})) for i in F3IDS})
         m = both(lambda j: j["virtualization"].update(virtualized=False, evidence=[]))
         g = run("virtualized", m["probe"], m["merged"])
         want_v = sorted(["virtualization", "floor_kind", "flush_sent_to_device", "floor_claim qualified on bare metal",
@@ -1417,7 +1473,10 @@ def real_selftest(chk):
                     mut(j)
                     with open(os.path.join(d, f), "w") as fh:
                         json.dump(j, fh)
-            CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv_wt.get("work", ""), td, []
+            # eleventh review MED 2: this cell's own F1b strace, under an OUT of its own
+            wto = os.path.join(td, "wtout")
+            put_f1b(wto, src_wt, None)
+            CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv_wt.get("work", ""), wto, []
             with contextlib.redirect_stdout(io.StringIO()):
                 check_real(d, 0, kv_wt, "wt")
             return {r["id"]: r for r in results}

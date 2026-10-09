@@ -667,15 +667,28 @@ def _post_batch(d, sha, mod):
     rep = {"proves": "planted", "devices": {},
            "windows": {"arms": {"append25": {"ops": 5, "devices": {} if wt else {"nvme0n1": win}},
                                 "nosync25": {"ops": 5, "devices": {}}}},
-           # [tenth review HIGH 1: a current report carries windows_short]
-           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0},
-                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0}}}}
+           # [tenth review HIGH 1: a current report carries windows_short; eleventh review MED 1: and the syncs wholly
+           # inside each arm's windows on any fd, and the events unattributed inside a window]
+           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0,
+                                                           "syncs_inside_any_fd": 5},
+                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0,
+                                                            "syncs_inside_any_fd": 0}},
+                        "unattributed": {"foreign_fd": 0, "no_fd": 0, "inside_foreign_fd": 0, "inside_no_fd": 0}}}
     if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
         rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
     if mod == "leafkind":
         sj["leaf"]["kind"] = "scsi_debug"
     if mod == "short":  # tenth review HIGH 1: every window synced, one short of its own (by fd)
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
+    if mod == "nosync-anyfd":  # eleventh review MED 1: an fsync on fd 7 (no arm's) wholly inside a nosync25 window
+        rep["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1)
+        rep["syscalls"]["unattributed"].update(inside_foreign_fd=1)
+    if mod == "inside-foreign":  # ... a sync on an fd its window's arm does not own, wholly inside an append25 window
+        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
+        rep["syscalls"]["unattributed"].update(inside_foreign_fd=1)
+    if mod == "inside-nofd":  # ... a sync naming no fd, wholly inside an append25 window
+        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
+        rep["syscalls"]["unattributed"].update(no_fd=1, inside_no_fd=1)
     if mod in ("nosync", "wt-nosync"):  # one append25 window with no fsync by the probe
         rep["syscalls"]["arms"]["append25"].update(syncs=4, windows_without_a_sync=1)
     if mod == "wt-mismatch":
@@ -733,6 +746,12 @@ def post_selftest(chk):
             ("A16: a write-through window with no fsync by the probe", "wt-nosync", "smoke", 3, "VOID fsync:", {}),
             ("A16: a write-back window with no fsync by the probe", "nosync", "smoke", 3, "VOID fsync:", {}),
             ("tenth review HIGH 1: a window short of one of its own syncs", "short", "smoke", 3, "VOID fsync:", {}),
+            ("eleventh review MED 1: an fsync on fd 7 wholly inside a nosync25 window", "nosync-anyfd", "smoke", 3,
+             "VOID fsync:", {}),
+            ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,
+             "VOID fsync:", {}),
+            ("eleventh review MED 1: a sync naming no fd wholly inside an append25 window", "inside-nofd", "smoke", 3,
+             "VOID fsync:", {}),
             ("MED 3: a write-back loop layer's window without a flush-carrying request", "loopflush", "smoke", 3,
              "VOID flush-carrying:", {}),
             ("A14: a batch declaring PLP bound to a verdict fire-checked without", "plp", "bound", 2, "plp:", {}),
