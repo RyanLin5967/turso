@@ -137,9 +137,12 @@ def sqlite(av):
 
 
 def selftest():
+    streams = {"sql": "aa" * 32, "age": "bb" * 32}
+    rb = {"count": 10000, "sum": 0, "row_hash": 83937210371}
     base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "live_branches": 0,
             "gen_seed_sha256": "ab" * 32, "du_bytes": 9000000, "engine_bytes": 8900000, "extents": {"t": 3},
-            "maintenance": ["VACUUM", "CHECKPOINT"]}
+            "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
+            "readback": dict(rb), "expected_readback": dict(rb)}
 
     def v(**kw):
         d = dict(base)
@@ -166,6 +169,15 @@ def selftest():
         ("no measured live branches", [v(live_branches=KeyError), v(system="dolt", live_branches=KeyError)], False),
         ("20 requested, 20 measured on every system",
          [v(prebranch=20, live_branches=20), v(system="dolt", prebranch=20, live_branches=20)], True),
+        # MED 3: what was piped (the digest of the bytes the write path sent) and what the engine READ BACK (count,
+        # sum(v), the order-independent row hash), each against the generator
+        ("the engine read back another table than the generator wrote",
+         [v(), v(system="dolt", readback=dict(rb, row_hash=rb["row_hash"] + 1))], False),
+        ("the engine read back another sum", [v(), v(system="b1", readback=dict(rb, sum=1))], False),
+        ("the piped parent stream is not the generator's",
+         [v(), v(system="doltgres", stream_sha256=dict(streams, sql="cc" * 32))], False),
+        ("no read-back", [v(), v(system="dolt", readback=KeyError)], False),
+        ("no stream digest", [v(), v(system="dolt", stream_sha256=KeyError)], False),
     ]
     bad = 0
     for name, fx, want in cases:

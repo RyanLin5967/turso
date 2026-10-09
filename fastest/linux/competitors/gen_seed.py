@@ -80,6 +80,23 @@ def rows_for(nbytes):
     return max(1, -(-int(nbytes) // 128))
 
 
+# ---- what the engine must READ BACK (lead review 62430d8bf..b49fb656a MED 3: the fixture guard compared its own
+# inputs; now each job records the digest of the bytes it actually piped and the engine's own read-back of t)
+def stream_digests(rows, updates=0, seed=1):
+    """RED stub."""
+    return {"sql": None, "age": None}
+
+
+def row_hash(rows, updates=0, seed=1):
+    """RED stub."""
+    return 0
+
+
+def expect(rows, updates=0, seed=1):
+    """'count|sum|row_hash' the engine must read back from t after loading these streams."""
+    return f"{rows}|{aged_sum(rows, updates, seed)}|{row_hash(rows, updates, seed)}"
+
+
 def selftest():
     bad = 0
 
@@ -109,11 +126,23 @@ def selftest():
     # SQLite 3.53 on the Mac, 2026-10-08): count|sum = 2500|131727070. Not computed by the subject.
     ok("aged sum(v) = what SQLite read back after the same stream", aged_sum(2500, 300, 1) == 131727070)
     ok("a fresh parent sums to 0", aged_sum(2500, 0, 1) == 0)
+    # MED 3: the order-independent row hash, sum over t of the first 6 hex digits of md5("id:v:pad"), as Dolt 2.4.1,
+    # Doltgres 1.4.0 and PostgreSQL 18 READ IT BACK after loading this stream (2500 rows, aged 300, seed 1; local probe
+    # 2026-10-09, all three: 2500|131727070|21429546430). Not computed by the subject.
+    ok("row hash = what three engines read back after the same stream", row_hash(2500, 300, 1) == 21429546430)
+    ok("expect() = count|sum|row_hash", expect(2500, 300, 1) == "2500|131727070|21429546430")
+    sd = stream_digests(2500, 300, 1)
+    ok("stream digests: the parent's is the long-pinned 351af3d4... at 10000 rows",
+       stream_digests(10000)["sql"] == "351af3d4e0eca98b1ccdda69b548d7337357b0cba56fc4851fb928cf85e1f26a")
+    ok("stream digests: an empty aging stream hashes as empty",
+       stream_digests(2500, 0, 1)["age"] == hashlib.sha256(b"").hexdigest())
+    ok("stream digests differ between aged and fresh", sd["age"] != stream_digests(2500, 0, 1)["age"])
+    n_extra = 5
     # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
     ok("aged sum(v) at the CI default = what three servers read back", aged_sum(10000, 200, 1) == 89963830)
-    n = 15
+    n = 15 + n_extra
     print(f"gen_seed selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
