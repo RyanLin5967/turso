@@ -19,7 +19,7 @@ from raw.tsv. The sequence checker is itself fire-checked first: planted breache
 be rejected. The checks a verdict holds are fixed in advance by plan(cell, arch, leaf class): a verdict whose ids
 differ from its plan fails, and run.sh refuses to bind one. Exit 0 all pass, 1 any fail, 2 usage.
 """
-import gzip, hashlib, json, os, re, sys
+import gzip, hashlib, json, os, re, sys, zlib
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -361,13 +361,15 @@ def check(cid, ok, detail, desc=""):
 
 
 def rd(p):
+    """The file's text, or None when it is missing or cannot be read whole (eleventh review MED 2: a truncated or
+    corrupt gzip raised EOFError or zlib.error past the old OSError catch; a caller treats None as missing)."""
     try:
         if p.endswith(".gz"):
             with gzip.open(p, "rt") as f:
                 return f.read()
         with open(p) as f:
             return f.read()
-    except OSError:
+    except (OSError, EOFError, zlib.error, UnicodeDecodeError):
         return None
 
 
@@ -2309,6 +2311,16 @@ def check_real(o3, rc, kv, leaf):
                     dbad.append(("a flush-gated op's window lacks one of its own syncs", a, sy["arms"].get(a)))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
+            # eleventh review MED 1: nosync25 owns no fd, so the fd rule above can never give it a sync; blkflush also
+            # counts the pid's syncs wholly inside each arm's windows on ANY fd, and nosync25's must be 0; and no sync
+            # may lie wholly inside a window on an fd that window's arm does not own, or on none (a missing count is
+            # not a zero)
+            if (sy["arms"].get("nosync25") or {}).get("syncs_inside_any_fd") != 0:
+                dbad.append(("nosync25's windows hold a sync by the probe on some fd", sy["arms"].get("nosync25")))
+            ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
+            if ua.get("inside_foreign_fd") != 0 or ua.get("inside_no_fd") != 0:
+                dbad.append(("a sync by the probe lies wholly inside a window on an fd its arm does not own, or on none",
+                             sy.get("unattributed")))
         dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
@@ -2371,11 +2383,48 @@ FRAME_VARIANT = {None: "no frame arm registered", "ow4k": "fdatasync4k (ow4k + f
 FRAME_VARIANT_NONE = "none in this probe: the registered frame arm has no fdatasync variant arm (A18 needs one)"
 
 
+def f1b_window_syncs(text):
+    """eleventh review MED 2: ({arm: fds}, problems) for the fsync and fdatasync calls INSIDE the timed windows of an
+    F1b strace -f -y trace: between a window's opening and closing clock_gettime(CLOCK_MONOTONIC_RAW), the only clock
+    reads the loop makes (sequence_problems holds F1b:real-all to exactly 2 x n x arms of them). Setup and teardown
+    syncs are outside every window and not counted. A sync split by strace (<unfinished ...>) counts by its opening
+    half. The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>."""
+    seen, clocks, probs = {}, 0, []
+    for line in text.splitlines():
+        m = LINE.match(line)
+        if m and "<unfinished ...>" not in line and "resumed>" not in line:
+            name, args = m.group(2), m.group(3)
+        else:
+            u = re.match(r"^\d+\s+(fsync|fdatasync)\((.*?)\s*<unfinished \.\.\.>$", line)
+            if not u:
+                continue
+            name, args = u.group(1), u.group(2)
+        if name == "clock_gettime":
+            clocks += 1
+            continue
+        if name not in ("fsync", "fdatasync") or clocks % 2 == 0:
+            continue
+        a = re.fullmatch(r"(\d+)<([^>]+)>", args.strip())
+        if not a:
+            probs.append("an in-window sync without fd<path>: " + line[:120])
+            continue
+        path, base = a.group(2), os.path.basename(a.group(2))
+        arm = (os.path.basename(os.path.dirname(path))[:-len(".clones")] if re.fullmatch(r"c\d+", base)
+               else base[:-len(".clones")] if base.endswith(".clones") else base)
+        seen.setdefault(arm, set()).add(int(a.group(1)))
+    if clocks == 0 or clocks % 2:
+        probs.append("%d clock reads: the trace holds no whole timed windows" % clocks)
+    return seen, probs
+
+
 def sync_fds_problems(sj, rows, n, f1b_trace):
     """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
     match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
-    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and, when this OUT
-    holds F1b's real-all strace (the same arms; strace -y prints each sync as fd<path>), the fds strace saw."""
+    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
+    the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
+    fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
+    (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
+    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
     bad = []
     sf = sj.get("sync_fds")
     if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
@@ -2388,17 +2437,17 @@ def sync_fds_problems(sj, rows, n, f1b_trace):
         if not isinstance(got, dict) or len(got) != nfd or sum(got.values()) != n * per_op or \
                 any(v != n for v in got.values()):
             bad.append(("sync_fds disagrees with the arm definitions", a, got, nfd, n * per_op))
-    if f1b_trace:
-        seen = {}
-        for m in re.finditer(r"\b(?:fsync|fdatasync)\((\d+)<([^>]+)>\)", f1b_trace):
-            path, base = m.group(2), os.path.basename(m.group(2))
-            arm = (os.path.basename(os.path.dirname(path))[:-len(".clones")] if re.fullmatch(r"c\d+", base)
-                   else base[:-len(".clones")] if base.endswith(".clones") else base)
-            seen.setdefault(arm, set()).add(int(m.group(1)))
-        for a in rows:
-            want = {int(k) for k in (sf.get(a) or {})}
-            if want and not want <= seen.get(a, set()):
-                bad.append(("sync_fds disagrees with F1b's strace", a, sorted(want), sorted(seen.get(a, set()))))
+    if f1b_trace is None:
+        bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
+        return bad
+    seen, probs = f1b_window_syncs(f1b_trace)
+    if probs:
+        bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
+        return bad
+    for a in rows:
+        want = {int(k) for k in (sf.get(a) or {})}
+        if want != seen.get(a, set()):
+            bad.append(("sync_fds disagrees with F1b's strace", a, sorted(want), sorted(seen.get(a, set()))))
     return bad
 
 

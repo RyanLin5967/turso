@@ -40,7 +40,10 @@ but cannot be placed in exactly one (every window under 1 us is one such).
 Timestamps: the trace prints mono_raw in microseconds (rounded), so an event's true time is +-500 ns of the printed
 value; a BLOCK event whose interval is not inside exactly one window is "ambiguous", counted, never attributed. A
 SYNC event is attributed by its fd (sync_windows): to the overlapping window whose arm owns that fd (tenth review
-HIGH 1); see sync_windows for the rule and its one blind spot.
+HIGH 1); see sync_windows for the rule and its one blind spot. Beside that, every sync event of the pid lying WHOLLY
+inside a window is counted for that window's arm on ANY fd (syncs_inside_any_fd), and one whose fd the arm does not
+own, or that names no fd, is counted unattributed inside a window (inside_foreign_fd, inside_no_fd): the fd rule
+alone can never give nosync25, which owns no fd, a sync (eleventh review MED 1).
 """
 import bisect, gzip, json, os, re, subprocess, sys, time
 
@@ -448,14 +451,17 @@ def sync_windows(sysev, w, pid, fdcap):
     # the timing (fd-blind attribution let 394 of 394 planted windows read synced: tenth review HIGH 1). Blind spot,
     # stated: an EXTRA sync on an arm's own fd, at a boundary between two windows of that same arm, can stand in for
     # the next window's missing one; F1 holds the binary to its defined sync count under strace, which excludes it.
+    # Eleventh review MED 1: nosync25's record owns no fd, so that rule can never give it a sync, and an event on an
+    # fd no overlapping window owns was attributed to none and read by nobody. So every event of the pid whose +-500 ns
+    # interval lies WHOLLY inside a window is also counted for that window's arm on ANY fd (or none): _inside, merged
+    # by report() as syncs_inside_any_fd; and one whose fd that arm does not own, or that names no fd, is counted in
+    # _unattributed as inside_foreign_fd or inside_no_fd. Containment, not overlap: an edge event (a neighbour's sync
+    # returning within 0.5 us of the boundary) is no window's here, as the self-test's case (c') pins.
     starts = [x[0] for x in w]
-    got = {}
-    amb, foreign, nofd = [], 0, 0
+    got, inside_k = {}, {}
+    amb, foreign, nofd, in_foreign, in_nofd = [], 0, 0, 0, 0
     for e in mine:
         fd = e[7] if len(e) > 7 else None
-        if fd is None:
-            nofd += 1
-            continue
         lo, hi = e[0] - e[1], e[0] + e[1]
         k = bisect.bisect_right(starts, hi)
         poss = []
@@ -464,6 +470,16 @@ def sync_windows(sysev, w, pid, fdcap):
             poss.append(j)
             j -= 1
         poss.sort()
+        for j in poss:
+            if w[j][0] <= lo and hi <= w[j][1]:
+                inside_k[j] = inside_k.get(j, 0) + 1
+                if fd is None:
+                    in_nofd += 1
+                elif fd not in fdcap[w[j][2]]:
+                    in_foreign += 1
+        if fd is None:
+            nofd += 1
+            continue
         cand = [j for j in poss if fd in fdcap[w[j][2]]]
         if not cand:
             foreign += bool(poss)
@@ -476,7 +492,7 @@ def sync_windows(sysev, w, pid, fdcap):
             cand = room[:1]
             amb.append((e, poss))  # counted as ambiguous (informational), attributed as above
         got[(cand[0], fd)] = got.get((cand[0], fd), 0) + 1
-    res, short = {}, {}
+    res, short, inside = {}, {}, {}
     for k, (t0, t1, a, i) in enumerate(w):
         r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0, "ambiguous": 0})
         r["ops"] += 1
@@ -485,13 +501,16 @@ def sync_windows(sysev, w, pid, fdcap):
         r["syncs"] += n_k
         r["windows_without_a_sync"] += n_k == 0
         short[a] = short.get(a, 0) + any(mine_k[fd] < c for fd, c in fdcap[a].items())
+        inside[a] = inside.get(a, 0) + inside_k.get(k, 0)
     for e, poss in amb:
         for a in sorted(set(w[j][2] for j in poss)):
             res[a]["ambiguous"] += 1
-    # the per-window shortfall (a window holding fewer than its arm's recorded syncs on some fd) and the events no
-    # window owns ride beside the per-arm records; report() merges the first into them as windows_short
+    # the per-window shortfall (a window holding fewer than its arm's recorded syncs on some fd), the events wholly
+    # inside each arm's windows on any fd, and the events no window owns ride beside the per-arm records; report()
+    # merges the first two into them as windows_short and syncs_inside_any_fd
     res["_short"] = short
-    res["_unattributed"] = {"foreign_fd": foreign, "no_fd": nofd}
+    res["_inside"] = inside
+    res["_unattributed"] = {"foreign_fd": foreign, "no_fd": nofd, "inside_foreign_fd": in_foreign, "inside_no_fd": in_nofd}
     return res
 
 
@@ -543,6 +562,8 @@ def report(out, device=None, windows=None, pid=None, summary=None):
                     rep_sys["unattributed"] = arms_s.pop("_unattributed")
                     for a, c in arms_s.pop("_short").items():
                         arms_s[a]["windows_short"] = c
+                    for a, c in arms_s.pop("_inside").items():  # eleventh review MED 1
+                        arms_s[a]["syncs_inside_any_fd"] = c
                     rep_sys["arms"] = arms_s
                 except Refuse as e:
                     rep_sys["refused"] = str(e)
