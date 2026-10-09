@@ -197,6 +197,21 @@ pub(crate) fn sql_counts() -> SqlCounts {
     }
 }
 
+thread_local! {
+    static T_WINDOWS_MET: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A trunk fork on this thread found no schema in hand at its snapshot's cookie (engine 2b's DDL
+/// window; a `cfg(test)` hook line in `Connection::fork_trunk_registered`, review 2 M2's premise).
+pub(crate) fn schema_window_met() {
+    bump(&T_WINDOWS_MET, 1);
+}
+
+/// This thread's count of `schema_window_met`.
+pub(crate) fn schema_windows_met() -> u64 {
+    T_WINDOWS_MET.with(|c| c.get())
+}
+
 /// Whether this thread holds a trunk's WAL write lock now (the fire-check's).
 pub(crate) fn wal_write_held() -> bool {
     wal_held()

@@ -1158,6 +1158,10 @@ impl Connection {
         let in_hand = [self.schema.read().clone(), self.db.clone_schema()]
             .into_iter()
             .find(|schema| schema.schema_version == cookie);
+        #[cfg(test)]
+        if in_hand.is_none() {
+            crate::branch::budget_probe::schema_window_met();
+        }
         let schema = match in_hand {
             Some(schema) => Some(schema),
             None if store::fe_mutant("fork_refuses_schema_window") => {
