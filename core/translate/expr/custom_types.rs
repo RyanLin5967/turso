@@ -893,22 +893,34 @@ mod tests {
         stmt.run_ignore_rows()
     }
 
-    /// Engine review 16 #21 (PLAUSIBLE, by reading; `blob_to_bigdecimal`'s validation unread): a
+    /// Engine review 16 #21, rewritten for engine review 20 HIGH 2 (FLAGGED, review-directed): a
     /// blob operand reaches numeric's operators as given, and they read a blob as the type's
-    /// internal encoding, so `x = X'00'` compared the column with a value no INSERT could have
-    /// stored. It must be refused as an INSERT of X'00' is, literal and bound. Red first: the fix
-    /// is written only once this runs red.
+    /// internal encoding, so `x = <blob>` compared the column with a value no INSERT could have
+    /// stored (INSERT refuses every blob). It must be refused as that INSERT is, literal and bound.
+    /// The first version used X'00', which `blob_to_bigdecimal` refuses as too short (under 14
+    /// bytes), so it passed at its own sha and could not discriminate; this one uses a well-formed
+    /// 18-byte encoding of 10.00 (version 1, scale 2, one limb of 1000), which the decoder accepts,
+    /// so `x = <it>` matches row 1 unless the operand is refused. X'00' stays only as a premise.
     #[test]
     fn a_blob_operand_of_numeric_is_refused_as_its_insert_is() {
+        const TEN: [u8; 18] = [1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0xE8, 3, 0, 0];
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&TEN).is_ok(),
+            "premise: the blob is a well-formed numeric encoding"
+        );
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&[0]).is_err(),
+            "premise: X'00' is refused by the decoder itself"
+        );
         let conn = open();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10.00)").unwrap();
-        let insert = conn.execute("INSERT INTO t VALUES (2, X'00')");
-        assert!(insert.is_err(), "premise: numeric refuses to store a blob it never encoded");
+        let insert = conn.execute("INSERT INTO t VALUES (2, X'0100020000000000000001000000E8030000')");
+        assert!(insert.is_err(), "premise: numeric refuses to store a blob, even its own encoding");
         for (sql, param) in [
-            ("x = X'00'", None),
-            ("x = ?1", Some(Value::from_slice(&[0]).unwrap())),
+            ("x = X'0100020000000000000001000000E8030000'", None),
+            ("x = ?1", Some(Value::from_slice(&TEN).unwrap())),
         ] {
             let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {sql}"), param);
             assert!(
