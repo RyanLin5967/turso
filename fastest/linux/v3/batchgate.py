@@ -498,6 +498,9 @@ def post(out, cell, sha, mode, verdict_path):
                 elif r.get("windows_short") != 0:  # attributed by fd: each window holds all its own (tenth review H1)
                     voids.append("fsync: %s's windows short of their own syncs (by fd): %r of %r" %
                                  (a, r.get("windows_short"), r.get("ops")))
+                if r.get("windows_over") != 0:  # ... and no more than its own (V3 review 12 item 8)
+                    voids.append("fsync: %s's windows over their own syncs (by fd): %r of %r" %
+                                 (a, r.get("windows_over"), r.get("ops")))
             # eleventh review MED 1, V3 review 12 item 6: every sync of the probe's that no overlapping window's arm
             # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) or that names no fd (no_fd) VOIDs
             # the batch; a missing count is not a zero. (The nosync25-only lookup that stood here VOIDed any smoke

@@ -450,9 +450,11 @@ def sync_windows(sysev, w, pid, fdcap):
     # copy arms sharing a clone fd number: the earliest of them still short of its per-fd count takes it, else it is
     # ambiguous and attributed to none. An event whose fd no overlapping window owns (a wrong-fd sync, another file)
     # is attributed to none ("foreign_fd"). So a window missing its own sync can never borrow a neighbour's, whatever
-    # the timing (fd-blind attribution let 394 of 394 planted windows read synced: tenth review HIGH 1). Blind spot,
-    # stated: an EXTRA sync on an arm's own fd, at a boundary between two windows of that same arm, can stand in for
-    # the next window's missing one; F1 holds the binary to its defined sync count under strace, which excludes it.
+    # the timing (fd-blind attribution let 394 of 394 planted windows read synced: tenth review HIGH 1). An extra
+    # sync that only its own window can take shows as windows_over (V3 review 12 item 8: nothing bounded a window's
+    # syncs from above). Blind spot, stated: an EXTRA sync on an fd that an overlapping window's arm also owns (the
+    # same arm at a round boundary, or clone2b and cfr2b sharing a clone fd) can stand in for that window's missing
+    # one; F1 holds the binary to its defined sync count under strace, which excludes it.
     # Eleventh review MED 1: nosync25's record owns no fd, so that rule can never give it a sync, and an event on an
     # fd no overlapping window owns was attributed to none and read by nobody. So every event of the pid whose +-500 ns
     # interval lies WHOLLY inside a window is also counted for that window's arm on ANY fd (or none): _inside, merged
@@ -494,7 +496,7 @@ def sync_windows(sysev, w, pid, fdcap):
             cand = room[:1]
             amb.append((e, poss))  # counted as ambiguous (informational), attributed as above
         got[(cand[0], fd)] = got.get((cand[0], fd), 0) + 1
-    res, short, inside = {}, {}, {}
+    res, short, inside, over = {}, {}, {}, {}
     for k, (t0, t1, a, i) in enumerate(w):
         r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0, "ambiguous": 0})
         r["ops"] += 1
@@ -503,6 +505,7 @@ def sync_windows(sysev, w, pid, fdcap):
         r["syncs"] += n_k
         r["windows_without_a_sync"] += n_k == 0
         short[a] = short.get(a, 0) + any(mine_k[fd] < c for fd, c in fdcap[a].items())
+        over[a] = over.get(a, 0) + any(mine_k[fd] > c for fd, c in fdcap[a].items())
         inside[a] = inside.get(a, 0) + inside_k.get(k, 0)
     for e, poss in amb:
         for a in sorted(set(w[j][2] for j in poss)):
@@ -511,6 +514,7 @@ def sync_windows(sysev, w, pid, fdcap):
     # inside each arm's windows on any fd, and the events no window owns ride beside the per-arm records; report()
     # merges the first two into them as windows_short and syncs_inside_any_fd
     res["_short"] = short
+    res["_over"] = over
     res["_inside"] = inside
     res["_unattributed"] = {"foreign_fd": foreign, "no_fd": nofd, "inside_foreign_fd": in_foreign, "inside_no_fd": in_nofd}
     return res
@@ -566,6 +570,8 @@ def report(out, device=None, windows=None, pid=None, summary=None):
                         arms_s[a]["windows_short"] = c
                     for a, c in arms_s.pop("_inside").items():  # eleventh review MED 1
                         arms_s[a]["syncs_inside_any_fd"] = c
+                    for a, c in arms_s.pop("_over").items():  # V3 review 12 item 8
+                        arms_s[a]["windows_over"] = c
                     rep_sys["arms"] = arms_s
                 except Refuse as e:
                     rep_sys["refused"] = str(e)

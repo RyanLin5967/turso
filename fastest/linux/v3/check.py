@@ -2406,6 +2406,10 @@ def check_real(o3, rc, kv, leaf):
                 # cfr2b sync the clone and the directory)
                 if a in rows and (sy["arms"].get(a) or {}).get("windows_short") != 0:
                     dbad.append(("a flush-gated op's window lacks one of its own syncs", a, sy["arms"].get(a)))
+                # V3 review 12 item 8: ... and no more than its own (an extra own-fd sync on a floor-reference arm,
+                # append25 or fdatasync4k, would otherwise pass); a missing count is not a zero
+                if a in rows and (sy["arms"].get(a) or {}).get("windows_over") != 0:
+                    dbad.append(("a flush-gated op's window holds more than its own syncs", a, sy["arms"].get(a)))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
             # eleventh review MED 1, V3 review 12 item 6: nosync25 owns no fd, so the fd rule can never give it a sync;
