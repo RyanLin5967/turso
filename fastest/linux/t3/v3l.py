@@ -25,9 +25,10 @@ write", and every block VOIDs. end_fsync supplies the last one. The registered c
   timed      untraced: the latencies, and the drive's flush counter (/sys/block/<disk>/stat field 16, flush requests
              completed) read just before and just after.
 Every run also reads the drive's sectors-written counter (stat field 7) just before and just after (gated on the
-fsync arm's two runs), and every run is preceded by a sync(2) of every filesystem, outside its window, so dirty data
-written earlier (the labelling run's, through a buffered loop) is not written back inside a later window and does not
-pad its count.
+fsync arm's two runs), and every run is preceded by a sync of every filesystem (sync(1)), outside its window, so dirty
+data written earlier (the labelling run's, through a buffered loop) is not written back inside a later window and does
+not pad its count (annex A24, the lead's ruling). The record keeps each sync's rc and seconds; a failed sync refuses
+the measurement.
 Gates (any failure makes the measurement VOID, and the block with it):
   - V1L: exactly 10,000 writes to the data file on each arm; 10,000 fsync of the data file on the fsync arm and no
     fsync on the control; no fdatasync, sync_file_range, syncfs or msync on either; no failed write or fsync; no
@@ -72,6 +73,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from fractions import Fraction
 
 N = 10000
@@ -269,7 +271,35 @@ def gates(rec):
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
     if not str(rec["leaf"].get("disk") or "").startswith("ram"):
         bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
+        bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
     return bad
+
+
+def sync_gate(disk, sy):
+    """Annex A24: each fsync run on a drive was preceded by a sync that ran and exited 0, as its record says; without
+    one, earlier dirty data may have been written back inside the window and padded the write count."""
+    bad = []
+    for run in ("timed", "labelling"):
+        r = sy.get(run) if isinstance(sy, dict) else None
+        if not isinstance(r, dict):
+            bad.append(f"drive {disk}: no sync record for the {run} fsync run (annex A24)")
+        elif r.get("ran") is not True or type(r.get("rc")) is not int or r["rc"] != 0:
+            bad.append(f"drive {disk}: the sync before the {run} fsync run did not run clean ({r!r}): earlier dirty "
+                       "data may pad its counts (annex A24)")
+    return bad
+
+
+def sync_record(runner=subprocess.run):
+    """The sync before a V3L run, outside its window (annex A24): sync(1), whose exit status is the rc the record
+    keeps, with the seconds it took. A sync that fails, times out or cannot start refuses the measurement."""
+    t = time.monotonic()
+    try:
+        r = runner(["sync"], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"the sync before a V3L run failed: {type(e).__name__}: {e}")
+    if r.returncode != 0:
+        raise RuntimeError(f"the sync before a V3L run failed: rc {r.returncode}: {(r.stderr or '').strip()[:200]}")
+    return {"ran": True, "rc": r.returncode, "secs": round(time.monotonic() - t, 3), "how": "sync(1)"}
 
 
 def write_gate(disk, t):
@@ -383,7 +413,7 @@ def measure(d, out, leafrec=None):
         tr, lj = os.path.join(out, f"{arm}.v1l"), os.path.join(out, f"{arm}-labelling.json")
         cmd = V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj)
         rec["argv"][f"{arm}/labelling"] = cmd
-        os.sync()  # outside the window: earlier dirty data cannot pad this run's counts
+        sy_lab = sync_record()  # outside the window: earlier dirty data cannot pad this run's counts (annex A24)
         k0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         g0, gs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
@@ -398,7 +428,7 @@ def measure(d, out, leafrec=None):
         tj = os.path.join(out, f"{arm}-timed.json")
         cmd = fio_cmd(f"v3l-{arm}", f, fs, tj)
         rec["argv"][f"{arm}/timed"] = cmd
-        os.sync()
+        sy_timed = sync_record()
         l0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         f0, fs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
@@ -415,6 +445,7 @@ def measure(d, out, leafrec=None):
         a["timed"]["lab_flush_ios_delta"] = g1 - g0
         a["timed"]["sectors_written_delta"] = fs1 - fs0
         a["timed"]["lab_sectors_written_delta"] = gs1 - gs0
+        a["sync"] = {"labelling": sy_lab, "timed": sy_timed}
         os.unlink(f)
         rec["arms"][arm] = a
     rec["published"] = publish(rec)
@@ -609,6 +640,10 @@ def plants(rec):
         arm("wt-unwritten", "write through",
             lambda r: r["arms"]["fsync"]["timed"].__setitem__("sectors_written_delta", N * SECTORS_PER_WRITE // 2),
             (f"drive {disk}:", "did not reach the drive"))
+        # annex A24: the sync rule, forced to fire by a failed sync before the timed run
+        arm("unsynced", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("timed", {"ran": True, "rc": 1}),
+            (f"drive {disk}:", "the sync before the timed fsync run"))
     arm("timed-half-syncs", rec["leaf"]["write_cache"],
         lambda r: r["arms"]["fsync"]["timed"].__setitem__("syncs", r["arms"]["fsync"]["timed"]["syncs"] // 2),
         "they must agree")
