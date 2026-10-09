@@ -1387,6 +1387,7 @@ impl Database {
             .branches
             .branch_named(name)?
             .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
+        self.branches.pause_connect_looked_up();
         self.connect_branch(id)
     }
 

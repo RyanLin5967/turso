@@ -3441,6 +3441,40 @@ fn a_drop_and_a_connect_never_both_win_a_named_branch() {
     }
 }
 
+/// Engine review 14 MED 9: `connect_named` promises `NoSuchBranch` when no unreleased branch has
+/// the name, but a drop that lands between its lookup and its open made the open fail untyped
+/// (`InternalError("... does not exist")` or `InvalidArgument("... has been reaped")`), which a
+/// server mapping by variant answers XX000. A connect parked between its lookup and its open
+/// (`HOLD_CONNECT_LOOKED_UP`) while the drop completes: the connect is refused as
+/// `NoSuchBranch("gone")`. Mutant `connect_race_untyped`.
+#[test]
+fn a_connect_racing_a_drop_is_refused_as_no_such_branch() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("connect-race.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("gone").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_CONNECT_LOOKED_UP, std::sync::atomic::Ordering::Release);
+        let connector = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect_named("gone").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_CONNECT_LOOKED_UP);
+        db.drop_branch("gone").unwrap_or_else(|e| {
+            panic!("catalog={catalog}: premise: the drop, made while the connect waited, succeeds: {e}")
+        });
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let connected = connector.join().unwrap();
+        assert!(
+            matches!(connected, Err(LimboError::NoSuchBranch(ref n)) if n == "gone"),
+            "catalog={catalog}: a connect that lost the race to a drop was not refused as NoSuchBranch: {connected:?}"
+        );
+    }
+}
+
 /// fastest-wire: the named-branch refusals are typed, so a server answers each with its own code
 /// without matching message text: `NameTaken` from `create_branch`, `NoSuchBranch` from
 /// `connect_named` and `drop_branch`, `BranchInUse` (the name, quoted) from a second
