@@ -2140,6 +2140,39 @@ fn integer_division_by_zero_is_22012() {
     assert_eq!(r.err(sql).code, "22012", "rows {:?}", r.rows);
 }
 
+/// A NUMERIC division by zero is 22012 "division by zero", as PostgreSQL answers: the engine's
+/// NUMERIC divide refuses a zero divisor as a constraint error with those words, which was mapped
+/// with every other constraint error to 23000, integrity_constraint_violation, so a driver raised an
+/// IntegrityError (wire review 16 item 2, the wire's half; the integer half is the engine's,
+/// integer_division_by_zero_is_22012).
+#[test]
+fn a_numeric_division_by_zero_is_22012() {
+    let dir = Scratch::new("numdiv0");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nd(x NUMERIC)").ok("nd");
+    a.q("INSERT INTO nd VALUES (1.5)").ok("row");
+    let sql = "SELECT x / 0 FROM nd";
+    let e = a.q(sql).err(sql);
+    assert_eq!(
+        e.message, "division by zero",
+        "premise: the engine's NUMERIC divide refused the zero divisor"
+    );
+    assert_eq!(e.code, "22012");
+}
+
+/// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer modulo by zero is 22012 in PostgreSQL; this
+/// engine answers one row holding NULL, as for `/` (wire review 16 item 2). Green with the engine's
+/// fix for integer_division_by_zero_is_22012.
+#[test]
+fn integer_modulo_by_zero_is_22012() {
+    let dir = Scratch::new("mod0");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT 1 % 0";
+    assert_eq!(a.q(sql).err(sql).code, "22012");
+}
+
 /// Engine errors carry PostgreSQL's SQLSTATE, so a driver raises the right exception class
 /// (psycopg's IntegrityError, not InternalError): at 472023b72 every one but Busy and
 /// BusySnapshot was XX000 (wire review 1 item 7). The codes are PostgreSQL's (errcodes.txt).
