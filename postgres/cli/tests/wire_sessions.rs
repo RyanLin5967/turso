@@ -3836,6 +3836,44 @@ fn copy_from_runs_inside_the_block_it_is_in() {
     assert_eq!(count(&mut a), "4", "the failed block kept rows");
 }
 
+/// COPY FROM reads only the options it implements (FORMAT text, DELIMITER, NULL, a boolean HEADER)
+/// and refuses every other before the file is read, nothing imported: an option PostgreSQL knows
+/// and this COPY does not (QUOTE and FORCE_NOT_NULL, which need CSV mode, DEFAULT, ON_ERROR,
+/// ENCODING, HEADER MATCH) is 0A000, and a name PostgreSQL does not know, or one given twice, is
+/// 42601, as PostgreSQL's ProcessCopyOptions answers. Its option loop ignored any name it did not
+/// read, so each of these imported the file's rows (HEADER MATCH as data, its header line
+/// included) (wire review 17 item 6). Control: HEADER false and a delimiter import both rows.
+#[test]
+fn copy_refuses_an_option_it_does_not_implement() {
+    let dir = Scratch::new("copyopts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE co(id INT, v TEXT)").ok("co");
+    let rows = dir.0.join("rows.tsv");
+    std::fs::write(&rows, "1\tone\n2\ttwo\n").unwrap();
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM co").single("count");
+    for (options, code) in [
+        ("(QUOTE '\"')", "0A000"),
+        ("(FORCE_NOT_NULL (v))", "0A000"),
+        ("(DEFAULT 'x')", "0A000"),
+        ("(ON_ERROR ignore)", "0A000"),
+        ("(ENCODING 'LATIN1')", "0A000"),
+        ("(HEADER MATCH)", "0A000"),
+        ("(NOSUCH 1)", "42601"),
+        ("(DELIMITER E'\\t', DELIMITER E'\\t')", "42601"),
+    ] {
+        let sql = format!("COPY co FROM '{}' {options}", rows.display());
+        assert_eq!(a.q(&sql).err(&sql).code, code, "{options}");
+        assert_eq!(count(&mut a), "0", "{options}: rows imported");
+    }
+    let sql = format!(
+        "COPY co FROM '{}' (FORMAT text, HEADER false, DELIMITER E'\\t')",
+        rows.display()
+    );
+    a.q(&sql).ok("control");
+    assert_eq!(count(&mut a), "2");
+}
+
 /// A statement the frontend performs while preparing it is refused before it runs when it holds a
 /// parameter: 42P02 over the simple protocol (nothing binds one), 0A000 over the extended one (no
 /// such statement takes parameters here); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
