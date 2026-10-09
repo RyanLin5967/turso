@@ -224,9 +224,10 @@ pub(super) struct ResolvedOperator {
 ///
 /// Operators fire when:
 /// 1. Both operands are columns of the same custom type, OR
-/// 2. One operand is a custom type column and the other a constant operand
-///    (`operand_compatible`): a literal whose type is compatible with the custom
-///    type's `value` input type, a bound parameter, or another constant expression.
+/// 2. One operand is a custom type column and the other a compatible operand
+///    (`operand_compatible`): a literal (through parentheses and a sign) or a CAST
+///    whose type is compatible with the custom type's `value` input type, or a bound
+///    parameter. Any other operand gets the standard comparison.
 ///
 /// Both arguments reach the function as user-facing values: the column decoded, the
 /// operand as given (`emit_custom_type_operator`).
@@ -356,23 +357,77 @@ pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
 }
 
 /// Whether `expr` is passed to an operator of a custom type whose `value` input type is
-/// `value_input_type`: a literal of a compatible type, or any other constant operand (a bound
-/// parameter, a negated or cast literal; `Optimizable::is_constant`), whose value's type is known
-/// only when it runs (fastest-wire, wire review 2 item 3: a parameter got the plain comparison, so
-/// `code = $1` from every extended-protocol client missed what the literal finds; engine review 14
-/// HIGH 1: chosen as constant, not from a list). Mutant `param_skips_type_operator` (test builds
-/// only): a parameter is not one, as before.
+/// `value_input_type`: an operand whose type is known before it runs and is compatible
+/// (`typed_operand_compatible`: a literal, through its parentheses and sign, or a CAST to a
+/// compatible type), or a bound parameter, whose value's type is known only when it runs
+/// (fastest-wire, wire review 2 item 3: a parameter got the plain comparison, so `code = $1` from
+/// every extended-protocol client missed what the literal finds). Anything else, a function call,
+/// a concatenation, a COLLATE operand, takes the plain comparison, as an incompatible literal does
+/// (engine review 16 MED 10: 2fa04254c passed every constant unchecked, so `v = ('abc')` raised in
+/// the operator where `v = 'abc'` compared plainly, and a COLLATE was dropped). Mutant
+/// `param_skips_type_operator` (test builds only): a parameter is not one, as before 6b. Mutant
+/// `operand_any_constant` (test builds only): any constant is one, as 2fa04254c had it.
 fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resolver) -> bool {
-    if let ast::Expr::Literal(_) = expr {
-        return literal_type_name(expr)
-            .is_some_and(|t| literal_compatible_with_value_type(t, value_input_type));
+    if matches!(expr, ast::Expr::Variable(_)) {
+        return !crate::branch::store::fe_mutant("param_skips_type_operator");
     }
-    if matches!(expr, ast::Expr::Variable(_))
-        && crate::branch::store::fe_mutant("param_skips_type_operator")
+    typed_operand_compatible(expr, value_input_type)
+        || (crate::branch::store::fe_mutant("operand_any_constant")
+            && !matches!(expr, ast::Expr::Literal(_))
+            && expr.is_constant(resolver))
+}
+
+/// Whether an operand whose type is known before it runs is of a type compatible with a custom
+/// type's `value` input type: a literal (`literal_type_name`), the same through parentheses
+/// around one expression, a sign on a numeric literal, or a CAST, by its target type
+/// (`cast_type_compatible`). False for everything else (engine review 16 MED 10).
+fn typed_operand_compatible(expr: &ast::Expr, value_input_type: &str) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => literal_type_name(expr)
+            .is_some_and(|t| literal_compatible_with_value_type(t, value_input_type)),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            typed_operand_compatible(&exprs[0], value_input_type)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            is_signed_numeric_literal(inner) && typed_operand_compatible(inner, value_input_type)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => cast_type_compatible(&type_name.name, value_input_type),
+        _ => false,
+    }
+}
+
+/// A numeric literal, possibly parenthesized or signed: what a sign keeps the literal's type for
+/// (`-'abc'` is not text, so a sign on anything else qualifies nothing).
+fn is_signed_numeric_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => is_signed_numeric_literal(&exprs[0]),
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            is_signed_numeric_literal(inner)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a CAST to `cast_type` yields a value of a custom type's `value` input type: the input
+/// is `any`, or names the CAST's type, or names the class of the CAST's affinity (INT -> integer,
+/// VARCHAR -> text, DOUBLE -> real, BLOB -> blob). A NUMERIC CAST has no single class.
+fn cast_type_compatible(cast_type: &str, value_input_type: &str) -> bool {
+    if value_input_type.eq_ignore_ascii_case("any") || cast_type.eq_ignore_ascii_case(value_input_type)
     {
-        return false;
+        return true;
     }
-    expr.is_constant(resolver)
+    let class = match crate::vdbe::affinity::Affinity::affinity(cast_type) {
+        crate::vdbe::affinity::Affinity::Integer => "integer",
+        crate::vdbe::affinity::Affinity::Text => "text",
+        crate::vdbe::affinity::Affinity::Real => "real",
+        crate::vdbe::affinity::Affinity::Blob => "blob",
+        _ => return false,
+    };
+    class.eq_ignore_ascii_case(value_input_type)
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
