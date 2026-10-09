@@ -3146,7 +3146,10 @@ fn end_frame_crc(frame: &[u8; END_FRAME_LEN]) -> u32 {
 /// one: taking it for torn would start an empty store over it, or reset its log.
 fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>> {
     // A header of a format before 11 is 32 bytes, its checksum at 24: read the version first, so
-    // such a log is refused by name rather than taken for a torn header.
+    // such a log is refused by name rather than taken for a torn header. Any version but this
+    // build's is checked against that layout too (engine review 16 #3: a whole 32-byte header of
+    // version 12 was taken for torn once the format moved to 13). Mutant
+    // `old_layout_checked_below_11_only` (test builds only): only versions before 11, as before.
     let Some(h) = bytes.get(..16) else {
         return Ok(None);
     };
@@ -3155,7 +3158,8 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>
     }
     let field = |at: usize| bytes.get(at..at + 4).map(|f| u32::from_le_bytes(f.try_into().unwrap()));
     let version = field(8).expect("16 bytes read");
-    let old = version < 11
+    let other = if super::store::fe_mutant("old_layout_checked_below_11_only") { version < 11 } else { version != format };
+    let old = other
         && bytes.len() >= 28
         && crc32c::crc32c(&bytes[..24]) == field(24).expect("28 bytes read");
     if old || (version != format && bytes.len() >= LOG_HEADER_LEN && crc32c::crc32c(&bytes[..HEADER_CRC_AT]) == field(HEADER_CRC_AT).expect("40 bytes")) {
