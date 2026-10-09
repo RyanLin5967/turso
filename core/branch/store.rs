@@ -6568,6 +6568,25 @@ impl BranchStore {
         self.group.durable(class)
     }
 
+    /// Test builds: the log position that makes the newest Release durable (engine review 17
+    /// HIGH 2: a drain-failure route's premise that only its own record is undrained).
+    #[cfg(test)]
+    pub(crate) fn last_release_lsn_for_test(&self) -> u64 {
+        self.last_release_lsn.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the log position that makes the newest kept pre-image's TrunkRetain durable.
+    #[cfg(test)]
+    pub(crate) fn retain_floor_for_test(&self) -> u64 {
+        self.retain_floor.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the log position that makes the newest fork durable.
+    #[cfg(test)]
+    pub(crate) fn last_fork_lsn_for_test(&self) -> u64 {
+        self.inner.lock().last_fork_lsn
+    }
+
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
     #[cfg(test)]
     pub(crate) fn arena_dirty(&self) -> bool {
