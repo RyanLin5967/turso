@@ -74,6 +74,7 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
+            StepResult::Sleep { duration } if waits_out_busy() => stmt.wait_out_busy(duration)?,
             StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
@@ -121,6 +122,7 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
+            StepResult::Sleep { duration } if waits_out_busy() => stmt.wait_out_busy(duration)?,
             StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
@@ -137,6 +139,36 @@ pub(crate) async fn exec_stmt<Ctx>(
             }
             StepResult::Row => panic!("statement should not return any rows"),
         }
+    }
+}
+
+/// Whether the tape loops answer a busy handler's `StepResult::Sleep` by waiting out its backoff
+/// (`Statement::wait_out_busy`) and stepping again. Yielding IO instead handed the driver nothing
+/// to do: its IO step returns at once when nothing is in flight, so the loop spun a core for the
+/// whole busy timeout (engine review 11 MED 4). The coroutine has no timer to yield on, so the
+/// wait blocks the driver's thread for one backoff step (at most 100 ms), as core's blocking
+/// helpers do; the busy statement has no IO of its own in flight then. Mutant `tape_sleep_yields`
+/// (test builds only): yield IO, as before.
+fn waits_out_busy() -> bool {
+    !fe_mutant("tape_sleep_yields")
+}
+
+/// The sync engine's registered mutants (`FE_MUTANT`, the convention of turso_core's branch
+/// store): one names one deliberate defect, so each red can be shown to fail on its mutant from
+/// the same test binary. TEST BUILDS ONLY: a production binary has no mutant to switch on. Read
+/// once per process.
+fn fe_mutant(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("FE_MUTANT").ok())
+            .as_deref()
+            == Some(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
     }
 }
 
