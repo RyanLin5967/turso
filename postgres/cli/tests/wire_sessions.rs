@@ -5653,6 +5653,52 @@ fn delete_using_reaches_the_row_behind_a_rowid_column() {
     );
 }
 
+/// DELETE ... USING ... RETURNING resolves a bare name as PostgreSQL does, over the target and the
+/// USING items together: a name both have is 42702 and nothing is deleted; a name only a USING item
+/// has, or a whole-row reference to one, returns what this server cannot (0A000), deleting
+/// nothing; a subquery in RETURNING reads its own FROM, so its columns are not the USING items'.
+/// Bare names were never checked: `RETURNING id` deleted and returned the target's id where
+/// PostgreSQL 17.11 answers 42702, `RETURNING flag` was 42703, and a subquery naming a USING table
+/// was refused (wire review 15 item 7).
+#[test]
+fn delete_using_returning_resolves_a_bare_name_over_both() {
+    let dir = Scratch::new("deleteusingret");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .ok("d rows");
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true), (3, false)")
+        .ok("k rows");
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM d").single("count");
+    for (sql, code) in [
+        (
+            "DELETE FROM d USING k WHERE d.id = k.id RETURNING id",
+            "42702",
+        ),
+        (
+            "DELETE FROM d USING k WHERE d.id = k.id RETURNING flag",
+            "0A000",
+        ),
+        (
+            "DELETE FROM d USING k WHERE d.id = k.id RETURNING k",
+            "0A000",
+        ),
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, code, "{sql}");
+        assert_eq!(count(&mut a), "3", "{sql}: nothing deleted");
+    }
+    let r = a
+        .q("DELETE FROM d USING k WHERE d.id = k.id AND k.flag \
+            RETURNING v, EXISTS (SELECT 1 FROM k AS j WHERE j.flag)")
+        .ok("a subquery in RETURNING");
+    assert_eq!(r.rows.len(), 1, "{:?}", r.rows);
+    assert_eq!(r.rows[0][0].as_deref(), Some("b"));
+    assert_eq!(count(&mut a), "2");
+}
+
 /// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
 /// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
 /// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
