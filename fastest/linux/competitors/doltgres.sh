@@ -69,13 +69,17 @@ seed)
   "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc
   if [ "$AGE" -gt 0 ]; then
     psqlc -At -c "SELECT dolt_commit('-am', 'age')"
-    # dolt_gc may end the calling session, so success is checked by a new connection afterwards; a failed GC fails
-    # the seed (the recorded maintenance must be what ran).
-    psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || true
-    psqlc -At -c "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after dolt_gc ($(tail -1 "$DATA.gc.txt"))"
-    # the session it ends reads as a closed connection; any other error is a failed GC
-    grep -viE 'closed the connection|terminat|connection to server|lost' "$DATA.gc.txt" | grep -qi 'error' &&
-      die "REFUSED: dolt_gc failed: $(tail -1 "$DATA.gc.txt")"
+    # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
+    # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
+    # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
+    gc_before=$(du -sB1 "$DATA/databases" | cut -f1)
+    gc_log0=$(stat -c %s "$LOG")
+    gcrc=0
+    psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
+    tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
+    "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
+      die "REFUSED: dolt_gc: $(cat "$DATA.gc.verdict")"
+    echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/databases" | cut -f1)"
     echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
   else
     echo "maintenance: dolt_commit seed"

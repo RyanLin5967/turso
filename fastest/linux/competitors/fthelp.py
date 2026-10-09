@@ -97,8 +97,19 @@ GC_OK = ("0", "{0}")  # DOLT_GC's status with -N (Dolt) / -At (Doltgres): an all
 
 
 def gc_verdict(rc, out, log):
-    """RED stub: accepts everything."""
-    return []
+    """Why the seed's GC did not succeed ([] = it did): the client's rc must be 0, its whole output exactly one GC_OK
+    status (no carve-out for a lost connection: in Dolt 2.4.1 DOLT_GC does not end the calling session, and a lost
+    connection is what a recovered panic or a failed handshake looks like), and the server log written since the CALL
+    must hold no panic."""
+    why = []
+    if str(rc).strip() != "0":
+        why.append(f"client rc {str(rc).strip()}")
+    if out.strip() not in GC_OK:
+        why.append(f"output {out.strip()[:160]!r} is not exactly one of {GC_OK}")
+    if re.search(r"panic", log, re.I):
+        why.append("the server log since the CALL holds a panic: " + next(
+            (ln.strip()[:160] for ln in log.splitlines() if re.search(r"panic", ln, re.I)), ""))
+    return why
 
 
 def selftest():

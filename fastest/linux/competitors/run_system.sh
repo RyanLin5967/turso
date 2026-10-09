@@ -498,7 +498,9 @@ server_main() {
     fi
   fi
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
-  srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { cp "$DATA".gc.* "$RAW/" 2>/dev/null; fail "seed"; return; }
+  # the GC's own record, banked with the job (MED 9: gc.txt was never banked): client output, log slice, verdict
+  for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict; do [ -e "$f" ] && cp "$f" "$RAW/seed-$(basename "$f")"; done
   prebranch_server
   server_fixture  # after prebranch: it records the live-branch count read back there (HIGH 1, MED 3)
   if [ "$KIND" = pg ]; then

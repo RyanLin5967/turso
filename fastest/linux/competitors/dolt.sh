@@ -56,13 +56,18 @@ seed)
   "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | my bench
   if [ "$AGE" -gt 0 ]; then
     my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
-    # DOLT_GC ends the calling session in sql-server mode, so success is checked by a new connection afterwards; a
-    # failed GC fails the seed (the recorded maintenance must be what ran).
-    my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || true
-    my -N bench -e "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after DOLT_GC ($(tail -1 "$DATA.gc.txt"))"
-    # the session it ends reads as ERROR 2013/2006 (lost connection); any other error is a failed GC
-    grep -viE 'lost connection|gone away|2013|2006' "$DATA.gc.txt" | grep -qi 'error' &&
-      die "REFUSED: DOLT_GC failed: $(tail -1 "$DATA.gc.txt")"
+    # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
+    # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
+    # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
+    # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
+    gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
+    gc_log0=$(stat -c %s "$LOG")
+    gcrc=0
+    my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
+    tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
+    "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
+      die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
+    echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
     echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
   else
     echo "maintenance: DOLT_COMMIT seed"
