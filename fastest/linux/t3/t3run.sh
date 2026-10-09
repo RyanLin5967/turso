@@ -47,10 +47,11 @@
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
 #   v3l-fsync-half      the BEFORE V3L's fio syncs every 2nd write (V3L_PLANT=fsync2: V1L and fio must VOID it)
-#   v3l-cache-lie       a write-cache lie under V3L BEFORE, on real hardware, whichever drive the runner draws: on a
-#                       write-back drive the block's loop is set to write through (fsyncs stop reaching the drive, and
-#                       the drive's flush counter gate must VOID it); on a write-through drive the drive's own queue is
-#                       set to write back (the kernel/drive cross-check must VOID it). Restored right after.
+#   v3l-cache-lie       a write-cache lie under V3L BEFORE, on a write-back drive (a write-through draw is NOT-RUN:
+#                       the kernel will not let its queue claim write back, T3 runner review item 10): the block's
+#                       loop is set to write through (fsyncs stop reaching the drive, and the drive's flush counter
+#                       gate must VOID it). The original is saved, restored right after under an EXIT trap, and read
+#                       back.
 # A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
@@ -368,32 +369,44 @@ v3batch() { # v3batch before|after DIR
 # filesystem): b0 before block 1, then bK after block K, which is also before block K+1 (nothing runs between).
 # VOID or refused fails the stage.
 v3l() { # v3l bK MNT
-  local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc lie=""
+  local when=$1 mnt=$2 o=$OUT/fs-$FS_NOW rc knob="" orig=""
   local -a env=()
   [ $DRY = 0 ] && env+=(V3L_REAL=1)
   [ "$PLANT_NOW:$when" = v3l-fsync-half:b0 ] && env+=(V3L_PLANT=fsync2)
   if [ "$PLANT_NOW:$when" = v3l-cache-lie:b0 ]; then
     # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
-    # (no fsync reaches the drive), or a write-through drive whose kernel queue claims write back
+    # (no fsync reaches the drive, so its flush counter gate fires). A write-through drive cannot be planted: the
+    # kernel refuses (6.8: EINVAL) or ignores (6.11) a write-back write to its queue, so that draw is NOT-RUN, not a
+    # failure (T3 runner review item 10); its cross-check is fired on copies by v3l.py's drive-mismatch plant.
     local lo disk wc
     lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
     disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
     wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
     case $wc:$lo in
-      "write back:loop"*) lie="/sys/block/$lo/queue/write_cache=write through" ;;
-      "write through:"*) lie="/sys/block/$disk/queue/write_cache=write back" ;;
+      "write back:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
+      "write through:"*)
+        echo "plant v3l-cache-lie: NOT-RUN: $disk is write through; the kernel will not let its queue claim write back" |
+          tee "$o/plant.txt" "$OUT/plant-notrun.txt" ;;
       *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
     esac
-    printf '%s\n' "${lie#*=}" | sudo tee "${lie%%=*}" > /dev/null || { echo "plant v3l-cache-lie: cannot write ${lie%%=*}"; return 1; }
-    [ "$(cat "${lie%%=*}")" = "${lie#*=}" ] || { echo "plant v3l-cache-lie: ${lie%%=*} did not take"; return 1; }
-    echo "plant v3l-cache-lie: ${lie%%=*} = ${lie#*=} (was $( [ "${lie#*=}" = "write back" ] && echo "write through" || echo "write back"))" | tee "$o/plant.txt"
-    env+=(V3L_PLANT=cache-lie)
+    if [ -n "$knob" ]; then
+      orig=$(cat "$knob") || return 1
+      [ "$orig" = "write back" ] || { echo "plant v3l-cache-lie: $knob reads '$orig' before the lie, not write back"; return 1; }
+      # restored whatever ends the measurement, the script included
+      trap 'printf "%s\n" "'"$orig"'" | sudo tee "'"$knob"'" > /dev/null' EXIT
+      printf '%s\n' "write through" | sudo tee "$knob" > /dev/null || { echo "plant v3l-cache-lie: cannot write $knob"; return 1; }
+      [ "$(cat "$knob")" = "write through" ] || { echo "plant v3l-cache-lie: $knob did not take"; return 1; }
+      echo "plant v3l-cache-lie: $knob = write through (was $orig)" | tee "$o/plant.txt"
+      env+=(V3L_PLANT=cache-lie)
+    fi
   fi
   env "${env[@]}" timeout 1800 python3 -B "$L/t3/v3l.py" measure "$mnt/v3l-$when" "$o/v3l-$when" \
     "$o/v3-before/summary.json" > "$o/v3l-$when.txt" 2>&1
   rc=$?
-  if [ -n "$lie" ]; then  # restore at once, so the rest of the run sees the drive as it is
-    printf '%s\n' "$( [ "${lie#*=}" = "write back" ] && echo "write through" || echo "write back")" | sudo tee "${lie%%=*}" > /dev/null
+  if [ -n "$knob" ]; then  # restore the saved original at once, read it back, and drop the trap
+    printf '%s\n' "$orig" | sudo tee "$knob" > /dev/null
+    trap - EXIT
+    [ "$(cat "$knob")" = "$orig" ] || { echo "plant v3l-cache-lie: $knob did not return to '$orig'"; return 1; }
   fi
   echo "$when rc=$rc" >> "$o/v3l.rc"
   [ $rc = 0 ] || { echo "V3L $when on $FS_NOW: rc $rc ($(tail -1 "$o/v3l-$when.txt"))"; return 1; }
