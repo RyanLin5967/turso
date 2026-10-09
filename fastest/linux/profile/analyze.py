@@ -340,7 +340,7 @@ def self_test():
         return {"clients": clients, "strace": {"refusals": ref, "windows": ws}, "ir_per_op": {"create": 1000.0}}
 
     def verdicts(head, base=None, baseline=None):
-        return {g: v for g, _, _, v in gates(head, base, budget, baseline)}
+        return {r[0]: r[3] for r in gates(head, base, budget, baseline)}
 
     cases = []
     ok = verdicts({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": arm_of(trace(1), 10)})
@@ -389,7 +389,7 @@ def self_test():
     hb["strace"]["windows"]["create"]["syscalls_per_op"]["getpid"] = 4.0
     rows = gates({"full-snap-c1": hb}, {"full-snap-c1": dict(hb)}, budget, None)
     cases.append(("only the absolute budget red: regression_green is true (the baseline advances)",
-                  {g: v for g, _, _, v in rows}.get("budget-syscalls/full-snap-c1") == "FAIL" and regression_green(rows)))
+                  {r[0]: r[3] for r in rows}.get("budget-syscalls/full-snap-c1") == "FAIL" and regression_green(rows)))
     rows = gates({"full-snap-c1": arm_of(trace(2), 20)}, None, budget, None)
     cases.append(("a flush-budget FAIL makes regression_green false", not regression_green(rows)))
     rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
@@ -399,7 +399,7 @@ def self_test():
     # are already unevaluated and the mutants `return evaluated` and "drop the syscalls-vs-base conjunct" passed all 19.
     two = arm_of(trace(2), 20)
     rows = gates({"full-snap-c1": two}, {"full-snap-c1": arm_of(trace(2), 20)}, budget, None)
-    v = {g: v for g, _, _, v in rows}
+    v = {r[0]: r[3] for r in rows}
     cases.append(("review 7a: base == head, both regression premises PASS, and a flush-budget FAIL still makes "
                   "regression_green false",
                   v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") == "PASS"
@@ -407,7 +407,7 @@ def self_test():
     nostrace = arm_of(trace(1), 10)
     del nostrace["strace"]
     rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": nostrace}, budget, None)
-    v = {g: v for g, _, _, v in rows}
+    v = {r[0]: r[3] for r in rows}
     cases.append(("review 7a: instructions PASS against an in-job base whose strace run failed, syscalls-vs-base not "
                   "PASS, nothing FAILs: regression_green false",
                   v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") != "PASS"
@@ -540,6 +540,81 @@ def self_test():
             shutil.rmtree(d, ignore_errors=True)
     cases.append(("review 28: verdict.tsv round-trips through write_verdict/read_verdict; a tab inside a field, an empty "
                   "or missing file, and a short line are refused", guarded(case_verdict_file)))
+
+    # review 29: regression_green named its two premises by id and exempted the absolute budget by id prefix
+    # (analyze.py:370 at 2d42982a0). Every row now carries a kind: "regression" (must PASS for regression_green),
+    # "budget" (the absolute budget; the budget job's), "info" (never gates; INFO or NOT-RUN only).
+    def mixed_rows(b=None):
+        return gates({"full-snap-c1": arm_of(trace(1), 10), "full-snap-c64": arm_of(trace(1), 10, clients=64),
+                      "async-snap-c1": {"arm": "async-snap-c1", "status": "NOT AVAILABLE: no async class"}},
+                     {"full-snap-c1": arm_of(trace(1), 10), "full-snap-c64": arm_of(trace(1), 10, clients=64)},
+                     b or budget, None)
+
+    def case_rows_carry_kind():
+        rows = mixed_rows()
+        return bool(rows) and all(len(r) == 5 and r[4] in ("regression", "budget", "info") for r in rows)
+    cases.append(("review 29: every row carries a kind (regression, budget or info)", guarded(case_rows_carry_kind)))
+
+    def case_kinds_by_row():
+        k = {r[0]: r[4] for r in mixed_rows()}
+        return (k.get("instructions/create") == "regression" and k.get("syscalls-vs-base/full-snap-c1") == "regression"
+                and k.get("budget-flush/full-snap-c1") == "regression"
+                and k.get("two-instruments/full-snap-c1/create") == "regression"
+                and k.get("syscalls-vs-base/full-snap-c64") == "info" and k.get("budget-flush/async-snap-c1") == "info"
+                and k.get("budget-syscalls/full-snap-c1") == "budget" and k.get("budget-syscalls/full-snap-c64") == "budget")
+    cases.append(("review 29: kinds by row: instructions, syscalls-vs-base at C=1, flush and two-instrument rows are "
+                  "regression; C>1 syscalls-vs-base and an unavailable class are info; budget-syscalls is budget",
+                  guarded(case_kinds_by_row)))
+
+    def case_green_reads_kinds():
+        clean = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": arm_of(trace(1), 10)}, budget, None)
+        return (regression_green(clean)
+                and not regression_green(clean + [("planted/x", "p", "p", "NOT-RUN", "regression")])
+                and not regression_green(clean + [("budget-syscalls/planted", "p", "p", "FAIL", "regression")])
+                and regression_green(clean + [("planted-budget/x", "p", "p", "FAIL", "budget")])
+                and regression_green(clean + [("planted-info/x", "p", "p", "NOT-RUN", "info")]))
+    cases.append(("review 29: regression_green reads kinds, not ids: a regression row that is not PASS blocks it under "
+                  "any id; a budget FAIL or an info row under any id does not", guarded(case_green_reads_kinds)))
+
+    def case_budget_reads_kinds():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
+        ok, _ = budget_verdict(rows)
+        bad_, why = budget_verdict(rows + [("planted-budget/x", "p", "p", "FAIL", "budget")])
+        return ok and not bad_ and any("planted-budget/x" in w for w in why)
+    cases.append(("review 29: the budget verdict reads budget-kind rows, not an id prefix",
+                  guarded(case_budget_reads_kinds)))
+
+    def case_premise_always_present():
+        none = by_id(gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)).get("syscalls-vs-base/full-snap-c1")
+        b2 = dict(budget, classes={k: x for k, x in budget["classes"].items() if k != "full"})
+        unreg_rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": arm_of(trace(1), 10)}, b2, None)
+        unreg = by_id(unreg_rows).get("syscalls-vs-base/full-snap-c1")
+        return (none is not None and none[3] == "NOT-RUN" and none[4] == "regression"
+                and unreg is not None and unreg[3] != "PASS" and unreg[4] == "regression"
+                and not regression_green(unreg_rows))
+    cases.append(("review 29: the syscalls-vs-base/full-snap-c1 premise row always exists (NOT-RUN, regression) when "
+                  "nothing compared it, with no base or with the arm cut short", guarded(case_premise_always_present)))
+
+    def case_verdict_file_kinds():
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="analyze-selftest-")
+        try:
+            p = os.path.join(d, "v.tsv")
+            refused = []
+            for line in ("x\te\tg\tFAIL\tinfo", "x\te\tg\tPASS\tinfo", "x\te\tg\tPASS\tweird", "x\te\tg\tMAYBE\tregression"):
+                open(p, "w").write(line + "\n")
+                try:
+                    read_verdict(p)
+                    refused.append(False)
+                except ValueError:
+                    refused.append(True)
+            open(p, "w").write("x\te\tg\tNOT-RUN\tinfo\n")
+            return all(refused) and len(refused) == 4 and read_verdict(p) == [("x", "e", "g", "NOT-RUN", "info")]
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    cases.append(("review 29: read_verdict refuses an unknown kind or verdict and an info row that PASSes or FAILs",
+                  guarded(case_verdict_file_kinds)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
