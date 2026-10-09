@@ -208,7 +208,12 @@ jobs:
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
-        run: timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
+        # LOW 14: the job's budget, derived from this step's own timeout so no cell can be cut mid-way: a cell not
+        # started by 12600 - 2 x (cap + 600) - 600 s is recorded "NOT RUN: budget" (at the 1800 s cap: 7200 s)
+        run: |
+          export FT_BUDGET_S=$(( 12600 - 2 * (${FT_CAP_S%.*} + 600) - 600 ))
+          [ "$FT_BUDGET_S" -gt 0 ] || { echo "the cap leaves no budget under the 12600 s step timeout"; exit 1; }
+          timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
       - name: Compress traces
         if: always()
         run: find "$RAW" -name '*.strace' -exec gzip -9 {} + || true

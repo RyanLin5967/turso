@@ -122,6 +122,21 @@ done
 # >= 1000 ok ops is complete with reduced n), and one outer timeout above it, the same for every system, bounds each
 # invocation (gate-6 review, t3run item 16).
 OUTER_S=$((${CAP_S%.*} + 600))
+# LOW 14: a time budget for the whole job (FT_BUDGET_S, seconds; 0 or unset = none). A cell not STARTED by then is
+# recorded "NOT RUN: budget" (cell.json and timed.json; reduce.py counts it, never a silent MISSING), so a job-level
+# timeout of at least BUDGET + 2 x OUTER_S (a cell's two bounded runs) + slack can never cut a cell mid-way. The
+# workflow derives it from its own `timeout`.
+BUDGET_S=${FT_BUDGET_S:-0}
+[[ $BUDGET_S =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_BUDGET_S [$BUDGET_S] is not a number of seconds" >&2; exit 2; }
+over_budget() { # over_budget CELLDIR NAME -> 0 (and the cell recorded NOT RUN) when the budget is spent
+  [ "$BUDGET_S" -gt 0 ] && [ "$SECONDS" -ge "$BUDGET_S" ] || return 1
+  local v="NOT RUN: budget (${SECONDS} s elapsed of FT_BUDGET_S ${BUDGET_S} s)"
+  mkdir -p "$1"
+  printf '{"name": "%s", "verdict": "%s"}\n' "$SYSTEM/$2" "$v" >"$1/cell.json"
+  printf '{"verdict": "%s"}\n' "$v" >"$1/timed.json"
+  fail "$2: $v"
+  return 0
+}
 fsused() { sync -f "$MNT"; df -B1 --output=used "$MNT" | tail -1 | tr -d ' '; }
 
 # Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG at D2
@@ -308,6 +323,7 @@ run_server_cell() { # run_server_cell SPEC C
   local spec=$1 c=$2 n d rc used0 used1 total ok created
   n=$(nops "$c")
   d="$RAW/cells/$spec-c$c"
+  over_budget "$d" "$spec-c$c" && return  # LOW 14
   mkdir -p "$d"
   echo "=== $SYSTEM $spec C=$c N=$n"
   bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" nowarm >/dev/null ||
@@ -677,6 +693,7 @@ b1_main() {
     for c in $CLIENTS; do
       n=$(nops "$c")
       d="$RAW/cells/b1-$spec-c$c"
+      over_budget "$d" "b1-$spec-c$c" && continue  # LOW 14
       bdir="$ROOT/branches/$spec-c$c"
       mkdir -p "$d" "$bdir"
       echo "=== b1 $spec C=$c N=$n"
