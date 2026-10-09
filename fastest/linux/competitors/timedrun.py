@@ -256,6 +256,11 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     return why
 
 
+def final_verdict(why, warm_rule=None, cap=None):
+    """RED stub: ignores the rule."""
+    return "ok" if not why else "REFUSED: " + "; ".join(why)
+
+
 def write_verdict(celldir, n, why):
     lab = load(os.path.join(celldir, "bb", "summary.json")) or {}
     t = load(os.path.join(celldir, "timed", "summary.json")) or {}
@@ -462,6 +467,16 @@ def selftest():
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
         got = ops(*args)
         print(("PASS" if got == want else "FAIL"), f"ops{args} = {got!r}, want {want!r}")
+        bad += got != want
+        cases.append(None)
+    # MED 7: the verdict is computed against the registered rule at the cap, rule(CAP), never the run's own: a clean
+    # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'
+    for why_in, rule_in, cap_in, want in (([], "1000:10:180", "1800", "ok"), ([], "1000:10:2", "1800", "ok-smoke-warmup"),
+                                          ([], "1000:10:6", "60", "ok"), (["x"], "1000:10:180", "1800", "REFUSED: x"),
+                                          ([], "1000:10:180.0", "1800", "ok-smoke-warmup")):
+        got = final_verdict(why_in, rule_in, cap_in)
+        print(("PASS" if got == want else "FAIL"), f"final_verdict({why_in}, {rule_in}, cap {cap_in}) = {got!r}, "
+              f"want {want!r}")
         bad += got != want
         cases.append(None)
     # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
