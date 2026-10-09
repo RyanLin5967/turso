@@ -850,6 +850,9 @@ struct StatementFailure {
     rerunnable: bool,
     /// The statement, as translated, is a COMMIT ([`StatementTypes::commits`]).
     commits: bool,
+    /// The statement, as translated, is a ROLLBACK of the whole block
+    /// ([`StatementTypes::rolls_back`]).
+    rolls_back: bool,
     info: Box<ErrorInfo>,
 }
 
@@ -1255,8 +1258,10 @@ impl Session {
             _ => {}
         }
         // Whether a failed engine statement got as far as running (a branch call, a CHECKPOINT
-        // or a refusal here is a statement that ran).
+        // or a refusal here is a statement that ran), and whether its translated parse was a
+        // COMMIT or a ROLLBACK of the block.
         let mut ran = true;
+        let mut parsed = (false, false);
         let result = match call {
             Some(call) => {
                 // A statement a Describe kept holds its connection open: a switch away, or a
@@ -1286,6 +1291,7 @@ impl Session {
                 st = self.state();
                 r.map_err(|f| {
                     ran = f.prepared;
+                    parsed = (f.commits, f.rolls_back);
                     f.info
                 })
             }
@@ -1303,6 +1309,13 @@ impl Session {
             r => r,
         };
         if result.is_err() {
+            // The block's end is read from the verb the reader saw or the parse the engine ran,
+            // whichever says COMMIT or ROLLBACK, never from the text alone (wire review 14 item 7).
+            let verb = match parsed {
+                (true, _) => TxVerb::Commit,
+                (_, true) => TxVerb::Rollback,
+                _ => verb,
+            };
             match verb {
                 // A COMMIT that ran and failed ends the block, as in PostgreSQL: whatever the
                 // engine kept of the transaction is rolled back and the session is idle. If that
@@ -1501,14 +1514,18 @@ impl Session {
         } else {
             Backoff::new(self.shared.lock_wait)
         };
+        // The last attempt, once the lock wait is spent, goes through the same rules as every
+        // other: it returned unchecked, past the backstop (wire review 14 item 7).
+        let mut last = false;
         loop {
             // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
-                // The state backstop: a statement that failed after the engine left the block it
-                // ran in (a COMMIT the verb reader did not see, or an error the engine answered by
-                // rolling the whole transaction back) is settled as a COMMIT is and never run
-                // again: run anew it would run outside the block (wire review 9 item 7; 476798d89
-                // had dropped f2804f119's state check).
+                // A COMMIT, as the verb reader or the parse the engine ran says, is settled as a
+                // COMMIT is and never run again. So is the state backstop's case: a statement that
+                // failed after the engine left the block it ran in, which, now that the reader
+                // and the parse agree (wire review 14 item 6), is an error the engine answered by
+                // rolling the whole transaction back: run anew it would run outside the block
+                // (wire review 9 item 7; 476798d89 had dropped f2804f119's state check).
                 Err(mut f)
                     if verb == TxVerb::Commit
                         || f.commits
@@ -1518,11 +1535,12 @@ impl Session {
                     return Err(f);
                 }
                 Err(f)
-                    if f.rerunnable
+                    if !last
+                        && f.rerunnable
                         && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
                 {
                     if !backoff.wait() {
-                        return self.engine_statement_once(conn, sql, portal, format, &mut backoff);
+                        last = true;
                     }
                 }
                 r => return r,
@@ -1542,6 +1560,7 @@ impl Session {
             prepared: false,
             rerunnable: true,
             commits: false,
+            rolls_back: false,
             info,
         };
         let described = portal.and_then(|_| self.take_described(conn, sql));
@@ -1592,6 +1611,7 @@ impl Session {
             prepared: true,
             rerunnable: stmt.n_change() == 0 && !(types.commits || types.rolls_back),
             commits: types.commits,
+            rolls_back: types.rolls_back,
             info: wire_info(e),
         })
     }
