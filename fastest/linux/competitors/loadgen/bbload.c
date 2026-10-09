@@ -33,7 +33,7 @@
  *   summary.json records the warm-up as decided: warmup_ops (the claims before the ending one), warmup_end_ns (the
  *   ending claim, ns since t0), warmup_capped, warmup_last_claim_ns (the last warm-up claim; null with none), and
  *   warmup_backsteps (claims judged with an older time than the one judged before them; 0 in closed loop, where each
- *   claim's time is read under the claim lock).
+ *   claim's time is read under the claim lock; expected in open loop, see claim_warm), and loop (closed | open).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
  * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
@@ -639,8 +639,17 @@ static int warmup_replay(const char *rule) {
  * judged later with an older time); open loop passes the op's intended time, as claim_op takes it. Returns PH_WARM
  * when this claim is a warm-up op, else the phase now in force: the claim that ends the warm-up opens the window at T
  * and is its first measured op. g_warm_backsteps counts claims judged with an older time than the one judged before:
- * 0 in closed loop by construction; open loop decides in lock order, each claim with its own client's intended time
- * (every client keeps its own Poisson schedule), so it can step back, and timedrun.py refuses any backstep. */
+ * 0 in closed loop by construction.
+ *
+ * Open loop. The macOS claim_op at artie 4010ff3b06, exactly: under g_claim, every claim takes the NEXT arrival of ONE
+ * Poisson arrival stream for the whole run (k.arrival = g_arr_idx++; k.intended = t = g_arr_t; then g_arr_t +=
+ * -log(unif(&g_arr_rng)) * 1e9 / RATE; the stream is seeded by --seed alone and starts at g_arr_t = g_t0), decides
+ * the warm-up with warm_ends(g_warm_claimed, t - g_t0, ...) at that intended time t, and the client then sleeps until
+ * it (sleep_until(k.intended)). This port makes the same decision at the same kind of time -- warm_ends at the claim's
+ * intended time, under the claim lock -- but its intended times come from one Poisson schedule per client at R/C, the
+ * port's own open-loop design, so claims reach the lock out of intended order: in open loop backsteps are expected and
+ * recorded, not a defect (summary.json loop; timedrun.py refuses backsteps in closed loop only, the lead's correction
+ * on 0138d2128). */
 static uint64_t g_claim_prev_el, g_warm_backsteps;
 static int claim_warm(const uint64_t *intended) {
     pthread_mutex_lock(&g_claim_mu);
@@ -1073,7 +1082,8 @@ int main(int argc, char **argv) {
     if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
     if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
-    fprintf(f, "\"warmup_backsteps\":%llu,", (unsigned long long)g_warm_backsteps);
+    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"%s\",", (unsigned long long)g_warm_backsteps,
+            OPEN_LOOP ? "open" : "closed"); /* loop: which order checks timedrun.py applies (closed only) */
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",

@@ -821,7 +821,8 @@ static int cmd_run(int argc, char **argv) {
     if (tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
     if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
-    fprintf(f, "\"warmup_backsteps\":%llu,", (unsigned long long)g_warm_backsteps);
+    /* loop: clonebench is closed-loop only (its "mode" field is b1/b0); timedrun.py applies the order checks to it */
+    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"closed\",", (unsigned long long)g_warm_backsteps);
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"
