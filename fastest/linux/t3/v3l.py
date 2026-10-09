@@ -660,6 +660,10 @@ def plants(rec):
         arm("wt-unwritten", "write through",
             lambda r: r["arms"]["fsync"]["timed"].__setitem__("sectors_written_delta", N * SECTORS_PER_WRITE // 2),
             (f"drive {disk}:", "did not reach the drive"))
+        # the labelling half of the same rule, on its own text (review 5 MED 4)
+        arm("wt-unwritten-lab", "write through",
+            lambda r: r["arms"]["fsync"]["timed"].__setitem__("lab_sectors_written_delta", N * SECTORS_PER_WRITE // 2),
+            (f"drive {disk}:", "in the labelling fsync run", "did not reach the drive"))
         # annex A24: the sync rule, forced to fire by a failed sync before the timed run
         arm("unsynced", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("timed", {"ran": True, "rc": 1}),

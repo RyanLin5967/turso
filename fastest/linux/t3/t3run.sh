@@ -405,18 +405,19 @@ v3l() { # v3l bK MNT
   [ $DRY = 0 ] && env+=(V3L_REAL=1)
   [ "$PLANT_NOW:$when" = v3l-fsync-half:b0 ] && env+=(V3L_PLANT=fsync2)
   if [ "$PLANT_NOW:$when" = v3l-cache-lie:b0 ]; then
-    # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
-    # (no fsync reaches the drive, so its flush counter gate fires). A write-through drive cannot be planted: the
-    # kernel refuses (6.8: EINVAL) or ignores (6.11) a write-back write to its queue, so that draw is NOT-RUN, not a
-    # failure (T3 runner review item 10); its cross-check is fired on copies by v3l.py's drive-mismatch plant.
+    # the lie is the LOOP's queue claiming write through, so no fsync reaches the backing file and its data stays in the
+    # page cache: behind a write-back drive the flush counter rule fires, behind a write-through drive (the runner's
+    # sda class) the sectors-written rule does ("did not reach the drive"; review 5 MED 4: the old NOT-RUN for a
+    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). Only a
+    # leaf that is not a loop has no knob, and that draw is NOT-RUN.
     local lo disk wc
     lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
     disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
     wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
     case $wc:$lo in
-      "write back:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
-      "write through:"*)
-        echo "plant v3l-cache-lie: NOT-RUN: $disk is write through; the kernel will not let its queue claim write back" |
+      "write back:loop"*|"write through:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
+      "write back:"*|"write through:"*)
+        echo "plant v3l-cache-lie: NOT-RUN: $lo is not a loop, so there is no loop queue to make lie" |
           tee "$o/plant.txt" "$OUT/plant-notrun.txt" ;;
       *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
     esac

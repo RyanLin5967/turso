@@ -54,7 +54,7 @@ jobs:
           - {block: brd, plant: ""}
           - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
           - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID (block 1): &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
-          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose"}
+          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose||V3L VOID (block 1): &&did not reach the drive"}
     env:
       PLANT: ${{ matrix.plant }}
       EXPECT: ${{ matrix.expect }}
@@ -101,7 +101,7 @@ jobs:
           plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
           notrun = os.path.join(os.path.dirname(sys.argv[1]), "plant-notrun.txt")
           if plant and os.path.exists(notrun):
-              # a draw the plant cannot reach (v3l-cache-lie on a write-through drive: T3 runner review item 10) is
+              # a draw the plant cannot reach (v3l-cache-lie on a leaf that is not a loop; review 5 MED 4) is
               # NOT-RUN, said so, and passes only if every block then passed with nothing planted
               print("PLANT", plant, open(notrun).read().strip())
               blocks = s.get("blocks") or []
