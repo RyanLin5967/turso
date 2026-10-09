@@ -2528,18 +2528,15 @@ def f1b_window_syncs(text):
     return seen, probs
 
 
-def sync_fds_problems(sj, rows, n, f1b_trace):
-    """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
-    match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
-    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
-    the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
-    fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
-    (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
-    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
-    bad = []
+def sync_fds_def_problems(sj, rows, n):
+    """The arm-definitions half of sync_fds_problems, on its own so batchgate's post runs it too (V3 review 11 LOW 2,
+    review 12 item 7: post trusted the probe's sync_fds): per arm in rows, one fd per synced file (the clone and the
+    directory for clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25), each
+    synced n times; a missing or overflowed record is one problem. -> [(tag, arm, recorded, fds, syncs)]."""
     sf = sj.get("sync_fds")
     if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
         return [("sync_fds disagrees with the arm definitions", "missing or overflowed", sj.get("sync_fds_overflow"))]
+    bad = []
     for a in rows:
         spec = OP.get(a, {})
         per_op = spec.get("fsync", 0) + spec.get("fdatasync", 0)
@@ -2548,6 +2545,21 @@ def sync_fds_problems(sj, rows, n, f1b_trace):
         if not isinstance(got, dict) or len(got) != nfd or sum(got.values()) != n * per_op or \
                 any(v != n for v in got.values()):
             bad.append(("sync_fds disagrees with the arm definitions", a, got, nfd, n * per_op))
+    return bad
+
+
+def sync_fds_problems(sj, rows, n, f1b_trace):
+    """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
+    match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
+    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
+    the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
+    fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
+    (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
+    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
+    bad = sync_fds_def_problems(sj, rows, n)
+    if bad and bad[0][1] == "missing or overflowed":
+        return bad
+    sf = sj.get("sync_fds")
     if f1b_trace is None:
         bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad

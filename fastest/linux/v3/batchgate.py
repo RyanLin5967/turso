@@ -502,10 +502,25 @@ def post(out, cell, sha, mode, verdict_path):
             # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) or that names no fd (no_fd) VOIDs
             # the batch; a missing count is not a zero. (The nosync25-only lookup that stood here VOIDed any smoke
             # batch without nosync25 as "None sync(s)"; the "wholly inside" counts stay descriptive.)
+            # V3 review 12 item 7: check.py's nosync25 rule, here too: nosync25 syncs nothing by definition, so its
+            # windows hold no sync attributed to it (a nosync25 that owns an fd and syncs on it shows here only: every
+            # unattributed count is then 0)
+            n0 = sarms.get("nosync25")
+            if isinstance(n0, dict) and n0.get("syncs") != 0:
+                voids.append("fsync: nosync25's windows hold %r sync(s) by the probe (it owns no fd by definition)"
+                             % (n0.get("syncs"),))
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
             if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
                 voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd), %r "
                              "naming no fd (no_fd)" % (ua.get("foreign_fd"), ua.get("no_fd")))
+            # review 11 LOW 2 / review 12 item 7: the probe's own sync_fds against the arm definitions (check.OP), the
+            # same half of check.py's sync_fds_problems; post trusted the record attribution reads by
+            import check as _ck
+            for t in _ck.sync_fds_def_problems(sj, sorted(sj.get("arms") or {}), sj.get("n")):
+                if t[1] == "missing or overflowed":
+                    voids.append("fsync: %s: missing or overflowed (sync_fds_overflow %r)" % (t[0], t[2]))
+                else:
+                    voids.append("fsync: %s: %s recorded %r, defined %d fd(s) and %d sync(s)" % t)
             merged["app_syncs_per_op"] = {a: round(r.get("syncs", 0) / max(1, r.get("ops", 1)), 4) for a, r in sarms.items()}
         merged["device_flushes"] = {"instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests "
                                     "and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",
