@@ -3972,6 +3972,90 @@ fn a_bind_postgresql_refuses_is_refused_before_bind_complete() {
     }
 }
 
+/// A Bind's format codes are refused only where PostgreSQL refuses them: a parameter code only for
+/// a parameter that exists (one code 2 with no values is accepted), after the parameter-format
+/// count (codes [2, 2, 2] for one value is 08P01, not 22023), and a result code only when a row is
+/// formatted (code 2 on an INSERT or on a SELECT of no rows succeeds; on a SELECT with a row it is
+/// 22023 at Execute). check_bind refused all three at the Bind with 22023 (wire review 13 item
+/// 10; E5-QUEUE R2(b) is an outcome divergence, not one of placement).
+#[test]
+fn a_format_code_is_refused_only_where_postgresql_refuses_it() {
+    let dir = Scratch::new("bindcodes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse, Bind (parameter codes, text values, result codes), Execute, Sync.
+    fn round(w: &mut Wire, sql: &str, pcodes: &[i16], values: &[&[u8]], rcodes: &[i16]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(pcodes.len() as i16).to_be_bytes());
+        for c in pcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&(rcodes.len() as i16).to_be_bytes());
+        for c in rcodes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    let mut wrong = Vec::new();
+    let cases: Vec<(&str, Vec<i16>, Vec<&[u8]>, Vec<i16>, Option<&str>)> = vec![
+        (
+            "INSERT INTO t VALUES (2, 'two')",
+            vec![],
+            vec![],
+            vec![2],
+            None,
+        ),
+        (
+            "SELECT id FROM t WHERE false",
+            vec![],
+            vec![],
+            vec![2],
+            None,
+        ),
+        ("SELECT id FROM t", vec![], vec![], vec![2], Some("22023")),
+        ("SELECT 1", vec![2], vec![], vec![], None),
+        (
+            "SELECT $1::int4",
+            vec![2, 2, 2],
+            vec![b"1"],
+            vec![],
+            Some("08P01"),
+        ),
+    ];
+    for (sql, pcodes, values, rcodes, code) in cases {
+        let r = round(&mut a, sql, &pcodes, &values, &rcodes);
+        let got = r.error.as_ref().map(|e| e.code.as_str());
+        if got != code {
+            wrong.push(format!(
+                "{sql} with codes {pcodes:?} / {rcodes:?}: {got:?}, want {code:?}"
+            ));
+        }
+    }
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2")
+            .single("the INSERT with result code 2 ran"),
+        "1"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// Reply messages up to ReadyForQuery: each type byte, the error fields of each ErrorResponse, and
 /// the ReadyForQuery status. Waits on the client's 30-second read timeout, so a reply that never
 /// ends fails the test there instead of hanging it.
