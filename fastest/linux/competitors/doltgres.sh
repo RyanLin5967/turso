@@ -67,23 +67,23 @@ seed)
   # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each autocommitted (AGE=0 pipes
   # an empty stream, whose digest is recorded too), then the documented maintenance: dolt_commit, then dolt_gc.
   "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc
-  if [ "$AGE" -gt 0 ]; then
-    psqlc -At -c "SELECT dolt_commit('-am', 'age')"
-    # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
-    # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
-    # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
-    gc_before=$(du -sB1 "$DATA/databases" | cut -f1)
-    gc_log0=$(stat -c %s "$LOG")
-    gcrc=0
-    psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
-    tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
-    "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
-      die "REFUSED: dolt_gc: $(cat "$DATA.gc.verdict")"
-    echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/databases" | cut -f1)"
-    echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
-  else
-    echo "maintenance: dolt_commit seed"
-  fi
+  # The maintenance runs whether or not the parent was aged (lead review 62430d8bf..b49fb656a MED 10): the age commit
+  # (--allow-empty: nothing changed at AGE=0), then dolt_gc; the server's GC-related settings are recorded beside it.
+  psqlc -At -c "SELECT dolt_commit('-am', 'age', '--allow-empty')"
+  psqlc -At -c "SELECT name, setting FROM pg_settings WHERE name LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 ||
+    echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
+  # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
+  # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
+  gc_before=$(du -sB1 "$DATA/databases" | cut -f1)
+  gc_log0=$(stat -c %s "$LOG")
+  gcrc=0
+  psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
+  tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
+    die "REFUSED: dolt_gc: $(cat "$DATA.gc.verdict")"
+  echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/databases" | cut -f1)"
+  echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
   echo "seeded t rows=$(psqlc -At -c 'SELECT count(*) FROM t') branch=$(psqlc -At -c 'SELECT active_branch()')"
   ;;
 sql)

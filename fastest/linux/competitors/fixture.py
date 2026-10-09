@@ -44,6 +44,31 @@ import gen_seed  # noqa: E402
 KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "stream_sha256", "readback")
 
 
+# The registered post-load maintenance after the aging step (PREREG §7: PG VACUUM, CHECKPOINT; Dolt/Doltgres
+# dolt_commit then dolt_gc; the SQLite B1 parent a TRUNCATE checkpoint), as each seed writes it -- run whether or not
+# the parent was aged (lead review 62430d8bf..b49fb656a MED 10: Dolt/Doltgres ran their GC only when aged).
+REGISTERED_MAINT = {"pg18-d2": ["VACUUM ANALYZE", "CHECKPOINT"], "dolt": ["DOLT_COMMIT age", "DOLT_GC"],
+                    "doltgres": ["dolt_commit age", "dolt_gc"], "b1": ["wal_checkpoint(TRUNCATE)"]}
+
+
+def maint_problem(f):
+    """Why a fixture's maintenance record is not its system's registered one (None = it is)."""
+    s = f.get("system")
+    want = REGISTERED_MAINT.get(s)
+    if want is None:
+        return f"{s}: no registered post-load maintenance"
+    m = f.get("maintenance")
+    items = [x.strip() for x in m.split(";")] if isinstance(m, str) else None
+    if not items:
+        return f"{s}: no maintenance record"
+    aged = next((i for i, x in enumerate(items) if x.startswith("aged ")), None)
+    if aged is None:
+        return f"{s}: maintenance {m!r} has no aging step"
+    if items[aged + 1:] != want:
+        return f"{s}: post-load maintenance {items[aged + 1:]} is not the registered {want}"
+    return None
+
+
 def compare(fixtures):
     """The reasons these fixtures are not one parent ([] = they are)."""
     if not fixtures:
@@ -69,6 +94,9 @@ def compare(fixtures):
                        f"{f.get('expected_streams')}")
         if f.get("readback") is not None and f.get("readback") != f.get("expected_readback"):
             why.append(f"{s}: the engine read back {f.get('readback')}, the generator wrote {f.get('expected_readback')}")
+        mp = maint_problem(f)  # MED 10
+        if mp:
+            why.append(mp)
         if not isinstance(f.get("du_bytes"), int) or f["du_bytes"] <= 0:
             why.append(f"{s}: no du_bytes")
         eb = f.get("engine_bytes")
