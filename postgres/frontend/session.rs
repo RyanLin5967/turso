@@ -132,7 +132,7 @@ impl PgConnection {
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
-        let sql = sql.as_ref().trim();
+        let sql = turso_pg_parser::pg_trim(sql.as_ref());
         if sql.is_empty() {
             return Ok(None);
         }
@@ -381,9 +381,9 @@ impl<'a> PgQueryRunner<'a> {
         Self {
             conn,
             stmts: split_statements(sql)
-                .unwrap_or_else(|_| vec![sql.trim().to_string()])
+                .unwrap_or_else(|_| vec![turso_pg_parser::pg_trim(sql).to_string()])
                 .into_iter()
-                .filter(|stmt| !stmt.trim().is_empty())
+                .filter(|stmt| !turso_pg_parser::pg_trim(stmt).is_empty())
                 .collect(),
             index: 0,
         }
@@ -407,15 +407,15 @@ impl Iterator for PgQueryRunner<'_> {
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     // Text with no separator but a trailing one is one statement: no literal, comment or dollar
     // quote can make it two, so libpg_query is not asked.
-    let trimmed = sql.trim();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    let trimmed = turso_pg_parser::pg_trim(sql);
+    let body = turso_pg_parser::pg_trim(trimmed.strip_suffix(';').unwrap_or(trimmed));
     if !body.is_empty() && !body.contains(';') {
         return Ok(vec![body.to_string()]);
     }
     match turso_pg_parser::split_statements(sql) {
-        Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
+        Ok(stmts) if stmts.is_empty() && !trimmed.is_empty() => Ok(vec![trimmed.to_string()]),
         Ok(stmts) => Ok(stmts),
-        Err(_) => Ok(vec![sql.trim().to_string()]),
+        Err(_) => Ok(vec![trimmed.to_string()]),
     }
 }
 
@@ -452,10 +452,11 @@ fn performs_at_prepare(parse_result: &turso_pg_parser::pg_query::ParseResult) ->
 fn prepare_statement_inner(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
-    types: Option<&mut StatementTypes>,
+    mut types: Option<&mut StatementTypes>,
     describe: bool,
 ) -> Result<Option<Statement>> {
-    let sql = sql.trim();
+    // PostgreSQL's whitespace only (wire review 13 item 1).
+    let sql = turso_pg_parser::pg_trim(sql);
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
             "The supplied SQL string contains no statements".to_string(),
@@ -494,7 +495,7 @@ fn prepare_statement_inner(
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(Some(stmt));
     }
-    if let Some(types) = types {
+    if let Some(types) = types.as_deref_mut() {
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
         if !used.is_empty() {
@@ -512,6 +513,16 @@ fn prepare_statement_inner(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if let Some(types) = types {
+        types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
+        types.rolls_back = matches!(
+            translated.cmd.stmt(),
+            ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
+        );
+    }
     if describe && !translated.prereqs.is_empty() {
         return Ok(None);
     }

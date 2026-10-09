@@ -130,6 +130,14 @@ fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
         .collect()
 }
 
+/// `s` without PostgreSQL's whitespace at either end: its lexer's `space` (space, tab, newline,
+/// carriage return, form feed, vertical tab) and nothing else. `str::trim` also strips Unicode
+/// spaces, which PostgreSQL lexes as identifier bytes: `COMMIT<NBSP>` was trimmed to a COMMIT the
+/// engine ran, where PostgreSQL answers 42601 (wire review 13 item 1).
+pub fn pg_trim(s: &str) -> &str {
+    s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b'))
+}
+
 /// Split a multi-statement SQL string into individual statements.
 /// Uses pg_query's scanner which correctly handles semicolons inside
 /// string literals, comments, and dollar-quoted strings.
@@ -140,7 +148,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
         .into_iter()
-        .map(|s| s.trim().to_string())
+        .map(|s| pg_trim(&s).to_string())
         .filter(|s| !s.is_empty())
         .collect())
 }

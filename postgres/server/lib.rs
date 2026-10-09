@@ -769,6 +769,8 @@ struct SessionState {
 struct StatementFailure {
     prepared: bool,
     rerunnable: bool,
+    /// The statement, as translated, is a COMMIT ([`StatementTypes::commits`]).
+    commits: bool,
     info: Box<ErrorInfo>,
 }
 
@@ -941,7 +943,15 @@ impl Session {
         pipeline: bool,
     ) -> SqlResult<()> {
         let mut st = self.state();
-        if st.implicit || st.aborted || TxVerb::of(sql) != TxVerb::Other {
+        // A flag the engine no longer backs (a statement ended its transaction) is cleared, and the
+        // block begun afresh: the flag follows the engine, never the text (wire review 13 item 1).
+        if st.implicit {
+            match self.current(&mut st) {
+                Ok(conn) if conn.inner().get_auto_commit() => st.implicit = false,
+                _ => return Ok(()),
+            }
+        }
+        if st.aborted || TxVerb::of(sql) != TxVerb::Other {
             return Ok(());
         }
         // A CHECKPOINT that would open the block runs at top level instead, as the full checkpoint
@@ -975,11 +985,14 @@ impl Session {
                     let _ = engine_tx(&conn, TxStmt::Rollback);
                 }
             }
-        } else if !matches!(
-            TxVerb::of(sql),
-            TxVerb::Begin | TxVerb::Commit | TxVerb::Rollback
-        ) {
-            st.implicit = true;
+        } else if TxVerb::of(sql) != TxVerb::Begin {
+            // The block lasts while the engine holds its transaction: a statement that ended it,
+            // whatever its text was read as, ends the block. Read from the text, a COMMIT the verb
+            // reader missed (`COMMIT<NBSP>`) left the flag set while the engine was back in
+            // autocommit, and every later statement committed on its own (wire review 13 item 1).
+            st.implicit = self
+                .current(&mut st)
+                .is_ok_and(|conn| !conn.inner().get_auto_commit());
         }
     }
 
@@ -1017,6 +1030,12 @@ impl Session {
         }
         let conn = self.current(&mut st)?;
         if conn.inner().get_auto_commit() {
+            return Ok(());
+        }
+        // A statement of the block failed where nothing rolled it back (a simple Query inside an
+        // unsynced pipeline): the block rolls back, never commits (wire review 13 item 1).
+        if std::mem::take(&mut st.aborted) {
+            let _ = engine_tx(&conn, TxStmt::Rollback);
             return Ok(());
         }
         if let Err(e) = engine_tx(&conn, TxStmt::Commit) {
@@ -1382,7 +1401,9 @@ impl Session {
                 // again: run anew it would run outside the block (wire review 9 item 7; 476798d89
                 // had dropped f2804f119's state check).
                 Err(mut f)
-                    if verb == TxVerb::Commit || (in_tx && conn.inner().get_auto_commit()) =>
+                    if verb == TxVerb::Commit
+                        || f.commits
+                        || (in_tx && conn.inner().get_auto_commit()) =>
                 {
                     f.info = commit_failed(conn, f.info);
                     return Err(f);
@@ -1411,6 +1432,7 @@ impl Session {
         let unprepared = |info: Box<ErrorInfo>| StatementFailure {
             prepared: false,
             rerunnable: true,
+            commits: false,
             info,
         };
         let described = portal.and_then(|_| self.take_described(conn, sql));
@@ -1421,6 +1443,11 @@ impl Session {
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
+        // A statement that ends the transaction, as the translator read it, is never stepped
+        // again, whatever the verb reader made of its text (wire review 13 item 1).
+        if types.commits || types.rolls_back {
+            *backoff = Backoff::never();
+        }
         match portal {
             Some(portal) => bind_portal_parameters(&mut stmt, portal, &types)
                 .map_err(|e| unprepared(wire_info(e)))?,
@@ -1452,7 +1479,8 @@ impl Session {
         };
         r.map_err(|e| StatementFailure {
             prepared: true,
-            rerunnable: stmt.n_change() == 0,
+            rerunnable: stmt.n_change() == 0 && !(types.commits || types.rolls_back),
+            commits: types.commits,
             info: wire_info(e),
         })
     }
@@ -1837,6 +1865,13 @@ impl TxVerb {
     }
 }
 
+/// One byte of PostgreSQL's whitespace (its lexer's `space`); vertical tab included, which
+/// `is_ascii_whitespace` omits, and no byte of a multi-byte character, which PostgreSQL lexes as an
+/// identifier byte (wire review 13 item 1).
+fn pg_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
+}
+
 /// The words of a statement for [`TxVerb::of`], each a slice of `sql`: a comment is whitespace
 /// wherever it stands (`--` to the line's end, `/* */` nested), as PostgreSQL's lexer reads one, so
 /// it also ends a word; a `"quoted"` name is one word, `,` a word of its own, and `$` continues a
@@ -1877,7 +1912,7 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
     };
     let mut i = 0;
     loop {
-        while i < b.len() && b[i].is_ascii_whitespace() {
+        while i < b.len() && pg_space(b[i]) {
             i += 1;
         }
         match comment(&b[i..]) {
@@ -1913,7 +1948,7 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
             continue;
         }
         match b[i] {
-            c if c.is_ascii_whitespace() => i += 1,
+            c if pg_space(c) => i += 1,
             _ if ended => return None,
             b';' => {
                 ended = true;
@@ -1943,7 +1978,7 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
             _ => {
                 let start = i;
                 while i < b.len()
-                    && !b[i].is_ascii_whitespace()
+                    && !pg_space(b[i])
                     && !matches!(b[i], b',' | b'"' | b'\'' | b';')
                     && comment(&b[i..]).is_none()
                 {
@@ -2299,7 +2334,7 @@ fn portal_not_found(name: &str) -> Box<ErrorInfo> {
 /// A statement with nothing in it (whitespace, or a lone `;`): PostgreSQL's empty query, answered
 /// with EmptyQueryResponse on both protocols.
 fn is_blank(sql: &str) -> bool {
-    let trimmed = sql.trim();
+    let trimmed = turso_pg_parser::pg_trim(sql);
     trimmed.is_empty() || trimmed == ";"
 }
 

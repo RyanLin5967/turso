@@ -186,6 +186,12 @@ pub struct StatementTypes {
     /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
     /// 1: refused at prepare from the text alone, a declared one could never run).
     pub untyped: std::collections::BTreeSet<u32>,
+    /// The translated statement is a COMMIT (`commits`) or a ROLLBACK of the whole transaction
+    /// (`rolls_back`), whatever its text: the server keys its COMMIT rules on this, never on its own
+    /// reading of the text, which `COMMIT<NBSP>` and other spellings it did not know slipped past
+    /// (wire review 13 item 1).
+    pub commits: bool,
+    pub rolls_back: bool,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;
