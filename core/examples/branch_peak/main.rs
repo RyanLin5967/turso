@@ -15,11 +15,26 @@
 //! The run exits NOT A RESULT if the engine does not hold exactly the live branches the harness
 //! holds, if a zombie exists, or if a read returns the wrong value.
 //!
+//! r11-ever amendment 34 (instrument I and its arms; every flag off reproduces the run above):
+//!   --phases       time each reap-down reap's phases in the store, with getrusage around every reap
+//!                  (outside the timed window); list each reap >= stall_us with its split
+//!   --null         after every reap-down reap, time a null op (256 xorshift steps, no memory)
+//!   --mem          malloc_zone_statistics at each phase end and churn checkpoint (macOS)
+//!   --entry-pages  the distinct pages holding the live states' table entries and `current` maps
+//!   --arm B|G|M|R|P|T  G: park the reap-down's states and leak them; R: reserve the free lists to
+//!                  --peak first; P: touch each churn victim's entry (untimed) before its timed reap;
+//!                  T: shrink the table after the reap-down; M: a label for a DYLD_INSERT_LIBRARIES run.
+//!
 //! On this store (resolve-vol-bushy-ever, merging r11-adv-x-f7fix): every fork is from the trunk, so
 //! no branch is ever a zombie and the F7 splice arm (off by default here) changes nothing; the table
 //! is F8' (ids never reused, a chunk freed when its states are all gone), so `table_capacity` can
 //! fall after the peak, which the volatile store's F8 never did. `branch_resident` and
 //! `branch_stats` return `Result` here.
+//!
+//! Instrument I (merging r11-ever-pk5-A): the phases are this store's release under its mutex
+//! (see `ReapProbe` in `store`; its log record, none in a volatile store, is in no phase); arm R
+//! reserves the arena's free list only (F8' has no table free list); arm T is refused, as on F8
+//! (F8' never moves a state), so `--arm T` exits NOT A RESULT here.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,6 +54,11 @@ struct Args {
     window: usize,
     stall_us: f64,
     seed: u64,
+    phases: bool,
+    null: bool,
+    mem: bool,
+    entry_pages: bool,
+    arm: char,
 }
 
 fn die(msg: &str) -> ! {
@@ -61,6 +81,11 @@ fn parse_args() -> Args {
         window: 5000,
         stall_us: 100.0,
         seed: 0x9E37_79B9_7F4A_7C15,
+        phases: false,
+        null: false,
+        mem: false,
+        entry_pages: false,
+        arm: 'B',
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -85,6 +110,21 @@ fn parse_args() -> Args {
             "--stall-us" => a.stall_us = val().parse().unwrap_or_else(|_| die("bad --stall-us")),
             "--seed" => a.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--untimed" => a.untimed = true,
+            "--phases" => a.phases = true,
+            "--null" => a.null = true,
+            "--mem" => a.mem = true,
+            "--entry-pages" => a.entry_pages = true,
+            "--arm" => {
+                a.arm = match val().as_str() {
+                    "B" => 'B',
+                    "G" => 'G',
+                    "M" => 'M',
+                    "R" => 'R',
+                    "P" => 'P',
+                    "T" => 'T',
+                    o => die(&format!("unknown --arm {o}")),
+                }
+            }
             o => die(&format!("unknown argument {o}")),
         }
     }
@@ -121,6 +161,85 @@ fn branch_value(tag: u64) -> String {
 
 fn rss_bytes() -> u64 {
     memory_stats::memory_stats().map_or(0, |m| m.physical_mem as u64)
+}
+
+/// Process-wide (minflt, majflt, nvcsw, nivcsw) from getrusage (amendment 34).
+fn rusage() -> [i64; 4] {
+    // SAFETY: getrusage fills one plain struct that it is handed.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    [
+        u.ru_minflt as i64,
+        u.ru_majflt as i64,
+        u.ru_nvcsw as i64,
+        u.ru_nivcsw as i64,
+    ]
+}
+
+fn delta(a: [i64; 4], b: [i64; 4]) -> [i64; 4] {
+    [b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]]
+}
+
+fn utc_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
+fn os_page_size() -> usize {
+    // SAFETY: sysconf reads a constant.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p <= 0 {
+        die("sysconf(_SC_PAGESIZE) failed");
+    }
+    p as usize
+}
+
+/// Amendment 34's null op: 256 xorshift steps on a register, no memory.
+fn null_op(x: u64) -> u64 {
+    let mut x = x | 1;
+    for _ in 0..256 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+    }
+    std::hint::black_box(x)
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct MallocStatistics {
+    blocks_in_use: u32,
+    size_in_use: usize,
+    max_size_in_use: usize,
+    size_allocated: usize,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+}
+
+/// malloc_zone_statistics over every zone (amendment 34, --mem).
+fn zone_line(label: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let mut st = MallocStatistics::default();
+        // SAFETY: a null zone asks for every zone's totals; the struct matches malloc/malloc.h.
+        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut st) };
+        format!(
+            "# zone phase={label} blocks_in_use={} size_in_use={} max_size_in_use={} size_allocated={}",
+            st.blocks_in_use, st.size_in_use, st.max_size_in_use, st.size_allocated
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    format!("# zone phase={label} unavailable")
+}
+
+fn entry_pages_line(db: &Database, label: &str, page: usize) -> String {
+    let (entries, maps) = db.branch_live_entry_pages(page);
+    format!("# entry_pages phase={label} page_size={page} entries={entries} maps={maps}")
 }
 
 struct Live {
@@ -214,6 +333,17 @@ fn main() {
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
         rss_bytes()
     );
+    let page = os_page_size();
+    println!(
+        "# amendment34 arm={} phases={} null={} mem={} entry_pages={} page_size={page} \
+         dyld_insert={:?}",
+        args.arm,
+        args.phases,
+        args.null,
+        args.mem,
+        args.entry_pages,
+        std::env::var("DYLD_INSERT_LIBRARIES").ok()
+    );
     let mut rng = Rng(args.seed);
     let mut created = 0usize;
     let fork_one = |created: usize| -> Live {
@@ -259,6 +389,12 @@ fn main() {
         not_a_result(&format!("after growth the engine holds {} states, {} zombies", r.states, r.zombies));
     }
     println!("{}", resident_line("grown", created, live.len(), &r));
+    if args.mem {
+        println!("{}", zone_line("grown"));
+    }
+    if args.entry_pages {
+        println!("{}", entry_pages_line(&db, "grown", page));
+    }
     println!(
         "# phase grow seconds={grow_s:.1} {} (fork+connect+write per branch) stalls_ge={} listed={:?}",
         summary("grow_branch", &mut grow_fork),
@@ -270,6 +406,23 @@ fn main() {
     //    i + (free slots before): a Vec doubling copies it at every power of two.
     let mut reap_down = Vec::new();
     let mut reap_stalls = Vec::new();
+    match args.arm {
+        'G' => {
+            db.branch_set_graveyard(Some(args.peak));
+        }
+        'R' => db.branch_reserve_free(args.peak),
+        _ => {}
+    }
+    if args.phases {
+        db.branch_set_reap_phases(true);
+    }
+    // Amendment 34: each reap >= stall_us with its phase split and rusage deltas; the null op's.
+    let mut split_stalls: Vec<String> = Vec::new();
+    let mut null_times = Vec::new();
+    let mut null_stalls: Vec<String> = Vec::new();
+    let mut phase_sums = [0u64; 5];
+    let mut ru_sum = [0i64; 4];
+    let mut null_seed = args.seed;
     let t1 = Instant::now();
     let mut reaped = 0usize;
     while live.len() > args.live {
@@ -281,9 +434,11 @@ fn main() {
         };
         let mut res = None;
         let mut vb = Some(victim.branch);
+        let ru_a = args.phases.then(rusage);
         timed(args.untimed, &mut reap_down, &mut || {
             res = Some(vb.take().unwrap().reap().unwrap())
         });
+        let ru_d = ru_a.map(|a| delta(a, rusage()));
         reaped += 1;
         let res = res.unwrap();
         if res.freed_pages != 1 || res.deferred {
@@ -294,13 +449,79 @@ fn main() {
                 reap_stalls.push((reaped, us));
             }
         }
+        if let Some(d) = ru_d {
+            let ph = db.branch_last_reap_phases();
+            for (s, p) in phase_sums.iter_mut().zip(ph) {
+                *s += p;
+            }
+            for (s, x) in ru_sum.iter_mut().zip(d) {
+                *s += x;
+            }
+            if let Some(&us) = reap_down.last() {
+                if us >= args.stall_us && split_stalls.len() < 2000 {
+                    let rest = us * 1e3 - ph.iter().sum::<u64>() as f64;
+                    split_stalls.push(format!(
+                        "# stall reap idx={reaped} us={us:.3} lock_ns={} remove_ns={} release_ns={} \
+                         child_gone_ns={} drop_ns={} rest_ns={rest:.0} minflt={} majflt={} nvcsw={} \
+                         nivcsw={} utc_ms={}",
+                        ph[0], ph[1], ph[2], ph[3], ph[4], d[0], d[1], d[2], d[3], utc_ms()
+                    ));
+                }
+            }
+        }
+        if args.null {
+            let ru_a = rusage();
+            let t = Instant::now();
+            null_seed = null_op(null_seed);
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            let d = delta(ru_a, rusage());
+            null_times.push(us);
+            if us >= args.stall_us && null_stalls.len() < 2000 {
+                null_stalls.push(format!(
+                    "# stall null idx={reaped} us={us:.3} minflt={} majflt={} nvcsw={} nivcsw={} utc_ms={}",
+                    d[0], d[1], d[2], d[3], utc_ms()
+                ));
+            }
+        }
     }
     let reap_s = t1.elapsed().as_secs_f64();
+    if args.phases {
+        db.branch_set_reap_phases(false);
+    }
+    let leaked = if args.arm == 'G' { db.branch_leak_graveyard() } else { 0 };
+    if args.arm == 'T' && !db.branch_shrink_table() {
+        not_a_result("arm T: this store cannot rebuild its branch table");
+    }
     let r = db.branch_resident().unwrap();
     if r.states != args.live || r.zombies != 0 || r.arena_in_use != args.live {
         not_a_result(&format!("after the reap-down: {r:?}"));
     }
     println!("{}", resident_line("reaped", created, live.len(), &r));
+    if args.phases {
+        println!(
+            "# reapdown phases_sum_ns lock={} remove={} release={} child_gone={} drop={} \
+             rusage minflt={} majflt={} nvcsw={} nivcsw={} graveyard_leaked={leaked}",
+            phase_sums[0], phase_sums[1], phase_sums[2], phase_sums[3], phase_sums[4],
+            ru_sum[0], ru_sum[1], ru_sum[2], ru_sum[3]
+        );
+        for l in &split_stalls {
+            println!("{l}");
+        }
+    } else if args.arm == 'G' {
+        println!("# reapdown graveyard_leaked={leaked}");
+    }
+    if args.null {
+        println!("# reapdown null {} listed={}", summary("null", &mut null_times), null_stalls.len());
+        for l in &null_stalls {
+            println!("{l}");
+        }
+    }
+    if args.mem {
+        println!("{}", zone_line("reaped"));
+    }
+    if args.entry_pages {
+        println!("{}", entry_pages_line(&db, "reaped", page));
+    }
     println!(
         "# phase reapdown seconds={reap_s:.2} reaped={reaped} {} stalls_ge={} listed={:?}",
         summary("reap", &mut reap_down),
@@ -343,6 +564,9 @@ fn main() {
             let k = rng.below(live.len());
             let victim = live.swap_remove_back(k).unwrap();
             live.push_back(Live { branch, row, tag });
+            if args.arm == 'P' {
+                std::hint::black_box(db.branch_touch(&victim.branch));
+            }
             let mut vb = Some(victim.branch);
             time(
                 3,
@@ -388,6 +612,12 @@ fn main() {
             not_a_result(&format!("churn checkpoint {ckpt}: {r:?}"));
         }
         println!("{}", resident_line("churn", created, live.len(), &r));
+        if args.mem {
+            println!("{}", zone_line("churn"));
+        }
+        if args.entry_pages {
+            println!("{}", entry_pages_line(&db, "churn", page));
+        }
         if !args.untimed {
             for (i, v) in ops.iter_mut().enumerate() {
                 if v.is_empty() {

@@ -340,6 +340,10 @@ pub(crate) struct BranchStore {
     /// rolled back) is not decided again by the retry — the page's written epoch already is the
     /// commit's own — yet the commit overwrites what it kept (review 3 #1).
     retain_floor: AtomicU64,
+    /// Time the phases of every release (r11-ever amendment 34, instrument I, ported from the
+    /// volatile store, 7831b51a7). Read before the lock, so the lock wait itself is one of the
+    /// phases. Off unless a harness turns it on.
+    reap_phases: AtomicBool,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -1129,6 +1133,50 @@ struct StoreInner {
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
     last_fork_lsn: u64,
+    /// Observation only; see [`ReapProbe`].
+    probe: ReapProbe,
+}
+
+/// r11-ever amendment 34's instrument I and its mechanism-removed arm G (7831b51a7, ported from
+/// the volatile store). Observation only: nothing here changes what a release frees or what any
+/// reader sees.
+#[derive(Default)]
+struct ReapProbe {
+    /// ns of the last release's phases while [`BranchStore::reap_phases`] is on: lock (the wait for
+    /// the store mutex), remove (the release's bookkeeping, `collect`'s lookups and the table
+    /// removal), release (gathering the state's slots, plus returning the freed slots to the arena,
+    /// `defer_frees`, after the last phase), child_gone (the child index and the parent's lineage),
+    /// drop (the removed state's destructor, i.e. the allocator's frees). Zeroed at each release's
+    /// start; a release that splices or keeps its branch records only the phases it reached. On
+    /// this store a release also builds and buffers its log record between the lock and the first
+    /// phase, and waits for it to be durable after the last: neither is in any phase (a volatile
+    /// store has no log).
+    last: [u64; 5],
+    /// Arm G: a removed state is parked here instead of dropped, so no free reaches the allocator.
+    /// Never emptied while the arm is on: the harness leaks it.
+    graveyard: Option<Vec<BranchState>>,
+    /// The fire-check's planted stall: sleep this long inside the drop phase.
+    planted_drop_sleep_us: u64,
+}
+
+/// Adds the time since `mark` to `acc` and restarts `mark`; a no-op while the phase timers are off.
+fn lap(mark: &mut Option<Instant>, acc: &mut u64) {
+    if let Some(m) = mark {
+        let now = Instant::now();
+        *acc += now.duration_since(*m).as_nanos() as u64;
+        *m = now;
+    }
+}
+
+/// The drop phase of a release: park the state in arm G's graveyard, or drop it.
+fn dispose(st: BranchState, probe: &mut ReapProbe) {
+    if probe.planted_drop_sleep_us > 0 {
+        std::thread::sleep(Duration::from_micros(probe.planted_drop_sleep_us));
+    }
+    match probe.graveyard.as_mut() {
+        Some(g) => g.push(st),
+        None => drop(st),
+    }
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -3135,6 +3183,7 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
+            reap_phases: AtomicBool::new(false),
             fuzzy: false,
         }
     }
@@ -3397,6 +3446,7 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
+            reap_phases: AtomicBool::new(false),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -5126,7 +5176,14 @@ impl BranchStore {
     fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
+        // r11-ever amendment 34, instrument I: the switch is read before the lock, so the lock
+        // wait is the first phase.
+        let t_lock = self.reap_phases.load(Ordering::Relaxed).then(Instant::now);
         let mut inner = self.inner.lock();
+        let mut mark = t_lock.map(|_| Instant::now());
+        if let (Some(t), Some(m)) = (t_lock, mark) {
+            inner.probe.last = [m.duration_since(t).as_nanos() as u64, 0, 0, 0, 0];
+        }
         inner.ensure(id)?;
         // Released already — by a racing drop of the same name, say — and possibly collected: the
         // Release may still be in the air, so this reports only once everything buffered so far is
@@ -5193,12 +5250,16 @@ impl BranchStore {
         // Until it is durable, a stopped store must still report the branch (engine review 7 #3).
         inner.releases_in_air.push_back(ReleaseInAir { lsn, id, fork_lsn, name });
         let mut freed = Vec::new();
-        let spliced = match inner.apply_release(id, &mut freed) {
+        let spliced = match inner.apply_release_timed(id, &mut freed, &mut mark) {
             Ok(spliced) => spliced,
             Err(e) => return Err(inner.fatal(e)),
         };
         let freed_pages = freed.len();
         inner.defer_frees(lsn, freed);
+        // Instrument I: returning the slots to the arena is the release phase's (the volatile
+        // store freed them inside it).
+        let StoreInner { probe, .. } = &mut *inner;
+        lap(&mut mark, &mut probe.last[2]);
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
         // Kept for a live child is decided now: the checkpoint `maybe_compact` may run can evict the
@@ -6671,6 +6732,82 @@ impl BranchStore {
         (inner.branches.len(), inner.branches.capacity())
     }
 
+    /// Amendment 34, instrument I: turn the per-release phase timers on or off.
+    pub(crate) fn set_reap_phases(&self, on: bool) {
+        self.reap_phases.store(on, Ordering::Relaxed);
+    }
+
+    /// ns of the last release's phases: lock, remove, release, child_gone, drop (see
+    /// [`ReapProbe::last`]).
+    pub(crate) fn last_reap_phases(&self) -> [u64; 5] {
+        self.inner.lock().probe.last
+    }
+
+    /// Arm G: from now on park every removed state instead of dropping it (`Some(reserve)`, the
+    /// graveyard's capacity up front), or stop parking (`None`; the parked states are dropped).
+    /// Returns how many states were parked.
+    pub(crate) fn set_graveyard(&self, reserve: Option<usize>) -> usize {
+        let mut inner = self.inner.lock();
+        let parked = inner.probe.graveyard.as_ref().map_or(0, Vec::len);
+        inner.probe.graveyard = reserve.map(Vec::with_capacity);
+        parked
+    }
+
+    /// Arm G's end: stop parking and leak the parked states. Returns how many.
+    pub(crate) fn leak_graveyard(&self) -> usize {
+        let parked = self.inner.lock().probe.graveyard.take().unwrap_or_default();
+        let n = parked.len();
+        std::mem::forget(parked);
+        n
+    }
+
+    /// The fire-check's planted stall: sleep `us` inside every release's drop phase (0: off).
+    pub(crate) fn plant_drop_sleep_us(&self, us: u64) {
+        self.inner.lock().probe.planted_drop_sleep_us = us;
+    }
+
+    /// Arm P: read the fields of `id`'s table entry, so the next release of it finds the entry in
+    /// cache. Returns a value derived from them with the top bit set (0 only if `id` has no
+    /// resident state), for the caller to keep.
+    pub(crate) fn touch(&self, id: BranchId) -> u64 {
+        let inner = self.inner.lock();
+        inner.branches.get(&id).map_or(0, |st| {
+            (st.fork_epoch ^ st.parent.0 ^ st.current.len() as u64 ^ st.handle as u64) | 1 << 63
+        })
+    }
+
+    /// Arm R: reserve the arena's free list for `n` more entries, so no push during the next `n`
+    /// releases moves it. The volatile store's F8 table had a free list too; F8' has none (ids are
+    /// never reused), so the arena's is the only one.
+    pub(crate) fn reserve_free(&self, n: usize) {
+        let mut inner = self.inner.lock();
+        if let Some(arena) = inner.arena.as_mut() {
+            arena.reserve_free(n);
+        }
+    }
+
+    /// Arm T: rebuild the branch table compactly. Returns false: F8' chunks never move a state
+    /// (`table::tests::a_branch_table_matches_a_model_and_never_moves_a_state`), as F8's did not.
+    pub(crate) fn shrink_table(&self) -> bool {
+        false
+    }
+
+    /// Instrument I's locality counter: over the resident states, the distinct `page_size` pages
+    /// holding their table entries, and holding the first value of each `current` map (its heap
+    /// block). Observation only; O(states).
+    pub(crate) fn live_entry_pages(&self, page_size: usize) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let mut entries = HashSet::new();
+        let mut maps = HashSet::new();
+        for (_, st) in inner.branches.iter() {
+            entries.insert(st as *const BranchState as usize / page_size);
+            if let Some(v) = st.current.values().next() {
+                maps.insert(v as *const Owned as usize / page_size);
+            }
+        }
+        (entries.len(), maps.len())
+    }
+
     /// Every resident structure's size, by a full scan under the lock: r11-ever's instrument
     /// (11b61bf44, 3b22a96ef's waste breakdown, 5d580203f's visible slots), ported from the volatile
     /// store. Observation only. As `stats` does, covered deferred frees are matured and parked
@@ -7161,6 +7298,7 @@ impl StoreInner {
             fail_stop: Arc::new(AtomicBool::new(false)),
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
+            probe: ReapProbe::default(),
         }
     }
 
@@ -8808,6 +8946,21 @@ impl StoreInner {
 
     /// Returns whether `id` was spliced out (see `collect`).
     fn apply_release(&mut self, id: BranchId, freed: &mut Vec<Slot>) -> Result<bool> {
+        self.apply_release_timed(id, freed, &mut None)
+    }
+
+    /// [`Self::apply_release`], timing its phases into `probe.last` while `mark` is set (r11-ever
+    /// amendment 34; `release_checked` sets it only while the phase timers are on). The mark
+    /// restarts here, so the remove phase begins with the release's own bookkeeping.
+    fn apply_release_timed(
+        &mut self,
+        id: BranchId,
+        freed: &mut Vec<Slot>,
+        mark: &mut Option<Instant>,
+    ) -> Result<bool> {
+        if let Some(m) = mark.as_mut() {
+            *m = Instant::now();
+        }
         self.ensure(id)?;
         let mut name = None;
         if let Some(st) = self.branches.get_mut(&id) {
@@ -8833,7 +8986,7 @@ impl StoreInner {
         // F-W1: a released branch is not listed.
         self.live_ids_remove(id);
         self.mark_dirty(id, DIRTY_ROW);
-        self.collect(id, freed)
+        self.collect_timed(id, freed, mark)
     }
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
@@ -8842,7 +8995,19 @@ impl StoreInner {
     /// Every freed slot goes to `freed`. Returns whether `id` itself was spliced: gone from the store
     /// like a branch freed whole, but its versions live on in its child, so its release was deferred
     /// (the volatile store's `collect` reports the same).
-    fn collect(&mut self, mut id: BranchId, freed: &mut Vec<Slot>) -> Result<bool> {
+    fn collect(&mut self, id: BranchId, freed: &mut Vec<Slot>) -> Result<bool> {
+        self.collect_timed(id, freed, &mut None)
+    }
+
+    /// [`Self::collect`], adding each phase's time to `probe.last` while `mark` is set (r11-ever
+    /// amendment 34, instrument I). A splice, and a retirement, are not split: their time is in
+    /// none of the phases.
+    fn collect_timed(
+        &mut self,
+        mut id: BranchId,
+        freed: &mut Vec<Slot>,
+        mark: &mut Option<Instant>,
+    ) -> Result<bool> {
         let first = id;
         loop {
             if !self.ensure(id)? {
@@ -8876,15 +9041,18 @@ impl StoreInner {
                 }
                 return Ok(false);
             }
-            let st = self.branches.remove(&id).expect("just looked it up");
+            let mut st = self.branches.remove(&id).expect("just looked it up");
             self.n_states -= 1;
             if let Some(cat) = self.cat.as_mut() {
                 cat.dirty.remove(&id);
                 cat.removed.insert(id);
             }
+            lap(mark, &mut self.probe.last[1]);
             freed.extend(st.current.values().map(|o| o.slot));
             freed.extend(st.pending.values().copied());
-            st.lineage.release_all(freed);
+            // Taken, not moved out of `st`: the state itself goes to the drop phase whole.
+            std::mem::take(&mut st.lineage).release_all(freed);
+            lap(mark, &mut self.probe.last[2]);
             let (parent, f) = (st.parent, st.fork_epoch);
             // The parent resident (its parked Commits applied, C-R) while the child is still listed:
             // each of those Commits decides retain-or-free as it did when the child was alive.
@@ -8904,6 +9072,9 @@ impl StoreInner {
                 // catalog's garbage, read in place (C-P).
                 self.trunk.lineage.child_gone(f, lo, hi, freed, &mut self.work);
                 self.trunk_catalog_garbage(f, lo, hi, freed)?;
+                lap(mark, &mut self.probe.last[3]);
+                dispose(st, &mut self.probe);
+                lap(mark, &mut self.probe.last[4]);
                 return Ok(false);
             }
             if !self.ensure(parent)? {
@@ -8918,6 +9089,9 @@ impl StoreInner {
                 .expect("a live branch's parent is kept while the branch lives");
             parent_st.lineage.child_gone(f, lo, hi, freed, &mut self.work);
             self.mark_dirty(parent, DIRTY_ROW | DIRTY_RET);
+            lap(mark, &mut self.probe.last[3]);
+            dispose(st, &mut self.probe);
+            lap(mark, &mut self.probe.last[4]);
             id = parent;
         }
     }

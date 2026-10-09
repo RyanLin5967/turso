@@ -1445,6 +1445,66 @@ impl Database {
         self.branches.table_shape()
     }
 
+    /// r11-ever amendment 34, instrument I: time the phases of every reap from now on (or stop).
+    /// Observation only.
+    #[doc(hidden)]
+    pub fn branch_set_reap_phases(&self, on: bool) {
+        self.branches.set_reap_phases(on)
+    }
+
+    /// ns of the last reap's phases while the timers are on: lock, remove, release, child_gone,
+    /// drop. Observation only.
+    #[doc(hidden)]
+    pub fn branch_last_reap_phases(&self) -> [u64; 5] {
+        self.branches.last_reap_phases()
+    }
+
+    /// Amendment 34, arm G: park removed branch states instead of freeing them (`Some(reserve)`),
+    /// or free the parked ones and stop (`None`). Returns how many were parked.
+    #[doc(hidden)]
+    pub fn branch_set_graveyard(&self, reserve: Option<usize>) -> usize {
+        self.branches.set_graveyard(reserve)
+    }
+
+    /// Arm G's end: stop parking and leak what was parked, so none of it ever reaches the
+    /// allocator. Returns how many states were leaked.
+    #[doc(hidden)]
+    pub fn branch_leak_graveyard(&self) -> usize {
+        self.branches.leak_graveyard()
+    }
+
+    /// The amendment-34 fire-check's planted stall: sleep `us` in every reap's drop phase.
+    #[doc(hidden)]
+    pub fn branch_plant_drop_sleep_us(&self, us: u64) {
+        self.branches.plant_drop_sleep_us(us)
+    }
+
+    /// Amendment 34, arm P: read `branch`'s table entry, so that its next reap finds it in cache.
+    #[doc(hidden)]
+    pub fn branch_touch(&self, branch: &Branch) -> u64 {
+        self.branches.touch(branch.id)
+    }
+
+    /// Amendment 34, arm R: reserve the branch store's free lists for `n` more entries (here the
+    /// arena's only: the F8' table has no free list).
+    #[doc(hidden)]
+    pub fn branch_reserve_free(&self, n: usize) {
+        self.branches.reserve_free(n)
+    }
+
+    /// Amendment 34, arm T: rebuild the branch table compactly; false if this store cannot.
+    #[doc(hidden)]
+    pub fn branch_shrink_table(&self) -> bool {
+        self.branches.shrink_table()
+    }
+
+    /// Amendment 34's locality counter: distinct `page_size` pages holding the live states' table
+    /// entries, and their `current` maps' heap blocks. Observation only; O(states).
+    #[doc(hidden)]
+    pub fn branch_live_entry_pages(&self, page_size: usize) -> (usize, usize) {
+        self.branches.live_entry_pages(page_size)
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -1767,6 +1827,9 @@ pub(crate) mod budget_probe;
 
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod probe_tests;
 
 #[cfg(test)]
 mod tests {

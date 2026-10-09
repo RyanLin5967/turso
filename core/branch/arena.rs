@@ -249,6 +249,11 @@ impl Arena {
         self.free.len()
     }
 
+    /// Reserve the free list for `n` more slots (r11-ever amendment 34, arm R).
+    pub(crate) fn reserve_free(&mut self, n: usize) {
+        self.free.reserve(n);
+    }
+
     /// `(high_water, free list capacity, free-bit words, chunks)`, for resident-size curves.
     /// Observation only. `chunks` counts the memory backing's chunks; a file-backed arena has none
     /// (its slots are in the arena file) and reports 0.
