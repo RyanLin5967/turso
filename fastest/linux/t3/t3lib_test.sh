@@ -57,5 +57,27 @@ check "an unlisted drive refuses" '! plp_listed "$T/sys" sda "$T/plp.tsv"'
 printf 'Samsung PM9A3\n' > "$T/plp.tsv"
 check "a model-only line does not list a drive" '! plp_listed "$T/sys" nvme0n1 "$T/plp.tsv"'
 
+# devguard round-2 attack LOW 4: every mkfs and wipefs reaches the device preflight checked, by its resolved path.
+# A refusal is rc 2 exactly, so a missing function (127) or a crash cannot pass as one.
+refuses2() { "$@"; [ $? = 2 ]; }
+mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
+REAL1=$(readlink -f "$T/dev/nvme1n1")
+ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
+check "a device path that still resolves to the preflight device passes" 'dev_unmoved "$T/dev/by-id-x" "$REAL1"'
+check "an empty preflight path refuses (rc 2)" 'refuses2 dev_unmoved "$T/dev/by-id-x" ""'
+ln -sfn "$T/dev/nvme2n1" "$T/dev/by-id-x"
+check "a device path that now resolves elsewhere refuses, naming where" \
+  'refuses2 dev_unmoved "$T/dev/by-id-x" "$REAL1" && grep -q nvme2n1 "$T/out.txt"'
+# the wipe in block_cleanup: only the filesystem this block made, on the unmoved device
+printf '#!/bin/sh\necho xfs\n' > "$T/blkid-xfs"; printf '#!/bin/sh\nexit 2\n' > "$T/blkid-none"
+chmod +x "$T/blkid-xfs" "$T/blkid-none"
+ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
+check "the block's own filesystem on the unmoved device may be wiped" \
+  'T3_BLKID="$T/blkid-xfs" fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
+check "another filesystem refuses the wipe" 'T3_BLKID="$T/blkid-xfs" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" btrfs'
+check "no signature at all refuses the wipe" 'T3_BLKID="$T/blkid-none" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
+ln -sfn "$T/dev/nvme2n1" "$T/dev/by-id-x"
+check "a moved device refuses the wipe" 'T3_BLKID="$T/blkid-xfs" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
+
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

@@ -318,7 +318,27 @@ def self_test():
     bare = [{"name": "nvme0n1", "type": "disk", "mountpoints": [None],
              "children": [{"name": "nvme0n1p1", "type": "part", "mountpoints": ["/"]}]},
             {"name": "nvme1n1", "type": "disk", "mountpoints": [None]}]
+    # round-2 attack LOW 1: a partitioned md (/ on md127p1, md127 over a partition of each of two disks), nested dm
+    # (/ on dm-crypt dm-1 over LVM dm-0 over a partition) and md over two WHOLE disks (members with no partition)
+    md_part = [N(d, "disk", children=[N(d + "p2", "part", d, children=[
+                   N("md127", "raid1", d + "p2", children=[N("md127p1", "part", "md127", ["/"])])])])
+               for d in ("nvme0n1", "nvme1n1")]
+    crypt_lvm = [N("nvme0n1", "disk", children=[N("nvme0n1p3", "part", "nvme0n1", children=[
+                     N("vg-root", "lvm", "nvme0n1p3", kname="dm-0", children=[
+                         N("cryptroot", "crypt", "dm-0", ["/"], kname="dm-1")])])]),
+                 N("nvme1n1", "disk")]
+    md_whole = [N(d, "disk", children=[N("md0", "raid1", d, ["/"])]) for d in ("nvme0n1", "nvme1n1")]
+    # round-2 attack MED 2: a spare disk that is not blank (a PV of the root volume group with no root extents, an
+    # unmounted btrfs member, any partition table) is neither mounted nor claimed, so only its signature tells: what
+    # `blkid -p -o export /dev/<dev>` answers for the disk and each partition, as (rc, stdout)
+    blank = {"nvme1n1": (2, "")}
+    parted = N("nvme1n1", "disk", children=[N("nvme1n1p1", "part", "nvme1n1")])
+    # round-2 attack LOW 3: two namespaces of one controller; the controller each /sys/block/<disk>/device names
+    ns2 = N("nvme0n2", "disk")
+    c0, c1 = "/sys/devices/pci0000:00/0000:00:01.0/nvme/nvme0", "/sys/devices/pci0000:00/0000:00:02.0/nvme/nvme1"
     ROOT = "holds the root filesystem"
+    SIG = "carries a signature"
+    CTRL = "shares its controller"
     ALLOW = "is not an NVMe namespace, SCSI disk or virtio disk"
     TELL = "cannot tell which disk holds /"
 
@@ -386,7 +406,11 @@ def self_test():
         return r.returncode, r.stdout, r.stderr
 
     pci = {"pci/nvme0n1": "disk", "pci/nvme0n1/nvme0n1p1": "part", "pci/nvme0n1/nvme0n1p2": "part",
-           "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
+           "pci/nvme0n1/nvme0n1p3": "part", "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
+    # round-2 attack LOW 2: an NVMe multipath head whose slaves are its path devices (the 4.15-era layout)
+    mpath = {"virtual/nvme-subsys0/nvme0n1": ["pci/nvme0/nvme0c0n1", "pci/nvme0/nvme0c1n1"],
+             "virtual/nvme-subsys0/nvme0n1/nvme0n1p1": "part", "pci/nvme0/nvme0c0n1": "disk",
+             "pci/nvme0/nvme0c1n1": "disk"}
     cases = [
         ("a spare NVMe disk passes", lambda: passes("nvme1n1", devs, [], [])),
         ("the root disk is refused by the root rule", lambda: refuses(f"nvme0n1 {ROOT}", "nvme0n1", devs, [], [])),
@@ -467,6 +491,64 @@ def self_test():
         ("sysfs: / on a whole disk is that disk", lambda: sysfs(["nvme2n1"], pci, "pci/nvme2n1")),
         ("sysfs: / with no block device (btrfs, overlay, NFS, tmpfs) cannot tell",
          lambda: sysfs_refuses("has no block device in sysfs", pci, None)),
+        # round-2 attack LOW 1: the three layouts the fakes missed, through both instruments
+        ("rootdisk: / on a partitioned md walks md127p1, md127, both member partitions, to both disks",
+         lambda: rootdisk(["nvme0n1", "nvme1n1"], md_part)),
+        ("rootdisk: / on dm-crypt over LVM over a partition walks dm-1, dm-0, the partition, the disk",
+         lambda: rootdisk(["nvme0n1"], crypt_lvm)),
+        ("rootdisk: / on md over two whole disks walks to both disks", lambda: rootdisk(["nvme0n1", "nvme1n1"], md_whole)),
+        ("sysfs: / on a partitioned md climbs md127p1 to md127, then both slaves to both disks",
+         lambda: sysfs(["nvme0n1", "nvme1n1"],
+                       dict(pci, **{"virtual/md127": ["pci/nvme0n1/nvme0n1p2", "pci/nvme1n1/nvme1n1p2"],
+                                    "virtual/md127/md127p1": "part"}), "virtual/md127/md127p1")),
+        ("sysfs: / on dm-crypt over LVM climbs dm-1's slave dm-0, then dm-0's slave, to the disk",
+         lambda: sysfs(["nvme0n1"], dict(pci, **{"virtual/dm-0": ["pci/nvme0n1/nvme0n1p3"],
+                                                 "virtual/dm-1": ["virtual/dm-0"]}), "virtual/dm-1")),
+        ("sysfs: / on md over two whole disks climbs both slaves, which are the disks",
+         lambda: sysfs(["nvme0n1", "nvme1n1"], dict(pci, **{"virtual/md0": ["pci/nvme0n1", "pci/nvme1n1"]}),
+                       "virtual/md0")),
+        # round-2 attack LOW 2: path devices in a head's slaves name the head, as lsblk does
+        ("sysfs: / on an NVMe multipath head whose slaves are its path devices names the head",
+         lambda: sysfs(["nvme0n1"], mpath, "virtual/nvme-subsys0/nvme0n1/nvme0n1p1")),
+        # round-2 attack MED 2: the signature rule, on blkid's low-level probe (libblkid on the device itself, not
+        # udev's database, which can lag a write) of the disk and each partition
+        ("MED 2: a spare disk with a partition table is refused by the signature rule (a partition may hold raw data)",
+         lambda: refuses(f"nvme1n1 {SIG} (DEVNAME=/dev/nvme1n1 PTUUID=5e1f PTTYPE=gpt)", "nvme1n1", devs, [], [], {}, {},
+                         None, {"nvme1n1": (0, "DEVNAME=/dev/nvme1n1\nPTUUID=5e1f\nPTTYPE=gpt\n")})),
+        ("MED 2: a whole-disk PV of the root volume group holding no root extents is refused by the signature rule",
+         lambda: refuses(f"nvme1n1 {SIG} (DEVNAME=/dev/nvme1n1 TYPE=LVM2_member)", "nvme1n1", devs, [], [], {}, {},
+                         None, {"nvme1n1": (0, "DEVNAME=/dev/nvme1n1\nTYPE=LVM2_member\n")})),
+        ("MED 2: an unmounted whole-disk btrfs member is refused by the signature rule",
+         lambda: refuses(f"nvme1n1 {SIG} (DEVNAME=/dev/nvme1n1 TYPE=btrfs)", "nvme1n1", devs, [], [], {}, {},
+                         None, {"nvme1n1": (0, "DEVNAME=/dev/nvme1n1\nTYPE=btrfs\n")})),
+        ("MED 2: a partition carrying an LVM2_member signature is refused by the signature rule",
+         lambda: refuses(f"nvme1n1p1 {SIG} (DEVNAME=/dev/nvme1n1p1 TYPE=LVM2_member)", "nvme1n1",
+                         [root, parted], [], [], {}, {}, None,
+                         {"nvme1n1": (0, "DEVNAME=/dev/nvme1n1\nPTTYPE=gpt\n"),
+                          "nvme1n1p1": (0, "DEVNAME=/dev/nvme1n1p1\nTYPE=LVM2_member\n")})),
+        ("MED 2: a partition lsblk lists that was not probed refuses", lambda: refuses(
+            "cannot probe nvme1n1p1's signatures", "nvme1n1", [root, parted], [], [], {}, {}, None, blank)),
+        ("MED 2: a probe that failed (blkid rc 4) refuses", lambda: refuses(
+            "cannot probe nvme1n1's signatures", "nvme1n1", devs, [], [], {}, {}, None, {"nvme1n1": (4, "")})),
+        ("MED 2: a probe that did not run refuses", lambda: refuses(
+            "cannot probe nvme1n1's signatures", "nvme1n1", devs, [], [], {}, {}, None, {"nvme1n1": (None, "timeout")})),
+        ("MED 2: no probe of the device at all refuses", lambda: refuses(
+            "cannot probe nvme1n1's signatures", "nvme1n1", devs, [], [], {}, {}, None, {})),
+        ("MED 2: 'nothing found' (rc 2) that still prints something refuses", lambda: refuses(
+            "cannot probe nvme1n1's signatures", "nvme1n1", devs, [], [], {}, {}, None,
+            {"nvme1n1": (2, "DEVNAME=/dev/nvme1n1\nTYPE=xfs\n")})),
+        ("MED 2: a blank spare disk (rc 2, nothing printed) passes the signature rule",
+         lambda: passes("nvme1n1", devs, [], [], {}, {}, None, blank)),
+        # round-2 attack LOW 3: the root rule compares drives, not only namespaces
+        ("LOW 3: another namespace on the root disk's controller is refused by the controller rule",
+         lambda: refuses(f"nvme0n2 {CTRL} ({c0}) with nvme0n1, which {ROOT}", "nvme0n2", devs + [ns2], [], [], {}, {},
+                         {"nvme0n1": c0, "nvme0n2": c0})),
+        ("LOW 3: a disk on another controller passes the controller rule", lambda: passes(
+            "nvme1n1", devs, [], [], {}, {}, {"nvme0n1": c0, "nvme1n1": c1})),
+        ("LOW 3: a device whose controller cannot be read is refused", lambda: refuses(
+            "cannot read nvme1n1's controller", "nvme1n1", devs, [], [], {}, {}, {"nvme0n1": c0})),
+        ("LOW 3: a root disk whose controller cannot be read refuses every device", lambda: refuses(
+            "cannot read nvme0n1's controller", "nvme1n1", devs, [], [], {}, {}, {"nvme1n1": c1})),
     ]
     bad = []
     try:
