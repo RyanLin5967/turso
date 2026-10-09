@@ -121,6 +121,11 @@ REFUSALS = {
     "R_reg_frame25": "other than append25",
     "R_reg_nonascii": "breaks the one strict rule",
     "R_reg_longline": "breaks the one strict rule",
+    # V3 review 12 item 2: each broken registry rule refuses with its own text, naming the key (the frame-arm allowlist
+    # inside reg_lookup had made R_reg_frame25 refuse with the generic byte/length text); the probe-side duplicate-key
+    # and unknown-key rules had no plant
+    "R_reg_dupkey": "is given twice",
+    "R_reg_unknownkey": "is not frame_arm or a d0_threshold",
 }
 # run.sh refusals: tag -> the refusing rule's own reason PREFIX (rc 2, no out dir, no probe run). Every planted
 # verdict also carries "planted", so a bare word ("plan", "cell", "arch") would match whatever rule fired (fresh
