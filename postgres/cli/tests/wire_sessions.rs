@@ -4614,6 +4614,142 @@ fn every_statement_checks_its_bind_arity() {
         .ok("keep was not deleted");
 }
 
+/// A named statement keeps the types it had when it first met the engine (its first Describe or
+/// Execute), as PostgreSQL fixes a prepared statement's parameter and result types at Parse: on a
+/// branch where its column is TEXT, its Execute is refused (0A000, PostgreSQL's code for "cached
+/// plan must not change result type"), not run with its parameters re-inferred as text. Re-inferred,
+/// the 4 binary int4 bytes Describe announced were read as UTF-8 and matched nothing, and a text '1'
+/// matched, where PostgreSQL errors (text = integer has no operator). Back on the trunk, where the
+/// types are the fixed ones again, it runs (wire review 14 item 11).
+#[test]
+fn a_named_statement_keeps_its_described_parameter_types() {
+    let dir = Scratch::new("frozentypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1)").ok("row");
+    a.q("SELECT turso_branch_create('textk')").ok("branch");
+    a.q("SELECT turso_branch_switch('textk')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(k TEXT)")
+        .ok("ft as text on the branch");
+    a.q("INSERT INTO ft VALUES ('1')").ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    // s is fixed by its Describe: its parameter is int4 on main.
+    a.send(b'P', b"s\0SELECT count(*) FROM ft WHERE k = $1\0\0\0");
+    a.send(b'D', b"Ss\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.params,
+        Some(vec![23]),
+        "premise: s's parameter is int4: {:?}",
+        r.error
+    );
+    // t is fixed by its first Execute, with 1 in text format: one row on main.
+    a.send(b'P', b"t\0SELECT count(*) FROM ft WHERE k = $1\0\0\0");
+    a.send(b'B', b"\0t\0\0\0\0\x01\0\0\0\x011\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("1".to_string())]],
+        "t on main: {:?}",
+        r.error
+    );
+    a.q("SELECT turso_branch_switch('textk')")
+        .ok("onto the branch");
+    // s with 1 as binary int4.
+    a.send(b'B', b"\0s\0\0\x01\0\x01\0\x01\0\0\0\x04\0\0\0\x01\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("0A000"),
+        "s ran with its parameter re-typed: rows {:?}",
+        r.rows
+    );
+    assert!(r.rows.is_empty(), "rows {:?}", r.rows);
+    assert_eq!(r.status, b'I');
+    // t with 1 in text format.
+    a.send(b'B', b"\0t\0\0\0\0\x01\0\0\0\x011\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("0A000"),
+        "t ran with its parameter re-typed: rows {:?}",
+        r.rows
+    );
+    // Control: back on main the types are the fixed ones, and s runs.
+    a.q("SELECT turso_branch_switch('main')").ok("main again");
+    a.send(b'B', b"\0s\0\0\x01\0\x01\0\x01\0\0\0\x04\0\0\0\x01\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("1".to_string())]],
+        "s on main: {:?}",
+        r.error
+    );
+}
+
+/// A named statement's result types are fixed at its first Describe too: on a branch where its
+/// column is TEXT, its Describe and its Execute are refused, 0A000 "cached plan must not change
+/// result type", as PostgreSQL's RevalidateCachedQuery refuses both. Its rows went out as text
+/// under the int4 RowDescription the client had been sent (wire review 14 item 11, the result half
+/// of the same mechanism).
+#[test]
+fn a_named_statement_keeps_its_described_result_types() {
+    let dir = Scratch::new("frozencols");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1)").ok("row");
+    a.q("SELECT turso_branch_create('textk')").ok("branch");
+    a.q("SELECT turso_branch_switch('textk')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(k TEXT)")
+        .ok("ft as text on the branch");
+    a.q("INSERT INTO ft VALUES ('x')").ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    a.send(b'P', b"r\0SELECT k FROM ft\0\0\0");
+    a.send(b'D', b"Sr\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.oids, Some(vec![23]), "premise: k is int4: {:?}", r.error);
+    a.q("SELECT turso_branch_switch('textk')")
+        .ok("onto the branch");
+    a.send(b'D', b"Sr\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error
+            .as_ref()
+            .map(|e| (e.code.as_str(), e.message.as_str())),
+        Some(("0A000", "cached plan must not change result type")),
+        "Describe on the branch: oids {:?}",
+        r.oids
+    );
+    a.send(b'B', b"\0r\0\0\0\0\0\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error
+            .as_ref()
+            .map(|e| (e.code.as_str(), e.message.as_str())),
+        Some(("0A000", "cached plan must not change result type")),
+        "Execute on the branch: rows {:?}",
+        r.rows
+    );
+    assert!(r.rows.is_empty(), "rows {:?}", r.rows);
+}
+
 /// A Bind is checked before anything of its statement runs, for every statement without a `$n`
 /// (its parameters are the ones Parse declared, none if it declared none): one value for `SET
 /// search_path TO nosuch` or `SET foreign_keys = off` is 08P01 and the setting is unchanged; a
