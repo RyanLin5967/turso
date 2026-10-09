@@ -615,19 +615,30 @@ def self_test():
     chk("accepts per-CPU stats with zero overruns",
         report_stats_problems({"cpu0": {"overrun": 0, "commit overrun": 0, "dropped events": 0}}) == [], "")
     # A16: the app's own syncs per window, from syscall tracepoints, by pid (expectations by hand)
-    def sev(comm, pid, ts, sc="fsync"):
-        return "%16s-%-7d [%03d] .....  %s: sys_%s(fd: 0x00000003)" % (comm, pid, 0, ts, sc)
+    def sev(comm, pid, ts, sc="fsync", fd=3):
+        return "%16s-%-7d [%03d] .....  %s: sys_%s(fd: 0x%08x)" % (comm, pid, 0, ts, sc, fd)
+    # [tenth review HIGH 1] a sync event is attributed by its fd to the overlapping window whose arm owns that fd: the
+    # planted cases name each event's fd (the arms' fds as run 37845193906 used them), and sync_windows takes the
+    # arm -> {fd: syncs per op} map the probe records (summary.json sync_fds)
+    FDCAP_T = {"append25": {3: 1}, "nosync25": {}, "clean": {14: 1}, "clone2b": {17: 1, 11: 1}, "cfr2b": {17: 1, 13: 1},
+               "ow4k": {5: 1}}
+
+    def swin(sysev, w, pid):
+        try:
+            return sync_windows(sysev, w, pid, FDCAP_T)
+        except Exception as e:  # the base takes no fd map
+            return {"error": repr(e)}
     slines = [sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001080", "fdatasync"),  # both in w0
               sev("other", 7, "0.002010"),                                                 # w2, another pid
               ev("kworker/0:1H", 10, 0, "0.001050", "7:0", "FF")]
     be, se, sp = parse_trace_all(HDR % (len(slines), len(slines)) + "\n".join(slines) + "\n", devs)
     chk("syscall lines parse: 3 syscall events and 1 block event, the header count matching both",
         len(se) == 3 and len(be) == 1 and not sp and [x[3] for x in se] == ["fsync", "fdatasync", "fsync"], (se, sp))
-    sw = sync_windows(se, windows, 99)
+    sw = swin(se, windows, 99)
     # eighth review M4: a sync printed 0.3 us after its window opened (interval straddling the start) is that window's
     edge = [(1000000, 1100000, "append25", 0), (1200000, 1300000, "append25", 1)]
     ee, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001000"), sev("v3floor", 99, "0.001200")]) + "\n", devs)[1:], None
-    swe = sync_windows(ee[0], edge, 99)
+    swe = swin(ee[0], edge, 99)
     chk("sync windows: a sync whose +-500 ns interval overlaps only its own window's start is attributed to it",
         swe.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 0, "ambiguous": 0}, swe)
     # ninth review M3: real batches leave 20-80 ns between windows (testdata raw.tsv, round 0), so a sync entering
@@ -636,21 +647,21 @@ def self_test():
     tight = [(1000000, 1099920, "append25", 0), (1100000, 1199920, "append25", 1), (1200000, 1299960, "append25", 2)]
     te, _ = parse_trace_all(HDR % (3, 3) + "\n".join([sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001100"),
                                                      sev("v3floor", 99, "0.001200")]) + "\n", devs)[1:], None
-    swt = sync_windows(te[0], tight, 99)
+    swt = swin(te[0], tight, 99)
     chk("sync windows: gaps of 80 and 40 ns, syncs printed at each later window's start -> every window holds one",
         (swt.get("append25") or {}).get("windows_without_a_sync") == 0 and (swt.get("append25") or {}).get("syncs") == 3,
         swt)
     # ... and a probe that drops the second window's sync still leaves a window without one (the shift cannot hide it)
     te2, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001200")])
                              + "\n", devs)[1:], None
-    swt2 = sync_windows(te2[0], tight, 99)
+    swt2 = swin(te2[0], tight, 99)
     chk("sync windows: the same windows with the second window's sync missing -> a window without a sync",
         (swt2.get("append25") or {}).get("windows_without_a_sync", 0) >= 1, swt2)
     # ... and a clean op whose fsync returned within 0.5 us of its window's end (its interval straddling into the next
     # window) never fills a following gated window that issued no sync: clean expects its own sync and has none
     cw = [(1000000, 1000900, "clean", 0), (1000950, 1100000, "append25", 0)]
-    ce, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001001") + "\n", devs)[1:], None
-    swc = sync_windows(ce[0], cw, 99)
+    ce, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001001", fd=14) + "\n", devs)[1:], None
+    swc = swin(ce[0], cw, 99)
     chk("sync windows: clean's fast fsync straddling into an append25 window with no sync -> append25 still lacks one",
         (swc.get("append25") or {}).get("windows_without_a_sync") == 1, swc)
     # run 37845193906 (the later-window rule of d455aa885): clone2b's SECOND fsync, returning within 0.5 us of its
@@ -658,12 +669,42 @@ def self_test():
     # Windows here: clone2b 1.000-1.0999 ms holding its first fsync wholly inside and its second at its very end, then
     # nosync25 from 1.10002 ms: nosync25 must hold none, clone2b both
     c2w = [(1000000, 1099990, "clone2b", 0), (1100010, 1103000, "nosync25", 0)]
-    c2e, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050"), sev("v3floor", 99, "0.001100")]) + "\n",
-                             devs)[1:], None
-    swn = sync_windows(c2e[0], c2w, 99)
+    c2e, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050", fd=17), sev("v3floor", 99, "0.001100", fd=11)])
+                             + "\n", devs)[1:], None
+    swn = swin(c2e[0], c2w, 99)
     chk("sync windows: clone2b's second fsync at its window's end beside a nosync25 window -> nosync25 holds none, "
         "clone2b two (run 37845193906)",
         (swn.get("nosync25") or {}).get("syncs") == 0 and (swn.get("clone2b") or {}).get("syncs") == 2, swn)
+    # tenth review HIGH 1, planted (expectations by hand):
+    # (a) an append25 window with no sync, then a clean window whose fast fsync (clean's fd 14) prints at clean's start,
+    #     overlapping append25's end: the fsync is clean's by its fd, so append25 still lacks one (the capacity rule of
+    #     fc6ed8060 gave it to append25: clean is not sync-gated, so the loan hid a gated window's missing sync)
+    aw = [(1000000, 1099990, "append25", 0), (1100010, 1101000, "clean", 0)]
+    ae, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001100", fd=14) + "\n", devs)[1:], None
+    swa = swin(ae[0], aw, 99)
+    chk("sync windows by fd: clean's fsync (fd 14) overlapping an append25 window with no sync -> append25 still lacks "
+        "one, clean holds it", (swa.get("append25") or {}).get("windows_without_a_sync") == 1
+        and (swa.get("clean") or {}).get("syncs") == 1, swa)
+    # (b) cfr2b's clone fsync (fd 17) inside, its directory fsync (fd 13) printed at its end overlapping an append25
+    #     window with no sync: append25 lacks one, cfr2b holds both
+    bw = [(1000000, 1099990, "cfr2b", 0), (1100010, 1200000, "append25", 0)]
+    be2, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050", fd=17), sev("v3floor", 99, "0.001100", fd=13)])
+                             + "\n", devs)[1:], None
+    swb = swin(be2[0], bw, 99)
+    chk("sync windows by fd: cfr2b's directory fsync (fd 13) at its end beside an append25 window with none -> append25 "
+        "lacks one, cfr2b two", (swb.get("append25") or {}).get("windows_without_a_sync") == 1
+        and (swb.get("cfr2b") or {}).get("syncs") == 2, swb)
+    # (c) the same cfr2b beside a nosync25 window: nosync25 holds none
+    cw2 = [(1000000, 1099990, "cfr2b", 0), (1100010, 1103000, "nosync25", 0)]
+    swd = swin(be2[0], cw2, 99)
+    chk("sync windows by fd: cfr2b then nosync25 -> nosync25 holds none, cfr2b two",
+        (swd.get("nosync25") or {}).get("syncs") == 0 and (swd.get("cfr2b") or {}).get("syncs") == 2, swd)
+    # (d) a sync wholly inside an ow4k window but on append25's fd (3): not ow4k's own file, so ow4k lacks one
+    dw = [(1000000, 1100000, "ow4k", 0)]
+    de, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001050", fd=3) + "\n", devs)[1:], None
+    swdd = swin(de[0], dw, 99)
+    chk("sync windows by fd: a sync on another arm's fd wholly inside an ow4k window -> ow4k lacks its own",
+        (swdd.get("ow4k") or {}).get("windows_without_a_sync") == 1, swdd)
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
@@ -687,7 +728,13 @@ def self_test():
             f.write("arm\ti\tns\tt0_ns\n")
             for t0, t1, a, i in windows:
                 f.write("%s\t%d\t%d\t%d\n" % (a, i, t1 - t0, t0))
-        r = report(rec, None, wt, 99)
+        sfp = os.path.join(rd_, "sync_fds.json")  # [tenth review HIGH 1] report() takes the probe's fd map
+        with open(sfp, "w") as f:
+            json.dump({"n": 2, "sync_fds": {"append25": {"3": 2}, "nosync25": {}}}, f)
+        try:
+            r = report(rec, None, wt, 99, sfp)
+        except TypeError as e:
+            r = {"syscalls": {"error": repr(e)}, "windows": {"arms": {"append25": {"devices": {"loop0": {"events": -1}}}}}}
         sa = (r.get("syscalls") or {}).get("arms") or {}
         chk("report() end to end on a planted record: per-arm syncs by pid 99 (append25 synced in both windows), the "
             "block events by device, and the syscalls record", sa.get("append25", {}).get("windows_without_a_sync") == 0
@@ -696,6 +743,67 @@ def self_test():
         r2 = report(rec, None, wt, None)
         chk("report() without --pid: the syscalls record has no per-arm sync count (post then refuses)",
             "arms" not in r2["syscalls"] and r2["syscalls"]["events"] == 2, r2.get("syscalls"))
+        r3 = report(rec, None, wt, 99)
+        chk("report() with --pid but no fd map: no per-arm sync count either (post then refuses)",
+            "arms" not in r3["syscalls"], r3.get("syscalls"))
+        # tenth review HIGH 1 on real bytes: run 37845193906's arm-xfs F3 record (testdata/blk-37845193906-arm-xfs,
+        # sync_fds.json derived from the same cell's F1b strace): nosync25 holds no sync, every gated window exactly
+        # its own; then one gated window's own sync dropped where a neighbour's event overlaps that window must show
+        tdd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "blk-37845193906-arm-xfs")
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check as _ck
+        meta = json.load(open(os.path.join(tdd, "sync_fds.json")))
+        try:
+            rr = report(tdd, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
+            ra = (rr.get("syscalls") or {}).get("arms") or {}
+        except TypeError as e:
+            ra = {"error": repr(e)}
+        bad_g = {a: (r.get("windows_without_a_sync"), r.get("windows_short")) for a, r in ra.items() if isinstance(r, dict)
+                 and a in _ck.GATED and (r.get("windows_without_a_sync") != 0 or r.get("windows_short") != 0)}
+        chk("real arm-xfs record (run 37845193906): nosync25 holds 0 syncs; every gated window holds exactly its own "
+            "(windows_without_a_sync 0, windows_short 0)", isinstance(ra.get("nosync25"), dict) and ra["nosync25"].get("syncs") == 0
+            and not bad_g and len([a for a in ra if a in _ck.GATED]) == 7, (ra.get("nosync25"), bad_g, ra.get("error")))
+        # the plant: by the raw windows and each event's fd (read here, not by the subject), a gated window W whose own
+        # sync lies wholly inside it while another window's sync event overlaps W; drop W's own and recount the header
+        text = gzip.open(os.path.join(tdd, "trace.txt.gz"), "rt").read()
+        lines = text.split("\n")
+        rows = []
+        for ln, line in enumerate(lines):
+            m = SYSLINE.match(line)
+            if m and int(m.group("pid")) == meta["pid"]:
+                t, hw = ts_ns(m.group("ts"))
+                rows.append((t, hw, int(re.search(r"fd: (?:0x)?([0-9a-f]+)", m.group("args")).group(1), 16), ln))
+        ww = read_windows(os.path.join(tdd, "raw.tsv"))
+        own = {a: {int(k) for k in v} for a, v in meta["sync_fds"].items()}
+        plant = None
+        for k, (t0, t1, a, i) in enumerate(ww):
+            if a not in _ck.GATED:
+                continue
+            mine = [r for r in rows if t0 <= r[0] - r[1] and r[0] + r[1] <= t1 and r[2] in own[a]]
+            foreign = [r for r in rows if r[0] + r[1] >= t0 and r[0] - r[1] <= t1 and r[2] not in own[a]]
+            if len(mine) == 1 and foreign and len(own[a]) == 1:
+                plant = (a, i, mine[0][3])
+                break
+        res_p = None
+        if plant:
+            pl = os.path.join(rd_, "plant")
+            os.makedirs(pl)
+            for f in ("start.json", "stop.json", "stats.json"):
+                shutil.copy(os.path.join(tdd, f), pl)
+            kept = [l for j, l in enumerate(lines) if j != plant[2]]
+            kept = [re.sub(r"entries-in-buffer/entries-written: (\d+)/(\d+)",
+                           lambda mm: "entries-in-buffer/entries-written: %d/%d" % (int(mm.group(1)) - 1, int(mm.group(2)) - 1), l)
+                    for l in kept]
+            with gzip.open(os.path.join(pl, "trace.txt.gz"), "wt") as f:
+                f.write("\n".join(kept))
+            try:
+                rp = report(pl, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
+                res_p = ((rp.get("syscalls") or {}).get("arms") or {}).get(plant[0])
+            except TypeError as e:
+                res_p = {"error": repr(e)}
+        chk("real arm-xfs record with one gated window's own sync dropped, a neighbour's event overlapping that window -> "
+            "the window shows (windows_without_a_sync 1)", plant is not None and isinstance(res_p, dict)
+            and res_p.get("windows_without_a_sync") == 1, (plant, res_p))
     finally:
         shutil.rmtree(rd_)
     tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "blkflush-selftest-%d.tsv" % os.getpid())

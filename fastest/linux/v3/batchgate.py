@@ -683,6 +683,8 @@ def _post_batch(d, sha, mod):
         sj["plp"] = "yes"
     if mod == "traced":
         sj["traced"] = True
+    if mod == "frame-ow64k":  # a drive cell, a registered threshold, frame arm ow64k: only the variant rule is left
+        sj.update(d0_threshold_ref="planted", frame_arm="ow64k")
     if mod == "loopflush-rental":  # a loop cell, everything registered: only the rental-drive rule is left
         sj["flush_path"].insert(0, {"fstype": "ext4", "source": "/dev/loop0", "loop_backing": "/x.img", "disk": "loop0",
                                     "sys": "/sys/block/loop0", "mount": "/l", "write_cache": "write back"})
@@ -730,6 +732,8 @@ def post_selftest(chk):
             ("A17: rental mode with no registered threshold or frame arm", "", "smoke", 2, "registration:",
              {"V3_REQUIRE_T3": "1"}),
             ("A16/eighth review M6: rental mode on a loop cell", "loopflush-rental", "smoke", 2, "rental:", {"V3_REQUIRE_T3": "1"}),
+            ("ninth review M6 / tenth review LOW 1: rental mode with frame arm ow64k (no fdatasync variant)", "frame-ow64k",
+             "smoke", 2, "registration: the registered frame arm", {"V3_REQUIRE_T3": "1"}),
             ("eighth review H2: a batch the probe ran traced", "traced", "smoke", 2, "traced:", {})):
         d = os.path.join(td, (mod or "control") + "-" + mode + ("-t3" if env else ""))
         vp = _post_batch(d, sha, mod)

@@ -1102,7 +1102,11 @@ def self_test():
                            # ninth review L9: append25 is already in the bound shape; a frame arm append25 names it twice
                            ("frame_arm append25", "frame_arm\tappend25\tref\n", False),
                            ("frame_arm ow64k", "frame_arm\tow64k\tref\n", True),
-                           ("frame_arm clean (not an M0 append or overwrite arm)", "frame_arm\tclean\tref\n", False)):
+                           ("frame_arm clean (not an M0 append or overwrite arm)", "frame_arm\tclean\tref\n", False),
+                           # tenth review LOW 2: every line under the one rule; a key twice is refused, not last-wins
+                           ("frame_arm twice", "frame_arm\tow4k\tref\nframe_arm\tow64k\tref\n", False),
+                           ("a threshold twice", "d0_threshold/ext4/wb/bare\t9.5\tr\nd0_threshold/ext4/wb/bare\t9.6\tr\n", False),
+                           ("an unknown key", "frame_arms\tow4k\tref\n", False)):
         open(os.path.join(rd_, "r.tsv"), "w").write("# comment\n" + text)
         try:
             registered(rd_, "r.tsv")
@@ -1110,8 +1114,46 @@ def self_test():
         except ValueError:
             got = False
         chk("REGISTERED.tsv rule: %s -> %s" % (name, "read" if ok else "refused"), got is ok)
+    try:  # tenth review LOW 4: an unreadable registry refuses, never reads as an empty one
+        registered(rd_, "no-such-registry.tsv")
+        unread = "read as %r" % (registered(rd_, "no-such-registry.tsv"),)
+    except (ValueError, OSError) as e:
+        unread = "refused: %r" % e
+    chk("REGISTERED.tsv rule: an unreadable registry -> refused", unread.startswith("refused"), unread)
     import shutil as _sh
     _sh.rmtree(rd_)
+    # tenth review HIGH 2: main() on an empty OUT, for every cell, arch, leaf class and box, evaluates exactly plan()'s
+    # ids in plan()'s order (run 37845193906 failed "plan" on 12/12 cells on the order alone)
+    import contextlib as _cl, io as _io, itertools as _it, tempfile as _tf2
+    global CELL, KIND, W, OUT, results
+    saved_g = (CELL, KIND, W, OUT, results)
+    orig_flc, orig_box = find_leaf_class, box_of
+    pbad, pruns = [], 0
+    try:
+        for cell, arch, lc, virt, flip, plp in _it.product(sorted(v3cell.CELLS), ("x86_64", "aarch64"), ("wb", "wt", "brd"),
+                                                           ("vm", "bare"), ("yes", "no"), ("yes", "no")):
+            tdp = _tf2.mkdtemp(prefix="check-plan-")
+            open(os.path.join(tdp, "info.txt"), "w").write("arch=%s\n" % arch)
+            bx = {"virt": virt, "flip": flip, "plp": plp}
+            globals()["find_leaf_class"] = lambda lc=lc: (lc, "planted")
+            globals()["box_of"] = lambda kv, bx=bx: dict(bx, leafdisk=None)
+            results = []
+            try:
+                with _cl.redirect_stdout(_io.StringIO()), _cl.redirect_stderr(_io.StringIO()):
+                    main([tdp, cell])
+                ids = [r["id"] for r in results]
+                pruns += 1
+                if ids != plan(cell, arch, lc, bx):
+                    pbad.append((cell, arch, lc, virt, flip, plp))
+            except Exception as e:  # noqa: BLE001
+                pbad.append((cell, arch, lc, virt, flip, plp, repr(e)[:120]))
+            finally:
+                _sh.rmtree(tdp, ignore_errors=True)
+    finally:
+        globals()["find_leaf_class"], globals()["box_of"] = orig_flc, orig_box
+        CELL, KIND, W, OUT, results = saved_g
+    chk("plan order: main() on an empty OUT evaluates exactly plan()'s ids in order, for all %d cell/arch/leaf/box "
+        "combinations" % pruns, pruns == 288 and not pbad, pbad[:4])
     # ninth review H1, L10, M6: the A18 floor reference as the probe picks it -- among append25 (fsync) and
     # fdatasync4k only (the frame arm runs with fsync and is not a candidate, even when registered), on raw nanosecond
     # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
