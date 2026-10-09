@@ -285,7 +285,12 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
 /// other thread is blocked, so what the work woke (the confirmation writer, at a flight's landing)
 /// has run and parked again. Mach traps and userspace only.
 fn settled(base: Option<u64>) -> bool {
-    probe::threads() == base && probe::others_blocked().unwrap_or(true)
+    // Review 2 M6: where the thread state cannot be read, a window cannot be shown to have closed;
+    // refuse, never fall through to "settled".
+    let threads = probe::threads().unwrap_or_else(|| panic!("budget window: the thread count cannot be read on this platform; refusing"));
+    let blocked = probe::others_blocked().unwrap_or_else(|| panic!("budget window: whether the other threads are blocked cannot be read on this platform; refusing"));
+    assert!(base.is_some(), "budget window: no base thread count; refusing");
+    Some(threads) == base && blocked
 }
 
 /// Spin, with no syscall, until `settled(base)` or the deadline; whether it settled.
@@ -1291,13 +1296,15 @@ fn run_instruments(cell: &str) -> String {
     s.insert("base", base.unwrap_or(0));
     s.insert("with", with.unwrap_or(0));
     s.insert("after", after.unwrap_or(0));
-    // A parked thread named as a persistent store thread is not counted, and a parked thread is
-    // blocked; a spinning one is not.
+    // A parked thread the engine reported as a persistent store thread (`probe::persistent_started`,
+    // as `start_confirm_writer` does; review 2 M6) is not counted, and a parked thread is blocked; a
+    // spinning one is not.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let named = std::thread::Builder::new()
-        .name(probe::PERSISTENT_THREADS[0].to_string())
-        .spawn(move || rx.recv())
-        .unwrap();
+    probe::persistent_started();
+    let named = std::thread::spawn(move || {
+        let _ = rx.recv();
+        probe::persistent_ended();
+    });
     let t = std::time::Instant::now();
     while probe::others_blocked() != Some(true) && t.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1321,20 +1328,19 @@ fn run_instruments(cell: &str) -> String {
     s.insert("spinning_seen_running", u64::from(seen_running));
     stop.store(true, std::sync::atomic::Ordering::Release);
     let _ = spinning.join();
-    // Review 2 H1: a RUNNING thread named as a persistent store thread (the confirmation writer at
-    // work) is not blocked: the persistent-name allowlist exempts such a thread from the thread
-    // count, never from the blocked check.
+    // Review 2 H1: a RUNNING persistent store thread (the confirmation writer at work) is not
+    // blocked: the persistent count exempts such a thread from the thread count, never from the
+    // blocked check.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    probe::persistent_started();
     let spinning_named = {
         let stop = stop.clone();
-        std::thread::Builder::new()
-            .name(probe::PERSISTENT_THREADS[0].to_string())
-            .spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-            })
-            .unwrap()
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            probe::persistent_ended();
+        })
     };
     let t = std::time::Instant::now();
     let mut seen_running = false;
@@ -1922,7 +1928,7 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
         assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
         assert_eq!(get("fc_thread_count", "spinning_seen_running"), 1, "a spinning thread read as blocked");
-        assert_eq!(get("fc_thread_count", "persistent_spinning_seen_running"), 1, "a running thread named as a persistent store thread read as blocked");
+        assert_eq!(get("fc_thread_count", "persistent_spinning_seen_running"), 1, "a running persistent store thread read as blocked");
     }
     #[cfg(target_vendor = "apple")]
     {

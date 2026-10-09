@@ -578,19 +578,28 @@ pub(crate) fn phys_footprint() -> Option<u64> {
     }
 }
 
-/// Threads a branch store keeps for its whole life, by name: not counted by [`threads`], since a
-/// window cannot wait for them to exit. An allowlist on purpose: an unknown long-lived thread is
-/// counted, so the windows never settle and the cell refuses, rather than its work being ignored.
-pub(crate) const PERSISTENT_THREADS: &[&str] = &["branch-confirm"];
+/// The store threads that live as long as their store (the confirmation writer, review 6 #1) and
+/// park between bursts of work: counted live by the engine itself (`persistent_started` before the
+/// spawn, `persistent_ended` as the thread's last act; three `cfg(test)` lines in
+/// `BranchStore::start_confirm_writer`), and left out of [`threads`] on every platform (review 2 M6;
+/// it replaced a name allowlist read with pthread calls inside the measured window, review 2 L1).
+static PERSISTENT_LIVE: AtomicI64 = AtomicI64::new(0);
 
-/// The threads of this process, each as `(is_self, blocked, persistent)`, given to `each`;
-/// `None` when they cannot be listed (off Apple). Mach traps and userspace only (the port list is
-/// given back with `mach_port_deallocate` and `vm_deallocate`; a thread's name is read from its
-/// pthread), so it can run inside a measured window without moving the syscall count. `blocked` is
-/// `TH_STATE_WAITING`: a thread in a blocking wait or syscall. A thread woken (by a notify) is
-/// runnable at once, before it runs, so a woken thread never reads blocked.
-#[allow(deprecated)]
-fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
+/// A persistent store thread is about to start.
+pub(crate) fn persistent_started() {
+    PERSISTENT_LIVE.fetch_add(1, Relaxed);
+}
+
+/// A persistent store thread is ending (or never started).
+pub(crate) fn persistent_ended() {
+    PERSISTENT_LIVE.fetch_sub(1, Relaxed);
+}
+
+/// The threads of this process, each as `(is_self, blocked)`, given to `each`; `None` when they cannot
+/// be listed (off Apple). Mach traps and userspace only (the port list is given back with
+/// `mach_port_deallocate` and `vm_deallocate`), so it can run inside a measured window without moving
+/// the syscall count. `blocked` is the kernel's `TH_STATE_WAITING` for the thread.
+fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
     #[cfg(target_vendor = "apple")]
     {
         extern "C" {
@@ -622,18 +631,7 @@ fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
                     &mut n,
                 )
             };
-            let blocked = kr == 0 && info.run_state == libc::TH_STATE_WAITING;
-            let mut name = [0 as libc::c_char; 64];
-            // SAFETY: a thread port of this task; a thread that has exited gives a null pthread.
-            let pt = unsafe { libc::pthread_from_mach_thread_np(port) };
-            let persistent = pt != 0
-                // SAFETY: a live pthread of this process and a buffer of the length given.
-                && unsafe { libc::pthread_getname_np(pt, name.as_mut_ptr(), name.len()) } == 0
-                // SAFETY: NUL-terminated by pthread_getname_np.
-                && unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-                    .to_str()
-                    .is_ok_and(|n| PERSISTENT_THREADS.contains(&n));
-            each(port == me, blocked, persistent);
+            each(port == me, kr == 0 && info.run_state == libc::TH_STATE_WAITING);
             // SAFETY: `list` holds `count` send rights, each released once.
             unsafe { mach_port_deallocate(task, port) };
         }
@@ -654,22 +652,21 @@ fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
     }
 }
 
-/// The threads this process has now, persistent ones (`PERSISTENT_THREADS`) left out: through
-/// [`each_thread`] on Apple (so it can be read inside a measured window), `/proc/self/stat` on Linux
-/// (persistent ones included there); `None` elsewhere.
+/// The threads this process has now, the live persistent store threads (`PERSISTENT_LIVE`) left out:
+/// through [`each_thread`] on Apple (so it can be read inside a measured window), `/proc/self/stat`
+/// on Linux; `None` elsewhere.
 pub(crate) fn threads() -> Option<u64> {
     let mut n = 0u64;
-    if each_thread(|_, _, persistent| n += u64::from(!persistent)).is_some() {
-        return Some(n);
-    }
-    linux_threads()
+    let raw = if each_thread(|_, _| n += 1).is_some() { Some(n) } else { linux_threads() }?;
+    u64::try_from(raw as i64 - PERSISTENT_LIVE.load(Relaxed)).ok()
 }
 
 /// Whether every thread but the caller is blocked (see [`each_thread`]): the work a notify woke has
-/// run and parked again. `None` off Apple.
+/// run and parked again. `None` off Apple: a window that needs it must refuse there, never assume it
+/// (review 2 M6).
 pub(crate) fn others_blocked() -> Option<bool> {
     let mut all = true;
-    each_thread(|me, blocked, _| all &= me || blocked)?;
+    each_thread(|me, blocked| all &= me || blocked)?;
     Some(all)
 }
 

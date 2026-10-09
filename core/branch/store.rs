@@ -4842,12 +4842,22 @@ impl BranchStore {
     fn start_confirm_writer(&self) {
         let group = self.group.clone();
         let store = self.inner.clone();
+        #[cfg(test)]
+        super::budget_probe::persistent_started();
         match crate::thread::Builder::new()
             .name("branch-confirm".to_string())
-            .spawn(move || run_confirm_writer(group, store))
+            .spawn(move || {
+                run_confirm_writer(group, store);
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+            })
         {
             Ok(handle) => *self.confirm_writer.lock() = Some((std::process::id(), handle)),
-            Err(e) => tracing::warn!("branch log confirmation writer not started: {e}"),
+            Err(e) => {
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                tracing::warn!("branch log confirmation writer not started: {e}")
+            }
         }
     }
 
