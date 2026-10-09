@@ -419,7 +419,8 @@ def self_test():
                                    for i, c in enumerate(cells)))
         for c in cells:
             a1 = f"{f}/cells/{c}/a1"
-            w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
+            if settle is not None:
+                w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
                 w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": ours_rule, "ops_total": ours_ops[0],
                                                            "ops_total_asked": ours_ops[1]}))
@@ -541,8 +542,12 @@ def self_test():
         ("MED 3: no package warm-up rule (warmup.txt) fails (parity)", {"rule": None}, False,
          lambda s: "the package's None" in first(s, "parity_refusals")),
         ("MED 3: ours planned 150 ops, asked and measured 150 passes", {"plan_ops": [150], "ours_ops": (150, 150)}, True, None),
-        ("MED 5: a run that did not settle is listed, not gated", {"settle": "quiet=no"}, True,
+        # TEST EDIT, flagged (fourth lane review MED 5 / T3 runner review item 9, gating chosen by the lane): this case
+        # said a run that did not settle is "listed, not gated" (ok True); it now fails the package, still listed
+        ("MED 5: a run that did not settle fails the package (listed in unquiet_runs)", {"settle": "quiet=no"}, False,
          lambda s: len(s["unquiet_runs"]) == 1 and "quiet=no" in s["unquiet_runs"][0]),
+        ("MED 5: a measured run with no settle.txt fails the package", {"settle": None}, False,
+         lambda s: any("no settle.txt" in x for x in s["unquiet_runs"])),
         ("LOW 11: a plan row without its block column leaves the run without a normaliser: fails",
          {"plan_cols": 6}, False, lambda s: "no pooled V3L p50" in first(s, "normaliser_missing") and not s["failed_blocks"]),
         ("MED 2: a drift record that disagrees with the batches' own append25 p50s fails the block",
