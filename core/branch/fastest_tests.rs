@@ -4901,50 +4901,118 @@ fn every_trunk_wal_sync_failure_site_fail_stops_on_its_own() {
     }
 }
 
-/// Engine review 10 #5: the trunk WAL syncs issued inside the WAL itself and at shutdown were not
-/// acted on: a checkpoint's sync of the WAL before its backfill (every autocheckpoint that
-/// backfills), a TRUNCATE checkpoint's sync of the truncated log, and the last connection's
-/// shutdown sync. Each fails through `?` past the pager's noted sync, so a failed drain of the
-/// device that holds branch records written and not yet drained (a D1 fork, plain-fsynced on
-/// Apple) left the store running, and the next commit's flush could promote them. Each site
-/// fail-stops the store on its own. Mutants (test builds only): `checkpoint_sync_unwatched`,
-/// `truncate_sync_unwatched`, `shutdown_sync_unwatched`.
+/// Engine review 10 #5, rewritten for engine review 17 HIGH 1 (FLAGGED, pre-approved): the trunk
+/// WAL syncs issued inside the WAL itself and at shutdown were not acted on: a checkpoint's sync of
+/// the WAL before its backfill, a TRUNCATE checkpoint's sync of the truncated log, and the last
+/// connection's shutdown sync. Each fails through `?` past the pager's noted sync, so a failed
+/// drain of the device that holds branch records written and not yet drained (a D1 fork,
+/// plain-fsynced on Apple) left the store running, and a later flush on any connection could
+/// promote them. An explicit `PRAGMA wal_checkpoint` answers such a failure with a busy row, so the
+/// failure is acted on where the sync is issued, never later. One arm per site and way in:
+/// `pragma` (PRAGMA wal_checkpoint; premise: its busy row), `api` (Connection::checkpoint; premise:
+/// its error), `shutdown` (the last connection's close). Both a fork from a fresh connection and
+/// another connection's trunk commit are refused after it. Mutants (test builds only):
+/// `checkpoint_sync_unwatched`, `truncate_sync_unwatched`, `shutdown_sync_unwatched`.
 #[cfg(target_vendor = "apple")]
-#[test]
-fn every_wal_internal_trunk_sync_failure_fail_stops() {
+fn a_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way: &str) {
+    use std::sync::atomic::Ordering as O;
     let _s = serial();
-    for catalog in [false, true] {
-        for (site, mode) in [("checkpoint", 1u8), ("truncate", 4), ("shutdown", 1)] {
-            let what = format!("catalog={catalog} site={site}");
-            let dir = tempfile::TempDir::new().unwrap();
-            let (db, armed) = open_failing_wal(&dir.path().join("walinternal.db"), opts(catalog, SyncClass::Fsync));
-            let trunk = db.connect().unwrap();
-            seed(&trunk);
-            trunk.execute("PRAGMA fullfsync = ON").unwrap();
-            trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
-            // Frames in the WAL, then a D1 fork: written and plain-fsynced, not drained.
-            trunk.execute("UPDATE t SET v = 'walled' WHERE id = 7").unwrap();
-            let _b = trunk.fork_branch().unwrap().into_id();
-            crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
-            armed.store(mode, std::sync::atomic::Ordering::Release);
-            let failed = match site {
-                "checkpoint" => trunk.execute("PRAGMA wal_checkpoint(PASSIVE)").map(|_| ()),
-                "truncate" => trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").map(|_| ()),
-                _ => trunk.close(),
+    let what = format!("catalog={catalog} site={site} way={way}");
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, armed) = open_failing_wal(&dir.path().join("walinternal.db"), opts(catalog, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+    // Frames in the WAL, then a D1 fork: written and plain-fsynced, not drained.
+    trunk.execute("UPDATE t SET v = 'walled' WHERE id = 7").unwrap();
+    let _b = trunk.fork_branch().unwrap().into_id();
+    crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+    // The checkpoint site fails the first WAL sync; the truncate site passes it and fails the next.
+    armed.store(if site == "truncate" { 4 } else { 1 }, O::Release);
+    match way {
+        "pragma" => {
+            let mode = if site == "truncate" { "TRUNCATE" } else { "PASSIVE" };
+            let rows = trunk
+                .prepare(format!("PRAGMA wal_checkpoint({mode})"))
+                .and_then(|mut s| s.run_collect_rows())
+                .unwrap_or_else(|e| panic!("{what}: premise: the PRAGMA answers rows: {e}"));
+            assert_eq!(rows[0][0].as_int(), Some(1), "{what}: premise: the PRAGMA answered busy=1 for the failed sync");
+        }
+        "api" => {
+            let mode = if site == "truncate" {
+                crate::CheckpointMode::Truncate { upper_bound_inclusive: None }
+            } else {
+                crate::CheckpointMode::Passive { upper_bound_inclusive: None }
             };
-            assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the armed sync was reached");
-            assert_eq!(
-                crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
-                site,
-                "{what}: premise: the failure reached its site"
-            );
-            assert!(failed.is_err(), "{what}: premise: the failed sync failed its statement");
-            assert_fail_stopped(
-                db.connect().unwrap().fork_branch().map(|x| x.into_id()),
-                &format!("{what}: the next fork after a failed WAL-internal drain"),
-            );
+            assert!(trunk.checkpoint(mode).is_err(), "{what}: premise: the failed sync failed the checkpoint");
+        }
+        _ => {
+            assert!(trunk.close().is_err(), "{what}: premise: the failed sync failed the close");
         }
     }
+    assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the armed sync was reached");
+    assert_eq!(
+        crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+        site,
+        "{what}: premise: the failure reached its site"
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        &format!("{what}: the next fork after a failed WAL-internal drain"),
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().execute("UPDATE t SET v = 'later' WHERE id = 9"),
+        &format!("{what}: another connection's trunk commit after a failed WAL-internal drain"),
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_pragma_checkpoint_wal_sync_fail_stops_a_snapshot_store() {
+    a_wal_internal_sync_failure_fail_stops(false, "checkpoint", "pragma");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_pragma_checkpoint_wal_sync_fail_stops_a_catalog_store() {
+    a_wal_internal_sync_failure_fail_stops(true, "checkpoint", "pragma");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_pragma_truncate_wal_sync_fail_stops_a_snapshot_store() {
+    a_wal_internal_sync_failure_fail_stops(false, "truncate", "pragma");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_pragma_truncate_wal_sync_fail_stops_a_catalog_store() {
+    a_wal_internal_sync_failure_fail_stops(true, "truncate", "pragma");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_api_checkpoint_wal_sync_fail_stops_a_snapshot_store() {
+    a_wal_internal_sync_failure_fail_stops(false, "checkpoint", "api");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_api_truncate_wal_sync_fail_stops_a_catalog_store() {
+    a_wal_internal_sync_failure_fail_stops(true, "truncate", "api");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_shutdown_wal_sync_fail_stops_a_snapshot_store() {
+    a_wal_internal_sync_failure_fail_stops(false, "shutdown", "close");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_shutdown_wal_sync_fail_stops_a_catalog_store() {
+    a_wal_internal_sync_failure_fail_stops(true, "shutdown", "close");
 }
 
 /// Engine review 8 #14 (review 3 #9's pager half): a trunk commit with no frames to sync whose
