@@ -1328,7 +1328,10 @@ def real_selftest(chk):
             return
         t = rd(os.path.join(srcd, "F1b", "real-all.trace.gz"))
         with gzip.open(fb, "wt") as fh:
-            fh.write(f1b(t) if f1b else t)
+            fh.write(f1b(t) if callable(f1b) else t)
+        if f1b == "truncated":  # V3 review 12 item 12: a gzip cut in half (EOFError inside gzip, past OSError)
+            with open(fb, "r+b") as fh:
+                fh.truncate(os.path.getsize(fb) // 2)
 
     def run(name, probe=None, merged=None, report=None, files=None, kvmut=None, f1b=None):
         global CELL, KIND, W, OUT, results
@@ -1414,6 +1417,15 @@ def real_selftest(chk):
         def f1b_no_cfr_dirsync(t):
             ls, c0 = f1b_lines(t)
             return "\n".join(ls[:c0] + [l for l in ls[c0:] if not re.match(r"^\d+\s+fsync\(\d+<[^>]*/cfr2b\.clones>\)", l)])
+
+        def f1b_noclock(t):  # V3 review 12 item 12: one clock read deleted (the windows' parity breaks)
+            ls, c0 = f1b_lines(t)
+            return "\n".join(ls[:c0] + ls[c0 + 1:])
+
+        def f1b_nodecor(t):  # ... an in-window fsync with no -y decoration: "fsync(3) = 0"
+            ls, c0 = f1b_lines(t)
+            m = re.match(r"^(\d+)\s", ls[c0])
+            return "\n".join(ls[:c0 + 1] + ["%s  fsync(3) = 0" % m.group(1)] + ls[c0 + 1:])
 
         def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
             # in-loop pwrite64, inside a timed window: a file that is no arm's own
@@ -1537,6 +1549,15 @@ def real_selftest(chk):
             # "cfr2b.src" and never compared (the loop ran over rows only)
             ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
              ["an F1b in-window sync on a file that is no arm's own"]),
+            # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
+            # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
+            # clock read and an undecorated in-window fsync make the windows unreadable
+            ("a truncated F1b gzip", {"f1b": "truncated"}, "F3:devflush",
+             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+            ("an F1b trace with one clock read deleted", {"f1b": f1b_noclock}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
+            ("an F1b trace with an in-window fsync without fd<path>", {"f1b": f1b_nodecor}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
         ]
         for name, muts, cid, want in cases:
             g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"),
