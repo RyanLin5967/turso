@@ -158,6 +158,28 @@ impl LimboError {
             _ => 1,
         }
     }
+
+    /// Whether this is an expression's refusal of a value (a function or a conversion rejecting
+    /// its input), which a catch region (`Insn::CatchBegin`) turns into a jump. An ALLOWLIST: IO,
+    /// corruption, busy, interrupts, internal errors and a RAISE's halt (a RAISE inside a region
+    /// is translated to the jump itself, so its `Insn::Halt` never runs there) are never caught.
+    pub fn is_catchable_value_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Constraint(_)
+                | Self::SqlError(_)
+                | Self::ConversionError(_)
+                | Self::ParseIntError(_)
+                | Self::ParseFloatError(_)
+                | Self::InvalidDate(_)
+                | Self::InvalidTime(_)
+                | Self::InvalidModifier(_)
+                | Self::InvalidArgument(_)
+                | Self::InvalidFormatter(_)
+                | Self::IntegerOverflow
+                | Self::TooBig
+        )
+    }
 }
 
 impl From<crate::alloc::AllocError> for LimboError {

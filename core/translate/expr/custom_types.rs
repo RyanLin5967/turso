@@ -329,6 +329,32 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
+/// The function a custom type's '=' calls: `find_custom_type_operator`'s direct match, the type's
+/// first '=' operator (None when that one is naked, or when there is none).
+pub(crate) fn type_eq_function(type_def: &TypeDef) -> Option<&str> {
+    type_def
+        .operators()
+        .iter()
+        .find(|op_def| op_def.op == "=")
+        .and_then(|op_def| op_def.func_name.as_deref())
+}
+
+/// The '=' function that checks an index seek on a column of this type (engine review 16 HIGH 2):
+/// for a type with a function '=', the seek key's ENCODE runs in a catch region and must round-trip
+/// under that function, or the seek is empty (`main_loop/seek.rs`), and the equality's WHERE term
+/// stays unconsumed, so the type's operator re-checks every row the seek returns
+/// (`optimizer::mark_seek_constraints_consumed`): a seek answers as a scan does. None for a type
+/// whose '=' is naked or absent: its seek keys by the encoding alone, as before. Mutant
+/// `seek_key_encodes_raising` (test builds only): None for every type, so the key is ENCODEd in
+/// place, raising and losing precision, and the term is consumed.
+pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
+    let eq = type_eq_function(type_def);
+    if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {
+        return None;
+    }
+    eq
+}
+
 /// Whether `expr` is passed to an operator of a custom type whose `value` input type is
 /// `value_input_type`: a literal of a compatible type, or any other constant operand (a bound
 /// parameter, a negated or cast literal; `Optimizable::is_constant`), whose value's type is known

@@ -15691,6 +15691,33 @@ pub fn op_reset_once(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Execute the [Insn::CatchBegin] instruction: until [Insn::CatchEnd], a catchable value error
+/// jumps to `target_pc` (`Program::normal_step`).
+pub fn op_catch_begin(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(CatchBegin { target_pc }, insn);
+    assert!(target_pc.is_offset());
+    state.catch_target = Some(target_pc.as_offset_int());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchEnd] instruction: close the catch region.
+pub fn op_catch_end(
+    _program: &Program,
+    state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    state.catch_target = None;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_found(
     program: &Program,
     state: &mut ProgramState,

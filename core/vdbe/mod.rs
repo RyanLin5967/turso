@@ -885,6 +885,9 @@ pub struct ProgramState {
     /// the promised outcome and drop staged work. The connection-level flag
     /// stays set and clears once no root statement is active.
     pub(crate) halt_in_progress: bool,
+    /// The open catch region's target ([Insn::CatchBegin]): while set, a catchable value error
+    /// an instruction raises jumps here instead of failing the statement (`normal_step`).
+    pub(crate) catch_target: Option<InsnReference>,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -988,6 +991,7 @@ impl ProgramState {
             pending_fail_error: None,
             pending_fail_prepare_error: None,
             halt_in_progress: false,
+            catch_target: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
         }
@@ -1139,6 +1143,7 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
+        self.catch_target = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -2154,6 +2159,15 @@ impl Program {
                         // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
                         // back, so auto-retrying can be useful.
                         return Ok(StepResult::Busy);
+                    }
+                    // Inside a catch region (Insn::CatchBegin), a value an expression refuses
+                    // jumps to the region's target: the statement goes on (engine review 16
+                    // HIGH 2: a seek key its ENCODE refuses seeks nothing). Only value errors
+                    // (an allowlist); IO, corruption, interrupts and internal errors still fail.
+                    Err(err)
+                        if state.catch_target.is_some() && err.is_catchable_value_error() =>
+                    {
+                        state.pc = state.catch_target.take().expect("checked just above");
                     }
                     Err(err)
                         if (matches!(err, LimboError::Constraint(_))
