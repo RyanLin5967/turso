@@ -79,14 +79,14 @@ def short(role):
     return role[len("aux:"):] if role.startswith("aux:") else role
 
 
-def fmt(cj):
+def fmt(cj, key="flushes"):
     if cj is None:
         return "MISSING"
     if cj.get("verdict") != "ok":
         return "FAIL"
-    v = cj.get("per_op", {}).get("flushes")
+    v = cj.get("per_op", {}).get(key)
     if v is None:
-        return "?"
+        return "?" if key == "flushes" else "—"
     s = f"{v:.2f}" if abs(v) >= 0.005 else "0.00"
     notes = " ".join(cj.get("notes", []))
     if cj.get("background_free") is False:
@@ -101,20 +101,29 @@ def fmt(cj):
 
 
 def main(rundir, c):
-    print(f"#### Flushes per op at C={c}: create / create+first-write (idle control subtracted)\n")
-    print("| System | Variant | " + " | ".join(h for _, _, h in COLS) + " |")
-    print("|---|---|" + "---|" * len(COLS))
+    # Every op is a CYCLE: create [+ switch][+ first write], then the untimed delete that holds the live-branch count
+    # fixed (lead review 62430d8bf..b49fb656a HIGH 1). Per-create flushes exist at C=1 only, from the phase split.
+    tables = [("flushes", f"#### Flushes per cycle at C={c}: create cycle / create+first-write cycle (each cycle ends "
+                          "in its untimed delete; idle control subtracted)\n")]
+    if str(c) == "1":
+        tables.append(("create", "\n#### Flushes per create at C=1: the create share of each cycle (each flush placed "
+                                 "by the load generator's op times; the delete's and the between-op flushes left out; "
+                                 "idle control subtracted over the create time)\n"))
     label = {DOLT: f"Dolt {run_version(rundir, 'dolt')} sql-server",
              DOLTGRES: f"Doltgres {run_version(rundir, 'doltgres')}"}
-    for sysl, var, system, cspec, wspec in ROWS:
-        sysl = label.get(sysl, sysl)
-        cells = []
-        for runner, fs, _ in COLS:
-            a = fmt(load(rundir, system, runner, fs, cspec, c))
-            b = fmt(load(rundir, system, runner, fs, wspec, c)) if wspec else "—"
-            cells.append(f"{a} / {b}")
-        print(f"| {sysl} | {var} | " + " | ".join(cells) + " |")
-    print(f"\n#### PostgreSQL 18 deferred flushes per op at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
+    for key, title in tables:
+        print(title)
+        print("| System | Variant | " + " | ".join(h for _, _, h in COLS) + " |")
+        print("|---|---|" + "---|" * len(COLS))
+        for sysl, var, system, cspec, wspec in ROWS:
+            sysl = label.get(sysl, sysl)
+            cells = []
+            for runner, fs, _ in COLS:
+                a = fmt(load(rundir, system, runner, fs, cspec, c), key)
+                b = fmt(load(rundir, system, runner, fs, wspec, c), key) if wspec else "—"
+                cells.append(f"{a} / {b}")
+            print(f"| {sysl} | {var} | " + " | ".join(cells) + " |")
+    print(f"\n#### PostgreSQL 18 deferred flushes per cycle at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
     print("| Job | Spec | " + " | ".join(h for _, _, h in COLS) + " |")
     print("|---|---|" + "---|" * len(COLS))
     for system in ("pg18-d2",):

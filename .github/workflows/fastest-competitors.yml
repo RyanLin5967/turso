@@ -77,6 +77,10 @@ jobs:
       - name: Refusal plants (a real run with the smoke warm-up cap, pg18-defaults) and timedrun.py selftest
         run: |
           timeout 120 python3 -B fastest/linux/competitors/timedrun.py selftest | tail -1
+          # HIGH 1's checks: the live-branch count (timedrun, fixture) and the C=1 phase split with its plant
+          timeout 120 python3 -B fastest/linux/competitors/fixture.py selftest | tail -1
+          timeout 120 python3 -B fastest/linux/competitors/stracecount.py selftest | tail -1
+          timeout 120 python3 -B fastest/linux/competitors/gen_seed.py selftest | tail -1
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
           # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
           # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.

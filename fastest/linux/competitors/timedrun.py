@@ -140,6 +140,21 @@ def check(celldir, n, warm_rule=None, live=None):
         traced = [r for r in rows if r[3] != 0]
         if traced:
             why.append(f"traced during the timed run: {traced[:5]}")
+    if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
+        got = {}
+        try:
+            for ln in open(os.path.join(celldir, "live.tsv")):
+                p = ln.split()
+                if len(p) == 2:
+                    got[p[0]] = p[1]
+        except OSError:
+            got = None
+        if got is None:
+            why.append("no live-branch record live.tsv: N around the runs is unknown")
+        else:
+            bad = {k: got.get(k) for k in LIVE_KEYS if got.get(k) != str(live)}
+            if bad:
+                why.append(f"live-branch count not held at {live}: {bad}")
     return why
 
 
@@ -150,6 +165,10 @@ def write_verdict(celldir, n, why):
            "labelling_dir": "bb", "ops_total": n,
            "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
            "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)}}
+    try:  # the live-branch counts around both runs, as run_system.sh read them (HIGH 1)
+        out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
+    except OSError:
+        out["live_branches"] = None
     with open(os.path.join(celldir, "timed.json"), "w") as f:
         json.dump(out, f)
     return out

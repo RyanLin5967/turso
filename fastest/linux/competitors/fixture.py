@@ -5,14 +5,16 @@ Every system times its creates against the same parent: gen_seed.py's table t at
 random single-row UPDATEs (0 = fresh, PREREG §7 / amendment 52: 1e5), with PREBRANCH live branches made before the
 cells (each with one private write: the system's own M1 op, untimed). Each job writes RAW/fixture.json:
 
-  {"system", "rows", "age_updates", "prebranch", "gen_seed_sha256" (of the exact SQL stream loaded, aging included),
-   "du_bytes" (du of the parent's files), "engine_bytes" (as the engine reports it; null only with "engine_bytes_why"),
-   "extents" (data file -> extent count), "maintenance" (the post-load steps run)}
+  {"system", "rows", "age_updates", "prebranch", "live_branches" (MEASURED after prebranch: the live-branch count N
+   every cell runs at, main excluded; lead review HIGH 1), "gen_seed_sha256" (gen_seed.py's digest of the SQL stream
+   for these rows and aging), "du_bytes" (du of the parent's files), "engine_bytes" (as the engine reports it; null
+   only with "engine_bytes_why"), "extents" (data file -> extent count), "maintenance" (the post-load steps run)}
 
-  fixture.py compare JSON...   exit 0 only when every fixture.json names the same rows, age_updates, prebranch and
-                               gen_seed_sha256, and each has du_bytes and either engine_bytes or a reason
-  fixture.py write OUT --system S --rows R --age K --prebranch N --du PATH... [--engine-bytes B | --engine-why W]
-                   [--extents FILE...] [--maintenance TEXT]
+  fixture.py compare JSON...   exit 0 only when every fixture.json names the same rows, age_updates, prebranch,
+                               live_branches and gen_seed_sha256, each one's live_branches equals its prebranch, and
+                               each has du_bytes and either engine_bytes or a reason
+  fixture.py write OUT --system S --rows R --age K --prebranch N --live L --du PATH... [--engine-bytes B |
+                   --engine-why W] [--extents FILE...] [--maintenance TEXT]
                                OUT = fixture.json: du_bytes = `du -sB1` over the PATHs (allocated bytes), extents =
                                filefrag's count per FILE, gen_seed_sha256 = gen_seed.py's digest for (R, K, seed 1)
   fixture.py sqlite FILE --rows R --age K --sqlite3 BIN
@@ -33,7 +35,7 @@ sys.path.insert(0, HERE)
 import gen_seed  # noqa: E402
 
 
-KEYS = ("rows", "age_updates", "prebranch", "gen_seed_sha256")
+KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256")
 
 
 def compare(fixtures):
@@ -51,6 +53,10 @@ def compare(fixtures):
             why.append(f"{k} differs: " + "; ".join(f"{json.loads(v)} on {ss}" for v, ss in vals.items()))
     for f in fixtures:
         s = f.get("system", "?")
+        # HIGH 1: the live-branch count every cell runs at is MEASURED (count_branches after prebranch, main
+        # excluded) and must be the requested one
+        if f.get("live_branches") is not None and f.get("live_branches") != f.get("prebranch"):
+            why.append(f"{s}: {f.get('live_branches')} live branches measured, {f.get('prebranch')} requested")
         if not isinstance(f.get("du_bytes"), int) or f["du_bytes"] <= 0:
             why.append(f"{s}: no du_bytes")
         eb = f.get("engine_bytes")
@@ -94,7 +100,9 @@ def extent_count(path):
 def write(av):
     out, o = av[0], opts(av[1:])
     rows, age = int(o["--rows"]), int(o["--age"])
+    lv = o.get("--live", "")
     fx = {"system": o["--system"], "rows": rows, "age_updates": age, "prebranch": int(o["--prebranch"]),
+          "live_branches": int(lv) if lv.isdigit() else None,
           "gen_seed_sha256": gen_seed.digest(rows, age, 1), "du_paths": o.get("--du", []),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,

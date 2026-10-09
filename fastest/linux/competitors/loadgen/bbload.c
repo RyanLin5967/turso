@@ -12,7 +12,9 @@
  *                                                    with --max-ops it is the registered per-run cap: a run it ends
  *                                                    with >= 1000 ok ops is complete with reduced n (capped: true)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
- *          [--stall-s S] [--allow-errors]
+ *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
+ *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
+ *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
  * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
@@ -34,6 +36,8 @@
  *   step connect <overrides>      timed; open a new connection (home conninfo + overrides) that becomes current
  *   step close                    timed; close the current non-home connection
  *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns
+ *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
+ *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -110,7 +114,7 @@ enum { P_PG = 0, P_MYSQL = 1 };
 enum { K_SQL, K_WRITE, K_CONNECT, K_CLOSE };
 enum { PH_INIT = 0, PH_WARM = 1, PH_MEAS = 2, PH_DRAIN = 3, PH_ABORT = 4 };
 
-typedef struct { int k; char *t; } step_t;
+typedef struct { int k; char *t; int serial; } step_t;
 typedef struct {
     int proto;
     char *connect;
@@ -150,6 +154,7 @@ typedef struct {
 
 static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
+static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
 static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
 static char WARM_RULE[64] = "";
 #define CAPPED_MIN 1000ULL /* PREREG: a capped run with >= 1000 measured ok ops is complete with reduced n */
@@ -166,6 +171,7 @@ static volatile uint64_t g_t0, g_tm0, g_tm1; /* run start, window start, window 
 static volatile uint64_t g_warm_claimed, g_meas_claimed, g_completed;
 static int g_nready, g_nfailed;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_serial_mu = PTHREAD_MUTEX_INITIALIZER; /* one sql-serial statement at a time, all clients */
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static char *g_errs[MAXERR];
 static uint64_t g_errn[MAXERR];
@@ -226,7 +232,9 @@ static int parse_step(char *rest, step_t *st, char *why) {
     while (*arg && *arg != ' ' && *arg != '\t') arg++;
     if (*arg) *arg++ = 0;
     arg = trim(arg);
+    st->serial = 0;
     if (!strcmp(kw, "sql")) st->k = K_SQL;
+    else if (!strcmp(kw, "sql-serial")) { st->k = K_SQL; st->serial = 1; }
     else if (!strcmp(kw, "write")) st->k = K_WRITE;
     else if (!strcmp(kw, "connect")) st->k = K_CONNECT;
     else if (!strcmp(kw, "close")) st->k = K_CLOSE;
@@ -501,7 +509,13 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
         return 0;
     }
     conn_t *target = *have_branch ? cur : &c->home;
-    return conn_exec(target, text, st->k == K_WRITE, why, wsz);
+    if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
+    /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
+     * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    pthread_mutex_lock(&g_serial_mu);
+    int rc = conn_exec(target, text, 0, why, wsz);
+    pthread_mutex_unlock(&g_serial_mu);
+    return rc;
 }
 
 static void record(client_t *c, const oprec *r) {
@@ -609,7 +623,7 @@ static void *client_main(void *arg) {
         }
         r.end = now_ns();
         if (V1 && C == 1) v1_set_mark(V1, V1_MARK_IDLE | (MARKB + seq + 1));
-        for (int k = 0; k < S.nafter; k++)
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; k++)
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
@@ -695,6 +709,7 @@ int main(int argc, char **argv) {
 #endif
         }
         else if (!strcmp(a, "--allow-errors")) ALLOW_ERR = 1;
+        else if (!strcmp(a, "--skip-after")) SKIP_AFTER = 1;
         else if (!strcmp(a, "--set") && v) {
             char *eq = strchr(argv[++i], '=');
             if (!eq || NSET >= MAXLIST) { fprintf(stderr, "bbload: --set k=v\n"); return 2; }
@@ -737,8 +752,13 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&g_mu);
     while (g_nready + g_nfailed < C) pthread_cond_wait(&g_cv, &g_mu);
     int failed = g_nfailed;
+    /* No warm-up asked for (all of OPS, S and MAX_S zero): the run starts in the measured phase, so --max-ops N makes
+     * exactly N ops. With a warm phase the first 1 ms tick let every client claim a warm op first, so an untimed
+     * N-op run (the prebranch) made about N + C (lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1). */
+    int nowarm = WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0;
     g_t0 = now_ns();
-    __atomic_store_n(&g_phase, failed ? PH_ABORT : PH_WARM, __ATOMIC_RELEASE);
+    if (nowarm && !failed) __atomic_store_n(&g_tm0, g_t0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_phase, failed ? PH_ABORT : (nowarm ? PH_MEAS : PH_WARM), __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     if (failed) {
@@ -747,9 +767,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bbload: %d of %d clients failed to connect or set up\n", failed, C);
         return 2;
     }
-    if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_WARM);
+    if (V1 && C > 1) v1_set_mark(V1, MARKB + (nowarm ? PH_MEAS : PH_WARM));
     struct rusage ru0, ru1;
     memset(&ru0, 0, sizeof ru0);
+    if (nowarm) getrusage(RUSAGE_SELF, &ru0);
     uint64_t last_done = 0, last_progress = now_ns();
     int stalled = 0, short_window = 0;
     for (;;) {
@@ -879,6 +900,7 @@ int main(int argc, char **argv) {
             v1run ? v1run : "", (unsigned long long)MARKB);
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
+    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
     if (!WARM_RULE[0]) snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:0", (unsigned long long)WARM_OPS, WARM_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",

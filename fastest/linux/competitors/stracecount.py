@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """stracecount.py -- exact flush counts from `strace -f -C -y` output (lane fastest-linux-comp).
 
-  stracecount.py count TRACE [--extra FILE]... [--root DIR] [--window W] [--clients BACKENDS.TSV]   -> JSON
+  stracecount.py count TRACE [--extra FILE]... [--root DIR] [--window W] [--clients BACKENDS.TSV] [--phases RAW.TSV]
+                      -> JSON (--phases: a C=1 run's raw.tsv; the flushes are also split into create / delete /
+                      between by its op times, see PHASES; refused for C>1)
+  stracecount.py selftest                                        the phase split's known answers and plant
                       (--extra: strace's stderr file; --window: trace.sh's OUT.window, whose proven-attach line is
                       what licenses reading a table-less, call-less attach window as zero; its OUT.pids roster and
                       the window's clone/fork lines map every flushing thread to a process and a role; --clients:
@@ -82,12 +85,41 @@ PHASES = ("create", "delete", "between")
 
 
 def load_intervals(raw):
-    """RED stub: no intervals."""
-    return []
+    """[(start_ns, end_ns, after_end_ns)] sorted by start, from bbload's or clonebench's raw.tsv (every op, warm-up and
+    drain included: their flushes are in the window too). Raises ValueError when the run is not C=1 (ops overlap and
+    cannot be placed by time), lacks a column, or holds no op."""
+    with open(raw) as f:
+        head = f.readline().rstrip("\n").split("\t")
+        need = ("client", "start_ns", "end_ns", "after_ns")
+        if any(k not in head for k in need):
+            raise ValueError(f"{raw}: no {[k for k in need if k not in head]} column")
+        ix = [head.index(k) for k in need]
+        iv, clients = [], set()
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < len(head):
+                continue
+            clients.add(p[ix[0]])
+            s, e, a = int(p[ix[1]]), int(p[ix[2]]), int(p[ix[3]])
+            iv.append((s, e, e + a))
+    if len(clients) > 1:
+        raise ValueError(f"{raw}: {len(clients)} clients: ops overlap at C>1, so no phase split")
+    if not iv:
+        raise ValueError(f"{raw}: no op")
+    return sorted(iv)
 
 
 def phase_of(t_ns, iv):
-    """RED stub."""
+    """create if START <= t <= END of some op, delete if END < t <= END + AFTER, else between."""
+    import bisect
+    k = bisect.bisect_right(iv, (t_ns, float("inf"), float("inf"))) - 1
+    if k < 0:
+        return "between"
+    s, e, a = iv[k]
+    if s <= t_ns <= e:
+        return "create"
+    if e < t_ns <= a:
+        return "delete"
     return "between"
 
 
@@ -391,6 +423,20 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
                 problems.append(f"call stamps {first_ts:.6f}..{last_ts:.6f} outside the window's life "
                                 f"[{lo:.6f}, {hi:.6f}]: the clock or the stamps are wrong")
             out_clock = steps
+    # The C=1 phase split (see PHASES): raw.tsv's CLOCK_MONOTONIC op times against the calls' CLOCK_REALTIME stamps,
+    # through the t0 pair's realtime-minus-monotonic offset (the clock checks above refuse a window whose offset moved).
+    ph_iv, ph_off, by_phase = None, None, None
+    if phases is not None:
+        try:
+            ph_iv = load_intervals(phases)
+        except (OSError, ValueError) as e:
+            problems.append(f"phase split asked for but impossible: {e}")
+        if "t0" in clock and "t0_mono" in clock:
+            ph_off = clock["t0"] - clock["t0_mono"]
+        else:
+            problems.append("phase split asked for but the window has no t0 clock pair to map the op times with")
+        if ph_iv is not None and ph_off is not None:
+            by_phase = {k: 0 for k in PHASES}
     before_t0, after_t1 = 0, 0
 
     def selected(ts):
@@ -439,6 +485,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
             else:
                 key = name
             flush[key] += 1
+            if by_phase is not None:
+                if ts is None:
+                    problems.append("a flush without a -ttt stamp: the phase split cannot place it")
+                    by_phase = None
+                else:
+                    by_phase[phase_of(int(round((ts - ph_off) * 1e9)), ph_iv)] += 1
             by_tid.setdefault(tid, {}).setdefault(key, 0)
             by_tid[tid][key] += 1
             pm = FDPATH.match(rest)
@@ -478,6 +530,11 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
         elif name == "io_submit":
             other["io_submit"] += 1
     out["flush_by_syscall"] = flush
+    if phases is not None:
+        out["flush_by_phase"] = by_phase  # None when the split was refused (the verdict says why)
+        if ph_iv:  # the time the ops spent in each phase, for an idle control scaled to it
+            out["phase_time_s"] = {"create": round(sum(e - s for s, e, _ in ph_iv) / 1e9, 6),
+                                   "delete": round(sum(a - e for _, e, a in ph_iv) / 1e9, 6)}
     out["t0"], out["calls_before_t0"], out["t1"], out["calls_after_t1"] = t0, before_t0, t1, after_t1
     out["clock_back_steps"], out["clock_max_back_s"] = back_steps, round(max_back, 6)
     out["clock_pairs"] = out_clock  # [from, to, realtime minus monotonic delta in s] per consecutive pair (attach)
@@ -616,6 +673,20 @@ def cell(a):
     # Attribution by process role (count(): attach roster + clone lineage + the load generator's backends).
     per["foreground"] = round(load.get("foreground_flushes", 0) / ops, 4)
     per["background"] = round(load.get("background_flushes", 0) / ops, 4)
+    # Every op is a CYCLE (lead review 62430d8bf..b49fb656a HIGH 1): create [+ switch][+ first write], then its untimed
+    # delete, so every per-op figure above is per cycle. At C=1 only the window is also split by op phase (the lead's
+    # ruling): "create" is the only per-create flush figure, idle-subtracted by the idle rate over the create time.
+    res["unit"] = "cycle: create [+ switch][+ first write] + the untimed delete"
+    ph = load.get("flush_by_phase")
+    if isinstance(ph, dict):
+        pt = load.get("phase_time_s", {})
+        rate = 0.0 if embedded else (res["idle"]["flushes"] / idle_s if idle_s > 0 else None)
+        for k in ("create", "delete", "between"):
+            per[k + "_raw"] = round(ph[k] / ops, 4)
+        for k in ("create", "delete"):
+            per[k] = round((ph[k] - rate * pt.get(k, 0.0)) / ops, 4) if rate is not None else None
+        res["phase_split"] = {"counts": ph, "time_s": pt, "rule": "C=1 only: each flush placed by its start stamp "
+                              "against the load generator's op times (create [start, end], delete (end, end + after])"}
     res["per_op"] = per
     res["load_by_role"] = load.get("by_role", {})
     res["idle_by_role"] = idle.get("by_role", {})
@@ -662,18 +733,20 @@ def cell(a):
     return res
 
 
-TABLE_COLS = ["name", "ops", "ops_ok", "flushes/op", "raw/op", "foreground/op", "background/op", "background_free",
-              "idle_flushes", "idle_s", "load_s", "fsync/op", "fdatasync/op", "sync_file_range/op",
-              "copy_file_range/op", "ficlone/op", "deferred/op", "verdict", "notes"]
+# Per CYCLE (create [+ switch][+ first write] + the untimed delete; HIGH 1), except the two C=1-only phase columns.
+TABLE_COLS = ["name", "ops", "ops_ok", "flushes/cycle", "raw/cycle", "create/op(C=1)", "delete/op(C=1)",
+              "foreground/cycle", "background/cycle", "background_free", "idle_flushes", "idle_s", "load_s",
+              "fsync/cycle", "fdatasync/cycle", "sync_file_range/cycle", "copy_file_range/cycle", "ficlone/cycle",
+              "deferred/cycle", "verdict", "notes"]
 
 
 def table_row(c):
     p = c.get("per_op", {})
-    return [c.get("name"), c.get("ops"), c.get("ops_ok"), p.get("flushes"), p.get("flushes_raw"), p.get("foreground"),
-            p.get("background"), c.get("background_free"), c.get("idle", {}).get("flushes"), c.get("idle_s"),
-            c.get("load_s"), p.get("fsync"), p.get("fdatasync"), p.get("sync_file_range"),
-            p.get("copy_file_range_calls"), p.get("ficlone"), c.get("deferred", {}).get("per_op", ""),
-            c.get("verdict"), " | ".join(c.get("notes", []))]
+    return [c.get("name"), c.get("ops"), c.get("ops_ok"), p.get("flushes"), p.get("flushes_raw"), p.get("create", ""),
+            p.get("delete", ""), p.get("foreground"), p.get("background"), c.get("background_free"),
+            c.get("idle", {}).get("flushes"), c.get("idle_s"), c.get("load_s"), p.get("fsync"), p.get("fdatasync"),
+            p.get("sync_file_range"), p.get("copy_file_range_calls"), p.get("ficlone"),
+            c.get("deferred", {}).get("per_op", ""), c.get("verdict"), " | ".join(c.get("notes", []))]
 
 
 def table(d):
@@ -702,8 +775,10 @@ def selftest():
 
     def raw(rows, header=hdr):
         return header + "".join("\t".join(str(x) for x in r) + "\n" for r in rows)
-    # op k: start 1000.05 + 0.2k s, end + 0.1 s, after 0.1 s (ns, CLOCK_MONOTONIC)
-    rows = [(0, k, "measure", 1, 0, 1000050000000 + k * 200000000, 1000150000000 + k * 200000000, 100000000,
+    # op k: start 1000.05 + 0.3k s, end + 0.1 s, after 0.1 s, then 0.1 s between ops (ns, CLOCK_MONOTONIC). (The RED
+    # commit spaced ops 0.2 s apart, so op k's delete ended at op k+1's start and three cases asked for "delete" or
+    # "between" at an instant that is also the next create's start; the abutting case is now a case of its own.)
+    rows = [(0, k, "measure", 1, 0, 1000050000000 + k * 300000000, 1000150000000 + k * 300000000, 100000000,
              100000000, -1) for k in range(3)]
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "raw.tsv")
@@ -715,8 +790,13 @@ def selftest():
         ok("load_intervals reads 3 ops", len(iv) == 3, iv)
         for t, want in ((1000100000000, "create"), (1000150000000, "create"), (1000150000001, "delete"),
                         (1000250000000, "delete"), (1000250000001, "between"), (1000000000000, "between"),
-                        (1000500000000, "create"), (1000700000000, "between")):
+                        (1000400000000, "create"), (1000500000000, "delete"), (1000900000000, "between")):
             ok(f"phase_of({t}) = {want}", phase_of(t, iv) == want, phase_of(t, iv))
+        # back-to-back ops (the closed loop's usual shape): the instant one op's delete ends and the next starts is
+        # the next create's
+        abut = [(1, 2, 3), (3, 4, 5)]
+        ok("abutting ops: the shared instant is the next create's", phase_of(3, abut) == "create", phase_of(3, abut))
+        ok("abutting ops: inside the first delete", phase_of(2.5, abut) == "delete", phase_of(2.5, abut))
         for name, text in (("two clients (C>1: no split)", raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)])),
                            ("no after_ns column", raw([r[:8] + r[9:] for r in rows],
                                                       hdr.replace("\tafter_ns", ""))),
@@ -750,6 +830,14 @@ def selftest():
         ok("plant: create 2, delete 1, between 1", r.get("flush_by_phase") == {"create": 2, "delete": 1, "between": 1},
            r.get("flush_by_phase"))
         ok("plant: the window itself is ok", r.get("verdict") == "ok", r.get("verdict"))
+        lj = os.path.join(d, "load.json")
+        json.dump(r, open(lj, "w"))
+        c = cell({"name": "plant/b1-m1-d2-c1", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0"})
+        pc = c.get("per_op", {})
+        ok("cell: 4 flushes over 3 cycles; create 2/3 and delete 1/3 per op at C=1",
+           (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")) == (1.3333, 0.6667, 0.3333,
+                                                                                               0.3333),
+           (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")))
         r2 = count(tr, [], "/x", w)
         ok("no split unless asked", "flush_by_phase" not in r2, r2.get("flush_by_phase"))
         open(p, "w").write(raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)]))

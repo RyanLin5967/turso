@@ -17,15 +17,21 @@
 #   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
 #               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
 #               op's dirty pages), reported apart from the window and never added to it
-#   cell.json : stracecount.py cell: flushes per op = (load - idle x load_s/idle_s) / ops, the raw count, and the
+#   cell.json : stracecount.py cell: flushes per CYCLE = (load - idle x load_s/idle_s) / ops, the raw count, and the
 #               split by process role (foreground: main, the load generator's backends, PG checkpointer/walwriter/
 #               bgwriter/io workers; background: everything else); background_free when the idle control and the
-#               load window's background processes flushed nothing
+#               load window's background processes flushed nothing; at C=1 also the split by op phase (create /
+#               delete / between, by the load generator's op times), whose create share is the only flushes-per-create
+# Every op is a CYCLE (lead review 62430d8bf..b49fb656a HIGH 1; PREREG §7 "N is held fixed"): the spec's timed steps,
+# then its untimed after-steps -- close the branch connection, delete the branch (Dolt/Doltgres one at a time) --
+# or clonebench --drop, so the live-branch count N stays LIVE0 (read back after prebranch) through every labelling and
+# timed run; CELLDIR/live.tsv records it around both, and timedrun.py check refuses a cell where it moved.
 # B1 is embedded (no server): its load window runs clonebench under strace from exec, there is no idle control
 # (no process exists outside the op loop), and the per-path classes in cell.json split branch from parent flushes.
 #
-# Then the functional checks of tools/competitors/SMOKE.md: isolation (parent/main sum(v) = the aged parent's PSUM,
-# gen_seed.py sum; a branch written by one M1 op reads PSUM + 1 over ROWS rows) and branch counts (every created branch exists), plus, where the system
+# Then the functional checks of tools/competitors/SMOKE.md: the branch count is LIVE0 after the cells; isolation
+# (parent/main sum(v) = the aged parent's PSUM, gen_seed.py sum; a DESIGNATED branch, one M1 op made after the cells
+# and kept, reads PSUM + 1 over ROWS rows), and the count then rose by exactly the designated branches, plus, where the system
 # clones, the clone proof (filefrag: the branch file's blocks ARE the parent's blocks, flagged shared; strace: the
 # copy_file_range / FICLONE calls). RAW/functional.txt ends in a VERDICT line; exit 1 if any check failed.
 set -uo pipefail
@@ -224,8 +230,15 @@ count_branches() {
   case $KIND in
     pg) sqlq "SELECT count(*) FROM pg_database WHERE datname LIKE 'b\_%'" ;;
     dolt|doltgres) sqlq "SELECT count(*) FROM dolt_branches" ;;
+    b1) find "$ROOT/branches" -name 'b_*.db' | awk 'END {print NR}' ;;
   esac
 }
+# The live-branch count N (lead review 62430d8bf..b49fb656a HIGH 1). Every create spec deletes its branch in an
+# untimed after-step (bbload) or with --drop (clonebench), so N stays at LIVE0 -- the count right after prebranch, main
+# included for Dolt/Doltgres -- for every cell. live_mark CELLDIR KEY appends "KEY N" to CELLDIR/live.tsv (read
+# outside every traced window); timedrun.py check refuses the cell unless all four keys read LIVE0.
+LIVE0=""
+live_mark() { echo "$2 $(count_branches)" >>"$1/live.tsv"; }
 
 bb_args() { # bb_args SPEC C N OUT [nowarm] -> BBA: the one bbload command line, so the labelling and timed runs are
   # identical; both warm up by WARMUP (gate-6 review, t3run item 3). nowarm: the untimed conncheck.
@@ -273,11 +286,14 @@ timed_run() {
 # count OUT -- stracecount over one window. A refused or crashed count FAILS the job (review finding 1: it used to
 # end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
 count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of OUT's tsplit stamp into JSON
-  local rc=0 cl=() pt=() js="$1.json"
+  # CPHASES=RAW.tsv (set by the caller for a C=1 load window only): split its flushes into create / delete / between by
+  # the load generator's op times (lead ruling on HIGH 1's flush attribution: at C>1 ops overlap, so no split).
+  local rc=0 cl=() pt=() ph=() js="$1.json"
   [ -n "${2:-}" ] && cl=(--clients "$2")
   [ -n "${3:-}" ] && { pt=(--part "$3"); js=$4; }
+  [ -n "${CPHASES:-}" ] && ph=(--phases "$CPHASES")
   python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} \
-    ${pt[@]+"${pt[@]}"} >"$js" || rc=$?
+    ${pt[@]+"${pt[@]}"} ${ph[@]+"${ph[@]}"} >"$js" || rc=$?
   [ $rc -eq 0 ] || fail "count $js: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$js" 2>&1 | tail -1))"
 }
 # ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
@@ -293,7 +309,7 @@ ops_of() {
 timedrun_check() {
   local k=1
   case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
-  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
     fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
   fi
@@ -321,6 +337,7 @@ run_server_cell() { # run_server_cell SPEC C
   used0=$(fsused)
   local log0 log1
   log0=$(stat -c %s "$DATA.log")
+  live_mark "$d" label_before
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
@@ -339,6 +356,7 @@ run_server_cell() { # run_server_cell SPEC C
     sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
   fi
   strace_detach "$d/load"
+  live_mark "$d" label_after
   used1=$(fsused)  # PG: after the CHECKPOINT
   echo "fs_used_before=$used0 fs_used_after=$used1 delta=$((used1 - used0))" >"$d/space.txt"
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
@@ -361,15 +379,21 @@ run_server_cell() { # run_server_cell SPEC C
   # run's deferred work out of the next cell's idle control and labelling window.
   if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s (before the timed run)"; fi
   bb_args "$spec" "$c" "$n" "$d/timed"
+  live_mark "$d" timed_before
   timed_run "$d/timed" "$(server_pid)" -- "${BBA[@]}" >/dev/null || true
+  live_mark "$d" timed_after
   if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
   timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
+  # Every op is a cycle now (create [+ switch][+ first write] + the untimed delete): at C=1 the load window's flushes
+  # are also split by op phase, the create share being the only per-create flush figure (lead ruling on HIGH 1).
+  local cph=""
+  [ "$c" = 1 ] && cph="$d/bb/raw.tsv"
   if [ "$KIND" = pg ]; then
-    count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
+    CPHASES=$cph count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
     count "$d/load" "$d/bb/backends.tsv" post "$d/deferred.json"
   else
-    count "$d/load" "$d/bb/backends.tsv"
+    CPHASES=$cph count "$d/load" "$d/bb/backends.tsv"
   fi
   ops_of "$d/bb" "$d"
   read -r total ok created <"$d/ops.txt"
@@ -400,22 +424,40 @@ server_fixture() {
       ext=("$DATA"/databases/*/.dolt/noms/*) ;;
   esac
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
-    --prebranch "$PREBRANCH" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} ${why:+--engine-why "$why"} \
-    --extents "${ext[@]}" --maintenance "$maint" >/dev/null || fail "fixture.json"
+    --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} \
+    ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" >/dev/null || fail "fixture.json"
+}
+# designate SPEC -- after the cells: ONE op of SPEC (C=1, no warm-up) with its after-steps skipped, so its branch
+# stays for the functional checks to read (the isolation read, the clone proof); prints the branch name. Untraced,
+# untimed, outside every cell.
+designate() {
+  mkdir -p "$RAW/designated"
+  bb_args "$1" 1 1 "$RAW/designated/$1" nowarm
+  "${BBA[@]}" --skip-after >"$RAW/designated/$1.txt" 2>&1 || { tail -1 "$RAW/designated/$1.txt"; return 1; }
+  python3 "$FH" branch "$RAW/designated/$1"
+}
+# live_excl_main -- LIVE0 without Dolt/Doltgres's main: the live branches every cell runs at, comparable across systems
+live_excl_main() {
+  case $LIVE0 in ''|*[!0-9]*) echo unknown; return ;; esac
+  if [ "$KIND" = dolt ] || [ "$KIND" = doltgres ]; then echo $((LIVE0 - 1)); else echo "$LIVE0"; fi
 }
 # prebranch_server -- PREBRANCH live branches before the cells, each with one private write: the system's own M1 op
-# (bbload, C=4, no warm-up, untraced, untimed); their creates join the branch-count check (RAW/prebranch.ops.txt).
+# (bbload --skip-after, so the branches stay; C=1 and no warm-up, so exactly PREBRANCH ops; untraced, untimed). Then
+# LIVE0 is READ (count_branches), and the job fails unless it is exactly PREBRANCH (+ main for Dolt/Doltgres): every
+# cell runs at that N (lead review 62430d8bf..b49fb656a HIGH 1, MED 3: the requested count used to be recorded, and a
+# C=4 run with a warm tick overshot it by about C).
 prebranch_server() {
-  [ "$PREBRANCH" -gt 0 ] || return 0
-  local sp
-  case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
-  bbload "$sp" 4 "$PREBRANCH" "$RAW/prebranch" nowarm >/dev/null || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
-  if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
-  python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || { fail "prebranch ops reader"; echo "0 0 0" >"$RAW/prebranch.ops.txt"; }
-  local created
-  created=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")
-  [ "$created" -ge "$PREBRANCH" ] 2>/dev/null && pass "prebranch: $created live branches with one private write each" ||
-    fail "prebranch: $created branches made, want >= $PREBRANCH"
+  local sp want
+  want=$PREBRANCH
+  [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
+  if [ "$PREBRANCH" -gt 0 ]; then
+    case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
+    bb_args "$sp" 1 "$PREBRANCH" "$RAW/prebranch" nowarm
+    "${BBA[@]}" --skip-after >"$RAW/prebranch.txt" 2>&1 || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
+    if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
+  fi
+  LIVE0=$(count_branches)
+  expect "live branches before the cells (LIVE0, read back)" "$LIVE0" "$want"
 }
 
 server_main() {
@@ -438,8 +480,8 @@ server_main() {
   fi
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
   srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { fail "seed"; return; }
-  server_fixture
   prebranch_server
+  server_fixture  # after prebranch: it records the live-branch count read back there (HIGH 1, MED 3)
   if [ "$KIND" = pg ]; then
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
@@ -479,28 +521,27 @@ server_main() {
   done
 
   fun "## functional checks ($SYSTEM on $(findmnt -n -o FSTYPE -T "$MNT"))"
+  # Every cell deleted what it created (HIGH 1), so the count is still LIVE0 here; the designated branches below are
+  # each ONE create with no delete (bbload --skip-after), and the count must rise by exactly their number: the counter
+  # that holds N fixed is shown to see a create that was not deleted.
+  expect "branch count after every cell (every create deleted: LIVE0)" "$(count_branches)" "$LIVE0"
+  local br spec
+  NDES=0  # designated branches made (each one create, no delete)
   # The clone proof first: a later read of the template could dirty a page whose write-back un-shares its extent.
   if [ "$KIND" = pg ]; then pg_clone_proof; fi
   expect "isolation: parent/main count|sum(v)" "$(sqlp "$COUNTSUM")" "$ROWS|$PSUM"
-  local want=0 m1 br
-  [ -f "$RAW/prebranch.ops.txt" ] && want=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")  # the live branches made first
-  for d in "$RAW"/cells/*; do
-    case $(basename "$d") in *select1*) continue ;; esac
-    [ -f "$d/ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/ops.txt")))
-    [ -f "$d/timed.ops.txt" ] && want=$((want + $(cut -d' ' -f3 "$d/timed.ops.txt")))  # the timed run's creates too
-  done
-  [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
-  expect "branch count (every created branch exists; created from raw.tsv)" "$(count_branches)" "$want"
   local nm1=0
-  for d in "$RAW"/cells/*-m1-c1 "$RAW"/cells/*-m1-wal-c1; do  # every M1 variant's first branch: one UPDATE, sum 1
-    [ -d "$d/bb" ] || continue
-    m1=$(basename "$d")
+  for spec in $SPECLIST; do  # every M1 variant: one designated branch, one UPDATE, sum PSUM + 1
+    case $spec in *-m1|*-m1-wal) ;; *) continue ;; esac
     nm1=$((nm1 + 1))
-    br=$(python3 "$FH" branch "$d/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
-    expect "isolation: $m1 branch $br count|sum(v) after one UPDATE" \
+    br=$(designate "$spec") || { fail "isolation $spec: no designated branch ($br)"; continue; }
+    NDES=$((NDES + 1))
+    expect "isolation: $spec designated branch $br count|sum(v) after one UPDATE" \
       "$(on_branch "$br" "$COUNTSUM" | tr '\t' '|')" "$ROWS|$((PSUM + 1))"
   done
-  [ $nm1 -gt 0 ] || fail "isolation: no M1 cell to read a branch from"
+  [ $nm1 -gt 0 ] || fail "isolation: no M1 spec to make a designated branch from"
+  expect "branch count after $NDES designated create(s) with no delete (the N counter sees a kept create)" \
+    "$(count_branches)" "$((LIVE0 + NDES))"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
   cp "$DATA.log" "$RAW/server_log.txt" 2>/dev/null
 }
@@ -510,13 +551,16 @@ pg_clone_proof() {
   # file_copy_method=clone; disjoint under copy. The strace half: copy_file_range calls in the create window. The
   # server runs clone (pg18-d2); pg18-create-copy is the negative control, its session
   # SET to copy: the same two instruments must read "copy" and 0 there, or the proof could not tell them apart.
+  # Every cell's branches are deleted (HIGH 1), so the filefrag half reads a DESIGNATED branch of the same spec, made
+  # after the cells (one create, kept); the strace half still reads the cell's own C=1 window.
   local cell want br tfile bfile cfr ncell=0
   tfile="$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")"
   for cell in pg18-create-c1 pg18-create-copy-c1; do
     [ -d "$RAW/cells/$cell/bb" ] || continue
     ncell=$((ncell + 1))
     case $cell in *copy*) want=copy ;; *) want=clone ;; esac
-    br=$(python3 "$FH" branch "$RAW/cells/$cell/bb") || { fail "clone proof $cell: no ok create"; continue; }
+    br=$(designate "${cell%-c1}") || { fail "clone proof $cell: no designated branch ($br)"; continue; }
+    NDES=$((NDES + 1))
     bfile="$DATA/$(srv sql "$DATA" "$br" "SELECT pg_relation_filepath('t')")"
     sync -f "$MNT"
     python3 "$FH" cloneproof "$tfile" "$bfile" >"$RAW/cloneproof-$cell.json"
@@ -536,6 +580,19 @@ pg_clone_proof() {
 }
 
 # ---------------------------------------------------------------- B1 (embedded)
+# designate_b1 SPEC -- after the cells: ONE clonebench op of SPEC (C=1, no warm-up, no --drop) into its own directory,
+# kept for the functional checks; prints the branch file's path.
+designate_b1() {
+  local op=${1%-*} sync=${1#*-} dir="$ROOT/branches/designated-$1"
+  mkdir -p "$dir"
+  timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$dir" \
+    --clients 1 --max-ops 1 --rows "$ROWS" --out "$RAW/designated-$1" >"$RAW/designated-$1.txt" 2>&1 ||
+    { tail -1 "$RAW/designated-$1.txt"; return 1; }
+  local f
+  f=$(find "$dir" -maxdepth 1 -name 'b_*.db')
+  [ "$(printf '%s\n' "$f" | awk 'NF {n++} END {print n + 0}')" = 1 ] || { echo "not one branch file in $dir: [$f]"; return 1; }
+  echo "$f"
+}
 b1_main() {
   local cell spec op sync c n d rc total ok created bdir
   DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/<cell>/...
@@ -544,19 +601,22 @@ b1_main() {
   # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
   python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" | tee "$RAW/mkparent.json" ||
     { fail "parent (fixture.py sqlite)"; return; }
+  # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
+  # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
+  # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
+  if [ "$PREBRANCH" -gt 0 ]; then
+    mkdir -p "$ROOT/branches/prebranch"
+    timeout "$OUTER_S" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" \
+      --clients 1 --max-ops "$PREBRANCH" --rows "$ROWS" --max-window-s "$CAP_S" --out "$RAW/prebranch" \
+      >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
+  fi
+  LIVE0=$(count_branches)
+  expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
-    --prebranch "$PREBRANCH" --du "$ROOT/parent.db" \
+    --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
     --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
     >/dev/null || fail "fixture.json"
-  if [ "$PREBRANCH" -gt 0 ]; then  # PREBRANCH live branches first, each with one private write (untraced, untimed)
-    mkdir -p "$ROOT/branches/prebranch"
-    "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" --clients 4 \
-      --max-ops "$PREBRANCH" --rows "$ROWS" --out "$RAW/prebranch" >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
-    python3 "$FH" ops "$RAW/prebranch" 1 >"$RAW/prebranch.ops.txt" || echo "0 0 0" >"$RAW/prebranch.ops.txt"
-    expect "prebranch: live branch files" "$(find "$ROOT/branches/prebranch" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" \
-      "$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")"
-  fi
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}
@@ -567,42 +627,54 @@ b1_main() {
       mkdir -p "$d" "$bdir"
       echo "=== b1 $spec C=$c N=$n"
       rc=0
+      # --drop: every op's branch is deleted, durably and untimed (HIGH 1), so N stays LIVE0; the labelling run is
+      # split by op phase at C=1 like the servers' (lead ruling on HIGH 1's flush attribution)
+      live_mark "$d" label_before
       strace_run "$d/load" timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
-        --dir "$bdir" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
+        --dir "$bdir" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" --drop \
         --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
+      live_mark "$d" label_after
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
-      count "$d/load"
+      local cph=""
+      [ "$c" = 1 ] && cph="$d/bb/raw.tsv"
+      CPHASES=$cph count "$d/load"
       ops_of "$d/bb" "$d"
       read -r total ok created <"$d/ops.txt"
       python3 "$SC" cell --name "$SYSTEM/b1-$spec-c$c" --load "$d/load.json" --idle none \
         --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" >"$d/cell.json"
       judge_cell "$d"
-      python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
-      expect "b1-$spec-c$c branch files (every created branch exists)" \
-        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$created"
+      python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/cycle', p.get('flushes'), 'create/op(C=1)', p.get('create'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
+      expect "b1-$spec-c$c branch files left (every created branch deleted)" \
+        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" 0
       # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
       # t3run item 2): the only latency file of the cell is timed/raw.tsv.
       mkdir -p "$bdir.timed"
+      live_mark "$d" timed_before
       timed_run "$d/timed" "" -- timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
         --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
-        --out "$d/timed" >/dev/null || true
+        --drop --out "$d/timed" >/dev/null || true
+      live_mark "$d" timed_after
       timedrun_check "$d" "$n" "b1-$spec-c$c"
-      expect "b1-$spec-c$c timed run branch files (every created branch exists)" \
-        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$(cut -d' ' -f3 "$d/timed.ops.txt")"
+      expect "b1-$spec-c$c timed run branch files left (every created branch deleted)" \
+        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" 0
     done
   done
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
+  expect "branch files after every cell (every create deleted: LIVE0)" "$(count_branches)" "$LIVE0"
   expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
   local f
+  NDES=0
+  # Every cell deleted its branches (HIGH 1): the checks read DESIGNATED branches, one create each with no --drop,
+  # made after the cells; the branch-file count must rise by exactly their number.
   for spec in m1-d2 m1-d0; do
-    f=$(find "$ROOT/branches/$spec-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
-    [ -n "$f" ] || { fail "isolation $spec: no branch b_*_0_0.db"; continue; }
-    expect "isolation: $spec branch $(basename "$f") integrity|count|sum(v)" \
+    f=$(designate_b1 "$spec") || { fail "isolation $spec: no designated branch ($f)"; continue; }
+    NDES=$((NDES + 1))
+    expect "isolation: $spec designated branch $(basename "$f") integrity|count|sum(v)" \
       "$("$SQ3" "$f" "PRAGMA integrity_check; SELECT count(*), sum(v) FROM t;" | tr '\n' '|' | sed 's/|$//')" "ok|$ROWS|$((PSUM + 1))"
   done
-  f=$(find "$ROOT/branches/m1c-d2-c1" -maxdepth 1 -name 'b_*_0_0.db' | head -1)
-  if [ -n "$f" ]; then
+  if f=$(designate_b1 m1c-d2); then
+    NDES=$((NDES + 1))
     expect "isolation: m1c-d2 branch $(basename "$f") count|sum(v)" "$("$SQ3" "$f" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
     sync -f "$MNT"
     python3 "$FH" cloneproof "$ROOT/parent.db" "$f" >"$RAW/cloneproof-m1c.json"
@@ -611,8 +683,10 @@ b1_main() {
     "$CB" extents "$f" >"$RAW/extents-m1c-branch.json" 2>&1
     "$CB" extents "$ROOT/parent.db" >"$RAW/extents-parent.json" 2>&1
   else
-    fail "clone proof: no m1c-d2 C=1 branch"
+    fail "clone proof: no designated m1c-d2 branch ($f)"
   fi
+  expect "branch files after $NDES designated create(s) with no delete (the N counter sees a kept create)" \
+    "$(count_branches)" "$((LIVE0 + NDES))"
   local fic created1
   fic=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['ficlone'])" "$RAW/cells/b1-m1c-d2-c1/load.json" 2>/dev/null)
   created1=$(cut -d' ' -f3 "$RAW/cells/b1-m1c-d2-c1/ops.txt" 2>/dev/null)

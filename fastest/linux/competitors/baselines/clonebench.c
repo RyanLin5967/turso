@@ -51,6 +51,8 @@
  *     its own registered recipe before a B0 number means anything.
  *   - extents: FIEMAP (FS_IOC_FIEMAP), which also reports FIEMAP_EXTENT_SHARED extents (the clone proof).
  *   - clock CLOCK_MONOTONIC; V1/C1b hooks only with BB_HOOKS=1 (as bbload.c): --v1-run and C1B_RUN refuse without.
+ *   - --drop is a durable delete: the unlinks, then fsync(branch dir) under --sync d2 (op err 4 if it fails),
+ *     untimed (after_ns). With no warm-up at all the run starts in the measured window, as bbload's does.
  */
 #ifndef BB_HOOKS
 #ifdef __APPLE__
@@ -498,6 +500,12 @@ static void *client_main(void *arg) {
             unlink(dst);
             snprintf(p, sizeof p, "%s-wal", dst); unlink(p);
             snprintf(p, sizeof p, "%s-shm", dst); unlink(p);
+#ifndef __APPLE__
+            /* Linux port: a DURABLE delete (PREREG §7, "each measured create is followed by a durable delete"; lead
+             * review 62430d8bf..b49fb656a HIGH 1): the unlinks reach the device by an fsync of the branch directory,
+             * under --sync d2; d0 takes none, like its creates. Untimed: after r.end, recorded in after_ns. */
+            if (!SYNC_D0 && fsync(g_dirfd) != 0 && r.ok) { r.ok = 0; r.err = 4; }
+#endif
         }
         r.after_end = now_ns();
         if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 4096; c->rec = realloc(c->rec, c->cap * sizeof *c->rec); }
@@ -610,8 +618,14 @@ static int cmd_run(int argc, char **argv) {
     struct rusage ru0, ru1;
     memset(&ru0, 0, sizeof ru0);
     uint64_t fl0 = 0, fl1 = 0;
-    g_phase = PH_WARM;
-    if (V1 && C > 1) v1_set_mark(V1, MARKB + 1);
+    /* No warm-up asked for (OPS, S and MAX_S all 0): start in the measured window, so --max-ops N makes exactly N ops
+     * (the B1 prebranch; lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1), as bbload does. */
+    if (WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0) {
+        getrusage(RUSAGE_SELF, &ru0);
+        tm0 = t_start;
+        g_phase = PH_MEAS;
+    } else g_phase = PH_WARM;
+    if (V1 && C > 1) v1_set_mark(V1, MARKB + (g_phase == PH_MEAS ? 2 : 1));
     for (;;) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);

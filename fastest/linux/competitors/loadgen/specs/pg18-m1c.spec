@@ -8,3 +8,7 @@ var branch = b_{run}_{c}_{i}
 step sql CREATE DATABASE {branch} TEMPLATE p STRATEGY = FILE_COPY
 step connect dbname={branch}
 step sql SELECT 1
+# HIGH 1 (lead review 62430d8bf..b49fb656a): N is held fixed -- every op, warm-up included, is followed by an
+# untimed durable delete of its branch (after-steps: recorded as after_ns, outside the op's latency)
+after close
+after sql DROP DATABASE {branch}
