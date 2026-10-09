@@ -699,10 +699,9 @@ def self_test():
                "ow4k": {5: 1}}
 
     def swin(sysev, w, pid):
-        try:
-            return sync_windows(sysev, w, pid, FDCAP_T)
-        except Exception as e:  # the base takes no fd map
-            return {"error": repr(e)}
+        # [V3 review 12 item 9/16: the `except Exception` shim that stood here turned an API break into FAIL lines, so
+        # the tenth review's reds failed at their base by exception, not by the rule; a crash is a crash now]
+        return sync_windows(sysev, w, pid, FDCAP_T)
     slines = [sev("v3floor", 99, "0.001020"), sev("v3floor", 99, "0.001080", "fdatasync"),  # both in w0
               sev("other", 7, "0.002010"),                                                 # w2, another pid
               ev("kworker/0:1H", 10, 0, "0.001050", "7:0", "FF")]
@@ -757,22 +756,43 @@ def self_test():
     aw = [(1000000, 1099990, "append25", 0), (1100010, 1101000, "clean", 0)]
     ae, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001100", fd=14) + "\n", devs)[1:], None
     swa = swin(ae[0], aw, 99)
+    ok_a = lambda sw: (sw.get("append25") or {}).get("windows_without_a_sync") == 1 and (sw.get("clean") or {}).get("syncs") == 1  # noqa: E731
     chk("sync windows by fd: clean's fsync (fd 14) overlapping an append25 window with no sync -> append25 still lacks "
-        "one, clean holds it", (swa.get("append25") or {}).get("windows_without_a_sync") == 1
-        and (swa.get("clean") or {}).get("syncs") == 1, swa)
+        "one, clean holds it", ok_a(swa), swa)
+
+    # V3 review 12 item 9: the registered NON-CRASHING fd-blind mutant (fc6ed8060's capacity rule: the earliest
+    # overlapping window still short of its total takes a sync, whatever its fd), written here as a reference; case (a)
+    # must kill it (its assertion fails on the mutant's output). (b) and (c) pass under it too: they are guards
+    def fd_blind(sysev, w, pid, fdcap):
+        cap = {a: sum(v.values()) for a, v in fdcap.items()}
+        got = {}
+        for e in sorted((x for x in sysev if x[6] == pid), key=lambda x: x[0]):
+            lo, hi = e[0] - e[1], e[0] + e[1]
+            room = [j for j, x in enumerate(w) if x[0] <= hi and x[1] >= lo and got.get(j, 0) < cap[x[2]]]
+            if room:
+                got[room[0]] = got.get(room[0], 0) + 1
+        res = {}
+        for k, (t0, t1, a, i) in enumerate(w):
+            r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0})
+            r["ops"] += 1
+            r["syncs"] += got.get(k, 0)
+            r["windows_without_a_sync"] += got.get(k, 0) == 0
+        return res
+    mb = fd_blind(ae[0], aw, 99, FDCAP_T)
+    chk("case (a) kills the fd-blind mutant (under it append25's window borrows clean's fd-14 fsync)", not ok_a(mb), mb)
     # (b) cfr2b's clone fsync (fd 17) inside, its directory fsync (fd 13) printed at its end overlapping an append25
     #     window with no sync: append25 lacks one, cfr2b holds both
     bw = [(1000000, 1099990, "cfr2b", 0), (1100010, 1200000, "append25", 0)]
     be2, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050", fd=17), sev("v3floor", 99, "0.001100", fd=13)])
                              + "\n", devs)[1:], None
     swb = swin(be2[0], bw, 99)
-    chk("sync windows by fd: cfr2b's directory fsync (fd 13) at its end beside an append25 window with none -> append25 "
-        "lacks one, cfr2b two", (swb.get("append25") or {}).get("windows_without_a_sync") == 1
+    chk("guard (passes under the fd-blind rule too): cfr2b's directory fsync (fd 13) at its end beside an append25 window "
+        "with none -> append25 lacks one, cfr2b two", (swb.get("append25") or {}).get("windows_without_a_sync") == 1
         and (swb.get("cfr2b") or {}).get("syncs") == 2, swb)
     # (c) the same cfr2b beside a nosync25 window: nosync25 holds none
     cw2 = [(1000000, 1099990, "cfr2b", 0), (1100010, 1103000, "nosync25", 0)]
     swd = swin(be2[0], cw2, 99)
-    chk("sync windows by fd: cfr2b then nosync25 -> nosync25 holds none, cfr2b two",
+    chk("guard (passes under the fd-blind rule too): cfr2b then nosync25 -> nosync25 holds none, cfr2b two",
         (swd.get("nosync25") or {}).get("syncs") == 0 and (swd.get("cfr2b") or {}).get("syncs") == 2, swd)
     # (e) a cfr2b window holding its clone fsync (fd 17) but not its directory fsync (fd 13): one sync, so it is not
     #     "without a sync", but it is short of its own (windows_short 1)
@@ -909,8 +929,9 @@ def self_test():
                                                                or r.get("windows_over") != 0)}
         chk("real arm-xfs record (run 37845193906): nosync25 holds 0 syncs; every gated window holds exactly its own "
             "(windows_without_a_sync 0, windows_short 0, windows_over 0)", isinstance(ra.get("nosync25"), dict) and ra["nosync25"].get("syncs") == 0
-            and not bad_g and sorted(a for a in ra if a in _ck.GATED) == sorted(
-                a for a in _ck.GATED if a in {x[2] for x in read_windows(os.path.join(tdd, "raw.tsv"))}),
+            # [coverage, AMENDED at V3 review 12 item 9, disclosed: the clause compared ra's gated keys with raw.tsv's,
+            # equal by construction; it now requires every check.GATED arm judged, 200 ops each (an xfs cell runs them all)]
+            and not bad_g and all(isinstance(ra.get(a), dict) and ra[a].get("ops") == 200 for a in _ck.GATED),
             (ra.get("nosync25"), bad_g, ra.get("error")))
         # eleventh review MED 1 on the real record (predicted from the testdata README's measurement: its
         # wholly-in-window events carry their arms' own fds on all 12 cells): nosync25 holds none on any fd, and no
