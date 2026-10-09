@@ -5405,13 +5405,25 @@ mod format_tests {
     #[test]
     fn an_open_makes_a_rename_the_dead_process_left_durable() {
         let dirs = || DIR_SYNCS.with(|c| c.get());
+        // The dead process: D0 flights, then a cut of them (its rename's directory unsynced,
+        // `dir_dirty`), and no flight after it (engine review 16 #18: the state C1 kills at
+        // cut.renamed leave, not a whole log alone).
+        let dead_after_a_cut = |files: &BranchFiles| {
+            flights(files, 0, &[1, 1], SyncClass::Off);
+            let mut journal = Journal::recover(files, SyncClass::Off).unwrap().expect("state").journal;
+            let generation = journal.generation;
+            journal.rewrite_from(LOG_HEADER_LEN as u64, generation).unwrap();
+            assert!(journal.dir_dirty, "premise: the dead process's cut left its rename unsynced");
+        };
         for class in [SyncClass::Fsync, SyncClass::FullFsync] {
             let dir = tempfile::TempDir::new().unwrap();
             let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-            flights(&files, 0, &[1, 1], class);
+            dead_after_a_cut(&files);
             let before = dirs();
             let recovered = Journal::recover(&files, class).unwrap().expect("state");
             assert!(!recovered.records.is_empty(), "{class:?}: premise: the whole log was kept");
+            // Recovery returns before any flight can be taken: a directory sync here comes before
+            // the first syncing flight's write.
             assert!(
                 dirs() > before,
                 "{class:?}: a syncing open left the log's directory unsynced"
@@ -5419,7 +5431,7 @@ mod format_tests {
         }
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        flights(&files, 0, &[1, 1], SyncClass::Off);
+        dead_after_a_cut(&files);
         let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         assert!(!recovered.records.is_empty(), "Off: premise: the whole log was kept");
         assert!(
