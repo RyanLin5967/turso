@@ -3731,6 +3731,67 @@ fn a_bytea_parameter_with_a_non_ascii_digit_is_refused() {
     assert_eq!(a.q("SELECT count(*) FROM ty").single("one row"), "1");
 }
 
+/// A text-format parameter its declared type cannot read is refused with the code PostgreSQL's
+/// input function raises (int2in/int4in/int8in, float8in, numeric_in, boolin, byteain, array_in
+/// over each; a PG18 record_pg.sh recording is owed): 22P02 for bad syntax, 22003 for an integer
+/// out of its type's range, 22023 for a bad bytea hex digit, and an array element's own code (an
+/// int4 element out of range is 22003, a bytea element's bad digit 22023). An integer with
+/// surrounding blanks is read, as int4in reads it. The scalar refusals were XX000
+/// (internal_error), no integer's range was checked below int8 (int4 '3000000000' and int2
+/// '70000' were bound), and an array element's error was replaced by a generic 22P02 (wire review
+/// 13 item 8 and LOW 17; review 14 item 28). Every case is checked before the test fails.
+#[test]
+fn a_parameter_its_type_cannot_read_is_refused_with_its_types_code() {
+    const BOOL: u32 = 16;
+    const INT8: u32 = 20;
+    const INT2: u32 = 21;
+    const INT4: u32 = 23;
+    const FLOAT8: u32 = 701;
+    const BYTEA_ARRAY: u32 = 1001;
+    const INT4_ARRAY: u32 = 1007;
+    const NUMERIC: u32 = 1700;
+    let dir = Scratch::new("paramcodes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let cases: [(u32, &[u8], &str); 12] = [
+        (INT4, b"x", "22P02"),
+        (INT4, b"1.5", "22P02"),
+        (INT2, b"70000", "22003"),
+        (INT4, b"3000000000", "22003"),
+        (INT8, b"9223372036854775808", "22003"),
+        (FLOAT8, b"abc", "22P02"),
+        (NUMERIC, b"abc", "22P02"),
+        (BOOL, b"maybe", "22P02"),
+        (INT4_ARRAY, b"{3000000000}", "22003"),
+        (INT4_ARRAY, b"{1.0}", "22P02"),
+        (BYTEA_ARRAY, b"{\"\\\\xZZ\"}", "22023"),
+        (BYTEA_ARRAY, b"{\"\\\\x0\"}", "22023"),
+    ];
+    let mut wrong = Vec::new();
+    for (oid, value, code) in cases {
+        let r = a.xt("SELECT $1", &[(oid, 0, value)]);
+        let got = r.error.as_ref().map(|e| e.code.clone());
+        if got.as_deref() != Some(code) {
+            wrong.push(format!(
+                "OID {oid} {:?}: {got:?} {:?}, want {code}",
+                String::from_utf8_lossy(value),
+                r.rows
+            ));
+        }
+        assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    }
+    let r = a.xt("SELECT $1", &[(INT4, 0, b" 7 ")]);
+    if r.error.is_some() || r.rows != vec![vec![Some("7".to_string())]] {
+        wrong.push(format!("int4 ' 7 ': {:?} {:?}, want 7", r.error, r.rows));
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A Bind PostgreSQL refuses is refused AT the Bind, before BindComplete, so the Execute after it
 /// runs nothing: a parameter format code other than 0 or 1 (22023 "unsupported format code: 2",
 /// even for a NULL value), a parameter-format list that is neither 0, 1 nor one per parameter
