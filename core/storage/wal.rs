@@ -3115,11 +3115,18 @@ impl WalFile {
     /// the trunk's device, and the pager acts on it HERE, as it fails (engine review 17 HIGH 1: an
     /// explicit PRAGMA wal_checkpoint answers it with a busy row, so a later check never came, and
     /// a flush on another connection masked it). The pager reads what the failed sync drained now.
-    /// A completion that fails after it yielded fails the statement's step, whose error path acts
-    /// on it. Unless the mutant named `unwatched` is on (test builds only).
+    /// A completion it returned is noted with the pager (`Pager::note_trunk_wal_sync`), so one that
+    /// fails after it yielded is acted on where the statement's checkpoint failure is handled
+    /// (`check_noted_syncs`; engine review 19 HIGH 1: io_uring and an extension VFS fail there, not
+    /// at issue). Unless the mutant named `unwatched` is on (test builds only), or, for the noted
+    /// half alone, mutant `yielded_wal_sync_unnoted` (as 910dbf21c left it).
     fn watched(&self, unwatched: &str, pager: &Pager, issued: Result<Completion>) -> Result<Completion> {
-        if issued.is_err() && !crate::branch::store::fe_mutant(unwatched) {
-            pager.trunk_wal_sync_failed();
+        if !crate::branch::store::fe_mutant(unwatched) {
+            match &issued {
+                Err(_) => pager.trunk_wal_sync_failed(),
+                Ok(c) if !crate::branch::store::fe_mutant("yielded_wal_sync_unnoted") => pager.note_trunk_wal_sync(c),
+                Ok(_) => {}
+            }
         }
         issued
     }

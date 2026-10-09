@@ -3964,11 +3964,12 @@ impl Pager {
     }
 
     /// Keep a sync of a trunk file this pager just issued — a commit's WAL sync, a WAL header's (a
-    /// commit's, a cache flush's, a spill's), a checkpoint's database file — for
-    /// `check_noted_syncs`: one that fails after it yielded is reported to the statement without
-    /// coming back here (review 6 #2, engine review 9 #2). Only with a branch store. A noted sync
-    /// that already failed is acted on before it is replaced.
-    fn note_trunk_wal_sync(&self, c: &Completion) {
+    /// commit's, a cache flush's, a spill's), a checkpoint's database file, and the syncs the WAL
+    /// issues itself (`WalFile::watched`: a checkpoint's and a TRUNCATE's; engine review 19 HIGH 1)
+    /// — for `check_noted_syncs`: one that fails after it yielded is reported to the statement
+    /// without coming back here (review 6 #2, engine review 9 #2). Only with a branch store. A
+    /// noted sync that already failed is acted on before it is replaced.
+    pub(crate) fn note_trunk_wal_sync(&self, c: &Completion) {
         if self.branch_store.get().is_some() {
             let previous = self.trunk_wal_sync.lock().replace(c.clone());
             if previous.is_some_and(|p| p.finished() && !p.succeeded()) {
@@ -3980,8 +3981,9 @@ impl Pager {
     /// Act on the noted sync if it finished and failed (`trunk_wal_sync_failed`); one still in
     /// flight stays noted. Where the next trunk commit begins (before anything it does could
     /// promote branch records over the failed drain), where every trunk write ends, and after a
-    /// failed checkpoint. The syncs the WAL issues itself are acted on where they fail
-    /// (`Wal::checkpoint`, `Wal::truncate_wal`; engine review 17 HIGH 1).
+    /// failed checkpoint. The syncs the WAL issues itself are acted on where they fail at issue
+    /// (`Wal::checkpoint`, `Wal::truncate_wal`; engine review 17 HIGH 1), and noted here when they
+    /// were issued, for a failure after they yielded (engine review 19 HIGH 1).
     pub(crate) fn check_noted_syncs(&self) {
         let failed = {
             let mut noted = self.trunk_wal_sync.lock();
