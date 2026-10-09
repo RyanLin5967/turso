@@ -552,7 +552,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Execute one iteration of underlying IO backend after TURSO_IO status code\n This function either return some ERROR status or TURSO_OK"]
+    #[doc = " Execute one iteration of underlying IO backend after TURSO_IO status code\n When that TURSO_IO stood for a busy handler's backoff, this waits the backoff out instead,\n so a step / run_io loop does not spin a core for the whole busy timeout\n This function either return some ERROR status or TURSO_OK"]
     pub fn turso_statement_run_io(
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,

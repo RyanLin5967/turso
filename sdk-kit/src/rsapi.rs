@@ -1313,6 +1313,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            pending_sleep: Mutex::new(None),
         }))
     }
 
@@ -1341,6 +1342,7 @@ impl TursoConnection {
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
+                    pending_sleep: Mutex::new(None),
                 }));
             }
         }
@@ -1371,6 +1373,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            pending_sleep: Mutex::new(None),
         }))
     }
 
@@ -1400,6 +1403,7 @@ impl TursoConnection {
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
+                        pending_sleep: Mutex::new(None),
                     }),
                     position,
                 )))
@@ -1487,6 +1491,14 @@ type StmtRegistry = Arc<Mutex<HashMap<usize, Weak<Mutex<Option<Statement>>>>>>;
 
 const FINALIZED_ERR: &str = "statement has been finalized";
 
+/// A busy handler's backoff that an async-mode step reported as [`TursoStatusCode::Io`]: the
+/// caller's answer to that Io, [`TursoStatement::run_io`], waits it out instead of stepping the
+/// IO backend (engine review 11 MED 4). It stands only for the Io that announced it: every step
+/// clears it first, and so does a reset.
+struct PendingSleep {
+    duration: Duration,
+}
+
 /// Advance one step of a statement's execution.
 /// Factored out of `TursoStatement` so it can be called while holding
 /// the `StatementHandle` lock without re-entrancy issues.
@@ -1494,7 +1506,9 @@ fn step_inner(
     stmt: &mut Statement,
     async_io: bool,
     waker: Option<&Waker>,
+    pending_sleep: &Mutex<Option<PendingSleep>>,
 ) -> Result<TursoStatusCode, TursoError> {
+    *pending_sleep.lock().unwrap() = None;
     loop {
         let result = if let Some(waker) = waker {
             stmt.step_with_waker(waker)
@@ -1508,6 +1522,7 @@ fn step_inner(
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
             StepResult::Sleep { duration } => {
                 if async_io {
+                    *pending_sleep.lock().unwrap() = Some(PendingSleep { duration });
                     Ok(TursoStatusCode::Io)
                 } else {
                     sync_wait_out_busy(stmt, duration)?;
@@ -1565,6 +1580,8 @@ pub struct TursoStatement {
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
+    /// Set when the last async-mode step's Io was a busy handler's backoff (see [`PendingSleep`]).
+    pending_sleep: Mutex<Option<PendingSleep>>,
 }
 
 impl Drop for TursoStatement {
@@ -1672,7 +1689,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        step_inner(stmt, self.async_io, waker)
+        step_inner(stmt, self.async_io, waker, &self.pending_sleep)
             .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
@@ -1691,7 +1708,7 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)
+            let status = step_inner(stmt, self.async_io, waker, &self.pending_sleep)
                 .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
@@ -1711,13 +1728,23 @@ impl TursoStatement {
             )));
         }
     }
-    /// run iteration of the IO backend
+    /// run iteration of the IO backend, the caller's answer to [TursoStatusCode::Io]
+    ///
+    /// When that Io stood for a busy handler's backoff, this waits the backoff out instead
+    /// (`Statement::wait_out_busy`): the busy statement has no IO in flight, so stepping the
+    /// backend would return at once, and a step / run_io loop would spin a core for the whole busy
+    /// timeout (engine review 11 MED 4). Mutant `sdk_run_io_spins` (test builds only): the IO
+    /// step, as before.
     pub fn run_io(&self) -> Result<(), TursoError> {
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        stmt._io().step()?;
+        let pending_sleep = self.pending_sleep.lock().unwrap().take();
+        match pending_sleep {
+            Some(sleep) if !fe_mutant("sdk_run_io_spins") => stmt.wait_out_busy(sleep.duration)?,
+            _ => stmt._io().step()?,
+        }
         Ok(())
     }
     /// get row value as an owned Value
@@ -1798,7 +1825,7 @@ impl TursoStatement {
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
             while stmt.execution_state().is_running() {
-                let status = step_inner(stmt, self.async_io, waker)?;
+                let status = step_inner(stmt, self.async_io, waker, &self.pending_sleep)?;
                 if status == TursoStatusCode::Io {
                     return Ok(status);
                 }
@@ -1814,6 +1841,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        *self.pending_sleep.lock().unwrap() = None;
         stmt.reset()?;
         stmt.clear_bindings();
         Ok(())
