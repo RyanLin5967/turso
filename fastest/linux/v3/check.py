@@ -2519,8 +2519,11 @@ def f1b_window_syncs(text):
     F1b strace -f -y trace: between a window's opening and closing clock_gettime(CLOCK_MONOTONIC_RAW), the only clock
     reads the loop makes (sequence_problems holds F1b:real-all to exactly 2 x n x arms of them). Setup and teardown
     syncs are outside every window and not counted. A sync split by strace (<unfinished ...>) counts by its opening
-    half. The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>."""
-    seen, clocks, probs = {}, 0, []
+    half. The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>, for an arm this
+    probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd (V3 review 12
+    item 11: it was keyed by its basename and never compared). -> (seen {arm: fds}, problems, odd paths)"""
+    seen, clocks, probs, odd = {}, 0, [], []
+    known = set(ALL.split(","))
     for line in text.splitlines():
         m = LINE.match(line)
         if m and "<unfinished ...>" not in line and "resumed>" not in line:
@@ -2540,12 +2543,18 @@ def f1b_window_syncs(text):
             probs.append("an in-window sync without fd<path>: " + line[:120])
             continue
         path, base = a.group(2), os.path.basename(a.group(2))
-        arm = (os.path.basename(os.path.dirname(path))[:-len(".clones")] if re.fullmatch(r"c\d+", base)
-               else base[:-len(".clones")] if base.endswith(".clones") else base)
+        if re.fullmatch(r"c\d+", base):
+            par = os.path.basename(os.path.dirname(path))
+            arm = par[:-len(".clones")] if par.endswith(".clones") else None
+        else:
+            arm = base[:-len(".clones")] if base.endswith(".clones") else base
+        if arm not in known:
+            odd.append(path)
+            continue
         seen.setdefault(arm, set()).add(int(a.group(1)))
     if clocks == 0 or clocks % 2:
         probs.append("%d clock reads: the trace holds no whole timed windows" % clocks)
-    return seen, probs
+    return seen, probs, odd
 
 
 def sync_fds_def_problems(sj, rows, n):
@@ -2583,10 +2592,12 @@ def sync_fds_problems(sj, rows, n, f1b_trace):
     if f1b_trace is None:
         bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad
-    seen, probs = f1b_window_syncs(f1b_trace)
+    seen, probs, odd = f1b_window_syncs(f1b_trace)
     if probs:
         bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
         return bad
+    if odd:  # V3 review 12 item 11: an in-window sync on a path that is no arm's file is reported, never dropped
+        bad.append(("an F1b in-window sync on a file that is no arm's own", sorted(set(odd))[:5]))
     for a in rows:
         want = {int(k) for k in (sf.get(a) or {})}
         if want != seen.get(a, set()):
