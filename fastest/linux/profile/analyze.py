@@ -4,7 +4,10 @@ profile.sh's raw output, gated against budget.json and against the base build; w
 against the baseline artifact's own numbers for full-snap-c1 (refused unless it names its sha and ran on this
 runner's cpu, PROFILE_CPU).
 
-usage: analyze.py <raw-dir> <budget.json> <out-dir> [--baseline prev-baseline.json] [--rebaseline]
+usage: analyze.py <raw-dir> <budget.json> <out-dir> [--baseline prev-baseline.json] [--rebaseline] [--base-rc RC]
+       (--base-rc: the base's profile.sh rc; non-zero drops the base and compares against the artifact, review 5
+       MED 11. The run's identity comes from PROFILE_DRIVER_SHA, PROFILE_SH_SHA, ImageVersion, PROFILE_VALGRIND and
+       <raw-dir>/head/sizes.txt, MED 12)
        analyze.py --self-test
        analyze.py --budget-verdict <verdict.tsv>   (the absolute syscall budget job; exit 1 unless it passes)
 
@@ -204,10 +207,35 @@ def row_problem(r):
     return None
 
 
-def artifact_refusal(baseline, cpu, field):
-    """None when the baseline artifact may stand in for an in-job base on `field`, else why it may not (T3 review
-    item 7b). It must name the sha it measured and the cpu it ran on, that cpu must be this runner's, and it must
-    hold the field; a missing label is a refusal, never a match of None to None."""
+# what must be the same for the artifact's numbers to stand in for a base (review 5 MED 12): the driver source, the
+# profile script, the sizes it ran, the runner image and valgrind
+IDENTITY_KEYS = ("driver_sha", "profile_sh", "profile_ops", "image", "valgrind")
+
+
+def art_value(baseline, arm, field):
+    """the artifact's FIELD for ARM: its per-arm record (review 5 MED 10), or, for the baseline arm of an artifact from
+    before per-arm records, its top-level field"""
+    arms = baseline.get("arms")
+    if isinstance(arms, dict) and arm in arms:
+        return (arms[arm] or {}).get(field)
+    return baseline.get(field) if arm == BASELINE_ARM else None
+
+
+def art_arms(baseline):
+    """the arms the artifact holds numbers for"""
+    arms = baseline.get("arms")
+    names = set(arms) if isinstance(arms, dict) else set()
+    if baseline.get("create_syscalls_per_op") or baseline.get("ir_create"):
+        names.add(BASELINE_ARM)
+    return names
+
+
+def artifact_refusal(baseline, cpu, field, arm=BASELINE_ARM, identity=None):
+    """None when the baseline artifact may stand in for an in-job base on ARM's `field`, else why it may not (T3 review
+    item 7b; review 5 MED 10, 12). It must name the sha it measured and the cpu it ran on, that cpu must be this
+    runner's, it must record the identity this run has (IDENTITY_KEYS: the same driver, profile script, sizes, image
+    and valgrind; a different driver is the usual reason the base would not build, so its numbers are another
+    driver's), and it must hold the field for ARM. A missing label is a refusal, never a match of None to None."""
     sha = baseline.get("sha")
     if not sha:
         return "the baseline artifact names no sha"
@@ -217,15 +245,26 @@ def artifact_refusal(baseline, cpu, field):
         return "this runner's cpu is unknown (PROFILE_CPU unset)"
     if baseline["cpu"] != cpu:
         return f"the baseline artifact of {sha} ran on cpu {baseline['cpu']!r}, this runner is cpu {cpu!r}"
-    if not baseline.get(field):
-        return f"the baseline artifact of {sha} holds no {field}"
+    ident = baseline.get("identity")
+    if not isinstance(ident, dict):
+        return (f"the baseline artifact of {sha} records no identity (driver, profile script, sizes, image, valgrind): "
+                "its numbers may be another driver's")
+    if not isinstance(identity, dict):
+        return "this run's identity (driver, profile script, sizes, image, valgrind) is unknown"
+    for k in IDENTITY_KEYS:
+        if not identity.get(k) or ident.get(k) != identity.get(k):
+            return f"the baseline artifact of {sha} ran {k} {ident.get(k)!r}, this run {identity.get(k)!r}"
+    if not art_value(baseline, arm, field):
+        return f"the baseline artifact of {sha} holds no {field} for {arm}"
     return None
 
 
-def gates(head, base, budget, baseline, cpu=None):
+def gates(head, base, budget, baseline, cpu=None, base_ok=True, identity=None):
     """baseline: the stored artifact (baseline.json of the run that uploaded it) or None; cpu: this runner's
-    PROFILE_CPU. A base built in this job outranks the artifact; without one, both regression gates compare
-    the baseline arm against the artifact's own numbers, refused unless artifact_refusal() passes it."""
+    PROFILE_CPU; identity: this run's IDENTITY_KEYS. A base built in this job outranks the artifact; without one, every
+    C=1 arm the artifact holds is compared against the artifact's own numbers for that arm, refused unless
+    artifact_refusal() passes it, and an artifact arm the head no longer runs FAILs (review 5 MED 10). base_ok False
+    (the base's profile run failed) drops the base entirely, with an info row, so the artifact stands in (MED 11)."""
     rows = []
 
     def row(g, exp, got, v, kind):
@@ -237,6 +276,11 @@ def gates(head, base, budget, baseline, cpu=None):
             raise ValueError(f"gates: row {g} is not representable: {why}")
         rows.append(r)
 
+    if not base_ok:
+        row("base/run", "an in-job base whose profile run exited 0",
+            "the base's profile run failed: the base is dropped and every comparison is against the baseline artifact",
+            "INFO", "info")
+        base = None
     for arm, h in sorted(head.items()):
         cls = arm.split("-")[0]
         if "NOT AVAILABLE" in h.get("status", ""):
@@ -289,21 +333,24 @@ def gates(head, base, budget, baseline, cpu=None):
         bw = (((base or {}).get(arm) or {}).get("strace") or {}).get("windows", {}).get("create")
         if bw:
             bx, src = bw["syscalls_per_op"], "base built in this job"
-        elif arm == BASELINE_ARM and baseline is not None:
+        elif baseline is not None and c == 1 and (arm == BASELINE_ARM or arm in art_arms(baseline)):
             # review 7b: without this, only an in-job base produced the row, so a base sha that would not build left
-            # the premise unevaluated on every later push and the baseline never advanced.
-            refused = artifact_refusal(baseline, cpu, "create_syscalls_per_op")
+            # the premise unevaluated on every later push and the baseline never advanced. Review 5 MED 10: every
+            # C=1 arm the artifact holds, not the baseline arm alone.
+            refused = artifact_refusal(baseline, cpu, "create_syscalls_per_op", arm, identity)
             if refused:
-                row(f"syscalls-vs-base/{arm}", "an in-job base, or the baseline artifact of this cpu",
+                row(f"syscalls-vs-base/{arm}", "an in-job base, or the baseline artifact of this cpu and identity",
                     f"refused: {refused}", "FAIL", "regression")
             else:
-                bx, src = baseline["create_syscalls_per_op"], f"baseline artifact of {baseline['sha']}"
+                bx, src = art_value(baseline, arm, "create_syscalls_per_op"), f"baseline artifact of {baseline['sha']}"
         if bx is None and not refused:
             # review 29: the row exists even with nothing to compare against. On the baseline arm at C=1 it is the
-            # regression premise, so NOT-RUN blocks regression_green; elsewhere it is a record.
+            # regression premise, so NOT-RUN blocks regression_green; elsewhere it is a record (a new arm the artifact
+            # does not hold stays info: review 5 MED 10).
             row(f"syscalls-vs-base/{arm}", "a base to compare the create window's syscalls against",
                 "no in-job base and no baseline artifact" if arm == BASELINE_ARM
-                else f"no in-job base for this arm (the baseline artifact records {BASELINE_ARM} only)",
+                else (f"no in-job base, and the baseline artifact holds no {arm} (a new arm)"
+                      if baseline is not None and c == 1 else "no in-job base for this arm"),
                 "NOT-RUN", "regression" if arm == BASELINE_ARM and c == 1 else "info")
         if bx is not None:
             hx = x["syscalls_per_op"]
@@ -319,6 +366,12 @@ def gates(head, base, budget, baseline, cpu=None):
             row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op vs {src}"
                 + ("" if c == 1 else " (C>1: contention-dependent, INFO)"),
                 worse or "ok", verdict, "regression" if c == 1 else "info")
+    if baseline is not None and not base:
+        # review 5 MED 10: an arm the artifact holds that the head no longer runs is a lost comparison, not a pass
+        for arm in sorted(art_arms(baseline) - set(head)):
+            row(f"syscalls-vs-base/{arm}", "the head runs every arm the baseline artifact holds",
+                f"the baseline artifact of {baseline.get('sha')} holds {arm}; this run's head has no such arm",
+                "FAIL", "regression")
     if not any(r[0] == f"syscalls-vs-base/{BASELINE_ARM}" for r in rows):
         # review 29: the premise row exists whatever cut the baseline arm short above (no strace, a refusal, a missing
         # window, an unregistered class, NOT AVAILABLE, or no such arm), so regression_green never passes without it.
@@ -332,9 +385,9 @@ def gates(head, base, budget, baseline, cpu=None):
     if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
         b, src = base[arm]["ir_per_op"]["create"], "base built in this job"
     elif baseline is not None:
-        why = artifact_refusal(baseline, cpu, "ir_create")
+        why = artifact_refusal(baseline, cpu, "ir_create", BASELINE_ARM, identity)
         if why is None:
-            b, src = baseline["ir_create"], f"baseline artifact of {baseline['sha']}"
+            b, src = art_value(baseline, BASELINE_ARM, "ir_create"), f"baseline artifact of {baseline['sha']}"
     # instructions/create is always emitted and always regression-kind: INFO (first run) blocks regression_green too
     if h is None:
         row("instructions/create", "a callgrind count", "none", "FAIL", "regression")
@@ -482,11 +535,15 @@ def self_test():
     # both regression gates compare against the baseline artifact's own numbers, which name the sha and cpu they came
     # from (artifact 11570831049: sha 60753525a, cpu "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz").
     art_sha = "60753525a41446b4c67209397a596cf014a20be0"
-    art = {"sha": art_sha, "cpu": "cpu-A", "ir_create": 1000.0,
+    # TEST EDIT, flagged (review 5 MED 12): the artifact must now record the identity this run has, so the fixture gains
+    # one and the two cases that expect it to stand in pass the same identity; no expectation changed
+    art_ident = {"driver_sha": "d" * 40, "profile_sh": "p" * 40, "profile_ops": "200:20:100", "image": "20261004.327.1",
+                 "valgrind": "valgrind-3.22.0"}
+    art = {"sha": art_sha, "cpu": "cpu-A", "ir_create": 1000.0, "identity": art_ident,
            "create_syscalls_per_op": {"fsync": 1.0, "futex": 1.0, "pwrite64": 1.0}}
 
     def case_artifact_runs():
-        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art, cpu="cpu-A")
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art, cpu="cpu-A", identity=art_ident)
         r = by_id(rows)
         sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
         return (sv is not None and sv[3] == "PASS" and art_sha in sv[1]
@@ -498,7 +555,8 @@ def self_test():
     def case_artifact_catches():
         hb = arm_of(trace(1), 10)
         hb["strace"]["windows"]["create"]["syscalls_per_op"]["fstat"] = 1.0
-        sv = by_id(gates({"full-snap-c1": hb}, None, budget, art, cpu="cpu-A")).get("syscalls-vs-base/full-snap-c1")
+        sv = by_id(gates({"full-snap-c1": hb}, None, budget, art, cpu="cpu-A", identity=art_ident)).get(
+            "syscalls-vs-base/full-snap-c1")
         return sv is not None and sv[3] == "FAIL" and "fstat" in sv[2]
     cases.append(("review 7b: a new syscall per create against the artifact FAILs (the comparison runs)",
                   guarded(case_artifact_catches)))
@@ -525,7 +583,8 @@ def self_test():
 
     def case_artifact_no_syscalls():
         a = {k: x for k, x in art.items() if k != "create_syscalls_per_op"}
-        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, a, cpu="cpu-A")
+        # with this run's identity, so the refusal is the missing field's and not the identity's (review 5 MED 12)
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, a, cpu="cpu-A", identity=art_ident)
         sv = by_id(rows).get("syscalls-vs-base/full-snap-c1")
         return sv is not None and sv[3] == "FAIL" and not regression_green(rows)
     cases.append(("review 7b: an artifact without create_syscalls_per_op is refused, regression_green false",
@@ -854,14 +913,33 @@ def main(argv):
         print("analyze: no head arms: nothing was measured", file=sys.stderr)
         return 1
     cpu = os.environ.get("PROFILE_CPU")
-    rows = gates(sides["head"], sides.get("base"), budget, baseline, cpu=cpu)
+    # review 5 MED 11: the base's own profile rc; a failed base run is dropped and the artifact stands in
+    base_ok = True
+    if "--base-rc" in argv:
+        base_ok = argv[argv.index("--base-rc") + 1] == "0"
+    # review 5 MED 12: this run's identity, which the artifact must match to stand in, and which baseline.json records
+    try:
+        sizes = open(os.path.join(raw, "head", "sizes.txt")).read().strip() or None
+    except OSError:
+        sizes = None
+    identity = {"driver_sha": os.environ.get("PROFILE_DRIVER_SHA"), "profile_sh": os.environ.get("PROFILE_SH_SHA"),
+                "profile_ops": sizes, "image": os.environ.get("ImageVersion"),
+                "valgrind": os.environ.get("PROFILE_VALGRIND")}
+    rows = gates(sides["head"], sides.get("base"), budget, baseline, cpu=cpu, base_ok=base_ok, identity=identity)
     os.makedirs(out, exist_ok=True)
     json.dump(sides, open(os.path.join(out, "summary.json"), "w"), indent=1)
     write_verdict(os.path.join(out, "verdict.tsv"), rows)
     h = sides["head"].get(BASELINE_ARM, {})
+
+    def create_syscalls(r):
+        return ((r.get("strace") or {}).get("windows", {}).get("create") or {}).get("syscalls_per_op")
+    # per C=1 arm (review 5 MED 10), with the identity a later run must match (MED 12); the top-level baseline-arm
+    # fields stay for readers of the old format
     json.dump({"sha": os.environ.get("GITHUB_SHA"), "ir_create": h.get("ir_per_op", {}).get("create"),
-               "ir_per_op": h.get("ir_per_op"), "cpu": cpu,
-               "create_syscalls_per_op": ((h.get("strace") or {}).get("windows", {}).get("create") or {}).get("syscalls_per_op")},
+               "ir_per_op": h.get("ir_per_op"), "cpu": cpu, "identity": identity,
+               "create_syscalls_per_op": create_syscalls(h),
+               "arms": {a: {"ir_create": (r.get("ir_per_op") or {}).get("create"), "create_syscalls_per_op": create_syscalls(r)}
+                        for a, r in sorted(sides["head"].items()) if r.get("clients", 1) == 1}},
               open(os.path.join(out, "baseline.json"), "w"), indent=1)
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("| gate | expected | got | verdict | kind |\n|---|---|---|---|---|\n")
