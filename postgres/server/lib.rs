@@ -27,7 +27,7 @@ pub mod counters;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard, OnceLock,
 };
 
 use async_trait::async_trait;
@@ -773,16 +773,58 @@ struct Session {
 /// again, so a slow-form call (a comment, a quoted name) cost a libpg_query parse at Bind, at each
 /// Describe and at Execute, and an ordinary statement mentioning the prefix up to 3 beside its own
 /// prepare (wire review 13 item 6).
+///
+/// With the parameter and result types the statement had when it first met the engine, at its
+/// first Describe or Execute: PostgreSQL fixes both at Parse, and a later Describe or Execute that
+/// finds others (a branch switch, a DDL or a search_path change altered what the statement reads)
+/// is refused, 0A000, as PostgreSQL's RevalidateCachedQuery refuses a changed result type. They
+/// were inferred again at each prepare, so a parameter Describe announced as int4 was read as text
+/// on a branch where its column is TEXT, its four binary bytes as UTF-8 (wire review 14 item 11).
+/// A re-Parse stores a new statement and Close drops this one, which clears them.
 #[derive(Debug, Clone)]
 struct Parsed {
     sql: String,
     call: Option<PgBranchCall>,
+    params: OnceLock<Vec<Type>>,
+    columns: OnceLock<Vec<Type>>,
 }
 
 impl Parsed {
     fn new(sql: String) -> Self {
         let call = branch_call(&sql);
-        Self { sql, call }
+        Self {
+            sql,
+            call,
+            params: OnceLock::new(),
+            columns: OnceLock::new(),
+        }
+    }
+
+    /// Fix the statement's parameter types at the first call, and refuse any later call whose
+    /// types are others. The same text with the same declared types has the same parameters, so
+    /// only their types can differ.
+    fn fix_params(&self, params: &[Type]) -> SqlResult<()> {
+        let fixed = self.params.get_or_init(|| params.to_vec());
+        if fixed.as_slice() == params {
+            return Ok(());
+        }
+        let n = fixed.iter().zip(params).take_while(|(a, b)| a == b).count() + 1;
+        Err(error(
+            "0A000",
+            format!("cached plan must not change the type of parameter ${n}"),
+        ))
+    }
+
+    /// Fix the statement's result column types at the first call, and refuse any later call whose
+    /// types are others, in PostgreSQL's words.
+    fn fix_columns(&self, columns: &[Type]) -> SqlResult<()> {
+        if self.columns.get_or_init(|| columns.to_vec()).as_slice() == columns {
+            return Ok(());
+        }
+        Err(error(
+            "0A000",
+            "cached plan must not change result type".to_string(),
+        ))
     }
 }
 
@@ -1576,9 +1618,30 @@ impl Session {
         if types.commits || types.rolls_back {
             *backoff = Backoff::never();
         }
+        let query =
+            types.new_table_keys.is_none() && stmt.num_columns() != 0 && !is_pg_non_query(sql);
+        let columns: Vec<Type> = if query {
+            (0..stmt.num_columns())
+                .map(|i| column_type(&stmt, &types.columns, i))
+                .collect()
+        } else {
+            Vec::new()
+        };
         match portal {
-            Some(portal) => bind_portal_parameters(&mut stmt, portal, &types)
-                .map_err(|e| unprepared(wire_info(e)))?,
+            // In exec_bind_message's order: the value count (08P01, as PostgreSQL's Bind answers),
+            // then the types the statement had when it first met the engine, or a refusal (see
+            // [`Parsed`]), before any value is read by a type.
+            Some(portal) => {
+                let params = parameter_types(&types, &portal.statement.parameter_types)
+                    .map_err(unprepared)?;
+                check_bind_arity(portal.parameter_len(), &portal.statement.id, params.len())
+                    .map_err(unprepared)?;
+                let parsed = &portal.statement.statement;
+                parsed.fix_params(&params).map_err(unprepared)?;
+                parsed.fix_columns(&columns).map_err(unprepared)?;
+                bind_portal_parameters(&mut stmt, portal, &params)
+                    .map_err(|e| unprepared(wire_info(e)))?
+            }
             // Nothing binds a parameter over the simple protocol, so a $n names none: 42P02, as
             // PostgreSQL answers, before the statement runs. It ran with the parameter unbound,
             // which the engine reads as NULL: `UPDATE t SET v = $1` nulled every row (wire review
@@ -1594,7 +1657,7 @@ impl Session {
         }
         let r = if let Some(table) = types.new_table_keys.as_deref() {
             create_with_keys(conn, &mut stmt, sql, table, backoff)
-        } else if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+        } else if !query {
             execute_non_query(&mut stmt, sql, backoff)
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
@@ -1602,7 +1665,7 @@ impl Session {
             execute_query(
                 &mut stmt,
                 format,
-                &types.columns,
+                &columns,
                 &conn.inner().current_schema(),
                 backoff,
             )
@@ -3081,6 +3144,16 @@ impl ExtendedQueryHandler for Session {
         let params = self
             .described_parameters(&target.parameter_types)
             .map_err(PgWireError::UserError)?;
+        // Fixed, or checked against the fixed ones, by a Describe that prepared the statement
+        // (see [`Parsed`]); one whose prepare would perform it prepared nothing, and its Execute
+        // fixes them.
+        if self.state().described.is_some() {
+            let parsed = &target.statement;
+            parsed.fix_params(&params).map_err(PgWireError::UserError)?;
+            parsed
+                .fix_columns(&field_types(&fields))
+                .map_err(PgWireError::UserError)?;
+        }
         Ok(DescribeStatementResponse::new(params, fields))
     }
 
@@ -3111,6 +3184,14 @@ impl ExtendedQueryHandler for Session {
         let fields = self
             .described_fields(&portal.result_column_format)
             .map_err(PgWireError::UserError)?;
+        // As do_describe_statement: the result types only, which a portal's Describe reports.
+        if self.state().described.is_some() {
+            portal
+                .statement
+                .statement
+                .fix_columns(&field_types(&fields))
+                .map_err(PgWireError::UserError)?;
+        }
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -3191,6 +3272,11 @@ where
         .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
         .await?;
     Ok(true)
+}
+
+/// The type of each result column a Describe reported, as [`Parsed::fix_columns`] reads them.
+fn field_types(fields: &[FieldInfo]) -> Vec<Type> {
+    fields.iter().map(|f| f.datatype().clone()).collect()
 }
 
 /// A prepared statement's result columns, typed by [`column_type`]: what Describe reports and what
@@ -3372,16 +3458,18 @@ fn create_with_keys(
 }
 
 /// Execute a query that returns rows and build a Query response. Each column has the type the
-/// statement gives it ([`column_type`]), the one Describe reported, and each row is encoded as it
-/// comes (wire review 1 item 14: no value inference, no row buffering beyond the reply's).
+/// statement gives it ([`column_type`]), the one Describe reported, computed by the caller once per
+/// column (`columns`, one per result column), and each row is encoded as it comes (wire review 1
+/// item 14: no value inference, no row buffering beyond the reply's).
 fn execute_query(
     stmt: &mut turso_core::Statement,
     format: &Format,
-    types: &[Option<u32>],
+    columns: &[Type],
     schema: &turso_core::schema::Schema,
     backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
-    let header = Arc::new(result_fields(stmt, types, format).map_err(PgWireError::UserError)?);
+    let header =
+        Arc::new(field_info(stmt, format, |i| columns[i].clone()).map_err(PgWireError::UserError)?);
     // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
     // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
     // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
@@ -3634,25 +3722,20 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
         .collect()
 }
 
-/// Bind a portal's parameters to its statement, each converted from its text by its type (see
-/// [`parameter_types`]): an undeclared parameter's is the one its context gives, the type Describe
-/// reported, not one guessed from the value (an integer, then a float, then a boolean: '007' went
-/// into a text column as 7; wire review 4 item 3). A parameter count other than the statement's
-/// (08P01, as PostgreSQL's Bind answers), or a value the engine refuses, fails the bind. The
-/// engine numbers PostgreSQL's $n as its parameter n.
+/// Bind a portal's parameters to its statement, each converted from its text by its type, `types`
+/// (see [`parameter_types`], fixed by [`Parsed::fix_params`]): an undeclared parameter's is the one
+/// its context gives, the type Describe reported, not one guessed from the value (an integer, then
+/// a float, then a boolean: '007' went into a text column as 7; wire review 4 item 3). The caller
+/// has checked the values are as many as `types` ([`check_bind_arity`]). A value the engine
+/// refuses fails the bind. The engine numbers PostgreSQL's $n as its parameter n.
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
     portal: &Portal<Parsed>,
-    statement_types: &StatementTypes,
+    types: &[Type],
 ) -> PgWireResult<()> {
-    let types = parameter_types(statement_types, &portal.statement.parameter_types)
-        .map_err(PgWireError::UserError)?;
-    check_bind_arity(portal.parameter_len(), &portal.statement.id, types.len())
-        .map_err(PgWireError::UserError)?;
-    // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value, and
-    // the values are as many as the statement's parameters (just above).
-    for (i, pg_type) in types.iter().enumerate() {
-        let value = match &portal.parameters[i] {
+    // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
+    for (i, (pg_type, sent)) in types.iter().zip(&portal.parameters).enumerate() {
+        let value = match sent {
             None => Value::Null,
             Some(bytes) if portal.parameter_format.is_binary(i) => {
                 pg_binary_to_value(bytes, pg_type, i + 1)?
