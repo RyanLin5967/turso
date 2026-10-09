@@ -457,6 +457,55 @@ fn a_split_refuses_a_stretch_that_is_no_statement() {
     }
 }
 
+/// A statement's parameters as PostgreSQL's lexer reads them, without a parse (wire review 17 item
+/// 2): a `$` inside a string (standard, `E'..'` with its backslash escapes, `U&'..'`), a quoted
+/// identifier, a dollar-quoted string, a comment (nested ones too) or an identifier (`a$3`) is no
+/// parameter; the highest `$n` is the count's floor; a number past MAX_PARAMETER is left to the
+/// parser. `analysed`: PostgreSQL analyses the statement at Parse and counts its `$n` (a query, a
+/// CALL, EXPLAIN, DECLARE, CREATE TABLE ... AS); a utility statement has its declared parameters
+/// alone, whatever its text holds.
+#[test]
+fn scan_params_reads_parameters_as_the_lexer_does() {
+    use turso_pg_parser::scan_params;
+    for (sql, highest, analysed) in [
+        ("SELECT $1, $12", Some(12), true),
+        ("SELECT '$3'", Some(0), true),
+        ("SELECT 'it''s $4'", Some(0), true),
+        ("SELECT \"$3\"", Some(0), true),
+        ("SELECT a$3 FROM t", Some(0), true),
+        ("SELECT $q$ $9 $q$, $2", Some(2), true),
+        ("SELECT $$ $9 $$", Some(0), true),
+        ("SELECT E'\\' $5 '", Some(0), true),
+        ("SELECT U&'$6'", Some(0), true),
+        ("/* $7 */ SELECT 1 -- $8", Some(0), true),
+        ("/* a /* $1 */ b */ SELECT $2", Some(2), true),
+        ("(SELECT $3)", Some(3), true),
+        ("WITH x AS (SELECT $1) SELECT * FROM x", Some(1), true),
+        ("insert into t values ($2, $1)", Some(2), true),
+        ("SELECT $70000", None, true),
+        ("CREATE TABLE c AS SELECT $1", Some(1), true),
+        ("CREATE TEMP TABLE c (a) AS VALUES ($1)", Some(1), true),
+        (
+            "CREATE TABLE g (a int GENERATED ALWAYS AS (b + $1) STORED)",
+            Some(1),
+            false,
+        ),
+        ("CREATE VIEW v AS SELECT $1", Some(1), false),
+        ("SET search_path TO \"$user\", public", Some(0), false),
+        ("SET foreign_keys = off /* $1 */", Some(0), false),
+        ("COPY t FROM STDIN WHERE v = $1", Some(1), false),
+        ("BEGIN", Some(0), false),
+        ("", Some(0), false),
+    ] {
+        let scan = scan_params(sql);
+        assert_eq!(
+            (scan.highest, scan.analysed),
+            (highest, analysed),
+            "{sql:?}"
+        );
+    }
+}
+
 #[test]
 fn test_postgresql_types() {
     let queries = vec![

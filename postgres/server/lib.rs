@@ -40,7 +40,7 @@ use turso_pg::{
     attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
     PgBranchCall, PgConnection, StatementTypes,
 };
-use turso_pg_parser::{pg_space, skip_blank, sql_comment};
+use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
@@ -781,10 +781,14 @@ struct Session {
 /// were inferred again at each prepare, so a parameter Describe announced as int4 was read as text
 /// on a branch where its column is TEXT, its four binary bytes as UTF-8 (wire review 14 item 11).
 /// A re-Parse stores a new statement and Close drops this one, which clears them.
+///
+/// With its parameters as PostgreSQL's lexer reads them ([`scan_params`]), read here once, so Bind
+/// counts every statement's values before anything of it runs (wire review 17 item 2).
 #[derive(Debug, Clone)]
 struct Parsed {
     sql: String,
     call: Option<PgBranchCall>,
+    scan: ParamScan,
     params: OnceLock<Vec<Type>>,
     columns: OnceLock<Vec<Type>>,
 }
@@ -792,9 +796,16 @@ struct Parsed {
 impl Parsed {
     fn new(sql: String) -> Self {
         let call = branch_call(&sql);
+        // A branch call's parameters are its arguments' (branch_call_types).
+        let scan = if call.is_some() {
+            ParamScan::default()
+        } else {
+            scan_params(&sql)
+        };
         Self {
             sql,
             call,
+            scan,
             params: OnceLock::new(),
             columns: OnceLock::new(),
         }
@@ -2850,30 +2861,34 @@ impl ExtendedQueryHandler for Session {
             return Err(PgWireError::StatementNotFound(name.to_owned()));
         };
         check_bind(&message).map_err(PgWireError::UserError)?;
-        // A statement's parameter count, where it is known from the text, is checked here, as
-        // PostgreSQL checks every statement's at Bind: a branch call's (its $n), and that of a
-        // statement with no `$n`, a CHECKPOINT or a transaction verb, which has none but those
-        // Parse declared (each with a type: 42P18 for one declared unspecified). Neither was
-        // checked, so two values for turso_branch_create($1) created the branch (wire review 10
-        // item 5), a value for CHECKPOINT or BEGIN ran it (wire review 12 item 2), and a SET
-        // with a value was performed by the prepare before Execute's check refused it (wire review
-        // 14 item 4). A statement with a `$n` has its count from its parse, checked at Execute
-        // (E5-QUEUE R2).
+        // Every statement's parameter count is checked here, first, as PostgreSQL's
+        // exec_bind_message checks it: a branch call's (its $n); a statement PostgreSQL analyses at
+        // Parse, the declared parameters and every `$n` its lexer reads ([`scan_params`]); any
+        // other, the declared ones alone (each with a type: 42P18 for one declared unspecified).
+        // None was checked at first, so two values for turso_branch_create($1) created the branch
+        // (wire review 10 item 5) and a value for CHECKPOINT or BEGIN ran it (wire review 12 item
+        // 2); then a statement whose text held a `$` byte was counted only at Execute, after its
+        // prepare, so a `$` in a comment or a quoted name let a SET be performed before the
+        // refusal, and a failed block's 25P02 or a format code's 22023 answered before the count
+        // (wire review 14 item 4, review 17 item 2). A `$n` past MAX_PARAMETER is left to the
+        // prepare, which refuses it (42601).
         let sql = &statement.statement.sql;
+        let scan = statement.statement.scan;
         let required = if let Some(call) = &statement.statement.call {
             Some(
                 parameter_types(&branch_call_types(call), &statement.parameter_types)
                     .map_err(PgWireError::UserError)?
                     .len(),
             )
-        } else if !sql.contains('$') || TxVerb::of(sql) != TxVerb::Other || is_checkpoint(sql) {
+        } else if scan.analysed && scan.highest != Some(0) {
+            scan.highest
+                .map(|n| statement.parameter_types.len().max(n as usize))
+        } else {
             Some(
                 parameter_types(&StatementTypes::default(), &statement.parameter_types)
                     .map_err(PgWireError::UserError)?
                     .len(),
             )
-        } else {
-            None
         };
         if let Some(required) = required {
             check_bind_arity(message.parameters.len(), &statement.id, required)
