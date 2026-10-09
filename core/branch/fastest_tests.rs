@@ -4577,6 +4577,45 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
     }
 }
 
+/// Engine review 16 LOW 12: a compaction marked what it made durable in the rewrite class read
+/// AFTER the rewrite, whose own log reset clears the inherited floor: a D0 store over a log a D2
+/// run wrote compacted in FullFsync and said Off, so the next FULL trunk commit, whose barrier
+/// covers a Release the snapshot carries, led a flight for it. The class is read before the
+/// rewrite. Both modes (a catalog store's sharp checkpoint marks its commit in the class captured
+/// before it already: the control). Mutant `rewrite_class_read_after`.
+#[test]
+fn a_compaction_over_an_inherited_floor_marks_what_it_synced() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("inherited-compaction.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::FullFsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            (x.into_id(), db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        assert!(db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the open inherited the D2 run's class");
+        db.branch(id).unwrap().reap().unwrap();
+        db.branch_compact_now().unwrap();
+        assert!(!db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the rewrite cleared the inherited floor");
+        let trunk = db.connect().unwrap();
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let led = db.branches.group_counters();
+        write_v(&trunk, 9, "after");
+        let now = db.branches.group_counters();
+        assert_eq!(
+            [now[0] - led[0], now[1] - led[1], now[4] - led[4]],
+            [0, 0, 0],
+            "catalog={catalog}: a FULL trunk commit led a flight for a Release the compaction made durable in FullFsync"
+        );
+    }
+}
+
 /// Engine review 8 #8: three free paths skipped the hold: a lease's expiry (every fork's expiry
 /// pass), `reap_if_due`, and a close's collection of a branch released while a connection was
 /// open. They logged the Release with a write only, then freed at once. Here a lease runs out and
