@@ -3724,6 +3724,9 @@ thread_local! {
     /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
     /// durable once before the next acknowledgement, never once per flight).
     pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test builds: branch-file syncs this thread asked for, by class (`[Fsync, FullFsync]`),
+    /// whatever the platform makes of them (engine review 16 MED 7: off Apple both are fsync(2)).
+    pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
 }
 
 /// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
@@ -3798,6 +3801,11 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
     if !class.syncs() {
         return Ok(());
     }
+    #[cfg(test)]
+    CLASS_SYNCS.with(|c| {
+        let c = &c[usize::from(class == SyncClass::FullFsync)];
+        c.set(c.get() + 1);
+    });
     // A sync makes the held writes reach the file first (simulated power loss, test builds).
     #[cfg(all(test, unix))]
     lose_unsynced::apply(file)?;
@@ -5408,6 +5416,56 @@ mod format_tests {
             journal.rewrite_from(end, generation).unwrap();
             assert_eq!(dirs(), before, "compaction={compaction}: the inherited floor outlived the rewrite that carried its records");
         }
+    }
+
+    /// Engine review 16 MED 7 (1): an end frame said only "synced by a syncing writer", not in which
+    /// class, so a log a D2 run acknowledged at F_FULLFSYNC, reopened in D1, decided Fsync, and its
+    /// first rewrite carried those records with plain fsyncs (on Apple not a drain of the device).
+    /// The class each kept flight was synced in decides: the first compaction syncs its snapshot and
+    /// its directory in FullFsync. Counted by class requested (`CLASS_SYNCS`), so it holds off Apple
+    /// too. Mutant `decided_class_untagged`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d1_open_of_a_d2_log_rewrites_its_records_in_full_fsync() {
+        let full = || CLASS_SYNCS.with(|c| c[1].get());
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::FullFsync);
+        let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
+        assert!(!journal.raised.syncs(), "premise: the D2 run never raised the header");
+        let before = full();
+        journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
+        let synced = full() - before;
+        assert!(
+            synced >= 2,
+            "the first compaction of records a D2 run acknowledged synced its snapshot and directory below FullFsync ({synced} FullFsync syncs)"
+        );
+    }
+
+    /// Engine review 16 MED 7 (2): a D0 open promoted any log holding a synced flight to FullFsync,
+    /// so a log a D1 run acknowledged only at fsync paid F_FULLFSYNCs at the open and its first
+    /// rewrite. Its flights' own class decides: Fsync, and no FullFsync sync. Mutant
+    /// `decided_class_untagged`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_open_of_a_d1_log_syncs_in_fsync_only() {
+        let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Fsync);
+        let (fsyncs, fulls) = classes();
+        let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+        journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
+        let (fsyncs_after, fulls_after) = classes();
+        assert!(
+            fsyncs_after + fulls_after > fsyncs + fulls,
+            "premise: the open and the first rewrite synced the D1 run's records at all"
+        );
+        assert_eq!(
+            fulls_after - fulls,
+            0,
+            "a D0 open of a log a D1 run acknowledged at fsync synced in FullFsync"
+        );
     }
 
     /// Engine review 7 #2 (a): review 5 #26's rule (damage under one whole later synced flight lies
