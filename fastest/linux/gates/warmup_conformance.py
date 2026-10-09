@@ -67,6 +67,10 @@ CASES = [
     ("claims at one instant count one by one", "2:0:100", [0, 0, 0, 0], (2, 2, 0)),
     ("truncation: S 1.0000000009 s is 1000000000 ns, not 1000000001", "1:1.0000000009:100",
      [0, S, S + 1], (1, 1, 0)),
+    # review 5 LOW 13: fractional seconds that a whole-seconds driver gets wrong
+    ("fractional S: 0.5 s, not 0, after OPS is met at 1 ns", "1:0.5:100", [0, 1, S // 2 - 1, S // 2], (3, 3, 0)),
+    ("fractional MAX_S: 2.5 s caps at 2500000000 ns, not at 2 s", "1000:0:2.5", [0, 5 * S // 2 - 1, 5 * S // 2],
+     (2, 2, 1)),
 ]
 LINE = re.compile(r"^stop_at=(\d+|none) warm_ops=(\d+) capped=(0|1|none)$")
 # rule strings every driver must refuse, exiting non-zero with no result line (review 5 MED 9): MAX_S 0 (never "no
@@ -89,10 +93,10 @@ def refuses(binary, rule):
     return r.returncode != 0 and not printed, f"rc {r.returncode}, stdout {r.stdout.strip()[-120:]!r}"
 
 
-def replay(binary, rule, trace):
+def replay(binary, rule, trace, timeout=60):
     try:
         r = subprocess.run([binary, "--warmup-replay", rule], input="".join(f"{t}\n" for t in trace),
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Refused(f"{binary} --warmup-replay {rule}: {type(e).__name__}: {e}")
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
@@ -114,7 +118,7 @@ def identity(binary):
 VERDICTS = {0: "PASS", 1: "FAIL", 2: "REFUSED", 3: "PARTIAL"}
 
 
-def run(drivers, record=None):
+def run(drivers, record=None, timeout=60):
     """drivers: {role: binary}; returns (rc, report lines). Each role's binary is named by realpath and sha256, and
     two roles resolving to one file or to one sha256 are REFUSED (review 5 MED 7: the same binary under all three roles
     gave rc 0). RECORD, when given, receives the verdict as JSON: rc, verdict, the case count, and per role its path,
@@ -148,7 +152,7 @@ def run(drivers, record=None):
     try:
         for name, binary in drivers.items():
             for case, rule, trace, want in CASES:
-                g = replay(binary, rule, trace)
+                g = replay(binary, rule, trace, timeout)
                 got[(name, case)] = g
                 ok = g == want
                 bad += not ok
