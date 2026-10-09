@@ -2559,7 +2559,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
     }
     // And the commit as durable as any record it replaces (review B-F3).
-    catalog.raise_sync(cap.arena_sync)?;
+    catalog.set_commit_sync(cap.arena_sync)?;
     catalog.begin()?;
     let written = (|| -> Result<()> {
         for (b, what) in &cap.rows {
@@ -2746,7 +2746,7 @@ fn run_flight(
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
-        // The class the catalog commit synced in: the capture's rewrite class (`raise_sync`), not
+        // The class the catalog commit synced in: the capture's commit class (`set_commit_sync`), not
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());

@@ -452,8 +452,10 @@ mod census_tests {
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    /// The class this handle's commits sync in (`prepared`, `raise_sync`).
+    /// The class this handle's commits sync in (`prepared`, `set_commit_sync`), and the one it was
+    /// opened in, below which `set_commit_sync` never goes.
     sync: SyncClass,
+    opened_sync: SyncClass,
     pub(crate) counters: CatalogCounters,
     /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
     pub(crate) prewarm: PrewarmStats,
@@ -630,20 +632,24 @@ impl Catalog {
             conn,
             _db: db,
             sync,
+            opened_sync: sync,
         })
     }
 
-    /// Sync this handle's commits in `class` from now on, if it is stronger than their class:
-    /// a checkpoint replaces log records that were made durable in a raised class, and its commit
-    /// must keep them that durable (fastest-engine review B-F3).
-    pub(crate) fn raise_sync(&mut self, class: SyncClass) -> Result<()> {
-        if !class.syncs() || class <= self.sync {
+    /// Sync this handle's commits in `class`, or in the class it was opened in if that is
+    /// stronger: a checkpoint replaces log records that were made durable in `class`, and its
+    /// commit must keep them that durable (fastest-engine review B-F3) and no more, so the class
+    /// the install claims for the commit is the one it synced in (engine review 16 LOW 13, review
+    /// 17 #14: this only raised, while the class a capture needs can drop). Blind spot: at
+    /// 8f11fa2af a capture's class never drops within a process (`synced_base` is sticky in the
+    /// free class), so no test reaches the lowering arm.
+    pub(crate) fn set_commit_sync(&mut self, class: SyncClass) -> Result<()> {
+        let class = class.max(self.opened_sync);
+        if class == self.sync {
             return Ok(());
         }
-        self.conn.execute("PRAGMA synchronous = FULL")?;
-        if class == SyncClass::FullFsync {
-            self.conn.execute("PRAGMA fullfsync = ON")?;
-        }
+        self.conn.execute(if class.syncs() { "PRAGMA synchronous = FULL" } else { "PRAGMA synchronous = OFF" })?;
+        self.conn.execute(if class == SyncClass::FullFsync { "PRAGMA fullfsync = ON" } else { "PRAGMA fullfsync = OFF" })?;
         self.sync = class;
         Ok(())
     }
