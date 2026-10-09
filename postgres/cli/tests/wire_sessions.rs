@@ -2451,6 +2451,114 @@ fn schema_ddl_is_refused_in_server_mode() {
         .ok("a create in the session that asked");
 }
 
+/// A parameter is typed from the relation the engine will write, through its schema and the
+/// session's search path: never from public's table of the same name. With public.t(c int) and
+/// s.t(c text), an undeclared '007' into s.t (INSERT, UPDATE SET, ON CONFLICT's excluded) or into
+/// t after `SET search_path TO s, public` is stored as '007' or refused 42P18 (the walk cannot read
+/// an attached schema), never typed int4 and stored as 7; a DML target is the table even when a
+/// CTE of its name is in scope; and a three-part `s.t.c` reference is refused 42P18, not text. The
+/// walk read every target in public alone (wire review 14 item 3; psycopg3 sends str parameters
+/// with OID 0, so it reaches this with default settings). The schema is made by the non-server CLI
+/// before the server starts: the server refuses CREATE SCHEMA, and attaches a schema file present
+/// at session open.
+#[test]
+fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
+    let dir = Scratch::new("schematarget");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+              CREATE TABLE p(name TEXT);\n\
+              CREATE SCHEMA s;\n\
+              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
+        )
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    assert!(
+        dir.0.join("turso-postgres-schema-s.db").exists(),
+        "premise: schema s has its file"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let mut check = |a: &mut Wire, what: &str, sql: &str, value: &[u8], read: &str| {
+        let r = a.xt(sql, &[(0, 0, value)]);
+        match &r.error {
+            Some(e) if e.code == "42P18" => {}
+            Some(e) => wrong.push(format!("{what}: {} {}", e.code, e.message)),
+            None => {
+                let got = a.q(read).single(what);
+                if got != "007" {
+                    wrong.push(format!("{what}: stored {got:?}, want '007' (or 42P18)"));
+                }
+            }
+        }
+    };
+    check(
+        &mut a,
+        "INSERT INTO s.t",
+        "INSERT INTO s.t VALUES (1, $1)",
+        b"007",
+        "SELECT c FROM s.t WHERE id = 1",
+    );
+    a.q("INSERT INTO s.t VALUES (2, 'x') ON CONFLICT DO NOTHING")
+        .ok("a row to update");
+    check(
+        &mut a,
+        "UPDATE s.t SET",
+        "UPDATE s.t SET c = $1 WHERE id = 2",
+        b"007",
+        "SELECT c FROM s.t WHERE id = 2",
+    );
+    check(
+        &mut a,
+        "ON CONFLICT excluded",
+        "INSERT INTO s.t VALUES (2, $1) ON CONFLICT (id) DO UPDATE SET c = excluded.c",
+        b"007",
+        "SELECT c FROM s.t WHERE id = 2",
+    );
+    a.q("SET search_path TO s, public").ok("search path");
+    check(
+        &mut a,
+        "INSERT INTO t by the search path",
+        "INSERT INTO t VALUES (3, $1)",
+        b"007",
+        "SELECT c FROM s.t WHERE id = 3",
+    );
+    a.q("SET search_path TO public").ok("search path back");
+    let r = a.describe_statement("WITH p AS (SELECT 1 AS name) DELETE FROM p WHERE name = $1");
+    if r.error.is_some() || r.params != Some(vec![25]) {
+        wrong.push(format!(
+            "DELETE FROM p beside a CTE p: Describe {:?} {:?}, want [25] (the table's text)",
+            r.params, r.error
+        ));
+    }
+    let r = a.describe_statement("SELECT 1 FROM t WHERE s.t.c = $1");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
+        wrong.push(format!(
+            "a three-part reference: {:?} {:?}, want 42P18",
+            r.params, r.error
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// ALTER TABLE ADD PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works in every transaction state a
 /// client can be in (autocommit; right after BEGIN; after BEGIN and a read; after BEGIN and a
 /// write): it commits with the block, keeps every row, takes effect, and leaves no aside table.
