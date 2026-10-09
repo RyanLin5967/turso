@@ -402,7 +402,8 @@ def self_test():
     def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
              plants=True, plants_fired=True, plp="no", lie=False, cell="ok", void=None, drift="pass", a25_after=300.0,
              rule=RULE, ours_rule=RULE, ours_ops=(200, 200), comp_ops=200, adapter_rc=0, k=1, settle="quiet=yes",
-             plan_ops=None, plan_cols=7, drift_json_us=None, bound=False, timed=None):
+             plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
+             ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1")):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         system = {"ok": "ours", "na": "ours", "compfail": "dolt", "comp": "dolt"}[cell]
@@ -418,19 +419,27 @@ def self_test():
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
         ops = plan_ops or [200] * k
-        w(f"{f}/plan.tsv", "".join("\t".join([c, system, "1", str(ops[i]), "1", "full", str(i + 1)][:plan_cols]) + "\n"
-                                   for i, c in enumerate(cells)))
+        w(f"{f}/plan.tsv", "".join("\t".join([c, system, "1", str(ops[i]), "1", "full", str(i + 1), str(age),
+                                             str(live)][:plan_cols]) + "\n" for i, c in enumerate(cells)))
         for c in cells:
             a1 = f"{f}/cells/{c}/a1"
             if settle is not None:
                 w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
+                fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
                 w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": ours_rule, "ops_total": ours_ops[0],
-                                                           "ops_total_asked": ours_ops[1]}))
+                                                           "ops_total_asked": ours_ops[1]}
+                                                          | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
             else:
                 verdict = "FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail" else "PASS F1\nVERDICT PASS\n"
                 w(f"{a1}/result/functional.txt", verdict)
+                info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
+                if info is not None:
+                    w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} {info} "
+                                                   "parent_sum=1\n")
+                if expected is not None:
+                    w(f"{a1}/result/expected-cells.txt", "".join(e + "\n" for e in expected))
                 for cc in ("c1-create", "c1-m1"):
                     # timed: None (an uncapped run of comp_ops), or (measured_ops, capped, timedrun's verdict)
                     mo, cap, tv = timed if timed else (comp_ops, False, "ok")
@@ -557,6 +566,23 @@ def self_test():
          {"a25_after": 400.0, "drift_json_us": 0.0}, False, lambda s: "V3 drift: append25 0.0" in s["failed_blocks"][0]),
         ("MED 6: a bound batch's plants are re-derived with its directory: wt-tampered fires",
          {"bound": True}, True, lambda s: s["blocks"][0]["a14_plants_rederived"].get("wt-tampered") is True),
+        ("HIGH 4 (fixture parity): ours recording no fixture fails", {"ours_fixture": None}, False,
+         lambda s: any("no fixture record" in x for x in s["fixture_refusals"])),
+        ("HIGH 4: ours whose fixture differs from its plan row (live 10 vs 20) fails",
+         {"ours_fixture": {"age": 200, "live": 10}}, False, lambda s: any("live" in x for x in s["fixture_refusals"])),
+        ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
+         {"cell": "comp", "comp_info": "dry=1 age=0 prebranch=20"}, False,
+         lambda s: any("age" in x for x in s["fixture_refusals"])),
+        ("LOW 15: a competitor run-info saying dry=0 inside a dry package fails",
+         {"cell": "comp", "comp_info": "dry=0 age=200 prebranch=20"}, False,
+         lambda s: any("dry" in x for x in s["fixture_refusals"])),
+        ("LOW 15: a competitor with no run-info.txt fails", {"cell": "comp", "comp_info": None}, False,
+         lambda s: any("run-info" in x for x in s["fixture_refusals"])),
+        ("LOW 24: a competitor cell listed in expected-cells.txt with no timed run fails",
+         {"cell": "comp", "expected": ("c1-create", "c1-m1", "c4-create")}, False,
+         lambda s: any("c4-create" in x for x in s["parity_refusals"])),
+        ("LOW 24: a competitor run with no expected-cells.txt fails", {"cell": "comp", "expected": None}, False,
+         lambda s: any("expected-cells.txt" in x for x in s["parity_refusals"])),
         ("LOW 11: K=3 blocks, all VALID: every run carries its own block's normaliser", {"k": 3}, True,
          lambda s: [r["block_k"] for r in s["runs"]] == [1, 2, 3] and all(r["v3l_pooled_fsync_p50_us"] == 10.0 for r in s["runs"])),
         ("LOW 11: K=3 with a VOID b1 fails blocks 1 and 2 and leaves their runs without a normaliser", {"k": 3, "after_v3l": "VOID"},
@@ -603,7 +629,7 @@ def self_test():
         for fs in fsl:
             plan = cells.plan(man, fs, 20261005)
             w(f"{out}/fs-{fs}/plan.tsv", "".join("\t".join(r) + "\n" for r in plan))
-            for cell, system, clients, ops, _, _, _ in plan:
+            for cell, system, clients, ops in (r[:4] for r in plan):
                 rows.append(f"{fs}\t{cell}\t{system}\t{clients}\t1\t0\tVALID")
                 a1 = f"{out}/fs-{fs}/cells/{cell}/a1"
                 if system == "ours":
