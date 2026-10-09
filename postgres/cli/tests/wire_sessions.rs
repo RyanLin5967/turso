@@ -4607,7 +4607,7 @@ fn a_malformed_query_in_a_skip_is_ignored() {
     for (n, query) in [(9, &b"SELECT 1"[..]), (10, &b"SELECT '\xff'\0"[..])] {
         let insert = format!("\0INSERT INTO t VALUES ({n}, 'n')\0\0\0");
         let round = [
-            frame(b'P', b"\0SELECT 1/0\0\0\0"),
+            frame(b'P', b"\0SELECT * FROM nosuch\0\0\0"),
             frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
             frame(b'E', &[0, 0, 0, 0, 0]),
             frame(b'Q', query),
@@ -4918,7 +4918,7 @@ fn a_bind_is_checked_before_its_statement_runs() {
     );
     assert_eq!(r.status, b'I', "no block begun");
     a.q("BEGIN").ok("begin");
-    assert_eq!(a.q("SELECT 1/0").status, b'E');
+    assert_eq!(a.q("SELECT * FROM nosuch").status, b'E');
     let r = round(&mut a, "ROLLBACK", &[25], &[b"x"]);
     assert_eq!(
         r.err("ROLLBACK with a value in a failed block").code,
@@ -6903,7 +6903,7 @@ fn an_implicit_block_follows_the_engines_transaction() {
         a.q("SELECT count(*) FROM t WHERE id > 1")
             .single("rows kept")
     };
-    let sql = "INSERT INTO t VALUES (2, 'two'); COMMIT\u{a0}; INSERT INTO t VALUES (3, 'three'); SELECT 1/0";
+    let sql = "INSERT INTO t VALUES (2, 'two'); COMMIT\u{a0}; INSERT INTO t VALUES (3, 'three'); INSERT INTO t VALUES (1, 'dup')";
     let r = a.q(sql);
     assert_eq!(r.err("COMMIT with an NBSP").code, "42601");
     assert_eq!(r.status, b'I');
@@ -6912,7 +6912,7 @@ fn an_implicit_block_follows_the_engines_transaction() {
         "INSERT INTO t VALUES (2, 'two')",
         "COMMIT\u{a0}",
         "INSERT INTO t VALUES (3, 'three')",
-        "SELECT 1/0",
+        "INSERT INTO t VALUES (1, 'dup')",
     ]);
     assert_eq!(r.err("pipeline COMMIT with an NBSP").code, "42601");
     assert_eq!(count(&mut a), "0", "pipeline: nothing kept");
@@ -6923,7 +6923,7 @@ fn an_implicit_block_follows_the_engines_transaction() {
     let r = a.q("SELECT turso_branch_switch('x')");
     assert_eq!(r.err("no branch x").code, "3D000");
     // An unsynced pipeline INSERT, then a simple Query that fails, then Sync: rolled back.
-    for query in ["SELECT 1/0", "SELECT turso_branch_create('y')"] {
+    for query in ["SELECT * FROM nosuch", "SELECT turso_branch_create('y')"] {
         let mut parse = vec![0u8];
         parse.extend_from_slice(b"INSERT INTO t VALUES (5, 'five')");
         parse.extend_from_slice(&[0, 0, 0]);
@@ -7054,7 +7054,7 @@ fn a_transaction_verb_is_read_by_its_whole_grammar() {
         assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "after {bad}");
         // In a failed block: still a syntax error, the block still failed.
         a.q("BEGIN").ok("begin");
-        a.q("SELECT 1/0").err("fail the block");
+        a.q("SELECT * FROM nosuch").err("fail the block");
         let r = a.q(bad);
         assert_eq!(r.status, b'E', "{bad} ended a failed block");
         a.q("ROLLBACK").ok("end");
@@ -7070,7 +7070,7 @@ fn a_transaction_verb_is_read_by_its_whole_grammar() {
     }
     // A verb behind a comment ends a failed block.
     a.q("BEGIN").ok("begin");
-    a.q("SELECT 1/0").err("fail the block");
+    a.q("SELECT * FROM nosuch").err("fail the block");
     let r = a.q("/* c */ ROLLBACK").ok("commented ROLLBACK");
     assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
     assert_eq!(r.status, b'I');
@@ -7212,7 +7212,7 @@ fn a_commented_transaction_verb_is_its_verb() {
     let mut a = seeded(&server);
     for rollback in ["ROLLBACK -- why", "/* c */ ROLLBACK", "ROLLBACK/**/;"] {
         a.q("BEGIN").ok("begin");
-        a.q("SELECT 1/0").err("fail the block");
+        a.q("SELECT * FROM nosuch").err("fail the block");
         let r = a.q(rollback).ok(rollback);
         assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{rollback}");
         assert_eq!(r.status, b'I', "{rollback}");
@@ -7248,7 +7248,11 @@ fn a_verb_beside_empty_statements_is_its_verb() {
     let mut a = seeded(&server);
     for sql in [";COMMIT", "COMMIT;;"] {
         a.q("BEGIN").ok("begin");
-        assert_eq!(a.q("SELECT 1/0").status, b'E', "premise: the block failed");
+        assert_eq!(
+            a.q("SELECT * FROM nosuch").status,
+            b'E',
+            "premise: the block failed"
+        );
         let r = a.x(sql, &[]).ok(sql);
         assert_eq!(
             r.tags,
