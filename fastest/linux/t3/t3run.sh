@@ -233,6 +233,9 @@ preflight() {
     DEV_NAME=$(basename "$DEV_REAL")
     dev_identity /sys "$DEV_NAME" > "$OUT/device-id.txt" 2> "$OUT/device-id.err" ||
       { cat "$OUT/device-id.err"; echo "REFUSED: cannot record $DEV_NAME's identity"; return 2; }
+    # V3L's write rule reads the drive's sectors-written counter, which moves only with iostats on (review 5 MED 2)
+    [ "$(cat "/sys/block/$DEV_NAME/queue/iostats" 2>/dev/null)" = 1 ] ||
+      { echo "REFUSED: $DEV_NAME's queue/iostats is not 1: its sectors-written counter does not advance, so every V3L would VOID"; return 2; }
     # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
     local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
     [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }

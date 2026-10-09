@@ -41,6 +41,8 @@ Gates (any failure makes the measurement VOID, and the block with it):
     flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, provisional until
     registered); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
     counter (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
+  - the leaf's queue/iostats reads 1 (recorded in leaf.iostats; measure() refuses otherwise, and gates() VOIDs a
+    record without it on its own text): the sectors-written counter moves only with iostats on (review 5 MED 2);
   - the drive's sectors-written counter rises by at least the fsynced data, N x 4 KiB = N x 8 sectors, across EACH
     fsync run, timed and labelling (T3 runner review item 10): over a write-through drive the flush counter reads 0
     whether or not an fsync reached the drive (a write-through loop above it sends no flush either, so its writes can
@@ -270,9 +272,24 @@ def gates(rec):
     else:
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
     if not str(rec["leaf"].get("disk") or "").startswith("ram"):
-        bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
+        # the write count only moves with queue/iostats 1; without it the write rule's verdict would name the wrong cause
+        ip = iostats_problem(rec["leaf"].get("iostats"))
+        if ip:
+            bad.append(f"drive {rec['leaf'].get('disk')}: {ip}")
+        else:
+            bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
         bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
     return bad
+
+
+def iostats_problem(v):
+    """Why the leaf's queue/iostats value V makes its sectors-written counter useless, or None when it is 1 (review 5
+    MED 2: flushes are counted whatever iostats says; sectors written are counted only with iostats on)"""
+    if v is None or str(v).strip() == "":
+        return "cannot read the leaf's queue/iostats: whether its sectors-written counter advances is unknown"
+    if str(v).strip() != "1":
+        return f"iostats off ({v!r}): the sectors-written counter does not advance"
+    return None
 
 
 def sync_gate(disk, sy):
@@ -396,6 +413,7 @@ def measure(d, out, leafrec=None):
            "n": N, "fio_version": sh("fio", "--version")[1].strip(),
            "strace_version": sv.splitlines()[0] if rc == 0 and sv else None,
            "leaf": {"chain": chain, "disk": disk, "write_cache": disk_attr(disk, "queue/write_cache"),
+                    "iostats": disk_attr(disk, "queue/iostats"),
                     "fua": disk_attr(disk, "queue/fua"), "rotational": disk_attr(disk, "queue/rotational"),
                     "model": disk_attr(disk, "device/model"), "drive_reports": drive_reports,
                     "drive_reports_from": leafrec,
@@ -404,6 +422,8 @@ def measure(d, out, leafrec=None):
            "virtualization": virt, "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
+    if not disk.startswith("ram") and iostats_problem(rec["leaf"]["iostats"]):
+        raise RuntimeError(f"{disk}: {iostats_problem(rec['leaf']['iostats'])} (review 5 MED 2; refused before any run)")
     os.makedirs(out)
     for arm, fs in (("fsync", True), ("control", False)):
         a = {}
