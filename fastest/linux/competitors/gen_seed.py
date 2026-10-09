@@ -4,9 +4,9 @@ ours: gate-6 review, t3run item 4). The table: t(id INTEGER PRIMARY KEY, v INT N
 1..ROWS, v = 0, a deterministic 100-char pad. Plain SQL accepted by PostgreSQL, Doltgres, Dolt (MySQL dialect) and
 SQLite; INSERTs in batches of 1000 rows.
 
-  gen_seed.py ROWS                        the parent SQL (unchanged form, used by pg18.sh, dolt.sh, doltgres.sh)
   gen_seed.py sql --rows R [--digest-out FILE]
-                                          the same; --digest-out: the sha256 of the bytes written, into FILE (MED 3)
+                                          the parent SQL (pg18.sh, dolt.sh, doltgres.sh pipe it; fixture.py sqlite
+                                          streams it); --digest-out: the sha256 of the bytes written, into FILE (MED 3)
   gen_seed.py age --rows R --updates K [--seed S] [--digest-out FILE]
                                           K random single-row UPDATEs, one statement each (autocommit: each committed),
                                           the same ids and values for every system (PREREG §7 / amendment 52 ages with
@@ -16,14 +16,11 @@ SQLite; INSERTs in batches of 1000 rows.
   gen_seed.py readback-sql --dialect pg|mysql
                                           the engine's own read-back query of that triple (pg: PostgreSQL, Doltgres)
   gen_seed.py readback-sqlite FILE        the same triple read from an SQLite file
-  gen_seed.py digest --rows R [--updates K] [--seed S]
-                                          sha256 of the exact SQL stream (parent, then aging): fixture.json's
-                                          gen_seed_sha256, the same for every system that loaded it
   gen_seed.py sum --rows R [--updates K] [--seed S]
                                           sum(v) over t after the aging (0 fresh): what isolation checks expect
-  gen_seed.py rows-for --bytes B          the row count for a parent of about B bytes (128 logical bytes a row:
-                                          id 4 + v 4 + pad 120), so every system is sized by one rule
   gen_seed.py selftest
+fixture.json's gen_seed_sha256 (the sha256 of the parent stream, then the aging) is digest(), taken by facts() in the
+same pass as everything else fixture.py records.
 """
 import hashlib
 import sys
@@ -39,7 +36,7 @@ def xorshift32(x):
 
 
 def sql_lines(rows):
-    """The parent: byte for byte what gen_seed.py ROWS has always printed (one pad stream across batches)."""
+    """The parent, as `gen_seed.py sql` prints it (one pad stream across batches)."""
     # INTEGER PRIMARY KEY (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so
     # B1's parent has no separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres
     # read INTEGER as INT, so one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
@@ -83,10 +80,6 @@ def digest(rows, updates=0, seed=1):
     for ln in age_lines(rows, updates, seed):
         h.update(ln.encode() + b"\n")
     return h.hexdigest()
-
-
-def rows_for(nbytes):
-    return max(1, -(-int(nbytes) // 128))
 
 
 # ---- what the engine must READ BACK (lead review 62430d8bf..b49fb656a MED 3: the fixture guard compared its own
@@ -202,8 +195,6 @@ def selftest():
     ok("digest: 64 hex", len(d0) == 64 and all(c in "0123456789abcdef" for c in d0))
     ok("digest covers the aging", d0 != d1 and d1 == digest(2500, 300, 7))
     ok("digest covers the row count", d0 != digest(2501))
-    ok("rows-for: 1 MB, 100 MB, 1 GB", (rows_for(1 << 20), rows_for(100 << 20), rows_for(1 << 30)) ==
-       (8192, 819200, 8388608))
     # The value SQLite itself reported after loading this stream (fixture.py sqlite, 2500 rows, 300 updates, seed 1,
     # SQLite 3.53 on the Mac, 2026-10-08): count|sum = 2500|131727070. Not computed by the subject.
     ok("aged sum(v) = what SQLite read back after the same stream", aged_sum(2500, 300, 1) == 131727070)
@@ -266,8 +257,6 @@ def arg(argv, name, default=None, conv=int):
 if __name__ == "__main__":
     av = sys.argv[1:]
     out = sys.stdout
-    if len(av) == 1 and av[0].isdigit():
-        av = ["sql", "--rows", av[0]]
     if not av:
         sys.exit(__doc__)
     cmd = av[0]
@@ -302,10 +291,6 @@ if __name__ == "__main__":
             n, s, hsum = n + 1, s + v, hsum + hash_row(i, v, pad)
         con.close()
         print(f"{n}|{s}|{hsum}")
-    elif cmd == "digest":
-        print(digest(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
-    elif cmd == "rows-for":
-        print(rows_for(arg(av, "--bytes")))
     elif cmd == "sum":
         print(aged_sum(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     else:

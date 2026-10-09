@@ -1,11 +1,5 @@
 /* clonebench.c -- the "just copy the file" baselines (PREREG §6 B0 and B1), embedded.
  *
- *   clonebench mkparent --db PATH --rows N [--age K] [--seed S]
- *       SQLite parent (Homebrew SQLite, NOT Apple's: Apple maps fullfsync to F_BARRIERFSYNC, tools/v1/FIRECHECK.md):
- *       t(id INTEGER PRIMARY KEY, v INT, pad TEXT), WAL, checkpointed TRUNCATE. --age K then fragments it the way
- *       PREREG §7 asks ("aged with random page updates"): clone it once so every extent is shared, apply K random
- *       row updates and a TRUNCATE checkpoint (each rewritten page is copy-on-write), delete the clone. Prints the
- *       extent count before and after (F_LOG2PHYS_EXT walk).
  *   clonebench extents FILE
  *   clonebench run --mode b1|b0 --op m1c|m1 --parent DB --dir BRANCHDIR --clients C --out OUT
  *       [--max-ops N | --duration-s S [--min-ops N]] [--warmup-ops W] [--hold-us U] [--sync d2|d0] [--rows R]
@@ -53,6 +47,8 @@
  *   - clock CLOCK_MONOTONIC; V1/C1b hooks only with BB_HOOKS=1 (as bbload.c): --v1-run and C1B_RUN refuse without.
  *   - --drop is a durable delete: the unlinks, then fsync(branch dir) under --sync d2 (op err 4 if it fails),
  *     untimed (after_ns). With no warm-up at all the run starts in the measured window, as bbload's does.
+ *   - no mkparent (lead review 62430d8bf..b49fb656a LOW 27): the Mac's own-generator parent is replaced on Linux by
+ *     gen_seed.py's stream, loaded by fixture.py sqlite (gate-6 review, t3run item 4: one parent for every system).
  */
 #ifndef BB_HOOKS
 #ifdef __APPLE__
@@ -255,69 +251,6 @@ static sqlite3 *sq_open(const char *path, int create) {
     int fl = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0) | SQLITE_OPEN_NOMUTEX;
     if (sqlite3_open_v2(path, &db, fl, NULL) != SQLITE_OK) { fprintf(stderr, "clonebench: open %s: %s\n", path, sqlite3_errmsg(db)); return NULL; }
     return db;
-}
-
-static int cmd_mkparent(int argc, char **argv) {
-    const char *db = NULL;
-    long rows = 0, age = 0;
-    uint64_t seed = 1;
-    for (int i = 0; i < argc; i++) {
-        if (!strcmp(argv[i], "--db") && i + 1 < argc) db = argv[++i];
-        else if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--age") && i + 1 < argc) age = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10) | 1;
-        else { fprintf(stderr, "clonebench mkparent: bad argument %s\n", argv[i]); return 2; }
-    }
-    if (!db || rows < 1) { fprintf(stderr, "usage: clonebench mkparent --db PATH --rows N [--age K]\n"); return 2; }
-    if (guard_file_dir(db)) return 2;
-    if (access(db, F_OK) == 0) { fprintf(stderr, "clonebench: REFUSED: %s exists\n", db); return 2; }
-    sqlite3 *h = sq_open(db, 1);
-    if (!h) return 2;
-    sq_exec(h, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1;"
-               "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad TEXT NOT NULL);");
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(h, "INSERT INTO t (id, v, pad) VALUES (?, 0, ?)", -1, &st, NULL);
-    char pad[101];
-    uint64_t r = seed;
-    sq_exec(h, "BEGIN");
-    for (long i = 1; i <= rows; i++) {
-        for (int k = 0; k < 100; k++) pad[k] = "abcdefghijklmnopqrstuvwxyz0123456789"[xs(&r) % 36];
-        pad[100] = 0;
-        sqlite3_bind_int64(st, 1, i);
-        sqlite3_bind_text(st, 2, pad, 100, SQLITE_STATIC);
-        if (sqlite3_step(st) != SQLITE_DONE) { fprintf(stderr, "clonebench: insert: %s\n", sqlite3_errmsg(h)); return 2; }
-        sqlite3_reset(st);
-        if (i % 100000 == 0) { sq_exec(h, "COMMIT"); sq_exec(h, "BEGIN"); }
-    }
-    sq_exec(h, "COMMIT");
-    sqlite3_finalize(st);
-    sq_exec(h, "PRAGMA wal_checkpoint(TRUNCATE)");
-    off_t sz;
-    long e0 = extents(db, &sz);
-    long e1 = e0;
-    if (age > 0) {
-        char ac[2100];
-        snprintf(ac, sizeof ac, "%s.agingclone", db);
-        unlink(ac);
-        if (clonefile(db, ac, 0) != 0) die("aging clonefile");
-        sqlite3_prepare_v2(h, "UPDATE t SET v = v + 1 WHERE id = ?", -1, &st, NULL);
-        sq_exec(h, "BEGIN");
-        for (long i = 1; i <= age; i++) {
-            sqlite3_bind_int64(st, 1, 1 + (long)(xs(&r) % (uint64_t)rows));
-            if (sqlite3_step(st) != SQLITE_DONE) { fprintf(stderr, "clonebench: age: %s\n", sqlite3_errmsg(h)); return 2; }
-            sqlite3_reset(st);
-            if (i % 1000 == 0) { sq_exec(h, "COMMIT"); sq_exec(h, "PRAGMA wal_checkpoint(TRUNCATE)"); sq_exec(h, "BEGIN"); }
-        }
-        sq_exec(h, "COMMIT");
-        sqlite3_finalize(st);
-        sq_exec(h, "PRAGMA wal_checkpoint(TRUNCATE)");
-        if (unlink(ac) != 0) die("unlink aging clone");
-        e1 = extents(db, &sz);
-    }
-    sqlite3_close(h);
-    printf("{\"db\":\"%s\",\"rows\":%ld,\"age\":%ld,\"bytes\":%lld,\"extents_before_age\":%ld,\"extents\":%ld}\n", db, rows, age,
-           (long long)sz, e0, e1);
-    return 0;
 }
 
 /* ---------- run ---------- */
@@ -678,7 +611,6 @@ static int cmd_run(int argc, char **argv) {
             }
         }
     }
-    (void)t_start;
     for (int i = 0; i < C; i++) pthread_join(cl[i].th, NULL);
     if (MODE_B0) {
         pthread_mutex_lock(&f_mu);
@@ -843,8 +775,7 @@ static int cmd_par(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: clonebench mkparent|extents|run|par ...\n"); return 2; }
-    if (!strcmp(argv[1], "mkparent")) return cmd_mkparent(argc - 2, argv + 2);
+    if (argc < 2) { fprintf(stderr, "usage: clonebench extents|run|par ...\n"); return 2; }
     if (!strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "par")) return cmd_par(argc - 2, argv + 2);
     if (!strcmp(argv[1], "extents") && argc == 3) {

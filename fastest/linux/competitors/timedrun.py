@@ -473,7 +473,14 @@ def selftest():
                                                                              "timed_before": LIVE, "timed_after": LIVE}),
          False),
     ]
-    bad = 0
+    bad = n = 0
+
+    def ok(cond, line):  # counts its own cases (LOW 27: the total came from padding `cases` with None)
+        nonlocal bad, n
+        print(("PASS" if cond else "FAIL"), line)
+        bad += not cond
+        n += 1
+
     with tempfile.TemporaryDirectory() as root:
         for i, (name, kw, want) in enumerate(cases):
             kw = dict(kw)
@@ -481,37 +488,27 @@ def selftest():
             d = fixture(root, f"c{i}", **kw)
             why = check(d, n_check, RULE, LIVE, CAP)
             got = not why
-            print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
-            bad += got != want
+            ok(got == want, f"{name} -> {'ok' if got else '; '.join(why)}")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
         got = ops(*args)
-        print(("PASS" if got == want else "FAIL"), f"ops{args} = {got!r}, want {want!r}")
-        bad += got != want
-        cases.append(None)
+        ok(got == want, f"ops{args} = {got!r}, want {want!r}")
     # MED 7: the verdict is computed against the registered rule at the cap, rule(CAP), never the run's own: a clean
     # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'
     for why_in, rule_in, cap_in, want in (([], "1000:10:180", "1800", "ok"), ([], "1000:10:2", "1800", "ok-smoke-warmup"),
                                           ([], "1000:10:6", "60", "ok"), (["x"], "1000:10:180", "1800", "REFUSED: x"),
                                           ([], "1000:10:180.0", "1800", "ok-smoke-warmup")):
         got = final_verdict(why_in, rule_in, cap_in)
-        print(("PASS" if got == want else "FAIL"), f"final_verdict({why_in}, {rule_in}, cap {cap_in}) = {got!r}, "
-              f"want {want!r}")
-        bad += got != want
-        cases.append(None)
+        ok(got == want, f"final_verdict({why_in}, {rule_in}, cap {cap_in}) = {got!r}, want {want!r}")
     # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
     for ok_ops, capped, want in ((1000, True, "complete"), (999, True, "p50_only"), (100, True, "p50_only"),
                                  (99, True, None), (0, True, None), (200, False, "complete")):
         got = tier({"capped": capped, "measured_ok": ok_ops, "measured_ops": ok_ops})
-        print(("PASS" if got == want else "FAIL"), f"tier(capped={capped}, ok={ok_ops}) = {got!r}, want {want!r}")
-        bad += got != want
-        cases.append(None)
+        ok(got == want, f"tier(capped={capped}, ok={ok_ops}) = {got!r}, want {want!r}")
     for cap, want in ((1800, "1000:10:180"), (60, "1000:10:6"), (3600, "1000:10:360")):
         got = rule(cap)
-        print(("PASS" if got == want else "FAIL"), f"rule({cap}) = {got!r}, want {want!r}")
-        bad += got != want
-        cases.append(None)
+        ok(got == want, f"rule({cap}) = {got!r}, want {want!r}")
     # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
     # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
     # Both values are compared as EXACT strings (review of e11a3c993, finding 5: "1.8e3" passed a numeric check and then
@@ -532,11 +529,8 @@ def selftest():
                             ("", "1000:10:180", False), ("nan", "1000:10:180", False), ("inf", "1000:10:180", False)):
         why = real_problem(cap, warm)
         got = why is None
-        print(("PASS" if got == want else "FAIL"), f"real run cap={cap!r} warmup={warm!r} ->",
-              "accepted" if got else f"refused: {why}")
-        bad += got != want
-        cases.append(None)
-    print(f"timedrun selftest: {len(cases) - bad}/{len(cases)}")
+        ok(got == want, f"real run cap={cap!r} warmup={warm!r} -> {'accepted' if got else f'refused: {why}'}")
+    print(f"timedrun selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
 

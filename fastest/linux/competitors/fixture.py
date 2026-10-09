@@ -166,9 +166,9 @@ def write(av):
     fx["readback"] = dict(zip(("count", "sum", "row_hash"), map(int, m.groups()))) if m else None
     fx["expected_readback"] = {k: gf[k] for k in ("count", "sum", "row_hash")}
     if fx["engine_bytes"] is None:
-        fx["engine_bytes_why"] = o.get("--engine-why") or f"engine size not read ({o.get('--engine-bytes')!r})"
-        if not o.get("--engine-why"):
-            fx["engine_bytes_why"] = None  # an unread size is not a reason: compare refuses it
+        # only a caller's stated reason excuses a missing size: an unread size is not a reason, so compare refuses it
+        # (LOW 27: this set a default message and then overwrote it with None)
+        fx["engine_bytes_why"] = o.get("--engine-why") or None
     with open(out, "w") as f:
         json.dump(fx, f, indent=1)
     print(json.dumps(fx))
@@ -212,12 +212,13 @@ def sqlite(av):
         for k, h in dg.items():
             with open(os.path.join(o["--digest-dir"], f"seed-{k}.sha256"), "w") as f:
                 f.write(h + "\n")
-    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size; SELECT count(*), sum(v) FROM t;"],
-                       capture_output=True, text=True, timeout=600)
+    # the engine's own size; the parent's contents are judged by the read-back triple (gen_seed.py readback-sqlite,
+    # MED 3), so no count|sum is recorded here (LOW 27: count_sum had no reader)
+    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size;"], capture_output=True, text=True, timeout=600)
     lines = q.stdout.split()
-    eng = int(lines[0]) * int(lines[1]) if q.returncode == 0 and len(lines) >= 3 else None
-    print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng,
-                      "count_sum": lines[2] if len(lines) >= 3 else None, "stream_sha256": dg,
+    ok = q.returncode == 0 and len(lines) == 2 and all(x.isdigit() for x in lines)
+    eng = int(lines[0]) * int(lines[1]) if ok else None
+    print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng, "stream_sha256": dg,
                       "maintenance": "journal_mode=WAL; load; aged %d; wal_checkpoint(TRUNCATE)" % age}))
 
 

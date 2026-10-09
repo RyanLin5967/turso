@@ -273,6 +273,16 @@ bb_args() { # bb_args SPEC C N OUT [nowarm] -> BBA: the one bbload command line,
   BBA=(timeout "$OUTER_S" "${BBA[@]}")
   [ "${5:-}" = nowarm ] || BBA+=(--warmup "$WARMUP")
 }
+cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command line of a B1 cell, so its labelling and
+  # timed runs are identical, as bb_args makes the servers' (LOW 27: the two were hand-copied)
+  CBA=(timeout "$OUTER_S" "$CB" run --mode b1 --op "$1" --sync "$2" --parent "$ROOT/parent.db" --dir "$3"
+    --clients "$4" --max-ops "$5" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" --drop --out "$6")
+}
+# create_step CELLDIR -> the spec's create step for fthelp.py ops: 2 for amendment 14 variant (a), whose step 1 checks
+# out the parent, else 1 (LOW 27: ops_of and timedrun_check each carried this case)
+create_step() {
+  case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) echo 2 ;; *) echo 1 ;; esac
+}
 bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
   local rc=0
   bb_args "$@"
@@ -300,8 +310,8 @@ count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of 
 # zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
 # never inside $(...) or <(...), where fail()'s count would be lost.
 ops_of() {
-  local k=1
-  case $(basename "$2") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac  # variant (a): step 1 checks out the parent, step 2 creates
+  local k
+  k=$(create_step "$2")
   if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
   # LOW 26: the reader's line itself must be three counts, or the job FAILS (a short or empty line read as empty
   # totals and reached stracecount's --ops)
@@ -314,8 +324,8 @@ ops_line_ok() {
 # timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
 # N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
 timedrun_check() {
-  local k=1
-  case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
+  local k
+  k=$(create_step "$1")
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
@@ -747,9 +757,8 @@ b1_main() {
       # --drop: every op's branch is deleted, durably and untimed (HIGH 1), so N stays LIVE0; the labelling run is
       # split by op phase at C=1 like the servers' (lead ruling on HIGH 1's flush attribution)
       live_mark "$d" label_before
-      strace_run "$d/load" timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
-        --dir "$bdir" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" --drop \
-        --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
+      cb_args "$op" "$sync" "$bdir" "$c" "$n" "$d/bb"
+      strace_run "$d/load" "${CBA[@]}" >"$d/bb.txt" 2>&1 || rc=$?
       live_mark "$d" label_after
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
@@ -768,9 +777,8 @@ b1_main() {
       # t3run item 2): the only latency file of the cell is timed/raw.tsv.
       mkdir -p "$bdir.timed"
       live_mark "$d" timed_before
-      timed_run "$d/timed" "" -- timeout "$OUTER_S" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" \
-        --dir "$bdir.timed" --clients "$c" --max-ops "$n" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" \
-        --drop --out "$d/timed" >/dev/null || true
+      cb_args "$op" "$sync" "$bdir.timed" "$c" "$n" "$d/timed"
+      timed_run "$d/timed" "" -- "${CBA[@]}" >/dev/null || true
       live_mark "$d" timed_after
       timedrun_check "$d" "$n" "b1-$spec-c$c"
       expect "b1-$spec-c$c timed run branch files left (every created branch deleted)" \
