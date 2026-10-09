@@ -50,6 +50,8 @@ case $MODE in
           || { echo "mkfixtures: REFUSED: V3_FIXTURES=nest needs V3_NEST_DIR, a directory on the block's filesystem (got '${V3_NEST_DIR:-}')" >&2; exit 2; } ;;
   *) echo "mkfixtures: REFUSED: V3_FIXTURES='$MODE' is not all or nest" >&2; exit 2 ;;
 esac
+# the one nest-chain loop matcher and a losetup listing that fails loudly (V3 review 12 item 1), shared with firecheck.sh
+. "$(cd "$(dirname "$0")" && pwd)/nestloops.sh" || { echo "mkfixtures: REFUSED: cannot source nestloops.sh" >&2; exit 2; }
 me="$(id -u):$(id -g)"
 # every fixture ext4 is made whole now (no lazyinit thread writing and committing later, which would put foreign
 # flush requests on the loop devices during the fire-check)
@@ -140,10 +142,11 @@ f_nest() {
   done
 }
 # the nest chain's teardown (t3run per block): n4 first, each level's loop detached after its unmount
-# the loops backed by a file of the chain: anything under $base/n<k>/ or an image named v3fx-n1.img (deleted or not)
+# the loops backed by a file of the chain: nestloops.sh's one matcher (under $base/n1/ .. $base/n4/, anchored, or an
+# image named v3fx-n1.img); returns 2 when losetup fails (V3 review 12 item 1: the prefix test here matched nbx's
+# $base/nb/x.img, and a failing losetup read as "nothing attached")
 chain_loops() {
-  losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$base/n" '{ dev = $1; $1 = ""; sub(/^ +/, "");
-    if (index($0, b) == 1 || $0 ~ /\/v3fx-n1\.img( \(deleted\))?$/) print dev }'
+  nest_loops "$base"
 }
 detach_loop() {  # detach_loop DEV LABEL: detach and wait until its backing file is gone
   local dev=$1 gone=0
@@ -152,13 +155,19 @@ detach_loop() {  # detach_loop DEV LABEL: detach and wait until its backing file
   [ "$gone" = 1 ] || { echo "teardown $2: $dev still has a backing file"; return 1; }
 }
 teardown_nest() {
-  local k mp dev back rc=0 found=0 stray
+  local k mp dev back rc=0 found=0 stray strays left ll
   for k in 4 3 2 1; do
     mp="$base/n$k"
     sudo rm -f "$base/n$k.ok"
     # tenth review MED 2: a loop backed by a file ON this level, attached but not mounted (a level whose mount failed,
     # a stray), would hold the level busy: detach it first, mounted ones above were unmounted in the previous pass
-    for stray in $(losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$mp/" '{ d = $1; $1 = ""; sub(/^ +/, ""); if (index($0, b) == 1) print d }'); do
+    # the listing first, on its own: this script has no pipefail, so a pipe would hide a failing losetup
+    if ll=$(loop_list); then
+      strays=$(printf '%s\n' "$ll" | awk -v b="$mp/" '{ d = $1; $1 = ""; sub(/^ +/, ""); if (index($0, b) == 1) print d }')
+    else
+      echo "teardown n$k: cannot list the loops (losetup failed)"; rc=1; strays=""
+    fi
+    for stray in $strays; do
       found=1
       mountpoint -q "$(findmnt -n -o TARGET -S "$stray" | tail -1)" 2>/dev/null && sudo umount "$(findmnt -n -o TARGET -S "$stray" | tail -1)"
       detach_loop "$stray" "n$k (an unmounted loop on it)" && echo "teardown n$k: detached $stray, backed by a file on $mp" || rc=1
@@ -176,15 +185,20 @@ teardown_nest() {
     echo "teardown n$k: unmounted $mp, detached $dev (backing $back)"
   done
   # n1's image held by a loop that is not n1's mount (a failed mount, a second attach): detach it too
-  for stray in $(chain_loops); do
+  strays=$(chain_loops) || { echo "teardown: cannot list the loops (losetup failed)"; rc=1; strays=""; }
+  for stray in $strays; do
     found=1
     detach_loop "$stray" "n1's image" && echo "teardown: detached $stray, still backed by the chain" || rc=1
   done
   for k in 1 2 3 4; do
     mountpoint -q "$base/n$k" 2>/dev/null && { echo "teardown: $base/n$k is still mounted"; rc=1; }
   done
-  # the outcome, not the steps: no loop may still be backed by a file of the chain
-  [ -z "$(chain_loops)" ] || { echo "teardown: loops still backed by the chain: $(chain_loops | xargs)"; rc=1; }
+  # the outcome, not the steps: no loop may still be backed by a file of the chain (a listing that fails is a failure)
+  if left=$(chain_loops); then
+    [ -z "$left" ] || { echo "teardown: loops still backed by the chain: $(echo $left)"; rc=1; }
+  else
+    echo "teardown: cannot list the loops at the end (losetup failed)"; rc=1
+  fi
   [ "$found" = 1 ] || echo "teardown: no nest chain under $base"
   return $rc
 }

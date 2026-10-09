@@ -51,6 +51,8 @@ set -uo pipefail
 [ $# -eq 4 ] || { echo "usage: firecheck.sh V3FLOOR CELL WORKDIR OUT" >&2; exit 2; }
 V3=$(readlink -f "$1") CELL=$2 W=$3 OUT=$4
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# the one nest-chain loop matcher, shared with mkfixtures.sh (V3 review 12 item 1)
+. "$HERE/nestloops.sh" || { echo "firecheck: REFUSED: cannot source nestloops.sh" >&2; exit 2; }
 KIND=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print(v3cell.kind(sys.argv[2]))' "$HERE" "$CELL" 2>/dev/null) \
   || { echo "firecheck: '$CELL' is not a cell (v3cell.py)" >&2; exit 2; }
 LOOPCELL=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print(int(v3cell.is_loop(sys.argv[2])))' "$HERE" "$CELL")
@@ -719,9 +721,18 @@ mkdir -p "$NM"
 if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
   echo "$nd" > "$NM/nest_dir"
-  # the loops still backed by a file of the chain (tenth review MED 1): under $FX/n*/ or an image named v3fx-n1.img
-  chainloops() { losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$FX/n" '{ d = $1; $1 = ""; sub(/^ +/, "");
-    if (index($0, b) == 1 || $0 ~ /\/v3fx-n1\.img( \(deleted\))?$/) print d " " $0 }'; }
+  # the loops still backed by a file of the chain, judged against a list derived HERE, not by the shared matcher
+  # (V3 review 12 item 1: a matcher copied verbatim cannot catch its own error): n1's image as built, and the level
+  # images $FX/n1..n3/x.img, each " (deleted)" or not; a losetup that fails is reported, never "nothing attached"
+  FXC=$(readlink -m "$FX")
+  chainloops() {
+    local l w1
+    w1=$(readlink -m "$nd/v3fx-n1.img")
+    l=$(loop_list) || { echo "losetup --list failed: the loops cannot be listed"; return 0; }
+    [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, ""); p = $0
+      sub(/ \(deleted\)$/, "", p)
+      if (p == w1 || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }'
+  }
   # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/ (as nbx's backing /mnt/v3fx/nb/x.img is), mounted,
   # must survive --teardown-nest untouched: same device, same backing file, still mounted
   pl=""
