@@ -452,8 +452,21 @@ fn performs_at_prepare(parse_result: &turso_pg_parser::pg_query::ParseResult) ->
 fn prepare_statement_inner(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
+    types: Option<&mut StatementTypes>,
+    describe: bool,
+) -> Result<Option<Statement>> {
+    prepare_statement_checked(pg_conn, sql, types, describe, true)
+}
+
+/// [`prepare_statement_inner`]; `check_keys` false for an ALTER's own rebuild statements, whose
+/// CREATE TABLEs carry the table's keys: the ALTER checks the keys it adds on its own, and an older
+/// key that no longer resolves must not refuse the rebuild (wire review 13 item 3).
+fn prepare_statement_checked(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     mut types: Option<&mut StatementTypes>,
     describe: bool,
+    check_keys: bool,
 ) -> Result<Option<Statement>> {
     // PostgreSQL's whitespace only (wire review 13 item 1).
     let sql = turso_pg_parser::pg_trim(sql);
@@ -497,7 +510,11 @@ fn prepare_statement_inner(
     }
     // A CREATE TABLE's foreign keys: their parents checked now, every key resolved by the server
     // once the table exists, in the CREATE's own transaction (wire review 13 item 2).
-    let new_table_keys = precheck_create_keys(&pg_conn.conn, &parse_result)?;
+    let new_table_keys = if check_keys {
+        precheck_create_keys(&pg_conn.conn, &parse_result)?
+    } else {
+        None
+    };
     if let Some(types) = types.as_deref_mut() {
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
@@ -916,6 +933,26 @@ fn handle_pg_add_constraints(
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
+    // The keys the ALTER adds, each checked against the catalog before anything is copied or
+    // dropped (a key onto the table itself as far as it can be before the table's own new keys
+    // exist): a refused key cost two copies of the table and an index rebuild, and an arity the
+    // engine refuses in the rebuilt CREATE TABLE was 42601 (wire review 13 item 4).
+    let keys: Vec<AddedForeignKey> = add
+        .constraints
+        .iter()
+        .filter_map(added_foreign_key)
+        .collect();
+    let child_columns: Vec<String> = conn
+        .current_schema()
+        .get_btree_table(table)
+        .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    for key in &keys {
+        check_foreign_key(conn, table, &child_columns, key, true)?;
+    }
+    // Whether the table's older keys resolve: if they do, the engine's own resolution after the
+    // rebuild can refuse only for a key this ALTER adds, and backs the per-key checks.
+    let resolved_before = keys.is_empty() || check_table_keys(conn, table).is_ok();
     let in_tx = !conn.get_auto_commit();
     execute_root(
         conn,
@@ -947,22 +984,17 @@ fn handle_pg_add_constraints(
                 None => execute_root(conn, sql)?,
             }
         }
-        // The keys the ALTER adds are checked last, once the table's indexes are back (a unique
-        // index re-created above can be a self-reference's parent key, and the orphan query can
-        // use the indexes): the parent and its key (42P01, 42830), the engine's own resolution of
-        // every key of the table with unique parent keys required (with keys off, a non-unique
-        // parent key was accepted, and every later INSERT into the table failed 'foreign key
-        // mismatch'; wire review 11 item 5), then the orphans (23503).
-        let keys: Vec<AddedForeignKey> = add
-            .constraints
-            .iter()
-            .filter_map(added_foreign_key)
-            .collect();
+        // The keys the ALTER adds are checked whole once the table's indexes are back (a unique
+        // index the ALTER adds can be a self-reference's parent key, and the orphan query can use
+        // the indexes): each key on its own (check_foreign_key), then, when the table's older keys
+        // resolved, the engine's own resolution of every key with unique parent keys required
+        // (with keys off, a non-unique parent key was accepted, and every later INSERT into the
+        // table failed 'foreign key mismatch'; wire review 11 item 5), then the orphans (23503).
         let mut parent_keys = Vec::with_capacity(keys.len());
         for key in &keys {
-            parent_keys.push(added_key_parent_columns(conn, &quoted, key)?);
+            parent_keys.push(check_foreign_key(conn, table, &child_columns, key, false)?);
         }
-        if !keys.is_empty() {
+        if !keys.is_empty() && resolved_before {
             check_table_keys(conn, table)?;
         }
         for (key, parent_columns) in keys.iter().zip(&parent_keys) {
@@ -1100,14 +1132,13 @@ fn create_foreign_keys(
     keys
 }
 
-/// A CREATE TABLE's foreign keys, checked against their parents before the table is created, as
-/// PostgreSQL checks them (42P01 for a parent that does not exist, 42830 for one with no primary key
-/// to default to or a key of another column count); a key onto the table itself waits for the
-/// table. Returns the table's name when it declares a key, for the server to resolve every key
-/// once the table exists ([`check_table_keys`]). CREATE TABLE IF NOT EXISTS of a table that exists
-/// checks nothing, as in PostgreSQL, which creates nothing. CREATE TABLE checked no parent, so a
-/// key onto a missing parent or a non-unique column was accepted and every INSERT into the table
-/// then failed (wire review 13 item 2).
+/// A CREATE TABLE's foreign keys, each checked before the table is created, as PostgreSQL checks
+/// them ([`check_foreign_key`]: 42P01, 42703, 42830); a key onto the table itself as far as it can
+/// be before the table exists. Returns the table's name when it declares a key, for the server to
+/// resolve every key once the table exists ([`check_table_keys`]). CREATE TABLE IF NOT EXISTS of a
+/// table that exists checks nothing, as in PostgreSQL, which creates nothing. CREATE TABLE checked
+/// no parent, so a key onto a missing parent or a non-unique column was accepted and every INSERT
+/// into the table then failed (wire review 13 item 2).
 fn precheck_create_keys(
     conn: &Arc<Connection>,
     parse: &turso_pg_parser::pg_query::ParseResult,
@@ -1128,29 +1159,83 @@ fn precheck_create_keys(
     {
         return Ok(None);
     }
-    let quoted = format!("\"{}\"", relation.relname.replace('"', "\"\""));
+    let child_columns: Vec<String> = create
+        .table_elts
+        .iter()
+        .filter_map(|elt| match elt.node.as_ref() {
+            Some(Node::ColumnDef(col)) => Some(col.colname.clone()),
+            _ => None,
+        })
+        .collect();
     for key in &keys {
-        if !key.parent.eq_ignore_ascii_case(&relation.relname) {
-            added_key_parent_columns(conn, &quoted, key)?;
-        }
+        check_foreign_key(conn, &relation.relname, &child_columns, key, true)?;
     }
     Ok(Some(relation.relname.clone()))
 }
 
-/// The parent key of a foreign key an ALTER adds, as PostgreSQL resolves it: the columns named,
-/// or the parent's primary key; a parent that does not exist is 42P01, one with no primary key to
-/// default to, or a key of another column count, 42830 (both were 42601).
-fn added_key_parent_columns(
+/// The names the engine reads as a parent table's rowid when no column of the table has the name
+/// (ROWID_STRS in core's planner).
+const ROWID_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// The checks PostgreSQL makes of a foreign key a CREATE TABLE or an ALTER adds, each key on its
+/// own and in PostgreSQL's order (ATAddForeignKeyConstraint): the parent exists (42P01); the key's
+/// columns are the child's (42703); the parent's columns exist, or it has a primary key to default
+/// to (42703, 42830); a unique key of the parent covers them as the engine resolves a parent key
+/// ([`parent_key_resolves`]; 42830, naming this key's parent); the two column counts agree
+/// (42830). Returns the parent key's columns. `child_columns` are the child's columns. With
+/// `own_keys_pending`, a key onto the child itself is checked as far as it can be before the
+/// child's own keys exist (its columns, and an explicit parent key's columns and count); its
+/// default and its uniqueness wait for the table. Resolving every key of the table instead blamed
+/// the first added key's parent, refused every new key beside an older one that no longer
+/// resolved, and gave a missing column 42830 (wire review 13 item 3).
+fn check_foreign_key(
     conn: &Arc<Connection>,
-    table: &str,
+    child: &str,
+    child_columns: &[String],
     key: &AddedForeignKey,
+    own_keys_pending: bool,
 ) -> Result<Vec<String>> {
     let schema = conn.current_schema();
-    let Some(parent) = schema.get_btree_table(&key.parent) else {
-        return Err(LimboError::ParseError(format!(
-            "relation \"{}\" does not exist",
-            key.parent
-        )));
+    let missing = |column: &str| {
+        LimboError::ParseError(format!(
+            "column \"{column}\" referenced in foreign key constraint does not exist"
+        ))
+    };
+    let disagree = |parent_columns: &[String]| {
+        LimboError::ParseError(format!(
+            "number of referencing and referenced columns for foreign key disagree (the key on \
+             {child} names {}, its parent key {})",
+            key.columns.len(),
+            parent_columns.len()
+        ))
+    };
+    let parent = if own_keys_pending && key.parent.eq_ignore_ascii_case(child) {
+        None
+    } else {
+        Some(schema.get_btree_table(&key.parent).ok_or_else(|| {
+            LimboError::ParseError(format!("relation \"{}\" does not exist", key.parent))
+        })?)
+    };
+    if let Some(column) = key
+        .columns
+        .iter()
+        .find(|k| !child_columns.iter().any(|c| c.eq_ignore_ascii_case(k)))
+    {
+        return Err(missing(column));
+    }
+    let is_rowid = |c: &str| ROWID_NAMES.iter().any(|r| c.eq_ignore_ascii_case(r));
+    let Some(parent) = parent else {
+        if let Some(column) = key
+            .parent_columns
+            .iter()
+            .find(|p| !is_rowid(p) && !child_columns.iter().any(|c| c.eq_ignore_ascii_case(p)))
+        {
+            return Err(missing(column));
+        }
+        if !key.parent_columns.is_empty() && key.parent_columns.len() != key.columns.len() {
+            return Err(disagree(&key.parent_columns));
+        }
+        return Ok(key.parent_columns.clone());
     };
     let parent_columns: Vec<String> = if key.parent_columns.is_empty() {
         parent
@@ -1159,6 +1244,13 @@ fn added_key_parent_columns(
             .map(|(c, _)| c.clone())
             .collect()
     } else {
+        if let Some(column) = key
+            .parent_columns
+            .iter()
+            .find(|p| parent.get_column(p).is_none() && !is_rowid(p))
+        {
+            return Err(missing(column));
+        }
         key.parent_columns.clone()
     };
     if parent_columns.is_empty() {
@@ -1167,20 +1259,55 @@ fn added_key_parent_columns(
             key.parent
         )));
     }
-    if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
+    if !parent_key_resolves(&schema, &parent, &parent_columns) {
         return Err(LimboError::ParseError(format!(
-            "number of referencing and referenced columns for foreign key disagree (the key on \
-             {table} names {}, its parent key {})",
-            key.columns.len(),
-            parent_columns.len()
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            key.parent
         )));
+    }
+    if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
+        return Err(disagree(&parent_columns));
     }
     Ok(parent_columns)
 }
 
+/// Whether the engine resolves `columns` of `parent` as a parent key, as core's
+/// Schema::resolve_fk does with unique keys required: the rowid (a single rowid name, or the
+/// column an INTEGER PRIMARY KEY makes the rowid), or a UNIQUE index with no WHERE on exactly those
+/// columns in that order. A key it does not resolve made every INSERT into the child fail
+/// 'foreign key mismatch'. PostgreSQL also accepts a unique key's columns in another order (wire
+/// review 13 item 20).
+fn parent_key_resolves(
+    schema: &turso_core::schema::Schema,
+    parent: &turso_core::schema::BTreeTable,
+    columns: &[String],
+) -> bool {
+    if let [column] = columns {
+        let rowid_alias = parent.columns().iter().any(|c| {
+            c.is_rowid_alias()
+                && c.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
+        });
+        if rowid_alias || ROWID_NAMES.iter().any(|r| column.eq_ignore_ascii_case(r)) {
+            return true;
+        }
+    }
+    schema.get_indices(&parent.name).any(|index| {
+        index.unique
+            && index.where_clause.is_none()
+            && index.columns.len() == columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(columns)
+                .all(|(i, c)| i.name.eq_ignore_ascii_case(c))
+    })
+}
+
 /// The check PostgreSQL makes when it adds a foreign key, as one query: a row of `table` whose key
 /// columns are all non-NULL (MATCH SIMPLE) and match no row of the parent key
-/// ([`added_key_parent_columns`]) fails the ALTER with 23503.
+/// ([`check_foreign_key`]) fails the ALTER with 23503.
 fn check_added_foreign_key(
     conn: &Arc<Connection>,
     table: &str,
@@ -1245,8 +1372,14 @@ fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
 }
 
 /// Run one PostgreSQL statement through this frontend, as a client's would be.
+/// One statement of an ALTER's rebuild, its foreign keys not checked again
+/// ([`prepare_statement_checked`]).
 fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
-    prepare_statement(pg_conn, sql)?.run_ignore_rows()
+    prepare_statement_checked(pg_conn, sql, None, false, false)?
+        .ok_or_else(|| {
+            LimboError::InternalError("only a Describe declines to prepare a statement".to_string())
+        })?
+        .run_ignore_rows()
 }
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {

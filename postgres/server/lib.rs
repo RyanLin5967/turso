@@ -2419,12 +2419,21 @@ fn sqlstate(e: &LimboError) -> &'static str {
             "42P01"
         }
         // A foreign key's parent key is not one (an ALTER's added key; wire review 11 item 5).
+        // The engine's own refusal of a key's arity, in a CREATE TABLE (wire review 13 item 4).
         LimboError::ParseError(m)
             if m.starts_with("there is no unique constraint matching given keys")
                 || m.starts_with("there is no primary key for referenced table")
-                || m.starts_with("number of referencing and referenced columns") =>
+                || m.starts_with("number of referencing and referenced columns")
+                || (m.starts_with("foreign key on \"") && m.contains(" child column(s) but ")) =>
         {
             "42830"
+        }
+        // A foreign key's column that does not exist (wire review 13 item 3).
+        LimboError::ParseError(m)
+            if m.starts_with("column \"")
+                && m.ends_with("\" referenced in foreign key constraint does not exist") =>
+        {
+            "42703"
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
