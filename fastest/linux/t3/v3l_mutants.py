@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""v3l.py's mutants (T3 runner review items 3, 4, 10, 18, 19; fourth lane review HIGH 3): each one deletes or weakens
-one check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
+"""v3l.py's mutants (T3 runner review items 3, 4, 6, 10, 18, 19; fourth lane review HIGH 3): each one deletes or
+weakens one check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
 
   v3l_mutants.py [NAME...]   run every mutant (or the named ones); exit 0 iff each is KILLED, 1 if any SURVIVED or
                              BROKE, 2 if refused (the unmutated self-test is not green, an unknown name, or a target
@@ -80,6 +80,9 @@ MUTANTS = [
      '        elif v < need:', '        elif v < need // 2:', "UNRUN (QUIET)"),
     ("10d-ram-exemption-for-all", "item 10: only a ram disk is exempt",
      '    if not str(rec["leaf"].get("disk") or "").startswith("ram"):', '    if False:', "UNRUN (QUIET)"),
+    ("6a-delete-L5-rederivation", "T3 runner review item 6: block() re-derives the verdict from the arms (review L5)",
+     '            if bool(again) != (r["verdict"] == "VOID") or r["verdict"] not in ("VALID", "VOID"):',
+     '            if False:', "UNRUN (QUIET)"),
     ("10e-no-wt-unwritten-plant", "item 10: the write rule is forced to fire on the real record (plant)",
      '        arm("wt-unwritten", "write through",', '        (lambda *a: None)("wt-unwritten", "write through",',
      "UNRUN (QUIET)"),

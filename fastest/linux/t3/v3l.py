@@ -70,6 +70,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from fractions import Fraction
 
 N = 10000
@@ -630,6 +631,19 @@ def _has(got, *subs):
 _BRD_B0 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "v3l-37812992594-brd-xfs-b0", "v3l.json")
 
 
+def _block_of(r):
+    """block() over one record written as both its before and its after file (a temp dir, removed)"""
+    d = tempfile.mkdtemp(prefix="v3l-st-")
+    try:
+        p = os.path.join(d, "v3l.json")
+        with open(p, "w") as f:
+            json.dump(r, f)
+        return block(p, p)
+    finally:
+        os.unlink(os.path.join(d, "v3l.json"))
+        os.rmdir(d)
+
+
 def _plant(res, name):
     """The named plant's entry in plants()' results, or {} when it was never run."""
     return next((p for p in res if p.get("plant") == name), {})
@@ -901,6 +915,17 @@ def self_test():
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
+        # T3 runner review item 6: block() re-derives the verdict from the record's own arms (review L5), so a file
+        # labelled VALID over VOID arms reads VOID on that rule's text; a truthful VALID file is the negative control
+        ("item 6: block() over a file labelled VALID with VOID arms (9,999 fsyncs) is VOID, on the re-derivation's text",
+         _ok(lambda: (lambda r: r["verdict"] == "VOID"
+                      and _has(r["before"]["void_reasons"], "disagrees with the gates re-run"))(
+             _block_of(dict(rec(fsyncs=N - 1), verdict="VALID", void_reasons=[], floor_kind="x",
+                            published={"fsync_p50_us": 300.0, "fsync_over_control_write_p50": 1.0}))))),
+        ("item 6: block() over a truthful VALID file is VALID (the negative control)",
+         _ok(lambda: _block_of(dict(rec(), verdict="VALID", void_reasons=[], floor_kind="x",
+                                    published={"fsync_p50_us": 300.0, "fsync_over_control_write_p50": 1.0}))
+             ["verdict"] == "VALID")),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:

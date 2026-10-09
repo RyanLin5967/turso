@@ -480,7 +480,7 @@ def self_test():
              rule=RULE, ours_rule=RULE, ours_ops=(200, 200), comp_ops=200, adapter_rc=0, k=1, settle="quiet=yes",
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
-             boundary_bins=None, garbage_v3l=None):
+             boundary_bins=None, garbage_v3l=None, v3l_plants_record=None):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         system = {"ok": "ours", "na": "ours", "compfail": "dolt", "comp": "dolt"}[cell]
@@ -565,6 +565,8 @@ def self_test():
             if os.path.exists(f"{f}/v3l-{b}/v3l.json"):
                 res, ok = v3l.plants(json.load(open(f"{f}/v3l-{b}/v3l.json")))
                 w(f"{f}/v3l-{b}-plants.json", json.dumps({"plants": res, "all_fired": ok}, default=str))
+        if v3l_plants_record is not None:  # a stored plants record that passes whatever the measurement is
+            w(f"{f}/v3l-b0-plants.json", json.dumps(v3l_plants_record))
         if drop:
             os.unlink(f"{f}/{drop}")
         if garbage_v3l:  # an unreadable measurement, written after its plants record
@@ -603,6 +605,11 @@ def self_test():
         ("A14: the plants record missing fails the block", {"plants": False}, False, None),
         ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False, None),
         ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False, None),
+        # T3 runner review item 6: with a stored plants record that passes, the block fails through block()'s own
+        # re-derivation, on its text (the case above also fails through the plants path, so it could not see L5 go)
+        ("item 6: a VALID recorded over VOID arms, stored plants passing, fails on block()'s re-derivation text",
+         {"lie": True, "v3l_plants_record": {"plants": [], "all_fired": True}}, False,
+         lambda s: "disagrees with the gates re-run" in s["failed_blocks"][0]),
         ("review M2: a refusal's run.sh line reaches the block's why", {"before_rc": 2}, False,
          lambda s: "planted refusal text" in s["failed_blocks"][0]),
         ("lane review LOW 10: a package whose only cell is NOT AVAILABLE measured nothing and fails", {"cell": "na"}, False, None),
