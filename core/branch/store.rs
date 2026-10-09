@@ -7086,18 +7086,41 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
 }
 
 fn name_taken(name: &str) -> LimboError {
-    LimboError::NameTaken(name.to_string())
+    untyped_branch_error(LimboError::NameTaken(name.to_string()))
+}
+
+/// Every typed named-branch refusal (`NoSuchBranch`, `NameTaken`, `BranchInUse`) is built through
+/// this, on its failure path only. Mutant `untyped_branch_errors` (test builds only; engine review
+/// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
+/// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
+pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
+    if !fe_mutant("untyped_branch_errors") {
+        return e;
+    }
+    match e {
+        LimboError::NoSuchBranch(name) => {
+            LimboError::InvalidArgument(format!("no branch is named {name:?}"))
+        }
+        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
+            "branch name {name:?} already names an unreleased branch"
+        )),
+        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+            "branch {id} already has an open connection; a branch serves one connection at a \
+             time, because a second one's page cache would silently miss the first one's commits"
+        )),
+        other => other,
+    }
 }
 
 /// Branch `id` (named `name`, if it is) already has an open connection, so `op` is refused
 /// (fastest-wire's typed refusal, `LimboError::BranchInUse`): the name as given, unquoted, its id,
 /// and the operation, whose reason the message gives (engine review 14 LOW 12).
 fn in_use(id: BranchId, name: Option<&str>, op: crate::error::BranchOp) -> LimboError {
-    LimboError::BranchInUse {
+    untyped_branch_error(LimboError::BranchInUse {
         name: name.map(str::to_string),
         id: id.0,
         op,
-    }
+    })
 }
 
 fn reaped(id: BranchId) -> LimboError {

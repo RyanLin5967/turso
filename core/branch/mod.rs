@@ -1386,7 +1386,7 @@ impl Database {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
         self.branches.pause_connect_looked_up();
         // A drop that lands between the lookup and the open leaves the open an untyped error (the
         // branch gone, or reaped): the name no longer names an unreleased branch, which is
@@ -1400,7 +1400,7 @@ impl Database {
             {
                 e
             } else {
-                LimboError::NoSuchBranch(name.to_string())
+                store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
             }
         })
     }
@@ -1414,7 +1414,7 @@ impl Database {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
