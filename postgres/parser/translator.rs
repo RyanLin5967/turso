@@ -1121,7 +1121,20 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // The table's schema goes on the index's name, which is how the engine (SQLite's grammar)
+        // names an index's database and the table's with it: PostgreSQL puts an index in its
+        // table's schema. It was dropped, so `CREATE UNIQUE INDEX ON s.t` indexed whichever t the
+        // bare name found, enforcing on the wrong table. public is the main database, as in
+        // qualified_name_from_range_var (wire review 17 item 1).
+        let index_name = ast::Name::from_string(&idx.idxname);
+        let idx_name = match relation.schemaname.to_lowercase().as_str() {
+            "" | "pg_catalog" | "information_schema" => ast::QualifiedName::single(index_name),
+            "public" => ast::QualifiedName::fullname(ast::Name::from_string("main"), index_name),
+            _ => ast::QualifiedName::fullname(
+                ast::Name::from_string(relation.schemaname.clone()),
+                index_name,
+            ),
+        };
 
         let mut columns = Vec::new();
         for param_node in &idx.index_params {
