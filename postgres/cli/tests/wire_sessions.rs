@@ -4339,6 +4339,78 @@ fn every_statement_checks_its_bind_arity() {
         .ok("keep was not deleted");
 }
 
+/// A Bind is checked before anything of its statement runs, for every statement without a `$n`
+/// (its parameters are the ones Parse declared, none if it declared none): one value for `SET
+/// search_path TO nosuch` or `SET foreign_keys = off` is 08P01 and the setting is unchanged; a
+/// declared but unspecified type for BEGIN is 42P18; and in a failed block a Bind of anything but
+/// a block exit without values is 25P02, the block still failed, as PostgreSQL's exec_bind_message
+/// refuses it. The count was checked at Execute, after the prepare had performed the SET, so the
+/// search path changed and the error came after (wire review 14 item 4).
+#[test]
+fn a_bind_is_checked_before_its_statement_runs() {
+    let dir = Scratch::new("bindbefore");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (the given declared OIDs), Bind (the given text values), Execute, Sync.
+    fn round(w: &mut Wire, sql: &str, oids: &[u32], values: &[&[u8]]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+        for oid in oids {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8, 0, 0];
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    let path = a.q("SHOW search_path").single("the search path");
+    let r = round(&mut a, "SET search_path TO nosuch", &[], &[b"x"]);
+    assert_eq!(r.err("SET with a value").code, "08P01");
+    assert_eq!(
+        a.q("SHOW search_path").single("the search path after"),
+        path,
+        "the SET ran before its Bind was refused"
+    );
+    a.q("CREATE TABLE fp(id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE fc(pid INT REFERENCES fp(id))")
+        .ok("child");
+    let r = round(&mut a, "SET foreign_keys = off", &[], &[b"x"]);
+    assert_eq!(r.err("SET foreign_keys with a value").code, "08P01");
+    assert_eq!(
+        a.q("INSERT INTO fc VALUES (5)")
+            .err("keys still enforced")
+            .code,
+        "23503"
+    );
+    let r = round(&mut a, "BEGIN", &[0], &[b"x"]);
+    assert_eq!(
+        r.err("BEGIN with an unspecified declared type").code,
+        "42P18"
+    );
+    assert_eq!(r.status, b'I', "no block begun");
+    a.q("BEGIN").ok("begin");
+    assert_eq!(a.q("SELECT 1/0").status, b'E');
+    let r = round(&mut a, "ROLLBACK", &[25], &[b"x"]);
+    assert_eq!(
+        r.err("ROLLBACK with a value in a failed block").code,
+        "25P02"
+    );
+    assert_eq!(r.status, b'E', "the block is still failed");
+    let r = round(&mut a, "SELECT 1", &[], &[]);
+    assert_eq!(r.err("a SELECT in a failed block").code, "25P02");
+    a.q("ROLLBACK").ok("end");
+}
+
 /// A Parse or Bind whose body ends before what it says it holds is refused with 08P01
 /// "insufficient data left in message", an ERROR, as PostgreSQL's pq_getmsg* refuse it: the frame
 /// was read whole, so the session skips to Sync and serves on, and no byte past the frame is read
