@@ -1143,6 +1143,8 @@ impl Connection {
         seen: Option<u64>,
         name: Option<&str>,
     ) -> Result<store::TrunkFork> {
+        #[cfg(test)]
+        crate::branch::budget_probe::fork_registration();
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;

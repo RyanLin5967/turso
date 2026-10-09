@@ -203,6 +203,18 @@ thread_local! {
     static T_WINDOWS_MET: Cell<u64> = const { Cell::new(0) };
     static T_FUTILE_LEADS: Cell<u64> = const { Cell::new(0) };
     static T_SLEEPS: Cell<u64> = const { Cell::new(0) };
+    static T_REGISTRATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A trunk fork registration attempt on this thread (`Connection::fork_trunk_registered`; review 2
+/// M5: an internal retry shows as more attempts than acknowledged creates).
+pub(crate) fn fork_registration() {
+    bump(&T_REGISTRATIONS, 1);
+}
+
+/// This thread's count of `fork_registration`.
+pub(crate) fn fork_registrations() -> u64 {
+    T_REGISTRATIONS.with(|c| c.get())
 }
 
 /// This thread slept through `crate::thread::sleep` (test builds' wrapper, review 2 M3).

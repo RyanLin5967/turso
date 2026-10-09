@@ -566,10 +566,17 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
 /// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation).
 fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     let rounds = shared_rounds(c);
-    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true)] {
+    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false)] {
         if cfw && c > 64 {
             continue;
         }
+        // Review 2 M5: creates beside a trunk writer (one DDL, then UPDATEs until the creates end),
+        // at C = 8 and 64 only.
+        let commits = arm == "shared_commits";
+        if commits && !(c == 8 || c == 64) {
+            continue;
+        }
+        let creating = std::sync::atomic::AtomicBool::new(true);
         // A start flag, not a Barrier: a thread that fails to start, or panics before the start,
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
@@ -581,8 +588,20 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // refused Busy or SchemaUpdated and retried (the population's `fork_one` retries them
         // silently); and its futile leads (`probe::futile_leads`: the store mutex and the group
         // lock taken to lead, and no flight led; review 1 #9).
-        let per: Vec<(u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
+        let per: Vec<(u64, u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
             let mut clients = Vec::new();
+            let creating = &creating;
+            let writer = commits.then(|| {
+                s.spawn(move || {
+                    let trunk = db.connect().unwrap();
+                    exec(&trunk, &format!("CREATE TABLE w{c}(x INTEGER)"));
+                    let mut i = 0u64;
+                    while creating.load(std::sync::atomic::Ordering::Acquire) {
+                        exec(&trunk, &format!("UPDATE t SET v = 'c{i}' WHERE id = {}", 1 + i % 50));
+                        i += 1;
+                    }
+                })
+            });
             for t in 0..c {
                 let go = &go;
                 let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
@@ -591,7 +610,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                         std::thread::yield_now();
                     }
                     let trunk = trunk.unwrap();
-                    let (w0, l0, f0) = (super::store::thread_waits(), probe::thread_locks(), probe::futile_leads());
+                    let (w0, l0, f0, g0) = (super::store::thread_waits(), probe::thread_locks(), probe::futile_leads(), probe::fork_registrations());
                     let (mut retries, mut max_ack) = (0u64, 0u64);
                     for i in 0..rounds {
                         let name = format!("{arm}-{t}-{i:04}");
@@ -617,6 +636,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                         retries,
                         max_ack,
                         delta(f0, probe::futile_leads()),
+                        delta(g0, probe::fork_registrations()),
                     )
                 });
                 match spawned {
@@ -629,7 +649,12 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
-            clients.into_iter().map(|h| h.join().unwrap()).collect()
+            let per: Vec<(u64, u64, u64, u64, u64, u64)> = clients.into_iter().map(|h| h.join().unwrap()).collect();
+            creating.store(false, std::sync::atomic::Ordering::Release);
+            if let Some(w) = writer {
+                w.join().unwrap();
+            }
+            per
         });
         let s1 = sync_counts();
         let mut m = Sample::new();
@@ -644,6 +669,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         m.insert("store_locks", per.iter().map(|p| p.1).sum());
         m.insert("retries", per.iter().map(|p| p.2).sum());
         m.insert("futile_leads", per.iter().map(|p| p.4).sum());
+        m.insert("registrations", per.iter().map(|p| p.5).sum());
         line(out, cell, arm, 0, &m);
     }
 }
@@ -3020,10 +3046,13 @@ fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
     for c in SHARED_CS {
         let spec = format!("shared_c{c}");
         let data = cell(&spec);
-        for arm in ["shared_create", "shared_cfw"] {
+        for arm in ["shared_create", "shared_cfw", "shared_commits"] {
             match data.ops.get(arm).and_then(|v| v.first()) {
                 Some(s) => lines.push((spec.clone(), c, arm, s.clone())),
-                None => assert!(arm == "shared_cfw" && c > 64, "{spec}: no {arm} line"),
+                None => assert!(
+                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)),
+                    "{spec}: no {arm} line"
+                ),
             }
         }
     }
@@ -3072,6 +3101,12 @@ fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_cou
     let mut failures = String::new();
     let mut seen = String::new();
     for (spec, c, arm, s) in shared_lines() {
+        // Beside trunk commits a create may also wait for a commit's publication (a different wait,
+        // `wait_trunk_commit_published`): that arm is judged by the retries, registrations and
+        // futile-lead budgets, not this one.
+        if arm == "shared_commits" {
+            continue;
+        }
         let (acks, waits, locks) = (s["acks"], s["store_waits"], s["store_locks"]);
         let per_client_acks = acks / c;
         let _ = write!(
@@ -3276,4 +3311,26 @@ fn a_d1_open_makes_two_plain_fsyncs() {
     let v = open_premises(&c, Some(0), &mut failures);
     open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
     assert!(failures.is_empty(), "a D1 open:\n{failures}");
+}
+
+/// Review 2 M5: an internal retry (a refusal the caller never sees, retried inside the engine) shows
+/// as more trunk-fork registration attempts than creates (`probe::fork_registrations`, a `cfg(test)`
+/// hook line at `Connection::fork_trunk_registered`'s entry). At every C, each create registers
+/// exactly once: these clients fork a trunk that already has live children, so no create takes the
+/// first-child path (which registers twice by design, its lock-free attempt and its locked one).
+/// Includes the arm beside trunk commits and a DDL. Mutant `internal_retry_in_fork_trunk`. WRITTEN
+/// NOT RUN.
+#[test]
+fn contention_each_create_registers_once_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        let creates = if arm == "shared_cfw" { s["acks"] / 2 } else { s["acks"] };
+        if s["registrations"] != creates {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} fork registrations for {creates} creates by {c} clients; budget equal", s["registrations"]);
+        }
+    }
+    assert!(failures.is_empty(), "creates registered more than once under contention (an internal retry):\n{failures}");
 }
