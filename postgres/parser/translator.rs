@@ -29,7 +29,13 @@ pub struct PostgreSQLTranslator {
     /// a subquery naming another relation alike shadows it, and nothing outside the SELECT and the
     /// subqueries under it sees it (wire review 2 item 6, gap review item 1).
     lateral_scopes: std::cell::RefCell<Vec<LateralScope>>,
+    /// The columns the statement's DELETE target declares, when the caller knows them
+    /// ([`PostgreSQLTranslator::with_target_columns`]); None reads as no rowid-named column.
+    target_columns: Option<Vec<String>>,
 }
+
+/// The names the engine gives a table's own row, each shadowed by a column of the same name.
+const ROW_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
 /// One SELECT's names for the reference rewrites (see `PostgreSQLTranslator::inline_lateral` and
 /// `PostgreSQLTranslator::series_column`).
@@ -47,6 +53,15 @@ struct LateralScope {
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The translator, told the columns the statement's DELETE target declares: a DELETE ...
+    /// USING names the target's own row by the first of rowid, _rowid_ and oid the target does not
+    /// declare. The bare rowid read a declared column of that name on both sides of the rewrite
+    /// (wire review 13 item 5).
+    pub fn with_target_columns(mut self, columns: Vec<String>) -> Self {
+        self.target_columns = Some(columns);
+        self
     }
 
     /// Run `f` in a LATERAL scope of its own: one SELECT's FROM names and inlined LATERAL columns,
@@ -1594,11 +1609,12 @@ impl PostgreSQLTranslator {
 
         // DELETE FROM t [AS x] USING u WHERE c deletes the target's rows that join a row of u. The
         // engine has no USING, so it is DELETE FROM t WHERE rowid IN (SELECT x.rowid FROM t [AS x],
-        // u WHERE c): the target and the USING items in ONE namespace, as PostgreSQL reads them, so
-        // a bare name both have is ambiguous (42702). The USING clause was dropped, so the WHERE ran
-        // against the target alone and deleted more (wire review 7 item 18); then translated as
-        // EXISTS (SELECT 1 FROM u WHERE c), a bare name bound to u alone, and `id = 2` deleted every
-        // target row (wire review 11 item 4).
+        // u WHERE c), rowid being the first of ROW_NAMES t does not declare: the target and the
+        // USING items in ONE namespace, as PostgreSQL reads them, so a bare name both have is
+        // ambiguous (42702). The USING clause was dropped, so the WHERE ran against the target
+        // alone and deleted more (wire review 7 item 18); then translated as EXISTS (SELECT 1 FROM
+        // u WHERE c), a bare name bound to u alone, and `id = 2` deleted every target row (wire
+        // review 11 item 4).
         let where_clause = if delete.using_clause.is_empty() {
             match &delete.where_clause {
                 Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
@@ -1633,6 +1649,21 @@ impl PostgreSQLTranslator {
                         .into(),
                 ));
             }
+            let declared = |name: &str| {
+                self.target_columns
+                    .iter()
+                    .flatten()
+                    .any(|c| c.eq_ignore_ascii_case(name))
+            };
+            let row = ROW_NAMES
+                .into_iter()
+                .find(|name| !declared(*name))
+                .ok_or_else(|| {
+                    ParseError::ParseError(format!(
+                        "DELETE ... USING on \"{target}\", which declares columns named rowid, \
+                         _rowid_ and oid, is not supported: no name is left for its rows"
+                    ))
+                })?;
             let mut items = vec![pg_query::protobuf::Node {
                 node: Some(pg_query::protobuf::node::Node::RangeVar(relation.clone())),
             }];
@@ -1646,7 +1677,7 @@ impl PostgreSQLTranslator {
                 Ok((from, where_clause))
             })?;
             Some(Box::new(ast::Expr::InSelect {
-                lhs: Box::new(ast::Expr::Id(ast::Name::from_string("rowid"))),
+                lhs: Box::new(ast::Expr::Id(ast::Name::from_string(row))),
                 not: false,
                 rhs: ast::Select {
                     with: None,
@@ -1656,7 +1687,7 @@ impl PostgreSQLTranslator {
                             columns: vec![ast::ResultColumn::Expr(
                                 Box::new(ast::Expr::Qualified(
                                     ast::Name::from_string(target),
-                                    ast::Name::from_string("rowid"),
+                                    ast::Name::from_string(row),
                                 )),
                                 None,
                             )],

@@ -528,7 +528,12 @@ fn prepare_statement_checked(
         types.used = used;
     }
 
-    let translator = PostgreSQLTranslator::new();
+    let translator =
+        match delete_using_target(&parse_result) {
+            Some((schema, table)) => PostgreSQLTranslator::new()
+                .with_target_columns(declared_columns(&pg_conn.conn, schema, table)?),
+            None => PostgreSQLTranslator::new(),
+        };
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -1492,6 +1497,52 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
                 "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
             )))
         }
+    }
+}
+
+/// The schema (None for public) and table a DELETE ... USING deletes from, if `parse` is one: its
+/// rewrite names the target's own row by a name the target does not declare (wire review 13 item
+/// 5).
+fn delete_using_target(
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Option<(Option<&str>, &str)> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let Some(Node::DeleteStmt(delete)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return None;
+    };
+    if delete.using_clause.is_empty() {
+        return None;
+    }
+    let relation = delete.relation.as_ref()?;
+    let schema = match relation.schemaname.as_str() {
+        "" | "public" => None,
+        other => Some(other),
+    };
+    Some((schema, relation.relname.as_str()))
+}
+
+/// The columns `table` declares: from the connection's schema for public, from the attached
+/// schema's table_info otherwise. Empty for a table that does not exist (the statement then fails
+/// on the table).
+fn declared_columns(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Vec<String>> {
+    match schema {
+        None => Ok(conn
+            .current_schema()
+            .get_btree_table(table)
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+            .unwrap_or_default()),
+        Some(schema) => get_table_columns(
+            conn,
+            &table.replace('\'', "''"),
+            Some(&schema.replace('"', "\"\"")),
+        ),
     }
 }
 
