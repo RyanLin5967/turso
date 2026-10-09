@@ -800,8 +800,9 @@ mod tests {
     /// fastest-wire (wire review 2 item 3, 6b (a)): a bound parameter compared with a custom-type
     /// column got the plain comparison, not the type's operator, so a numeric column (stored
     /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
-    /// as a literal of the type's value input type: encoded and passed to the operator. Mutant
-    /// `param_skips_type_operator`.
+    /// as a literal of the type's value input type: passed to the operator as given (2fa04254c;
+    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is vestigial since then,
+    /// no operand being encoded, and stays as written. Mutant `param_skips_type_operator`.
     #[test]
     fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
         let conn = open();
