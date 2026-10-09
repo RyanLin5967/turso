@@ -2519,7 +2519,12 @@ impl Journal {
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64;
         self.header_stale = false;
-        self.dir_dirty = false;
+        // Renames this reset made, or the compaction before it, or a dead process's compaction
+        // whose stale log an open resets (`End::Reset`), are durable only once the directory is
+        // synced: here when the class syncs, otherwise by the next flight that syncs (engine
+        // review 16 MED 6, as `rewrite_from_as` does). Mutant `reset_unsynced_rename_left_clean`
+        // (test builds only): left clean, as before.
+        self.dir_dirty = !class.syncs() && !super::store::fe_mutant("reset_unsynced_rename_left_clean");
         // The records an earlier run made durable are carried in a synced rewrite now (a
         // compaction's snapshot, synced before this reset; a page-size restart's empty state).
         self.inherited = SyncClass::Off;
