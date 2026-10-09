@@ -2421,6 +2421,65 @@ impl Journal {
         Ok(flight)
     }
 
+    /// A held-free upgrade (`BranchStore::sync_upgrade`; engine review 18 HIGH 1): a sync in
+    /// `class`, or this journal's own when stronger, of everything the log holds, taken under the
+    /// store mutex with no flight in the air. Nothing buffered is taken and no log region is
+    /// reserved, so flights that only write go on while it syncs. The arena's dirty file (slots
+    /// written so far, whether their records are written or still buffered) and the directory a
+    /// cut left unsynced come along, and the class is noted in the header as a flight's would be.
+    /// A take that fails fail-stops the journal, as a flight's does.
+    pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass) -> Result<Upgrade> {
+        self.check_live()?;
+        let class = class.max(self.sync);
+        let taken = (|| -> Result<(File, Option<File>)> {
+            let on_disk = file_len(&self.file)?;
+            if on_disk != self.len {
+                return Err(corrupt(
+                    "the branch log changed under this journal; another store instance wrote it",
+                ));
+            }
+            let log = self
+                .file
+                .try_clone()
+                .map_err(|e| io_error(e, "dup branch log"))?;
+            Ok((log, arena.take_dirty_file()?))
+        })();
+        let (log, arena) = match taken {
+            Ok(taken) => taken,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
+        let dir = match self.take_dirty_dir(class) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
+        self.note_class(class);
+        let header = self.take_header_patch();
+        Ok(Upgrade {
+            log,
+            arena,
+            dir,
+            header,
+            class,
+            at: self.len,
+            rewrites: self.rewrites,
+        })
+    }
+
+    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed: when no flight
+    /// was taken and no rewrite ran since, every byte the log holds was synced, so the next flight's
+    /// end frame says so (`prev_synced`), as after an upgrade flight.
+    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) {
+        if self.len == at && self.rewrites == rewrites {
+            self.prev_synced = true;
+        }
+    }
+
     /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
     /// the writer's own class syncs. Mutant `prev_synced_ignored` (test builds only): the writer's
     /// class alone, as before engine review 16 MED 5.
@@ -3002,6 +3061,38 @@ impl Flight {
     /// Frame bytes in this flight (observation only).
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+/// A held-free upgrade's sync (`Journal::take_upgrade`; engine review 18 HIGH 1): the log, the
+/// arena's dirty file and the directory a cut left unsynced, synced by `Upgrade::sync` holding no
+/// lock and no flight slot. It writes no frame.
+pub(crate) struct Upgrade {
+    log: File,
+    arena: Option<File>,
+    dir: Option<File>,
+    /// The header's raised-class field, when this upgrade is the first sync in a stronger class.
+    header: Option<[u8; 4]>,
+    pub(crate) class: SyncClass,
+    /// The log's length and its rewrite count when taken (`Journal::upgrade_landed`).
+    pub(crate) at: u64,
+    pub(crate) rewrites: u64,
+}
+
+impl Upgrade {
+    /// The slots first, a plain fsync (ruling 85a032f01, as a flight's), then the header's raised
+    /// class, the directory, and the log in `class`: the order `Flight::write` keeps.
+    pub(crate) fn sync(self) -> Result<()> {
+        if let Some(arena) = &self.arena {
+            fsync_file(arena, SyncClass::Fsync)?;
+        }
+        if let Some(raised) = &self.header {
+            write_at(&self.log, raised, HEADER_RAISED_AT)?;
+        }
+        if let Some(dir) = &self.dir {
+            fsync_dir(dir, SyncClass::Fsync)?;
+        }
+        fsync_file(&self.log, self.class)
     }
 }
 
