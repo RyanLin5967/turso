@@ -474,6 +474,17 @@ def self_test(data):
         t = [x for x in p if x["plant"] == "wt-tampered"]
         cases.append(("an unbound batch's wt-tampered is recorded not applicable and not counted",
                       ok and t[0]["fired"] is None and t[0]["counted"] is False))
+        # fourth lane review MED 7: off the runner (the bound path absent, the verdict beside the batch) the plant must
+        # still reach the sha256 check, not fire on a verdict it could not find
+        moved = os.path.join(tmp, "relocated", "v3-before")
+        sj = wt()
+        sj["_app_sync"] = app_sync_evidence(moved)
+        p, ok = plants(sj, True, 0, "no", moved)
+        t = [x for x in p if x["plant"] == "wt-tampered"]
+        cases.append(("MED 7: off the runner, wt-tampered fires on the sha256 check, not on a missing verdict",
+                      ok and len(t) == 1 and t[0]["fired"] is True
+                      and any("sha256" in r for r in t[0]["got"]["reasons"])
+                      and not any("FileNotFoundError" in r for r in t[0]["got"]["reasons"])))
     # the real records (testdata/README.md): run 37812355435's batches in the c225124ae format
     for name, want in (("v3-37812355435-x86-ext4loop", "PASS"), ("v3-37812355435-arm-ext4loop", "FAIL")):
         d = os.path.join(data, name)
