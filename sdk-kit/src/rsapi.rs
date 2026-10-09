@@ -1491,12 +1491,37 @@ type StmtRegistry = Arc<Mutex<HashMap<usize, Weak<Mutex<Option<Statement>>>>>>;
 
 const FINALIZED_ERR: &str = "statement has been finalized";
 
-/// A busy handler's backoff that an async-mode step reported as [`TursoStatusCode::Io`]: the
-/// caller's answer to that Io, [`TursoStatement::run_io`], waits it out instead of stepping the
-/// IO backend (engine review 11 MED 4). It stands only for the Io that announced it: every step
-/// clears it first, and so does a reset.
+/// A busy handler's backoff that an async-mode step without a waker reported as
+/// [`TursoStatusCode::Io`]: the caller's answer to that Io, [`TursoStatement::run_io`], waits it
+/// out instead of stepping the IO backend (engine review 11 MED 4). It stands only for the Io that
+/// announced it: every step clears it first, and so does a reset.
 struct PendingSleep {
     duration: Duration,
+}
+
+/// The async-mode answer to a busy handler's `StepResult::Sleep`, which the step reports as Io.
+/// A step with a task's waker (the Rust `turso` crate) hands the waker to the busy timer, which
+/// wakes it once the backoff is over. Core does not wake it with the Sleep, so the task is neither
+/// polled again at once (a spin for the whole busy timeout) nor held inside a poll by a `run_io`
+/// that waits the backoff out; its `run_io` steps the IO backend, which has nothing in flight. A
+/// step without one (the C API) leaves a [`PendingSleep`] for its caller's `run_io` to wait out.
+/// Mutant `sdk_waker_sleep_blocks` (test builds only): the waker is woken at once and `run_io`
+/// waits the backoff out, as before.
+fn async_answer_busy(
+    duration: Duration,
+    waker: Option<&Waker>,
+    pending_sleep: &Mutex<Option<PendingSleep>>,
+) {
+    match waker {
+        Some(waker) if !fe_mutant("sdk_waker_sleep_blocks") => {
+            crate::busy_timer::wake_after(duration, waker.clone());
+        }
+        Some(waker) => {
+            waker.wake_by_ref();
+            *pending_sleep.lock().unwrap() = Some(PendingSleep { duration });
+        }
+        None => *pending_sleep.lock().unwrap() = Some(PendingSleep { duration }),
+    }
 }
 
 /// Advance one step of a statement's execution.
@@ -1522,7 +1547,7 @@ fn step_inner(
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
             StepResult::Sleep { duration } => {
                 if async_io {
-                    *pending_sleep.lock().unwrap() = Some(PendingSleep { duration });
+                    async_answer_busy(duration, waker, pending_sleep);
                     Ok(TursoStatusCode::Io)
                 } else {
                     sync_wait_out_busy(stmt, duration)?;
@@ -1730,7 +1755,8 @@ impl TursoStatement {
     }
     /// run iteration of the IO backend, the caller's answer to [TursoStatusCode::Io]
     ///
-    /// When that Io stood for a busy handler's backoff, this waits the backoff out instead
+    /// When that Io stood for a busy handler's backoff (of a step without a waker; a step with one
+    /// has the busy timer wake its task instead), this waits the backoff out
     /// (`Statement::wait_out_busy`): the busy statement has no IO in flight, so stepping the
     /// backend would return at once, and a step / run_io loop would spin a core for the whole busy
     /// timeout (engine review 11 MED 4). Mutant `sdk_run_io_spins` (test builds only): the IO

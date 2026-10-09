@@ -601,10 +601,11 @@ impl Statement {
             let now = self.pager.io.current_time_monotonic();
             if now < busy_state.timeout() {
                 // The timeout has not been reached yet: ask the caller to wait
-                // out the remaining delay before stepping again.
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                // out the remaining delay before stepping again. A Sleep does
+                // not wake `waker`: its caller owns the wait (a sleep, or a timer
+                // that wakes the task), since a wake now polls the task again at
+                // once and spins for the whole busy timeout (engine review 11
+                // MED 4).
                 return Ok(StepResult::Sleep {
                     duration: busy_state.get_delay(now),
                 });
@@ -680,10 +681,8 @@ impl Statement {
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
                 // Handler says retry: ask the caller to wait out the backoff
-                // delay before stepping again.
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                // delay before stepping again. As above, a Sleep does not wake
+                // `waker`: the caller owns the wait.
                 res = Ok(StepResult::Sleep {
                     duration: busy_state.get_delay(now),
                 });
@@ -729,6 +728,9 @@ impl Statement {
         self._step(None)
     }
 
+    /// [`Self::step`], registering `waker` with the IO the step waits on. A
+    /// `StepResult::Sleep` (a busy handler's backoff) does not wake it: the caller
+    /// must step again once the duration has passed, by a timer that wakes its task.
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))

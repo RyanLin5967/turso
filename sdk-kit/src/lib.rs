@@ -5,6 +5,7 @@ use std::{
 
 use crate::rsapi::TursoError;
 
+mod busy_timer;
 pub mod capi;
 pub mod rsapi;
 
