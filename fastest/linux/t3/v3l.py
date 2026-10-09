@@ -680,6 +680,31 @@ def self_test():
                             "wb-layer-half").get("fired") is True)),
         ("item 4: plant wb-layer-half fires on a write-through record carrying labelling count 0",
          _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wb-layer-half").get("fired") is True)),
+        # item 18 (T3 runner review LOW 18): the floor is proportional, timed per fsync >= labelling per fsync x (1 -
+        # SLACK), not the whole-number floor lab // N that let ~47% flush loss pass at 1.9 per fsync
+        ("item 18: labelling 1.9 per fsync (19000), timed 1.0003 per fsync (10003) VOIDs, on the floor rule's text",
+         _has(gates(_lab(rec(delta=N + 3), 19000)), "write-back drive nvme1n1", "per fsync the labelling run showed")),
+        ("item 18: a loop layer at labelling 1.9 per fsync, timed 1.0003 VOIDs, on the floor rule's text",
+         _has(gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N + 3,
+                                 "lab_flush_ios_delta": 19000}])),
+              "write-back loop layer loop3", "per fsync the labelling run showed")),
+        ("item 18: labelling 2 per fsync (20000), timed exactly 0.95 of it (19000) is VALID (the slack's edge)",
+         gates(_lab(rec(delta=19000), 20000)) == []),
+        ("item 18: labelling 2 per fsync (20000), timed 18999 (just under 0.95 of it) VOIDs",
+         _has(gates(_lab(rec(delta=18999), 20000)), "per fsync the labelling run showed")),
+        ("item 18: SLACK is one named constant, 0.05, marked provisional until registered",
+         _ok(lambda: float(SLACK) == 0.05 and re.search(r"^SLACK = .*provisional until registered",
+                                                         open(__file__).read(), re.M) is not None)),
+        ("item 18: the record publishes both ratios and the slack (drive 2.0003 timed, 2.0004 labelling; layer 1.5, 2.0)",
+         _ok(lambda: (lambda p: p["flush_ios_per_fsync"] == 2.0003 and p["lab_flush_ios_per_fsync"] == 2.0004
+                      and p["floor_slack"] == 0.05
+                      and p["layers"] == {"loop3": {"flush_ios_per_fsync": 1.5, "lab_flush_ios_per_fsync": 2.0}})(
+             publish(_lab(rec(delta=20003, layers=[{"name": "loop3", "write_cache": "write back",
+                                                    "flush_ios_delta": 15000, "lab_flush_ios_delta": 20000}]),
+                          20004))))),
+        ("item 18: a missing count publishes None, not a crash",
+         _ok(lambda: (lambda p: p["flush_ios_per_fsync"] is None and p["lab_flush_ios_per_fsync"] is None)(
+             publish(rec(delta=None))))),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
