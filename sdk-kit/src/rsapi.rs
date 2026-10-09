@@ -3038,4 +3038,99 @@ mod tests {
         let mut commit = holder.prepare_single("COMMIT").unwrap();
         assert_eq!(commit.execute(None).unwrap().status, TursoStatusCode::Done);
     }
+
+    /// Engine review 11 MED 4, the waker half of the busy-timeout spin: the Rust `turso` crate
+    /// steps an async-mode statement with its task's waker, answers TursoStatusCode::Io with
+    /// run_io, and returns Poll::Pending. A busy handler's backoff comes back as that Io with the
+    /// waker already woken (core wakes it with the Sleep), so the task is polled again at once:
+    /// it spun for the whole busy timeout, and with run_io waiting the backoff out it holds the
+    /// executor thread inside each poll instead. Here that poll loop, on a thread that parks
+    /// between polls until its waker unparks it, waits out a 500 ms busy timeout behind another
+    /// connection's open write transaction: the thread's CPU time over the wait must be a small
+    /// fraction of it, and no single poll may last as long as a backoff step (the longest is
+    /// 100 ms, so a poll that sleeps one lasts at least that).
+    #[cfg(unix)]
+    #[test]
+    fn a_waker_busy_wait_neither_spins_nor_sleeps_in_a_poll() {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        fn execute_to_end(stmt: &mut super::TursoStatement) -> TursoStatusCode {
+            loop {
+                let status = stmt.execute(None).unwrap().status;
+                if status != TursoStatusCode::Io {
+                    return status;
+                }
+                stmt.run_io().unwrap();
+            }
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("busy.db");
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: true,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        // An async open is driven by opening again; the syscall backend completes each read
+        // inside the call that issues it.
+        while db.open().unwrap().is_io() {}
+        let holder = db.connect().unwrap();
+        for sql in ["CREATE TABLE t(x)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+            let mut stmt = holder.prepare_single(sql).unwrap();
+            assert_eq!(execute_to_end(&mut stmt), TursoStatusCode::Done);
+        }
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(500));
+        let mut insert = waiter.prepare_single("INSERT INTO t VALUES (2)").unwrap();
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let (mut longest, mut polls) = (std::time::Duration::ZERO, 0usize);
+        let (wall, cpu) = (std::time::Instant::now(), crate::thread_cpu());
+        let refused = loop {
+            // One poll, as the turso crate's Statement::step makes it: step with the waker, and
+            // on Io run the IO and return Pending.
+            let poll = std::time::Instant::now();
+            let outcome = insert.execute(Some(&waker)).and_then(|done| {
+                if done.status == TursoStatusCode::Io {
+                    insert.run_io().map(|()| None)
+                } else {
+                    Ok(Some(done.status))
+                }
+            });
+            longest = longest.max(poll.elapsed());
+            polls += 1;
+            match outcome {
+                Ok(None) => std::thread::park(),
+                ready => break ready,
+            }
+        };
+        let (waited, spent) = (wall.elapsed(), crate::thread_cpu() - cpu);
+        assert!(
+            matches!(refused, Err(TursoError::Busy(_))),
+            "premise: the second writer is refused busy, got {refused:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(450),
+            "premise: the busy timeout was waited out (waited {waited:?})"
+        );
+        assert!(
+            spent < std::time::Duration::from_millis(100),
+            "the busy wait spent {spent:?} of CPU over {waited:?} in {polls} polls: it spun"
+        );
+        assert!(
+            longest < std::time::Duration::from_millis(50),
+            "one poll of the busy wait lasted {longest:?} (of {waited:?}, {polls} polls): \
+             it slept a backoff step inside the poll, holding the executor thread"
+        );
+        let mut commit = holder.prepare_single("COMMIT").unwrap();
+        assert_eq!(execute_to_end(&mut commit), TursoStatusCode::Done);
+    }
 }
