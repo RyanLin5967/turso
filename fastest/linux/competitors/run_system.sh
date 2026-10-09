@@ -515,6 +515,15 @@ cap_plants() {
     --set rows="$ROWS" --stall-s 60 --warmup 1000:1:0 >"$d.txt" 2>&1 || rc=$?
   expect "warm-up plant --warmup 1000:1:0 (A23: MAX_S 0 ends at the first claim): rc|warmup_ops|warmup_capped" \
     "$rc|$(jf "$d/summary.json" warmup_ops)|$(jf "$d/summary.json" warmup_capped)" "0|0|True"
+  # A23 open loop (the macOS claim_op's one run-wide arrival stream, drawn under the claim lock): four clients at
+  # 100 ops/s judge their claims in arrival order, so the record says loop open and 0 backsteps. A regression check
+  # on the live binary, not a deterministic red (per-client schedules stepped back only through wake-up jitter).
+  d="$RAW/plants/warmup-open" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 4 --mode open --rate 100 --duration-s 2 \
+    --set port="$PORT" --set rows="$ROWS" --stall-s 60 --warmup 20:0.2:60 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant open loop --warmup 20:0.2:60: rc|loop|warmup_backsteps|warmup_ops >= 20" \
+    "$rc|$(jf "$d/summary.json" loop)|$(jf "$d/summary.json" warmup_backsteps)|$(python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get("warmup_ops", -1) >= 20)' "$d/summary.json" 2>/dev/null)" \
+    "0|open|0|True"
   # MED 7: --warmup with a legacy flag is refused (rc 2), and the recorded rule is the EFFECTIVE one
   d="$RAW/plants/warmup-mixed" rc=0
   timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \

@@ -549,16 +549,23 @@ def selftest():
         ("A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)",
          dict(tracer=clean, timed_extra={"warmup_backsteps": 1}), False),
         ("A23: no warmup_backsteps in the record", dict(tracer=clean, timed_extra={"warmup_backsteps": None}), False),
-        # The lead's correction on 0138d2128: in OPEN loop each client keeps its own Poisson schedule, so claims reach
-        # the lock out of intended order and backsteps are expected, not a defect; only a closed-loop backstep is one.
-        # The run's loop mode is therefore part of the record.
-        ("A23: an open-loop record with backsteps is accepted (per-client intended times, decided in lock order)",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), True),
+        # The lead's REVERSAL of its correction on 0138d2128 (that correction, at 8eb5e7699, accepted open-loop
+        # backsteps because this port's open loop drew one Poisson schedule per client): the survivor, the macOS
+        # claim_op at 4010ff3b06, draws every open-loop arrival from ONE run-wide stream under the claim lock, so its
+        # claims are judged in arrival order and backsteps are 0 in both loop modes; the port now draws that stream.
+        # The loop field stays in the record; the two order checks apply in both modes again.
+        ("A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), False),
         ("A23: the same record in closed loop is refused",
          dict(tracer=clean, timed_extra={"loop": "closed", "warmup_backsteps": 3}), False),
-        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's (a backstep at the "
-         "end): accepted", dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
-                                                           "warmup_last_claim_ns": 10_000_600_000}), True),
+        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
+                                         "warmup_last_claim_ns": 10_000_600_000}), False),
+        ("A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}),
+         False),
+        ("A23: a shared-stream open-loop record (0 backsteps, claims in arrival order) is accepted",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 0}), True),
         ("A23: no loop mode in the record", dict(tracer=clean, timed_extra={"loop": None}), False),
         ("A23: a loop mode that is neither closed nor open", dict(tracer=clean, timed_extra={"loop": "b1"}), False),
         ("the labelling run's warm-up left early",
