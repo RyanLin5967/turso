@@ -1388,7 +1388,21 @@ impl Database {
             .branch_named(name)?
             .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         self.branches.pause_connect_looked_up();
-        self.connect_branch(id)
+        // A drop that lands between the lookup and the open leaves the open an untyped error (the
+        // branch gone, or reaped): the name no longer names an unreleased branch, which is
+        // NoSuchBranch, as the lookup would now answer (engine review 14 MED 9). Error path only:
+        // the success path is unchanged. Mutant `connect_race_untyped` (test builds only): the
+        // open's own error, as before.
+        self.connect_branch(id).map_err(|e| {
+            if crate::branch::store::fe_mutant("connect_race_untyped")
+                || matches!(e, LimboError::NoSuchBranch(_))
+                || !self.branches.is_gone_or_released(id)
+            {
+                e
+            } else {
+                LimboError::NoSuchBranch(name.to_string())
+            }
+        })
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.

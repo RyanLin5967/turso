@@ -5219,6 +5219,21 @@ impl BranchStore {
         pause_at(Some(&*self.trunk_commit_hold), HOLD_CONNECT_LOOKED_UP);
     }
 
+    /// Whether branch `id` is gone or released (`Handle::is_released`): what a drop that landed
+    /// after `connect_named`'s lookup leaves (engine review 14 MED 9). Called on the connect's
+    /// error path only. A failed lookup counts as not gone, so the connect's own error stands.
+    pub(crate) fn is_gone_or_released(&self, id: BranchId) -> bool {
+        let mut inner = self.inner.lock();
+        match inner.ensure(id) {
+            Ok(false) => true,
+            Ok(true) => inner
+                .branches
+                .get(&id)
+                .is_none_or(|st| st.handle.is_released()),
+            Err(_) => false,
+        }
+    }
+
     /// Mutant `drop_check_separate_hold` only (`Database::drop_branch`): the open check in a
     /// store-mutex hold of its own, apart from the release (engine review 14 MED 7's regression,
     /// check-then-act across two holds).
