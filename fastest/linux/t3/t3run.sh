@@ -186,7 +186,7 @@ finish() {
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
-  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh gates/warmup_conformance.py
+  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh t3/v3l_mutants.py gates/warmup_conformance.py
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -656,6 +656,11 @@ selftests() {
   timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
   timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
     { echo "self-test warmup_conformance FAILED"; return 1; }
+  # v3l.py's mutant table: its own guard, then every mutant, each of which must be KILLED (review 5 MED 5: nothing ran it)
+  timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test > "$OUT/v3l-mutants-selftest.txt" 2>&1 ||
+    { echo "self-test v3l_mutants FAILED"; return 1; }
+  timeout 1800 python3 -B "$L/t3/v3l_mutants.py" > "$OUT/v3l-mutants.txt" 2>&1 ||
+    { tail -3 "$OUT/v3l-mutants.txt"; echo "v3l mutants: not every mutant KILLED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd want d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
     { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }

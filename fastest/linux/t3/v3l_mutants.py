@@ -3,8 +3,10 @@
 deletes or weakens one check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
 
   v3l_mutants.py [NAME...]   run every mutant (or the named ones); exit 0 iff each is KILLED, 1 if any SURVIVED or
-                             BROKE, 2 if refused (the unmutated self-test is not green, an unknown name, or a target
-                             text not found exactly once in v3l.py: the table is stale, so nothing is run)
+                             BROKE, 2 if refused (the unmutated self-test is not green, an unknown name, or a stale
+                             table: a target not found exactly once in v3l.py, an indented target not at a line start,
+                             or a mutated source that does not compile; review 5 MED 5), so nothing is run
+  v3l_mutants.py self-test   the table guard on synthetic sources and on the real table
 
 KILLED means the copy's self-test exits 1 with at least one FAIL line. A copy that exits otherwise (a crash at import,
 a SyntaxError, a timeout) is BROKEN, not killed: a mutant that cannot load proves nothing about the check it removed.
@@ -72,7 +74,8 @@ MUTANTS = [
     ("H3b-no-ram-exception", "lane review 4 HIGH 3 / LOW 7: a ram disk's agreeing report is 'none (RAM)'",
      '    return "none (RAM)" if str(disk or "").startswith("ram") else wc', '    return wc', "UNRUN (QUIET)"),
     ("10a-delete-write-rule", "T3 runner review item 10: the sectors-written gate",
-     '        bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])\n', '', "UNRUN (QUIET)"),
+     '            bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])\n', '            pass\n',
+     "UNRUN (QUIET)"),
     ("10b-labelling-run-not-judged", "item 10: the labelling fsync run is judged as well as the timed one",
      '(("timed", "sectors_written_delta"), ("labelling", "lab_sectors_written_delta"))',
      '(("timed", "sectors_written_delta"),)', "UNRUN (QUIET)"),
@@ -95,6 +98,29 @@ MUTANTS = [
      '        arm("wt-unwritten", "write through",', '        (lambda *a: None)("wt-unwritten", "write through",',
      "UNRUN (QUIET)"),
 ]
+
+
+def table_problems(src, mutants):
+    """Why the table cannot run against SRC (review 5 MED 5), as a list: a target not found exactly once; an indented
+    (whole-line) target that does not begin at a line start, so it matches inside a deeper indentation and its edit
+    would glue lines together; a mutated source that does not compile, which would be reported BROKEN, never KILLED.
+    compile() parses, it runs nothing."""
+    bad = []
+    for name, _what, old, new, _last in mutants:
+        n = src.count(old)
+        if n != 1:
+            bad.append(f"{name}: target found {n} times, not once")
+            continue
+        at = src.find(old)
+        if old[:1] in (" ", "\t") and at > 0 and src[at - 1] != "\n":
+            bad.append(f"{name}: an indented target that does not begin at a line start (it matches inside a deeper "
+                       "indentation)")
+            continue
+        try:
+            compile(src.replace(old, new), "v3l.py", "exec")
+        except SyntaxError as e:
+            bad.append(f"{name}: the mutated source does not compile ({e.msg}, line {e.lineno})")
+    return bad
 
 
 def selftest(path):
@@ -149,9 +175,9 @@ def main(argv):
     print(f"control (unmutated): {total}")
     src = open(SRC).read()
     todo = [m for m in MUTANTS if not names or m[0] in names]
-    stale = [(m[0], src.count(m[2])) for m in todo if src.count(m[2]) != 1]
+    stale = table_problems(src, todo)
     if stale:
-        print(f"v3l_mutants: REFUSED: target text not found exactly once (name, count): {stale}")
+        print(f"v3l_mutants: REFUSED: stale table: {stale}")
         return 2
     d = tempfile.mkdtemp(prefix="v3lmut-")
     bad = 0
