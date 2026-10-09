@@ -12,7 +12,7 @@ use turso_pg_parser::translator::{
     try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
     try_extract_drop_schema, try_extract_set, try_extract_show, PgAddConstraints, PgBranchArg,
     PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
-    PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
+    PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -675,8 +675,7 @@ fn try_prepare_special(
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return handle_pg_show(pg_conn, &show_stmt).map(Some);
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
@@ -859,6 +858,69 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     } else {
         unsupported("this server answers only by its own setting of it")
     }
+}
+
+/// SHOW of `show`'s parameter, from the settings SET keeps (see [`handle_pg_set`]; wire review 16
+/// item 4), one text row under PostgreSQL's name for it: search_path from the session's own path,
+/// each name quoted as PostgreSQL quotes it (`"$user", public`, PostgreSQL's default, when none was
+/// set); foreign_keys from the engine; transaction_read_only and default_transaction_read_only
+/// off; the client settings at the values this server answers by. SHOW ALL is 0A000, and any other
+/// name 42704, as PostgreSQL answers a name it does not know (one it knows that this list omits,
+/// NOOP_PARAMETERS among them, gets 42704 too: their values are not kept). Every SHOW became
+/// `PRAGMA <name>` from the client's identifier, which the engine performed while compiling, a
+/// Describe included: `SHOW "synchronous = off"` set the sync mode, `SHOW "fullfsync = off"`
+/// turned F_FULLFSYNC into fsync, `SHOW wal_checkpoint` checkpointed.
+fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result<Statement> {
+    let name = show.name.to_ascii_lowercase();
+    let fixed = |column: &'static str, value: &'static str| (column, value.to_string());
+    let (column, value) = match name.as_str() {
+        "search_path" => {
+            let path = pg_conn.session_state.lock().unwrap().search_path.clone();
+            let shown = if path.is_empty() {
+                "\"$user\", public".to_string()
+            } else {
+                path.iter()
+                    .map(|n| turso_pg_parser::quote_identifier(n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            ("search_path", shown)
+        }
+        "foreign_keys" => {
+            let mut stmt = pg_conn.conn.prepare("PRAGMA foreign_keys")?;
+            let rows = stmt.run_collect_rows()?;
+            let on = rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_int())
+                == Some(1);
+            ("foreign_keys", if on { "on" } else { "off" }.to_string())
+        }
+        "transaction_read_only" => fixed("transaction_read_only", "off"),
+        "default_transaction_read_only" => fixed("default_transaction_read_only", "off"),
+        "client_encoding" => fixed("client_encoding", "UTF8"),
+        "standard_conforming_strings" => fixed("standard_conforming_strings", "on"),
+        "bytea_output" => fixed("bytea_output", "hex"),
+        "datestyle" => fixed("DateStyle", "ISO, MDY"),
+        "intervalstyle" => fixed("IntervalStyle", "postgres"),
+        "timezone" => fixed("TimeZone", "UTC"),
+        "extra_float_digits" => fixed("extra_float_digits", "1"),
+        "all" => {
+            return Err(LimboError::ParseError(
+                "SHOW ALL is not supported".to_string(),
+            ))
+        }
+        _ => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized configuration parameter \"{name}\""
+            )))
+        }
+    };
+    pg_conn.conn.prepare(format!(
+        "SELECT '{}' AS \"{}\"",
+        value.replace('\'', "''"),
+        column
+    ))
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
