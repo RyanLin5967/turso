@@ -701,6 +701,16 @@ fn rewritten_class(journal: &Journal) -> SyncClass {
     }
 }
 
+/// What a rewrite marks durable in: `before`, its `rewritten_class` read before it ran, since a
+/// rewrite's own log reset or cut clears the inherited floor it synced in (engine review 16 LOW
+/// 12). Mutant `rewrite_class_read_after` (test builds only): read after, as before.
+fn rewrite_class_marked(before: Option<SyncClass>, journal: &Journal) -> SyncClass {
+    match before {
+        Some(class) if !fe_mutant("rewrite_class_read_after") => class,
+        _ => rewritten_class(journal),
+    }
+}
+
 
 /// How long the group must stay idle (no flight landed) before the confirmation writer writes the
 /// last flight's word (review 6 #1). Under load a whole later flight proves each earlier one
@@ -4831,6 +4841,9 @@ impl BranchStore {
                 .as_ref()
                 .map(|j| (j.lsn(), j.rewrite_class()));
             let generation = inner.cat.as_ref().map(|c| c.generation);
+            // The class the cut rewrites the log in, read before the cut clears the inherited
+            // floor (engine review 16 LOW 12).
+            let cut_class = inner.journal.as_ref().map(rewritten_class);
             let checkpointed = inner.checkpoint_catalog(fail_after_rename);
             if let Some((lsn, class)) = covered {
                 let committed = inner.cat.as_ref().map(|c| c.generation) != generation;
@@ -4842,8 +4855,8 @@ impl BranchStore {
             if let Some(journal) = inner.journal.as_ref() {
                 // The catalog holds what preceded the capture; the cut log holds, synced, what
                 // followed it in the file.
-                self.group
-                    .mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
+                let class = rewrite_class_marked(cut_class, journal);
+                self.group.mark_durable(journal.lsn() - journal.pending_len(), class);
             }
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
@@ -4862,8 +4875,9 @@ impl BranchStore {
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
+        let class = rewritten_class(journal);
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), rewritten_class(journal));
+        self.group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -4964,11 +4978,13 @@ impl BranchStore {
             // mutex.
             drop(self.group.quiesce());
         }
+        let restart_class = inner.journal.as_ref().map(rewritten_class);
         inner.ensure_backing(page_size)?;
         if restart {
-            // It did (it refuses otherwise): the empty state supersedes everything buffered.
+            // It did (it refuses otherwise): the empty state supersedes everything buffered, in
+            // the class read before its rewrite cleared the inherited floor (review 16 LOW 12).
             if let Some(journal) = inner.journal.as_ref() {
-                self.group.mark_durable(journal.lsn(), rewritten_class(journal));
+                self.group.mark_durable(journal.lsn(), rewrite_class_marked(restart_class, journal));
             }
         }
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
