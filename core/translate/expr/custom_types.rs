@@ -1264,6 +1264,55 @@ mod tests {
         }
     }
 
+    /// Engine review 14 LOW 14: an IN list never consulted a custom type's operator (condition.rs
+    /// `translate_in_list` compares each element with a plain Eq), so `w IN ('b')` and
+    /// `x IN (?1)` answered differently from `w = 'b'` and `x = ?1`, for literals and parameters
+    /// alike. An IN list answers as the OR of its elements' `=`: on tag (whose '=' is instr)
+    /// `w IN ('b')` finds 'abc' as `w = 'b'` does, NOT IN inverts it, and numeric's IN agrees
+    /// with its '='. Mutant `in_list_skips_type_operator`.
+    #[test]
+    fn an_in_list_compares_with_the_types_operator() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2), w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5, 'abc')").unwrap();
+        for (eq, in_list, param) in [
+            ("w = 'b'", "w IN ('b')", None),
+            ("w = 'b'", "w IN ('zz', 'b')", None),
+            ("w = ?1", "w IN (?1)", Some(Value::build_text("b"))),
+            ("NOT (w = 'b')", "w NOT IN ('b')", None),
+            ("x = ?1", "x IN (?1)", Some(Value::from_f64(1.5))),
+            ("x = 1.5", "x IN (7, 1.5)", None),
+            ("x = 1.501", "x IN (1.501)", None),
+        ] {
+            let by_eq = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {eq}"),
+                param.clone(),
+            );
+            let by_in = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {in_list}"),
+                param.clone(),
+            );
+            assert!(by_eq.is_ok(), "premise: {eq} answers: {by_eq:?}");
+            assert!(
+                matches!((&by_in, &by_eq), (Ok(a), Ok(b)) if a == b),
+                "{in_list} answered {by_in:?}, where {eq} answers {by_eq:?}"
+            );
+        }
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE w = 'b'", None), Ok(1)),
+            "premise: tag's '=' (instr) finds 'b' in 'abc'"
+        );
+    }
+
     /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
     /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
     /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
