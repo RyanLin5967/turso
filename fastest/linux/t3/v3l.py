@@ -589,6 +589,8 @@ def self_test():
         ("item 3: a write-back drive whose labelling count is N-1 (timed N+3) VOIDs",
          _has(gates(_lab(rec(delta=N + 3), N - 1)), "fewer than one per fsync in the strace-checked run")),
         ("item 3: a write-back drive whose labelling count is N (timed N+3) is VALID", gates(_lab(rec(delta=N + 3), N)) == []),
+        ("item 3: a write-back drive whose labelling count is not an int ('20004') VOIDs (unreadable is not absent)",
+         _has(gates(_lab(rec(delta=20003), "20004")), "write-back drive nvme1n1", "labelling count unreadable")),
         ("item 3: a write-back loop layer whose labelling run rose N//2 (timed N+3) VOIDs, on the labelling rule's text",
          _has(gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N + 3,
                                  "lab_flush_ios_delta": N // 2}])),
