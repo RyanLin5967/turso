@@ -240,6 +240,29 @@ def _self_test(d):
     rc, rep = run({"fastest_profile": noisy})
     cases.append(("a driver printing more than its result line is REFUSED (rc 2)", rc == 2, rep[-1]))
     cases.append(("no driver at all is REFUSED (rc 2)", run({})[0] == 2, ""))
+    # review 5 MED 8: the LIVE loop -- a driver's run records the claims it judged (ns since its warm-up began) and the
+    # decision it made; live_check replays those claims through the same driver's --warmup-replay and compares
+    live = os.path.join(d, "live.json")
+
+    def live_rc(rec):
+        with open(live, "w") as f:
+            json.dump(rec, f)
+        return live_check(good, live)[0]
+    claims = [i * S for i in range(21)]
+    cases.append(("MED 8: a live record whose decision is the rule's (5:2:180 stops at claim 5) passes (rc 0)",
+                  _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": claims, "stop_at": 5, "warm_ops": 5,
+                                         "capped": 0}) == 0), ""))
+    cases.append(("MED 8: a live record that stopped one claim late FAILS (rc 1)",
+                  _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": claims, "stop_at": 6, "warm_ops": 6,
+                                         "capped": 0}) == 1), ""))
+    cases.append(("MED 8: a live record that says capped where the rule says done FAILS (rc 1)",
+                  _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": claims, "stop_at": 5, "warm_ops": 5,
+                                         "capped": 1}) == 1), ""))
+    cases.append(("MED 8: a live record with no claims is REFUSED (rc 2)",
+                  _safe(lambda: live_rc({"rule": "5:2:180", "stop_at": 5, "warm_ops": 5, "capped": 0}) == 2), ""))
+    cases.append(("MED 8: a live record whose claims go back in time is REFUSED (rc 2)",
+                  _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": [0, 2 * S, S], "stop_at": None,
+                                         "warm_ops": 3, "capped": None}) == 2), ""))
     bad = [n for n, ok, _ in cases if not ok]
     for n, ok, last in cases:
         print(f"WARMUP-CONFORMANCE self-test {'PASS' if ok else 'FAIL'}: {n}" + ("" if ok else f" ({last})"))
