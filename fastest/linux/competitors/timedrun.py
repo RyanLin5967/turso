@@ -8,12 +8,13 @@ TracerPid of every task of the command's process tree and the server's at the st
 appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), and writes the run's exit status to CELLDIR/timed.rc;
 the load generator records its own TracerPid at the window's start and end (summary.json tracerpid_tm0/tm1).
 
-  timedrun.py check CELLDIR N RULE LIVE
+  timedrun.py check CELLDIR N RULE LIVE CAP
                                 CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
                                 exactly N ops like the labelling run, the tracer record shows it untraced throughout
                                 (tracer_problems: no TracerPid, no gap over GAP_S, sweeps bracketing the window, both
-                                roles swept; MED 4), both runs recorded the
-                                warm-up RULE, and the live-branch count held at LIVE: CELLDIR/live.tsv's four
+                                roles swept; MED 4), both runs recorded the warm-up RULE AND did it (run_problems,
+                                MED 6: the effective warm-up meets OPS and S or ran to MAX_S, the window bound is CAP,
+                                capped only with a window at its bound), and the live-branch count held at LIVE: CELLDIR/live.tsv's four
                                 counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
                                 review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
                                 so N is the same before and after each run and the same for every cell)
@@ -162,6 +163,38 @@ def real_problem(cap_s, warmup):
 
 
 LIVE_KEYS = ("label_before", "label_after", "timed_before", "timed_after")
+WARM_SLACK_S = 0.05  # a warm-up may overrun MAX_S by the load generator's 1 ms tick plus scheduling slack
+
+
+def run_problems(nm, sm, warm_rule, cap):
+    """MED 6: what the run DID against what it was told -- its effective warm-up (warmup_ops, warmup_s) must satisfy
+    the rule OPS:S:MAX_S ((ops >= OPS and s >= S) or s >= MAX_S, and s <= MAX_S + slack), its window bound must be
+    the cap, and a run that says capped must have a window at least its bound."""
+    why = []
+    try:
+        o_r, s_r, m_r = warm_rule.split(":")
+        o_r, s_r, m_r = int(o_r), float(s_r), float(m_r)
+    except (AttributeError, ValueError):
+        return [f"{nm} run: warm-up rule {warm_rule!r} unreadable"]
+    wo, ws = sm.get("warmup_ops"), sm.get("warmup_s")
+    if not isinstance(wo, int) or isinstance(wo, bool) or not isinstance(ws, (int, float)) or isinstance(ws, bool):
+        why.append(f"{nm} run has no effective warm-up record (warmup_ops {wo!r}, warmup_s {ws!r})")
+    else:
+        if not ((wo >= o_r and ws >= s_r) or (m_r > 0 and ws >= m_r)):
+            why.append(f"{nm} run left its warm-up early: {wo} ops in {ws:.3f} s against {warm_rule}")
+        if m_r > 0 and ws > m_r + WARM_SLACK_S:
+            why.append(f"{nm} run's warm-up overran MAX_S: {ws:.3f} s against {m_r:g} s")
+    if cap is not None:
+        mw, w = sm.get("max_window_s"), sm.get("window_s")
+        try:
+            capf = float(cap)
+        except (TypeError, ValueError):
+            capf = None
+        if not isinstance(mw, (int, float)) or capf is None or abs(mw - capf) > 1e-6:
+            why.append(f"{nm} run's window bound {mw!r} is not the cap {cap!r}")
+        elif sm.get("capped") is True and (not isinstance(w, (int, float)) or w < mw):
+            why.append(f"{nm} run says capped but its window {w!r} s is shorter than its bound {mw!r} s")
+    return why
 
 
 def check(celldir, n, warm_rule=None, live=None, cap=None):
@@ -202,6 +235,8 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
             got = (sm or {}).get("warmup_rule")
             if got != warm_rule:
                 why.append(f"{nm} run warm-up rule {got!r}, not the registered {warm_rule!r}")
+            if sm:  # MED 6: and what each run DID against that rule and the cap
+                why += run_problems(nm, sm, warm_rule, cap)
     why += tracer_problems(os.path.join(celldir, "timed.tracer.tsv"), t)  # MED 4
     if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
         got = {}
@@ -470,9 +505,9 @@ def selftest():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 6 and sys.argv[1] == "check":
+    if len(sys.argv) == 7 and sys.argv[1] == "check":
         n = int(sys.argv[3])
-        why = check(sys.argv[2], n, sys.argv[4], sys.argv[5])
+        why = check(sys.argv[2], n, sys.argv[4], sys.argv[5], sys.argv[6])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
     if len(sys.argv) == 3 and sys.argv[1] == "tier":  # SUMMARY.JSON: run_system.sh's cap plants (MED 5)

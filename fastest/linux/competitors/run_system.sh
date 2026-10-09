@@ -283,7 +283,7 @@ ops_of() {
 timedrun_check() {
   local k=1
   case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
-  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
     fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
   fi
