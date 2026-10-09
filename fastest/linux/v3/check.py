@@ -2403,15 +2403,14 @@ def check_real(o3, rc, kv, leaf):
                     dbad.append(("a flush-gated op's window lacks one of its own syncs", a, sy["arms"].get(a)))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
-            # eleventh review MED 1: nosync25 owns no fd, so the fd rule above can never give it a sync; blkflush also
-            # counts the pid's syncs wholly inside each arm's windows on ANY fd, and nosync25's must be 0; and no sync
-            # may lie wholly inside a window on an fd that window's arm does not own, or on none (a missing count is
-            # not a zero)
-            if (sy["arms"].get("nosync25") or {}).get("syncs_inside_any_fd") != 0:
-                dbad.append(("nosync25's windows hold a sync by the probe on some fd", sy["arms"].get("nosync25")))
+            # eleventh review MED 1, V3 review 12 item 6: nosync25 owns no fd, so the fd rule can never give it a sync;
+            # every sync of the probe's that no overlapping window's arm owns (foreign_fd: a nosync25 window's
+            # included, wholly inside or at its edge) or that names no fd (no_fd) must be 0 (a missing count is not a
+            # zero). The "wholly inside" counts (syncs_inside_any_fd, inside_*) are strictly weaker and stay
+            # descriptive: an edge or sub-us-window sync shows only in foreign_fd
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
-            if ua.get("inside_foreign_fd") != 0 or ua.get("inside_no_fd") != 0:
-                dbad.append(("a sync by the probe lies wholly inside a window on an fd its arm does not own, or on none",
+            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
+                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns, or on none",
                              sy.get("unattributed")))
         dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
         rec["device_flushes_per_op"] = dfp

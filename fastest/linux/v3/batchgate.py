@@ -498,16 +498,14 @@ def post(out, cell, sha, mode, verdict_path):
                 elif r.get("windows_short") != 0:  # attributed by fd: each window holds all its own (tenth review H1)
                     voids.append("fsync: %s's windows short of their own syncs (by fd): %r of %r" %
                                  (a, r.get("windows_short"), r.get("ops")))
-            # eleventh review MED 1: nosync25 owns no fd, so the fd rule can never give it a sync: its windows must
-            # hold none on ANY fd, and no sync of the probe's may lie wholly inside a window on an fd that window's arm
-            # does not own, or on none (a missing count is not a zero)
-            n0 = sarms.get("nosync25") or {}
-            if n0.get("syncs_inside_any_fd") != 0:
-                voids.append("fsync: nosync25's windows hold %r sync(s) by the probe on some fd" % (n0.get("syncs_inside_any_fd"),))
+            # eleventh review MED 1, V3 review 12 item 6: every sync of the probe's that no overlapping window's arm
+            # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) or that names no fd (no_fd) VOIDs
+            # the batch; a missing count is not a zero. (The nosync25-only lookup that stood here VOIDed any smoke
+            # batch without nosync25 as "None sync(s)"; the "wholly inside" counts stay descriptive.)
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
-            if ua.get("inside_foreign_fd") != 0 or ua.get("inside_no_fd") != 0:
-                voids.append("fsync: %r sync(s) by the probe wholly inside a window on an fd its arm does not own, %r on none"
-                             % (ua.get("inside_foreign_fd"), ua.get("inside_no_fd")))
+            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
+                voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd), %r "
+                             "naming no fd (no_fd)" % (ua.get("foreign_fd"), ua.get("no_fd")))
             merged["app_syncs_per_op"] = {a: round(r.get("syncs", 0) / max(1, r.get("ops", 1)), 4) for a, r in sarms.items()}
         merged["device_flushes"] = {"instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests "
                                     "and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",

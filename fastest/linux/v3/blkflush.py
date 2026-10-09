@@ -42,8 +42,10 @@ value; a BLOCK event whose interval is not inside exactly one window is "ambiguo
 SYNC event is attributed by its fd (sync_windows): to the overlapping window whose arm owns that fd (tenth review
 HIGH 1); see sync_windows for the rule and its one blind spot. Beside that, every sync event of the pid lying WHOLLY
 inside a window is counted for that window's arm on ANY fd (syncs_inside_any_fd), and one whose fd the arm does not
-own, or that names no fd, is counted unattributed inside a window (inside_foreign_fd, inside_no_fd): the fd rule
-alone can never give nosync25, which owns no fd, a sync (eleventh review MED 1).
+own, or that names no fd, is counted unattributed inside a window (inside_foreign_fd, inside_no_fd): DESCRIPTIVE
+counts (V3 review 12 item 6). The gates (check.py F3:devflush, batchgate post) read unattributed foreign_fd and no_fd,
+which are strictly stronger: a sync no overlapping window's arm owns is counted in foreign_fd whether it is wholly
+inside a window or straddles an edge (an edge or a sub-us window holds it in no window's interior).
 """
 import bisect, gzip, json, os, re, subprocess, sys, time
 
