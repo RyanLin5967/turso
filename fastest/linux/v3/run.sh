@@ -67,6 +67,11 @@ for v in LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH; do
 done
 sha=$(sha256sum "$BIN" | cut -d' ' -f1) && [ -n "$sha" ] || refuse "cannot hash $BIN"
 fstype=$(findmnt -n -o FSTYPE -T "$DIR") || refuse "cannot find the filesystem of $DIR"
+# the cell's layout before any op (ninth review L13): a loop cell's D is on a loop device, a block cell's is not; the
+# whole layout is post's (v3cell.layout_problems), this only stops a mislabelled batch before it runs 10000 ops
+msrc=$(findmnt -n -o SOURCE -T "$DIR") || refuse "cannot find the mount source of $DIR"
+python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(0 if v3cell.is_loop(sys.argv[2]) == sys.argv[3].startswith("/dev/loop") else 1)' "$HERE" "$CELL" "$msrc" \
+  || refuse "cell layout: V3_CELL=$CELL is a $(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print("loop" if v3cell.is_loop(sys.argv[2]) else "block")' "$HERE" "$CELL") cell, but $DIR is on $msrc"
 arch=$(uname -m)
 vsha="" vrun="" vleaf="" vbasis=""
 if [ -n "${V3_FIRECHECK_VERDICT:-}" ] && [ -n "${V3_SMOKE:-}" ]; then
@@ -98,8 +103,15 @@ if [ "$mode" = bound ]; then
 else
   shape="smoke: N=$N arms ${args[*]:-default}"
 fi
+rental=no
 if [ "${V3_REQUIRE_T3:-}" = 1 ]; then
+  rental=yes
   tj=$(python3 -B "$GATE" t3pre) || refuse "V3_REQUIRE_T3=1 and the registered T3 preconditions do not hold: $tj"
+  # a real run is on a drive (A16; eighth review M6): no loop cell; the probe itself refuses an unregistered frame arm
+  # or threshold before any op (--require-registered, eighth review L7), and post re-checks both after
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(1 if v3cell.is_loop(sys.argv[2]) else 0)' "$HERE" "$CELL" \
+    || refuse "rental: V3_CELL=$CELL is a loop cell; a real run is on a drive (A16: loop devices are dry-run only)"
+  args+=(--require-registered)
 fi
 TMP="$OUT.stamp_start.json" BLKD="$OUT.blkflush"
 { [ ! -e "$OUT" ] && [ ! -e "$TMP" ] && [ ! -e "$BLKD" ]; } || refuse "$OUT, $TMP or $BLKD exists"
@@ -117,19 +129,25 @@ src=2 rrc=2 grc=2
 if [ -d "$OUT" ]; then
   mv "$TMP" "$OUT/stamp_start.json"
   mv "$BLKD" "$OUT/blkflush"
-  python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json"
+  # the flush path's devices, from the probe's own summary (ninth review L12); none read is stamp end's own problem
+  devs=$(python3 -B -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+d = [l.get("disk") for l in s.get("flush_path") or []]  # not the multipath path disks (tenth review LOW 5)
+print(",".join(x for x in d if x))' "$OUT/summary.json" 2>/dev/null)
+  python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json" --devices "${devs:-}"
   src=$?
   if [ -f "$OUT/raw.tsv" ]; then
     ppid=$(python3 -B -c 'import json, sys; print(int(json.load(open(sys.argv[1]))["pid"]))' "$OUT/summary.json" 2>/dev/null)
     if [ -n "$ppid" ]; then
-      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" --pid "$ppid" > "$OUT/blkflush/report.json"
+      # the probe's own sync_fds key the per-window sync attribution (tenth review HIGH 1)
+      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" --pid "$ppid" --summary "$OUT/summary.json" > "$OUT/blkflush/report.json"
     else
       python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
     fi
     rrc=$?
   fi
-  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\nplp=%s\nshape=%s\n' \
-    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" "$V3_PLP" "$shape" > "$OUT/binary.txt"
+  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\nbind_basis=%s\nplp=%s\nshape=%s\nrental=%s\n' \
+    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" "$vbasis" "$V3_PLP" "$shape" "$rental" > "$OUT/binary.txt"
   if [ -f "$OUT/summary.json" ]; then
     if [ "$mode" = bound ]; then
       python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" "$V3_FIRECHECK_VERDICT"

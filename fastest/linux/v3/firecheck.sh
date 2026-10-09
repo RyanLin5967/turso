@@ -51,6 +51,8 @@ set -uo pipefail
 [ $# -eq 4 ] || { echo "usage: firecheck.sh V3FLOOR CELL WORKDIR OUT" >&2; exit 2; }
 V3=$(readlink -f "$1") CELL=$2 W=$3 OUT=$4
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# the one nest-chain loop matcher, shared with mkfixtures.sh (V3 review 12 item 1)
+. "$HERE/nestloops.sh" || { echo "firecheck: REFUSED: cannot source nestloops.sh" >&2; exit 2; }
 KIND=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print(v3cell.kind(sys.argv[2]))' "$HERE" "$CELL" 2>/dev/null) \
   || { echo "firecheck: '$CELL' is not a cell (v3cell.py)" >&2; exit 2; }
 LOOPCELL=$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; print(int(v3cell.is_loop(sys.argv[2])))' "$HERE" "$CELL")
@@ -297,6 +299,23 @@ rm -f "$W/ow1m" "$tgt"
 echo leftover > "$W/append25"
 refuse R_leftover_file "$V3" --dir "$W" --out "$(o R_leftover_file)" --n 5 --arms append25,nosync25
 rm -f "$W/append25"
+# ninth review L13, M6, M7, L9: the probe's own registration and rental refusals, each on a planted --registered file
+printf '# planted: a threshold, no frame arm\nd0_threshold/ext4/wb/vm\t9.5\tplanted\n' > "$OUT/F4/reg_noframe.tsv"
+printf 'frame_arm\tow64k\tplanted\n' > "$OUT/F4/reg_ow64k.tsv"
+printf 'frame_arm\tappend25\tplanted\n' > "$OUT/F4/reg_frame25.tsv"
+printf 'frame_arm\tow4k\tDECISIONS \xe2\x80\xa6 (PREREG \xc2\xa74)\n' > "$OUT/F4/reg_nonascii.tsv"
+{ printf '#%.0s' $(seq 600); printf '\nframe_arm\tow4k\tplanted\n'; } > "$OUT/F4/reg_longline.tsv"
+# V3 review 12 item 2: the duplicate-key and unknown-key rules, each with its own refusal text
+printf 'frame_arm\tow4k\tplanted\nframe_arm\tow64k\tplanted again\n' > "$OUT/F4/reg_dupkey.tsv"
+printf 'frame_arms\tow4k\tplanted\n' > "$OUT/F4/reg_unknownkey.tsv"
+refuse R_rental_noreg "$V3" --dir "$W" --out "$(o R_rental_noreg)" --n 5 --arms append25,nosync25 --plp no --require-registered
+for t in noframe:reg_noframe novariant:reg_ow64k; do
+  refuse "R_rental_${t%%:*}" "$V3" --dir "$W" --out "$(o "R_rental_${t%%:*}")" --n 5 --arms append25,nosync25 --plp no \
+    --registered "$OUT/F4/${t#*:}.tsv" --require-registered
+done
+for t in frame25 nonascii longline dupkey unknownkey; do
+  refuse "R_reg_$t" "$V3" --dir "$W" --out "$(o "R_reg_$t")" --n 5 --arms append25,nosync25 --plp no --registered "$OUT/F4/reg_$t.tsv"
+done
 # items 9, 10, 12, 15, 1(a): fixtures
 fx R_hidden_tmpfs ht
 fx R_hidden_nobarrier hn
@@ -540,6 +559,9 @@ refuse R_runsh_fcenv env V3_SMOKE=1 V3FLOOR_FIRECHECK=1 bash "$RS" "$V3" "$W" "$
 refuse R_runsh_nocell env -u V3_CELL V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nocell)" 5 --arms append25,nosync25
 refuse R_runsh_badcell env V3_CELL=bogus V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_badcell)" 5 --arms append25,nosync25
 refuse R_runsh_noplp env -u V3_PLP V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_noplp)" 5 --arms append25,nosync25
+# ninth review L13: this cell's own kind under the other layout's name (block <-> loop) refuses before the probe runs
+if [ "${CELL%loop}" != "$CELL" ]; then otherlayout=${CELL%loop}; else otherlayout=${CELL}loop; fi
+refuse R_runsh_celllayout env V3_CELL="$otherlayout" V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_celllayout)" 5 --arms append25,nosync25
 # item 17: V3_REQUIRE_T3=1 on a box where the T3 rule is false. Some x86 runners expose cpufreq with every CPU on
 # "performance" (run 37475543956), where the rule holds: there it is shown accepting (P_runsh_t3, recorded) and then
 # made false for the plant by moving cpu0 to another governor, restored after.
@@ -573,7 +595,7 @@ if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
 else
   echo "V3_SHIM missing" > "$OUT/F4/R_runsh_ldpreload.txt"; echo missing > "$OUT/F4/R_runsh_ldpreload.rc"
 fi
-refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated)" 5 --arms fdatasync4k,nosync25
+refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated)" 5 --arms clean,nosync25
 # fresh review I-H1: a batch gate that fails (here a stub batchgate.py in a copy of the harness exiting 1) is a
 # refusal, never the probe's rc 0
 GH="$OUT/F4/gatecrash-harness"
@@ -694,6 +716,66 @@ if [ -n "${V3_PREV:-}" ] && [ -x "${V3_PREV}/v3floor" ]; then
   pv prev_L9_verdictswap python3 -B "$HERE/postplant.py" "$OUT/F3" "$R2/prev_L9_verdictswap" "$CELL" "$SHA" verdictswap "$V3_PREV/batchgate.py"
 fi
 
+# mkfixtures.sh's two per-block modes for t3run (fastest-linux), last, after every plant on n3/n4: tear the chain
+# down, prove nothing of it is left, rebuild it with V3_FIXTURES=nest on the same directory, and run P_nest3's probe
+# on the rebuilt n3 (P_nest_modes)
+NM=$OUT/F4/P_nest_modes
+mkdir -p "$NM"
+if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
+  nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
+  echo "$nd" > "$NM/nest_dir"  # information only: read back from the n1 under test, so it judges nothing
+  # V3 review 12 item 5: the CELL's own directory for n1, derived here from the work dir's mount, never from the n1
+  # under test: a /dev/loop source's backing file's directory, otherwise the mount target; canonical (readlink -m)
+  wsrc=$(findmnt -n -o SOURCE -T "$W" | tail -1)
+  case $wsrc in
+    /dev/loop*) cdir=$(dirname "$(losetup -n -O BACK-FILE "$wsrc" | xargs)") ;;
+    *) cdir=$(findmnt -n -o TARGET -T "$W" | tail -1) ;;
+  esac
+  cdir=$(readlink -m "$cdir")
+  echo "$cdir" > "$NM/cell_nest_dir.txt"
+  first1=$(readlink -m "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
+  echo "$first1" > "$NM/first_n1_backing.txt"
+  # the loops still backed by a file of the chain, judged against a list derived HERE, not by the shared matcher
+  # (V3 review 12 item 1: a matcher copied verbatim cannot catch its own error): n1's image as built, and the level
+  # images $FX/n1..n3/x.img, each " (deleted)" or not; a losetup that fails is reported, never "nothing attached"
+  FXC=$(readlink -m "$FX")
+  chainloops() {
+    local l w1
+    w1=$first1
+    l=$(loop_list) || { echo "losetup --list failed: the loops cannot be listed"; return 0; }
+    [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, ""); p = $0
+      sub(/ \(deleted\)$/, "", p)
+      if (p == w1 || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }'
+  }
+  # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/ (as nbx's backing /mnt/v3fx/nb/x.img is), mounted,
+  # must survive --teardown-nest untouched: same device, same backing file, still mounted
+  pl=""
+  sudo mkdir -p "$FX/nb" "$FX/nbplant"
+  sudo truncate -s 64M "$FX/nb/teardown-plant.img" && pl=$(sudo losetup --find --show "$FX/nb/teardown-plant.img") \
+    && sudo mkfs.ext4 -q -F "$pl" && sudo mount "$pl" "$FX/nbplant" \
+    && echo "$pl $(losetup -n -O BACK-FILE "$pl" | xargs)" > "$NM/plant_before.txt"
+  timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
+  if [ -n "$pl" ]; then echo "$pl $(losetup -n -O BACK-FILE "$pl" 2>/dev/null | xargs)" > "$NM/plant_after.txt"; fi
+  mountpoint -q "$FX/nbplant" 2>/dev/null && echo yes > "$NM/plant_mounted.txt"
+  # the plant is removed now, whatever the teardown did to it
+  sudo umount "$FX/nbplant" 2>/dev/null; [ -n "$pl" ] && sudo losetup -d "$pl" 2>/dev/null; sudo rm -f "$FX/nb/teardown-plant.img"
+  { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
+    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops | sed 's/^/loop still attached: /'; } > "$NM/after_teardown.txt"
+  timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$cdir" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
+  { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && [ -f "$FX/n$k.ok" ] && echo "n$k mounted ok"; done; } > "$NM/after_rebuild.txt"
+  # the rebuilt n1's image is on the nest dir given, not anywhere else (tenth review MED 1)
+  rb=$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" 2>/dev/null | xargs)
+  if [ -n "$rb" ]; then readlink -m "$rb"; fi > "$NM/rebuilt_n1_backing.txt"
+  timeout 300 "$V3" --dir "$FX/n3/w" --out "$NM/probe.out" --n 5 --arms append25,nosync25 > "$NM/probe.txt" 2>&1; echo $? > "$NM/probe.rc"
+  # tenth review MED 2's plant: a loop attached to a file on n1 and never mounted; --teardown-nest must detach it and
+  # leave no loop backed by the chain
+  sudo truncate -s 64M "$FX/n1/stray.img" && sstray=$(sudo losetup --find --show "$FX/n1/stray.img") && echo "$sstray" > "$NM/stray.dev"
+  timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/stray_teardown.txt" 2>&1; echo $? > "$NM/stray_teardown.rc"
+  { chainloops | sed 's/^/loop still attached: /'; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done; } > "$NM/after_stray.txt"
+else
+  echo "no proved nest chain to tear down (n1.ok absent or n1 not mounted)" > "$NM/na.txt"
+fi
+
 sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null
 [ "$LEAFW" != "$ROOTW" ] && rm -rf "$LEAFW"
 ls -A "$W" > "$OUT/work-leftover.txt"
@@ -710,6 +792,8 @@ else
   timeout 1800 env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o P_runsh_ok)" 10000 --arms "$BSHAPE" > "$OUT/F4/P_runsh_ok.txt" 2>&1
   echo $? > "$OUT/F4/P_runsh_ok.rc"
   refuse R_runsh_boundshape env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o R_runsh_boundshape)" 5 --arms "$BSHAPE"
+  # ... and the other half of the shape: N=10000 with an arm missing (eighth review L4)
+  refuse R_runsh_boundarms env -u V3FLOOR_BRD -u V3_SMOKE V3_BIND_PENDING_SHA="$VSHA" V3_FIRECHECK_VERDICT="$OUT/verdict.json" bash "$RS" "$V3" "$W" "$(o R_runsh_boundarms)" 10000 --arms append25,nosync25
 fi
 python3 -B "$HERE/check.py" --bind "$OUT" "$CELL"
 brc=$?

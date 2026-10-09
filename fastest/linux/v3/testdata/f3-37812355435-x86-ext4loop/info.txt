@@ -1,0 +1,111 @@
+utc=2026-10-08T18:10:33Z
+run_id=37812355435-1
+cell=ext4loop
+kind=ext4
+brd_cell=0
+work=/mnt/fastest-v3-ext4loop/work
+work_fstype=ext4
+work_mount=/dev/loop0 /mnt/fastest-v3-ext4loop rw,relatime,noinit_itable
+root_mount=/dev/nvme0n1p1 ext4   rw,relatime,discard,journal_async_commit,errors=remount-ro,commit=30,data=writeback
+root_disk=nvme0n1 write_cache=[write back]
+mnt_mount=/dev/nvme0n1p1 ext4   rw,relatime,discard,journal_async_commit,errors=remount-ro,commit=30,data=writeback
+loop /dev/loop1  /v3fx-nb.img                 0
+loop /dev/loop19 /v3fx-mdb.img                0
+loop /dev/loop17 /v3fx-ejd.img                0
+loop /dev/loop8  /v3fx-del.img (deleted)      0
+loop /dev/loop15 /v3fx-ldlog.img              0
+loop /dev/loop6  /v3fx-lz.img                 0
+loop /dev/loop13 /v3fx-ds.img                 0
+loop /dev/loop4  /v3fx-hn1.img                0
+loop /dev/loop21 /v3fx-dm.img                 0
+loop /dev/loop11 /mnt/v3fx/n2/x.img           0
+loop /dev/loop2  /mnt/v3fx/nb/x.img           0
+loop /dev/loop0  /fastest-loop-ext4loop.img   0
+loop /dev/loop18 /v3fx-mda.img                0
+loop /dev/loop9  /v3fx-n1.img                 0
+loop /dev/loop16 /v3fx-ejj.img                0
+loop /dev/loop7  /x.img                       0
+loop /dev/loop14 /v3fx-ld.img                 0
+loop /dev/loop5  /v3fx-hn2.img                0
+loop /dev/loop22 /v3fx-dj.img                 0
+loop /dev/loop12 /mnt/v3fx/n3/x.img           0
+loop /dev/loop3  /v3fx-ht.img                 0
+loop /dev/loop20 /v3fx-wt.img                 0
+loop /dev/loop10 /mnt/v3fx/n1/x.img           0
+v3floor_sha256=47025d72f07965ea543c98f1443d0a497595fd46ba4fdaae67ba561e452475aa
+arch=x86_64
+uname=Linux 6.17.0-1022-azure x86_64
+strace=strace -- version 6.8
+clocksource=tsc available=[tsc hyperv_clocksource_tsc_page hyperv_clocksource_msr acpi_pm ]
+base_sha=df4b39e535de7f3fefd36ee37fbb0c19ac0f4e35
+base_v3floor_sha256=bde134b50e43babf2d5220229555e42e9ce7f9196b64bc42726bd9ac06b2f734
+personality_under_setarch_R=00040000
+block dm-0 write_cache=[write back] fua=[0]
+block loop0 write_cache=[write back] fua=[0]
+block loop1 write_cache=[write back] fua=[0]
+block loop10 write_cache=[write back] fua=[0]
+block loop11 write_cache=[write back] fua=[0]
+block loop12 write_cache=[write back] fua=[0]
+block loop13 write_cache=[write back] fua=[0]
+block loop14 write_cache=[write back] fua=[0]
+block loop15 write_cache=[write back] fua=[0]
+block loop16 write_cache=[write back] fua=[0]
+block loop17 write_cache=[write back] fua=[0]
+block loop18 write_cache=[write back] fua=[0]
+block loop19 write_cache=[write back] fua=[0]
+block loop2 write_cache=[write back] fua=[0]
+block loop20 write_cache=[write through] fua=[0]
+block loop21 write_cache=[write back] fua=[0]
+block loop22 write_cache=[write back] fua=[0]
+block loop3 write_cache=[write back] fua=[0]
+block loop4 write_cache=[write back] fua=[0]
+block loop5 write_cache=[write back] fua=[0]
+block loop6 write_cache=[write back] fua=[0]
+block loop7 write_cache=[write back] fua=[0]
+block loop8 write_cache=[write back] fua=[0]
+block loop9 write_cache=[write back] fua=[0]
+block nvme0n1 write_cache=[write back] fua=[1]
+block ram0 write_cache=[write through] fua=[0]
+block ram1 write_cache=[write through] fua=[0]
+block sda write_cache=[write back] fua=[1]
+acl /dev/loop0 user:runner:r--
+acl /dev/loop1 user:runner:r--
+acl /dev/loop10 user:runner:r--
+acl /dev/loop11 user:runner:r--
+acl /dev/loop12 user:runner:r--
+acl /dev/loop13 user:runner:r--
+acl /dev/loop14 user:runner:r--
+acl /dev/loop15 user:runner:r--
+acl /dev/loop16 user:runner:r--
+acl /dev/loop17 user:runner:r--
+acl /dev/loop18 user:runner:r--
+acl /dev/loop19 user:runner:r--
+acl /dev/loop2 user:runner:r--
+acl /dev/loop20 user:runner:r--
+acl /dev/loop21 user:runner:r--
+acl /dev/loop22 user:runner:r--
+acl /dev/loop3 user:runner:r--
+acl /dev/loop4 user:runner:r--
+acl /dev/loop5 user:runner:r--
+acl /dev/loop6 user:runner:r--
+acl /dev/loop7 user:runner:r--
+acl /dev/loop8 user:runner:r--
+acl /dev/loop9 user:runner:r--
+acl /dev/nvme0 user:runner:r--
+acl /dev/sda user:runner:r--
+detect_virt=microsoft
+plp=no
+scsi_hosts=host0:storvsc_host host1:scsi_debug 
+v3dyn_sha256=f23f813fb3e5bc8464e486769e27fbd2b851e04d7095d9bbeb110ac39738fd02 noop_sha256=9d1787d9d4608158d64c94892b00d4eb44a0f583fa292dc13eb45bb273d953b2
+prev_sha=40a3c9502d4998067d2080d32650ec28fdb9b367
+prev_v3floor_sha256=1ea06022d1d9753e0b828c272db961803833682a6cd563422a5489f8651bcc19
+ldso_preload_before=
+leaf_class=wb
+leafdisk=nvme0n1 write_cache=[write back] scsi=0
+box=virt=vm,flip=yes,plp=no
+shm_fstype=tmpfs
+chattr_dir=/mnt/fastest-v3-ext4loop/v3chattr-work --S-----------e------- /mnt/fastest-v3-ext4loop/v3chattr-work
+ficlone_ioctl_index=5
+leafw=/mnt/fastest-v3-ext4loop/v3leaf-work
+ldso_preload_after=
+t3_rule_holds=0

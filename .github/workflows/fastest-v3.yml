@@ -52,9 +52,9 @@ jobs:
           python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
           python3 -B fastest/linux/v3/check.py --self-test 2>&1 | tee st/check-selftest.txt
           for c in ext4 xfs btrfs ext4loop xfsloop btrfsloop; do for a in x86_64 aarch64; do for l in wb wt brd; do
-            for v in vm bare; do for f in yes no; do
-              echo "$c $a $l $v $f $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" "$v" "$f" | wc -l)"
-            done; done; done; done; done | tee st/plan-sizes.txt
+            for v in vm bare; do for f in yes no; do for p in yes no; do
+              echo "$c $a $l $v $f $p $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" "$v" "$f" "$p" | wc -l)"
+            done; done; done; done; done; done | tee st/plan-sizes.txt
           grep -q '^BLKFLUSH SELF-TEST .* PASS$' st/blkflush-selftest.txt
           grep -q '^BATCHGATE SELF-TEST .* PASS$' st/batchgate-selftest.txt
           grep -q '^CHECK SELF-TEST .* PASS$' st/check-selftest.txt
