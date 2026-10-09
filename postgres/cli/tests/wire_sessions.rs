@@ -4986,6 +4986,78 @@ fn a_named_statement_keeps_its_described_result_types() {
     assert!(r.rows.is_empty(), "rows {:?}", r.rows);
 }
 
+/// A Bind's value count is checked at Bind for every statement, its parameters counted as
+/// PostgreSQL counts them (wire review 17 item 2): a `$` that is no parameter (in a comment, a quoted
+/// identifier) leaves a SET with the parameters Parse declared, none, so one value is 08P01 at Bind
+/// and the SET is not performed; and a query's count comes first in exec_bind_message's order, so
+/// two values for `SELECT $1` are 08P01 in a failed block (not 25P02) and with format code 2 (not
+/// 22023). The count was skipped for any text holding a `$`: the prepare at Execute performed the
+/// SET, and only then was the Bind refused.
+#[test]
+fn a_bind_counts_parameters_as_the_lexer_reads_them() {
+    let dir = Scratch::new("bindlexer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (no declared types), Bind (one format code if given, then the text values), Execute,
+    // Sync.
+    fn round(w: &mut Wire, sql: &str, codes: &[i16], values: &[&[u8]]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(codes.len() as i16).to_be_bytes());
+        for c in codes {
+            bind.extend_from_slice(&c.to_be_bytes());
+        }
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        w.read_reply()
+    }
+    a.q("CREATE TABLE fp(id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE fc(pid INT REFERENCES fp(id))")
+        .ok("child");
+    for sql in [
+        "SET foreign_keys = off /* $1 */",
+        "SET foreign_keys = off -- $1",
+    ] {
+        let r = round(&mut a, sql, &[], &[b"x"]);
+        assert_eq!(r.err(sql).code, "08P01", "{sql}");
+        assert_eq!(
+            a.q("INSERT INTO fc VALUES (5)").err(sql).code,
+            "23503",
+            "{sql} was performed before its Bind was refused"
+        );
+    }
+    let path = a.q("SHOW search_path").single("the search path");
+    let sql = "SET search_path TO \"s$1\", public";
+    let r = round(&mut a, sql, &[], &[b"x"]);
+    assert_eq!(r.err(sql).code, "08P01");
+    assert_eq!(
+        a.q("SHOW search_path").single("the search path after"),
+        path,
+        "{sql} was performed before its Bind was refused"
+    );
+    // Control: a query's own $1 with one value runs.
+    let r = round(&mut a, "SELECT $1::int + 1", &[], &[b"41"]);
+    assert_eq!(r.rows, vec![vec![Some("42".to_string())]], "{:?}", r.error);
+    a.q("BEGIN").ok("begin");
+    assert_eq!(a.q("SELECT * FROM nosuch").status, b'E');
+    let r = round(&mut a, "SELECT $1", &[], &[b"1", b"2"]);
+    assert_eq!(r.err("two values in a failed block").code, "08P01");
+    assert_eq!(r.status, b'E', "the block is still failed");
+    a.q("ROLLBACK").ok("end");
+    let r = round(&mut a, "SELECT $1", &[2], &[b"1", b"2"]);
+    assert_eq!(r.err("two values, format code 2").code, "08P01");
+}
+
 /// A Bind is checked before anything of its statement runs, for every statement without a `$n`
 /// (its parameters are the ones Parse declared, none if it declared none): one value for `SET
 /// search_path TO nosuch` or `SET foreign_keys = off` is 08P01 and the setting is unchanged; a
