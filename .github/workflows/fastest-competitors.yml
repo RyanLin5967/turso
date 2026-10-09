@@ -1,6 +1,8 @@
 name: fastest-competitors
 # Lane fastest-linux-comp: the FASTEST competitors on Linux -- PostgreSQL 18 (PGDG; STRATEGY=FILE_COPY with
-# file_copy_method=clone and STRATEGY=WAL_LOG, each at D2 = pg18-d2 and at defaults = pg18-defaults, amendment 14),
+# file_copy_method=clone and STRATEGY=WAL_LOG at D2 = pg18-d2, amendment 14, plus the clone proof's copy control
+# pg18-create-copy; pg18-defaults is DROPPED on Linux by the lead's ruling, artie DECISIONS 6b0bef481b: on Linux it
+# configures the same server as pg18-d2, and PREREG-CORE v2's OUT list excludes PG18 at its defaults),
 # Dolt and Doltgres at the registered versions of versions.tsv (2.4.1, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
 # variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
 # and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
@@ -28,7 +30,7 @@ on:
         description: "per-run cap in seconds: the measured window's bound (registered: 1800)"
         default: "1800"
       warmup:
-        description: "warm-up OPS:S:MAX_S; empty = PREREG :210's rule at cap_s (1000:10:180 at 1800 s)"
+        description: "warm-up OPS:S:MAX_S (smoke cap 1000:10:2; PREREG :210's rule at 1800 s is 1000:10:180; empty gives 1000:10:2)"
         default: "1000:10:2"
       age:
         description: "aging UPDATEs applied to the parent (PREREG §7: 1e5; 0 = fresh)"
@@ -69,16 +71,56 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # Lead ruling (artie DECISIONS 6b0bef481b): the smoke warm-up cap is for smoke only, so a real run (FT_DRY=0, or
+      # unset) with it must refuse; plant_real.sh makes run_system.sh meet it, the dropped pg18-defaults and the other
+      # real-run refusals, plus controls that must get past them. A failure here fails the build, so no cell runs.
+      - name: Refusal plants (a real run with the smoke warm-up cap, pg18-defaults) and timedrun.py selftest
+        run: |
+          timeout 120 python3 -B fastest/linux/competitors/timedrun.py selftest | tail -1
+          # HIGH 1's checks: the live-branch count (timedrun, fixture) and the C=1 phase split with its plant
+          timeout 120 python3 -B fastest/linux/competitors/fixture.py selftest | tail -1
+          timeout 120 python3 -B fastest/linux/competitors/stracecount.py selftest | tail -1
+          timeout 120 python3 -B fastest/linux/competitors/gen_seed.py selftest | tail -1
+          timeout 120 python3 -B fastest/linux/competitors/fthelp.py selftest | tail -1  # MED 9: the GC verdict
+          timeout 120 python3 -B fastest/linux/competitors/pins.py selftest | tail -1    # LOW 20: CI never ran it
+          timeout 120 python3 -B fastest/linux/competitors/smoke_table.py selftest | tail -1  # LOW 25: version labels
+          timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
+          # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
+          # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.
+          timeout 120 python3 -B fastest/linux/competitors/drive.py selftest | tail -1
+          mkdir -p "$RUNNER_TEMP/build-hw"
+          timeout 120 python3 -B fastest/linux/competitors/drive.py record "$RUNNER_TEMP" "$RUNNER_TEMP/build-hw/drive-build.json" ||
+            echo "drive.py refused this build runner's disk (rc=$?); each run job records and gates its own"
       - name: Packages (PGDG libpq 18, MariaDB connector, clang, cmake, fio)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -q libpq-dev libmariadb-dev clang cmake pkg-config fio
+          # LOW 24: the PGDG archive too, so the pinned package stays installable after PGDG's main pool drops it,
+          # and libpq-dev pinned to the same registered package (read through pins.py, the one table's reader)
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt-archive.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg-archive main" |
+            sudo tee /etc/apt/sources.list.d/pgdg-archive.list
+          sudo apt-get update -q
+          pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
+          [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
+          sudo apt-get install -y -q "libpq-dev=$pgv" "libpq5=$pgv" libmariadb-dev clang cmake pkg-config fio
       - name: Hardware record
         run: bash fastest/linux/hw/record.sh "$RUNNER_TEMP/build-hw" "$RUNNER_TEMP/hw-target" 15
       - name: Build bbload, clonebench, sqlite3 (BB_HOOKS=0)
         run: timeout 1500 bash fastest/linux/competitors/build.sh dist
+      # PREREG annex A23 / A23-AM1: the warm-up rule OPS:S:MAX_S is the macOS bbload's claim_op decision (warm_ends at
+      # artie 4010ff3b06), and every driver must make the same decision on the same claims. The shared harness
+      # (fastest/linux/gates/warmup_conformance.py, verbatim from fastest-branching b736990a9) replays its 12
+      # hand-derived cases through each built driver's --warmup-replay. fastest_profile is not built here, so the
+      # verdict for these two is PARTIAL, rc 3, which requires every case to match for both; anything else fails the
+      # build. The three-driver run (rc 0) is the integration branch's.
+      - name: A23 warm-up conformance (bbload, clonebench)
+        run: |
+          timeout 120 python3 -B fastest/linux/gates/warmup_conformance.py self-test | tail -1
+          rc=0
+          timeout 300 python3 -B fastest/linux/gates/warmup_conformance.py run --bbload dist/bbload \
+            --clonebench dist/clonebench || rc=$?
+          [ "$rc" = 3 ] || { echo "warm-up conformance rc=$rc, want 3 (both drivers match every case)"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: competitor-tools-${{ matrix.runner }}
@@ -99,7 +141,8 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
         fs: [xfs, btrfs]
-        system: [pg18-d2, pg18-defaults, dolt, doltgres, b1]
+        # pg18-defaults is dropped on Linux (lead ruling, artie 6b0bef481b); reduce.py pins these systems
+        system: [pg18-d2, dolt, doltgres, b1]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     env:
@@ -111,10 +154,15 @@ jobs:
       FT_IDLE_S: ${{ inputs.idle_s || '30' }}
       # The registered 1800 s cap bounds every measured window (gate-6 item 16). SMOKE overrides only the warm-up's
       # MAX_S: 1000:10:2 is PREREG :210's OPS and S with at most 2 s of warm-up (a full 1000-op warm-up per run would
-      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used, and FT_WARMUP empty gives
-      # the registered 1000:10:180.
+      # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used. An empty input also gives
+      # 1000:10:2 (the `||` default); pass 1000:10:180 for the registered rule. That cap is accepted for SMOKE only
+      # (lead ruling, artie DECISIONS 6b0bef481b): these jobs say so with FT_DRY=1, and run_system.sh refuses the cap
+      # on a real run (FT_DRY=0, its default; the build job's plant proves it). A clean cell warmed up by any rule but
+      # rule(FT_CAP_S) gets timed.json verdict 'ok-smoke-warmup', never 'ok', and reduce.py accepts it only from a
+      # dry=1 job (lead review 62430d8bf..b49fb656a MED 7).
       FT_CAP_S: ${{ inputs.cap_s || '1800' }}
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
+      FT_DRY: "1"
       # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
       # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
       FT_AGE: ${{ inputs.age || '200' }}
@@ -131,9 +179,16 @@ jobs:
           sudo apt-get install -y -q postgresql-common
           echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          # LOW 24: the PGDG archive as a second source, so the pinned package stays installable once PGDG's main
+          # pool moves past it (the build job adds the same line)
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt-archive.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg-archive main" |
+            sudo tee /etc/apt/sources.list.d/pgdg-archive.list
+          sudo apt-get update -q
           # PostgreSQL pinned to the registered package of versions.tsv (gate-6 review, t3run item 13); a PGDG
-          # repository without it fails here rather than installing another version.
-          pgv=$(awk -F'\t' '$1 == "postgresql" && $4 == "pgdg_package" {print $5}' fastest/linux/competitors/versions.tsv)
+          # repository without it fails here rather than installing another version. The pin is read through pins.py
+          # (LOW 24: this was a second, awk reader of the table), which exits non-zero on a missing row, and the
+          # step's bash -e stops on that.
+          pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
           [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
           sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
@@ -151,7 +206,8 @@ jobs:
           chmod +x dist/bbload dist/clonebench dist/sqlite3
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP age=$FT_AGE prebranch=$FT_PREBRANCH";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP dry=$FT_DRY (smoke, uncredited) age=$FT_AGE prebranch=$FT_PREBRANCH";
+            echo "systems=pg18-d2,dolt,doltgres,b1 pg18-defaults=DROPPED (lead ruling artie 6b0bef481b: on Linux it is pg18-d2's server; pg18-d2 runs the copy control pg18-create-copy)";
             cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries
@@ -181,7 +237,12 @@ jobs:
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
-        run: timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
+        # LOW 14: the job's budget, derived from this step's own timeout so no cell can be cut mid-way: a cell not
+        # started by 12600 - 2 x (cap + 600) - 600 s is recorded "NOT RUN: budget" (at the 1800 s cap: 7200 s)
+        run: |
+          export FT_BUDGET_S=$(( 12600 - 2 * (${FT_CAP_S%.*} + 600) - 600 ))
+          [ "$FT_BUDGET_S" -gt 0 ] || { echo "the cap leaves no budget under the 12600 s step timeout"; exit 1; }
+          timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
       - name: Compress traces
         if: always()
         run: find "$RAW" -name '*.strace' -exec gzip -9 {} + || true
@@ -217,6 +278,7 @@ jobs:
             >"$RUNNER_TEMP/reduce/reduce.tsv" 2>"$RUNNER_TEMP/reduce/reduce.err" || rc=$?
           echo "reduce_rc=$rc git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT" | tee "$RUNNER_TEMP/reduce/reduce-rc.txt"
           grep '^JOBS' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
+          grep '^DRIVES' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
           echo "CELLS rows: $(grep '^CELLS' "$RUNNER_TEMP/reduce/reduce.tsv" | awk 'END {print NR - 1}')"
           cat "$RUNNER_TEMP/reduce/reduce.err"
           # SMOKE.md's tables, generated here from the same raw (smoke_table.py, C=1 and C=4)

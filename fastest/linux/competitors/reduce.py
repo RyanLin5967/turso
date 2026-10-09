@@ -15,11 +15,18 @@ What SHOULD be there is never taken from what is there (review finding 11):
     workflow is a MISSING row (third review, finding 6).
 A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
-  JOBS   artifact, firecheck verdict, functional verdict, failed functional lines
-  CELLS  artifact, cell, then stracecount.py's table columns (TABLE_COLS)
+  JOBS     artifact, firecheck verdict, functional verdict, failed functional lines
+  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok; 'ok-smoke-warmup' is ok
+           only in a smoke job, run-info dry=1)
+  PARAMS   one line: the run's one cap_s and warm-up rule, or why the jobs differ (MED 7)
+  FIXTURE  one line: the run's one parent fixture, or why the jobs' fixtures differ
+  DRIVES   artifact, drive class (drive.py CLASSES), whether a flush reaches the drive (no filesystem in the chain
+           mounted nobarrier), disks, device chain
+  CELLS    artifact, cell, then stracecount.py's table columns (TABLE_COLS)
 Exit 0 only if every expected job and cell is present and readable, every fire-check passed each PINNED_FIRECHECK
 check (one PASS line each, no FAIL line, one "VERDICT PASS n/n" with n the pinned count), every functional verdict is
-a PASS and every cell verdict is ok; 1 otherwise (after printing everything); 2 if the expectation itself cannot be
+a PASS, every cell verdict and timed verdict is ok, the fixtures agree and every present job has its drive class;
+1 otherwise (after printing everything); 2 if the expectation itself cannot be
 determined.
 """
 import glob
@@ -33,13 +40,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import stracecount  # noqa: E402  (the same table columns as each job's own flushes.tsv)
 import fixture  # noqa: E402  (one parent fixture for every system)
+import drive  # noqa: E402  (the drive classes a job's drive.json may name)
 
 WORKFLOW = ".github/workflows/fastest-competitors.yml"
 _PG = ["pg18-select1", "pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal"]
 _DV = ["create", "a-m1c", "a-m1", "b-m1c", "b-m1", "c-m1c", "c-m1"]
+# pg18-defaults is DROPPED on Linux (lead ruling, artie DECISIONS 6b0bef481b: on Linux it configures pg18-d2's server,
+# and PREREG-CORE v2's OUT list excludes PG18 at its defaults); pg18-d2 runs the clone proof's copy control. A workflow
+# that lists pg18-defaults again gets MISSING rows (no pinned expectation), and run_system.sh refuses the system.
 PINNED_SPECS = {
-    "pg18-d2": _PG,
-    "pg18-defaults": _PG + ["pg18-create-copy"],
+    "pg18-d2": _PG + ["pg18-create-copy"],
     "dolt": ["dolt-select1"] + [f"dolt-{v}" for v in _DV],
     "doltgres": ["doltgres-select1"] + [f"doltgres-{v}" for v in _DV],
     "b1": [f"b1-{s}" for s in ("m1c-d2", "m1-d2", "m1c-d0", "m1-d0")],
@@ -57,6 +67,7 @@ PINNED_FIRECHECK = (
     "F7-threads-before-attach", "F8-rwf_dsync-refused", "F9-libaio-refused", "F10a-untraced-descendant-detected",
     "F10b-descendants-attached", "F10c-storm-control-misses", "F10d-storm-attach-complete", "F11-split-pre",
     "F11-split-post", "F12-t1-cut", "F13-clock-step-refused", "F14-stamper-subshell-safe",
+    "F15-timed-run-tracer-seen",
 )
 
 
@@ -64,6 +75,16 @@ def refuse(msg):
     """The expectation itself cannot be determined: say why and exit 2 (the docstring's promise; sys.exit(str) is 1)."""
     print(msg, file=sys.stderr)
     sys.exit(2)
+
+
+def run_param(job_dir, key):
+    """KEY=VALUE from the job's run/run-info.txt first line (run_system.sh's), or None."""
+    try:
+        first = open(os.path.join(job_dir, "run", "run-info.txt")).readline()
+    except OSError:
+        return None
+    m = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", first)
+    return m.group(1) if m else None
 
 
 def last_line(path, prefix):
@@ -197,9 +218,23 @@ def main(argv):
                 tv = json.load(open(tj)).get("verdict")
             except (OSError, ValueError) as e:
                 tv = f"MISSING ({e.__class__.__name__})"
-            if tv != "ok":
+            # MED 7: 'ok-smoke-warmup' (a clean cell warmed up by the CI smoke cap, not the registered rule) stands
+            # only in a smoke job (run-info dry=1); a real run needs 'ok'
+            if tv != "ok" and not (tv == "ok-smoke-warmup" and run_param(a, "dry") == "1"):
                 print(f"TIMED\t{name}\t{cell}\t{tv}")
                 bad += 1
+    # MED 7: one cap and one warm-up rule for every job of the run (each job's run/run-info.txt)
+    params = {}
+    for name in names:
+        if name in present:
+            params.setdefault((run_param(os.path.join(d, name), "cap_s"), run_param(os.path.join(d, name), "warmup")),
+                              []).append(name)
+    if len(params) != 1 or None in {v for k in params for v in k}:
+        print("PARAMS\tall jobs\tREFUSED: the jobs ran with different (cap_s, warmup) or recorded none: "
+              + "; ".join(f"{k} on {len(v)} job(s)" for k, v in params.items()))
+        bad += 1
+    else:
+        print(f"PARAMS\tall jobs\tone cap and rule: cap_s={next(iter(params))[0]} warmup={next(iter(params))[1]}")
     # One parent fixture for every system of the run (gate-6 review, t3run item 4): every present job's
     # run/fixture.json must name the same rows, aging, live branches and generator digest (fixture.py compare).
     fxs = []
@@ -216,6 +251,26 @@ def main(argv):
     print("FIXTURE\tall jobs\t" + ("one parent: " + json.dumps({k: fxs[0].get(k) for k in fixture.KEYS})
                                    if not fwhy else "REFUSED: " + "; ".join(fwhy)))
     bad += 1 if fwhy else 0
+    # The drive class each job ran on (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3): run/drive.json from
+    # drive.py, which run_system.sh writes before any cell; a present job without a readable one is not a pass.
+    # A class outside drive.CLASSES, or no flush_reaches_drive boolean, is not a record (review of e11a3c993, findings
+    # 3 and 11).
+    print("DRIVES\tartifact\tdrive_class\tflush_reaches_drive\tdisks\tchain")
+    for name in names:
+        if name not in present:
+            continue
+        try:
+            dj = json.load(open(os.path.join(d, name, "run", "drive.json")))
+            if dj["drive_class"] not in drive.CLASSES or not isinstance(dj["flush_reaches_drive"], bool):
+                raise ValueError(f"drive_class {dj['drive_class']!r}, flush_reaches_drive "
+                                 f"{dj['flush_reaches_drive']!r}")
+            row = [dj["drive_class"], "yes" if dj["flush_reaches_drive"] else "no",
+                   ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__}: {e})")
+            bad += 1
+            continue
+        print("DRIVES\t" + "\t".join([name] + row))
     print("CELLS\tartifact\tcell\t" + "\t".join(stracecount.TABLE_COLS))
     for name, cell, c in cells:
         if c is None:

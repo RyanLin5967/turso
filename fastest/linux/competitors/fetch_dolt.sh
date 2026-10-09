@@ -45,10 +45,16 @@ fetch() { # fetch NAME URL SHA256 BINNAME
 fetch dolt "https://github.com/dolthub/dolt/releases/download/v$dolt_v/dolt-linux-$arch.tar.gz" "$dolt_sha" dolt
 fetch doltgres "https://github.com/dolthub/doltgresql/releases/download/v$dg_v/doltgresql-linux-$arch.tar.gz" "$dg_sha" doltgres
 dolt_quiet_root "$work/root"
-{ echo "dolt version: $("$BIN/dolt" version 2>&1 | head -3 | tr '\n' ' ')";
-  echo "doltgres version: $(cd "$work" && "$BIN/doltgres" -version 2>&1 | head -3 | tr '\n' ' ')";
+# Each version command's own output, unprefixed, is what check-version reads: since LOW 19 it takes the version from
+# the FIRST line in the command's own form ("dolt version X", "Doltgres version X"). This used to grep the prefixed,
+# space-joined OUT lines ("dolt version: dolt version 2.4.1 ..."), which that first-line rule refuses, and its
+# `grep -v doltgres` never removed anything (LOW 27). The rc is recorded; the output is what is judged.
+dv_rc=0 dgv_rc=0
+"$BIN/dolt" version >"$work/dv" 2>&1 || dv_rc=$?
+(cd "$work" && "$BIN/doltgres" -version) >"$work/dgv" 2>&1 || dgv_rc=$?
+{ echo "dolt version (rc=$dv_rc): $(head -3 "$work/dv" | tr '\n' ' ')";
+  echo "doltgres version (rc=$dgv_rc): $(head -3 "$work/dgv" | tr '\n' ' ')";
   echo "telemetry: DOLT_ROOT_PATH config $(cat "$work/root/.dolt/config_global.json") DOLT_DISABLE_EVENT_FLUSH=$DOLT_DISABLE_EVENT_FLUSH"; } >>"$OUT"
-grep 'dolt version' "$OUT" | grep -v doltgres >"$work/dv"; grep 'doltgres version' "$OUT" >"$work/dgv"
-python3 -B "$PINS" check-version dolt "$work/dv" || die "REFUSED: dolt does not report $dolt_v: $(cat "$work/dv")"
-python3 -B "$PINS" check-version doltgres "$work/dgv" || die "REFUSED: doltgres does not report $dg_v: $(cat "$work/dgv")"
+python3 -B "$PINS" check-version dolt "$work/dv" || die "REFUSED: dolt does not report $dolt_v: $(head -3 "$work/dv")"
+python3 -B "$PINS" check-version doltgres "$work/dgv" || die "REFUSED: doltgres does not report $dg_v: $(head -3 "$work/dgv")"
 cat "$OUT"

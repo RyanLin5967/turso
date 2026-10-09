@@ -9,7 +9,7 @@
 # the kernel can, a silent byte copy when it cannot, which is why the driver proves the clone from shared extents.
 # Amendment 14's "FILE_COPY with file_copy_method=clone ... at its defaults" is MODE d1clone; on Linux it configures
 # the same server as d2 (every d2 line but file_copy_method is a Linux default), which `settings` dumps to show.
-#   pg18.sh settings DATA             every pg_settings row (name, setting, source) as TSV
+#   pg18.sh settings DATA             every pg_settings row (name, setting, unit, source) as TSV
 #   pg18.sh writethrough DATA         ask this postgres binary to accept wal_sync_method=fsync_writethrough
 #                                     (postgres -C); prints its output and rc -- Linux builds refuse it
 #
@@ -20,12 +20,15 @@
 #   pg18.sh sql   DATA DB SQL         one statement through psql (prints rows unaligned)
 #   pg18.sh stop  DATA                SIGINT (fast shutdown) to the recorded pid only; waits for exit
 #
-# MODE d2      : wal_sync_method=fsync_writethrough (F_FULLFSYNC), fsync=on, full_page_writes=on,
-#                synchronous_commit=on, file_copy_method=clone  (PREREG §4 "Competitor D2 settings")
-# MODE default : PostgreSQL's own defaults (wal_sync_method=open_datasync = D1 on macOS, file_copy_method=copy)
-# MODE d1clone : defaults plus file_copy_method=clone (isolates durability from the copy method; report only)
-# All modes: listen 127.0.0.1:PORT, no Unix socket (the scratch path exceeds sun_path), max_connections=1100
-# (C up to 1024 plus spare), trust auth for user postgres. Branch op: CREATE DATABASE b TEMPLATE p STRATEGY=FILE_COPY.
+# MODE d2      : (the Linux port, LOW 23: the Mac's fsync_writethrough does not exist here) wal_sync_method=fdatasync,
+#                fsync=on, full_page_writes=on, synchronous_commit=on, file_copy_method=clone (PREREG §4 "Competitor
+#                D2 settings")
+# MODE default : PostgreSQL's own defaults for the settings above (on Linux wal_sync_method=fdatasync already;
+#                file_copy_method=copy); not a Linux run system (pg18-defaults is dropped, ruling 6b0bef481b)
+# MODE d1clone : defaults plus file_copy_method=clone (on Linux the same server as d2; report only)
+# All modes: shared_buffers = 25% of MemTotal (gate-6 item 15; initdb's 128 MB is NOT a default here), listen
+# 127.0.0.1:PORT, no Unix socket (the scratch path exceeds sun_path), max_connections=1100 (C up to 1024 plus spare),
+# trust auth for user postgres. Branch op: CREATE DATABASE b TEMPLATE p STRATEGY=FILE_COPY.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 cmd=${1:-}; DATA=${2:-}
@@ -44,6 +47,12 @@ init)
   mkdir -p "$(dirname "$DATA")"
   "$FT_PG18/initdb" -D "$DATA" -U postgres -A trust --encoding=UTF8 --locale=C >"$DATA.initdb.log" 2>&1 ||
     { tail -20 "$DATA.initdb.log" >&2; die "initdb failed"; }
+  # LOW 22: shared_buffers is computed BEFORE the config is written, from a copy of /proc/meminfo kept beside the data
+  # dir (DATA.meminfo; run_system.sh checks against that same read), and a failed or empty value stops the init
+  # instead of writing "shared_buffers = "
+  cp /proc/meminfo "$DATA.meminfo" || die "cannot read /proc/meminfo"
+  SB=$("$FT_PY" -B "$FT_HERE/pins.py" shared-buffers "$DATA.meminfo") || die "pins.py shared-buffers failed"
+  [[ $SB =~ ^[0-9]+MB$ ]] || die "shared_buffers [$SB] is not <N>MB"
   {
     echo ""
     echo "# ---- fastest-tools pg18.sh, mode $MODE ----"
@@ -53,7 +62,7 @@ init)
     echo "max_connections = 1100"
     # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15; initdb's default is 128 MB); run_system.sh
     # refuses a server whose pg_settings value differs (pins.py check-pg)
-    echo "shared_buffers = $("$FT_PY" -B "$FT_HERE/pins.py" shared-buffers /proc/meminfo)"
+    echo "shared_buffers = $SB"
     if [ "$MODE" = d2 ]; then
       echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"
@@ -81,18 +90,21 @@ seed)
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
   psqlc -d postgres -c "CREATE DATABASE p"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | psqlc -d p
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | psqlc -d p
   psqlc -d p -c "CHECKPOINT"
   # Aged parent (gate-6 review, t3run item 4; PREREG §7 / amendment 52): AGE committed single-row UPDATEs (psql
-  # autocommits each statement), the same stream for every system, then PG's documented maintenance.
-  [ "$AGE" -gt 0 ] && { "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc -d p; }
+  # autocommits each statement), the same stream for every system, then PG's documented maintenance. AGE=0 pipes an
+  # empty stream, so its digest is recorded too.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc -d p
   psqlc -d p -c "VACUUM ANALYZE t" -c "CHECKPOINT"
   echo "maintenance: CHECKPOINT; aged $AGE; VACUUM ANALYZE; CHECKPOINT"
   echo "seeded p.t rows=$(psqlc -d p -At -c 'SELECT count(*) FROM t') size=$(psqlc -d p -At -c "SELECT pg_size_pretty(pg_database_size('p'))")"
   ;;
 settings)
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
-  psqlc -d postgres -At -F $'\t' -c "SELECT name, setting, source FROM pg_settings ORDER BY name"
+  # name, setting, unit, source (LOW 21: the unit column, so a setting's bytes are read, never guessed)
+  psqlc -d postgres -At -F $'\t' -c "SELECT name, setting, coalesce(unit, ''), source FROM pg_settings ORDER BY name"
   ;;
 writethrough)
   # Not started: postgres -C reads the config, applies -c, prints the value and exits. rc is the evidence.

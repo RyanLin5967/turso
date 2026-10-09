@@ -49,13 +49,17 @@
 #      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late; the t1 line repeated;
 #      the t1 line after strace_rc; the fsync table row removed or bumped; a loose pair; a 1.2 ms step with and without
 #      err widening; a table with no call lines. Each is REFUSED for its own reason, or ok where the err widens the
-#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
+#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc. On copies of F1's
+#      LAUNCH window: unmodified ok with coproc stamps; t1 stepped; the t0 pair line removed; every call stamp 5 s late;
+#      t1 after strace_rc; t1 repeated; only t0_mono stripped (E4's shape) -- each refused for its own reason.
 #   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
 #      reply in its pipe is skipped; the next top-level calls are served by the coproc; the stamper's fd numbers
 #      reopened onto decoys (a file and /dev/null, both and then each alone, and two anonymous pipes; the setup
 #      proven by /proc) are refused with nothing written; then one in-order probe after a one-word and a non-ASCII line must get its
 #      own reply first (no leaked request, no answer to a malformed line); clock_pair stamps one-shot when the shape
 #      check refuses; the reply-shape check passes the stamper's format and refuses 5 malformed replies.
+#   F15 the timed run's tracer record (trace.sh timed_run, timedrun.py tracer-check): a clean run passes; a strace
+#      attached to the server mid-run and detached before the end is seen (TRACED lines) and refused.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -63,7 +67,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=23
+NCHECK=24
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -703,17 +707,24 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
   # Launch windows (strace_run) carry clock pairs too (SMOKE.md erratum E4), on copies of F1's: (p) unmodified, ok
   # with F1's 10 flushes and t0/t1 from the stamper; (q) t1's realtime +0.1 s, refused for the step; (r) the t0 pair
-  # line removed, refused for the missing pair.
-  for k in p q r; do
+  # line removed, refused for the missing pair; and, so each launch-window check is forced to fire alone (lead review
+  # 62430d8bf..b49fb656a MED 8): (s) every call stamp +5 s, refused only for calls outside [t0, t1]; (t) the t1 line
+  # after strace_rc, refused for the order; (u) the t1 line repeated, refused for the repeated stamp; (v) only
+  # t0_mono= stripped from the t0 line (E4's own shape: t0 present, its pair half missing), refused for the pair.
+  for k in p q r s t u v; do
     for x in strace strace.err window cmd.err; do cp "$OUT/f1.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
   awk '/^t1=/ { split($1, a, "="); $1 = sprintf("t1=%.9f", a[2] + 0.1) } { print }' "$OUT/f1.window" >"$OUT/f13q.window"
   awk '!/^t0=/ { print }' "$OUT/f1.window" >"$OUT/f13r.window"
-  for k in a b c d e f g h i j k l m n p q r; do count "f13$k"; done
+  awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f1.strace" >"$OUT/f13s.strace"
+  awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f1.window" >"$OUT/f13t.window"
+  awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f1.window" >"$OUT/f13u.window"
+  awk '/^t0=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t0_mono=/) $i = "" } { print }' "$OUT/f1.window" >"$OUT/f13v.window"
+  for k in a b c d e f g h i j k l m n p q r s t u v; do count "f13$k"; done
   if python3 -c "
 import json, sys
 o = sys.argv[1]
-J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqr'}
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqrstuv'}
 v = {k: r['verdict'] for k, r in J.items()}
 src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
@@ -727,14 +738,16 @@ ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
       v['c'] == 'ok' and J['c']['flushes'] == 10 and
       src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'} and
       v['p'] == 'ok' and J['p']['flushes'] == 10 and J['p'].get('clock_src') == {'t0': 'coproc', 't1': 'coproc'} and
-      refused('q', STEP) and refused('r', 'without its clock pair'))
-print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqr'), '| (l)', v['l'][:20], J['l']['flushes'],
+      refused('q', STEP) and refused('r', 'without its clock pair') and
+      refused('s', OUTSIDE, BACK, STEP) and refused('t', 't1 after its strace_rc') and
+      refused('u', 'repeated stamp') and refused('v', 'without its clock pair', STEP))
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqrstuv'), '| (l)', v['l'][:20], J['l']['flushes'],
       '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src,
       '| (p)', v['p'][:20], J['p']['flushes'], J['p'].get('clock_src'))
 sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
-    log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
+    log "PASS F13-clock-step-refused: $(head -c 2000 "$OUT/f13.txt")"
   else
-    log "FAIL F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"; fails=$((fails + 1))
+    log "FAIL F13-clock-step-refused: $(head -c 2000 "$OUT/f13.txt")"; fails=$((fails + 1))
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
@@ -843,6 +856,38 @@ if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" &
   log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped, decoy fds (setup proven) refused together and one at a time (0 bytes written), anonymous-pipe decoys refused together and one at a time with no leaked request (leak detector control read back) [$s10], the in-order probe answered first after malformed requests, clock_pair one-shot when the shape check refuses, 6/6 reply shapes judged: [$s8]"
 else
   log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive/$alive2 [$s3] [$s4] proc=$haveproc decoy=[$s5] ${dsz} bytes; write-fd decoy=[$s6] ${dsz2} bytes; read-fd decoy=[$s7] pipe decoys=[$s10] [$s11] [$s12] control=[$ctl] leak=[$leak] probe's first reply=[$stray]; after malformed=[$s8]; shape check bypassed=[$s9]; shapes $shapes/6"
+  fails=$((fails + 1))
+fi
+
+# F15 (lead review 62430d8bf..b49fb656a MED 4): the timed run's tracer record must SEE a tracer that attaches to the
+# server mid-run and detaches before the end, and a clean run must pass. A dummy server (python, 4 s) and a dummy
+# command (python, 2 s) run under trace.sh's timed_run; in the attach case strace -p attaches to the server 0.6 s in and
+# is detached (SIGINT) 0.6 s later. The window handed to timedrun.py tracer-check is [start + 0.3 s, start + 1.5 s], as
+# a load generator's summary would give it, with its own TracerPid 0.
+f15() { # f15 OUT ATTACH(0|1) -> tracer-check's verdict line; its rc
+  local o=$1 srv t0 att=""
+  python3 -c 'import time; time.sleep(4)' &
+  srv=$!
+  if [ "$2" = 1 ]; then
+    ( sleep 0.6; strace -p "$srv" -o /dev/null 2>"$o.strace.err" & s=$!; sleep 0.6; kill -INT "$s"; wait "$s" ) &
+    att=$!
+  fi
+  timed_run "$o" "$srv" -- python3 -c 'import time; time.sleep(2)' >/dev/null
+  [ -n "$att" ] && wait "$att"
+  kill "$srv" 2>/dev/null
+  wait "$srv" 2>/dev/null
+  t0=$(awk '$1 == "SWEEP" && $2 == "start" {print $3; exit}' "$o.tracer.tsv")
+  python3 -B -c 'import json, sys; t = float(sys.argv[1]); json.dump({"tm0_realtime_s": t + 0.3, "tm1_realtime_s": t + 1.5, "tracerpid_tm0": 0, "tracerpid_tm1": 0}, open(sys.argv[2], "w"))' \
+    "${t0:-0}" "$o.summary.json"
+  python3 -B "$HERE/timedrun.py" tracer-check "$o.tracer.tsv" "$o.summary.json"
+}
+v15c=$(f15 "$OUT/f15-clean" 0); rc15c=$?
+v15a=$(f15 "$OUT/f15-attach" 1); rc15a=$?
+n15=$(grep -c '^TRACED ' "$OUT/f15-attach.tracer.tsv" 2>/dev/null)
+if [ "$rc15c" = 0 ] && [ "$v15c" = ok ] && [ "$rc15a" != 0 ] && [[ $v15a == *"traced during the timed run"* ]] && [ "${n15:-0}" -gt 0 ]; then
+  log "PASS F15-timed-run-tracer-seen: a clean timed run passes the tracer check; a strace attached mid-run and detached before the end is seen in $n15 TRACED line(s) and refused"
+else
+  log "FAIL F15-timed-run-tracer-seen: clean rc=$rc15c [$v15c]; attached rc=$rc15a [$v15a]; TRACED lines ${n15:-0}"
   fails=$((fails + 1))
 fi
 

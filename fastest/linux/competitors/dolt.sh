@@ -47,24 +47,31 @@ seed)
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | my bench
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
   # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each its own autocommitted
-  # statement, then Dolt's documented maintenance: dolt_commit, then dolt_gc.
-  if [ "$AGE" -gt 0 ]; then
-    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | my bench
-    my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
-    # DOLT_GC ends the calling session in sql-server mode, so success is checked by a new connection afterwards; a
-    # failed GC fails the seed (the recorded maintenance must be what ran).
-    my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || true
-    my -N bench -e "SELECT 1" >/dev/null || die "REFUSED: the server did not answer after DOLT_GC ($(tail -1 "$DATA.gc.txt"))"
-    # the session it ends reads as ERROR 2013/2006 (lost connection); any other error is a failed GC
-    grep -viE 'lost connection|gone away|2013|2006' "$DATA.gc.txt" | grep -qi 'error' &&
-      die "REFUSED: DOLT_GC failed: $(tail -1 "$DATA.gc.txt")"
-    echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
-  else
-    echo "maintenance: DOLT_COMMIT seed"
-  fi
+  # statement (AGE=0 pipes an empty stream, whose digest is recorded too), then Dolt's documented maintenance:
+  # dolt_commit, then dolt_gc.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | my bench
+  # The maintenance runs whether or not the parent was aged (lead review 62430d8bf..b49fb656a MED 10: an unaged Dolt
+  # parent used to be measured un-GC'd, unlike PG and SQLite): the age commit (--allow-empty: nothing changed at AGE=0),
+  # then DOLT_GC. The server's GC settings are recorded beside it.
+  my -N bench -e "CALL DOLT_COMMIT('-am', 'age', '--allow-empty')" >/dev/null
+  my -N bench -e "SHOW VARIABLES LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 || echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
+  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
+  # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
+  # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
+  gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
+  gc_log0=$(stat -c %s "$LOG")
+  gcrc=0
+  my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
+  tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
+    die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
+  echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
+  echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)
