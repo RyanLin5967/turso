@@ -481,13 +481,31 @@ def self_test():
                                           "leaf_flushes_completed": 0 if brd else 2800, "voids": voids,
                                           "blkflush_leaf_gate": {"outcome": "not applicable" if brd else "pass"}}})
 
+    SHAS = {"bbload": "b" * 64, "clonebench": "c" * 64, "fastest_profile": "f" * 64}
+
+    def conformance_files(out, kind="match"):
+        """what t3run's build and envchecks stages write: binaries.txt (sha256sum of the package's binaries) and
+        warmup-conformance.json (warmup_conformance.py run --record, review 5 MED 6, 7). kind: match, None (no
+        record), partial (rc 3), badsha (the record names another fastest_profile)"""
+        w(f"{out}/binaries.txt", "sha=x\n" + "".join(f"{v}  {k}\n" for k, v in SHAS.items()))
+        if kind is None:
+            return
+        drv = {k: {"path": f"/dist/{k}", "realpath": f"/dist/{k}", "sha256": v} for k, v in SHAS.items()}
+        if kind == "badsha":
+            drv["fastest_profile"]["sha256"] = "0" * 64
+        rc = 3 if kind == "partial" else 0
+        w(f"{out}/warmup-conformance.json", json.dumps({"rc": rc, "verdict": {0: "PASS", 3: "PARTIAL"}[rc], "cases": 12,
+                                                        "drivers": drv}))
+
     def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop",
              plants=True, plants_fired=True, plp="no", lie=False, cell="ok", void=None, drift="pass", a25_after=300.0,
              rule=RULE, ours_rule=RULE, ours_ops=(200, 200), comp_ops=200, adapter_rc=0, k=1, settle="quiet=yes",
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
-             boundary_bins=None, garbage_v3l=None, v3l_plants_record=None):
+             boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
+             loop="closed"):
         out = os.path.join(root, "out")
+        conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         system = {"ok": "ours", "na": "ours", "compfail": "dolt", "comp": "dolt"}[cell]
         cells = [f"{system}-full-c1-r{i}" for i in range(1, k + 1)]
@@ -528,7 +546,9 @@ def self_test():
                     # timed: None (an uncapped run of comp_ops), or (measured_ops, capped, timedrun's verdict)
                     mo, cap, tv = timed if timed else (comp_ops, False, "ok")
                     w(f"{a1}/result/cells/{cc}/timed/summary.json",
-                      json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}))
+                      json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}
+                                 | ({"warmup_backsteps": backsteps} if backsteps is not None else {})
+                                 | ({"loop": loop} if loop is not None else {})))
                     if tv is not None:
                         w(f"{a1}/result/cells/{cc}/timed.json", json.dumps({"verdict": tv, "ops": comp_ops}))
                 w(f"{a1}/adapter.txt", "")
@@ -712,6 +732,27 @@ def self_test():
          False, lambda s: [r["v3l_pooled_fsync_p50_us"] for r in s["runs"]] == [None, None, 10.0]
          and len(s["normaliser_missing"]) == 2 and "V3L VOID (block 1)" in s["failed_blocks"][0]
          and "V3L VOID (block 2)" in s["failed_blocks"][0] and "block 3" not in s["failed_blocks"][0]),
+        # review 5 MED 6: A23 on the T3 path -- the package's warm-up is creditable only with a three-driver
+        # conformance record (rc 0) bound by sha256 to the binaries it ran, and no competitor claim judged out of time
+        # order (lead ruling DECISIONS 0be36a068b: warmup_backsteps > 0 refuses in BOTH loop modes; loop is reported)
+        ("MED 6: a matching conformance record makes the warm-up creditable", {}, True,
+         lambda s: s.get("warmup_creditable") is True),
+        ("MED 6: no conformance record refuses parity and credit", {"conformance": None}, False,
+         lambda s: s.get("warmup_creditable") is False and any("conformance" in x for x in s["parity_refusals"])
+         and any("A23" in x for x in s.get("loud_owed") or [])),
+        ("MED 6: a PARTIAL record (rc 3) refuses", {"conformance": "partial"}, False,
+         lambda s: s.get("warmup_creditable") is False and any("rc 3" in x for x in s["parity_refusals"])),
+        ("MED 6: a record whose fastest_profile sha256 is not the package's refuses, naming it", {"conformance": "badsha"},
+         False, lambda s: any("fastest_profile" in x and "sha256" in x for x in s["parity_refusals"])),
+        ("MED 6: a competitor timed run with a warm-up backstep refuses", {"cell": "comp", "backsteps": 1}, False,
+         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+        ("MED 6: a backstep refuses in open loop too (loop is only reported)", {"cell": "comp", "backsteps": 2,
+                                                                               "loop": "open"}, False,
+         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+        ("MED 6: a competitor timed run that records no warmup_backsteps refuses", {"cell": "comp", "backsteps": None},
+         False, lambda s: any("backstep" in x for x in s["parity_refusals"])),
+        ("MED 6: a clean competitor run (closed loop, 0 backsteps) passes and reports its loop", {"cell": "comp"}, True,
+         lambda s: s["runs"][0].get("warmup_loops") == ["closed", "closed"]),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:
@@ -730,7 +771,8 @@ def self_test():
             fh.write("xfs\tdolt-full-c1-r1\tdolt\t1\t1\t0\tVALID\n")
         a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
         w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
-        w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300}))
+        w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300,
+                                                                         "warmup_backsteps": 0, "loop": "closed"}))
         # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
         w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300}))
         w(f"{a1}/result/expected-cells.txt", "c1-create\n")
@@ -751,6 +793,7 @@ def self_test():
         fsl = sorted({r["fs"] for r in cells.load(man)})
         w(f"{out}/fslist.txt", " ".join(fsl) + "\n")
         w(f"{out}/warmup.txt", f"warm-up rule {RULE} (cap 1800s)\n")
+        conformance_files(out)
         rows = ["fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid"]
         for fs in fsl:
             plan = cells.plan(man, fs, 20261005)
@@ -764,7 +807,8 @@ def self_test():
                 else:
                     w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
-                                                                              "measured_ops": int(ops)}))
+                                                                              "measured_ops": int(ops),
+                                                                              "warmup_backsteps": 0, "loop": "closed"}))
                     w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops)}))
                     w(f"{a1}/result/expected-cells.txt", "c1\n")
         w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
