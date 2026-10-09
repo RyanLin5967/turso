@@ -275,9 +275,15 @@ def parse_trace_all(text, devices):
             sm = SYSLINE.match(line)
             if sm:
                 t, hw = ts_ns(sm.group("ts"))
-                fm = SYSFD.fullmatch(sm.group("args").strip())  # "fd: 3" or "fd: 0x00000003": hex either way
+                # the tracepoint prints the fd in hex without 0x (measured on the banked traces: the clone fd 17 is
+                # "fd: 11"); a "0x" form parses as hex too. An fd that does not parse is a line that does not parse:
+                # the record refuses (V3 review 12 item 10), never a sync counted as no_fd
+                fm = SYSFD.fullmatch(sm.group("args").strip())
+                if not fm:
+                    probs.append("a syscall line whose fd does not parse: " + line[:160])
+                    continue
                 sysev.append((t, hw, "sys", sm.group("sc"), sm.group("sc"), sm.group("comm"), int(sm.group("pid")),
-                              int(fm.group(1), 16) if fm else None))
+                              int(fm.group(1), 16)))
                 continue
             probs.append("unparsed line: " + line[:160])
             continue
