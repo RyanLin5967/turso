@@ -1497,11 +1497,22 @@ def real_selftest(chk):
             # eleventh review MED 1: the pid's syncs lying wholly inside a window, counted on ANY fd: nosync25's must be
             # 0, and none may lie wholly inside a window on an fd that window's arm does not own (the review's plant: an
             # fsync on fd 7 inside a nosync25 window, which the fd rule alone gives to no window)
+            # [amended at V3 review 12 item 6, disclosed: such a sync is counted in foreign_fd too (a wholly-inside
+            # event on an fd its window's arm does not own has no owning candidate), so the plant is made consistent
+            # (foreign_fd 1) and the one gate is foreign_fd/no_fd == 0; the "wholly inside" counts are descriptive]
             ("an fsync on fd 7 wholly inside a nosync25 window",
              {"report": lambda j: (j["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1),
-                                   j["syscalls"].setdefault("unattributed", {}).update(inside_foreign_fd=1))},
-             "F3:devflush", ["nosync25's windows hold a sync by the probe on some fd",
-                             "a sync by the probe lies wholly inside a window on an fd its arm does not own, or on none"]),
+                                   j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1, inside_foreign_fd=1))},
+             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            # V3 review 12 item 6: a sync on an fd no arm owns at a nosync25 window's EDGE (t0 + 200 ns: its +-500 ns
+            # interval is not wholly inside, so every "inside" count stays 0 and only foreign_fd sees it), a sync
+            # naming no fd, and a report without foreign_fd (a missing count is not a zero)
+            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            ("a sync naming no fd (no_fd 1)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(no_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            ("a report whose unattributed lacks foreign_fd",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
             # eleventh review MED 2: the F1b cross-check refuses without its trace, and compares the probe's sync_fds
             # with the fds strace saw synced INSIDE each arm's timed windows, as sets (setup syncs excluded)
             ("no F1b real-all trace", {"f1b": "absent"}, "F3:devflush",

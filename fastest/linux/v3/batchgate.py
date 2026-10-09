@@ -690,15 +690,24 @@ def _post_batch(d, sha, mod):
         sj["leaf"]["kind"] = "scsi_debug"
     if mod == "short":  # tenth review HIGH 1: every window synced, one short of its own (by fd)
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
+    # [the three eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an
+    # fd its arm does not own is counted in foreign_fd as well, so each plant now carries the foreign_fd/no_fd a real
+    # report would, and the gate is foreign_fd/no_fd == 0]
     if mod == "nosync-anyfd":  # eleventh review MED 1: an fsync on fd 7 (no arm's) wholly inside a nosync25 window
         rep["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1)
-        rep["syscalls"]["unattributed"].update(inside_foreign_fd=1)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
     if mod == "inside-foreign":  # ... a sync on an fd its window's arm does not own, wholly inside an append25 window
         rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
-        rep["syscalls"]["unattributed"].update(inside_foreign_fd=1)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
     if mod == "inside-nofd":  # ... a sync naming no fd, wholly inside an append25 window
         rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
         rep["syscalls"]["unattributed"].update(no_fd=1, inside_no_fd=1)
+    if mod == "foreign-edge":  # V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge: foreign_fd only
+        rep["syscalls"]["unattributed"].update(foreign_fd=1)
+    if mod == "nofd-only":  # ... a sync naming no fd outside every window's interior: no_fd only
+        rep["syscalls"]["unattributed"].update(no_fd=1)
+    if mod == "unattr-nokey":  # ... a report whose unattributed lacks foreign_fd (a missing count is not a zero)
+        rep["syscalls"]["unattributed"].pop("foreign_fd")
     if mod in ("nosync", "wt-nosync"):  # one append25 window with no fsync by the probe
         rep["syscalls"]["arms"]["append25"].update(syncs=4, windows_without_a_sync=1)
     if mod == "wt-mismatch":
@@ -762,6 +771,10 @@ def post_selftest(chk):
              "VOID fsync:", {}),
             ("eleventh review MED 1: a sync naming no fd wholly inside an append25 window", "inside-nofd", "smoke", 3,
              "VOID fsync:", {}),
+            ("V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
+             "foreign-edge", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 6: a sync naming no fd (no_fd 1)", "nofd-only", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 6: a report whose unattributed lacks foreign_fd", "unattr-nokey", "smoke", 3, "VOID fsync:", {}),
             ("MED 3: a write-back loop layer's window without a flush-carrying request", "loopflush", "smoke", 3,
              "VOID flush-carrying:", {}),
             ("A14: a batch declaring PLP bound to a verdict fire-checked without", "plp", "bound", 2, "plp:", {}),

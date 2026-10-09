@@ -807,6 +807,17 @@ def self_test():
     #      cfr2b holds 1 wholly inside (its clone fsync; the directory fsync straddles its end)
     chk("sync windows (MED 1): case (c)'s edge event is not wholly inside nosync25's window -> nosync25 holds 0 on any fd, "
         "cfr2b 1", (swd.get("_inside") or {}).get("nosync25") == 0 and (swd.get("_inside") or {}).get("cfr2b") == 1, swd)
+    # (h) V3 review 12 item 6: an fsync on fd 7 (no arm's) about 200 ns into a nosync25 window, printed at its start: its
+    #     +-500 ns interval straddles the append25/nosync25 boundary, so it is wholly inside NO window and every
+    #     "inside" count stays 0; only foreign_fd sees it, which is why check and post gate foreign_fd/no_fd == 0
+    hw = [(1000000, 1100000, "append25", 0), (1100010, 1200000, "nosync25", 0)]
+    he, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050", fd=3), sev("v3floor", 99, "0.001100", fd=7)])
+                            + "\n", devs)[1:], None
+    swh = swin(he[0], hw, 99)
+    chk("sync windows (review 12 item 6): an unowned-fd sync at a nosync25 window's edge -> foreign_fd 1, every inside "
+        "count 0 (so only a foreign_fd gate can see it)", (swh.get("_unattributed") or {}).get("foreign_fd") == 1
+        and (swh.get("_unattributed") or {}).get("inside_foreign_fd") == 0 and (swh.get("_inside") or {}).get("nosync25") == 0
+        and (swh.get("nosync25") or {}).get("syncs") == 0, swh)
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
