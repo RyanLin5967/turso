@@ -148,7 +148,7 @@ jobs:
           rc=0; dist/fastest_profile --dir "$d/async" --class async > dist/smoke-async.txt || rc=$?
           cat dist/smoke-async.txt
           [ $rc -eq 4 ] && grep -q '^NOT AVAILABLE' dist/smoke-async.txt || { echo "async class: rc=$rc, expected the rc 4 refusal"; exit 1; }
-      - name: The driver's own contract (exact --ops-total split, the warm-up rule kept; fourth lane review MED 6)
+      - name: The driver's own contract (exact --ops-total split, the warm-up rule kept; fourth lane review MED 6, LOW 14)
         # results, not exit codes: driver_contract.py checks each summary.json against the asked T, C and rule, with
         # rules whose outcome is forced (1000000:0:2 must run to MAX_S; 10:0:30 must stop on its ops), so a driver
         # that ignores OPS, swaps S and MAX_S, stops at once or splits T into T+1 fails here
@@ -170,6 +170,14 @@ jobs:
           refuse inf --class full --warmup 1000:inf:inf
           refuse zero-max --class full --warmup 10:0:0
           echo "driver contract: 2 records kept, 6 refusals refused"
+          # one warm-up rule for every driver (fourth lane review LOW 14): the driver replays bbload's OPS:S:MAX_S rule
+          # on the shared cases. bbload and clonebench are macOS builds, so here the verdict can only be PARTIAL (rc 3:
+          # every case matches, not all three drivers given); the three-driver run is on the Mac
+          W=fastest/linux/gates/warmup_conformance.py
+          python3 -B $W self-test | tail -1
+          rc=0; python3 -B $W run --fastest-profile dist/fastest_profile > dist/warmup-conformance.txt || rc=$?
+          cat dist/warmup-conformance.txt
+          [ $rc -eq 3 ] || { echo "warm-up conformance: rc $rc, want 3 (PARTIAL, every case matching)"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: engine-release-${{ matrix.runner }}

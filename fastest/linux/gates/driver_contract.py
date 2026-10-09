@@ -5,9 +5,11 @@
         ops_total == ops_total_asked == T, ops_by_client sums to T and equals the exact split (T / C, plus one for the
         clients whose id is below T % C) or BY_CLIENT (a comma list) when given, ops_per_client null unless the split
         is even, warmup_per_client null, warmup_rule == RULE, and the warm-up record keeps RULE (OPS:S:MAX_S):
-          - stop_secs >= min(S, MAX_S) (the main thread polls every 20 ms; no early stop),
-          - stop_secs < MAX_S + SLACK (never past MAX_S by more than a poll and a scheduling delay),
+          - stop_secs >= min(S, MAX_S) (the stop is decided at a claim, by bbload's rule; no early stop),
+          - stop_secs < MAX_S + SLACK (never past MAX_S by more than the cycles in flight and a scheduling delay),
           - stop_secs < MAX_S implies ops_at_stop >= OPS (it stopped early only because both minimums held),
+          - capped is a bool (bbload's warmup_cap_applied); ops_at_stop < OPS implies capped, and capped implies
+            stop_secs >= MAX_S (fourth lane review LOW 14: bbload's OPS:S:MAX_S rule is the definition),
           - drain_secs >= 0, secs == stop_secs + drain_secs (to print precision), ops >= ops_at_stop.
   driver_contract.py self-test                                  the checker on synthetic records; exit 0 iff all pass
 
@@ -18,7 +20,7 @@ swaps S and MAX_S, stops at once, or splits T into T+1 ops fails the job, not on
 import json
 import sys
 
-SLACK = 0.5  # seconds past MAX_S a stop may land: one 20 ms poll plus a loaded runner's scheduling delay
+SLACK = 0.5  # seconds past MAX_S a stop may land: the next claim after a cycle in flight, plus a loaded runner's delay
 
 
 def split(t, c):
@@ -58,24 +60,33 @@ def check(j, t, c, rule, by_client=None):
         bad.append(f"stopped at {st} s, before MAX_S {m}, with {oa} ops < OPS {ops}")
     if dr < 0 or abs(se - (st + dr)) > 2e-3 or ot < oa:
         bad.append(f"drain {dr}, secs {se} vs stop + drain {st + dr}, ops {ot} vs ops_at_stop {oa}")
+    cap = w.get("capped")
+    if not isinstance(cap, bool):
+        bad.append(f"warmup.capped {cap!r}, want true or false (bbload's warmup_cap_applied)")
+    else:
+        if oa < ops and not cap:
+            bad.append(f"stopped with {oa} ops < OPS {ops} and not capped: only MAX_S can end it there")
+        if cap and st < m - 1e-3:
+            bad.append(f"capped at {st} s, before MAX_S {m}")
     return bad
 
 
 def self_test():
-    def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=5010, by=None, per="auto", wpc=None):
+    def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=5010, by=None, per="auto", wpc=None,
+            capped=True):
         by = by if by is not None else split(t, c)
         return {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
                 "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
                 "warmup_per_client": wpc, "warmup_rule": rule,
                 "warmup": {"rule": rule, "ops_at_stop": oa, "ops": ot, "stop_secs": st, "drain_secs": dr,
-                           "secs": round(st + dr, 3)}}
+                           "secs": round(st + dr, 3), "capped": capped}}
 
     cases = [
         ("a run to MAX_S with T=33 over 4 clients keeps the contract", check(rec(), 33, 4, "1000000:0:2") == []),
         ("the split is [9, 8, 8, 8]", split(33, 4) == [9, 8, 8, 8]),
         ("T=20 over 16 clients is four at 2", split(20, 16) == [2] * 4 + [1] * 12),
         ("an early stop on ops (10:0:30) keeps the contract",
-         check(rec(rule="10:0:30", st=0.04, oa=12, ot=40), 33, 4, "10:0:30") == []),
+         check(rec(rule="10:0:30", st=0.04, oa=12, ot=40, capped=False), 33, 4, "10:0:30") == []),
         ("mutant: OPS ignored (stops at S=0 with 0 of 10^6 ops)",
          check(rec(st=0.02, oa=3), 33, 4, "1000000:0:2") != []),
         ("mutant: S and MAX_S swapped (stops at 0 with MAX_S 2)", check(rec(st=0.0, oa=0), 33, 4, "1000000:0:2") != []),
@@ -90,6 +101,14 @@ def self_test():
                                              "1000000:0:2") != []),
         ("an incomplete warm-up record fails", check(rec() | {"warmup": {"rule": "1000000:0:2"}}, 33, 4,
                                                      "1000000:0:2") != []),
+        # fourth lane review LOW 14: the record says whether MAX_S ended it, as bbload's warmup_cap_applied does
+        ("LOW 14: a warm-up record with no capped field fails",
+         check(rec() | {"warmup": {k: v for k, v in rec()["warmup"].items() if k != "capped"}}, 33, 4,
+               "1000000:0:2") != []),
+        ("LOW 14: capped as a string fails", check(rec(capped="true"), 33, 4, "1000000:0:2") != []),
+        ("LOW 14: a stop below OPS that says not capped fails", check(rec(capped=False), 33, 4, "1000000:0:2") != []),
+        ("LOW 14: capped before MAX_S fails",
+         check(rec(rule="10:0:30", st=0.04, oa=12, ot=40, capped=True), 33, 4, "10:0:30") != []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
