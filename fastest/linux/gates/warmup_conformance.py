@@ -27,8 +27,11 @@ claim before the stop is a warm-up op, so warm_ops == stop_at.
 
 The expected values below are derived by hand from the rule's text, never from running a driver.
 """
+import hashlib
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -110,6 +113,7 @@ def run(drivers):
 
 
 FAKE = r'''#!/usr/bin/env python3
+# fake replayer {name}
 import sys
 ops, s, m = sys.argv[2].split(":")
 ops, s_ns, m_ns = int(ops), {conv}(float(s) * 1e9), {conv}(float(m) * 1e9)
@@ -126,17 +130,35 @@ print(f"stop_at=none warm_ops={{claimed}} capped=none")
 '''
 
 
+def _safe(f):
+    try:
+        return bool(f())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def fake(d, name, conv="int", cmp=">=", extra=0, capped_expr="0 if done else 1"):
     p = os.path.join(d, name)
     with open(p, "w") as f:
-        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr))
+        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr, name=name))
     os.chmod(p, 0o755)
     return p
 
 
 def self_test():
     d = tempfile.mkdtemp(prefix="warmup-conformance-")
+    try:
+        return _self_test(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)  # review 5 LOW 13: the directory leaked
+
+
+def _self_test(d):
+    # TEST EDIT, flagged (review 5 MED 7): the cases below gave ONE file under several roles, which is the hole MED 7
+    # closes (the same binary under all three roles gave rc 0); each role now gets its own correct fake (the files
+    # differ by their name line), and every expectation is unchanged
     good = fake(d, "good")
+    good_b, good_c = fake(d, "good-bbload"), fake(d, "good-clonebench")
     wrong = {
         "strict time (> for >=)": (fake(d, "gt", cmp=">"), "edge: exactly OPS claimed and exactly S elapsed"),
         "capped wins over done": (fake(d, "capwins", capped_expr="1 if capped else 0"),
@@ -145,12 +167,31 @@ def self_test():
         "rounding, not truncation": (fake(d, "round", conv="round"), "truncation"),
     }
     cases = []
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good})
+    cases.append(("three correct fakes, one per role, pass (rc 0)", rc == 0, rep[-1]))
+    # review 5 MED 7: a verdict is about three binaries, so one file (or one byte-identical copy) under two roles refuses
     rc, rep = run({"bbload": good, "clonebench": good, "fastest_profile": good})
-    cases.append(("the correct fake, given as all three drivers, passes (rc 0)", rc == 0, rep[-1]))
+    cases.append(("MED 7: one file under all three roles is REFUSED (rc 2)", rc == 2 and "same" in rep[-1], rep[-1]))
+    twin = os.path.join(d, "twin")
+    shutil.copyfile(good, twin)
+    os.chmod(twin, 0o755)
+    rc, rep = run({"bbload": good_b, "clonebench": twin, "fastest_profile": good})
+    cases.append(("MED 7: a byte-identical copy under a second role is REFUSED (rc 2)", rc == 2 and "same" in rep[-1],
+                  rep[-1]))
+    rec = os.path.join(d, "record.json")
+
+    def rec_ok():
+        run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good}, record=rec)
+        r = json.load(open(rec))
+        return (r["rc"] == 0 and r["verdict"] == "PASS" and r["cases"] == len(CASES)
+                and all(r["drivers"][role]["sha256"] == hashlib.sha256(open(p, "rb").read()).hexdigest()
+                        and r["drivers"][role]["realpath"] == os.path.realpath(p)
+                        for role, p in (("bbload", good_b), ("clonebench", good_c), ("fastest_profile", good))))
+    cases.append(("MED 7: --record writes the rc, the verdict and each role's realpath and sha256", _safe(rec_ok), ""))
     rc, rep = run({"fastest_profile": good})
     cases.append(("one correct driver alone is PARTIAL (rc 3), never a pass", rc == 3, rep[-1]))
     for what, (p, case) in wrong.items():
-        rc, rep = run({"bbload": good, "clonebench": good, "fastest_profile": p})
+        rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": p})
         named = any(ln.startswith("warmup conformance FAIL: fastest_profile: " + case) for ln in rep)
         cases.append((f"a wrong fake ({what}) fails (rc 1) on its case {case!r}", rc == 1 and named, rep[-1]))
     rc, rep = run({"fastest_profile": os.path.join(d, "absent")})
