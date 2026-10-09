@@ -259,6 +259,16 @@ pub(super) struct OperatorEncodeInfo {
     which: EncodeArg,
 }
 
+/// The column an operand meets, for mutant `operand_keeps_column_typmod` alone: built in test
+/// builds only (engine review 16 #22: a `Column` clone per prepare that production never read).
+fn encode_info(column: &Column, type_def: &Arc<TypeDef>, which: EncodeArg) -> Option<OperatorEncodeInfo> {
+    cfg!(test).then(|| OperatorEncodeInfo {
+        column: column.clone(),
+        type_def: type_def.clone(),
+        which,
+    })
+}
+
 /// Result of resolving a custom type operator. May be a direct match or derived
 /// from `<` and `=` operators (e.g. `>` is derived as swap_args + `<`).
 pub(super) struct ResolvedOperator {
@@ -348,11 +358,7 @@ pub(super) fn find_custom_type_operator(
                     func_name,
                     swap_args,
                     negate,
-                    encode_info: Some(OperatorEncodeInfo {
-                        column: lhs.column.clone(),
-                        type_def: lhs.type_def.clone(),
-                        which: EncodeArg::Second,
-                    }),
+                    encode_info: encode_info(&lhs.column, &lhs.type_def, EncodeArg::Second),
                 });
             }
         }
@@ -366,11 +372,7 @@ pub(super) fn find_custom_type_operator(
                     func_name,
                     swap_args,
                     negate,
-                    encode_info: Some(OperatorEncodeInfo {
-                        column: rhs.column.clone(),
-                        type_def: rhs.type_def.clone(),
-                        which: EncodeArg::First,
-                    }),
+                    encode_info: encode_info(&rhs.column, &rhs.type_def, EncodeArg::First),
                 });
             }
         }
