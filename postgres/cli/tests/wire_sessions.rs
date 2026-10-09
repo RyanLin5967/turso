@@ -4787,6 +4787,110 @@ fn a_parameter_is_typed_through_views_subqueries_and_stars() {
     );
 }
 
+/// An undeclared parameter compared with a column of a FROM item the walk did not model is typed
+/// from that item, as PostgreSQL types it (OIDs from PostgreSQL's rules; a PG18 record_pg.sh
+/// recording is owed): a scalar subquery's FROM holding a derived table (a, c) or a join (b), a
+/// function in FROM at the same level (with and without a column alias), a function whose column
+/// shadows an outer one in an EXISTS, and a `*` over a function. A scalar subquery's FROM kept only
+/// its tables and a function in FROM added nothing to its level, so $1 was typed from the outer p's
+/// column of the name (a: text where PostgreSQL says int8; b: int4 where it says text, and the
+/// query failed), refused 42P18 with no such outer column (c), or fell to text (wire review 14 item
+/// 2: what 85195930a claimed to have closed). Every case is checked before the test fails.
+#[test]
+fn a_parameter_is_typed_by_every_kind_of_from_item() {
+    const INT8: u32 = 20;
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    let dir = Scratch::new("inferfromitems");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, n INT, name TEXT)")
+        .ok("p");
+    a.q("INSERT INTO p VALUES (1, 5, 'abc'), (2, 7, 'def'), (3, 9, 'ghi')")
+        .ok("rows");
+    a.q("CREATE VIEW d AS SELECT count(*) AS c FROM p")
+        .ok("view d");
+    a.q("CREATE VIEW v AS SELECT id, name AS n FROM p")
+        .ok("view v");
+    let all = vec!["1", "2", "3"];
+    let cases: Vec<(&str, u32, &str, Vec<&str>)> = vec![
+        (
+            "SELECT id FROM p WHERE (SELECT name FROM (SELECT count(*) AS name FROM p) s) > $1 \
+             ORDER BY id",
+            INT8,
+            "2",
+            all.clone(),
+        ),
+        (
+            "SELECT id FROM p WHERE (SELECT n FROM v JOIN d ON true ORDER BY v.id LIMIT 1) = $1 \
+             ORDER BY id",
+            TEXT,
+            "abc",
+            all.clone(),
+        ),
+        (
+            "SELECT id FROM p WHERE (SELECT c FROM (SELECT count(*) AS c FROM p) s) > $1 \
+             ORDER BY id",
+            INT8,
+            "2",
+            all.clone(),
+        ),
+        (
+            "SELECT g FROM generate_series(1, 10) AS g WHERE g > $1 ORDER BY g",
+            INT4,
+            "8",
+            vec!["9", "10"],
+        ),
+        (
+            "SELECT x FROM generate_series(1, 10) AS g(x) WHERE x > $1 ORDER BY x",
+            INT4,
+            "8",
+            vec!["9", "10"],
+        ),
+        (
+            "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM generate_series(1, 3) AS name \
+             WHERE name = $1) ORDER BY id",
+            INT4,
+            "2",
+            all.clone(),
+        ),
+        (
+            "SELECT c FROM (SELECT * FROM generate_series(1, 3) AS c) s WHERE c > $1 ORDER BY c",
+            INT4,
+            "1",
+            vec!["2", "3"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, oid, value, want) in cases {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(vec![oid]) {
+            wrong.push(format!(
+                "{sql}: Describe {:?} {:?}, want [{oid}]",
+                r.params, r.error
+            ));
+        }
+        let r = a.xt(sql, &[(0, 0, value.as_bytes())]);
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect();
+        if r.error.is_some() || got != want {
+            wrong.push(format!(
+                "{sql} with {value}: {got:?} {:?}, want {want:?}",
+                r.error
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A circular view is answered with an error and the server serves on. The inference walk opened a
 /// view by walking its query, which reached the view again: with no visited set it recursed until
 /// the session thread's 8 MiB stack overflowed, which aborts the process, every session with it,
