@@ -227,6 +227,23 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     }
 }
 
+/// An argument of numeric's operator functions as a decimal (engine review 16 #21, review 20
+/// HIGH 2). Their operands reach them as user-facing values (a numeric column read decoded, as
+/// text; the other operand as given: `emit_custom_type_operator`), so a blob can only be an operand
+/// given as one, which numeric's INSERT refuses (`numeric_encode`). It is refused here with that
+/// same error rather than read as the type's internal encoding, which made `x = <blob>` match a
+/// value no INSERT could have stored. The sort comparator still reads stored encodings
+/// (`value_to_bigdecimal`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
+/// encoding, as before.
+fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
+    if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
+        return Err(LimboError::Constraint(format!(
+            "invalid input for type numeric: \"{val}\""
+        )));
+    }
+    value_to_bigdecimal(val)
+}
+
 /// Create a sort comparator closure from a SortComparatorType enum.
 fn make_sort_comparator(
     cmp_type: &SortComparatorType,
@@ -10543,8 +10560,8 @@ pub fn op_function(
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -10579,8 +10596,8 @@ pub fn op_function(
                 match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
