@@ -4556,7 +4556,8 @@ mod tests {
     }
 
     /// A bytea parameter's hex is read byte by byte: a multi-byte character among the digits is
-    /// an invalid digit (22P02, as PostgreSQL's byteain answers), never a slice inside it.
+    /// an invalid digit (22023, as PostgreSQL's byteain answers: measured on 17.11 by wire review
+    /// 13 item 8, which found 22P02 asserted here), never a slice inside it.
     /// `&hex[i..i + 2]` sliced a &str inside `é` and panicked, and under the release build's
     /// panic=abort one client's Bind ended every session (wire review 9 item 5).
     #[test]
@@ -4572,7 +4573,7 @@ mod tests {
                 Err(PgWireError::UserError(info)) => info,
                 other => panic!("{text:?}: {other:?}"),
             };
-            assert_eq!(e.code, "22P02", "{text:?}: {e:?}");
+            assert_eq!(e.code, "22023", "{text:?}: {e:?}");
         }
         assert_eq!(
             pg_bytes_to_value(b"\\x00Ff", &Type::BYTEA).ok(),
