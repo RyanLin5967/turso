@@ -145,12 +145,13 @@ def expect(rows, updates=0, seed=1):
 
 
 def selftest():
-    bad = 0
+    bad = n = 0
 
-    def ok(name, cond):
-        nonlocal bad
+    def ok(name, cond):  # counts every case it is given (LOW 27: the total used to be a hard-coded number)
+        nonlocal bad, n
         print(("PASS" if cond else "FAIL"), name)
         bad += not cond
+        n += 1
 
     a = list(sql_lines(2500))
     ok("parent SQL: CREATE then 3 INSERT batches for 2500 rows", len(a) == 4 and a[0].startswith("CREATE TABLE t ("))
@@ -179,17 +180,34 @@ def selftest():
     ok("row hash = what three engines read back after the same stream", row_hash(2500, 300, 1) == 21429546430)
     ok("expect() = count|sum|row_hash", expect(2500, 300, 1) == "2500|131727070|21429546430")
     sd = stream_digests(2500, 300, 1)
-    ok("stream digests: the parent's is the long-pinned 351af3d4... at 10000 rows",
-       stream_digests(10000)["sql"] == "351af3d4e0eca98b1ccdda69b548d7337357b0cba56fc4851fb928cf85e1f26a")
+    # MED 11: the table's key is INTEGER PRIMARY KEY, a rowid alias in SQLite (INT PRIMARY KEY gave B1's parent an
+    # extra sqlite_autoindex_t_1 that every first write searched); every other byte of the parent stream is still the
+    # generator's of 62430d8bf, pinned (LOW 17) by putting the old CREATE line back: 351af3d4... at 10000 rows
+    OLD_CREATE = "CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+    s10 = list(sql_lines(10000))
+    ok("the parent's CREATE: id INTEGER PRIMARY KEY",
+       s10[0] == "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);")
+    ok("the rest of the parent stream is 62430d8bf's (351af3d4... with the old CREATE line)",
+       hashlib.sha256("".join(ln + "\n" for ln in [OLD_CREATE] + s10[1:]).encode()).hexdigest() ==
+       "351af3d4e0eca98b1ccdda69b548d7337357b0cba56fc4851fb928cf85e1f26a")
     ok("stream digests: an empty aging stream hashes as empty",
        stream_digests(2500, 0, 1)["age"] == hashlib.sha256(b"").hexdigest())
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.executescript("\n".join(list(sql_lines(2500)) + list(age_lines(2500, 300, 1))))
+    ok("SQLite: no sqlite_autoindex_t_1 (id is the rowid)",
+       not db.execute("SELECT name FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%'").fetchall())
+    plan = " ".join(str(r[-1]) for r in db.execute("EXPLAIN QUERY PLAN UPDATE t SET v = v + 1 WHERE id = 5"))
+    ok(f"SQLite: the M1 statement searches t by its INTEGER PRIMARY KEY ({plan})", "INTEGER PRIMARY KEY" in plan)
+    cnt, sv = db.execute("SELECT count(*), sum(v) FROM t").fetchone()
+    rh = sum(hash_row(i, v, p) for i, v, p in db.execute("SELECT id, v, pad FROM t"))
+    ok("SQLite read back the generator's triple", f"{cnt}|{sv}|{rh}" == expect(2500, 300, 1))
+    db.close()
     ok("stream digests differ between aged and fresh", sd["age"] != stream_digests(2500, 0, 1)["age"])
-    n_extra = 5
     # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
     ok("aged sum(v) at the CI default = what three servers read back", aged_sum(10000, 200, 1) == 89963830)
-    n = 15 + n_extra
     print(f"gen_seed selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
