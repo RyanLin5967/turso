@@ -354,6 +354,23 @@ def self_test():
     rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
     cases.append(("review L3: no base (syscalls-vs-base and instructions not evaluated) makes regression_green false",
                   not regression_green(rows)))
+    # review 7a (T3 review of 4bdb3a042..2d42982a0): the two cases above pass base=None, so both regression premises
+    # are already unevaluated and the mutants `return evaluated` and "drop the syscalls-vs-base conjunct" passed all 19.
+    two = arm_of(trace(2), 20)
+    rows = gates({"full-snap-c1": two}, {"full-snap-c1": arm_of(trace(2), 20)}, budget, None)
+    v = {g: v for g, _, _, v in rows}
+    cases.append(("review 7a: base == head, both regression premises PASS, and a flush-budget FAIL still makes "
+                  "regression_green false",
+                  v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") == "PASS"
+                  and v.get("budget-flush/full-snap-c1") == "FAIL" and not regression_green(rows)))
+    nostrace = arm_of(trace(1), 10)
+    del nostrace["strace"]
+    rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": nostrace}, budget, None)
+    v = {g: v for g, _, _, v in rows}
+    cases.append(("review 7a: instructions PASS against an in-job base whose strace run failed, syscalls-vs-base not "
+                  "PASS, nothing FAILs: regression_green false",
+                  v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") != "PASS"
+                  and "FAIL" not in v.values() and not regression_green(rows)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
