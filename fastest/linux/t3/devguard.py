@@ -3,18 +3,30 @@
 denylist, and a partition of the root disk or a symlink to /dev/ram0 passed it).
 
   devguard.py check DEVICE     exit 0 and print the resolved disk when every rule holds; else exit 2 with every reason
+  devguard.py rootdisk         print the top-level disk(s) under "/", one per line, and exit 0; when it cannot tell,
+                               exit 2 with the reason on stderr. t3run fires `check` on each disk it prints, and
+                               requires exit 2 with the root rule's own text
   devguard.py self-test        the rules on synthetic lsblk trees; exit 0 iff every case passes
 
 Rules (all must hold):
+  - it is not a disk that holds "/", and it does not sit on one (T3 runner review MED 13). The walk starts at the one
+    device lsblk shows mounted at "/". It climbs lsblk's PKNAME chain through partitions, LVM, dm and md (an md or dm
+    device with several parents climbs all of them) to the top-level ancestors, and each one must be TYPE disk. So
+    an LVM or md root names the disk(s) under it, not a partition, and a spare partition of a root disk is refused
+    by this rule as well as by the allowlist. When the walk cannot tell, every device is refused. It cannot tell
+    when nothing or several devices are at "/", when a top-level ancestor is not a disk, when lsblk prints no KNAME
+    or PKNAME, or when a PKNAME is not the device lsblk nests the node under. This rule is evaluated first, so no
+    rule that returns early can skip it;
   - DEVICE resolves (symlinks followed) to /dev/<name> with name a whole NVMe namespace (nvmeXnY), SCSI disk (sdX) or
     virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem or anything else is refused);
   - no partition or holder of it is mounted or in use: lsblk MOUNTPOINTS anywhere in its tree; every descendant is a
     bare partition (an LVM volume, md array, crypt or dm child refuses); the disk's AND each partition's
     /sys/block/<disk>/<part>/holders are empty; and an exclusive open (O_EXCL) of the disk and of each partition
     succeeds, so nothing in the kernel claims them (lane review MED 5; needs root, so t3run runs it under sudo -n);
-  - it is not the disk that holds "/" (compared by disk, so a spare partition of the root disk cannot pass);
   - it is not a native-multipath NVMe head (/sys/block/<name>/multipath non-empty): its flush counter may live on the
     path devices, which V3L does not read (stated blind spot, refused rather than guessed).
+Stated blind spot of the root rule: "/" is found only through lsblk's MOUNTPOINTS. A root that lsblk does not list
+(overlay, NFS, tmpfs) cannot be told apart, so every device is refused and none passes.
 """
 import json
 import os
@@ -23,6 +35,117 @@ import subprocess
 import sys
 
 ALLOWED = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+)$")
+# KNAME and PKNAME carry the walk (PKNAME names the parent's KERNEL name: dm-0, not the mapper name)
+LSBLK = ["lsblk", "-J", "-o", "NAME,KNAME,PKNAME,TYPE,MOUNTPOINTS"]
+
+
+class CannotTell(Exception):
+    """the root walk cannot name the disk(s) under "/"; every caller refuses rather than guesses"""
+
+
+def lsblk_text():
+    try:
+        out = subprocess.run(LSBLK, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise CannotTell(f"lsblk did not run: {e}")
+    if out.returncode != 0:
+        raise CannotTell(f"lsblk failed: {out.stderr.strip()[:200]}")
+    return out.stdout
+
+
+def parse_lsblk(text):
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        raise CannotTell(f"lsblk output is not JSON: {text.strip()[:200]!r}")
+    devices = doc.get("blockdevices") if isinstance(doc, dict) else None
+    if not isinstance(devices, list):
+        raise CannotTell("lsblk JSON has no blockdevices list")
+    return devices
+
+
+def lsblk_graph(devices):
+    """(kname -> set of PKNAMEs, kname -> TYPE, knames mounted at "/") over every place lsblk's tree prints a node.
+    An md or dm device with several parents is printed under each one, so it has several PKNAMEs. Raises CannotTell
+    when a node lacks KNAME or PKNAME, or when its PKNAME is not the device it is nested under: the two would be
+    two answers to the same question."""
+    parents, types, at_root = {}, {}, set()
+
+    def walk(node, under):
+        if not isinstance(node, dict) or not node.get("kname") or "pkname" not in node:
+            raise CannotTell(f"lsblk node {node.get('name') if isinstance(node, dict) else node!r} lacks KNAME or PKNAME")
+        k = node["kname"]
+        if node["pkname"] != under:
+            raise CannotTell(f"{k} has PKNAME {node['pkname']!r} but sits under {under!r}")
+        parents.setdefault(k, set())
+        if under:
+            parents[k].add(under)
+        types[k] = node.get("type")
+        if "/" in (node.get("mountpoints") or []):
+            at_root.add(k)
+        for c in node.get("children") or []:
+            walk(c, k)
+
+    for d in devices:
+        walk(d, None)
+    return parents, types, at_root
+
+
+def top_ancestors(parents, kname):
+    """the top-level ancestors of KNAME up the PKNAME chain: KNAME itself when it is top-level, none when lsblk
+    does not list it"""
+    seen, todo, tops = set(), [kname], set()
+    while todo:
+        k = todo.pop()
+        if k in seen or k not in parents:
+            continue
+        seen.add(k)
+        if parents[k]:
+            todo += sorted(parents[k])
+        else:
+            tops.add(k)
+    return tops
+
+
+def root_disks(devices):
+    """(the top-level disk(s) under "/", sorted; the device mounted at "/"; the PKNAME graph), or raise CannotTell"""
+    parents, types, at_root = lsblk_graph(devices)
+    if not at_root:
+        raise CannotTell("no device in lsblk is mounted at /")
+    if len(at_root) > 1:
+        raise CannotTell(f"several devices are mounted at / ({sorted(at_root)})")
+    src = next(iter(at_root))
+    disks = sorted(top_ancestors(parents, src))
+    if not disks:
+        raise CannotTell(f"/ is on {src}, which has no top-level ancestor in lsblk")
+    for d in disks:
+        if types.get(d) != "disk":
+            raise CannotTell(f"/ is on {src}, whose top-level ancestor {d} has TYPE {types.get(d)!r}, not disk")
+    return disks, src, parents
+
+
+def root_rule(name, devices):
+    """the root rule's reasons for NAME: it is a disk that holds "/", or it sits on one (compared by disk)"""
+    try:
+        disks, src, parents = root_disks(devices)
+    except CannotTell as e:
+        return [f"cannot tell which disk holds / ({e}): refused rather than guessed"]
+    if name in disks:
+        return [f"{name} holds the root filesystem (/ is on {src}, walked up lsblk's PKNAME chain)"]
+    # a top-level disk is its own top-level ancestor: excluding NAME keeps this branch from standing in for the one
+    # above, so disabling that one is caught (MED 13's mutant, planted on this code)
+    return [f"{name} is on {d}, which holds the root filesystem (/ is on {src})"
+            for d in sorted((top_ancestors(parents, name) & set(disks)) - {name})]
+
+
+def rootdisk_report(text=None):
+    """the rootdisk subcommand on `lsblk -J` output TEXT (run lsblk when None; injectable so the self-test feeds
+    fixtures): (0, [disk, ...]) or (2, [why it cannot tell])"""
+    try:
+        disks, _, _ = root_disks(parse_lsblk(lsblk_text() if text is None else text))
+    except CannotTell as e:
+        return 2, [f"cannot tell which disk holds /: {e}"]
+    return 0, disks
 
 
 def tree_mounts(node):
@@ -30,13 +153,6 @@ def tree_mounts(node):
     for c in node.get("children") or []:
         m += tree_mounts(c)
     return m
-
-
-def root_disk(devices):
-    for d in devices:
-        if "/" in tree_mounts(d):
-            return d["name"]
-    return None
 
 
 def descendants(node):
@@ -48,7 +164,9 @@ def descendants(node):
 
 
 def problems(name, devices, holders, multipath, part_holders=None, busy=None):
-    bad = []
+    # the root rule first, so the early return below cannot skip it (MED 13: a partition under an LVM root was
+    # refused only as "not top-level", and the root rule never ran)
+    bad = root_rule(name, devices)
     if not ALLOWED.match(name or ""):
         bad.append(f"{name!r} is not an NVMe namespace, SCSI disk or virtio disk (allowlist nvmeXnY, sdX, vdX)")
     node = next((d for d in devices if d.get("name") == name), None)
@@ -72,11 +190,6 @@ def problems(name, devices, holders, multipath, part_holders=None, busy=None):
         bad.append(f"{dev} cannot be opened exclusively ({why}): the kernel claims it")
     if multipath:
         bad.append(f"{name} is a multipath NVMe head ({multipath}): its flush counter may be on the path devices")
-    rd = root_disk(devices)
-    if rd is None:
-        bad.append("cannot tell which disk holds / (refused rather than guessed)")
-    elif rd == name:
-        bad.append(f"{name} holds the root filesystem")
     return bad
 
 
@@ -85,10 +198,10 @@ def check(dev):
     name = os.path.basename(real)
     if not real.startswith("/dev/") or not os.path.exists(real):
         return name, [f"{dev} does not resolve to a device node under /dev ({real})"]
-    out = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE,MOUNTPOINTS"], capture_output=True, text=True, timeout=60)
-    if out.returncode != 0:
-        return name, [f"lsblk failed: {out.stderr.strip()[:200]}"]
-    devices = json.loads(out.stdout).get("blockdevices") or []
+    try:
+        devices = parse_lsblk(lsblk_text())
+    except CannotTell as e:
+        return name, [str(e)]
     hp = f"/sys/block/{name}/holders"
     holders = sorted(os.listdir(hp)) if os.path.isdir(hp) else []
     mp = f"/sys/block/{name}/multipath"
@@ -243,6 +356,11 @@ def self_test():
 def main(a):
     if a[1:] == ["self-test"]:
         return self_test()
+    if a[1:] == ["rootdisk"]:
+        rc, out = rootdisk_report()
+        for line in out:
+            print(line if rc == 0 else f"devguard: rootdisk: {line}", file=sys.stdout if rc == 0 else sys.stderr)
+        return rc
     if len(a) == 3 and a[1] == "check":
         name, bad = check(a[2])
         if bad:

@@ -572,11 +572,19 @@ selftests() {
     python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
   done
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
-  local rd; rd=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1)
-  [ -n "$rd" ] || { echo "selftests: cannot tell the root disk, so devguard's root refusal cannot be fired"; return 1; }
-  if sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$rd" > "$OUT/devguard-root.txt" 2>&1; then
-    echo "devguard ALLOWED the root disk /dev/$rd"; return 1
-  fi
+  local rd d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
+    { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }
+  [ -n "$rd" ] || { echo "selftests: devguard rootdisk printed no disk"; return 1; }
+  # every disk under / (an md root has several): exit 2 AND the root rule's own text for that disk. Any other exit (a
+  # sudo or Python crash), or another rule refusing alone, is not this rule firing (T3 runner review MED 13)
+  for d in $rd; do
+    sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$d" > "$OUT/devguard-root-$d.txt" 2>&1
+    rc=$?
+    if [ $rc != 2 ] || ! grep -qF "REFUSED: $d holds the root filesystem" "$OUT/devguard-root-$d.txt"; then
+      cat "$OUT/devguard-root-$d.txt"
+      echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$d holds the root filesystem'; got exit $rc"; return 1
+    fi
+  done
   fcenv_check
 }
 stage selftests selftests
