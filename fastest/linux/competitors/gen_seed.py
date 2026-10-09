@@ -186,13 +186,16 @@ def selftest():
 
     a = list(sql_lines(2500))
     ok("parent SQL: CREATE then 3 INSERT batches for 2500 rows", len(a) == 4 and a[0].startswith("CREATE TABLE t ("))
-    ok("parent SQL is deterministic", a == list(sql_lines(2500)))
-    ok("rows 1..2500, each once", sum(x.count("),(") + 1 for x in a[1:]) == 2500 if len(a) == 4 else False)
+    # LOW 17: the determinism cases have a non-empty premise (two empty streams are equal too), and the ids are
+    # checked as ids, not as a count of separators
+    ok("parent SQL is deterministic (and not empty)", len(a) == 4 and a == list(sql_lines(2500)))
+    ids = [int(tup.strip("()").split(",", 1)[0]) for x in a[1:] for tup in x[x.index("VALUES ") + 7:-1].split("),(")]
+    ok("rows: the ids are exactly 1..2500, in order", ids == list(range(1, 2501)))
     ok("the first 1000 rows do not depend on ROWS", list(sql_lines(1000))[1:] == a[1:2])
     g = list(age_lines(2500, 300, 7))
     ok("aging: 300 single-row UPDATEs", len(g) == 300 and all(x.startswith("UPDATE t SET v = ") and " WHERE id = " in x
                                                                for x in g))
-    ok("aging is deterministic for (rows, updates, seed)", g == list(age_lines(2500, 300, 7)))
+    ok("aging is deterministic for (rows, updates, seed) (and not empty)", len(g) == 300 and g == list(age_lines(2500, 300, 7)))
     ok("aging ids stay in 1..rows", all(1 <= int(x.rsplit("= ", 1)[1].rstrip(";")) <= 2500 for x in g) if g else False)
     ok("another seed ages differently", g != list(age_lines(2500, 300, 8)))
     d0, d1 = digest(2500), digest(2500, 300, 7)
