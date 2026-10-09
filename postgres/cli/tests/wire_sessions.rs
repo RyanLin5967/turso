@@ -5362,6 +5362,69 @@ fn a_reconnect_right_after_a_close_is_not_refused() {
     );
 }
 
+/// An implicit block (a multi-statement query, or a pipeline up to Sync) lives as long as the
+/// engine's transaction does, whatever the statements' text says: a statement that ends the
+/// engine's transaction ends the block, and a failure after it cannot be committed by the next
+/// statement. Its state was read from the statement text: `COMMIT<NBSP>` read as an ordinary
+/// statement, the frontend trimmed the NBSP and the engine committed, and every later statement of
+/// the query committed on its own, so a failure at the end kept rows 2 and 3 (PostgreSQL lexes
+/// the NBSP into the keyword and answers 42601, keeping neither). A simple Query inside an unsynced
+/// pipeline that fails leaves the pipeline's rows rolled back at Sync (wire review 13 item 1).
+#[test]
+fn an_implicit_block_follows_the_engines_transaction() {
+    let dir = Scratch::new("implicitstate");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let count = |a: &mut Wire| {
+        a.q("SELECT count(*) FROM t WHERE id > 1")
+            .single("rows kept")
+    };
+    let sql = "INSERT INTO t VALUES (2, 'two'); COMMIT\u{a0}; INSERT INTO t VALUES (3, 'three'); SELECT 1/0";
+    let r = a.q(sql);
+    assert_eq!(r.err("COMMIT with an NBSP").code, "42601");
+    assert_eq!(r.status, b'I');
+    assert_eq!(count(&mut a), "0", "simple: nothing kept");
+    let r = a.pipeline(&[
+        "INSERT INTO t VALUES (2, 'two')",
+        "COMMIT\u{a0}",
+        "INSERT INTO t VALUES (3, 'three')",
+        "SELECT 1/0",
+    ]);
+    assert_eq!(r.err("pipeline COMMIT with an NBSP").code, "42601");
+    assert_eq!(count(&mut a), "0", "pipeline: nothing kept");
+    let r =
+        a.q("INSERT INTO t VALUES (4, 'four'); COMMIT AND CHAIN; SELECT turso_branch_create('x')");
+    assert!(r.error.is_some(), "AND CHAIN in an implicit block");
+    assert_eq!(count(&mut a), "0", "chain: nothing kept");
+    let r = a.q("SELECT turso_branch_switch('x')");
+    assert_eq!(r.err("no branch x").code, "3D000");
+    // An unsynced pipeline INSERT, then a simple Query that fails, then Sync: rolled back.
+    for query in ["SELECT 1/0", "SELECT turso_branch_create('y')"] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"INSERT INTO t VALUES (5, 'five')");
+        parse.extend_from_slice(&[0, 0, 0]);
+        a.send(b'P', &parse);
+        a.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        let r = a.q(query);
+        assert!(
+            r.error.is_some(),
+            "{query} in an unsynced pipeline: {:?}",
+            r.tags
+        );
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        assert_eq!(r.status, b'I', "{query}: idle after Sync");
+        assert_eq!(
+            count(&mut a),
+            "0",
+            "{query}: the pipeline's insert rolled back"
+        );
+    }
+    let r = a.q("SELECT turso_branch_switch('y')");
+    assert_eq!(r.err("no branch y").code, "3D000");
+}
+
 /// SAVEPOINT, RELEASE and ROLLBACK TO in an IMPLICIT block (a multi-statement query, or a pipeline
 /// before its Sync) are 25P01, as PostgreSQL refuses them there: the block is rolled back, the
 /// session is idle, and nothing is kept or held. They ran, and ended the implicit block's
