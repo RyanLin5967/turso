@@ -1428,4 +1428,33 @@ mod tests {
             );
         }
     }
+
+    /// Lead ruling 2026-10-09 on e52f01422 (a FIX item): numeric division takes PostgreSQL's
+    /// result scale (`select_div_scale` in numeric.c: at least NUMERIC_MIN_SIG_DIGITS = 16
+    /// significant digits, never below either operand's display scale, rounded half away from
+    /// zero), not bigdecimal's. The expectations are DERIVED from PostgreSQL's select_div_scale by
+    /// reading its source, not from our output (100.00 / 10: the first base-10000 digits give a
+    /// quotient weight of 0, so 16 decimal places; 1.00 / 3: 1 <= 3 lowers the weight to -1, so
+    /// 20). LOUD-OWED: replace each expectation by PostgreSQL 18's output for the same query,
+    /// verbatim. Mutant `div_scale_bigdecimal`.
+    #[test]
+    fn numeric_division_takes_postgresqls_result_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100), (2, 30), (3, 1), (4, -2)")
+            .unwrap();
+        for (sql, want) in [
+            ("SELECT x / 10 FROM t WHERE id = 1", "10.0000000000000000"),
+            ("SELECT x / 10 FROM t WHERE id = 2", "3.0000000000000000"),
+            ("SELECT x / 3 FROM t WHERE id = 3", "0.33333333333333333333"),
+            ("SELECT x / 3 FROM t WHERE id = 4", "-0.66666666666666666667"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
 }
