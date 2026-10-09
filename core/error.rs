@@ -35,6 +35,20 @@ pub enum LimboError {
     CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]
     LockingError(String),
+    /// A named branch lookup found no unreleased branch of that name (`Database::connect_named`,
+    /// `Database::drop_branch`): typed so a server can answer it as its own protocol's "no such
+    /// database" (fastest-wire). Built on the failure path only.
+    #[error("no branch is named {0:?}")]
+    NoSuchBranch(String),
+    /// `Connection::create_branch`: the name already names an unreleased branch.
+    #[error("branch name {0:?} already names an unreleased branch")]
+    NameTaken(String),
+    /// A branch already has an open connection: a second connection is refused (a branch serves
+    /// one at a time, because a second one's page cache would silently miss the first one's
+    /// commits), and so is `Database::drop_branch` until it closes. The branch's name, quoted, or
+    /// its id for an unnamed one.
+    #[error("branch {0} already has an open connection: a branch serves one connection at a time")]
+    BranchInUse(String),
     #[error("Parse error: {0}")]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error("Parse error: {0}")]

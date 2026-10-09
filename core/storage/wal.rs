@@ -616,6 +616,96 @@ trait WalCoordination: Debug + Send + Sync {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: the trunk WAL sync site this thread issued a sync at last (engine review 10 #5:
+    /// a site test names the site its failure reached). Observation only.
+    pub(crate) static WAL_SYNC_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// A trunk WAL sync is issued at `site` (test builds: `WAL_SYNC_SITE`; nothing otherwise).
+#[inline]
+pub(crate) fn wal_sync_site(site: &'static str) {
+    #[cfg(test)]
+    WAL_SYNC_SITE.with(|s| s.set(site));
+    let _ = site;
+}
+
+/// The trunk's syncs of its own files that a branch store must hear about when they fail (review 6
+/// #2, engine review 9 #2, engine review 10 #5): a failed sync on the branch files' device can be
+/// a failed drain of it. The pager notes the syncs it issues; the WAL notes those it issues itself
+/// (a checkpoint's sync before its backfill, a TRUNCATE checkpoint's sync of the truncated log)
+/// through `Wal::watch_syncs`, since their failures reach the statement through `?` without
+/// passing the pager. The pager acts on what this holds (`Pager::check_noted_syncs`).
+#[doc(hidden)]
+pub struct TrunkSyncWatch {
+    /// The last sync noted: acted on once it finished failed.
+    noted: Mutex<Option<Completion>>,
+    /// A noted sync failed where no pager could act at once: at its issue, or a failed one was
+    /// replaced by the next.
+    failed: AtomicBool,
+}
+
+impl Default for TrunkSyncWatch {
+    fn default() -> Self {
+        Self {
+            noted: Mutex::new(None),
+            failed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Debug for TrunkSyncWatch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrunkSyncWatch")
+            .field("failed", &self.failed.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl TrunkSyncWatch {
+    /// Note `c`, a sync just issued; returns whether the noted one it replaces had failed.
+    pub(crate) fn issued(&self, c: &Completion) -> bool {
+        let previous = self.noted.lock().replace(c.clone());
+        previous.is_some_and(|p| p.finished() && !p.succeeded())
+    }
+
+    /// A sync failed where the pager cannot act at once (the WAL issued it).
+    pub(crate) fn failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    /// Note a sync the WAL issued: its failure at issue, or a failed one it replaces, is kept for
+    /// the pager.
+    fn noted_by_wal(&self, issued: &Result<Completion>) {
+        match issued {
+            Ok(c) => {
+                if self.issued(c) {
+                    self.failed();
+                }
+            }
+            Err(_) => self.failed(),
+        }
+    }
+
+    /// Whether a noted sync failed since this was last asked; one still in flight stays noted.
+    pub(crate) fn take_failure(&self) -> bool {
+        let noted = {
+            let mut noted = self.noted.lock();
+            match noted.as_ref() {
+                Some(c) if c.finished() => noted.take().is_some_and(|c| !c.succeeded()),
+                _ => false,
+            }
+        };
+        self.failed.swap(false, Ordering::AcqRel) | noted
+    }
+
+    /// Forget the noted sync (acted on already).
+    pub(crate) fn forget(&self) {
+        self.noted.lock().take();
+    }
+}
+
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
@@ -758,6 +848,9 @@ pub trait Wal: Debug + Send + Sync {
     fn full_fsync_device(&self) -> Option<u64> {
         None
     }
+    /// Note every sync this WAL issues itself in `watch` (a pager with a branch store; engine
+    /// review 10 #5). A WAL that issues none of its own ignores it.
+    fn watch_syncs(&self, _watch: Arc<TrunkSyncWatch>) {}
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
     /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
@@ -2687,6 +2780,8 @@ pub struct WalFile {
     coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
+    /// The pager's watch of the trunk's syncs (`Wal::watch_syncs`), when it has a branch store.
+    sync_watch: OnceLock<Arc<TrunkSyncWatch>>,
     write_lock_held: AtomicBool,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
@@ -3076,6 +3171,17 @@ enum TryBeginReadResult {
 }
 
 impl WalFile {
+    /// A sync this WAL issued, noted in the pager's watch when it has one (`Wal::watch_syncs`),
+    /// unless the mutant named `unwatched` is on (test builds only).
+    fn watched(&self, unwatched: &str, issued: Result<Completion>) -> Result<Completion> {
+        if let Some(watch) = self.sync_watch.get() {
+            if !crate::branch::store::fe_mutant(unwatched) {
+                watch.noted_by_wal(&issued);
+            }
+        }
+        issued
+    }
+
     fn prepare_transformed_frame(
         buffer_pool: &Arc<BufferPool>,
         wal_header: &WalHeader,
@@ -4042,6 +4148,10 @@ impl Wal for WalFile {
         self.coordination.wal_file().ok()?.full_fsync_device()
     }
 
+    fn watch_syncs(&self, watch: Arc<TrunkSyncWatch>) {
+        let _ = self.sync_watch.set(watch);
+    }
+
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("wal_sync");
@@ -4729,6 +4839,7 @@ impl WalFile {
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
+            sync_watch: OnceLock::new(),
             write_lock_held: AtomicBool::new(false),
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
@@ -4921,7 +5032,11 @@ impl WalFile {
                 // drops the unsynced WAL tail — a torn database that matches
                 // no committed prefix.
                 CheckpointState::SyncWal => {
-                    let c = self.sync(pager.get_sync_type())?;
+                    wal_sync_site("checkpoint");
+                    // Watched for the pager (engine review 10 #5): a failure here is a failed
+                    // drain of the trunk's device. Mutant `checkpoint_sync_unwatched` (test builds
+                    // only): not watched, as before.
+                    let c = self.watched("checkpoint_sync_unwatched", self.sync(pager.get_sync_type()))?;
                     self.ongoing_checkpoint.write().state = CheckpointState::Processing;
                     io_yield_one!(c);
                 }
@@ -5243,7 +5358,10 @@ impl WalFile {
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
-            let c = file.sync(
+            wal_sync_site("truncate");
+            // Watched for the pager (engine review 10 #5). Mutant `truncate_sync_unwatched` (test
+            // builds only): not watched, as before.
+            let issued = file.sync(
                 Completion::new_sync(move |res| {
                     if let Err(err) = res {
                         tracing::debug!("WAL sync failed: {err}")
@@ -5252,7 +5370,8 @@ impl WalFile {
                     }
                 }),
                 sync_type,
-            )?;
+            );
+            let c = self.watched("truncate_sync_unwatched", issued)?;
             result.wal_sync_sent = true;
             io_yield_one!(c);
         }

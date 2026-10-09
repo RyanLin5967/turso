@@ -500,6 +500,13 @@ pub enum BranchFailpoint {
     /// The confirmation word of the next group flight fails to reach the log's header, as an I/O
     /// error would (review 6 #1).
     ConfirmWriteFails,
+    /// The next sync of a temp file that is to replace a branch file (a cut's or rewrite's new
+    /// log, a reset log, a compaction's snapshot) fails as an I/O error would (review 6 #2).
+    ReplacementSyncFails,
+    /// The next capture that takes a handle on the arena file to sync it (a sharp catalog
+    /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
+    /// #3: the capture's other fallible step, beside its read snapshot).
+    ArenaHandleFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -612,6 +619,12 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+    /// Snapshot stores (engine review 7 #4): copies of the recovered snapshot state made at the
+    /// open, and replays of snapshot and log (a second one when the last flight's check failed),
+    /// and the slots the last flight's check read.
+    pub snapshot_copies: u64,
+    pub replays: u64,
+    pub checked_slots: u64,
 }
 
 /// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an
@@ -1134,15 +1147,47 @@ impl Connection {
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
         // The branch starts with the schema that matches the committed pages it will read. The
-        // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
-        // if neither does, a DDL commit is between publishing its pages and its schema, and the
-        // caller retries rather than fork a branch whose schema disagrees with its pages.
-        let schema = [self.schema.read().clone(), self.db.clone_schema()]
+        // connection's own snapshot or the shared one is that schema whenever the cookie agrees.
+        // If neither does, a DDL commit is between publishing its pages and its schema, and the
+        // fork re-reads the schema its snapshot holds rather than refuse (engine 2b: refused, a
+        // create failed whenever it met that window). Mutant `fork_refuses_schema_window` (test
+        // builds only): refused with SchemaUpdated, as before.
+        let in_hand = [self.schema.read().clone(), self.db.clone_schema()]
             .into_iter()
-            .find(|schema| schema.schema_version == cookie)
-            .ok_or(LimboError::SchemaUpdated)?;
+            .find(|schema| schema.schema_version == cookie);
+        let schema = match in_hand {
+            Some(schema) => schema,
+            None if store::fe_mutant("fork_refuses_schema_window") => {
+                return Err(LimboError::SchemaUpdated)
+            }
+            None => self.reread_schema_at_snapshot(cookie)?,
+        };
         let page_size = pager.get_page_size_unchecked().get() as usize;
         self.db.branches.fork_trunk(schema, page_size, seen, name)
+    }
+
+    /// The schema this connection's open read snapshot holds, when no schema in hand matches its
+    /// cookie (`fork_trunk_registered`): re-read from the snapshot's pages into the connection, as
+    /// SQLite re-reads its schema on SQLITE_SCHEMA, and not published (the DDL commit that wrote it
+    /// publishes its own). A failed re-read leaves the connection the schema it had. Costs one
+    /// `sqlite_schema` scan, only on a fork that meets a DDL commit's publication window.
+    fn reread_schema_at_snapshot(
+        self: &Arc<Connection>,
+        cookie: u32,
+    ) -> Result<Arc<crate::schema::Schema>> {
+        let kept = self.schema.read().clone();
+        self.set_tx_state(TransactionState::Read);
+        let reread = self.reparse_schema();
+        self.set_tx_state(TransactionState::None);
+        let schema = self.schema.read().clone();
+        match reread {
+            Ok(()) if schema.schema_version == cookie => Ok(schema),
+            other => {
+                *self.schema.write() = kept;
+                other?;
+                Err(LimboError::SchemaUpdated)
+            }
+        }
     }
 
     /// The branch this connection is open on, if any.
@@ -1335,25 +1380,31 @@ impl Database {
     }
 
     /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch already has a connection.
     pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         self.connect_branch(id)
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch has an open connection (fastest-wire: a server
+    /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
+    /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
         // branch is never touched (its id differs).
-        self.branches.release_handle(id)
+        self.branches.release_named(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
@@ -1412,6 +1463,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
         self.branches.checkpoint_counters()
+    }
+
+    /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
+    /// observing only).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_start_failures(&self) -> u64 {
+        self.branches.checkpoint_start_failures()
     }
 
     /// Confirmation words written into the branch log's header, and those whose write failed
@@ -1511,13 +1569,15 @@ impl Database {
 /// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
 /// window fails. In a process that runs one test there is no neighbour.
 ///
-/// GATE: `cfg(unix)`, and nothing narrower is needed. The tests close no descriptors (the fresh
-/// process has no neighbour whose lock a child could hold), so `getdtablesize`, which Android's
-/// libc lacks, is no longer called anywhere. Every libc call they make — `fork`, `waitpid`,
-/// `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix target in libc 0.2.186,
-/// Android included (READ: `src/unix/mod.rs`'s unconditional `extern` block, and
-/// `src/unix/linux_like/mod.rs`).
-#[cfg(all(test, unix))]
+/// GATE: `alone` and `finished` need only `std::process`, so every test build has them: a test that
+/// runs alone for a process-wide hook (`R11_CKPT`, `CUT_PANICS`) runs on every target (engine
+/// review 7 #13's judge). `exit_code` is `cfg(unix)`, and nothing narrower is needed. The tests
+/// close no descriptors (the fresh process has no neighbour whose lock a child could hold), so
+/// `getdtablesize`, which Android's libc lacks, is no longer called anywhere. Every libc call they
+/// make — `fork`, `waitpid`, `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix
+/// target in libc 0.2.186, Android included (READ: `src/unix/mod.rs`'s unconditional `extern`
+/// block, and `src/unix/linux_like/mod.rs`).
+#[cfg(test)]
 pub(crate) mod fork_driver {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1564,6 +1624,7 @@ pub(crate) mod fork_driver {
 
     /// The exit code of a forked child. Waits at most 60 s; on the deadline it SIGKILLs and reaps
     /// the child and fails.
+    #[cfg(unix)]
     pub(crate) fn exit_code(pid: libc::pid_t) -> i32 {
         let mut status = 0;
         let deadline = Instant::now() + Duration::from_secs(60);

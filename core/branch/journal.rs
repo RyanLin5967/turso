@@ -92,8 +92,14 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// frame-layer marker, no longer a record): a tag saying whether the flight was synced, the
 /// flight's length, and its crc32c, both the end frame's own checksum and the flight's seeded with
 /// the nonce. A 9 or 10 log ("written before the log nonce") is refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 11;
-const SPLICE_FORMAT_VERSION: u32 = 12;
+///
+/// 13 and 14 (fastest-engine, engine review 10 #2 and review 6 #7): the end frame says how its
+/// writer synced it, per flight: not at all, by a writer whose own class syncs (every flight
+/// before it was synced before it was written), raised by a writer whose class does not, or
+/// ORDERED ahead of a trunk commit's flush by either (`EndKind`). An 11 or 12 log tagged every
+/// synced or ordered flight alike, so it is refused, never reinterpreted.
+const FORMAT_VERSION: u32 = 13;
+const SPLICE_FORMAT_VERSION: u32 = 14;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -109,10 +115,90 @@ pub(crate) fn format_version(splice: bool) -> u32 {
 /// reserved bytes.
 const LOG_HEADER_LEN: usize = 40;
 const FRAME_HEADER_LEN: usize = 8;
-/// The end frame's tags: a flight written in a class that does not sync, and one that does (or is
-/// ordered ahead of a trunk commit's flush). No record tag takes either value.
+/// The end frame's tags (`EndKind`): a flight written in a class that does not sync; one synced by
+/// a writer whose own class syncs, or by one whose class does not (raised); and one ordered ahead
+/// of a trunk commit's flush by either. No record tag takes any of these values.
 const END_TAG: u8 = 0xE0;
 const END_SYNCED_TAG: u8 = 0xE1;
+const END_RAISED_TAG: u8 = 0xE2;
+const END_ORDERED_TAG: u8 = 0xE3;
+const END_ORDERED_RAISED_TAG: u8 = 0xE4;
+
+/// What a flight's end frame says about how its writer synced it (engine review 10 #2: per flight,
+/// not per incarnation, since a reopen in another class keeps the incarnation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EndKind {
+    /// Written in a class that does not sync: its slots may never have reached the device.
+    Unsynced,
+    /// Synced by a writer whose own class syncs: it synced every flight before writing the next,
+    /// so this flight being written proves the one before it was synced.
+    Synced,
+    /// Synced by a writer whose class does not (a raised D0 flight): durable itself, it proves
+    /// nothing about the flights before it.
+    Raised,
+    /// ORDERED ahead of a trunk commit's F_FULLFSYNC (barriered, never confirmed), by a writer
+    /// whose class syncs (review 6 #7): its slots were barriered ahead of its records, so its
+    /// records on the device prove its slots are.
+    Ordered,
+    /// `Ordered`, by a writer whose class does not sync: it proves nothing about the flights
+    /// before it.
+    OrderedRaised,
+}
+
+impl EndKind {
+    /// The kind of a flight synced or not (`syncs`), ordered or not, by a writer whose class syncs
+    /// or not.
+    fn of(syncs: bool, base_syncs: bool) -> Self {
+        match (syncs, base_syncs) {
+            (false, _) => EndKind::Unsynced,
+            (true, true) => EndKind::Synced,
+            (true, false) => EndKind::Raised,
+        }
+    }
+
+    fn ordered_by(base_syncs: bool) -> Self {
+        if base_syncs {
+            EndKind::Ordered
+        } else {
+            EndKind::OrderedRaised
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            EndKind::Unsynced => END_TAG,
+            EndKind::Synced => END_SYNCED_TAG,
+            EndKind::Raised => END_RAISED_TAG,
+            EndKind::Ordered => END_ORDERED_TAG,
+            EndKind::OrderedRaised => END_ORDERED_RAISED_TAG,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            END_TAG => Some(EndKind::Unsynced),
+            END_SYNCED_TAG => Some(EndKind::Synced),
+            END_RAISED_TAG => Some(EndKind::Raised),
+            END_ORDERED_TAG => Some(EndKind::Ordered),
+            END_ORDERED_RAISED_TAG => Some(EndKind::OrderedRaised),
+            _ => None,
+        }
+    }
+
+    /// Synced, or ordered ahead of a flush: the flight was durable once its trunk commit was.
+    fn synced(self) -> bool {
+        self != EndKind::Unsynced
+    }
+
+    /// Written by a writer that synced (or ordered) every flight before writing the next.
+    fn by_syncing_writer(self) -> bool {
+        matches!(self, EndKind::Synced | EndKind::Ordered)
+    }
+
+    fn ordered(self) -> bool {
+        matches!(self, EndKind::Ordered | EndKind::OrderedRaised)
+    }
+}
 /// tag(1) flight length(4) the flight's crc32c, seeded with the nonce(4).
 const END_PAYLOAD_LEN: usize = 9;
 /// An end frame: its frame header, whose checksum is seeded with the nonce too, and its payload.
@@ -287,6 +373,9 @@ const _: () = {
         TAG_FORK_NAMED,
         END_TAG,
         END_SYNCED_TAG,
+        END_RAISED_TAG,
+        END_ORDERED_TAG,
+        END_ORDERED_RAISED_TAG,
     ];
     let mut i = 0;
     while i < tags.len() {
@@ -622,6 +711,11 @@ pub(crate) struct Recovered {
     pub(crate) snapshot: Option<SnapshotState>,
     pub(crate) records: Vec<Record>,
     pub(crate) journal: Journal,
+    /// The kept log ends at its last whole flight, nothing was cut, and the open just synced it in
+    /// a class that proves stable storage (engine review 7 #4): once the store has read that
+    /// flight's slots back and the arena holds no unsynced write, the flight may be confirmed
+    /// (`Journal::confirm_at_open`), so the next open does not check it again.
+    pub(crate) confirmable: bool,
 }
 
 /// What a recovery scan read, before anything in the files was changed (review 5 #1, #2): the
@@ -798,6 +892,9 @@ impl Scanned {
         let from = self.from();
         let journal = &mut self.journal;
         let generation = journal.generation;
+        // The kept log ends at its last whole flight and was just synced in a class that proves
+        // stable storage (engine review 7 #4): see `Recovered::confirmable`.
+        let mut confirmable = false;
         match self.end {
             End::Keep { len, whole, log_gen, synced_end, .. } => {
                 journal.len = whole as u64;
@@ -817,22 +914,44 @@ impl Scanned {
                     // generation now, so appends and the next checkpoint see one log.
                     let cut = at.map_or(whole, |i| self.ends[i]);
                     journal.generation = log_gen;
-                    journal.rewrite_from(cut as u64, generation)?;
+                    // In the class recovery decided (engine review 7 #1). Mutant
+                    // `cut_ignores_decided_class` (test builds only): the rewrite class.
+                    if super::store::fe_mutant("cut_ignores_decided_class") {
+                        journal.rewrite_from(cut as u64, generation)?;
+                    } else {
+                        journal.rewrite_from_as(cut as u64, generation, class.max(journal.rewrite_class()))?;
+                    }
                 } else if whole < len && !super::store::fe_mutant("no_torn_tail_cut") {
-                    // A torn flight, never acknowledged: the kept flights become a NEW incarnation
-                    // (a fresh nonce; review 5 #7), so should the cut not reach the disk (a D0
-                    // truncation is never synced), nothing appended after it can make the old
-                    // bytes valid again. Mutant `cut_in_place` (test builds only): truncated in
-                    // place, as before. (Mutant `no_torn_tail_cut`: the tail is left in the file.)
+                    // A torn or dropped flight, never acknowledged, and what follows it are cut
+                    // (mutant `no_torn_tail_cut`: the tail is left in the file).
                     tracing::warn!(
                         "branch log {}: a torn flight cut at byte {whole} ({} bytes)",
                         files.log.display(),
                         len - whole
                     );
-                    if super::store::fe_mutant("cut_in_place") {
+                    // The arena truncation clause (engine review 7 #1): when the class recovery
+                    // decided syncs, the log is truncated IN PLACE at the first dropped or invalid
+                    // record and that is made durable — a full sync of the log, then of its
+                    // directory — before anything is appended. The kept flights keep their bytes,
+                    // nonce and tags, and the old bytes can never come back. Only a log nothing ever
+                    // synced (the decided class does not sync) becomes a NEW incarnation instead (a
+                    // fresh nonce; review 5 #7): its truncation would never reach the disk, so
+                    // nothing appended after it may make the old bytes valid again; its rename is
+                    // made durable by the next flight that syncs (`dir_dirty`). Mutants
+                    // `cut_ignores_decided_class` (test builds only: every cut a fresh-nonce rewrite
+                    // in the rewrite class, as before) and `cut_in_place` (in place even when
+                    // nothing syncs, as before review 5 #7).
+                    // Mutant M-h (`apply_torn_flight`) cuts in place too, so the torn flight's whole
+                    // records are really replayed and the mutant dies on its test's assertion, not
+                    // on a refusal of the rewrite (engine review 7 #5).
+                    let in_place = (class.syncs() && !super::store::fe_mutant("cut_ignores_decided_class"))
+                        || super::store::fe_mutant("cut_in_place")
+                        || super::store::fe_mutant("apply_torn_flight");
+                    if in_place {
                         set_file_len(&journal.file, whole as u64)?;
                         if class.syncs() {
-                            fsync_file(&journal.file, class)?;
+                            fsync_file(&journal.file, SyncClass::FullFsync)?;
+                            fsync_dir_of(&files.log, SyncClass::FullFsync)?;
                         }
                     } else {
                         let snapshot_len = journal.snapshot_len;
@@ -842,8 +961,29 @@ impl Scanned {
                 } else if class.syncs() {
                     // What is kept is synced before anything follows it: the last whole flight
                     // may have been written and never synced by the process that died, and a
-                    // later flight's frames will prove it was.
+                    // later flight's frames will prove it was. So is its directory: that process
+                    // may have died between a cut's rename and the flight that would have synced
+                    // it, and `dir_dirty` died with it (engine review 10 #4). Mutant
+                    // `open_forgets_unsynced_rename` (test builds only): not synced, as before.
                     fsync_file(&journal.file, class)?;
+                    if !super::store::fe_mutant("open_forgets_unsynced_rename") {
+                        fsync_dir_of(&files.log, class)?;
+                    }
+                    confirmable = proves_stable(class);
+                } else if !super::store::fe_mutant("open_forgets_unsynced_rename") {
+                    // Nothing here syncs: the next flight that does (a raised one) syncs the
+                    // directory first, as after a cut in this process.
+                    journal.dir_dirty = true;
+                }
+                // The records kept were made durable in `class` by the run that wrote them: the
+                // first rewrite of them syncs in it too (engine review 10 #3), set after the cut
+                // above, so the open's own rewrite does not clear it. Mutant
+                // `inherited_floor_dropped` (test builds only): not set, as before.
+                if class.syncs()
+                    && class > journal.sync.max(journal.raised)
+                    && !super::store::fe_mutant("inherited_floor_dropped")
+                {
+                    journal.inherited = class;
                 }
             }
             End::Reset => journal.reset_log(generation)?,
@@ -854,6 +994,7 @@ impl Scanned {
             snapshot: self.snapshot,
             records: self.records,
             journal: self.journal,
+            confirmable,
         })
     }
 }
@@ -943,6 +1084,9 @@ pub(crate) struct Journal {
     fail_next_take: bool,
     /// See [`Journal::fail_next_confirm`].
     fail_next_confirm: bool,
+    /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
+    /// run off the store mutex (`prepare_cut`, through its `CutSource`).
+    fail_next_replacement_sync: AtomicBool,
     /// The format version this journal writes and was read at (`format_version`).
     format: u32,
     /// Frame bytes ever buffered by this journal: the log sequence number a group flight makes
@@ -957,6 +1101,12 @@ pub(crate) struct Journal {
     /// checkpoint and its log cut), which therefore syncs in `rewrite_class` (fastest-engine review
     /// B-F3). Kept in the log header, so a restart keeps it too.
     raised: SyncClass,
+    /// The class an earlier run made the recovered records durable in, when it is stronger than
+    /// `sync` and `raised` (a D1 or D2 log reopened in D0; engine review 10 #3): set by the open,
+    /// cleared once the first rewrite lands, which carries those records into a snapshot, the
+    /// catalog or a new log synced in it. Not kept in the header: a later run's records are only
+    /// as durable as that run's class.
+    inherited: SyncClass,
     /// This incarnation of the log's nonce (format 11): in its header, and seeding every end
     /// frame's checksums, so recovery never takes an older incarnation's flight for one of this.
     nonce: u32,
@@ -986,6 +1136,10 @@ pub(crate) struct CutSource {
     class: SyncClass,
     tmp: PathBuf,
     nonce: u32,
+    /// The `ReplacementSyncFails` failpoint, taken when the source was.
+    fail_sync: bool,
+    /// The journal's fail-stop flag: a failed sync of the prepared log sets it (review 6 #2).
+    poisoned: Arc<AtomicBool>,
 }
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
@@ -1003,6 +1157,9 @@ pub(crate) struct CutPrep {
     old_nonce: u32,
     /// The raised class the new header was written with: a raise since is written at the install.
     raised: SyncClass,
+    /// Every flight the prep kept is tagged synced (`reframe_tagged`): the install may confirm a
+    /// delta's last flight only then (engine review 7 #1).
+    all_synced: bool,
 }
 
 impl Journal {
@@ -1067,10 +1224,12 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
             pending_class: SyncClass::Off,
             raised: SyncClass::Off,
+            inherited: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1265,10 +1424,12 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
             pending_class: SyncClass::Off,
             raised,
+            inherited: SyncClass::Off,
             nonce: 0,
             header_stale: false,
             rewrites: 0,
@@ -1284,7 +1445,17 @@ impl Journal {
         let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
         let end = match header {
             Some((log_ps, log_gen, nonce)) if replayable(log_gen) => {
-                if log_ps != page_size {
+                // A log of the state's own generation must share its page size. An OLDER catalog
+                // log may not (engine review 9 #4): a page-size restart commits the catalog at the
+                // new size before it rewrites the log, so a crash, or a failed rewrite, between the
+                // two leaves the old log behind it; that log is accepted only if nothing in it
+                // follows the new generation's marker (checked below, once its records are read),
+                // and the open rewrites it at the new size. Mutant `older_log_page_size_refused`
+                // (test builds only): refused, as before.
+                let older_at_another_size = log_ps != page_size
+                    && log_gen < generation
+                    && !super::store::fe_mutant("older_log_page_size_refused");
+                if log_ps != page_size && !older_at_another_size {
                     return Err(corrupt(if catalog_store {
                         "log and catalog disagree on the page size"
                     } else {
@@ -1356,7 +1527,7 @@ impl Journal {
                         if records.len() > whole.1 {
                             last_flight = Some(whole);
                         }
-                        if payload[0] == END_SYNCED_TAG {
+                        if EndKind::from_tag(payload[0]).is_some_and(EndKind::synced) {
                             synced_end = true;
                         } else {
                             unsynced_end = true;
@@ -1384,7 +1555,10 @@ impl Journal {
                     // #2). A flight written in a class that does not sync (D0) proves nothing, so
                     // under D0 every damage is a torn flight and cut. The flight the damage lies in
                     // was never acknowledged otherwise, whatever survived of it, and is cut below.
-                    if let Some(at) = synced_flight_over(&bytes, pos, nonce, sync.syncs()) {
+                    let confirmed = bytes
+                        .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
+                        .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+                    if let Some(at) = synced_flight_over(&bytes, pos, nonce, unsynced_end, confirmed, sync.syncs()) {
                         // No truncation is offered (review 7 item 1, the lead's decision): the
                         // flight was acknowledged.
                         let state = if catalog_store { &files.cat } else { &files.snap };
@@ -1407,13 +1581,18 @@ impl Journal {
                 }
                 // A last flight confirmed in the header (its sync returned) keeps its records whatever
                 // its slots hold: a slot failing then is damage, refused when read, never a silently
-                // older page. An unconfirmed one is the store's to check once it has replayed it
+                // older page. So does an ordered one (review 6 #7): its slots were barriered ahead
+                // of its records, so its records being here proves its slots reached the device.
+                // An unconfirmed one is the store's to check once it has replayed it
                 // (`Scanned::last_flight_slots`).
                 let confirmed = bytes
                     .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
                     .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+                let ordered_last = whole.0 >= END_PAYLOAD_LEN
+                    && EndKind::from_tag(bytes[whole.0 - END_PAYLOAD_LEN]).is_some_and(EndKind::ordered);
                 let last = last_flight.filter(|&(start, _)| {
                     start < whole.0
+                        && !ordered_last
                         && confirmed
                             != Some(confirm_word(
                                 u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap()),
@@ -1429,6 +1608,16 @@ impl Journal {
                 }
                 records.truncate(whole.1);
                 ends.truncate(whole.1);
+                if older_at_another_size {
+                    let marker = Record::Checkpoint { generation };
+                    let from = records.iter().rposition(|r| *r == marker).map_or(records.len(), |i| i + 1);
+                    if from < records.len() {
+                        return Err(corrupt(
+                            "the catalog is at another page size than the older log, and the log holds \
+                             records after the catalog's checkpoint",
+                        ));
+                    }
+                }
                 End::Keep {
                     len: bytes.len(),
                     whole: whole.0,
@@ -1497,6 +1686,17 @@ impl Journal {
         self.fail_next_confirm = true;
     }
 
+    /// Fail the next replacement's sync as an I/O error would (the `ReplacementSyncFails`
+    /// failpoint; review 6 #2).
+    pub(crate) fn fail_next_replacement_sync(&self) {
+        self.fail_next_replacement_sync.store(true, Ordering::Release);
+    }
+
+    /// Whether the next replacement sync fails (spends the failpoint).
+    fn take_replacement_sync_failure(&self) -> bool {
+        self.fail_next_replacement_sync.swap(false, Ordering::AcqRel)
+    }
+
     /// Fail the arena sync of the next compaction as an I/O error would (the `ArenaSyncFails`
     /// failpoint, snapshot stores).
     pub(crate) fn fail_next_arena_sync(&mut self) {
@@ -1534,6 +1734,12 @@ impl Journal {
     /// so a catalog store there cannot cut its log (nor reopen from crash state S1); catalog mode
     /// is unix-only as written.
     pub(crate) fn rewrite_from(&mut self, from: u64, generation: u64) -> Result<()> {
+        self.rewrite_from_as(from, generation, self.rewrite_class())
+    }
+
+    /// `rewrite_from`, synced in `class`: recovery's, which can be stronger than the rewrite class
+    /// (a D0 store over flights synced by an earlier run; engine review 7 #1).
+    pub(crate) fn rewrite_from_as(&mut self, from: u64, generation: u64, class: SyncClass) -> Result<()> {
         self.check_live()?;
         let end = self.mark();
         if from < LOG_HEADER_LEN as u64 || from > end {
@@ -1547,13 +1753,13 @@ impl Journal {
         if !kept.is_empty() {
             read_at(&self.file, &mut kept, file_from)?;
         }
-        // Every kept record, raised ones included, stays as durable as it was (review B-F3).
-        let class = self.rewrite_class();
+        // Every kept record, raised ones included, stays as durable as it was (review B-F3): `class`
+        // is at least the rewrite class.
         // Framed again for a new incarnation, every kept flight keeping its boundary (review 2
         // #3); the cut can fall inside a flight, whose kept part becomes a flight of its own.
         // Every flight is in the file whole here, so each new one is too once its sync returns.
         let nonce = fresh_nonce(self.nonce);
-        let (suffix, last_crc) = reframe(&kept, self.nonce, nonce, class.syncs())?;
+        let (suffix, last_crc, all_synced) = reframe_tagged(&kept, self.nonce, nonce, class.syncs())?;
         let tmp = self.files.log_tmp();
         let written = (|| -> Result<File> {
             let f = open_rw(&tmp, true)?;
@@ -1565,14 +1771,12 @@ impl Journal {
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
                 // Synced with the rest below: the kept last flight is confirmed, when that sync
-                // proves stable storage (review 6 #1).
-                if cut_confirms(class) {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                // proves stable storage (review 6 #1) and no kept flight was written unsynced
+                // (engine review 7 #1).
+                write_cut_word(&f, class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if class.syncs() {
-                fsync_file(&f, class)?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
             }
             Ok(f)
         })();
@@ -1583,14 +1787,18 @@ impl Journal {
                 return Err(e);
             }
         };
-        if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+        if let Err(e) = rename_file(&tmp, &self.files.log) {
             let _ = std::fs::remove_file(&tmp);
             return Err(io_error(e, "rename branch log rewrite"));
         }
         // From here the new file is the log.
         self.file = f;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A rewrite ends any back-off. Mutant `no_backoff_reset` (test builds only; engine review 8
+        // #3): it keeps it, measured in the old log's length.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
@@ -1606,7 +1814,14 @@ impl Journal {
                 self.set_poisoned();
                 return Err(e);
             }
+        } else {
+            // The rename is not durable: the next flight that syncs (a raised one) syncs the
+            // directory first (engine review 7 #1), so nothing acknowledged durable lands in a log
+            // a power cut could rename away. Mutant `unsynced_rename_left_clean` (test builds only).
+            self.dir_dirty = !super::store::fe_mutant("unsynced_rename_left_clean");
         }
+        // The records an earlier run made durable are carried in a synced rewrite now.
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
@@ -1630,6 +1845,8 @@ impl Journal {
             class: self.rewrite_class(),
             tmp: self.files.log_tmp(),
             nonce: self.nonce,
+            fail_sync: self.take_replacement_sync_failure(),
+            poisoned: self.poisoned.clone(),
         }))
     }
 
@@ -1642,20 +1859,17 @@ impl Journal {
             read_at(&src.log, &mut kept, from)?;
         }
         let nonce = fresh_nonce(src.nonce);
-        let (suffix, last_crc) = reframe(&kept, src.nonce, nonce, src.class.syncs())?;
+        let (suffix, last_crc, all_synced) = reframe_tagged(&kept, src.nonce, nonce, src.class.syncs())?;
         let written = (|| -> Result<File> {
             let f = open_rw(&src.tmp, true)?;
             lock_exclusive(&f, &src.tmp)?;
             write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
-                if cut_confirms(src.class) {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&f, src.class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if src.class.syncs() {
-                fsync_file(&f, src.class)?;
+                sync_replacement(&f, src.class, src.fail_sync, &src.poisoned)?;
             }
             Ok(f)
         })();
@@ -1670,6 +1884,7 @@ impl Journal {
                 nonce,
                 old_nonce: src.nonce,
                 raised: src.raised,
+                all_synced,
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&src.tmp);
@@ -1708,20 +1923,17 @@ impl Journal {
         if self.len > prep.upto {
             let mut delta = vec![0u8; (self.len - prep.upto) as usize];
             read_at(&self.file, &mut delta, prep.upto)?;
-            let (frames, last_crc) = reframe(&delta, self.nonce, prep.nonce, class.syncs())?;
+            let (frames, last_crc, delta_synced) = reframe_tagged(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
-                if cut_confirms(class) {
-                    let end = len + frames.len() as u64;
-                    write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&prep.file, class, prep.all_synced && delta_synced, last_crc, len + frames.len() as u64)?;
                 if class.syncs() {
-                    fsync_file(&prep.file, class)?;
+                    sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
                 len += frames.len() as u64;
             }
         }
-        if let Err(e) = std::fs::rename(self.files.log_tmp(), &self.files.log) {
+        if let Err(e) = rename_file(&self.files.log_tmp(), &self.files.log) {
             let _ = std::fs::remove_file(self.files.log_tmp());
             return Err(io_error(e, "rename branch log rewrite"));
         }
@@ -1729,13 +1941,21 @@ impl Journal {
         // From here the new file is the log.
         self.file = prep.file;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = prep.nonce;
         self.len = len;
         self.header_stale = false;
         self.snapshot_len = 0;
-        self.dir_dirty = class.syncs();
+        // Synced by the next flight that syncs, before its own log sync, whatever this store's
+        // class: in D0 that is a raised flight (engine review 7 #1). Mutant
+        // `unsynced_rename_left_clean` (test builds only): only when the rewrite class syncs.
+        self.dir_dirty = class.syncs() || !super::store::fe_mutant("unsynced_rename_left_clean");
+        // The records an earlier run made durable are carried in a synced rewrite now.
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
@@ -1768,13 +1988,14 @@ impl Journal {
     }
 
     /// The class every rewrite of the log's records syncs in: the store's own, or the strongest one
-    /// any record was made durable in, if stronger (see `raised`).
+    /// any record was made durable in, if stronger (see `raised`, and `inherited` until the first
+    /// rewrite after an open lands).
     pub(crate) fn rewrite_class(&self) -> SyncClass {
         // fastest-engine mutant `rewrite_store_class` (test builds only): rewrites in the store's.
         if super::store::fe_mutant("rewrite_store_class") {
             return self.sync;
         }
-        self.sync.max(self.raised)
+        self.sync.max(self.raised).max(self.inherited)
     }
 
     /// A write in `class` is about to make records durable: remember a class stronger than any so
@@ -1855,7 +2076,7 @@ impl Journal {
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
-        frames.extend_from_slice(&end_frame(self.nonce, class.syncs(), &self.pending));
+        frames.extend_from_slice(&end_frame(self.nonce, EndKind::of(class.syncs(), self.sync.syncs()), &self.pending));
         let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -1906,7 +2127,7 @@ impl Journal {
         }
         write_at(&self.file, frames, self.len)?;
         if let Some(dir) = dir {
-            fsync_file(dir, SyncClass::Fsync)?;
+            fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
         }
         if class.syncs() {
@@ -1942,6 +2163,18 @@ impl Journal {
         self.pending_class = self.pending_class.max(class);
     }
 
+    /// The class a flight taken now for a wait in `class` would sync in: at least this journal's
+    /// own, and what is buffered raised it to (`pending_class`).
+    fn flight_class(&self, class: SyncClass) -> SyncClass {
+        class.max(self.sync).max(self.pending_class)
+    }
+
+    /// Whether a flight taken now for a wait in `class` would sync (engine review 9 #8: such a
+    /// flight is not taken while a checkpoint syncs the arena).
+    pub(crate) fn flight_syncs(&self, class: SyncClass) -> bool {
+        self.flight_class(class).syncs()
+    }
+
     /// Take everything buffered as one [`Flight`], for a group flush written outside the store
     /// mutex (fastest-engine M1 item 2; gc 389b474b4's `take_flight`). The log region is reserved
     /// here, so the next flight goes after it; the caller guarantees no other flight is in the air
@@ -1961,15 +2194,7 @@ impl Journal {
         let fail = std::mem::take(&mut self.fail_next_write);
         let fail_confirm = std::mem::take(&mut self.fail_next_confirm);
         self.check_live()?;
-        let class = class.max(self.sync).max(self.pending_class);
-        // A raised flight in a D0 store makes its records durable where D0's never are: the slots
-        // they name are marked, so a later D0 free of one waits for a sync (review 5 #18). Marked at
-        // the take, whether or not the flight then succeeds: holding a free longer is safe.
-        if !self.sync.syncs() && class.syncs() {
-            for &slot in &self.pending_slots {
-                arena.mark_synced_named(slot);
-            }
-        }
+        let class = self.flight_class(class);
         let end_lsn = self.lsn;
         if self.pending.is_empty() && !upgrade {
             return Ok(Flight {
@@ -1985,6 +2210,7 @@ impl Journal {
                 ordered: false,
                 dir: None,
                 nonce: self.nonce,
+                base_syncs: self.sync.syncs(),
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -2056,6 +2282,7 @@ impl Journal {
             ordered: false,
             dir,
             nonce: self.nonce,
+            base_syncs: self.sync.syncs(),
         })
     }
 
@@ -2085,15 +2312,31 @@ impl Journal {
     /// A checkpoint or compaction failed: the next is wanted only once another threshold's worth of
     /// log has been written (`compact_after`).
     pub(crate) fn defer_compaction(&mut self) {
-        self.compact_after = self.len + compact_min_log_bytes();
+        // Mutant `backoff_never_resumes` (test builds only; engine review 8 #3): the back-off never
+        // ends (half of u64::MAX, so the hard limit's sum cannot overflow).
+        self.compact_after = if super::store::fe_mutant("backoff_never_resumes") {
+            u64::MAX / 2
+        } else {
+            self.len + compact_min_log_bytes()
+        };
     }
 
     /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that
     /// finds the log past this waits for its install (InnoDB's synchronous flush point beside its
     /// asynchronous one), so the log stays within twice the threshold plus the operations in
     /// flight (r11-restart-r2, F-FZ).
+    ///
+    /// Measured from where the checkpoint was due (engine review 8 #1): after a failed one,
+    /// `compact_after` defers the next by a threshold, so that retry starts past twice the
+    /// threshold from the last cut, and the absolute limit would make every operation during its
+    /// flight wait for its install. `compact_after` is 0 at open and after every cut, so otherwise
+    /// nothing changes. Mutant `hard_limit_absolute` (test builds only): as before.
     pub(crate) fn past_hard_limit(&self) -> bool {
-        self.len > 2 * compact_min_log_bytes().max(2 * self.snapshot_len)
+        let threshold = compact_min_log_bytes().max(2 * self.snapshot_len);
+        if super::store::fe_mutant("hard_limit_absolute") {
+            return self.len > 2 * threshold;
+        }
+        self.len > (2 * threshold).max(self.compact_after + threshold)
     }
 
     /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.
@@ -2142,10 +2385,10 @@ impl Journal {
             let f = open_rw(&tmp, true)?;
             write_at(&f, &out, 0)?;
             if class.syncs() {
-                fsync_file(&f, class)?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
             }
         }
-        std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
+        rename_file(&tmp, &self.files.snap).map_err(|e| {
             self.set_poisoned();
             io_error(e, "rename branch snapshot")
         })?;
@@ -2194,7 +2437,7 @@ impl Journal {
                 lock_exclusive(&f, &tmp)?;
                 write_at(&f, &header, 0)?;
                 if class.syncs() {
-                    fsync_file(&f, class)?;
+                    sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
                 Ok(f)
             })();
@@ -2205,7 +2448,7 @@ impl Journal {
                     return Err(e);
                 }
             };
-            if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+            if let Err(e) = rename_file(&tmp, &self.files.log) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(io_error(e, "rename branch log reset"));
             }
@@ -2225,6 +2468,9 @@ impl Journal {
         self.len = LOG_HEADER_LEN as u64;
         self.header_stale = false;
         self.dir_dirty = false;
+        // The records an earlier run made durable are carried in a synced rewrite now (a
+        // compaction's snapshot, synced before this reset; a page-size restart's empty state).
+        self.inherited = SyncClass::Off;
         Ok(())
     }
 
@@ -2284,6 +2530,20 @@ fn cut_confirms(class: SyncClass) -> bool {
     proves_stable(class) || super::store::fe_mutant("cut_confirms_unsynced")
 }
 
+/// Write a cut's confirmation of the flight it keeps last (checksum `last_crc`, ending at `end`)
+/// into `file`'s header, when it may: the cut's own sync proves stable storage (`cut_confirms`),
+/// and every flight it keeps was written synced (`all_synced`, engine review 7 #1). A raised D0
+/// log's rewrite class syncs, yet a D0 flight it keeps named slots no sync covered: by the class
+/// alone the cut confirmed it, and recovery then refused a lost slot of it as damage instead of
+/// dropping the flight (engine review 8 #4). The one copy of the rule, for the three cuts.
+/// Mutant `cut_confirms_by_class` (test builds only): the class alone.
+fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32, end: u64) -> Result<()> {
+    if cut_confirms(class) && (all_synced || super::store::fe_mutant("cut_confirms_by_class")) {
+        write_at(file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+    }
+    Ok(())
+}
+
 /// A landed flight's confirmation (review 6 #1): the word for the log's header and the log it goes
 /// to, handed to the store's confirmation writer instead of being written inside the flight's
 /// acknowledgement window. The log may since have been replaced by a cut: the word then goes to
@@ -2298,7 +2558,35 @@ pub(crate) struct Confirm {
     fail: bool,
 }
 
+impl Journal {
+    /// Confirm the log's last flight at an open (engine review 7 #4; `Recovered::confirmable`):
+    /// its slots read back whole, the arena held no unsynced write, and the open's own sync of the
+    /// log proved stable storage, which drained the device the arena is on as well. The word is
+    /// bound to that flight's end frame and to where it ends, as a flight's own is (review 6 #1),
+    /// and written unsynced: its absence proves nothing.
+    pub(crate) fn confirm_at_open(&self) -> Result<()> {
+        if self.len < LOG_HEADER_LEN as u64 + 4 {
+            return Ok(());
+        }
+        let mut crc = [0u8; 4];
+        read_at(&self.file, &mut crc, self.len - 4)?;
+        write_at(&self.file, &confirm_word(u32::from_le_bytes(crc), self.len).to_le_bytes(), HEADER_CONFIRM_AT)
+    }
+}
+
 impl Confirm {
+    /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
+    /// the group, engine review 8 #9).
+    #[cfg(test)]
+    pub(crate) fn for_test(log: File, proved: bool) -> Self {
+        Self {
+            log,
+            word: 0,
+            proved,
+            fail: false,
+        }
+    }
+
     /// Whether the word may be written as is (`proved`).
     pub(crate) fn proved(&self) -> bool {
         self.proved
@@ -2435,6 +2723,9 @@ pub(crate) struct Flight {
     dir: Option<File>,
     /// The log incarnation's nonce, for the end frame `write` builds.
     nonce: u32,
+    /// The writer's own class syncs (`Journal::sync`): its end frame says whether it was synced as
+    /// every flight of this writer is, or raised (`EndKind`; engine review 10 #2).
+    base_syncs: bool,
 }
 
 impl Flight {
@@ -2481,7 +2772,15 @@ impl Flight {
         }
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
-            let end = end_frame(self.nonce, self.class.syncs(), &self.bytes);
+            // An ordered flight says so (review 6 #7): recovery takes its slots as there whenever
+            // its records are. Mutant `ordered_tag_ignored` (test builds only): tagged as a synced
+            // flight, as before.
+            let kind = if self.ordered && self.class.syncs() && !super::store::fe_mutant("ordered_tag_ignored") {
+                EndKind::ordered_by(self.base_syncs)
+            } else {
+                EndKind::of(self.class.syncs(), self.base_syncs)
+            };
+            let end = end_frame(self.nonce, kind, &self.bytes);
             self.bytes.extend_from_slice(&end);
             write_at(&log, &self.bytes, self.at)?;
         }
@@ -2490,7 +2789,7 @@ impl Flight {
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
         if let Some(dir) = &self.dir {
-            fsync_file(dir, SyncClass::Fsync)?;
+            fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
         }
         let mut confirm = None;
@@ -2596,12 +2895,12 @@ fn scan_crc_seeded(seed: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 pub(crate) static SCAN_CRC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A flight's end frame (format 11): the tag (synced or not), the flight's length, and its crc32c,
-/// the frame's own checksum and the flight's both seeded with the incarnation's `nonce`.
-fn end_frame(nonce: u32, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
+/// A flight's end frame (format 13): the tag (`EndKind`), the flight's length, and its crc32c, the
+/// frame's own checksum and the flight's both seeded with the incarnation's `nonce`.
+fn end_frame(nonce: u32, kind: EndKind, flight: &[u8]) -> [u8; END_FRAME_LEN] {
     let mut frame = [0u8; END_FRAME_LEN];
     let p = FRAME_HEADER_LEN;
-    frame[p] = if synced { END_SYNCED_TAG } else { END_TAG };
+    frame[p] = kind.tag();
     frame[p + 1..p + 5].copy_from_slice(&(flight.len() as u32).to_le_bytes());
     frame[p + 5..p + 9].copy_from_slice(&crc32c::crc32c_append(nonce, flight).to_le_bytes());
     frame[0..4].copy_from_slice(&(END_PAYLOAD_LEN as u32).to_le_bytes());
@@ -2612,7 +2911,7 @@ fn end_frame(nonce: u32, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
 
 /// Whether a frame of `len` payload bytes whose tag is `tag` is an end frame.
 fn is_end(len: usize, tag: u8) -> bool {
-    len == END_PAYLOAD_LEN && (tag == END_TAG || tag == END_SYNCED_TAG)
+    len == END_PAYLOAD_LEN && EndKind::from_tag(tag).is_some()
 }
 
 /// Whether the bytes at `at` could begin a whole frame, from its length, its tag and the count a
@@ -2630,7 +2929,9 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
         TAG_TRUNK_RETAIN => len == 29,
         TAG_RELEASE | TAG_RELEASE_OPEN | TAG_CLOSE | TAG_CLOCK | TAG_CHECKPOINT => len == 9,
         TAG_LEASE => len == 25,
-        END_TAG | END_SYNCED_TAG => len == END_PAYLOAD_LEN,
+        END_TAG | END_SYNCED_TAG | END_RAISED_TAG | END_ORDERED_TAG | END_ORDERED_RAISED_TAG => {
+            len == END_PAYLOAD_LEN
+        }
         _ => false,
     };
     (ok && p + len <= bytes.len()).then_some(len)
@@ -2639,7 +2940,9 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
 /// The first whole frame at or after `from`: `(offset, payload length, a synced end frame)`. An end
 /// frame is whole only under this incarnation's `nonce`; a record frame by its own checksum and
 /// decoding.
-fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, bool)> {
+/// The next whole frame of this incarnation at or after `from`: its offset, payload length, and
+/// for an end frame its kind (`None` for a record frame).
+fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, Option<EndKind>)> {
     let last = bytes.len().checked_sub(FRAME_HEADER_LEN + 1)?;
     (from..=last).find_map(|at| {
         let len = plausible_frame(bytes, at)?;
@@ -2648,9 +2951,9 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
         if is_end(len, payload[0]) {
             scan_crc_seeded(nonce, payload)
                 .eq(&crc)
-                .then_some((at, len, payload[0] == END_SYNCED_TAG))
+                .then_some((at, len, EndKind::from_tag(payload[0])))
         } else {
-            (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, false))
+            (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, None))
         }
     })
 }
@@ -2658,30 +2961,62 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
 /// Whether the damage at `damage` lies in, or before, a flight known to have been synced (review 2
 /// #2): a synced end frame of this incarnation after the damage, followed by any whole frame; or
 /// (review 5 #26) a synced end frame whose flight's own checksum holds from a frame boundary past
-/// the damage, a whole later flight — taken as proof only in a store whose class syncs (`syncs`),
-/// where every flight is synced before the next is written; under D0 an unsynced flight can be
-/// followed by a raised, synced one. A flight is written only after the one before it was synced,
+/// the damage, a whole later flight. A flight is written only after the one before it was synced,
 /// so either proves that sync returned: an acknowledged write was lost. Returns that end frame's
 /// offset.
-fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32, syncs: bool) -> Option<usize> {
+///
+/// The second form proves the damaged flight's sync returned only if the later flight's WRITER
+/// synced every flight before writing the next (engine review 7 #2), decided from the log's own
+/// evidence, not the opener's class: the later flight's own end frame says its writer's class
+/// synced (`EndKind::Synced`; engine review 10 #2: per flight, since a reopen in another class
+/// keeps the incarnation, so a whole-incarnation reading was wrong both ways), or the header
+/// confirms the later flight itself (`confirmed`: its sync returned, so every byte before it was
+/// durable). A raised flight (`EndKind::Raised`) proves nothing about the flights before it.
+/// Mutants (test builds only): `writer_syncs_by_opener` (the writer taken to sync iff the opener's
+/// class does, `opener_syncs`, as before engine review 7 #2) and
+/// `writer_evidence_whole_incarnation` (no whole flight of the incarnation tagged unsynced, before
+/// the damage, `unsynced_before`, or after it, as before engine review 10 #2).
+fn synced_flight_over(
+    bytes: &[u8],
+    damage: usize,
+    nonce: u32,
+    unsynced_before: bool,
+    confirmed: Option<u32>,
+    opener_syncs: bool,
+) -> Option<usize> {
     // fastest-engine mutant `damage_always_torn` (test builds only): every damage is a torn flight.
     if super::store::fe_mutant("damage_always_torn") {
         return None;
     }
+    let by_opener = super::store::fe_mutant("writer_syncs_by_opener");
+    let whole_incarnation = super::store::fe_mutant("writer_evidence_whole_incarnation");
+    let mut unsynced_seen = unsynced_before;
     // From the damage itself: an end frame whose own checksum holds but whose flight's does not
     // is where the scan stopped, and it is a synced flight covering the damage.
     let mut at = damage;
     let mut synced_end = None;
-    while let Some((found, len, synced)) = next_whole_frame(bytes, at, nonce) {
+    while let Some((found, len, end)) = next_whole_frame(bytes, at, nonce) {
         if synced_end.is_some() {
             return synced_end;
         }
-        if synced {
+        if end == Some(EndKind::Unsynced) {
+            unsynced_seen = true;
+        }
+        if let Some(kind) = end.filter(|k| k.synced()) {
             // Mutant `whole_later_flight_ignored` (test builds only): as before review 5 #26.
             let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
             let flight_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
             let flight_crc = u32::from_le_bytes(payload[5..9].try_into().unwrap());
-            let whole_later = syncs
+            let flight_end = (found + FRAME_HEADER_LEN + len) as u64;
+            let confirms = confirmed == Some(confirm_word(flight_crc, flight_end));
+            let writer_syncs = if by_opener {
+                opener_syncs
+            } else if whole_incarnation {
+                !unsynced_seen || confirms
+            } else {
+                kind.by_syncing_writer() || confirms
+            };
+            let whole_later = writer_syncs
                 && found.checked_sub(flight_len).is_some_and(|start| {
                     start > damage && scan_crc_seeded(nonce, &bytes[start..found]) == flight_crc
                 });
@@ -2700,10 +3035,24 @@ fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32, syncs: bool) -> O
 /// one end frame per kept flight, so every flight's boundary is kept (review 2 #3), and none for a
 /// flight with no kept record. A frame that is not whole is refused: the region was written whole
 /// before it was read. Returns the bytes and the last flight's checksum (for `HEADER_CONFIRM_AT`).
+///
+/// `synced`: the rewrite is synced. A kept flight is tagged synced only when its old end frame said
+/// so AND the rewrite syncs (engine review 7 #1): a flight written unsynced named slots no sync
+/// covered, and its tag is what tells a later open the arena may hold such writes (review 5 #10).
+/// Mutant `reframe_retags_by_class` (test builds only): every flight tagged by the rewrite's class
+/// alone, as before. Test builds only: every production rewrite calls `reframe_tagged`.
+#[cfg(test)]
 fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
+    reframe_tagged(kept, old, new, synced).map(|(out, last_crc, _)| (out, last_crc))
+}
+
+/// `reframe`, also saying whether every kept flight is tagged synced in the result: only then may
+/// a rewrite confirm its last one (engine review 7 #1).
+fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32, bool)> {
     let mut out = Vec::with_capacity(kept.len());
     let mut flight_at = 0;
     let mut last_crc = 0;
+    let mut all_synced = true;
     let mut pos = 0;
     while pos < kept.len() {
         let whole = kept.get(pos..pos + FRAME_HEADER_LEN).and_then(|head| {
@@ -2716,9 +3065,9 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
             } else {
                 len > 0 && crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
             };
-            ok.then_some((len, end))
+            ok.then_some((len, end, end && EndKind::from_tag(payload[0]).is_some_and(EndKind::synced)))
         });
-        let Some((len, end)) = whole else {
+        let Some((len, end, was_synced)) = whole else {
             return Err(corrupt(&format!(
                 "branch log rewrite met a frame that is not whole at byte {pos} of its kept suffix"
             )));
@@ -2727,7 +3076,12 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
         if !end {
             out.extend_from_slice(&kept[pos..next]);
         } else if out.len() > flight_at {
-            let frame = end_frame(new, synced, &out[flight_at..]);
+            let tag_synced = synced && (was_synced || super::store::fe_mutant("reframe_retags_by_class"));
+            all_synced &= tag_synced;
+            // A synced rewrite syncs every kept flight before anything follows them, as a writer
+            // whose class syncs does: a kept flight raised or synced is Synced in the new log
+            // (engine review 10 #2).
+            let frame = end_frame(new, EndKind::of(tag_synced, true), &out[flight_at..]);
             last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
             flight_at = out.len();
@@ -2741,7 +3095,27 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
             "branch log rewrite: the kept region does not end at a flight boundary".to_string(),
         ));
     }
-    Ok((out, last_crc))
+    Ok((out, last_crc, all_synced))
+}
+
+/// Sync a temp file that is to replace a branch file, in `class`; `fail` is the
+/// `ReplacementSyncFails` failpoint. A failed sync fail-stops the journal (`poisoned`; review 6
+/// #2): on Apple a failed F_FULLFSYNC is a failed drain of the whole device, which may have lost
+/// what earlier flights only barriered or plain-fsynced, and a later sync would report success over
+/// the loss (PostgreSQL panics on any fsync failure for the same reason). Mutant
+/// `replacement_sync_error_kept` (test builds only): the old file stays and the store goes on.
+fn sync_replacement(file: &File, class: SyncClass, fail: bool, poisoned: &AtomicBool) -> Result<()> {
+    let synced = if fail {
+        Err(LimboError::InternalError(
+            "failpoint: a branch file's replacement failed to sync".to_string(),
+        ))
+    } else {
+        fsync_file(file, class)
+    };
+    if synced.is_err() && !super::store::fe_mutant("replacement_sync_error_kept") {
+        poisoned.store(true, Ordering::Release);
+    }
+    synced
 }
 
 /// The flight checksum an end frame carries.
@@ -2794,37 +3168,65 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
         " (written before flight framing; recreate the branch files)".to_string()
     } else if version < 11 {
         " (written before the log nonce; recreate the branch files)".to_string()
+    } else if version < 13 {
+        " (written before per-flight writer evidence; recreate the branch files)".to_string()
     } else {
         String::new()
     }
 }
 
-/// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
-/// one branch store per set of branch files, in this process or another. A second store is
-/// refused at open instead of racing the first one's appends.
-///
-/// `flock(2)`, not `fcntl`: an `fcntl` lock belongs to the PROCESS, so two stores in one process
-/// (`Database::do_open`, which skips the registry, or a reopen inside the registry's `Weak`
-/// window) would both get it. An `flock` lock belongs to the open file description.
-///
-/// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
-/// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
-/// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
-/// verified here), which two stores in one process would share. And fork(2) without exec SHARES
-/// the lock with the child (macOS flock(2) NOTES: descriptors duplicated "through dup(2) or
-/// fork(2)" hold "multiple references to a single lock"): the child cannot write (`Journal::pid`
-/// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
-/// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
-/// (std opens files close-on-exec; recalled, not verified here).
-/// Test builds: while it holds 1, the next log open waits between its open(2) and its flock(2),
-/// having marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 5 #6).
+/// Test builds: while it holds 1, the next open of the log at `OPEN_LOCK_HOLD_PATH` waits between
+/// its open(2) and its flock(2), having marked its arrival (`| HOLD_ARRIVED`); stored 0 to release
+/// it (review 5 #6). Keyed to that one path (engine review 7 #13), so a neighbouring test's open
+/// neither consumes nor waits on it; armed and disarmed by `OpenLockHold`.
 #[cfg(test)]
 pub(crate) static OPEN_LOCK_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static OPEN_LOCK_HOLD_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-fn pause_before_lock() {
+/// Test builds: opens of a log that found its path naming another file once locked
+/// (`open_log_locked`), per log path: engine review 7 #13 asks that the rename race be shown to
+/// happen. Counted before the lock is accepted or the open made again, so a mutant that accepts
+/// the stale lock still shows the race happened (its judge: it must die on its claim, not on this).
+#[cfg(test)]
+static LOCK_RENAMED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: how many opens of the log at `path` found it renamed under their lock.
+#[cfg(test)]
+pub(crate) fn lock_renamed(path: &Path) -> u64 {
+    let seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+    seen.iter().find(|(p, _)| p.as_path() == path).map_or(0, |&(_, n)| n)
+}
+
+/// Test builds: `OPEN_LOCK_HOLD` armed for one log path while this lives; dropped, it releases and
+/// disarms the hold whatever the test did (a panic while armed no longer hangs later opens).
+#[cfg(test)]
+pub(crate) struct OpenLockHold;
+
+#[cfg(test)]
+impl OpenLockHold {
+    pub(crate) fn arm(path: &Path) -> Self {
+        *OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+        OPEN_LOCK_HOLD.store(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenLockHold {
+    fn drop(&mut self) {
+        OPEN_LOCK_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        *OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+fn pause_before_lock(path: &Path) {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering as O;
+        if OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_deref() != Some(path) {
+            return;
+        }
         let arrived = 1 | super::store::HOLD_ARRIVED;
         if OPEN_LOCK_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
             while OPEN_LOCK_HOLD.load(O::Acquire) == arrived {
@@ -2832,6 +3234,8 @@ fn pause_before_lock() {
             }
         }
     }
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 /// How many times a log replaced under an open is opened again before the open is refused.
@@ -2847,10 +3251,19 @@ fn open_log_locked(path: &Path, open: impl Fn(&Path) -> Result<Option<File>>) ->
         let Some(file) = open(path)? else {
             return Ok(None);
         };
-        pause_before_lock();
+        pause_before_lock(path);
         lock_exclusive(&file, path)?;
+        let names = still_names(&file, path)?;
+        #[cfg(test)]
+        if !names {
+            let mut seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+            match seen.iter_mut().find(|(p, _)| p.as_path() == path) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((path.to_path_buf(), 1)),
+            }
+        }
         // Mutant `lock_any_inode` (test builds only): the lock is taken on whatever was opened.
-        if still_names(&file, path)? || super::store::fe_mutant("lock_any_inode") {
+        if names || super::store::fe_mutant("lock_any_inode") {
             return Ok(Some(file));
         }
     }
@@ -2881,6 +3294,23 @@ fn still_names(file: &File, path: &Path) -> Result<bool> {
     }
 }
 
+/// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
+/// one branch store per set of branch files, in this process or another. A second store is
+/// refused at open instead of racing the first one's appends.
+///
+/// `flock(2)`, not `fcntl`: an `fcntl` lock belongs to the PROCESS, so two stores in one process
+/// (`Database::do_open`, which skips the registry, or a reopen inside the registry's `Weak`
+/// window) would both get it. An `flock` lock belongs to the open file description.
+///
+/// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
+/// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
+/// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
+/// verified here), which two stores in one process would share. And fork(2) without exec SHARES
+/// the lock with the child (macOS flock(2) NOTES: descriptors duplicated "through dup(2) or
+/// fork(2)" hold "multiple references to a single lock"): the child cannot write (`Journal::pid`
+/// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
+/// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
+/// (std opens files close-on-exec; recalled, not verified here).
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     // fastest-engine mutant `no_log_lock` (test builds only): no lock is taken.
     if super::store::fe_mutant("no_log_lock") {
@@ -2908,6 +3338,14 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = (file, path);
     Ok(())
+}
+
+/// The snapshot state `scan_as` took, read again from its file (engine review 7 #4): a snapshot
+/// store's open replays a second time only when its last flight's check fails, and reads the
+/// snapshot again for that instead of copying it before every replay. The open holds the log's
+/// lock, so the file is the one the scan read.
+pub(crate) fn reread_snapshot(files: &BranchFiles, format: u32) -> Result<SnapshotState> {
+    read_snapshot(&files.snap, format).map(|(_, _, state, _)| state)
 }
 
 /// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
@@ -3157,6 +3595,81 @@ mod lose_unsynced {
             });
         }
     }
+
+    /// Renames not yet made durable, per directory `(dev, ino)`, in order: each as (where the file
+    /// waits, where it goes).
+    fn renames() -> &'static Mutex<HashMap<(u64, u64), Vec<(PathBuf, PathBuf)>>> {
+        static RENAMES: OnceLock<Mutex<HashMap<(u64, u64), Vec<(PathBuf, PathBuf)>>>> = OnceLock::new();
+        RENAMES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Hold the rename of `from` over `to` until `to`'s directory is synced (engine review 7 #6):
+    /// a power cut before that loses it, as a file system may, leaving the old file at `to`. The
+    /// file moves at once to a name of its own beside `to` (so `from` is free again, as after a real
+    /// rename), and reaches `to` at the directory's sync (`apply`). `Ok(false)` when not armed (the
+    /// caller renames).
+    pub(super) fn hold_rename(from: &Path, to: &Path) -> Result<bool> {
+        if !armed() {
+            return Ok(false);
+        }
+        let dir = match to.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let meta = std::fs::metadata(dir).map_err(|e| io_error(e, "stat branch directory"))?;
+        let mut renames = renames().lock().unwrap();
+        let held = renames.entry((meta.dev(), meta.ino())).or_default();
+        let waits = PathBuf::from(format!("{}.held-rename-{}", to.display(), held.len()));
+        std::fs::rename(from, &waits).map_err(|e| io_error(e, "hold branch file rename"))?;
+        held.push((waits, to.to_path_buf()));
+        Ok(true)
+    }
+
+    /// A directory's sync: the renames held for it reach their names, in order.
+    pub(super) fn apply_renames(dir: &File) -> Result<()> {
+        if !armed() {
+            return Ok(());
+        }
+        let Some(k) = key(dir) else {
+            return Ok(());
+        };
+        let held = renames().lock().unwrap().remove(&k).unwrap_or_default();
+        for (waits, to) in held {
+            std::fs::rename(&waits, &to).map_err(|e| io_error(e, "apply branch file rename"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Rename `from` over `to` (a temp file taking a branch file's place). In test builds under the
+/// power-loss simulation (`FE_LOSE_UNSYNCED`), the rename reaches `to` only when `to`'s directory is
+/// synced, so a crash model can see a rename that was never made durable (engine review 7 #6).
+fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    match lose_unsynced::hold_rename(from, to) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => return Err(std::io::Error::other(e.to_string())),
+    }
+    std::fs::rename(from, to)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
+    /// durable once before the next acknowledgement, never once per flight).
+    pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
+/// simulation held for it.
+fn fsync_dir(dir: &File, class: SyncClass) -> Result<()> {
+    #[cfg(all(test, unix))]
+    lose_unsynced::apply_renames(dir)?;
+    fsync_file(dir, class)?;
+    #[cfg(test)]
+    DIR_SYNCS.with(|c| c.set(c.get() + 1));
+    Ok(())
 }
 
 /// The device an open file lives on (`fstat`'s `st_dev`); `None` where it cannot be read or off
@@ -3283,10 +3796,19 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         // the writes too. Any other failure is the sync's own (review 3 #4): retried, a later sync
         // of the file could report success for pages this one lost. Mutant `barrier_retries_any`
         // (test builds only): every failure falls back, as before.
+        //
+        // And only on a kernel that does not fall back itself (review 6 #6): from Darwin 23
+        // (macOS 14, xnu-10002) the kernel turns an F_BARRIERFSYNC the file system does not
+        // support into an F_FULLFSYNC and latches that per mount, so ENOTSUP, EOPNOTSUPP, EINVAL
+        // or ENOTTY reaching userland is that full sync's own failure, and a userland fallback
+        // would be the fsyncgate retry. (The kernel also retries EINVAL itself; and EOPNOTSUPP
+        // there can be either the file system's refusal or the full sync's, which it cannot tell
+        // apart from here — the reason the version, not the errno, decides.) Mutant
+        // `barrier_retries_on_new_kernel` (test builds only): the errno decides on every kernel.
         let unsupported = matches!(
             e.raw_os_error(),
             Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
-        );
+        ) && (darwin_major() < 23 || super::store::fe_mutant("barrier_retries_on_new_kernel"));
         if unsupported || super::store::fe_mutant("barrier_retries_any") {
             crate::io::count_barrier_fallback();
             return fsync_file(file, class);
@@ -3300,10 +3822,73 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
 #[cfg(test)]
 static BARRIER_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Test builds: the Darwin major version `barrier_file` takes the kernel for (0: the running
+/// kernel's), so both of its kernel arms run on one machine (review 6 #6).
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) static DARWIN_MAJOR_FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The running kernel's Darwin major version (`uname`'s release, "25.6.0" -> 25), read once. One
+/// that cannot be read counts as a new kernel (u32::MAX): then no failed barrier is retried, which
+/// costs an old kernel on a file system without barriers its fail-stop instead of a fallback, and
+/// never retries a failed full sync (review 6 #6).
+#[cfg(target_vendor = "apple")]
+fn darwin_major() -> u32 {
+    #[cfg(test)]
+    {
+        let forced = DARWIN_MAJOR_FORCED.load(std::sync::atomic::Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    running_darwin_major()
+}
+
+/// `darwin_major` with no test override: the running kernel's, from `uname`, read once.
+#[cfg(target_vendor = "apple")]
+fn running_darwin_major() -> u32 {
+    static MAJOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        // SAFETY: `uname` fills the struct it is given; a zeroed `utsname` is a valid value.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut name) } != 0 {
+            return u32::MAX;
+        }
+        // SAFETY: `uname` NUL-terminates `release` within the array.
+        let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+        release.to_str().map_or(u32::MAX, parse_darwin_major)
+    })
+}
+
+/// A Darwin release string's major version ("25.6.0" -> 25, "23" -> 23); u32::MAX when it has
+/// none (engine review 9 #11). Mutants (test builds only): `darwin_major_parses_minor` (the
+/// second field: "25.6.0" -> 6) and `darwin_major_unreadable_old` (0 when unreadable, an old
+/// kernel: the userland barrier retry review 6 #6 removed from macOS 14 on).
+#[cfg(target_vendor = "apple")]
+fn parse_darwin_major(release: &str) -> u32 {
+    let field = if super::store::fe_mutant("darwin_major_parses_minor") { 1 } else { 0 };
+    let unreadable = if super::store::fe_mutant("darwin_major_unreadable_old") {
+        0
+    } else {
+        u32::MAX
+    };
+    release
+        .split('.')
+        .nth(field)
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(unreadable)
+}
+
 /// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
 #[cfg(test)]
 pub(crate) fn fail_next_barrier(errno: i32) {
     BARRIER_ERRNO.store(errno, std::sync::atomic::Ordering::Release);
+}
+
+/// Test builds: the errno `fail_next_barrier` armed and no barrier has taken yet (0: none), so a
+/// test can assert its injection reached a barrier (engine review 9 #19).
+#[cfg(test)]
+pub(crate) fn barrier_errno_pending() -> i32 {
+    BARRIER_ERRNO.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
@@ -3315,7 +3900,7 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
             _ => Path::new("."),
         };
         let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
-        fsync_file(&d, class)
+        fsync_dir(&d, class)
     }
     #[cfg(not(unix))]
     {
@@ -3328,15 +3913,59 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Engine review 9 #11: a Darwin release's major version is its FIRST field, and a release
+    /// with none reads as a new kernel (u32::MAX), never an old one: an old one would retry a
+    /// failed barrier as a full sync (review 6 #6). The tests that force the version skip this.
+    /// Mutants `darwin_major_parses_minor`, `darwin_major_unreadable_old`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_darwin_release_reads_as_its_major_version() {
+        for (release, major) in [
+            ("25.6.0", 25),
+            ("22.6.0", 22),
+            ("23", 23),
+            ("", u32::MAX),
+            ("x.1", u32::MAX),
+        ] {
+            assert_eq!(
+                parse_darwin_major(release),
+                major,
+                "the major version was misread from Darwin release {release:?}"
+            );
+        }
+    }
+
+    /// Engine review 9 #11: unforced, the store takes the running kernel for the major version
+    /// that `sysctl -n kern.osrelease` reports, a reader other than the subject's `uname`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_running_kernels_darwin_major_is_the_one_sysctl_reports() {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.osrelease"])
+            .output()
+            .expect("premise: sysctl ran");
+        assert!(out.status.success(), "premise: sysctl kern.osrelease succeeded");
+        let release = String::from_utf8(out.stdout).expect("premise: sysctl printed UTF-8");
+        let digits: String = release.trim().chars().take_while(char::is_ascii_digit).collect();
+        let expected: u32 =
+            digits.parse().expect("premise: the release starts with its major version");
+        assert_eq!(
+            running_darwin_major(),
+            expected,
+            "the store reads kernel release {release:?} as another major version"
+        );
+    }
+
     /// The nonce in the header of the log at `path` (format 11).
     pub(super) fn log_nonce(path: &Path) -> u32 {
         let bytes = std::fs::read(path).unwrap();
         u32::from_le_bytes(bytes[HEADER_NONCE_AT..HEADER_NONCE_AT + 4].try_into().unwrap())
     }
 
-    /// An end frame for the record frames `flight`, as the log at `path` would write it.
+    /// An end frame for the record frames `flight`, as the log at `path` would write it (a synced
+    /// one as a writer whose class syncs tags it).
     pub(super) fn forged_end(path: &Path, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
-        end_frame(log_nonce(path), synced, flight)
+        end_frame(log_nonce(path), EndKind::of(synced, true), flight)
     }
 
     /// Two whole SYNCED flights of `frames` each, as the log at `path` would write them: what proves,
@@ -3951,14 +4580,23 @@ mod flight_tests {
 
     /// A flight whose end did not reach the disk whole is dropped whole: none of it was
     /// acknowledged, and a whole record inside it is not replayed on its own (mutant M-h,
-    /// `apply_torn_flight`, must fail this).
+    /// `apply_torn_flight`, must fail this — on its assertion: the open returning its state is a
+    /// premise, so a mutant that makes the open fail shows as a premise failure, not a kill).
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #5): the `unwrap` became that premise.
     #[test]
     fn a_flight_whose_end_is_torn_is_dropped_whole() {
         let dir = tempfile::TempDir::new().unwrap();
         let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         let len = std::fs::metadata(&files.log).unwrap().len();
         OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
-        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let recovered = match Journal::recover(&files, SyncClass::Off) {
+            Ok(Some(recovered)) => recovered,
+            other => panic!(
+                "premise: the open returned its state (a failure here is not this test's claim): {:?}",
+                other.map(|r| r.is_some())
+            ),
+        };
         assert_eq!(forks(&recovered.records), vec![1, 2], "a torn flight's whole record was replayed");
         drop(recovered);
         assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
@@ -4428,14 +5066,22 @@ mod format_tests {
     /// Review 5 #6: a second store that opens the log path just before the first store replaces the
     /// log by a rename, and takes the lock just after, must not get the lock of the unlinked inode:
     /// it would see no state and clobber the live log. The lock is taken on the file the path names
-    /// once it is held, and the second create is refused. (Hook: the next open waits between its
-    /// open(2) and its flock(2).)
+    /// once it is held, and the second create is refused. (Hook: the next open of this log waits
+    /// between its open(2) and its flock(2).)
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #13): the hook is armed for this test's log path only and
+    /// disarmed by a guard (a panic while armed hung every later log open in the binary), and the
+    /// race is shown to have happened: the second open found the path renamed once it was locked.
+    /// FLAGGED TEST EDIT (its judge, 2026-10-06T14:45:43Z): that premise is counted per log path
+    /// (`lock_renamed`) and before the lock is accepted, so mutant `lock_any_inode` passes it and
+    /// dies on the claim below, not on the premise.
     #[test]
     fn a_lock_taken_across_a_rename_of_the_log_is_refused() {
         use std::sync::atomic::Ordering as O;
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        OPEN_LOCK_HOLD.store(1, O::Release);
+        let retries = lock_renamed(&files.log);
+        let _hold = OpenLockHold::arm(&files.log);
         let second = {
             let files = files.clone();
             std::thread::spawn(move || Journal::create(&files, 512, SyncClass::Off).map(|_| ()))
@@ -4449,6 +5095,10 @@ mod format_tests {
         let first = Journal::create(&files, 512, SyncClass::Off).unwrap();
         OPEN_LOCK_HOLD.store(0, O::Release);
         let got = second.join().unwrap();
+        assert!(
+            lock_renamed(&files.log) > retries,
+            "premise: the second open found the log renamed under its lock"
+        );
         assert!(got.is_err(), "a second store took the lock of the log's old inode");
         drop(first);
     }
@@ -4504,5 +5154,309 @@ mod format_tests {
             Err(e) => e.to_string(),
         };
         assert!(!refused.contains("snapshot"), "a catalog store's refusal names a snapshot: {refused}");
+    }
+
+    // ---- engine review 7 #1 and the arena truncation clause ----
+
+    /// Whether the log holds a whole flight tagged synced, and one tagged not synced, as a scan
+    /// reads them.
+    fn end_tags(files: &BranchFiles) -> (bool, bool) {
+        let scanned = Journal::scan_as(files, SyncClass::Fsync, FORMAT_VERSION).unwrap().expect("state");
+        match scanned.end {
+            End::Keep { synced_end, unsynced_end, .. } => (synced_end, unsynced_end),
+            End::Reset => (false, false),
+        }
+    }
+
+    /// Engine review 7 #1, and the arena truncation clause ("recovery truncates the log at the first
+    /// dropped or invalid record and makes that durable — ftruncate, F_FULLFSYNC of the log and of
+    /// its directory — before the next append"): a log that D1 or D2 flights were synced into and
+    /// whose tail is torn, reopened in D0, is cut IN PLACE and the cut synced, since the class
+    /// recovery decides for it syncs (the kept flights are tagged synced). Before, the cut ignored
+    /// that class: the durable log was copied into an unsynced temp file renamed over it, with no
+    /// directory sync, and every kept flight retagged unsynced.
+    #[cfg(unix)]
+    #[test]
+    fn a_synced_log_cut_at_a_d0_recovery_is_truncated_in_place_and_made_durable() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        // A hole in the last flight: it was never acknowledged, and is cut.
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let inode = std::fs::metadata(&files.log).unwrap().ino();
+        let before = super::super::sync_counts();
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let after = super::super::sync_counts();
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        drop(recovered);
+        let meta = std::fs::metadata(&files.log).unwrap();
+        assert_eq!(meta.ino(), inode, "the cut replaced the log instead of truncating it");
+        assert_eq!(meta.len(), starts[2], "the log was not truncated at the first dropped record");
+        // F_FULLFSYNC is Apple's; elsewhere the full sync is an fsync(2).
+        let full = after.full_fsync - before.full_fsync;
+        let synced = if cfg!(target_vendor = "apple") { full } else { full + after.fsync - before.fsync };
+        assert!(
+            synced >= 2,
+            "the cut was not made durable (a full sync of the log and of its directory) before the next \
+             append: {synced} full syncs"
+        );
+        assert_eq!(end_tags(&files), (true, false), "the cut retagged synced flights as unsynced");
+    }
+
+    /// Engine review 7 #1: a log of D0 flights cut at a D2 recovery keeps them tagged unsynced, so
+    /// every later open still counts the arena as holding writes no sync covered (review 5 #10)
+    /// and syncs it. Before, the cut retagged them synced in the class it rewrote in, and one more
+    /// reopen lost the mark.
+    #[test]
+    fn a_d0_written_log_cut_under_d2_keeps_its_flights_unsynced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Off);
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let recovered = Journal::recover(&files, SyncClass::FullFsync).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        drop(recovered);
+        for open in 0..2 {
+            assert!(end_tags(&files).1, "open {open}: the D0 flights lost their unsynced tag");
+            let again = Journal::recover(&files, SyncClass::FullFsync).unwrap().expect("state");
+            drop(again);
+        }
+    }
+
+    /// Engine review 7 #1: a D0 recovery cut of D0 flights (nothing ever synced) stays a new
+    /// incarnation, confirms no flight (no sync proved one), and leaves its rename for the next
+    /// flight that syncs (a raised one) to make durable, by syncing the log's directory first.
+    #[test]
+    fn a_d0_recovery_cut_confirms_nothing_and_leaves_its_rename_to_the_next_synced_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Off);
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        assert!(recovered.journal.dir_dirty, "a D0 cut's rename is left for no later sync to make durable");
+        drop(recovered);
+        let bytes = std::fs::read(&files.log).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4].try_into().unwrap()),
+            0,
+            "a D0 cut confirmed a flight no sync proved"
+        );
+    }
+
+    /// Engine review 10 #4: `dir_dirty` lives in memory, so a process that died after a cut's
+    /// rename and before the flight that would sync the directory (C1 kills at cut.renamed) left
+    /// the rename not durable, and the next process acknowledged syncing flights over it: a power
+    /// cut can bring back the older-generation log and lose them. An open of a whole log, which
+    /// cuts nothing, cannot tell whether the dead process renamed: a syncing open syncs the
+    /// log's directory before anything follows, and a D0 open leaves it to the next flight that
+    /// syncs. Mutant `open_forgets_unsynced_rename`.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_makes_a_rename_the_dead_process_left_durable() {
+        let dirs = || DIR_SYNCS.with(|c| c.get());
+        for class in [SyncClass::Fsync, SyncClass::FullFsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            flights(&files, 0, &[1, 1], class);
+            let before = dirs();
+            let recovered = Journal::recover(&files, class).unwrap().expect("state");
+            assert!(!recovered.records.is_empty(), "{class:?}: premise: the whole log was kept");
+            assert!(
+                dirs() > before,
+                "{class:?}: a syncing open left the log's directory unsynced"
+            );
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert!(!recovered.records.is_empty(), "Off: premise: the whole log was kept");
+        assert!(
+            recovered.journal.dir_dirty,
+            "Off: a D0 open left a rename no later syncing flight makes durable"
+        );
+    }
+
+    /// Engine review 10 #3: a log a D1 run synced (acknowledged in Fsync) reopened in D0 has
+    /// rewrite class Off: its header was never raised, and the class recovery decided for it was
+    /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
+    /// compaction, then replaced the log holding those acknowledged records with an unsynced file
+    /// and no directory sync. Until that first rewrite lands, the store rewrites in the class the
+    /// records were made durable in. Mutant `inherited_floor_dropped`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_open_of_a_synced_log_rewrites_in_the_class_it_was_synced_in() {
+        let dirs = || DIR_SYNCS.with(|c| c.get());
+        for compaction in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            flights(&files, 0, &[1, 1], SyncClass::Fsync);
+            let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+            assert!(!journal.raised.syncs(), "compaction={compaction}: premise: the D1 run never raised the header");
+            let (before, synced) = (dirs(), super::super::sync_counts());
+            if compaction {
+                journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
+            } else {
+                let end = journal.mark();
+                let generation = journal.generation;
+                journal.rewrite_from(end, generation).unwrap();
+            }
+            let after = super::super::sync_counts();
+            assert!(
+                after.fsync + after.full_fsync > synced.fsync + synced.full_fsync,
+                "compaction={compaction}: the first rewrite of acknowledged records synced no file"
+            );
+            assert!(
+                dirs() > before,
+                "compaction={compaction}: the first rewrite of acknowledged records synced no directory"
+            );
+            let before = dirs();
+            let end = journal.mark();
+            let generation = journal.generation;
+            journal.rewrite_from(end, generation).unwrap();
+            assert_eq!(dirs(), before, "compaction={compaction}: the inherited floor outlived the rewrite that carried its records");
+        }
+    }
+
+    /// Engine review 7 #2 (a): review 5 #26's rule (damage under one whole later synced flight lies
+    /// in an acknowledged flight) rests on the WRITER syncing every flight before the next, so it
+    /// holds for a log D1/D2 flights were synced into whatever class reopens it. Before, a D0 open
+    /// of such a log cut it silently: TrunkRetains dropped, children reading newer trunk pages.
+    #[test]
+    fn damage_under_a_whole_later_flight_of_a_syncing_writer_is_refused_at_a_d0_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        // The middle flight's end frame is lost; the last flight is whole.
+        overwrite(&files.log, starts[2] - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+        let got = Journal::recover(&files, SyncClass::Off);
+        assert!(
+            matches!(got, Err(LimboError::Corrupt(_))),
+            "an acknowledged flight lost under one whole later flight was cut at a D0 open: {:?}",
+            got.map(|r| r.map(|r| forks(&r.records)))
+        );
+    }
+
+    /// Engine review 7 #2 (b): in a D0 log, a flight written unsynced followed by a raised, synced
+    /// one proves nothing about the first: it was never synced before the second was written, and a
+    /// crash before the second's sync returned can keep the second whole and tear the first. So a
+    /// torn D0 flight under a whole raised flight is a torn tail, cut, at any open; the evidence is
+    /// the log's own (the unsynced flight's end frame), not the opener's class. Before, a syncing
+    /// open refused it: "every branch is lost".
+    #[test]
+    fn a_torn_d0_flight_under_a_raised_flight_is_cut_at_a_syncing_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let second;
+        {
+            let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+            let mut arena = Arena::new(512);
+            journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            second = journal.len;
+            journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+            journal.raise_pending_class(SyncClass::FullFsync);
+            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+        }
+        // The first flight's record frame is torn; its end frame (tagged unsynced) and the raised
+        // flight after it are whole.
+        overwrite(&files.log, LOG_HEADER_LEN as u64 + 2, &[0u8; 4]);
+        let got = Journal::recover(&files, SyncClass::Fsync);
+        match got {
+            Ok(Some(r)) => assert!(forks(&r.records).is_empty(), "the torn tail was not cut: {:?}", forks(&r.records)),
+            other => panic!(
+                "a torn D0 flight under a raised flight (from byte {second}) was refused or lost the state: {:?}",
+                other.map(|r| r.map(|r| forks(&r.records)))
+            ),
+        }
+    }
+
+    /// Engine review 10 #2 (a): the writer's evidence was read across the whole incarnation, and a
+    /// D0 run's unsynced flight earlier in it (kept by a D1 reopen) made every later whole D1
+    /// flight prove nothing: damage under one was cut silently, dropping acknowledged records. The
+    /// evidence is per flight now: a whole later flight its writer tagged synced by its own class
+    /// proves the damaged flight before it was synced. Mutant `writer_evidence_whole_incarnation`.
+    #[test]
+    fn damage_under_a_later_base_synced_flight_is_refused_after_an_earlier_d0_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1], SyncClass::Off);
+        let first_end;
+        {
+            let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
+            let mut arena = Arena::new(512);
+            journal.buffer(&Record::Fork { child: 21, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+            first_end = journal.len;
+            journal.buffer(&Record::Fork { child: 22, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        }
+        assert!(end_tags(&files).1, "premise: the D0 run's flight is still tagged unsynced");
+        // The first D1 flight's end frame is lost; the D1 flight after it is whole.
+        overwrite(&files.log, first_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+        let got = Journal::recover(&files, SyncClass::Fsync);
+        assert!(
+            matches!(got, Err(LimboError::Corrupt(_))),
+            "an acknowledged D1 flight lost under a whole later D1 flight was cut: {:?}",
+            got.map(|r| r.map(|r| forks(&r.records)))
+        );
+    }
+
+    /// Engine review 10 #2 (b): a D0 flight torn whole away (its end frame too) between two raised
+    /// flights left no unsynced flight in the incarnation for the old rule to see, so the later
+    /// raised flight was taken for a syncing writer's and the open refused, "every branch is
+    /// lost", where the D0 flight and the raised one after it were never acknowledged. A raised
+    /// flight's own tag says its writer's class does not sync: cut, at a D0 and a syncing open.
+    /// Mutant `writer_evidence_whole_incarnation`.
+    #[test]
+    fn a_vanished_d0_flight_before_a_raised_flight_is_cut_at_any_open() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let (from, to);
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                let mut arena = Arena::new(512);
+                journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+                journal.raise_pending_class(SyncClass::FullFsync);
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                from = journal.len;
+                journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                to = journal.len;
+                journal.buffer(&Record::Fork { child: 3, parent: 0 }).unwrap();
+                journal.raise_pending_class(SyncClass::FullFsync);
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            }
+            overwrite(&files.log, from, &vec![0u8; (to - from) as usize]);
+            let got = Journal::recover(&files, opener);
+            match got {
+                Ok(Some(r)) => assert_eq!(forks(&r.records), vec![1], "{opener:?}: the torn tail was not cut where it begins"),
+                other => panic!(
+                    "{opener:?}: a vanished D0 flight before a raised one was refused or lost the state: {:?}",
+                    other.map(|r| r.map(|r| forks(&r.records)))
+                ),
+            }
+        }
+    }
+
+    /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
+    /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
+    /// stays synced only when the rewrite syncs too.
+    #[test]
+    fn reframe_keeps_a_flights_unsynced_tag() {
+        for (written, rewrite) in [(SyncClass::Off, true), (SyncClass::Fsync, true), (SyncClass::Fsync, false)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let starts = flights(&files, 0, &[2], written);
+            let bytes = std::fs::read(&files.log).unwrap();
+            let nonce = tests::log_nonce(&files.log);
+            let (out, _) = reframe(&bytes[starts[0] as usize..], nonce, nonce ^ 1, rewrite).unwrap();
+            let tag = out[out.len() - END_FRAME_LEN + FRAME_HEADER_LEN];
+            let want = if written.syncs() && rewrite { END_SYNCED_TAG } else { END_TAG };
+            assert_eq!(tag, want, "written in {written:?}, rewritten syncing={rewrite}: the end frame's tag");
+        }
     }
 }

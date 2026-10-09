@@ -738,6 +738,31 @@ const C1_POINTS: &[&str] = &[
     "cut.dir_synced",
 ];
 
+/// Whether a C1 run in this mode can reach `point` (engine review 7 #8): a snapshot store takes no
+/// catalog checkpoint (`ckpt.*`) and cuts no log (`cut.*`); a catalog store compacts into no
+/// snapshot (`compact.renamed`) and cuts only when its checkpoints are fuzzy.
+fn c1_reachable(point: &str, catalog: bool, fuzzy: bool) -> bool {
+    match point {
+        "compact.renamed" => !catalog,
+        p if p.starts_with("ckpt.") => catalog,
+        p if p.starts_with("cut.") => catalog && fuzzy,
+        _ => true,
+    }
+}
+
+/// The checkpoint threshold a C1 child runs with when `FE_C1_THRESHOLD` is unset and the trial is
+/// aimed at a checkpoint or a cut (engine review 7 #8): low enough that one runs within a trial.
+const C1_CKPT_THRESHOLD: u64 = 64 << 10;
+
+/// `FE_C1_THRESHOLD`, refused unless it is a byte count (engine review 7 #8: a malformed value was
+/// silently ignored, and the run reached no checkpoint).
+fn c1_threshold() -> Option<u64> {
+    std::env::var("FE_C1_THRESHOLD").ok().map(|v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("FE_C1_THRESHOLD={v:?} is not a byte count"))
+    })
+}
+
 const C1_TRIAL_SECS: u64 = 20;
 
 fn encode_ops(ops: &[Op]) -> String {
@@ -925,7 +950,7 @@ fn c1_child() {
     };
     // Review 4 #10: a lowered checkpoint threshold, so fuzzy checkpoints (and their cut windows)
     // run within a trial.
-    if let Some(bytes) = std::env::var("FE_C1_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+    if let Some(bytes) = c1_threshold() {
         super::journal::set_compact_threshold(bytes);
     }
     let db = open_at(Path::new(&path), c1_opts());
@@ -1191,8 +1216,15 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         if let Ok(ms) = std::env::var("FE_KILL_DELAY_MS") {
             cmd.env("FE_KILL_DELAY_MS", ms);
         }
-        if let Ok(bytes) = std::env::var("FE_C1_THRESHOLD") {
-            cmd.env("FE_C1_THRESHOLD", bytes);
+        match c1_threshold() {
+            Some(bytes) => {
+                cmd.env("FE_C1_THRESHOLD", bytes.to_string());
+            }
+            // A trial aimed at a checkpoint or a cut runs one within the trial (engine review 7 #8).
+            None if catalog && (point.starts_with("ckpt.") || point.starts_with("cut.")) => {
+                cmd.env("FE_C1_THRESHOLD", C1_CKPT_THRESHOLD.to_string());
+            }
+            None => {}
         }
         cmd.spawn().unwrap()
     };
@@ -1306,6 +1338,19 @@ fn c1_sigkill_at_aimed_points() {
     let class = env_class_named("FE_C1_CLASS");
     let seed = env_u64("FE_C1_SEED", 7);
     let recover_kill = std::env::var("FE_C1_RECOVER_KILL").is_ok_and(|v| v == "1");
+    let _ = c1_threshold();
+    // Only the points this mode can reach are aimed at, and each must land (engine review 7 #8):
+    // a run that never reached one has not tested it. (Before, every point was cycled, so a
+    // catalog run of 18 trials never aimed at the cut points, and one landing anywhere passed.)
+    let fuzzy = catalog
+        && super::BranchCheckpoint::resolve(None, std::env::var_os("R11_SPLICE").is_some())
+            .is_ok_and(|m| m == super::BranchCheckpoint::Fuzzy);
+    let points: Vec<&str> = C1_POINTS.iter().copied().filter(|p| c1_reachable(p, catalog, fuzzy)).collect();
+    let only = std::env::var("FE_C1_POINT").ok();
+    if let Some(p) = only.as_deref() {
+        assert!(C1_POINTS.contains(&p), "FE_C1_POINT={p:?} is not a C1 kill point");
+        assert!(points.contains(&p), "FE_C1_POINT={p:?} cannot be reached in this mode (catalog={catalog}, fuzzy={fuzzy})");
+    }
     let mut rng = Rng(seed | 1);
     let (mut landed, mut unaimed, mut violations) = (0u64, 0u64, Vec::new());
     let mut per_point: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
@@ -1313,10 +1358,9 @@ fn c1_sigkill_at_aimed_points() {
     // observation, reported beside the verdict (an operation the engine refused mid-run).
     let mut in_run: BTreeMap<String, u64> = BTreeMap::new();
     for trial in 0..trials {
-        let only = std::env::var("FE_C1_POINT").ok();
         let point: &str = match only.as_deref() {
             Some(p) => C1_POINTS.iter().copied().find(|q| *q == p).expect("a known kill point"),
-            None => C1_POINTS[trial as usize % C1_POINTS.len()],
+            None => points[trial as usize % points.len()],
         };
         let n = 1 + rng.below(40);
         let rk = (recover_kill && trial % 3 == 2).then(|| 1 + rng.below(20));
@@ -1353,6 +1397,24 @@ fn c1_sigkill_at_aimed_points() {
         println!("C1 in-run error x{n}: {message}");
     }
     assert!(violations.is_empty(), "{summary}\n{}", violations.join("\n"));
+    // Every point aimed at must have landed at least once (engine review 7 #8), checked before the
+    // weaker "some kill landed", so a run that landed none still says which points it missed. Mutant
+    // `c1_coverage_unchecked` (test builds only): as before, one landing anywhere passes.
+    let aimed: Vec<&str> = match only.as_deref() {
+        Some(p) => vec![p],
+        None => points.clone(),
+    };
+    let missing: Vec<&str> = aimed
+        .into_iter()
+        .filter(|p| per_point.get(p).is_none_or(|e| e.0 == 0))
+        .collect();
+    assert!(
+        missing.is_empty() || super::store::fe_mutant("c1_coverage_unchecked"),
+        "{summary}: C1 COVERAGE: no kill landed at {missing:?}, which this mode reaches; raise FE_C1_TRIALS \
+         (at least {} for {} points) or aim one with FE_C1_POINT",
+        2 * points.len(),
+        points.len()
+    );
     assert!(landed > 0, "{summary}: no kill landed where it was aimed");
 }
 
