@@ -183,9 +183,12 @@ def warm_problems(nm, sm, warm_rule):
     (capped, and only when not done), in integer ns with seconds truncated as (uint64_t)(S * 1e9) -- Python's float
     product is the same IEEE double and int() truncates the same way. The binaries record warmup_ops (the claims before
     the ending one), warmup_end_ns (the ending claim), warmup_capped, and warmup_last_claim_ns (the last warm-up claim,
-    null with none). Exactly what the rule implies, nothing within a slack: the ending claim ends it as recorded, the
-    last warm-up claim did not (it came before MAX_S, and did not already meet OPS and S), and warmup_s is the ending
-    claim's time. (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
+    null with none) and warmup_backsteps (claims judged with an older time than the one before them). Exactly what the
+    rule implies, nothing within a slack: the ending claim ends it as recorded, the last warm-up claim did not (it came
+    before MAX_S, and did not already meet OPS and S), warmup_s is the ending claim's time, the record names its loop
+    mode, and every claim was judged in time order in either mode: no backstep, and no warm-up claim after the ending
+    one (closed loop reads each claim's time under the claim lock; open loop takes the next arrival of the run's one
+    arrival stream under it, as the macOS claim_op does). (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
     try:
         o_r, s_r, m_r = warm_rule.split(":")
         o_r, s_r, m_r = int(o_r), float(s_r), float(m_r)
@@ -199,6 +202,13 @@ def warm_problems(nm, sm, warm_rule):
         return [f"{nm} run has no A23 warm-up record (warmup_ops {wo!r}, warmup_end_ns {end!r}, warmup_capped "
                 f"{capped!r}, warmup_last_claim_ns {last!r}, warmup_s {ws!r})"]
     why = []
+    # The loop mode is recorded, and the order checks hold in BOTH modes (the lead's reversal of its correction on
+    # 0138d2128): a closed-loop claim's time is read under the claim lock, and an open-loop claim takes the next
+    # arrival of the run's one arrival stream under the same lock (the macOS claim_op at 4010ff3b06), so in either mode
+    # claims are judged in time order and a step back is a defect.
+    loop = sm.get("loop")
+    if loop not in ("closed", "open"):
+        why.append(f"{nm} run's loop mode {loop!r} is neither closed nor open")
     done = wo >= o_r and end >= s_ns
     if capped and done:
         why.append(f"{nm} run says its warm-up ended capped, but OPS and S were met at the ending claim "
@@ -219,6 +229,15 @@ def warm_problems(nm, sm, warm_rule):
                        f"{last} ns, met OPS and S of {warm_rule})")
     if abs(ws - end / 1e9) > 1e-6:
         why.append(f"{nm} run's warmup_s {ws} is not its ending claim's time {end / 1e9:.9f} s")
+    # The claims were judged in time order (fastest-linux's LOW on f6c2dbb2f): the binaries read a closed-loop claim's
+    # time under the claim lock, as claim_op does, and count every claim judged with an older time than the one judged
+    # before it. Without that order, an ending claim older than an already-counted warm-up claim passes the last-claim
+    # check above whenever that claim was not the last one judged.
+    bs = sm.get("warmup_backsteps")
+    if not _count(bs):
+        why.append(f"{nm} run has no warmup_backsteps record ({bs!r})")
+    elif bs:
+        why.append(f"{nm} run judged {bs} warm-up claim(s) with an older time than the claim judged before them")
     return why
 
 
@@ -363,9 +382,13 @@ CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # S 10 of the rule 1000:10:180; an uncapped 5 s window under the 1800 s cap). PREREG annex A23: the warm-up ends at a
 # claim, so the record names that claim's time (warmup_end_ns, ns since t0), whether it ended capped, and the time of
 # the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
-# 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done.
+# 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done. warmup_backsteps: the claims judged
+# with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are);
+# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (each client's own intended
+# times, decided in lock order).
 RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
-       "warmup_last_claim_ns": 9_999_800_000, "max_window_s": 1800.0, "window_s": 5.0}
+       "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
+       "window_s": 5.0}
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
@@ -518,6 +541,32 @@ def selftest():
          dict(tracer=clean, timed_extra={"warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}), False),
         ("A23: warm-up ops but no last claim time", dict(tracer=clean, timed_extra={"warmup_last_claim_ns": None}),
          False),
+        # fastest-linux's LOW on f6c2dbb2f: the closed-loop claim time was read BEFORE g_claim_mu, so a slower claimant
+        # could be judged later in lock order with an older time -- and an ending claim older than a warm-up claim
+        # already counted is invisible to the last-claim check whenever that claim was not the last one judged
+        # (e.g. warm 10.0003 s, warm 10.0001 s, end 10.0002 s). The binaries now count such backsteps under the lock.
+        ("A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)",
+         dict(tracer=clean, timed_extra={"warmup_backsteps": 1}), False),
+        ("A23: no warmup_backsteps in the record", dict(tracer=clean, timed_extra={"warmup_backsteps": None}), False),
+        # The lead's REVERSAL of its correction on 0138d2128 (that correction, at 8eb5e7699, accepted open-loop
+        # backsteps because this port's open loop drew one Poisson schedule per client): the survivor, the macOS
+        # claim_op at 4010ff3b06, draws every open-loop arrival from ONE run-wide stream under the claim lock, so its
+        # claims are judged in arrival order and backsteps are 0 in both loop modes; the port now draws that stream.
+        # The loop field stays in the record; the two order checks apply in both modes again.
+        ("A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), False),
+        ("A23: the same record in closed loop is refused",
+         dict(tracer=clean, timed_extra={"loop": "closed", "warmup_backsteps": 3}), False),
+        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
+                                         "warmup_last_claim_ns": 10_000_600_000}), False),
+        ("A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}),
+         False),
+        ("A23: a shared-stream open-loop record (0 backsteps, claims in arrival order) is accepted",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 0}), True),
+        ("A23: no loop mode in the record", dict(tracer=clean, timed_extra={"loop": None}), False),
+        ("A23: a loop mode that is neither closed nor open", dict(tracer=clean, timed_extra={"loop": "b1"}), False),
         ("the labelling run's warm-up left early",
          dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
                                        "warmup_last_claim_ns": 999_000_000}), False),
@@ -585,7 +634,7 @@ def selftest():
     # rule's text (the same edges as the shared harness's cases), never from a driver.
     def wrec(ops, end_ns, capped, last_ns):
         return {"warmup_ops": ops, "warmup_s": end_ns / 1e9, "warmup_capped": capped, "warmup_end_ns": end_ns,
-                "warmup_last_claim_ns": last_ns}
+                "warmup_last_claim_ns": last_ns, "warmup_backsteps": 0, "loop": "closed"}
     for rule_in, rec, want, what in (
             ("1000:1:0", wrec(0, 0, True, None), True, "MAX_S 0 ends at the first claim, capped (no 'no limit')"),
             ("1000:1:0", wrec(1000, 1_200_000_000, False, 1_190_000_000), False,
