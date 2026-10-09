@@ -556,30 +556,49 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
         let s0 = sync_counts();
-        std::thread::scope(|s| {
-            let started = (0..c).try_for_each(|t| {
+        // Per client, from its start to its last acknowledgement: the store's condition-variable
+        // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
+        // counts again), its store-mutex acquisitions, and the creates refused Busy or
+        // SchemaUpdated and retried (the population's `fork_one` retries them silently).
+        let per: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
+            let mut clients = Vec::new();
+            for t in 0..c {
                 let go = &go;
-                std::thread::Builder::new()
-                    .stack_size(8 << 20)
-                    .spawn_scoped(s, move || {
-                        let trunk = db.connect();
-                        while !go.load(std::sync::atomic::Ordering::Acquire) {
-                            std::thread::yield_now();
-                        }
-                        let trunk = trunk.unwrap();
-                        for i in 0..rounds {
-                            let name = format!("{arm}-{t}-{i:04}");
-                            fork_one(&trunk, Some(&name));
-                            if cfw {
-                                let b = db.connect_named(&name).unwrap();
-                                exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                    let trunk = db.connect();
+                    while !go.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let trunk = trunk.unwrap();
+                    let (w0, l0) = (super::store::thread_waits(), probe::thread_locks());
+                    let mut retries = 0u64;
+                    for i in 0..rounds {
+                        let name = format!("{arm}-{t}-{i:04}");
+                        loop {
+                            match trunk.create_branch(&name) {
+                                Ok(_) => break,
+                                Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => retries += 1,
+                                Err(e) => panic!("{arm}: create {name}: {e}"),
                             }
                         }
-                    })
-                    .map(|_| ())
-            });
+                        if cfw {
+                            let b = db.connect_named(&name).unwrap();
+                            exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                        }
+                    }
+                    (delta(w0, super::store::thread_waits()), delta(l0, probe::thread_locks()), retries)
+                });
+                match spawned {
+                    Ok(h) => clients.push(h),
+                    Err(e) => {
+                        // The clients already started must not be left parked for ever.
+                        go.store(true, std::sync::atomic::Ordering::Release);
+                        panic!("{cell}: a thread of {c} did not start: {e}");
+                    }
+                }
+            }
             go.store(true, std::sync::atomic::Ordering::Release);
-            started.unwrap_or_else(|e| panic!("{cell}: a thread of {c} did not start: {e}"));
+            clients.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let s1 = sync_counts();
         let mut m = Sample::new();
@@ -588,6 +607,10 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
         m.insert("barrier", s1.barrier - s0.barrier);
+        m.insert("store_waits", per.iter().map(|p| p.0).sum());
+        m.insert("store_waits_max_client", per.iter().map(|p| p.0).max().unwrap_or(0));
+        m.insert("store_locks", per.iter().map(|p| p.1).sum());
+        m.insert("retries", per.iter().map(|p| p.2).sum());
         line(out, cell, arm, 0, &m);
     }
 }
@@ -2542,4 +2565,72 @@ fn a_schema_window_reread_runs_under_the_wal_write_lock_only_on_the_first_child_
         let _ = writeln!(failures, "  first_control under the WAL write lock (page reads, prepares, schema rows): {:?} at {}, {:?} at {}; budget equal", (a.1, a.2, a.3), a.0, (b.1, b.2, b.3), b.0);
     }
     assert!(failures.is_empty(), "the schema window's re-read under the WAL write lock [engine 2b]:\n{failures}");
+}
+
+// ---- contention: C clients creating at once (the shared-flight cells, `SHARED_CS`) ----
+
+/// Every shared-flight line: `(cell, C, arm, sample)`; the create-then-first-write arm runs only up
+/// to C = 64. Refuses a cell that lacks an arm it must have.
+fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
+    let mut lines = Vec::new();
+    for c in SHARED_CS {
+        let spec = format!("shared_c{c}");
+        let data = cell(&spec);
+        for arm in ["shared_create", "shared_cfw"] {
+            match data.ops.get(arm).and_then(|v| v.first()) {
+                Some(s) => lines.push((spec.clone(), c, arm, s.clone())),
+                None => assert!(arm == "shared_cfw" && c > 64, "{spec}: no {arm} line"),
+            }
+        }
+    }
+    lines
+}
+
+/// Engine review 4 (the retry storm) and the trunk fork's own contract (`BranchStore::fork_trunk`:
+/// "The fork itself waits for no trunk commit and never retries"): at every C from 1 to 1,024, no
+/// create is refused Busy or SchemaUpdated and retried. WRITTEN NOT RUN (2026-10-09, QUIET).
+#[test]
+fn contention_no_create_is_refused_and_retried_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        if s["retries"] != 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} creates refused and retried by {c} clients; budget 0", s["retries"]);
+        }
+    }
+    assert!(failures.is_empty(), "creates refused under contention:\n{failures}");
+}
+
+/// Review 1 #9 (futile wake-ups) and group commit's shape (DESIGN §3; PREREG M2: a create buffered
+/// while a flight is in progress rides the next one): at every C from 1 to 1,024, the clients' store
+/// waits number at most two per acknowledgement — the flight in progress, then its own. The count is
+/// one per condition-variable wait call (`store::thread_waits`), so a waiter woken for a flight that
+/// does not carry it, and waiting again, counts again: a convoy, or one condition variable woken for
+/// every flight, shows here as more. Store-mutex acquisitions per acknowledgement are reported with
+/// it (no budget: a flight leader's count per flight is not stated anywhere). WRITTEN NOT RUN
+/// (2026-10-09, QUIET).
+#[test]
+fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        let (acks, waits, locks) = (s["acks"], s["store_waits"], s["store_locks"]);
+        assert!(acks > 0, "{spec}: {arm}: no acknowledgement counted");
+        let _ = write!(
+            seen,
+            " C={c}/{arm} {:.2} waits, {:.2} locks per ack (worst client {});",
+            waits as f64 / acks as f64,
+            locks as f64 / acks as f64,
+            s["store_waits_max_client"]
+        );
+        if waits > 2 * acks {
+            let _ = writeln!(failures, "  {spec}: {arm}: {waits} store waits over {acks} acknowledgements by {c} clients; budget <= 2 per acknowledgement");
+        }
+    }
+    assert!(failures.is_empty(), "acknowledgements wait through more than two flights (all:{seen}):\n{failures}");
 }

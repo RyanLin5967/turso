@@ -386,6 +386,11 @@ pub(crate) fn end() -> Snapshot {
     s
 }
 
+/// This thread's store-mutex acquisitions so far (exact per thread however many others run).
+pub(crate) fn thread_locks() -> u64 {
+    T_LOCKS.with(|c| c.get())
+}
+
 /// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
 /// per thread however many others run.
 pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
