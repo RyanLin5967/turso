@@ -2656,6 +2656,58 @@ fn terminate_ends_the_session_and_frees_its_branch_first() {
         .ok("a delete right after the close, first try");
 }
 
+/// The create-latency pilot's connect form: a session started on a new branch runs SELECT 1 and an
+/// UPDATE, then sends Terminate and reads to EOF with its own end open, as bbload's synchronous
+/// close does. The server closes within 2 s, having kept the UPDATE (or rolled back the block it
+/// was in), and the next create and the delete succeed first try. In fastest-tools' dry run
+/// (frontier/fastest/tools/pilot/raw/20261008T212622Z-EXPLORATORY-dry2-*, T_m1-connect) every close
+/// waited out bbload's 5 s bound and the next create or delete took 1-2 s, on a binary built
+/// 2026-10-06T03:39Z, before 02ebcc464 (wire review 3 item 3); the dev tree's head then was
+/// 6dcd40163 (reflog). terminate_ends_the_session_and_frees_its_branch_first runs no statement on
+/// the branch before its Terminate.
+#[test]
+fn a_branch_session_that_wrote_closes_at_terminate() {
+    let dir = Scratch::new("terminatewrite");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let close = |c: &mut Wire, what: &str| {
+        c.send(b'X', &[]);
+        c.s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 1];
+        let read = c.s.read(&mut buf);
+        assert!(
+            matches!(read, Ok(0)),
+            "{what}: after Terminate the server did not close within 2 s: {read:?}"
+        );
+    };
+    for (name, in_block, kept) in [("w0", false, "branch"), ("w1", true, "trunk")] {
+        a.q(&format!("SELECT turso_branch_create('{name}')"))
+            .ok("create");
+        let mut c = server
+            .connect_to(&format!("postgres/{name}"))
+            .expect("startup on the branch");
+        c.q("SELECT 1").ok("select");
+        if in_block {
+            c.q("BEGIN").ok("begin");
+        }
+        c.q("UPDATE t SET v = 'branch' WHERE id = 1").ok("update");
+        close(&mut c, name);
+        a.q(&format!("SELECT turso_branch_create('{name}n')"))
+            .ok("the next create, first try");
+        let mut r = server
+            .connect_to(&format!("postgres/{name}"))
+            .expect("a new session on the branch, first try");
+        assert_eq!(
+            r.q("SELECT v FROM t WHERE id = 1").single("the row"),
+            kept,
+            "{name}"
+        );
+        close(&mut r, name);
+        a.q(&format!("SELECT turso_branch_delete('{name}')"))
+            .ok("a delete right after the close, first try");
+    }
+}
+
 /// A delete right after a session on the branch closed its socket (no Terminate, no retry)
 /// succeeds: the server waits, as PostgreSQL's DROP DATABASE waits up to 5 s for exiting backends,
 /// for the closing session to release the branch, instead of refusing 55006 because the release
