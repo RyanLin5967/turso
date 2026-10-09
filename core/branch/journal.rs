@@ -5716,6 +5716,47 @@ mod format_tests {
         }
     }
 
+    /// Engine review 16 #16: a synced rewrite syncs every kept flight before anything follows them,
+    /// so `reframe_tagged` tags a kept raised flight Synced, evidence for the flight before it,
+    /// and nothing tested that. Raised R1, an unsynced D0 flight U, raised R2 (each raised flight
+    /// written after a byte that may not have been synced, so both tagged Raised), all kept by a
+    /// synced cut, then R1's end frame lost: R2, whole and Synced in the new log, proves R1 was
+    /// synced, and recovery refuses at a D0 and a syncing open. Mutant `reframe_keeps_raised`.
+    #[test]
+    fn damage_under_a_kept_raised_flight_after_a_synced_cut_is_refused() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let mut r1_end = 0;
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                let mut arena = Arena::new(512);
+                for (child, raised) in [(1, true), (2, false), (3, true)] {
+                    journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                    if raised {
+                        journal.raise_pending_class(SyncClass::FullFsync);
+                    }
+                    journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                    if child == 1 {
+                        r1_end = journal.len;
+                    }
+                }
+                let generation = journal.generation;
+                journal.rewrite_from_as(LOG_HEADER_LEN as u64, generation, SyncClass::Fsync).unwrap();
+                assert_eq!(journal.len, std::fs::metadata(&files.log).unwrap().len(), "premise: the cut kept every flight");
+            }
+            // R1's end frame is lost in the cut log (its flights keep their offsets: the header and
+            // every frame keep their lengths).
+            overwrite(&files.log, r1_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+            let got = Journal::recover(&files, opener);
+            assert!(
+                matches!(got, Err(LimboError::Corrupt(_))),
+                "{opener:?}: a raised flight a synced cut kept, lost under a whole later kept flight, was cut: {:?}",
+                got.map(|r| r.map(|r| forks(&r.records)))
+            );
+        }
+    }
+
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
     /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
     /// stays synced only when the rewrite syncs too.
