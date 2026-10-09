@@ -7260,6 +7260,7 @@ version = "0.8.0-pre.7"
 dependencies = [
  "clap",
  "hex",
+ "libc",
  "sha1",
  "tempfile",
  "turso_core",
