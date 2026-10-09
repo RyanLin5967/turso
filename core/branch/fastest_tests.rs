@@ -5552,6 +5552,45 @@ fn a_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way: &str) 
     );
 }
 
+/// Engine review 17 LOW 10: `wal_insert_frame` (the raw WAL API, open once no branch exists)
+/// writes and syncs the WAL's header first when the WAL was truncated, and that sync was unwatched
+/// while undrained branch records could remain. A D0 store over a fullfsync trunk (so the sync is
+/// a drain on Apple too) with x's Release undrained, the WAL truncated, its header's sync failing:
+/// the next fork is refused. Mutant `raw_header_sync_unwatched`.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_failed_raw_frame_header_sync_fail_stops_a_store_with_an_undrained_record() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("raw-header.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let page_size = trunk.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let mut frame = vec![0u8; 24 + page_size];
+        trunk.wal_get_frame(1, &mut frame).unwrap();
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.wal_insert_begin().unwrap();
+        armed.store(1, O::Release);
+        let inserted = trunk.wal_insert_frame(1, &frame);
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the WAL header's sync was reached");
+        assert!(inserted.is_err(), "{what}: premise: the failed header sync failed the insert");
+        let _ = trunk.wal_insert_end(false);
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a failed raw WAL header sync with an undrained Release"),
+        );
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_failed_pragma_checkpoint_wal_sync_fail_stops_a_snapshot_store() {
