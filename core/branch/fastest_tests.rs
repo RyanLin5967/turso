@@ -4465,6 +4465,46 @@ fn a_fuzzy_install_marks_its_commit_in_the_class_it_synced_in() {
     );
 }
 
+/// Engine review 17 MED 6: the arm of review 15 MED 2 that runs on every target. A D0 catalog
+/// store, unraised at the capture, releases x (its Release at `r`); the fuzzy checkpoint is held
+/// after its catalog commit (synced in Off); a childless FULL trunk commit then leads the flight
+/// its barrier needs, raising the log (`take_flight` notes the class before the write) and failing
+/// (`GroupFlightFails`), which fail-stops the store. The install must mark its commit in the class
+/// it synced in: durable(Fsync) stays below `r`, and the next childless FULL trunk commit, whose
+/// barrier covers `r`, leads a flight and is refused. Mutant `fuzzy_committed_class_at_install`.
+#[test]
+fn a_fuzzy_install_marks_its_commit_in_its_capture_class_after_a_failed_raised_flight() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("fuzzy-class-portable.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.fork_branch().unwrap().reap().unwrap();
+    let r = db.branches.last_release_lsn_for_test();
+    assert!(r > 0, "premise: x's Release is logged");
+    assert!(!db.branches.rewrite_class_for_test().syncs(), "premise: the D0 store is not raised at the capture");
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("premise: the checkpoint never committed", || {
+        db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED
+    });
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+    assert!(failed.is_err(), "premise: the barrier's raised flight failed the commit");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the failed flight's take raised the log");
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert!(
+        db.branches.durable_for_test(SyncClass::Fsync) < r,
+        "the fuzzy install marked its Off catalog commit durable in the raised class on a fail-stopped store"
+    );
+    assert_fail_stopped(
+        trunk.execute("UPDATE t SET v = 'again' WHERE id = 9").map(|_| ()),
+        "the next childless FULL trunk commit over a Release the install did not make durable",
+    );
+}
+
 /// Sets `store::HOLD_BOUND_FORCED` for one test, and clears it when dropped.
 struct HoldBound;
 
