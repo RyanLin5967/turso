@@ -353,24 +353,39 @@ static const char *whyf(const char *fmt, ...) {
 }
 /* The fds each arm's timed ops sync (tenth review HIGH 1): recorded per arm, with the number of calls on each, and
  * written to summary.json as sync_fds, so blkflush attributes a traced fsync/fdatasync by its fd to the window of the
- * arm that owns that fd instead of by time alone. Only the calls op() makes (CUR_ARM >= 0): setup and teardown syncs
- * are not an op's. More distinct fds than SYNCFD_MAX on one arm marks the record overflowed (post then refuses). */
+ * arm that owns that fd instead of by time alone. An op only stores the fds it synced in the caller's synced_t (at
+ * most SYNC_OP_MAX: the clone and the directory); the timed loop records them with note_syncs AFTER the window's
+ * closing clock read (V3 review 12 item 14: the bookkeeping, a per-arm linear scan and the CUR_ARM stores, ran inside
+ * the timed window and inflated the floor reference). Setup and teardown syncs are not an op's. More distinct fds than
+ * SYNCFD_MAX on one arm, or more syncs in one op than SYNC_OP_MAX, marks the record overflowed (post then refuses). */
 #define SYNCFD_MAX 4
-static int CUR_ARM = -1, SYNC_OVERFLOW = 0;
+#define SYNC_OP_MAX 2
+typedef struct {
+    int n, over;
+    int fd[SYNC_OP_MAX];
+} synced_t;
+static int SYNC_OVERFLOW = 0;
 static int SYNC_FD[NARMS][SYNCFD_MAX], SYNC_NFD[NARMS];
 static uint64_t SYNC_CALLS[NARMS][SYNCFD_MAX];
-static void note_sync(int fd) {
-    if (CUR_ARM < 0) return;
-    for (int k = 0; k < SYNC_NFD[CUR_ARM]; k++)
-        if (SYNC_FD[CUR_ARM][k] == fd) { SYNC_CALLS[CUR_ARM][k]++; return; }
-    if (SYNC_NFD[CUR_ARM] == SYNCFD_MAX) { SYNC_OVERFLOW = 1; return; }
-    SYNC_FD[CUR_ARM][SYNC_NFD[CUR_ARM]] = fd;
-    SYNC_CALLS[CUR_ARM][SYNC_NFD[CUR_ARM]++] = 1;
+static void synced(synced_t *sy, int fd) { /* inside the window: one store */
+    if (sy->n < SYNC_OP_MAX) sy->fd[sy->n++] = fd;
+    else sy->over = 1;
 }
-static void barrier(int fd) {
+static void note_syncs(int a, const synced_t *sy) { /* outside the window */
+    if (sy->over) SYNC_OVERFLOW = 1;
+    for (int q = 0; q < sy->n; q++) {
+        int fd = sy->fd[q], k;
+        for (k = 0; k < SYNC_NFD[a] && SYNC_FD[a][k] != fd; k++) {}
+        if (k < SYNC_NFD[a]) { SYNC_CALLS[a][k]++; continue; }
+        if (SYNC_NFD[a] == SYNCFD_MAX) { SYNC_OVERFLOW = 1; continue; }
+        SYNC_FD[a][SYNC_NFD[a]] = fd;
+        SYNC_CALLS[a][SYNC_NFD[a]++] = 1;
+    }
+}
+static void barrier(int fd, synced_t *sy) {
     if (MUTANT) return;
     if (fsync(fd) == -1) die("fsync");
-    note_sync(fd);
+    synced(sy, fd);
 }
 static void setup_sync(int fd, const char *what) { if (fsync(fd) == -1) die(what); } /* never mutated */
 static uint64_t now(void) {
@@ -621,18 +636,13 @@ static void setup(int a, armst *s, int crash) {
     }
 }
 
-static void op_body(int a, armst *s, uint64_t i);
-static void op(int a, armst *s, uint64_t i) {
-    CUR_ARM = a;
-    op_body(a, s, i);
-    CUR_ARM = -1;
-}
-static void op_body(int a, armst *s, uint64_t i) {
+/* one op of arm a; the fds it synced go to sy (recorded by the caller after the timed window: review 12 item 14) */
+static void op(int a, armst *s, uint64_t i, synced_t *sy) {
     buf[i % 4096] ^= 1; /* every write differs */
     if (is_append(a)) {
         if (pwrite(s->fd, buf, s->rec, s->off) != (ssize_t)s->rec) die("append");
         s->off += (off_t)s->rec;
-        if (a != NOSYNC25) barrier(s->fd);
+        if (a != NOSYNC25) barrier(s->fd, sy);
     } else if (a == OW4K || a == OW64K || a == OW1M || a == FDATASYNC4K) {
         if (s->off + (off_t)s->rec > s->cap) s->off = 0;
         if (pwrite(s->fd, buf, s->rec, s->off) != (ssize_t)s->rec) die("overwrite");
@@ -640,10 +650,10 @@ static void op_body(int a, armst *s, uint64_t i) {
         if (a == FDATASYNC4K) {
             if (!MUTANT) {
                 if (fdatasync(s->fd) == -1) die("fdatasync");
-                note_sync(s->fd);
+                synced(sy, s->fd);
             }
         }
-        else barrier(s->fd);
+        else barrier(s->fd, sy);
     } else if (is_copy(a)) {
         char nm[32];
         snprintf(nm, sizeof nm, "c%llu", (unsigned long long)i);
@@ -659,12 +669,12 @@ static void op_body(int a, armst *s, uint64_t i) {
             ssize_t r = copy_file_range(s->srcfd, &oin, fd, NULL, MIB, 0);
             if (r != (ssize_t)MIB) { if (r >= 0) errno = EIO; die("copy_file_range (failed or short)"); }
         } else if (ioctl(fd, FICLONE, s->srcfd) != 0) die("ioctl FICLONE");
-        if (a != CLONE1B) barrier(fd);
+        if (a != CLONE1B) barrier(fd, sy);
         if (close(fd) != 0) die("clone close");
-        barrier(s->dfd);
+        barrier(s->dfd, sy);
     } else if (a == CLEAN) {
         if (fsync(s->fd) == -1) die("clean fsync"); /* the control is never mutated */
-        note_sync(s->fd);
+        synced(sy, s->fd);
     }
 }
 
@@ -1462,7 +1472,8 @@ static int crash_main(int arm, const char *out, const char *exe_sha) {
     for (size_t i = 0; i < sizeof buf; i++) buf[i] = (char)xs();
     armst s;
     setup(arm, &s, 1);
-    op(arm, &s, 0);
+    synced_t sy0 = {0}; /* crash mode writes no summary: the fds are not recorded */
+    op(arm, &s, 0, &sy0);
     char p[PATH_MAX];
     pathf(p, sizeof p, "%s/crash.json", out);
     FILE *f = fopen(p, "w");
@@ -1699,10 +1710,12 @@ int main(int argc, char **argv) {
         for (int j = na - 1; j > 0; j--) { int k = (int)(xs() % (uint64_t)(j + 1)), t = order[j]; order[j] = order[k]; order[k] = t; }
         for (int q = 0; q < na; q++) {
             int j = order[q];
+            synced_t sy = {0};
             uint64_t t0 = now();
-            op(sel[j], &st[j], i);
+            op(sel[j], &st[j], i, &sy);
             lat[j][i] = now() - t0;
             t0s[j][i] = t0;
+            note_syncs(sel[j], &sy); /* after the window's closing clock read (review 12 item 14) */
         }
     }
     /* stationarity, recorded: p50 of the first and the last quarter of each arm's ops, in op order (fresh review M3) */
