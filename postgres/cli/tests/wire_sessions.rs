@@ -5349,6 +5349,103 @@ fn an_added_foreign_key_needs_a_unique_parent_key() {
     a.q("INSERT INTO c VALUES (5)").ok("a matching child");
 }
 
+/// ALTER TABLE ADD FOREIGN KEY checks each key it adds on its own, in PostgreSQL's order
+/// (ATAddForeignKeyConstraint): a second added key onto a non-unique parent column is 42830 naming
+/// that key's parent; a parent column or a key column that does not exist is 42703 "column ...
+/// referenced in foreign key constraint does not exist" (the parent's was 42830); and a child
+/// whose older key no longer resolves still takes a valid new key. The engine's resolution of
+/// every key of the table was the check, so its error always blamed the first added key's parent,
+/// and an older unresolvable key refused every new one (wire review 13 item 3). The older key is
+/// made unresolvable by dropping the unique index it needs, which PostgreSQL refuses (2BP01) and
+/// this server does not (E5-QUEUE); if that DROP is ever refused, this arm's premise fails, loudly.
+#[test]
+fn an_added_foreign_key_is_checked_on_its_own() {
+    let dir = Scratch::new("fkown");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("CREATE TABLE q(id INT PRIMARY KEY, code INT UNIQUE)")
+        .ok("q");
+    a.q("INSERT INTO q VALUES (1, 5)").ok("q row");
+    a.q("CREATE TABLE c(x INT, y INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5, NULL)").ok("c row");
+    let sql =
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES q(code), ADD FOREIGN KEY (y) REFERENCES p(code)";
+    let r = a.q(sql);
+    assert_eq!(r.status, b'I', "{sql}");
+    let e = r.err(sql);
+    assert_eq!(e.code, "42830", "{sql}");
+    assert!(
+        e.message.contains("referenced table \"p\""),
+        "the second key's parent is named: {}",
+        e.message
+    );
+    for sql in [
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES q(nosuch)",
+        "ALTER TABLE c ADD FOREIGN KEY (nosuch) REFERENCES q(code)",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.status, b'I', "{sql}");
+        let e = r.err(sql);
+        assert_eq!(e.code, "42703", "{sql}");
+        assert!(
+            e.message
+                .contains("\"nosuch\" referenced in foreign key constraint"),
+            "{sql}: {}",
+            e.message
+        );
+    }
+    // No key was added: c takes an orphan.
+    a.q("INSERT INTO c VALUES (6, 6)")
+        .ok("c is unchanged after the refusals");
+    a.q("CREATE TABLE r(id INT PRIMARY KEY, code INT)").ok("r");
+    a.q("CREATE UNIQUE INDEX r_code ON r(code)")
+        .ok("r's unique key");
+    a.q("CREATE TABLE d(x INT REFERENCES r(code), y INT)")
+        .ok("d, keyed on r(code)");
+    a.q("DROP INDEX r_code")
+        .ok("premise: the index d's key needs can be dropped here");
+    a.q("ALTER TABLE d ADD FOREIGN KEY (y) REFERENCES q(code)")
+        .ok("a valid key beside an older one that no longer resolves");
+}
+
+/// ALTER TABLE ADD FOREIGN KEY refuses a key the catalog alone condemns before it rebuilds the
+/// table: a parent key of another column count is 42830, and `REFERENCES nosuch(a, b)` is 42P01
+/// (both were 42601, the engine refusing the rebuilt CREATE TABLE after the table was copied
+/// aside and dropped). While another session holds the trunk's write lock the refusal is answered
+/// as it is, not 55P03 after the lock wait: nothing is written for it, so a refused ALTER costs
+/// O(catalog) instead of two copies of the table and an index rebuild (wire review 13 item 4).
+#[test]
+fn a_foreign_key_the_catalog_refuses_is_refused_before_the_rebuild() {
+    let dir = Scratch::new("fkearly");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT UNIQUE)")
+        .ok("p");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9, 9)")
+        .ok("another session takes the write lock");
+    for (sql, code) in [
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id, code)",
+            "42830",
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES nosuch(a, b)",
+            "42P01",
+        ),
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, code, "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+    }
+    w.q("ROLLBACK").ok("end");
+    a.q("INSERT INTO c VALUES (6)").ok("c is unchanged");
+}
+
 /// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
 /// it. Its copy-back ran with foreign keys enforced, so it counted rows again: (i) a block's
 /// deferred orphan was cancelled by a valid child the copy re-inserted, and COMMIT kept the
