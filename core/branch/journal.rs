@@ -3182,9 +3182,9 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
             } else {
                 len > 0 && crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
             };
-            ok.then_some((len, end, if end { EndKind::from_tag(payload[0]).map_or(SyncClass::Off, EndKind::class) } else { SyncClass::Off }))
+            ok.then_some((len, end, if end { EndKind::from_tag(payload[0]) } else { None }))
         });
-        let Some((len, end, was_class)) = whole else {
+        let Some((len, end, was)) = whole else {
             return Err(corrupt(&format!(
                 "branch log rewrite met a frame that is not whole at byte {pos} of its kept suffix"
             )));
@@ -3193,15 +3193,18 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
         if !end {
             out.extend_from_slice(&kept[pos..next]);
         } else if out.len() > flight_at {
+            let was_class = was.map_or(SyncClass::Off, EndKind::class);
             let tag_synced = synced && (was_class.syncs() || super::store::fe_mutant("reframe_retags_by_class"));
             all_synced &= tag_synced;
             // A synced rewrite syncs every kept flight before anything follows them, as a writer
             // whose class syncs does: a kept flight raised or synced is Synced in the new log
             // (engine review 10 #2), in the class it was made durable in (engine review 16 MED 7:
             // what a later rewrite of its records must sync in; the rewrite's own class is at
-            // least that, `Journal::rewrite_class`).
+            // least that, `Journal::rewrite_class`). Mutant `reframe_keeps_raised` (test builds
+            // only; engine review 16 #16): a raised one stays Raised.
             let class = if tag_synced { was_class.max(SyncClass::Fsync) } else { SyncClass::Off };
-            let frame = end_frame(new, EndKind::of_class(class, true), &out[flight_at..]);
+            let base = !(super::store::fe_mutant("reframe_keeps_raised") && was.is_some_and(|k| k.synced() && !k.by_syncing_writer()));
+            let frame = end_frame(new, EndKind::of_class(class, base), &out[flight_at..]);
             last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
             flight_at = out.len();
