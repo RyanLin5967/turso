@@ -56,6 +56,20 @@ def load(path):
     return rows
 
 
+def plan(path, fs, seed):
+    """One filesystem's runs: rows of [cell-rK, system, clients, ops, runs, class, K]."""
+    rows = [r for r in load(path) if r["fs"] == fs]
+    rng = random.Random(f"{seed}:{fs}")
+    blocks = max(int(r["runs"]) for r in rows) if rows else 0
+    out = []
+    for k in range(1, blocks + 1):
+        block = [r for r in rows if int(r["runs"]) >= k]
+        rng.shuffle(block)
+        for r in block:
+            out.append([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"], str(k)])
+    return out
+
+
 def main(a):
     if len(a) == 3 and a[1] == "fslist":
         seen = []
@@ -65,15 +79,8 @@ def main(a):
         print(" ".join(seen))
         return 0
     if len(a) == 5 and a[1] == "plan":
-        rows = [r for r in load(a[2]) if r["fs"] == a[3]]
-        rng = random.Random(f"{a[4]}:{a[3]}")
-        blocks = max(int(r["runs"]) for r in rows) if rows else 0
-        for k in range(1, blocks + 1):
-            block = [r for r in rows if int(r["runs"]) >= k]
-            rng.shuffle(block)
-            for r in block:
-                print("\t".join([f"{r['cell']}-r{k}", r["system"], r["clients"], r["ops"], r["runs"], r["class"],
-                                  str(k)]))
+        for row in plan(a[2], a[3], a[4]):
+            print("\t".join(row))
         return 0
     print(__doc__, file=sys.stderr)
     return 2

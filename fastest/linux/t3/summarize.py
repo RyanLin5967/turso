@@ -550,6 +550,37 @@ def self_test():
                       not ok and any("planned op totals differ" in x for x in s["parity_refusals"]), s["parity_refusals"]))
     finally:
         shutil.rmtree(root)
+    # fourth lane review HIGH 2: the repo's own smoke manifest, planned by cells.py, gives no parity refusal (the
+    # PREREG sizes n_run per system, so ours at 200 and a competitor at 30 in one block is the registered shape)
+    import cells  # noqa: E402
+    root = tempfile.mkdtemp(prefix="summarize-st-")
+    try:
+        out = os.path.join(root, "out")
+        man = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cells-smoke.tsv")
+        fsl = sorted({r["fs"] for r in cells.load(man)})
+        w(f"{out}/fslist.txt", " ".join(fsl) + "\n")
+        w(f"{out}/warmup.txt", f"warm-up rule {RULE} (cap 1800s)\n")
+        rows = ["fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid"]
+        for fs in fsl:
+            plan = cells.plan(man, fs, 20261005)
+            w(f"{out}/fs-{fs}/plan.tsv", "".join("\t".join(r) + "\n" for r in plan))
+            for cell, system, clients, ops, _, _, _ in plan:
+                rows.append(f"{fs}\t{cell}\t{system}\t{clients}\t1\t0\tVALID")
+                a1 = f"{out}/fs-{fs}/cells/{cell}/a1"
+                if system == "ours":
+                    w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
+                                                               "ops_total_asked": int(ops)}))
+                else:
+                    w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
+                    w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
+                                                                              "measured_ops": int(ops)}))
+                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops)}))
+        w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
+        s, _ = summarize(out, "sha", "1", "m")
+        cases.append(("HIGH 2: cells-smoke.tsv planned by cells.py gives no parity refusal (n_run is per system)",
+                      s["parity_refusals"] == [] and s["planned_runs"] > 0, s["parity_refusals"]))
+    finally:
+        shutil.rmtree(root)
     root = tempfile.mkdtemp(prefix="summarize-st-")
     try:
         s, _ = summarize(make(root), "sha", "1", "m")
