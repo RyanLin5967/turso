@@ -31,13 +31,14 @@ Gates (any failure makes the measurement VOID, and the block with it):
     in the timed run as in the V1L-checked labelling run (the timed run has no tracer; this ties it to the checked one);
   - the drive's queue/write_cache reads "write back" or "write through" (anything else VOIDs); on "write back" the flush
     counter rises by at least 10,000 across the timed fsync run AND across the strace-checked labelling run (a lower
-    bound: another process's flushes can pad it, never shrink it; T3 runner review item 3), and the timed run makes
-    at least the labelling run's whole flushes per fsync; on "write through" it reads 0 in both runs. Every LOOP layer
-    is gated the same way on its own counter (gate-6 review M3), so a write-through layer above the drive shows as a
-    drive counter that did not rise;
+    bound: another process's flushes can pad it, never shrink it; T3 runner review item 3), and the timed run's
+    flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, provisional until
+    registered); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
+    counter (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
   - the timed fsync run carries fio's own sync count (N-1 or N; fio 3.36 does not count the end_fsync), a p50 and
     the histogram bins (review M1: no measurement, no normaliser, no VALID).
-Published, not gates (lines 180 and 553): the fsync p50, the fsync/control write p50 ratio, the before-to-after
+Published, not gates (lines 180 and 553): both runs' drive flushes per fsync and every loop layer's, with the slack
+(item 18), the fsync p50, the fsync/control write p50 ratio, the before-to-after
 drift. On a write-through drive floor_kind says "no volatile cache: no drive flush": the block layer sends such a
 drive no flush, so the fsync latency is not a drive flush (GitHub-hosted runners' disks are such drives).
 The pooled p50 merges the two timed fsync runs' latency histograms (fio json+ bins, fio's own ~1.5% buckets).
@@ -53,8 +54,10 @@ import os
 import re
 import subprocess
 import sys
+from fractions import Fraction
 
 N = 10000
+SLACK = Fraction("0.05")  # provisional until registered: the floor rule's allowance, timed vs labelling flushes per fsync
 V1L = ["strace", "-f", "-y", "-ttt",
        "-e", "trace=%file,%desc,ioctl,copy_file_range,sync_file_range,syncfs,msync,fallocate"]
 WRITES = ("write", "pwrite64", "writev", "pwritev", "pwritev2")
@@ -241,12 +244,14 @@ def counter_gate(what, wc, timed, lab):
     """One device's flush counter over the timed fsync run (`timed`) and the strace-checked labelling run (`lab`), A16:
     write back: at least one flush per fsync in the timed run; at least one per fsync in the labelling run (a count
       below N VOIDs, whatever the timed run did: PREREG line 180 voids "fewer than one per fsync" in the run whose
-      fsyncs strace checked; T3 runner review item 3); a count that is not an int is unreadable and VOIDs; and at least
-      the whole flushes per fsync the labelling run showed this stack making (floor(lab / N), e.g. 2 through a loop), so
-      a timed run that lost part of its fsyncs cannot pass on a stack that makes 2 per fsync (gate-6 review 7, lane
-      review MED 3). Blind spot, stated: a record with NO labelling count (None) gets the timed rule only; measure()
-      has written one for the drive and every loop layer since 7dc4d4c04, so only a record from before then, or a
-      hand-made one, is judged that way;
+      fsyncs strace checked; T3 runner review item 3); a count that is not an int is unreadable and VOIDs; and the
+      timed run's flushes per fsync at least the labelling run's x (1 - SLACK), so a timed run that lost part of its
+      fsyncs cannot pass on a stack that makes 2 per fsync, nor ~47% of them at 1.9 per fsync as the whole-number
+      floor lab // N let it (gate-6 review 7, lane review MED 3, T3 runner review item 18). Exact rationals, so the
+      edge (timed = 0.95 x labelling) passes. SLACK absorbs the labelling run's padding by another process's
+      flushes; its value is provisional until registered. Blind spot, stated: a record with NO labelling count
+      (None) gets the timed rule only; measure() has written one for the drive and every loop layer since 7dc4d4c04,
+      so only a record from before then, or a hand-made one, is judged that way;
     write through: the counter must read 0 in both runs (the block layer sends no flush; a count contradicts the
       recorded state and VOIDs), each run judged on its own and reported in its own words (T3 runner review item 4)."""
     bad = []
@@ -259,9 +264,10 @@ def counter_gate(what, wc, timed, lab):
         elif isinstance(lab, int) and lab < N:
             bad.append(f"write-back {what}: its flush counter rose {lab} across the {N} fsyncs of the labelling run "
                        "(fewer than one per fsync in the strace-checked run)")
-        elif isinstance(lab, int) and not short and timed < (lab // N) * N:
-            bad.append(f"write-back {what}: its flush counter rose {timed} in the timed run, fewer than the "
-                       f"{lab // N} per fsync the labelling run showed ({lab} across {N})")
+        elif isinstance(lab, int) and not short and Fraction(timed) < Fraction(lab) * (1 - SLACK):
+            bad.append(f"write-back {what}: {timed / N:.4f} flushes per fsync in the timed run, below (1 - "
+                       f"{float(SLACK)}) x the {lab / N:.4f} per fsync the labelling run showed ({timed} and {lab} "
+                       f"across {N})")
     elif wc == "write through":
         if timed != 0:
             bad.append(f"write-through {what}: its flush counter rose {timed} in the timed run; a write-through queue "
@@ -339,11 +345,7 @@ def measure(d, out, leafrec=None):
         a["timed"]["lab_flush_ios_delta"] = g1 - g0
         os.unlink(f)
         rec["arms"][arm] = a
-    ft, ct = rec["arms"]["fsync"]["timed"], rec["arms"]["control"]["timed"]
-    rec["published"] = {"fsync_p50_us": ft.get("fsync_p50_us"), "fsync_p99_us": ft.get("fsync_p99_us"),
-                        "control_write_p50_us": ct.get("write_p50_us"),
-                        "fsync_over_control_write_p50": ratio(ft.get("fsync_p50_us"), ct.get("write_p50_us")),
-                        "flush_ios_per_fsync": round(ft["flush_ios_delta"] / N, 3)}
+    rec["published"] = publish(rec)
     rec["floor_kind"] = ("brd: no drive (dry runs only, never credited)" if disk.startswith("ram")
                          else "write-back drive: flush requests completed by the driver (issued and acknowledged, not "
                               "persistence)" if rec["leaf"]["write_cache"] == "write back"
@@ -360,6 +362,28 @@ def measure(d, out, leafrec=None):
 
 def ratio(a, b):
     return round(a / b, 2) if a and b else None
+
+
+def per_fsync(count):
+    """A flush count over the N fsyncs, or None when the count is absent or not an int."""
+    return round(count / N, 4) if isinstance(count, int) and not isinstance(count, bool) else None
+
+
+def publish(rec):
+    """The record's published numbers (not gates): the fsync p50s, and both runs' flushes per fsync for the drive and
+    for every loop layer, with the floor's slack (T3 runner review item 18)."""
+    ft, ct = rec["arms"]["fsync"]["timed"], rec["arms"]["control"]["timed"]
+    return {"fsync_p50_us": ft.get("fsync_p50_us"), "fsync_p99_us": ft.get("fsync_p99_us"),
+            "control_write_p50_us": ct.get("write_p50_us"),
+            "fsync_over_control_write_p50": ratio(ft.get("fsync_p50_us"), ct.get("write_p50_us")),
+            "flush_ios_per_fsync": per_fsync(ft.get("flush_ios_delta")),
+            "lab_flush_ios_per_fsync": per_fsync(ft.get("lab_flush_ios_delta")),
+            "layers": {lay.get("name"): {"flush_ios_per_fsync": per_fsync(lay.get("flush_ios_delta")),
+                                         "lab_flush_ios_per_fsync": per_fsync(lay.get("lab_flush_ios_delta"))}
+                       for lay in rec["leaf"].get("layers") or []},
+            "floor_slack": float(SLACK),
+            "floor_rule": "write back: timed flushes per fsync >= labelling flushes per fsync x (1 - floor_slack); "
+                          "the slack is provisional until registered"}
 
 
 def pooled_p50_ns(bins_list):
