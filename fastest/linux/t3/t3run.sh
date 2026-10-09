@@ -678,6 +678,11 @@ selftests() {
         echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$want_text'; got exit $rc"; return 1
       fi
     done
+    # and nothing devguard could not read: on this box a "cannot read" line would refuse a rental's own spare as well
+    # (review 5 MED 1: an unreadable controller link refuses every device)
+    if grep -qF "cannot read" "$OUT/devguard-root-$d.txt"; then
+      cat "$OUT/devguard-root-$d.txt"; echo "selftests: devguard could not read something on /dev/$d"; return 1
+    fi
   done
 }
 stage preflight preflight
