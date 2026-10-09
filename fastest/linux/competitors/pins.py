@@ -2,7 +2,7 @@
 """pins.py -- the registered versions and PG's shared_buffers (lane fastest-linux-comp; gate-6 review, t3run items 13
 and 15). Every value comes from versions.tsv (one table) or /proc/meminfo, and every check refuses a mismatch.
 
-  pins.py get SYSTEM ARCH KIND          the table's value (exit 2 if absent): e.g. dolt amd64 tarball_sha256
+  pins.py get SYSTEM ARCH KIND          the table's value (exit 1 with a message if absent): e.g. dolt amd64 tarball_sha256
   pins.py version SYSTEM                the registered version
   pins.py check-version SYSTEM FILE     exit 0 only when FILE (a version command's output) has, on its FIRST line and
                                         in that command's own form (FIRST_LINE), exactly the registered version
