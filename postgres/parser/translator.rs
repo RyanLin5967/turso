@@ -29,10 +29,14 @@ pub struct PostgreSQLTranslator {
     /// a subquery naming another relation alike shadows it, and nothing outside the SELECT and the
     /// subqueries under it sees it (wire review 2 item 6, gap review item 1).
     lateral_scopes: std::cell::RefCell<Vec<LateralScope>>,
-    /// The columns the statement's DELETE target declares, when the caller knows them
-    /// ([`PostgreSQLTranslator::with_target_columns`]); None reads as no rowid-named column.
-    target_columns: Option<Vec<String>>,
+    /// The columns a relation declares, by (schema, name), when the caller can tell
+    /// ([`PostgreSQLTranslator::with_columns`]).
+    columns: Option<Box<ColumnLookup>>,
 }
+
+/// A relation's declared columns by (schema, as written or empty; name), or None when they cannot
+/// be read.
+type ColumnLookup = dyn Fn(&str, &str) -> Option<Vec<String>>;
 
 /// The names the engine gives a table's own row, each shadowed by a column of the same name.
 const ROW_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
@@ -55,13 +59,88 @@ impl PostgreSQLTranslator {
         Self::default()
     }
 
-    /// The translator, told the columns the statement's DELETE target declares: a DELETE ...
-    /// USING names the target's own row by the first of rowid, _rowid_ and oid the target does not
-    /// declare. The bare rowid read a declared column of that name on both sides of the rewrite
-    /// (wire review 13 item 5).
-    pub fn with_target_columns(mut self, columns: Vec<String>) -> Self {
-        self.target_columns = Some(columns);
+    /// The translator, able to read a relation's declared columns, which a DELETE ... USING
+    /// needs: it names the target's own row by the first of rowid, _rowid_ and oid the target does
+    /// not declare (the bare rowid read a declared column of that name on both sides of the
+    /// rewrite: wire review 13 item 5), and resolves RETURNING's bare names over the target and the
+    /// USING items together (wire review 15 item 7).
+    pub fn with_columns(
+        mut self,
+        lookup: impl Fn(&str, &str) -> Option<Vec<String>> + 'static,
+    ) -> Self {
+        self.columns = Some(Box::new(lookup));
         self
+    }
+
+    /// The columns `rv` declares, renamed by its alias's column list; None when they cannot be
+    /// read.
+    fn columns_of(&self, rv: &pg_query::protobuf::RangeVar) -> Option<Vec<String>> {
+        let mut columns = self.columns.as_ref()?(&rv.schemaname, &rv.relname)?;
+        if let Some(alias) = &rv.alias {
+            rename_columns(&mut columns, &alias.colnames);
+        }
+        Some(columns)
+    }
+
+    /// The relations the USING items bring into scope, each by the name a reference qualifies it
+    /// by, with its columns when they can be read: a table's (renamed by an alias's column list),
+    /// a subquery's from its target list or alias column list, a function's from its alias column
+    /// list; a join's sides, and its alias as a name of no columns of its own.
+    fn using_relations(
+        &self,
+        item: &pg_query::protobuf::Node,
+        out: &mut Vec<(String, Option<Vec<String>>)>,
+    ) {
+        use pg_query::protobuf::node::Node;
+        let alias_name = |a: &Option<pg_query::protobuf::Alias>| {
+            a.as_ref()
+                .filter(|a| !a.aliasname.is_empty())
+                .map(|a| a.aliasname.clone())
+        };
+        let alias_columns = |a: &Option<pg_query::protobuf::Alias>| -> Option<Vec<String>> {
+            let names: Vec<String> = a
+                .as_ref()?
+                .colnames
+                .iter()
+                .filter_map(|c| match c.node.as_ref() {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            (!names.is_empty()).then_some(names)
+        };
+        match item.node.as_ref() {
+            Some(Node::RangeVar(r)) => out.push((
+                alias_name(&r.alias).unwrap_or_else(|| r.relname.clone()),
+                self.columns_of(r),
+            )),
+            Some(Node::RangeSubselect(r)) => {
+                let mut columns = match r.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                    Some(Node::SelectStmt(q)) => select_output_names(q),
+                    _ => None,
+                };
+                if let (Some(columns), Some(a)) = (columns.as_mut(), &r.alias) {
+                    rename_columns(columns, &a.colnames);
+                }
+                out.push((
+                    alias_name(&r.alias).unwrap_or_default(),
+                    columns.or_else(|| alias_columns(&r.alias)),
+                ));
+            }
+            Some(Node::RangeFunction(r)) => out.push((
+                alias_name(&r.alias).unwrap_or_default(),
+                alias_columns(&r.alias),
+            )),
+            Some(Node::JoinExpr(j)) => {
+                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                    self.using_relations(side, out);
+                }
+                if let Some(a) = alias_name(&j.alias) {
+                    out.push((a, Some(Vec::new())));
+                }
+            }
+            _ => out.push((String::new(), None)),
+        }
     }
 
     /// Run `f` in a LATERAL scope of its own: one SELECT's FROM names and inlined LATERAL columns,
@@ -1635,22 +1714,14 @@ impl PostgreSQLTranslator {
                     "table name \"{target}\" specified more than once"
                 )));
             }
-            // RETURNING returns the target's columns only: a reference to a USING relation, or a
-            // `*` (which PostgreSQL widens to the USING columns), is refused rather than answered
-            // 42703 or short (wire review 11 item 13).
-            if delete
-                .returning_list
-                .iter()
-                .any(|t| returning_reads_beyond(t, &names))
-            {
-                return Err(ParseError::ParseError(
-                    "DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is \
-                     not supported: return the target's columns"
-                        .into(),
-                ));
+            let target_columns = self.columns_of(relation);
+            let mut using = Vec::new();
+            for item in &delete.using_clause {
+                self.using_relations(item, &mut using);
             }
+            check_using_returning(&delete.returning_list, target_columns.as_deref(), &using)?;
             let declared = |name: &str| {
-                self.target_columns
+                target_columns
                     .iter()
                     .flatten()
                     .any(|c| c.eq_ignore_ascii_case(name))
@@ -5872,24 +5943,138 @@ pub struct PgBranchCall {
     pub args: Vec<PgBranchArg>,
 }
 
-/// Whether a RETURNING target reads past the target of a DELETE ... USING: a bare `*`, or any
-/// column reference qualified by one of the USING items' names (`k.flag`, `k.*`).
-fn returning_reads_beyond(target: &pg_query::protobuf::Node, using_names: &[String]) -> bool {
-    use pg_query::protobuf::node::Node;
-    let Some(node) = target.node.as_ref() else {
-        return false;
-    };
-    node.nodes().iter().any(|(r, ..)| {
-        let pg_query::NodeRef::ColumnRef(c) = r else {
-            return false;
-        };
-        let field = |i: usize| c.fields.get(i).and_then(|f| f.node.as_ref());
-        match (c.fields.len(), field(0)) {
-            (1, Some(Node::AStar(_))) => true,
-            (n, Some(Node::String(s))) if n >= 2 => using_names.iter().any(|u| *u == s.sval),
-            _ => false,
+/// Rename `columns` by an alias's column list, the first ones in order; the rest keep their names.
+fn rename_columns(columns: &mut [String], names: &[pg_query::protobuf::Node]) {
+    for (column, name) in columns.iter_mut().zip(names) {
+        if let Some(pg_query::protobuf::node::Node::String(s)) = name.node.as_ref() {
+            column.clone_from(&s.sval);
         }
-    })
+    }
+}
+
+/// A SELECT's output column names as PostgreSQL names them (an alias, a column reference's last
+/// field, a function's name, else "?column?"), or None when the walk cannot name them all (a `*`, a
+/// set operation).
+fn select_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+    use pg_query::protobuf::node::Node;
+    if select.larg.is_some() || select.target_list.is_empty() {
+        return None;
+    }
+    select
+        .target_list
+        .iter()
+        .map(|t| {
+            let Some(Node::ResTarget(t)) = t.node.as_ref() else {
+                return None;
+            };
+            if !t.name.is_empty() {
+                return Some(t.name.clone());
+            }
+            match t.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(Node::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                },
+                Some(Node::FuncCall(f)) => match f.funcname.last().and_then(|n| n.node.as_ref()) {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                },
+                _ => Some("?column?".to_string()),
+            }
+        })
+        .collect()
+}
+
+/// A DELETE ... USING's RETURNING, resolved as PostgreSQL resolves it, over the target and the
+/// USING items together (`using`: [`PostgreSQLTranslator::using_relations`]); the subqueries in
+/// it read their own FROM and are not checked. The rewrite returns the target's columns only, so:
+/// a bare name the target and a USING item both have is 42702 "column reference is ambiguous"; a
+/// `*`, a name qualified by a USING item at any position, a bare name only a USING item has or may
+/// have, a whole-row reference to one, and a bare name the target has beside a USING item whose
+/// columns cannot be read are refused (0A000). `target_columns` None (no lookup) reads as the
+/// target having every name. Bare names were never checked: `RETURNING id` deleted and returned
+/// the target's id where PostgreSQL answers 42702, and a subquery naming a USING table was refused
+/// (wire review 11 item 13, review 15 item 7).
+fn check_using_returning(
+    returning: &[pg_query::protobuf::Node],
+    target_columns: Option<&[String]>,
+    using: &[(String, Option<Vec<String>>)],
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+    let unsupported = || {
+        ParseError::ParseError(
+            "DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not \
+             supported: return the target's columns"
+                .into(),
+        )
+    };
+    let has = |columns: &[String], name: &str| columns.iter().any(|c| c.eq_ignore_ascii_case(name));
+    for target in returning {
+        let Some(node) = target.node.as_ref() else {
+            continue;
+        };
+        let refs = node.nodes();
+        let mut in_subqueries = std::collections::HashSet::new();
+        for (r, ..) in &refs {
+            if let NodeRef::SubLink(l) = r {
+                if let Some(sub) = l.subselect.as_deref().and_then(|s| s.node.as_ref()) {
+                    for (inner, ..) in sub.nodes() {
+                        if let NodeRef::ColumnRef(c) = inner {
+                            in_subqueries.insert(c as *const pg_query::protobuf::ColumnRef);
+                        }
+                    }
+                }
+            }
+        }
+        for (r, ..) in &refs {
+            let NodeRef::ColumnRef(c) = r else {
+                continue;
+            };
+            if in_subqueries.contains(&(*c as *const pg_query::protobuf::ColumnRef)) {
+                continue;
+            }
+            let fields: Vec<Option<&str>> = c
+                .fields
+                .iter()
+                .map(|f| match f.node.as_ref() {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match fields.as_slice() {
+                [None] => return Err(unsupported()),
+                [Some(name)] => {
+                    let name = *name;
+                    let in_target = target_columns.is_none_or(|cols| has(cols, name));
+                    let using_has = using
+                        .iter()
+                        .any(|(_, cols)| cols.as_deref().is_some_and(|cols| has(cols, name)));
+                    let using_unknown = using.iter().any(|(_, cols)| cols.is_none());
+                    let whole_row = using.iter().any(|(n, _)| n == name);
+                    if in_target && using_has {
+                        return Err(ParseError::ParseError(format!(
+                            "column reference \"{name}\" is ambiguous"
+                        )));
+                    }
+                    if using_unknown || (!in_target && (using_has || whole_row)) {
+                        return Err(unsupported());
+                    }
+                }
+                [qualifiers @ .., _] => {
+                    if qualifiers
+                        .iter()
+                        .flatten()
+                        .any(|q| using.iter().any(|(n, _)| n == q))
+                    {
+                        return Err(unsupported());
+                    }
+                }
+                [] => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The names a FROM item makes visible (its alias, else a table's name; a join's both sides and its

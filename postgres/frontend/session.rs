@@ -528,12 +528,15 @@ fn prepare_statement_checked(
         types.used = used;
     }
 
-    let translator =
-        match delete_using_target(&parse_result) {
-            Some((schema, table)) => PostgreSQLTranslator::new()
-                .with_target_columns(declared_columns(&pg_conn.conn, schema, table)?),
-            None => PostgreSQLTranslator::new(),
-        };
+    // A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
+    // item 7); no other statement pays for the lookup.
+    let translator = if is_delete_using(&parse_result) {
+        let conn = pg_conn.conn.clone();
+        PostgreSQLTranslator::new()
+            .with_columns(move |schema, table| relation_columns(&conn, schema, table))
+    } else {
+        PostgreSQLTranslator::new()
+    };
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -1614,49 +1617,34 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     }
 }
 
-/// The schema (None for public) and table a DELETE ... USING deletes from, if `parse` is one: its
-/// rewrite names the target's own row by a name the target does not declare (wire review 13 item
-/// 5).
-fn delete_using_target(
-    parse: &turso_pg_parser::pg_query::ParseResult,
-) -> Option<(Option<&str>, &str)> {
+/// Whether `parse` is one DELETE ... USING (its rewrite reads the relations' declared columns).
+fn is_delete_using(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;
-    let [raw] = parse.protobuf.stmts.as_slice() else {
-        return None;
-    };
-    let Some(Node::DeleteStmt(delete)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
-        return None;
-    };
-    if delete.using_clause.is_empty() {
-        return None;
-    }
-    let relation = delete.relation.as_ref()?;
-    let schema = match relation.schemaname.as_str() {
-        "" | "public" => None,
-        other => Some(other),
-    };
-    Some((schema, relation.relname.as_str()))
+    matches!(
+        parse.protobuf.stmts.as_slice(),
+        [raw] if matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(Node::DeleteStmt(d)) if !d.using_clause.is_empty()
+        )
+    )
 }
 
-/// The columns `table` declares: from the connection's schema for public, from the attached
-/// schema's table_info otherwise. Empty for a table that does not exist (the statement then fails
-/// on the table).
-fn declared_columns(
-    conn: &Arc<Connection>,
-    schema: Option<&str>,
-    table: &str,
-) -> Result<Vec<String>> {
+/// The columns `table` declares: from the connection's schema for public (or no schema), from the
+/// attached schema's table_info otherwise; None for a relation it cannot read (a view, one that
+/// does not exist).
+fn relation_columns(conn: &Arc<Connection>, schema: &str, table: &str) -> Option<Vec<String>> {
     match schema {
-        None => Ok(conn
+        "" | "public" => conn
             .current_schema()
             .get_btree_table(table)
-            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
-            .unwrap_or_default()),
-        Some(schema) => get_table_columns(
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect()),
+        schema => get_table_columns(
             conn,
             &table.replace('\'', "''"),
             Some(&schema.replace('"', "\"\"")),
-        ),
+        )
+        .ok()
+        .filter(|columns| !columns.is_empty()),
     }
 }
 
