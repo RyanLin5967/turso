@@ -29,6 +29,8 @@ struct PgConnectionInner {
     /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
     /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
     broken: std::sync::atomic::AtomicBool,
+    /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
+    view_cache: Mutex<crate::result_types::ViewCache>,
 }
 
 impl PgConnectionInner {
@@ -89,6 +91,7 @@ impl PgConnection {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
+                view_cache: Mutex::new(crate::result_types::ViewCache::default()),
             }),
         }
     }
@@ -560,10 +563,12 @@ fn prepare_statement_checked(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
+            let search_path = pg_conn.session_state.lock().unwrap().search_path.clone();
             (types.params, types.untyped) = crate::result_types::parameter_types(
                 &parse_result,
                 &schema,
-                &pg_conn.session_state.lock().unwrap().search_path,
+                &search_path,
+                &pg_conn.view_cache,
             );
         }
         types.used = used;

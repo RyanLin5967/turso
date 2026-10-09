@@ -226,8 +226,53 @@ pub use turso_pg_parser::MAX_PARAMETER;
 /// reference no relation in scope has is left untyped (text).
 pub fn parameter_types(
     parse: &ParseResult,
+    schema: &std::sync::Arc<Schema>,
+    search_path: &[String],
+    cache: &std::sync::Mutex<ViewCache>,
+) -> (
+    std::collections::BTreeMap<u32, u32>,
+    std::collections::BTreeSet<u32>,
+) {
+    let memo = {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let same = cache
+            .schema
+            .as_ref()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, schema))
+            && cache.search_path == search_path;
+        if !same {
+            cache.schema = Some(schema.clone());
+            cache.search_path = search_path.to_vec();
+            cache.views.clear();
+        }
+        std::mem::take(&mut cache.views)
+    };
+    let view_memo = std::rc::Rc::new(std::cell::RefCell::new(memo));
+    let result = parameter_types_with(parse, schema, search_path, &view_memo);
+    cache.lock().unwrap_or_else(|e| e.into_inner()).views = view_memo.take();
+    result
+}
+
+/// Each view's columns as the parameter-type walk read them, for one schema snapshot and search
+/// path: a statement over views parsed each view every time it was prepared, and a view reached
+/// k times was parsed k times (2^depth for a view joining the one before it twice; wire review 14
+/// item 10). Keyed by the snapshot itself, the Arc the connection hands out until DDL replaces it,
+/// which the cache holds so that it cannot be mistaken for a later one; a view read where the walk
+/// was cut (a cycle, the depth bound) is not kept.
+#[derive(Default)]
+pub struct ViewCache {
+    schema: Option<std::sync::Arc<Schema>>,
+    search_path: Vec<String>,
+    views: ViewMemo,
+}
+
+type ViewMemo = std::collections::HashMap<String, Option<Vec<(String, Option<u32>)>>>;
+
+fn parameter_types_with(
+    parse: &ParseResult,
     schema: &Schema,
     search_path: &[String],
+    view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
 ) -> (
     std::collections::BTreeMap<u32, u32>,
     std::collections::BTreeSet<u32>,
@@ -240,6 +285,8 @@ pub fn parameter_types(
         views: Vec::new(),
         subselects: Default::default(),
         search_path: search_path.to_vec(),
+        view_memo: view_memo.clone(),
+        cuts: Default::default(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -321,6 +368,11 @@ struct Infer<'a> {
     /// The session's search path, as SET search_path left it; empty is public alone
     /// ([`Infer::main_relname`]).
     search_path: Vec<String>,
+    /// The views read so far for this snapshot ([`ViewCache`]), shared with every nested walk.
+    view_memo: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    /// How many times a view was cut (a cycle, the depth bound), shared with every nested walk: a
+    /// view whose reading saw a cut is not memoised.
+    cuts: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -638,17 +690,57 @@ impl Infer<'_> {
         if self.views.len() >= MAX_VIEW_DEPTH
             || self.views.iter().any(|v| v.eq_ignore_ascii_case(relname))
         {
+            self.cuts.set(self.cuts.get() + 1);
             return None;
         }
+        let key = relname.to_ascii_lowercase();
+        if let Some(columns) = self.view_memo.borrow().get(&key) {
+            return columns.clone();
+        }
         let view = self.schema.get_view(relname)?;
+        let cuts = self.cuts.get();
+        let columns = self.read_view(&view, relname);
+        if self.cuts.get() == cuts {
+            self.view_memo.borrow_mut().insert(key, columns.clone());
+        }
+        columns
+    }
+
+    /// [`Infer::view_columns`] of `view`, read: its stored query walked, or, when libpg_query cannot
+    /// read the text the engine stored (SQLite's rendering: `IS TRUE` is `IS 1`), the engine's own
+    /// columns for the view, typed by their declared types. Such a view became one the walk
+    /// cannot open, and a parameter compared with its columns was refused 42P18 (wire review 14
+    /// item 10).
+    fn read_view(
+        &self,
+        view: &turso_core::schema::View,
+        relname: &str,
+    ) -> Option<Vec<(String, Option<u32>)>> {
+        let engine_columns = || {
+            Some(
+                view.columns
+                    .iter()
+                    .map(|c| (c.name.clone().unwrap_or_default(), column_oid(c)))
+                    .collect(),
+            )
+        };
         let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
-        let parsed = turso_pg_parser::parse(sql).ok()?;
-        let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?;
+        let Ok(parsed) = turso_pg_parser::parse(sql) else {
+            return engine_columns();
+        };
+        let Some(stmt) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|raw| raw.stmt.as_deref())
+        else {
+            return engine_columns();
+        };
         let Some(Node::ViewStmt(v)) = stmt.node.as_ref() else {
-            return None;
+            return engine_columns();
         };
         let Some(Node::SelectStmt(query)) = v.query.as_deref().and_then(|q| q.node.as_ref()) else {
-            return None;
+            return engine_columns();
         };
         let mut views = self.views.clone();
         views.push(relname.to_string());
@@ -660,6 +752,8 @@ impl Infer<'_> {
             views,
             subselects: Default::default(),
             search_path: self.search_path.clone(),
+            view_memo: self.view_memo.clone(),
+            cuts: self.cuts.clone(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1424,6 +1518,8 @@ impl Infer<'_> {
             views: self.views.clone(),
             subselects: self.subselects.clone(),
             search_path: self.search_path.clone(),
+            view_memo: self.view_memo.clone(),
+            cuts: self.cuts.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
