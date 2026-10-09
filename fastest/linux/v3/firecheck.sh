@@ -722,7 +722,18 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   # the loops still backed by a file of the chain (tenth review MED 1): under $FX/n*/ or an image named v3fx-n1.img
   chainloops() { losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$FX/n" '{ d = $1; $1 = ""; sub(/^ +/, "");
     if (index($0, b) == 1 || $0 ~ /\/v3fx-n1\.img( \(deleted\))?$/) print d " " $0 }'; }
+  # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/ (as nbx's backing /mnt/v3fx/nb/x.img is), mounted,
+  # must survive --teardown-nest untouched: same device, same backing file, still mounted
+  pl=""
+  sudo mkdir -p "$FX/nb" "$FX/nbplant"
+  sudo truncate -s 64M "$FX/nb/teardown-plant.img" && pl=$(sudo losetup --find --show "$FX/nb/teardown-plant.img") \
+    && sudo mkfs.ext4 -q -F "$pl" && sudo mount "$pl" "$FX/nbplant" \
+    && echo "$pl $(losetup -n -O BACK-FILE "$pl" | xargs)" > "$NM/plant_before.txt"
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
+  if [ -n "$pl" ]; then echo "$pl $(losetup -n -O BACK-FILE "$pl" 2>/dev/null | xargs)" > "$NM/plant_after.txt"; fi
+  mountpoint -q "$FX/nbplant" 2>/dev/null && echo yes > "$NM/plant_mounted.txt"
+  # the plant is removed now, whatever the teardown did to it
+  sudo umount "$FX/nbplant" 2>/dev/null; [ -n "$pl" ] && sudo losetup -d "$pl" 2>/dev/null; sudo rm -f "$FX/nb/teardown-plant.img"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
     [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops | sed 's/^/loop still attached: /'; } > "$NM/after_teardown.txt"
   timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$nd" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"

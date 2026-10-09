@@ -1253,6 +1253,23 @@ def self_test():
         got = wcp(a0, b1, devs) if wcp else ["(no write_cache_problems in stamp.py)"]
         ok = (got == []) if want is None else (bool(got) and all(want in x for x in got))
         chk("stamp write cache (ninth review L12): %s -> %s" % (name, "no problem" if want is None else want), ok, got)
+    # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
+    # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
+    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are) and a losetup that fails (which must
+    # never read as "nothing attached"); and neither script may keep a copy of the old prefix matcher
+    import subprocess as _sp12
+    nl = os.path.join(HERE, "nestloops.sh")
+    r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
+    chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
+        "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
+        and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
+    copies = []
+    for nm12 in ("mkfixtures.sh", "firecheck.sh"):
+        t12 = rd(os.path.join(HERE, nm12))
+        if t12 is None or 'awk -v b="$base/n"' in t12 or 'awk -v b="$FX/n"' in t12 or '/nestloops.sh"' not in t12:
+            copies.append(nm12)
+    chk("one matcher: mkfixtures.sh and firecheck.sh source nestloops.sh and keep no copy of the old prefix matcher",
+        not copies, copies)
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
@@ -1851,7 +1868,13 @@ def main(argv):
     rb1 = (rd(os.path.join(nm, "rebuilt_n1_backing.txt")) or "").strip()
     wb1 = (rd(os.path.join(nm, "want_n1_backing.txt")) or "MISSING").strip()
     ast = rd(os.path.join(nm, "after_stray.txt"))
+    # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
+    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
+    pb = (rd(os.path.join(nm, "plant_before.txt")) or "").strip()
+    pa = (rd(os.path.join(nm, "plant_after.txt")) or "").strip()
+    plant_ok = bool(pb) and pa == pb and (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip() == "yes"
     check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
+          and plant_ok
           and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
           and sorted(ar.split("\n")[:-1]) == ["n%d mounted ok" % k for k in (1, 2, 3, 4)]
           and rb1 == wb1  # tenth review MED 1: the rebuilt n1's image is the nest dir's
@@ -1862,6 +1885,7 @@ def main(argv):
           and ast is not None and ast.strip() == "",
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
            "rebuilt_n1_backing": rb1, "want_n1_backing": wb1, "after_stray": ast,
+           "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
            "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
