@@ -1083,4 +1083,192 @@ mod tests {
             vec![vec![crate::Value::from_i64(42)]]
         );
     }
+
+    /// Mirrors the PG frontend (postgres/frontend/catalog.rs): the tables it creates carry a
+    /// marker in their stored SQL, and its `parse_table_sql` sets
+    /// `BTreeTable::rowid_alias_not_null` on the tables it recognizes as its own, because every
+    /// PostgreSQL primary key is NOT NULL. Unmarked rows keep SQLite semantics.
+    struct PgKeyTestDialect;
+
+    impl PgKeyTestDialect {
+        const PREFIX: &'static str = "/* pgkey */ ";
+    }
+
+    impl Dialect for PgKeyTestDialect {
+        fn name(&self) -> &'static str {
+            "pgkey-test"
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            match sql.strip_prefix(Self::PREFIX) {
+                Some(own) => {
+                    let mut table = BTreeTable::from_sql(own, root_page)?;
+                    table.rowid_alias_not_null = true;
+                    Ok(table)
+                }
+                None => BTreeTable::from_sql(sql, root_page),
+            }
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(format!("{}{input}", Self::PREFIX))
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+    }
+
+    /// fastest-engine 4c (LEAD-ORDER 6; the 2026-10-06T20:26Z ruling on wire COMPAT 02b7729d3): in
+    /// a table whose frontend makes every primary key NOT NULL, an EXPLICIT NULL into the INTEGER
+    /// PRIMARY KEY rowid alias raises the NOT NULL constraint (23502 at the wire): a literal, a
+    /// bound parameter, a named column, a row of a multi-row INSERT (the statement undoes its
+    /// earlier rows and only them), UPDATE SET key = NULL (literal and bound) and an upsert's DO
+    /// UPDATE SET key = NULL. An omitted key still takes a new rowid; the key stays the rowid
+    /// alias with no index of its own; the rule holds after ALTER TABLE and after a reopen. A plain
+    /// SQLite table keeps SQLite's rule: a NULL key takes a new rowid.
+    #[test]
+    fn an_explicit_null_into_a_frontend_tables_integer_key_raises_not_null() {
+        fn not_null(result: &crate::Result<()>) -> bool {
+            matches!(
+                result,
+                Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"
+            )
+        }
+        fn run_bound(conn: &Arc<crate::Connection>, sql: &str) -> crate::Result<()> {
+            let mut stmt = conn.prepare(sql)?;
+            stmt.bind_at(std::num::NonZero::new(1).unwrap(), crate::Value::Null)?;
+            stmt.run_ignore_rows()
+        }
+        fn ints(conn: &Arc<crate::Connection>, sql: &str) -> Vec<i64> {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_int().unwrap())
+                .collect()
+        }
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            let literal = conn.execute("INSERT INTO k VALUES (NULL, 'literal')");
+            assert!(
+                not_null(&literal),
+                "CLAIM: a literal NULL key did not raise NOT NULL: {literal:?}"
+            );
+            let bound = run_bound(&conn, "INSERT INTO k VALUES (?1, 'bound')");
+            assert!(not_null(&bound), "a bound NULL key: {bound:?}");
+            let named = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'named')");
+            assert!(not_null(&named), "a NULL key in a named column list: {named:?}");
+
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO k VALUES (3, 'three')").unwrap();
+            let multi = conn.execute("INSERT INTO k VALUES (5, 'five'), (NULL, 'null')");
+            assert!(not_null(&multi), "a NULL key in a multi-row INSERT: {multi:?}");
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                ints(&conn, "SELECT id FROM k ORDER BY id"),
+                vec![3],
+                "the failed INSERT undid its own earlier row and nothing else"
+            );
+
+            conn.execute("INSERT INTO k (v) VALUES ('omitted')").unwrap();
+            assert_eq!(
+                ints(&conn, "SELECT id FROM k ORDER BY id"),
+                vec![3, 4],
+                "an omitted key takes a new rowid"
+            );
+            let update = conn.execute("UPDATE k SET id = NULL WHERE id = 4");
+            assert!(not_null(&update), "UPDATE SET key = NULL: {update:?}");
+            let update_bound = run_bound(&conn, "UPDATE k SET id = ?1 WHERE id = 4");
+            assert!(
+                not_null(&update_bound),
+                "UPDATE SET key = a bound NULL: {update_bound:?}"
+            );
+            let upsert = conn.execute(
+                "INSERT INTO k VALUES (4, 'again') ON CONFLICT (id) DO UPDATE SET id = NULL",
+            );
+            assert!(not_null(&upsert), "an upsert's DO UPDATE SET key = NULL: {upsert:?}");
+            assert_eq!(
+                ints(&conn, "SELECT id FROM k ORDER BY id"),
+                vec![3, 4],
+                "no refused statement changed a row"
+            );
+            assert_eq!(
+                ints(&conn, "SELECT count(*) FROM k WHERE rowid = id"),
+                vec![2],
+                "the key is still the rowid alias"
+            );
+            assert_eq!(
+                ints(
+                    &conn,
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'k'"
+                ),
+                vec![0],
+                "the key has no index of its own"
+            );
+
+            conn.execute("ALTER TABLE k ADD COLUMN w INTEGER").unwrap();
+            let after_alter = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'after alter')");
+            assert!(not_null(&after_alter), "after ALTER TABLE: {after_alter:?}");
+            conn.close().unwrap();
+        }
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let reopened = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'reopened')");
+            assert!(not_null(&reopened), "after a reopen: {reopened:?}");
+            conn.execute("INSERT INTO k (v) VALUES ('omitted after the reopen')")
+                .unwrap();
+            assert_eq!(ints(&conn, "SELECT id FROM k ORDER BY id"), vec![3, 4, 5]);
+            conn.close().unwrap();
+        }
+
+        let db = open_db(&io, "sqlitekey.db", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO k VALUES (NULL, 'literal')").unwrap();
+        run_bound(&conn, "INSERT INTO k VALUES (?1, 'bound')").unwrap();
+        assert_eq!(
+            ints(&conn, "SELECT id FROM k ORDER BY id"),
+            vec![1, 2],
+            "a SQLite table turns a NULL key into a new rowid"
+        );
+        conn.close().unwrap();
+    }
 }
