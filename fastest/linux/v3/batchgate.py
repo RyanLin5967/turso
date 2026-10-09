@@ -669,6 +669,9 @@ def _post_batch(d, sha, mod):
           "leaf_write_cache": "write through" if wt else "write back",
           "virtualization": {"virtualized": False, "evidence": []}, "n": 5, "pid": 4242, "plp": "no",
           "arms": {"append25": {}, "nosync25": {}}, "flush_control_arms": {"append25": {"gated": True}},
+          # [V3 review 12 item 7 / review 11 LOW 2: a current probe summary carries its sync_fds, which post now holds
+          # to the arm definitions: append25 one fd synced once per op, nosync25 none]
+          "sync_fds": {"append25": {"3": 5}, "nosync25": {}}, "sync_fds_overflow": False,
           "timing_control": "not applicable: no volatile cache" if wt else "pass", "d0_threshold_key": "d0_threshold/ext4/wb/bare",
           "d0_threshold_ref": None, "frame_arm": None, "traced": False}
     win = {"events": 5, "zero_windows": 0, "flush_carrying_zero_windows": 0, "bare_flush_zero_windows": 0, "per_op": 1.0}
@@ -700,6 +703,11 @@ def _post_batch(d, sha, mod):
     if mod == "inside-nofd":  # ... a sync naming no fd, wholly inside an append25 window
         rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
         rep["syscalls"]["unattributed"].update(no_fd=1, inside_no_fd=1)
+    if mod == "nosync-ownfd":  # V3 review 12 item 7: nosync25 OWNS an fd and syncs on it, every unattributed count 0
+        sj["sync_fds"]["nosync25"] = {"9": 5}
+        rep["syscalls"]["arms"]["nosync25"].update(syncs=5, windows_without_a_sync=0)
+    if mod == "deffd-short":  # review 11 LOW 2: a probe that records no fd for append25 (its sync unrecorded)
+        sj["sync_fds"]["append25"] = {}
     if mod == "foreign-edge":  # V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge: foreign_fd only
         rep["syscalls"]["unattributed"].update(foreign_fd=1)
     if mod == "nofd-only":  # ... a sync naming no fd outside every window's interior: no_fd only
@@ -807,6 +815,22 @@ def post_selftest(chk):
                 all(str(r).startswith((want,) + also) for r in refs)
         chk("post() on a planted batch, %s -> rc %d%s" % (name, want_rc, "" if want is None else " (%s)" % want),
             ok, (rc, g))
+    # V3 review 12 item 7 and review 11 LOW 2, each with its EXACT VOID text (expected by hand): nosync25 owning and
+    # syncing an fd with every unattributed count 0 (the foreign_fd gate cannot see it), and a sync_fds that breaks
+    # the arm definitions (post trusted the probe's own record)
+    for name, mod, want_voids in (
+            ("nosync25 owns fd 9 and syncs on it, unattributed all 0", "nosync-ownfd",
+             ["fsync: nosync25's windows hold 5 sync(s) by the probe (it owns no fd by definition)",
+              "fsync: sync_fds disagrees with the arm definitions: nosync25 recorded {'9': 5}, defined 0 fd(s) and 0 sync(s)"]),
+            ("append25's sync_fds records no fd", "deffd-short",
+             ["fsync: sync_fds disagrees with the arm definitions: append25 recorded {}, defined 1 fd(s) and 5 sync(s)"])):
+        d = os.path.join(td, "exact-" + mod)
+        _post_batch(d, sha, mod)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = post(d, "ext4", sha, "smoke", None)
+        g = load(os.path.join(d, "gate.json"))
+        chk("post() (review 12 item 7 / review 11 LOW 2): %s -> rc 3 with exactly %s" % (name, want_voids),
+            rc == 3 and g.get("refusals") == [] and g.get("voids") == want_voids, (rc, g.get("voids"), g.get("refusals")))
     # gate-6 MED 6: the start-to-end drift
     for name, ea, ok_rc in (("4 us", 1004.0, 0), ("61 us", 1061.0, 3)):
         sd, ed = os.path.join(td, "drift-s-" + name.split()[0]), os.path.join(td, "drift-e-" + name.split()[0])
