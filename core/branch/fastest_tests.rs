@@ -6546,6 +6546,51 @@ fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
     }
 }
 
+/// Engine review 17 MED 3: a catalog checkpoint's own WAL syncs (its PASSIVE and TRUNCATE phase 4,
+/// on the branch files' device) only logged a failure: the catalog's Database has a volatile store
+/// of its own, which is where its pager reported, and phase 4 holds only the writer, so records can
+/// be undrained then. A failed catalog sync that drains the device (an F_FULLFSYNC on Apple, any
+/// sync elsewhere) goes through the main store's at-risk decision: here a raised (FullFsync) D0
+/// catalog store with an undrained fork made while its fuzzy checkpoint waits after the catalog
+/// commit, and the catalog's next WAL sync failing. The next fork is refused. Mutant
+/// `catalog_sync_failure_logged`.
+#[test]
+fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some(Arc::new(FailWalSyncIo {
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        armed: armed.clone(),
+        held: Arc::new(std::sync::Mutex::new(None)),
+    }));
+    let db = open_at(&dir.path().join("cat-sync.db"), opts(true, SyncClass::Off));
+    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    let _x = trunk.fork_branch().unwrap().into_id();
+    write_v(&trunk, 3, "raised");
+    assert_eq!(db.branches.rewrite_class_for_test(), SyncClass::FullFsync, "premise: the trunk commit raised the log to FullFsync");
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("premise: the checkpoint's catalog commit never landed", || {
+        db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let _y = db.connect().unwrap().fork_branch().unwrap().into_id();
+    assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "premise: the fork's record is undrained");
+    armed.store(1, O::Release);
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(armed.load(O::Acquire), 0, "premise: the catalog's phase 4 reached its WAL sync");
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        "the next fork after a failed catalog WAL sync with an undrained fork",
+    );
+}
+
 /// Engine review 11 MED 8: a raised D0 store's fuzzy checkpoint settles in the store's class
 /// (Off), so it took an ORDERED flight in the air (landed, its trunk commit's WAL F_FULLFSYNC still
 /// to come) as settled, and committed the catalog over records whose callers may yet be told they

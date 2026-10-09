@@ -449,6 +449,11 @@ mod census_tests {
     }
 }
 
+/// Test builds: the IO the next `Catalog::open` uses instead of a platform IO, taken once (engine
+/// review 17 MED 3: a catalog whose WAL sync fails).
+#[cfg(test)]
+pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<Arc<dyn IO>>> = std::sync::Mutex::new(None);
+
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
@@ -508,7 +513,14 @@ impl Catalog {
     /// `synchronous = FULL`, so a checkpoint's commit is durable before the log starts over; `Off`
     /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
     pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        #[cfg(test)]
+        let hooked = NEXT_CATALOG_IO.lock().unwrap().take();
+        #[cfg(not(test))]
+        let hooked: Option<Arc<dyn IO>> = None;
+        let io: Arc<dyn IO> = match hooked {
+            Some(io) => io,
+            None => Arc::new(PlatformIO::new()?),
+        };
         let path = path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
         })?;
