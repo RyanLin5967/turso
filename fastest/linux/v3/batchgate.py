@@ -696,9 +696,9 @@ def _post_batch(d, sha, mod):
            # [tenth review HIGH 1: a current report carries windows_short; eleventh review MED 1: and the syncs wholly
            # inside each arm's windows on any fd, and the events unattributed inside a window]
            "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0,
-                                                           "syncs_inside_any_fd": 5},
+                                                           "syncs_inside_any_fd": 5, "windows_over": 0},
                                                "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0,
-                                                            "syncs_inside_any_fd": 0}},
+                                                            "syncs_inside_any_fd": 0, "windows_over": 0}},
                         "unattributed": {"foreign_fd": 0, "no_fd": 0, "inside_foreign_fd": 0, "inside_no_fd": 0}}}
     if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
         rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
@@ -706,6 +706,8 @@ def _post_batch(d, sha, mod):
         sj["leaf"]["kind"] = "scsi_debug"
     if mod == "short":  # tenth review HIGH 1: every window synced, one short of its own (by fd)
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
+    if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
+        rep["syscalls"]["arms"]["append25"].update(windows_over=1)
     # [the three eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an
     # fd its arm does not own is counted in foreign_fd as well, so each plant now carries the foreign_fd/no_fd a real
     # report would, and the gate is foreign_fd/no_fd == 0]
@@ -786,6 +788,7 @@ def post_selftest(chk):
             ("A16: a write-through window with no fsync by the probe", "wt-nosync", "smoke", 3, "VOID fsync:", {}),
             ("A16: a write-back window with no fsync by the probe", "nosync", "smoke", 3, "VOID fsync:", {}),
             ("tenth review HIGH 1: a window short of one of its own syncs", "short", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 8: a window over its own syncs (an extra own-fd sync)", "over", "smoke", 3, "VOID fsync:", {}),
             ("eleventh review MED 1: an fsync on fd 7 wholly inside a nosync25 window", "nosync-anyfd", "smoke", 3,
              "VOID fsync:", {}),
             ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,

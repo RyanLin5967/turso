@@ -809,6 +809,15 @@ def self_test():
     #      cfr2b holds 1 wholly inside (its clone fsync; the directory fsync straddles its end)
     chk("sync windows (MED 1): case (c)'s edge event is not wholly inside nosync25's window -> nosync25 holds 0 on any fd, "
         "cfr2b 1", (swd.get("_inside") or {}).get("nosync25") == 0 and (swd.get("_inside") or {}).get("cfr2b") == 1, swd)
+    # (i) V3 review 12 item 8: an append25 window holding TWO fsyncs of its own fd 3 wholly inside: an extra sync no
+    #     window could absorb is over its own (_over 1); every count from below still reads clean
+    iw = [(1000000, 1100000, "append25", 0), (1200000, 1300000, "append25", 1)]
+    ie, _ = parse_trace_all(HDR % (3, 3) + "\n".join([sev("v3floor", 99, "0.001030", fd=3), sev("v3floor", 99, "0.001060", fd=3),
+                                                     sev("v3floor", 99, "0.001250", fd=3)]) + "\n", devs)[1:], None
+    swi = swin(ie[0], iw, 99)
+    chk("sync windows (review 12 item 8): an append25 window with two of its own fsyncs -> _over append25 1; without and "
+        "short 0", (swi.get("_over") or {}).get("append25") == 1 and (swi.get("append25") or {}).get("windows_without_a_sync") == 0
+        and (swi.get("_short") or {}).get("append25") == 0, swi)
     # (h) V3 review 12 item 6: an fsync on fd 7 (no arm's) about 200 ns into a nosync25 window, printed at its start: its
     #     +-500 ns interval straddles the append25/nosync25 boundary, so it is wholly inside NO window and every
     #     "inside" count stays 0; only foreign_fd sees it, which is why check and post gate foreign_fd/no_fd == 0
@@ -886,10 +895,14 @@ def self_test():
             ra = (rr.get("syscalls") or {}).get("arms") or {}
         except TypeError as e:
             ra = {"error": repr(e)}
-        bad_g = {a: (r.get("windows_without_a_sync"), r.get("windows_short")) for a, r in ra.items() if isinstance(r, dict)
-                 and a in _ck.GATED and (r.get("windows_without_a_sync") != 0 or r.get("windows_short") != 0)}
+        # [V3 review 12 item 8, disclosed: "exactly its own" asserted only "at least its own"; windows_over 0 now
+        # bounds it from above. Predicted: fc6ed8060's offline re-derivation found every arm's total exactly its defined
+        # count (the rest 200, cfr2b/clone2b 400) with no window short, so none can be over]
+        bad_g = {a: (r.get("windows_without_a_sync"), r.get("windows_short"), r.get("windows_over")) for a, r in ra.items()
+                 if isinstance(r, dict) and a in _ck.GATED and (r.get("windows_without_a_sync") != 0 or r.get("windows_short") != 0
+                                                               or r.get("windows_over") != 0)}
         chk("real arm-xfs record (run 37845193906): nosync25 holds 0 syncs; every gated window holds exactly its own "
-            "(windows_without_a_sync 0, windows_short 0)", isinstance(ra.get("nosync25"), dict) and ra["nosync25"].get("syncs") == 0
+            "(windows_without_a_sync 0, windows_short 0, windows_over 0)", isinstance(ra.get("nosync25"), dict) and ra["nosync25"].get("syncs") == 0
             and not bad_g and sorted(a for a in ra if a in _ck.GATED) == sorted(
                 a for a in _ck.GATED if a in {x[2] for x in read_windows(os.path.join(tdd, "raw.tsv"))}),
             (ra.get("nosync25"), bad_g, ra.get("error")))

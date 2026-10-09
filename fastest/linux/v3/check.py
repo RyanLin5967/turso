@@ -1375,9 +1375,11 @@ def real_selftest(chk):
             ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
             n00 = (sy0.get("arms") or {}).get("nosync25") or {}
             chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
-                "no_fd, inside_foreign_fd, inside_no_fd present and 0)" % fx,
+                "no_fd, inside_foreign_fd, inside_no_fd present and 0; every arm's windows_over 0, review 12 item 8)" % fx,
                 n00.get("syncs_inside_any_fd") == 0 and sorted(ua0) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
-                and all(v == 0 for v in ua0.values()), (n00, ua0))
+                and all(v == 0 for v in ua0.values()) and bool(sy0.get("arms"))
+                and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in (sy0.get("arms") or {}).values()),
+                (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
             return {"probe": f, "merged": f}
@@ -1487,6 +1489,9 @@ def real_selftest(chk):
              "F3:devflush", ["sync_fds disagrees with the arm definitions"]),
             ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
              "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
+            # V3 review 12 item 8: an extra own-fd sync in a floor-reference arm's window (append25)
+            ("an append25 window over its own syncs", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_over=1)},
+             "F3:devflush", ["a flush-gated op's window holds more than its own syncs"]),
             # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate
             ("fdatasync4k: a window without a flush-carrying request",
              {"report": lambda j: j["windows"]["arms"]["fdatasync4k"]["devices"]["nvme0n1"].update(flush_carrying_zero_windows=1)},
