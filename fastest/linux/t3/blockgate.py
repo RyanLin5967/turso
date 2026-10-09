@@ -396,7 +396,9 @@ def self_test(data):
         if tc is None:
             tc = TIMING.get("brd" if kind == "brd" else "write back+plp" if wc == "write back" and plp == "yes" else wc,
                             "pass")
-        return {"timing_control": tc, "flush_control": tc, "d0_control": d0, "plp": plp, "traced": False,
+        gated = ["append25", "append64", "ow4k", "ow64k", "ow1m", "cfr2b", "fdatasync4k"]  # 7 x n=200 = need 1400
+        return {"timing_control": tc, "flush_control": tc, "d0_control": d0, "plp": plp, "traced": False, "n": 200,
+                "flush_control_arms": {a: {"gated": True} for a in gated} | {"nosync25": {"gated": False}},
                 "leaf": {"write_cache": wc, "drive_reports": drive, "kind": kind}, "leaf_write_cache": wc,
                 "flush_gate": {"outcome": gate, "required_flushes": need, "leaf_flushes_completed": got,
                                "blkflush_leaf_gate": {"outcome": bk}, "voids": list(voids)},
@@ -456,6 +458,20 @@ def self_test(data):
         ("brd rc 0 PASS", dec(brd(), 0, "brd") == "PASS"),
         ("brd D0 foreign writer rc 3 FAILs (no RECORDED any more)", dec(brd(d0=foreign), 3, "brd") == "FAIL"),
         ("brd with an applied timing control FAILs", dec(brd(tc="pass"), 0, "brd") == "FAIL"),
+        # fourth lane review LOW 16: red at 2d42982a0, whose brd branch RECORDED a timing-only void
+        ("LOW 16: brd rc 3 whose only void is the timing control FAILs (no RECORDED)",
+         dec(brd(tc="FAIL: run void (append25 ratio 3.1 <= threshold 10.00)"), 3, "brd") == "FAIL"),
+        # fourth lane review LOW 19: the sync count is re-derived, n x the flush-gated arms, never trusted
+        ("LOW 19: required_flushes that is not n x the gated arms FAILs",
+         dec(dict(rec(), n=200, flush_control_arms={"append25": {"gated": True}, "ow4k": {"gated": True}})) == "FAIL"),
+        ("LOW 19: required_flushes equal to n x the gated arms passes",
+         dec(dict(rec(need=400), n=200, flush_control_arms={"append25": {"gated": True}, "ow4k": {"gated": True}})) == "PASS"),
+        # fourth lane review LOW 17: a real run's device block needs a bound batch of the registered shape, any class
+        ("LOW 17: an unbound (smoke) write-back batch FAILs a device block", dec(rec(sync=False), 0, "device") == "FAIL"),
+        ("LOW 17: the same batch passes a loop (dry-run) block", dec(rec(sync=False), 0, "loop") == "PASS"),
+        ("LOW 17: a bound batch of N=200 FAILs a device block", dec(dict(rec(), n=200), 0, "device") == "FAIL"),
+        ("LOW 17: a bound batch of N=10000 passes a device block",
+         dec(dict(rec(need=70000, got=140000), n=10000), 0, "device") == "PASS"),
     ]
     want_order = ["control", "b-missing", "b-mismatch", "b-nodrive", "void-d0", "void-nosync", "wb-pass", "wb-short",
                   "wb-gatefail", "plp-pass", "plp-d0", "plp-nosync", "wt-pass", "wt-nonzero", "wt-nosync", "wt-tampered"]
@@ -500,12 +516,16 @@ def self_test(data):
     for name, want in (("v3-37812355435-x86-ext4loop", "PASS"), ("v3-37812355435-arm-ext4loop", "FAIL")):
         d = os.path.join(data, name)
         sj, raw = load(d)
-        r = decide(sj, True, 0, "loop", "no") if sj is not None else {"decision": None, "reasons": ["no record"]}
+        rc = int(open(os.path.join(d, "rc")).read().split("rc=")[-1].split()[0])  # run.sh's own rc (LOW 19)
+        r = decide(sj, raw, rc, "loop", "no") if sj is not None else {"decision": None, "reasons": ["no record"]}
         why = "write back, counter met" if want == "PASS" else "write through, unbound smoke: no A16 (3) evidence"
         cases.append((f"real {name}: {want} ({why})", r["decision"] == want
                       and (want == "PASS" or any(x.startswith("(write through) no strace") for x in r["reasons"]))))
-        p, ok = plants(sj, True, 0, "no", d)
+        p, ok = plants(sj, raw, rc, "no", d)
         cases.append((f"real {name}: plants all fire on copies of it", ok and [x["plant"] for x in p] == want_order))
+        if want == "PASS":
+            cases.append((f"LOW 17: real {name} (smoke, N=200) FAILs as a device block",
+                          decide(sj, raw, rc, "device", "no")["decision"] == "FAIL"))
     bad = [n for n, good in cases if not good]
     for n, good in cases:
         print(f"BLOCKGATE self-test {'PASS' if good else 'FAIL'}: {n}")
