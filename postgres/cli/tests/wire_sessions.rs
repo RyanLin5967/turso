@@ -3825,9 +3825,10 @@ fn a_parameter_its_type_cannot_read_is_refused_with_its_types_code() {
 /// runs nothing: a parameter format code other than 0 or 1 (22023 "unsupported format code: 2",
 /// even for a NULL value), a parameter-format list that is neither 0, 1 nor one per parameter
 /// (08P01), and, for a branch call, a parameter count other than the call's (08P01). A result
-/// format code other than 0 or 1 is refused here too (22023), where PostgreSQL refuses it at
-/// Execute as it formats the first row: pgwire folds a single code into text, so only the Bind
-/// shows it (E5-QUEUE R2).
+/// format code other than 0 or 1 is refused (22023) as PostgreSQL refuses it, at Execute when the
+/// row is formatted, so after BindComplete; a branch call refuses it before the call runs
+/// (FLAGGED edit, wire review 13 item 10: these two rows asserted no BindComplete, the placement
+/// E5-QUEUE R2(b) recorded, which refused result codes on statements that return no row).
 /// These were checked at Execute, or for a branch call not at all: `SELECT turso_branch_create($1)`
 /// bound with three format codes, with two values or with code 2 created the branch durably and
 /// acknowledged it (wire review 10 item 5).
@@ -3956,10 +3957,17 @@ fn a_bind_postgresql_refuses_is_refused_before_bind_complete() {
                 "{what}: {e:?}"
             );
         }
-        assert!(
-            !tags.contains(&b'2'),
-            "{what}: BindComplete was sent: {tags:?}"
-        );
+        if rcodes.is_empty() {
+            assert!(
+                !tags.contains(&b'2'),
+                "{what}: BindComplete was sent: {tags:?}"
+            );
+        } else {
+            assert!(
+                tags.contains(&b'2'),
+                "{what}: a result code is refused at Execute, after BindComplete: {tags:?}"
+            );
+        }
         assert_eq!(
             a.q("SELECT 1").single(what),
             "1",

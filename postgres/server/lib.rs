@@ -831,6 +831,10 @@ struct SessionState {
     /// The named portals that ran to completion without rows, or failed: a second Execute of one
     /// is 55000, never a second run (wire review 12 item 5).
     done_portals: std::collections::HashSet<String>,
+    /// The first result format code other than 0 or 1 each portal was bound with: refused
+    /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
+    /// so a statement that returns no row succeeds (wire review 13 item 10).
+    bad_result_codes: std::collections::HashMap<String, i16>,
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -920,7 +924,11 @@ impl Session {
         }
         let mut st = self.state();
         st.done_portals.clear();
-        std::mem::take(&mut st.portals)
+        let ended = std::mem::take(&mut st.portals);
+        for name in &ended {
+            st.bad_result_codes.remove(name);
+        }
+        ended
     }
 
     fn transaction_status(&self) -> TransactionStatus {
@@ -1594,6 +1602,12 @@ impl Session {
         portal: Option<&Portal<Parsed>>,
         format: &Format,
     ) -> SqlResult<Response> {
+        // A result format code other than 0 or 1, refused as PostgreSQL refuses it when it formats
+        // the row, which every branch call returns: before the call changes anything (wire review
+        // 13 item 10).
+        if let Some(code) = portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
+            return Err(error("22023", format!("unsupported format code: {code}")));
+        }
         let f = call.function.as_str();
         if f == "turso_branch_current" {
             arity(call, 0)?;
@@ -2816,12 +2830,28 @@ impl ExtendedQueryHandler for Session {
         {
             return Err(PgWireError::UserError(aborted_error()));
         }
+        check_parameter_codes(&message).map_err(PgWireError::UserError)?;
         let portal = Portal::try_new(&message, statement)?;
-        if portal.name != DEFAULT_NAME {
+        {
             let mut st = self.state();
-            st.done_portals.remove(&portal.name);
-            if !st.portals.contains(&portal.name) {
-                st.portals.push(portal.name.clone());
+            match message
+                .result_column_format_codes
+                .iter()
+                .copied()
+                .find(|c| !matches!(c, 0 | 1))
+            {
+                Some(code) => {
+                    st.bad_result_codes.insert(portal.name.clone(), code);
+                }
+                None => {
+                    st.bad_result_codes.remove(&portal.name);
+                }
+            }
+            if portal.name != DEFAULT_NAME {
+                st.done_portals.remove(&portal.name);
+                if !st.portals.contains(&portal.name) {
+                    st.portals.push(portal.name.clone());
+                }
             }
         }
         client.portal_store().put_portal(Arc::new(portal));
@@ -2920,7 +2950,8 @@ impl ExtendedQueryHandler for Session {
             PortalExecutionState::Initial => {
                 match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
                     Response::Query(mut results) => {
-                        *state = if feed_rows(client, &mut results, max_rows).await? {
+                        let refuse = self.state().bad_result_codes.get(name).copied();
+                        *state = if feed_rows(client, &mut results, max_rows, refuse).await? {
                             PortalExecutionState::Suspended(results)
                         } else {
                             PortalExecutionState::Finished
@@ -2957,7 +2988,7 @@ impl ExtendedQueryHandler for Session {
                 }
             }
             PortalExecutionState::Suspended(results) => {
-                if !feed_rows(client, results, max_rows).await? {
+                if !feed_rows(client, results, max_rows, None).await? {
                     *state = PortalExecutionState::Finished;
                 }
             }
@@ -3141,6 +3172,7 @@ async fn feed_rows<C>(
     client: &mut C,
     results: &mut QueryResponse,
     max_rows: usize,
+    refuse: Option<i16>,
 ) -> PgWireResult<bool>
 where
     C: Sink<PgWireBackendMessage> + Unpin,
@@ -3153,6 +3185,14 @@ where
     while max_rows == 0 || rows < max_rows {
         match data.next().await {
             Some(row) => {
+                // `refuse`: a result format code other than 0 or 1, refused at the first row as
+                // PostgreSQL's printtup refuses it (wire review 13 item 10).
+                if let Some(code) = refuse {
+                    return Err(PgWireError::UserError(error(
+                        "22023",
+                        format!("unsupported format code: {code}"),
+                    )));
+                }
                 client.feed(PgWireBackendMessage::DataRow(row?)).await?;
                 rows += 1;
             }
@@ -3649,22 +3689,17 @@ fn bind_portal_parameters(
     Ok(())
 }
 
-/// PostgreSQL's checks of a Bind message alone, made before BindComplete (exec_bind_message): every
-/// parameter and result format code is 0 (text) or 1 (binary), else 22023 "unsupported format
-/// code: N" (even for a NULL value), and a parameter-format list is empty, one code, or one per value
-/// sent, else 08P01. They were made at Execute, after BindComplete, or for a branch call not at
-/// all, and a single bad code was invisible there: pgwire folds one code into text (wire review 10
-/// item 5). PostgreSQL refuses a bad result code at Execute instead, as it formats the first row
-/// (E5-QUEUE R2).
+/// PostgreSQL's first check of a Bind message (exec_bind_message), made before anything else and
+/// before BindComplete: a parameter-format list is empty, one code, or one per value sent, else
+/// 08P01. The value count, the failed-block refusal and the parameter codes follow, in
+/// exec_bind_message's order ([`check_parameter_codes`]); a result code is refused only when a
+/// row is formatted (`SessionState::bad_result_codes`). They were made at Execute, after
+/// BindComplete, or for a branch call not at all, and a single bad code was invisible there: pgwire
+/// folds one code into text (wire review 10 item 5); then every code was refused here first, so a
+/// result code 2 on an INSERT and a parameter code 2 with no values were refused where PostgreSQL
+/// succeeds, and codes [2, 2, 2] for one value was 22023 where it answers 08P01 (wire review 13
+/// item 10).
 fn check_bind(bind: &Bind) -> SqlResult<()> {
-    if let Some(code) = bind
-        .parameter_format_codes
-        .iter()
-        .chain(&bind.result_column_format_codes)
-        .find(|c| !matches!(c, 0 | 1))
-    {
-        return Err(error("22023", format!("unsupported format code: {code}")));
-    }
     let (codes, values) = (bind.parameter_format_codes.len(), bind.parameters.len());
     if codes > 1 && codes != values {
         return Err(error(
@@ -3673,6 +3708,23 @@ fn check_bind(bind: &Bind) -> SqlResult<()> {
         ));
     }
     Ok(())
+}
+
+/// The format code of each value a Bind sends is 0 (text) or 1 (binary), else 22023 "unsupported
+/// format code: N" (even for a NULL value), as PostgreSQL reads each value's format: one code
+/// applies to every value, so it is read only when a value is sent.
+fn check_parameter_codes(bind: &Bind) -> SqlResult<()> {
+    if bind.parameters.is_empty() {
+        return Ok(());
+    }
+    match bind
+        .parameter_format_codes
+        .iter()
+        .find(|c| !matches!(c, 0 | 1))
+    {
+        Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
+        None => Ok(()),
+    }
 }
 
 /// A Bind's value count against its statement's parameters, in PostgreSQL's words (08P01), the
