@@ -1640,6 +1640,9 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
 }
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    if let Some(why) = &stmt.refused {
+        return Err(LimboError::ParseError(why.clone()));
+    }
     if stmt.has_where {
         return Err(LimboError::ParseError(
             "COPY FROM ... WHERE is not supported".to_string(),

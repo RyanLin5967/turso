@@ -4808,20 +4808,6 @@ fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
     }
 }
 
-/// Extract a boolean value from a DefElem's arg.
-/// If arg is None (bare keyword like HEADER), returns None (caller defaults to true).
-fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
-    let arg = def.arg.as_deref()?;
-    match &arg.node {
-        Some(pg_query::protobuf::node::Node::Integer(i)) => Some(i.ival != 0),
-        Some(pg_query::protobuf::node::Node::String(s)) => Some(matches!(
-            s.sval.to_lowercase().as_str(),
-            "true" | "on" | "1"
-        )),
-        _ => None,
-    }
-}
-
 /// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
 /// and type parameters (e.g. `[4]` for `varchar(4)`, `[10, 2]` for `numeric(10, 2)`).
 #[derive(Debug, Clone, PartialEq)]
@@ -5499,6 +5485,10 @@ pub struct PgCopyFromStmt {
     /// The statement has a WHERE, which this COPY does not read: it is refused (wire review 13
     /// item 9: every row was imported).
     pub has_where: bool,
+    /// Why its options are refused, before the file is read: an option PostgreSQL knows that this
+    /// COPY does not implement ("... is not supported", 0A000), or one PostgreSQL does not know or
+    /// given twice (42601), as ProcessCopyOptions answers (wire review 17 item 6).
+    pub refused: Option<String>,
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
@@ -5556,28 +5546,75 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     let mut header = false;
     let mut null_string = None;
 
+    // An allowlist: the options this COPY implements are read, every other is refused before the
+    // file is read. The loop ignored any name it did not read, so QUOTE or FORCE_NOT_NULL in text
+    // mode, DEFAULT, ON_ERROR, ENCODING, an unknown name and HEADER MATCH (read as false, its
+    // header line imported as data) all imported the file (wire review 17 item 6).
+    let mut refused = None;
+    let mut seen: Vec<&str> = Vec::new();
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             continue;
         };
-        match def.defname.as_str() {
-            "format" => {
-                // Only support text format for now
-                if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return None; // unsupported format
+        let name = def.defname.as_str();
+        if seen.contains(&name) {
+            refused = Some("conflicting or redundant options".to_string());
+            break;
+        }
+        seen.push(name);
+        let unsupported = |what: &str| Some(format!("COPY {what} is not supported"));
+        match name {
+            "format" => match def_elem_string_val(def) {
+                Some(val) if val.eq_ignore_ascii_case("text") => {}
+                Some(val) => refused = unsupported(&format!("format \"{val}\"")),
+                None => refused = Some("COPY format requires a value".to_string()),
+            },
+            "delimiter" => delimiter = def_elem_string_val(def),
+            "null" => null_string = def_elem_string_val(def),
+            // HEADER alone is true; else a Boolean, as PostgreSQL's parse_bool reads one; MATCH,
+            // which checks the header against the columns, is not implemented.
+            "header" => match def.arg.as_deref().map(|a| &a.node) {
+                None => header = true,
+                Some(Some(pg_query::protobuf::node::Node::Integer(i)))
+                    if matches!(i.ival, 0 | 1) =>
+                {
+                    header = i.ival == 1
+                }
+                Some(Some(pg_query::protobuf::node::Node::String(v))) => {
+                    match v.sval.to_ascii_lowercase().as_str() {
+                        "true" | "on" | "yes" | "1" => header = true,
+                        "false" | "off" | "no" | "0" => header = false,
+                        "match" => refused = unsupported("HEADER MATCH"),
+                        _ => {
+                            refused =
+                                Some("header requires a Boolean value or \"match\"".to_string())
+                        }
                     }
                 }
-            }
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "header" => header = def_elem_bool_val(def).unwrap_or(true),
-            "null" => null_string = def_elem_string_val(def),
-            _ => {}
+                _ => refused = Some("header requires a Boolean value or \"match\"".to_string()),
+            },
+            "freeze"
+            | "quote"
+            | "escape"
+            | "force_quote"
+            | "force_not_null"
+            | "force_null"
+            | "convert_selectively"
+            | "encoding"
+            | "on_error"
+            | "reject_limit"
+            | "log_verbosity"
+            | "default" => refused = unsupported(&format!("option \"{name}\"")),
+            _ => refused = Some(format!("option \"{name}\" not recognized")),
+        }
+        if refused.is_some() {
+            break;
         }
     }
 
     Some(PgCopyFromStmt {
         has_where: copy.where_clause.is_some(),
+        refused,
         table_name,
         schema_name,
         columns,
