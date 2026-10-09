@@ -4122,6 +4122,139 @@ fn a_malformed_sync_is_still_answered() {
     assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
 }
 
+/// A malformed Sync ends its round as a well-formed one does: the transaction it ends takes its
+/// named portals with it, so an Execute of one after it is 34000 and runs nothing; and inside a
+/// block a portal suspended by max_rows survives a Sync and a simple Query, then is gone after
+/// COMMIT. The malformed path answered its ERROR and ReadyForQuery and skipped the rest of the
+/// round, so the portal outlived the transaction and its UPDATE ran and committed (wire review 15
+/// item 4).
+#[test]
+fn a_malformed_sync_ends_its_round() {
+    let dir = Scratch::new("badsyncround");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, 'two'), (3, 'three')")
+        .ok("rows");
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    let round = [
+        frame(b'P', b"s1\0UPDATE t SET v = 'changed' WHERE id = 1\0\0\0"),
+        frame(b'B', b"p\0s1\0\0\0\0\0\0\0"),
+        frame(b'S', &[0]),
+    ]
+    .concat();
+    a.s.write_all(&round).unwrap();
+    let (_, errors, status) = read_raw_reply(&mut a);
+    assert_eq!(errors.len(), 1, "the malformed Sync: {errors:?}");
+    assert_eq!(errors[0].code, "08P01");
+    assert_eq!(status, b'I');
+    a.s.write_all(&[frame(b'E', b"p\0\0\0\0\0"), frame(b'S', &[])].concat())
+        .unwrap();
+    let (_, errors, _) = read_raw_reply(&mut a);
+    assert_eq!(
+        errors.iter().map(|e| e.code.as_str()).collect::<Vec<_>>(),
+        vec!["34000"],
+        "the portal went with its transaction"
+    );
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 1").single("unchanged"),
+        "trunk"
+    );
+    // Inside a block a suspended portal lives until the block ends.
+    a.q("BEGIN").ok("begin");
+    let fetch = |rows: i32| -> Vec<u8> {
+        let mut e = b"p2\0".to_vec();
+        e.extend_from_slice(&rows.to_be_bytes());
+        e
+    };
+    let round = [
+        frame(b'P', b"s2\0SELECT id FROM t ORDER BY id\0\0\0"),
+        frame(b'B', b"p2\0s2\0\0\0\0\0\0\0"),
+        frame(b'E', &fetch(1)),
+        frame(b'S', &[]),
+    ]
+    .concat();
+    a.s.write_all(&round).unwrap();
+    let (tags, errors, status) = read_raw_reply(&mut a);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(tags.contains(&b's'), "suspended: {tags:?}");
+    assert_eq!(status, b'T');
+    assert_eq!(a.q("SELECT 1").single("a query in the block"), "1");
+    a.s.write_all(&[frame(b'E', &fetch(0)), frame(b'S', &[])].concat())
+        .unwrap();
+    let (tags, errors, _) = read_raw_reply(&mut a);
+    assert!(errors.is_empty(), "the portal resumes: {errors:?}");
+    assert_eq!(
+        tags.iter().filter(|t| **t == b'D').count(),
+        2,
+        "the two rows left: {tags:?}"
+    );
+    a.q("COMMIT").ok("end");
+    a.s.write_all(&[frame(b'E', &fetch(0)), frame(b'S', &[])].concat())
+        .unwrap();
+    let (_, errors, _) = read_raw_reply(&mut a);
+    assert_eq!(
+        errors.iter().map(|e| e.code.as_str()).collect::<Vec<_>>(),
+        vec!["34000"],
+        "the portal went with the block"
+    );
+}
+
+/// A malformed simple Query that arrives while the session skips to Sync after an extended error is
+/// ignored, as PostgreSQL ignores every message but Sync there before it reads the body: one
+/// ErrorResponse and one ReadyForQuery for the round, and the INSERT pipelined after the Query
+/// never runs. The malformed Query ended the skip with an ERROR and a ReadyForQuery of its own, so
+/// the extended messages after it ran and Sync committed them (wire review 15 item 5; a regression
+/// of e4e5fc79d, wider since 569e1793c sends invalid UTF-8 down the same path).
+#[test]
+fn a_malformed_query_in_a_skip_is_ignored() {
+    let dir = Scratch::new("badqueryskip");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let frame = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    };
+    for (n, query) in [(9, &b"SELECT 1"[..]), (10, &b"SELECT '\xff'\0"[..])] {
+        let insert = format!("\0INSERT INTO t VALUES ({n}, 'n')\0\0\0");
+        let round = [
+            frame(b'P', b"\0SELECT 1/0\0\0\0"),
+            frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
+            frame(b'E', &[0, 0, 0, 0, 0]),
+            frame(b'Q', query),
+            frame(b'P', insert.as_bytes()),
+            frame(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]),
+            frame(b'E', &[0, 0, 0, 0, 0]),
+            frame(b'S', &[]),
+        ]
+        .concat();
+        a.s.write_all(&round).unwrap();
+        let (tags, errors, status) = read_raw_reply(&mut a);
+        assert_eq!(errors.len(), 1, "{n}: one error for the round: {errors:?}");
+        assert_eq!(status, b'I');
+        a.s.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut more = [0u8; 1];
+        let extra = a.s.read(&mut more);
+        a.s.set_read_timeout(None).unwrap();
+        assert!(
+            extra.is_err(),
+            "{n}: a second reply after the round's ReadyForQuery: {extra:?} (tags {tags:?})"
+        );
+        assert_eq!(
+            a.q(&format!("SELECT count(*) FROM t WHERE id = {n}"))
+                .single("the INSERT after the Query never ran"),
+            "0"
+        );
+    }
+}
+
 /// A Bind that supplies a value count other than the statement's parameters is 08P01 for EVERY
 /// statement, as PostgreSQL's exec_bind_message refuses it, before anything runs: a branch call
 /// (create with two format codes and one value, create with two values, delete of a literal with one
