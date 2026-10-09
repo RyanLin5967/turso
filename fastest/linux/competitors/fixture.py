@@ -142,9 +142,10 @@ def write(av):
     out, o = av[0], opts(av[1:])
     rows, age = int(o["--rows"]), int(o["--age"])
     lv = o.get("--live", "")
+    gf = gen_seed.facts(rows, age, 1)  # MED 12: every generator value below from ONE pass over the stream
     fx = {"system": o["--system"], "rows": rows, "age_updates": age, "prebranch": int(o["--prebranch"]),
           "live_branches": int(lv) if lv.isdigit() else None,
-          "gen_seed_sha256": gen_seed.digest(rows, age, 1), "du_paths": o.get("--du", []),
+          "gen_seed_sha256": gf["digest"], "du_paths": o.get("--du", []),
           # MED 11: the table's schema line, by itself (a schema change no longer hides inside the stream digest)
           "schema_sha256": hashlib.sha256((next(gen_seed.sql_lines(1)) + "\n").encode()).hexdigest(),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
@@ -160,10 +161,10 @@ def write(av):
         except OSError:
             sd[k] = None
     fx["stream_sha256"] = sd if len(sd) == 2 and all(sd.values()) else None
-    fx["expected_streams"] = gen_seed.stream_digests(rows, age, 1)
+    fx["expected_streams"] = gf["streams"]
     m = re.fullmatch(r"(\d+)\|(\d+)\|(\d+)", o.get("--readback", "").strip())
     fx["readback"] = dict(zip(("count", "sum", "row_hash"), map(int, m.groups()))) if m else None
-    fx["expected_readback"] = dict(zip(("count", "sum", "row_hash"), map(int, gen_seed.expect(rows, age, 1).split("|"))))
+    fx["expected_readback"] = {k: gf[k] for k in ("count", "sum", "row_hash")}
     if fx["engine_bytes"] is None:
         fx["engine_bytes_why"] = o.get("--engine-why") or f"engine size not read ({o.get('--engine-bytes')!r})"
         if not o.get("--engine-why"):
@@ -178,17 +179,39 @@ def sqlite(av):
     rows, age, sq3 = int(o["--rows"]), int(o["--age"]), o["--sqlite3"]
     if os.path.exists(path):
         sys.exit(f"fixture.py sqlite: {path} exists")
-    sql, aging = list(gen_seed.sql_lines(rows)), list(gen_seed.age_lines(rows, age, 1))
-    # MED 3: the digest of each stream as this write path feeds it (the same framing as gen_seed.py --digest-out)
-    dg = {k: hashlib.sha256("".join(ln + "\n" for ln in ls).encode()).hexdigest() for k, ls in (("sql", sql), ("age", aging))}
-    if o.get("--digest-dir"):
+    # MED 12: the stream goes into sqlite3's stdin line by line as it is generated (the old feed held the whole SQL
+    # about three times over: ~28 GB at the 10 GiB tier), and each stream's digest (MED 3, the same framing as gen_seed.py
+    # --digest-out) is computed in that same pass. sqlite3's stdout and stderr go to temporary files, so neither pipe can
+    # fill and stall the writer.
+    import tempfile
+    hs = {"sql": hashlib.sha256(), "age": hashlib.sha256()}
+    with tempfile.TemporaryFile("w+") as so, tempfile.TemporaryFile("w+") as se:
+        p = subprocess.Popen([sq3, path], stdin=subprocess.PIPE, stdout=so, stderr=se, text=True)
+        try:
+            p.stdin.write("PRAGMA journal_mode=WAL;\n")
+            for k, lines in (("sql", gen_seed.sql_lines(rows)), ("age", gen_seed.age_lines(rows, age, 1))):
+                for ln in lines:
+                    b = ln + "\n"
+                    p.stdin.write(b)
+                    hs[k].update(b.encode())
+            p.stdin.write("PRAGMA wal_checkpoint(TRUNCATE);\n")
+            p.stdin.close()
+        except BrokenPipeError:
+            pass  # sqlite3 died: its rc and stderr say why, below
+        try:
+            rc = p.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            sys.exit(f"fixture.py sqlite: {sq3} did not finish in 3600 s")
+        se.seek(0)
+        err = se.read()
+    if rc != 0:
+        sys.exit(f"fixture.py sqlite: {sq3} rc {rc}: {err[-400:]}")
+    dg = {k: h.hexdigest() for k, h in hs.items()}
+    if o.get("--digest-dir"):  # written only after sqlite3 consumed the whole stream and exited 0
         for k, h in dg.items():
             with open(os.path.join(o["--digest-dir"], f"seed-{k}.sha256"), "w") as f:
                 f.write(h + "\n")
-    feed = ["PRAGMA journal_mode=WAL;"] + sql + aging + ["PRAGMA wal_checkpoint(TRUNCATE);"]
-    r = subprocess.run([sq3, path], input="\n".join(feed) + "\n", capture_output=True, text=True, timeout=3600)
-    if r.returncode != 0:
-        sys.exit(f"fixture.py sqlite: {sq3} rc {r.returncode}: {r.stderr[-400:]}")
     q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size; SELECT count(*), sum(v) FROM t;"],
                        capture_output=True, text=True, timeout=600)
     lines = q.stdout.split()

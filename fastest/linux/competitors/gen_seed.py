@@ -143,8 +143,31 @@ def readback_sql(dialect):
 
 
 def facts(rows, updates=0, seed=1):
-    """RED stub."""
-    return {}
+    """Everything a fixture records about the generator, in ONE pass over the parent stream (MED 12: at the 10 GiB
+    tier each pass takes about 30 min): {"count", "sum", "row_hash", "streams": {"sql", "age"}, "digest"} -- the same
+    values as aged_sum, row_hash, stream_digests and digest, with O(aged rows) memory."""
+    aging = list(age_lines(rows, updates, seed))  # K lines (1e5 at most registered): small
+    last = {}
+    for ln in aging:
+        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
+        last[int(i)] = int(v)
+    hs, ha, hc = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
+    total = 0
+    for ln in sql_lines(rows):
+        b = (ln + "\n").encode()
+        hs.update(b)
+        hc.update(b)
+        if ln.startswith("INSERT"):
+            for tup in ln[ln.index("VALUES ") + 7:-1].split("),("):
+                i, v, pad = tup.strip("()").split(",", 2)
+                i = int(i)
+                total += hash_row(i, last.get(i, int(v)), pad.strip("'"))
+    for ln in aging:
+        b = (ln + "\n").encode()
+        ha.update(b)
+        hc.update(b)
+    return {"count": rows, "sum": sum(last.values()), "row_hash": total,
+            "streams": {"sql": hs.hexdigest(), "age": ha.hexdigest()}, "digest": hc.hexdigest()}
 
 
 def expect(rows, updates=0, seed=1):

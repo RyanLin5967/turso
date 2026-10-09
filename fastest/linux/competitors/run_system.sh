@@ -623,6 +623,13 @@ b1_main() {
   mkdir -p "$ROOT/branches"
   # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
   # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
+  # MED 12 plant: a 1e6-row parent (about 110 MB of SQL) built under a 300 MB virtual-memory limit must succeed, since
+  # the stream is piped and never held (the old feed held it about three times over, which this limit refuses)
+  local mp="$ROOT/plant-1e6.noindex.db" mrc=0
+  ( ulimit -v 300000; exec python3 -B "$HERE/fixture.py" sqlite "$mp" --rows 1000000 --age 0 --sqlite3 "$SQ3" ) \
+    >"$RAW/plant-stream-1e6.txt" 2>&1 || mrc=$?
+  expect "stream plant: a 1e6-row SQLite parent under ulimit -v 300000 (rc)" "$mrc" 0
+  rm -f "$mp" "$mp-wal" "$mp-shm"
   python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
     tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
   # MED 3: the parent as SQLite reads it back (count, sum, row hash) against what the generator wrote
