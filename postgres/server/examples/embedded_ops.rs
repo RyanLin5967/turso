@@ -4,7 +4,7 @@
 //! C1b tracers stamp (CLOCK_UPTIME_RAW), so their events can be attributed to steps.
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
-//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra]
+//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra|extra-write]
 //!                [--name-prefix P] --out FILE
 //!
 //! `--name-prefix P` (default `b_`) names op k's branch `P<k>`: the budget passes the prefix the wire
@@ -16,6 +16,9 @@
 //! that already has children (the path credited cells take; wire review 1 item 18). `--plant extra`
 //! (a budget fire-check) also commits a trunk row inside each create step, as the wire side's
 //! `--plant both` does, so the two sides stay equal and only the budget's absolute counts can fail.
+//! `--plant extra-write` commits a second row on the branch inside each write step, as the wire
+//! side's `--plant both-write` does: the write step's registered absolute counts must catch it
+//! (wire review 15 item 10).
 //!
 //! The cycle, per op k (the statements the wire side sends, and the engine call each maps to):
 //!   create  SELECT turso_branch_create('b_k')   Connection::create_branch on the trunk connection
@@ -93,6 +96,7 @@ struct Args {
     ops: u64,
     siblings: u64,
     plant_extra: bool,
+    plant_extra_write: bool,
     name_prefix: String,
     out: String,
 }
@@ -103,6 +107,7 @@ fn args() -> Args {
     let (mut durability, mut store) = ("full".to_string(), "catalog".to_string());
     let (mut rows, mut warmup, mut ops, mut siblings) = (1000, 20, 200, 0);
     let mut plant_extra = false;
+    let mut plant_extra_write = false;
     let mut name_prefix = "b_".to_string();
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
@@ -116,7 +121,8 @@ fn args() -> Args {
             "--siblings" => siblings = v().parse().unwrap(),
             "--plant" => match v().as_str() {
                 "extra" => plant_extra = true,
-                other => panic!("--plant {other}: extra"),
+                "extra-write" => plant_extra_write = true,
+                other => panic!("--plant {other}: extra or extra-write"),
             },
             "--name-prefix" => name_prefix = v(),
             "--out" => out = Some(v()),
@@ -142,6 +148,7 @@ fn args() -> Args {
         ops,
         siblings,
         plant_extra,
+        plant_extra_write,
         name_prefix,
         out: out.expect("--out"),
     }
@@ -230,6 +237,9 @@ fn main() {
         stmt.run_ignore_rows().unwrap();
         assert_eq!(stmt.n_change(), 1, "the write touched no row");
         drop(stmt);
+        if a.plant_extra_write {
+            run(&branch, &format!("INSERT INTO t2 VALUES ({seq})"));
+        }
         rec(seq, phase, "write", p0, Probe::now());
 
         let p0 = Probe::now();
