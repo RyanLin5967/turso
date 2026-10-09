@@ -1444,7 +1444,13 @@ fn target_name(val: &PgNode) -> String {
 }
 
 /// Columns renamed by an alias's column list (`AS d(a, b)`), the rest keeping their names.
+/// A list holding the [`STAR`] marker (a `*` the walk could not expand) is returned as it is: the
+/// marker is what makes the relation one the walk cannot open, and renamed away it read as a
+/// relation of the aliased columns, untyped (wire review 14 item 8).
 fn rename(mut columns: Vec<(String, Option<u32>)>, names: &[PgNode]) -> Vec<(String, Option<u32>)> {
+    if columns.iter().any(|(n, _)| n == STAR) {
+        return columns;
+    }
     for (column, name) in columns.iter_mut().zip(names) {
         if let Some(Node::String(s)) = name.node.as_ref() {
             column.0 = s.sval.clone();
