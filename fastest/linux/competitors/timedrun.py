@@ -36,6 +36,7 @@ the load generator records its own TracerPid at the window's start and end (summ
 """
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -287,6 +288,13 @@ def write_verdict(celldir, n, why, warm_rule=None, cap=None):
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
     except OSError:
         out["live_branches"] = None
+    # LOW 15: the timed run's own template waits (PG; run_system.sh's timed.template_waits.txt), recorded and FLAGGED
+    # like the labelling run's in cell.json, never dropped
+    tw = os.path.join(celldir, "timed.template_waits.txt")
+    if os.path.exists(tw):
+        w = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", open(tw).read())}
+        out["template_waits"] = w
+        out["template_waits_flagged"] = any(w.values())
     with open(os.path.join(celldir, "timed.json"), "w") as f:
         json.dump(out, f)
     return out

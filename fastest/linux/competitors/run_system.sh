@@ -378,8 +378,22 @@ run_server_cell() { # run_server_cell SPEC C
   if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s (before the timed run)"; fi
   bb_args "$spec" "$c" "$n" "$d/timed"
   live_mark "$d" timed_before
+  local tlog0 tlog1
+  tlog0=$(stat -c %s "$DATA.log")
   timed_run "$d/timed" "$(server_pid)" -- "${BBA[@]}" >/dev/null || true
+  tlog1=$(stat -c %s "$DATA.log")
   live_mark "$d" timed_after
+  # LOW 15: the timed run's own server log and, for PG, its template waits (amendment 14 section 6's flag covered only
+  # the labelling run): recorded in timed.template_waits.txt, read into timed.json, and FLAGGED like the labelling run's
+  tail -c +$((tlog0 + 1)) "$DATA.log" | head -c $((tlog1 - tlog0)) >"$d/timed.server_log.txt"
+  if [ "$KIND" = pg ]; then
+    local tav tbusy
+    tav=$(grep -c 'terminating autovacuum process due to administrator command' "$d/timed.server_log.txt")
+    tbusy=$(grep -c 'is being accessed by other users' "$d/timed.server_log.txt")
+    echo "autovacuum_terminated_in_window=$tav template_busy_errors=$tbusy" >"$d/timed.template_waits.txt"
+    [ "$tav" = 0 ] && [ "$tbusy" = 0 ] ||
+      fun "FLAG $spec-c$c timed run: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $tav, busy-template errors $tbusy"
+  fi
   if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
   timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
