@@ -4609,6 +4609,29 @@ fn an_empty_extended_statement_is_an_empty_query() {
     );
 }
 
+/// A Parse of more than one statement is refused (42601 "cannot insert multiple commands into a
+/// prepared statement"), as PostgreSQL refuses it, failing the block it arrives in. The prepare
+/// translated only the first statement, so `COMMIT; INSERT ...` inside a block committed it,
+/// skipped the INSERT and answered success (wire review 14 item 5).
+#[test]
+fn a_parse_of_several_statements_is_refused() {
+    let dir = Scratch::new("parsemulti");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')")
+        .ok("a write in the block");
+    let r = a.x("COMMIT; INSERT INTO t VALUES (9, 'nine')", &[]);
+    assert_eq!(r.err("two statements in one Parse").code, "42601");
+    assert_eq!(r.status, b'E', "the block failed");
+    a.q("ROLLBACK").ok("end");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id IN (2, 9)")
+            .single("nothing kept"),
+        "0"
+    );
+}
+
 /// A statement of nothing but semicolons and comments (`;;`, `-- c`, `/* c */`) is PostgreSQL's
 /// empty query on both protocols: EmptyQueryResponse, no error, and a pipeline it sits in commits
 /// its earlier INSERT at Sync. A lone U+00A0 is not whitespace to PostgreSQL's lexer: 42601. Read
