@@ -6804,6 +6804,52 @@ fn a_reconnect_right_after_a_close_is_not_refused() {
     );
 }
 
+/// A simple Query is parsed whole before any of it runs, as PostgreSQL parses it: a part that is
+/// no statement (`COMMIT<NBSP>`, which lexes as one identifier; `foo`; `ROLBACK`) is 42601, and
+/// nothing of the query runs, in autocommit or in a block (which fails). libpg_query's scanner
+/// split emitted only the parts holding a keyword and dropped the rest, so the other statements ran
+/// and nothing was refused (wire review 16 item 1). Failure here is a duplicate key, never `1/0`,
+/// which this engine answers NULL (wire review 16 item 2).
+#[test]
+fn a_query_with_a_part_that_is_no_statement_runs_nothing() {
+    let dir = Scratch::new("nostmt");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE sp(id INT PRIMARY KEY)").ok("sp");
+    for sql in [
+        "INSERT INTO sp VALUES (2); COMMIT\u{a0}; INSERT INTO sp VALUES (3)",
+        "foo; INSERT INTO sp VALUES (4)",
+        "INSERT INTO sp VALUES (5); ROLBACK",
+        "INSERT INTO sp VALUES (6); 'x'",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42601", "{sql:?}");
+        assert_eq!(r.status, b'I', "{sql:?}");
+    }
+    assert_eq!(
+        a.q("SELECT count(*) FROM sp").single("rows"),
+        "0",
+        "a statement of a refused query ran"
+    );
+    // Control: the same statements with no stray part run, and a comment or a run of `;` between
+    // them is no part.
+    a.q("INSERT INTO sp VALUES (2); /* c */ ;; INSERT INTO sp VALUES (3) -- end")
+        .ok("two inserts");
+    assert_eq!(a.q("SELECT count(*) FROM sp").single("rows"), "2");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO sp VALUES (7)").ok("insert in the block");
+    let sql = "UPDATE sp SET id = id + 100; ROLBACK";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "42601");
+    assert_eq!(r.status, b'E', "the block fails");
+    a.q("ROLLBACK").ok("rollback");
+    assert_eq!(
+        a.q("SELECT sum(id) FROM sp").single("ids"),
+        "5",
+        "the block's insert or the UPDATE survived"
+    );
+}
+
 /// An implicit block (a multi-statement query, or a pipeline up to Sync) lives as long as the
 /// engine's transaction does, whatever the statements' text says: a statement that ends the
 /// engine's transaction ends the block, and a failure after it cannot be committed by the next
