@@ -3672,46 +3672,77 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
-/// Assumes text format encoding (UTF-8 string representations).
+/// Assumes text format encoding (UTF-8 string representations). A value the type cannot read is
+/// refused as the type's input function refuses it: 22P02 for bad syntax, 22003 for a value outside
+/// the type, 22023 for bad bytea hex; they were XX000, and no integer's range below int8 was checked
+/// (wire review 13 item 8, review 14 item 28).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
-        PgWireError::UserError(Box::new(error_info(&format!(
-            "invalid UTF-8 in parameter: {e}"
-        ))))
+        PgWireError::UserError(error(
+            "22021",
+            format!("invalid byte sequence for encoding \"UTF8\" in parameter: {e}"),
+        ))
     })?;
     if let Some(element) = element_of(pg_type.oid()).and_then(Type::from_oid) {
         return pg_array_to_value(text, &element);
     }
+    let syntax = |name: &str| {
+        PgWireError::UserError(error(
+            "22P02",
+            format!("invalid input syntax for type {name}: \"{text}\""),
+        ))
+    };
+    let out_of_range = |name: &str| {
+        PgWireError::UserError(error(
+            "22003",
+            format!("value \"{text}\" is out of range for type {name}"),
+        ))
+    };
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
-            let i: i64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
-                    "invalid integer parameter: {e}"
-                ))))
-            })?;
-            Ok(Value::from_i64(i))
+            let (name, min, max) = match *pg_type {
+                Type::INT2 => ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
+                Type::INT4 => ("integer", i64::from(i32::MIN), i64::from(i32::MAX)),
+                _ => ("bigint", i64::MIN, i64::MAX),
+            };
+            match pg_integer(text) {
+                Some(Some(i)) if (min..=max).contains(&i) => Ok(Value::from_i64(i)),
+                Some(_) => Err(out_of_range(name)),
+                None => Err(syntax(name)),
+            }
         }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
-            let f: f64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
-                    "invalid float parameter: {e}"
-                ))))
-            })?;
+            let name = match *pg_type {
+                Type::FLOAT4 => "real",
+                Type::FLOAT8 => "double precision",
+                _ => "numeric",
+            };
+            let trimmed = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
+            let f: f64 = trimmed.parse().map_err(|_| syntax(name))?;
+            // A finite spelling past the type's range ('1e400'), which Rust reads as infinity.
+            let infinite_spelled = trimmed
+                .trim_start_matches(['+', '-'])
+                .to_ascii_lowercase()
+                .starts_with("inf");
+            let past = match *pg_type {
+                Type::FLOAT4 => f.is_finite() && f.abs() > f64::from(f32::MAX),
+                _ => false,
+            };
+            if (f.is_infinite() && !infinite_spelled) || past {
+                return Err(out_of_range(name));
+            }
             Ok(Value::from_f64(f))
         }
-        Type::BOOL => match text {
-            "t" | "true" | "TRUE" | "1" | "yes" | "on" => Ok(Value::from_i64(1)),
-            "f" | "false" | "FALSE" | "0" | "no" | "off" => Ok(Value::from_i64(0)),
-            _ => Err(PgWireError::UserError(Box::new(error_info(&format!(
-                "invalid boolean parameter: {text}"
-            ))))),
+        Type::BOOL => match pg_bool(text) {
+            Some(b) => Ok(Value::from_i64(i64::from(b))),
+            None => Err(syntax("boolean")),
         },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
                 let data =
-                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22P02", e)))?;
+                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22023", e)))?;
                 Ok(Value::from_blob(data))
             } else {
                 // Raw bytes as-is
@@ -3799,15 +3830,14 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
                     return Err(malformed());
                 }
             }
+            // An element its type cannot read fails with that type's own error, as array_in fails
+            // with its element's input function's: it was always a generic 22P02, so an int4
+            // element out of range or a bytea element's bad digit had the wrong code (wire review
+            // 13 LOW 17).
             values.push(if !quoted && item.eq_ignore_ascii_case("null") {
                 Value::Null
             } else {
-                pg_bytes_to_value(item.as_bytes(), element).map_err(|_| {
-                    PgWireError::UserError(error(
-                        "22P02",
-                        format!("invalid input syntax for type {element}: \"{item}\""),
-                    ))
-                })?
+                pg_bytes_to_value(item.as_bytes(), element)?
             });
             match chars.next() {
                 None => break,
@@ -3821,8 +3851,82 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
     Ok(Value::Blob(record.into_payload()))
 }
 
+/// An integer as PostgreSQL's integer input functions read one (pg_strtoint64_safe, PostgreSQL 16
+/// and later): blanks around it, an optional sign, then decimal digits, or 0x / 0o / 0b and that
+/// base's digits, with one underscore allowed between two digits. `Some(None)` for a well-formed
+/// integer past i64 (out of range), `None` for bad syntax.
+fn pg_integer(text: &str) -> Option<Option<i64>> {
+    let s = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (radix, digits) = match s.get(..2).map(|p| p.to_ascii_lowercase()).as_deref() {
+        Some("0x") => (16, &s[2..]),
+        Some("0o") => (8, &s[2..]),
+        Some("0b") => (2, &s[2..]),
+        _ => (10, s),
+    };
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+        return None;
+    }
+    let mut magnitude: u128 = 0;
+    let mut previous_underscore = false;
+    for c in digits.chars() {
+        if c == '_' {
+            if previous_underscore {
+                return None;
+            }
+            previous_underscore = true;
+            continue;
+        }
+        previous_underscore = false;
+        let d = c.to_digit(radix)?;
+        // Saturates past every i64 magnitude, which is all an out-of-range verdict needs.
+        magnitude = magnitude
+            .saturating_mul(u128::from(radix))
+            .saturating_add(u128::from(d));
+    }
+    let limit = if negative {
+        u128::from(i64::MIN.unsigned_abs())
+    } else {
+        i64::MAX as u128
+    };
+    if magnitude > limit {
+        return Some(None);
+    }
+    let value = if negative {
+        (magnitude as i128).wrapping_neg() as i64
+    } else {
+        magnitude as i64
+    };
+    Some(Some(value))
+}
+
+/// A boolean as PostgreSQL's boolin reads one (parse_bool_with_len): blanks around it, any case,
+/// `t`/`true`, `y`/`yes`, `f`/`false`, `n`/`no` or any prefix of those words, `on`, `off` (at least
+/// two letters, so `o` is ambiguous), `1` and `0`. It took six spellings, so `True`, ` t` and `of`
+/// were refused.
+fn pg_bool(text: &str) -> Option<bool> {
+    let s = text
+        .trim_matches(|c: char| c.is_ascii() && pg_space(c as u8))
+        .to_ascii_lowercase();
+    let prefix_of = |word: &str| !s.is_empty() && word.starts_with(s.as_str());
+    match s.as_str() {
+        "1" => Some(true),
+        "0" => Some(false),
+        "on" => Some(true),
+        "of" | "off" => Some(false),
+        _ if prefix_of("true") || prefix_of("yes") => Some(true),
+        _ if prefix_of("false") || prefix_of("no") => Some(false),
+        _ => None,
+    }
+}
+
 /// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
-/// digits, whitespace skipped between pairs, its messages on bad input (22P02 at the caller). Read
+/// digits, whitespace skipped between pairs, its messages on bad input (22023 at the caller, as
+/// byteain raises them). Read
 /// by character, never sliced: `&hex[i..i + 2]` cut a multi-byte character and panicked, and under
 /// the release build's panic=abort one client's Bind ended every session (wire review 9 item 5).
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
@@ -4091,10 +4195,6 @@ fn is_create_table_as(upper: &str) -> bool {
         return false;
     }
     matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
-}
-
-fn error_info(message: &str) -> ErrorInfo {
-    ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
 }
 
 #[cfg(test)]
