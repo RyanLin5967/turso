@@ -427,6 +427,36 @@ fn test_multiple_statements() {
     assert_eq!(stmts.len(), 2);
 }
 
+/// libpg_query's scanner split emits only the stretches holding a keyword: a text with any other
+/// stretch (`COMMIT<NBSP>`, one identifier; `foo`; `ROLBACK`; a bare string) is refused, never split
+/// around it, so its caller prepares it whole and the parser refuses it, as PostgreSQL does (wire
+/// review 16 item 1). Whitespace, comments and runs of `;` between, before and after statements are
+/// no stretch.
+#[test]
+fn a_split_refuses_a_stretch_that_is_no_statement() {
+    for sql in [
+        "INSERT INTO t VALUES (2); COMMIT\u{a0}; INSERT INTO t VALUES (3)",
+        "foo; SELECT 1",
+        "SELECT 1; ROLBACK",
+        "SELECT 1; 'x'",
+    ] {
+        let split = split_statements(sql);
+        assert!(split.is_err(), "{sql:?} split as {split:?}");
+    }
+    for (sql, n) in [
+        ("SELECT 1; /* c */ ;; SELECT 2 -- end", 2),
+        ("  SELECT 1;\n", 1),
+        ("/* only */ ;", 0),
+    ] {
+        let split = split_statements(sql);
+        assert_eq!(
+            split.as_ref().map(Vec::len).ok(),
+            Some(n),
+            "{sql:?}: {split:?}"
+        );
+    }
+}
+
 #[test]
 fn test_postgresql_types() {
     let queries = vec![
