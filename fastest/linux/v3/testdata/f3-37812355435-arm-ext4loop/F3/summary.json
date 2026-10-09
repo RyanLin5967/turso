@@ -2,8 +2,8 @@
  "app_syncs_per_op": {
   "append25": 1.0,
   "append64": 1.0,
-  "cfr2b": 1.84,
-  "clean": 0.425,
+  "cfr2b": 2.0,
+  "clean": 1.0,
   "fdatasync4k": 1.0,
   "nosync25": 0.0,
   "ow1m": 1.0,
@@ -475,6 +475,35 @@
  "seed_arg": 11,
  "statfs_magic": "0xef53",
  "super_opts": "rw,noinit_itable",
+ "sync_fds": {
+  "append25": {
+   "3": 200
+  },
+  "append64": {
+   "4": 200
+  },
+  "cfr2b": {
+   "13": 200,
+   "9": 200
+  },
+  "clean": {
+   "10": 200
+  },
+  "fdatasync4k": {
+   "11": 200
+  },
+  "nosync25": {},
+  "ow1m": {
+   "7": 200
+  },
+  "ow4k": {
+   "5": 200
+  },
+  "ow64k": {
+   "6": 200
+  }
+ },
+ "sync_fds_overflow": false,
  "timing_control": "not applicable: no volatile cache",
  "timing_gated_arms": [
   "append25"

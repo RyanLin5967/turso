@@ -495,6 +495,9 @@ def post(out, cell, sha, mode, verdict_path):
                 if r.get("ops") != (arms.get(a) or {}).get("ops") or r.get("windows_without_a_sync") != 0:
                     voids.append("fsync: %s's windows without an fsync or fdatasync by the probe: %r of %r" %
                                  (a, r.get("windows_without_a_sync"), r.get("ops")))
+                elif r.get("windows_short") != 0:  # attributed by fd: each window holds all its own (tenth review H1)
+                    voids.append("fsync: %s's windows short of their own syncs (by fd): %r of %r" %
+                                 (a, r.get("windows_short"), r.get("ops")))
             merged["app_syncs_per_op"] = {a: round(r.get("syncs", 0) / max(1, r.get("ops", 1)), 4) for a, r in sarms.items()}
         merged["device_flushes"] = {"instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests "
                                     "and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",
@@ -664,12 +667,15 @@ def _post_batch(d, sha, mod):
     rep = {"proves": "planted", "devices": {},
            "windows": {"arms": {"append25": {"ops": 5, "devices": {} if wt else {"nvme0n1": win}},
                                 "nosync25": {"ops": 5, "devices": {}}}},
-           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0},
-                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5}}}}
+           # [tenth review HIGH 1: a current report carries windows_short]
+           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0},
+                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0}}}}
     if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
         rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
     if mod == "leafkind":
         sj["leaf"]["kind"] = "scsi_debug"
+    if mod == "short":  # tenth review HIGH 1: every window synced, one short of its own (by fd)
+        rep["syscalls"]["arms"]["append25"].update(windows_short=1)
     if mod in ("nosync", "wt-nosync"):  # one append25 window with no fsync by the probe
         rep["syscalls"]["arms"]["append25"].update(syncs=4, windows_without_a_sync=1)
     if mod == "wt-mismatch":
@@ -726,6 +732,7 @@ def post_selftest(chk):
             ("A16: a write-through leaf whose drive reports write back", "wt-mismatch", "smoke", 2, "drive report:", {}),
             ("A16: a write-through window with no fsync by the probe", "wt-nosync", "smoke", 3, "VOID fsync:", {}),
             ("A16: a write-back window with no fsync by the probe", "nosync", "smoke", 3, "VOID fsync:", {}),
+            ("tenth review HIGH 1: a window short of one of its own syncs", "short", "smoke", 3, "VOID fsync:", {}),
             ("MED 3: a write-back loop layer's window without a flush-carrying request", "loopflush", "smoke", 3,
              "VOID flush-carrying:", {}),
             ("A14: a batch declaring PLP bound to a verdict fire-checked without", "plp", "bound", 2, "plp:", {}),

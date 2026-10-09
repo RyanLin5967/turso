@@ -187,10 +187,9 @@ def registered(here=HERE, path="REGISTERED.tsv"):
     three non-empty fields, key <= 120, value <= 60, ref <= 200 bytes; a d0 threshold a plain decimal above 1; a frame
     arm one of append64, ow4k, ow64k, ow1m."""
     out = {}
-    try:  # bytes, so that every byte is seen (text mode would translate a CR away)
-        raw = open(os.path.join(here, path), "rb").read()
-    except OSError:
-        raw = b""
+    # bytes, so that every byte is seen (text mode would translate a CR away); an unreadable registry raises (OSError),
+    # never reads as an empty one (tenth review LOW 4)
+    raw = open(os.path.join(here, path), "rb").read()
     lines = raw.split(b"\n")
     if lines and lines[-1] == b"":
         lines = lines[:-1]
@@ -204,6 +203,11 @@ def registered(here=HERE, path="REGISTERED.tsv"):
         f = line.split("\t")
         if len(f) != 3 or not all(f) or len(f[0]) > REG_KEY_MAX or len(f[1]) > REG_VAL_MAX or len(f[2]) > REG_REF_MAX:
             raise ValueError("REGISTERED.tsv: a line that is not key<TAB>value<TAB>ref within the caps: %r" % line[:80])
+        # tenth review LOW 2: the keys are an allowlist, and a key twice is refused (no last-wins), as in the probe
+        if f[0] != "frame_arm" and not re.fullmatch(r"d0_threshold/(ext4|xfs|btrfs)/(wb|wt|brd)/(vm|bare|nr)", f[0]):
+            raise ValueError("REGISTERED.tsv: key %r is neither frame_arm nor d0_threshold/<fs>/<wb|wt|brd>/<vm|bare|nr>" % f[0])
+        if f[0] in out:
+            raise ValueError("REGISTERED.tsv: key %s twice" % f[0])
         if f[0].startswith("d0_threshold/") and not (re.fullmatch(r"[0-9]+(\.[0-9]*)?", f[1]) and float(f[1]) > 1.0):
             raise ValueError("REGISTERED.tsv: %s = %r is not a plain decimal above 1" % (f[0], f[1]))
         if f[0] == "frame_arm" and f[1] not in FRAME_ARMS_ALLOWED:
@@ -1372,6 +1376,11 @@ def real_selftest(chk):
             ("a miscounted requirement", {"files": {"gate.json": lambda j: j["flush_gate"].update(required_flushes=1399)},
                                           "merged": lambda j: j["flush_gate"].update(required_flushes=1399)},
              "F3:gate", ["required_flushes"]),
+            # tenth review HIGH 1: the fd record and the per-fd shortfall
+            ("cfr2b's sync_fds one fd short", both(lambda j: j["sync_fds"].update(cfr2b={k: v for k, v in list(j["sync_fds"]["cfr2b"].items())[:1]})),
+             "F3:devflush", ["sync_fds disagrees with the arm definitions"]),
+            ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
+             "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
             # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate
             ("fdatasync4k: a window without a flush-carrying request",
              {"report": lambda j: j["windows"]["arms"]["fdatasync4k"]["devices"]["nvme0n1"].update(flush_carrying_zero_windows=1)},
@@ -1778,11 +1787,21 @@ def main(argv):
     pj = rj(os.path.join(nm, "probe.out", "summary.json")) or {}
     at = rd(os.path.join(nm, "after_teardown.txt"))
     ar = rd(os.path.join(nm, "after_rebuild.txt"))
+    rb1 = (rd(os.path.join(nm, "rebuilt_n1_backing.txt")) or "").strip()
+    wb1 = (rd(os.path.join(nm, "want_n1_backing.txt")) or "MISSING").strip()
+    ast = rd(os.path.join(nm, "after_stray.txt"))
     check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
           and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
           and sorted(ar.split("\n")[:-1]) == ["n%d mounted ok" % k for k in (1, 2, 3, 4)]
-          and rc_of(os.path.join(nm, "probe.rc")) in (0, 3) and pj.get("layers") == 4 and pj.get("loop_layers") == 3,
+          and rb1 == wb1  # tenth review MED 1: the rebuilt n1's image is the nest dir's
+          and rc_of(os.path.join(nm, "probe.rc")) in (0, 3) and pj.get("layers") == 4 and pj.get("loop_layers") == 3
+          # tenth review MED 2: a stray loop on n1, never mounted, is detached by the teardown, which leaves no loop on
+          # the chain and nothing mounted
+          and bool((rd(os.path.join(nm, "stray.dev")) or "").strip()) and rc_of(os.path.join(nm, "stray_teardown.rc")) == 0
+          and ast is not None and ast.strip() == "",
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
+           "rebuilt_n1_backing": rb1, "want_n1_backing": wb1, "after_stray": ast,
+           "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
            "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
           "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
@@ -2225,8 +2244,13 @@ def check_real(o3, rc, kv, leaf):
                 if a in rows and ((sy["arms"].get(a) or {}).get("windows_without_a_sync") != 0 or
                                   (sy["arms"].get(a) or {}).get("ops") != n):
                     dbad.append(("a flush-gated op's window holds no fsync by the probe", a, sy["arms"].get(a)))
+                # tenth review HIGH 1: syncs are attributed by fd, so each window must hold ALL its own (clone2b and
+                # cfr2b sync the clone and the directory)
+                if a in rows and (sy["arms"].get(a) or {}).get("windows_short") != 0:
+                    dbad.append(("a flush-gated op's window lacks one of its own syncs", a, sy["arms"].get(a)))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
+        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
         rec["shared_devices"] = shared
@@ -2286,6 +2310,37 @@ def check_real(o3, rc, kv, leaf):
 
 FRAME_VARIANT = {None: "no frame arm registered", "ow4k": "fdatasync4k (ow4k + fdatasync)"}
 FRAME_VARIANT_NONE = "none in this probe: the registered frame arm has no fdatasync variant arm (A18 needs one)"
+
+
+def sync_fds_problems(sj, rows, n, f1b_trace):
+    """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
+    match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
+    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and, when this OUT
+    holds F1b's real-all strace (the same arms; strace -y prints each sync as fd<path>), the fds strace saw."""
+    bad = []
+    sf = sj.get("sync_fds")
+    if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
+        return [("sync_fds disagrees with the arm definitions", "missing or overflowed", sj.get("sync_fds_overflow"))]
+    for a in rows:
+        spec = OP.get(a, {})
+        per_op = spec.get("fsync", 0) + spec.get("fdatasync", 0)
+        nfd = 2 if a in ("clone2b", "cfr2b") else (1 if per_op else 0)
+        got = sf.get(a)
+        if not isinstance(got, dict) or len(got) != nfd or sum(got.values()) != n * per_op or \
+                any(v != n for v in got.values()):
+            bad.append(("sync_fds disagrees with the arm definitions", a, got, nfd, n * per_op))
+    if f1b_trace:
+        seen = {}
+        for m in re.finditer(r"\b(?:fsync|fdatasync)\((\d+)<([^>]+)>\)", f1b_trace):
+            path, base = m.group(2), os.path.basename(m.group(2))
+            arm = (os.path.basename(os.path.dirname(path))[:-len(".clones")] if re.fullmatch(r"c\d+", base)
+                   else base[:-len(".clones")] if base.endswith(".clones") else base)
+            seen.setdefault(arm, set()).add(int(m.group(1)))
+        for a in rows:
+            want = {int(k) for k in (sf.get(a) or {})}
+            if want and not want <= seen.get(a, set()):
+                bad.append(("sync_fds disagrees with F1b's strace", a, sorted(want), sorted(seen.get(a, set()))))
+    return bad
 
 
 def floor_reference_problems(sj, p50ns):

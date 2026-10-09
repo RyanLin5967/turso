@@ -132,14 +132,15 @@ if [ -d "$OUT" ]; then
   # the flush path's devices, from the probe's own summary (ninth review L12); none read is stamp end's own problem
   devs=$(python3 -B -c 'import json, sys
 s = json.load(open(sys.argv[1]))
-d = [l.get("disk") for l in s.get("flush_path") or []] + [p.get("disk") for p in (s.get("leaf") or {}).get("multipath") or []]
+d = [l.get("disk") for l in s.get("flush_path") or []]  # not the multipath path disks (tenth review LOW 5)
 print(",".join(x for x in d if x))' "$OUT/summary.json" 2>/dev/null)
   python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json" --devices "${devs:-}"
   src=$?
   if [ -f "$OUT/raw.tsv" ]; then
     ppid=$(python3 -B -c 'import json, sys; print(int(json.load(open(sys.argv[1]))["pid"]))' "$OUT/summary.json" 2>/dev/null)
     if [ -n "$ppid" ]; then
-      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" --pid "$ppid" > "$OUT/blkflush/report.json"
+      # the probe's own sync_fds key the per-window sync attribution (tenth review HIGH 1)
+      python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" --pid "$ppid" --summary "$OUT/summary.json" > "$OUT/blkflush/report.json"
     else
       python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
     fi

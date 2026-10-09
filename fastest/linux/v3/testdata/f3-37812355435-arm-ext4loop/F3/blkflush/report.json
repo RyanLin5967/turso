@@ -39,57 +39,66 @@
  "syscalls": {
   "arms": {
    "append25": {
-    "ambiguous": 15,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "append64": {
-    "ambiguous": 16,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "cfr2b": {
-    "ambiguous": 53,
+    "ambiguous": 0,
     "ops": 200,
-    "syncs": 368,
+    "syncs": 400,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "clean": {
-    "ambiguous": 118,
-    "ops": 200,
-    "syncs": 85,
-    "windows_without_a_sync": 115
-   },
-   "fdatasync4k": {
-    "ambiguous": 11,
+    "ambiguous": 2,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
+    "windows_without_a_sync": 0
+   },
+   "fdatasync4k": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "nosync25": {
-    "ambiguous": 16,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 0,
+    "windows_short": 0,
     "windows_without_a_sync": 200
    },
    "ow1m": {
-    "ambiguous": 11,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "ow4k": {
-    "ambiguous": 16,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "ow64k": {
-    "ambiguous": 12,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    }
   },
@@ -101,7 +110,11 @@
   "traced": [
    "sys_enter_fsync",
    "sys_enter_fdatasync"
-  ]
+  ],
+  "unattributed": {
+   "foreign_fd": 0,
+   "no_fd": 0
+  }
  },
  "tool": "blkflush.py",
  "trace_clock": "mono_raw",
@@ -341,6 +354,6 @@
   "outside_by_device": {
    "loop0": 22
   },
-  "source": "/home/runner/work/turso/turso/v3-raw/firecheck/F3/raw.tsv"
+  "source": "/Users/idide/wt/turso-fastest-linux-v3.noindex/fastest/linux/v3/testdata/f3-37812355435-arm-ext4loop/F3/raw.tsv"
  }
 }

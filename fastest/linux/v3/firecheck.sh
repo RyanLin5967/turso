@@ -298,7 +298,7 @@ echo leftover > "$W/append25"
 refuse R_leftover_file "$V3" --dir "$W" --out "$(o R_leftover_file)" --n 5 --arms append25,nosync25
 rm -f "$W/append25"
 # ninth review L13, M6, M7, L9: the probe's own registration and rental refusals, each on a planted --registered file
-printf '# planted: a threshold, no frame arm\nd0_threshold/planted/wb/vm\t9.5\tplanted\n' > "$OUT/F4/reg_noframe.tsv"
+printf '# planted: a threshold, no frame arm\nd0_threshold/ext4/wb/vm\t9.5\tplanted\n' > "$OUT/F4/reg_noframe.tsv"
 printf 'frame_arm\tow64k\tplanted\n' > "$OUT/F4/reg_ow64k.tsv"
 printf 'frame_arm\tappend25\tplanted\n' > "$OUT/F4/reg_frame25.tsv"
 printf 'frame_arm\tow4k\tDECISIONS \xe2\x80\xa6 (PREREG \xc2\xa74)\n' > "$OUT/F4/reg_nonascii.tsv"
@@ -719,12 +719,23 @@ mkdir -p "$NM"
 if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
   echo "$nd" > "$NM/nest_dir"
+  # the loops still backed by a file of the chain (tenth review MED 1): under $FX/n*/ or an image named v3fx-n1.img
+  chainloops() { losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$FX/n" '{ d = $1; $1 = ""; sub(/^ +/, "");
+    if (index($0, b) == 1 || $0 ~ /\/v3fx-n1\.img( \(deleted\))?$/) print d " " $0 }'; }
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
-    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; } > "$NM/after_teardown.txt"
+    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops | sed 's/^/loop still attached: /'; } > "$NM/after_teardown.txt"
   timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$nd" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && [ -f "$FX/n$k.ok" ] && echo "n$k mounted ok"; done; } > "$NM/after_rebuild.txt"
+  # the rebuilt n1's image is on the nest dir given, not anywhere else (tenth review MED 1)
+  losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" 2>/dev/null | xargs > "$NM/rebuilt_n1_backing.txt"
+  echo "$nd/v3fx-n1.img" > "$NM/want_n1_backing.txt"
   timeout 300 "$V3" --dir "$FX/n3/w" --out "$NM/probe.out" --n 5 --arms append25,nosync25 > "$NM/probe.txt" 2>&1; echo $? > "$NM/probe.rc"
+  # tenth review MED 2's plant: a loop attached to a file on n1 and never mounted; --teardown-nest must detach it and
+  # leave no loop backed by the chain
+  sudo truncate -s 64M "$FX/n1/stray.img" && sstray=$(sudo losetup --find --show "$FX/n1/stray.img") && echo "$sstray" > "$NM/stray.dev"
+  timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/stray_teardown.txt" 2>&1; echo $? > "$NM/stray_teardown.rc"
+  { chainloops | sed 's/^/loop still attached: /'; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done; } > "$NM/after_stray.txt"
 else
   echo "no proved nest chain to tear down (n1.ok absent or n1 not mounted)" > "$NM/na.txt"
 fi

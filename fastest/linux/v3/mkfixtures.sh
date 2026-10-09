@@ -140,30 +140,51 @@ f_nest() {
   done
 }
 # the nest chain's teardown (t3run per block): n4 first, each level's loop detached after its unmount
+# the loops backed by a file of the chain: anything under $base/n<k>/ or an image named v3fx-n1.img (deleted or not)
+chain_loops() {
+  losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$base/n" '{ dev = $1; $1 = ""; sub(/^ +/, "");
+    if (index($0, b) == 1 || $0 ~ /\/v3fx-n1\.img( \(deleted\))?$/) print dev }'
+}
+detach_loop() {  # detach_loop DEV LABEL: detach and wait until its backing file is gone
+  local dev=$1 gone=0
+  sudo losetup -d "$dev" || { echo "teardown $2: losetup -d $dev FAILED"; return 1; }
+  for _ in $(seq 1 20); do [ -e "/sys/block/${dev##*/}/loop/backing_file" ] || { gone=1; break; }; sleep 0.5; done
+  [ "$gone" = 1 ] || { echo "teardown $2: $dev still has a backing file"; return 1; }
+}
 teardown_nest() {
-  local k mp dev back gone rc=0 found=0
+  local k mp dev back rc=0 found=0 stray
   for k in 4 3 2 1; do
     mp="$base/n$k"
     sudo rm -f "$base/n$k.ok"
+    # tenth review MED 2: a loop backed by a file ON this level, attached but not mounted (a level whose mount failed,
+    # a stray), would hold the level busy: detach it first, mounted ones above were unmounted in the previous pass
+    for stray in $(losetup --list -n -O NAME,BACK-FILE 2>/dev/null | awk -v b="$mp/" '{ d = $1; $1 = ""; sub(/^ +/, ""); if (index($0, b) == 1) print d }'); do
+      found=1
+      mountpoint -q "$(findmnt -n -o TARGET -S "$stray" | tail -1)" 2>/dev/null && sudo umount "$(findmnt -n -o TARGET -S "$stray" | tail -1)"
+      detach_loop "$stray" "n$k (an unmounted loop on it)" && echo "teardown n$k: detached $stray, backed by a file on $mp" || rc=1
+    done
     mountpoint -q "$mp" 2>/dev/null || continue
     found=1
     dev=$(findmnt -n -o SOURCE "$mp" | tail -1)
     back=$(losetup -n -O BACK-FILE "$dev" 2>/dev/null | xargs)
     sudo umount "$mp" || { echo "teardown n$k: umount $mp FAILED"; rc=1; continue; }
     case $dev in
-      /dev/loop*)
-        sudo losetup -d "$dev" || { echo "teardown n$k: losetup -d $dev FAILED"; rc=1; }
-        gone=0
-        for _ in $(seq 1 20); do [ -e "/sys/block/${dev##*/}/loop/backing_file" ] || { gone=1; break; }; sleep 0.5; done
-        [ "$gone" = 1 ] || { echo "teardown n$k: $dev still has a backing file"; rc=1; } ;;
+      /dev/loop*) detach_loop "$dev" "n$k" || rc=1 ;;
       *) echo "teardown n$k: $mp was on $dev, not a loop device"; rc=1 ;;
     esac
     [ "$k" = 1 ] && [ -n "$back" ] && sudo rm -f "$back"
     echo "teardown n$k: unmounted $mp, detached $dev (backing $back)"
   done
+  # n1's image held by a loop that is not n1's mount (a failed mount, a second attach): detach it too
+  for stray in $(chain_loops); do
+    found=1
+    detach_loop "$stray" "n1's image" && echo "teardown: detached $stray, still backed by the chain" || rc=1
+  done
   for k in 1 2 3 4; do
     mountpoint -q "$base/n$k" 2>/dev/null && { echo "teardown: $base/n$k is still mounted"; rc=1; }
   done
+  # the outcome, not the steps: no loop may still be backed by a file of the chain
+  [ -z "$(chain_loops)" ] || { echo "teardown: loops still backed by the chain: $(chain_loops | xargs)"; rc=1; }
   [ "$found" = 1 ] || echo "teardown: no nest chain under $base"
   return $rc
 }

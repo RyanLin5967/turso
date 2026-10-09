@@ -41,57 +41,66 @@
  "syscalls": {
   "arms": {
    "append25": {
-    "ambiguous": 16,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "append64": {
-    "ambiguous": 25,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "cfr2b": {
-    "ambiguous": 88,
+    "ambiguous": 0,
     "ops": 200,
-    "syncs": 331,
+    "syncs": 400,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "clean": {
-    "ambiguous": 158,
-    "ops": 200,
-    "syncs": 53,
-    "windows_without_a_sync": 147
-   },
-   "fdatasync4k": {
-    "ambiguous": 16,
+    "ambiguous": 1,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
+    "windows_without_a_sync": 0
+   },
+   "fdatasync4k": {
+    "ambiguous": 0,
+    "ops": 200,
+    "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "nosync25": {
-    "ambiguous": 29,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 0,
+    "windows_short": 0,
     "windows_without_a_sync": 200
    },
    "ow1m": {
-    "ambiguous": 31,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "ow4k": {
-    "ambiguous": 29,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    },
    "ow64k": {
-    "ambiguous": 17,
+    "ambiguous": 0,
     "ops": 200,
     "syncs": 200,
+    "windows_short": 0,
     "windows_without_a_sync": 0
    }
   },
@@ -103,7 +112,11 @@
   "traced": [
    "sys_enter_fsync",
    "sys_enter_fdatasync"
-  ]
+  ],
+  "unattributed": {
+   "foreign_fd": 0,
+   "no_fd": 0
+  }
  },
  "tool": "blkflush.py",
  "trace_clock": "mono_raw",
@@ -463,6 +476,6 @@
    "loop0": 22,
    "nvme0n1": 22
   },
-  "source": "/home/runner/work/turso/turso/v3-raw/firecheck/F3/raw.tsv"
+  "source": "/Users/idide/wt/turso-fastest-linux-v3.noindex/fastest/linux/v3/testdata/f3-37812355435-x86-ext4loop/F3/raw.tsv"
  }
 }

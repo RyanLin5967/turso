@@ -6,14 +6,15 @@
                                             trace_clock mono_raw; write OUT/start.json
   blkflush.py stop OUT                      stop it; keep OUT/trace.txt.gz, OUT/stats.json (per-CPU ring buffer
                                             stats), OUT/stop.json; remove the instance
-  blkflush.py report OUT [--device D] [--windows RAW.tsv [--pid P]]
+  blkflush.py report OUT [--device D] [--windows RAW.tsv [--pid P --summary SUMMARY.json]]
                                             print JSON: per device the F requests by kind, and with --windows (a
                                             v3floor raw.tsv: arm, i, ns, t0_ns) per arm the requests inside its ops'
-                                            CLOCK_MONOTONIC_RAW windows; with --pid, per arm the windows in which
-                                            process P entered no fsync or fdatasync (syscalls:sys_enter_fsync and
-                                            sys_enter_fdatasync, traced in the same instance: annex ruling A16, the
-                                            app's own sync per op, which a write-through drive's zero flush count
-                                            cannot show)
+                                            CLOCK_MONOTONIC_RAW windows; with --pid and the probe's summary (its
+                                            sync_fds: per arm the fds its ops sync, and how often), per arm the
+                                            windows in which process P did not enter its own fsync or fdatasync
+                                            (syscalls:sys_enter_fsync and sys_enter_fdatasync, traced in the same
+                                            instance: annex ruling A16, the app's own sync per op, which a
+                                            write-through drive's zero flush count cannot show)
   blkflush.py gen DEV OUT.tsv N             fire-check generator (not a measurement): N fsync(2)s of the raw block
                                             device DEV, then N buffered 4 KiB writes, then N empty windows, each
                                             window recorded as a raw.tsv row (arms devfsync, devwrite, idle)
@@ -37,7 +38,9 @@ preflush+fua request: a FUA-only write makes only itself durable) and bare_flush
 window counts once whatever else it holds; and ambiguous_by_device, the events that may belong to the arm's windows
 but cannot be placed in exactly one (every window under 1 us is one such).
 Timestamps: the trace prints mono_raw in microseconds (rounded), so an event's true time is +-500 ns of the printed
-value; an event whose interval is not inside exactly one window is "ambiguous", counted, never attributed.
+value; a BLOCK event whose interval is not inside exactly one window is "ambiguous", counted, never attributed. A
+SYNC event is attributed by its fd (sync_windows): to the overlapping window whose arm owns that fd (tenth review
+HIGH 1); see sync_windows for the rule and its one blind spot.
 """
 import bisect, gzip, json, os, re, subprocess, sys, time
 
@@ -46,6 +49,7 @@ EVENT = "events/block/block_rq_issue"
 SYSEVENTS = ["events/syscalls/sys_enter_fsync", "events/syscalls/sys_enter_fdatasync"]
 SYSLINE = re.compile(r"^\s*(?P<comm>.+?)-(?P<pid>\d+)\s+\[(?P<cpu>\d+)\]\s+(?:(?P<flags>\S+)\s+)?(?P<ts>\d+\.\d+):\s+"
                      r"sys_(?P<sc>fsync|fdatasync)\((?P<args>[^)]*)\)\s*$")
+SYSFD = re.compile(r"fd: (?:0x)?([0-9a-f]+)")
 LINE = re.compile(r"^\s*(?P<comm>.+?)-(?P<pid>\d+)\s+\[(?P<cpu>\d+)\]\s+(?:(?P<flags>\S+)\s+)?(?P<ts>\d+\.\d+):\s+"
                   r"(?P<ev>[a-z_]+):\s+(?P<body>.*)$")
 BODY = re.compile(r"^(?P<maj>\d+),(?P<min>\d+)\s+(?P<rwbs>[A-Z]+)\s+(?P<bytes>\d+)\s+\((?P<cmd>[^)]*)\)\s+"
@@ -266,7 +270,9 @@ def parse_trace_all(text, devices):
             sm = SYSLINE.match(line)
             if sm:
                 t, hw = ts_ns(sm.group("ts"))
-                sysev.append((t, hw, "sys", sm.group("sc"), sm.group("sc"), sm.group("comm"), int(sm.group("pid"))))
+                fm = SYSFD.fullmatch(sm.group("args").strip())  # "fd: 3" or "fd: 0x00000003": hex either way
+                sysev.append((t, hw, "sys", sm.group("sc"), sm.group("sc"), sm.group("comm"), int(sm.group("pid")),
+                              int(fm.group(1), 16) if fm else None))
                 continue
             probs.append("unparsed line: " + line[:160])
             continue
@@ -402,64 +408,94 @@ def per_arm(events, w):
     return arms, amb, outside
 
 
-def syncs_per_op():
-    """arm -> the fsync/fdatasync calls each op issues, BY DEFINITION: check.py's OP table (the one spec F1 holds the
-    binary to under strace), never the probe's own say."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import check
-    return {a: spec.get("fsync", 0) + spec.get("fdatasync", 0) for a, spec in check.OP.items()}
+def sync_fds_of(summary_path):
+    """The probe's own record of the fds each arm's ops sync (summary.json sync_fds, tenth review HIGH 1) -> arm ->
+    {fd: syncs per op}. Refuses (Refuse) when it is missing, overflowed, or a count is not a whole multiple of n."""
+    try:
+        with open(summary_path) as f:
+            sj = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Refuse("no probe summary for the sync fds (%s): %r" % (summary_path, e))
+    n, raw = sj.get("n"), sj.get("sync_fds")
+    if not isinstance(n, int) or n <= 0 or not isinstance(raw, dict) or sj.get("sync_fds_overflow") is True:
+        raise Refuse("the probe summary has no usable sync_fds (n %r, sync_fds %r, overflow %r)"
+                     % (n, type(raw).__name__, sj.get("sync_fds_overflow")))
+    out = {}
+    for a, fds in raw.items():
+        if not isinstance(fds, dict):
+            raise Refuse("sync_fds[%s] is not a map" % a)
+        out[a] = {}
+        for fd, calls in fds.items():
+            if not (isinstance(calls, int) and calls % n == 0 and calls > 0 and re.fullmatch(r"[0-9]+", str(fd))):
+                raise Refuse("sync_fds[%s][%s] = %r is not a whole number of syncs per op over n %d" % (a, fd, calls, n))
+            out[a][int(fd)] = calls // n
+    return out
 
 
-def sync_windows(sysev, w, pid, expect=None):
-    """per arm: windows in which process pid entered no fsync or fdatasync (and the count it entered)."""
-    expect = syncs_per_op() if expect is None else expect
-    unknown = sorted({a for _, _, a, _ in w if a not in expect})
+def sync_windows(sysev, w, pid, fdcap):
+    """per arm: windows in which process pid did not enter its own fsync or fdatasync, and windows short of the arm's
+    recorded syncs (fdcap: arm -> {fd: syncs per op}, the probe's sync_fds)."""
+    unknown = sorted({a for _, _, a, _ in w if a not in fdcap})
     if unknown:
-        raise Refuse("arm(s) %s have no sync definition in check.OP" % unknown)
+        raise Refuse("arm(s) %s have no sync fds in the probe's record" % unknown)
     mine = sorted((e for e in sysev if e[6] == pid), key=lambda e: e[0])
-    # The probe is single-threaded: its syncs and its windows are both in time order, and each window holds exactly
-    # its arm's defined syncs (F1 holds the binary to that count under strace). A sync event belongs to a window its
-    # +-500 ns interval overlaps. Windows are 20-80 ns apart on real batches (ninth review M3), so an interval can
-    # overlap two windows: a sync entering just after its window opened, or one returning just before its window
-    # closed (a clean fsync can return in < 0.5 us; clone2b's and cfr2b's second fsync ends their window). Such an
-    # event is given to the EARLIEST overlapped window that still lacks one of its defined syncs (run 37845193906: the
-    # later-window rule gave clone2b's second fsync to a following nosync25 window). So an event fills a later window
-    # only when every earlier overlapped window already holds its full count, and a window missing its own sync can
-    # never borrow a neighbour's, except a neighbour's sync beyond its defined count, which F1 refuses on the same
-    # binary (stated blind spot). An event no overlapped window has room for is ambiguous, attributed to none.
+    # A sync event is the window's that OWNS ITS FD (tenth review HIGH 1): among the windows its +-500 ns interval
+    # overlaps (windows are 20-80 ns apart, so an interval can overlap two or three of them), only those whose arm
+    # syncs that fd are candidates. One candidate takes it. Two or more are the same arm at a round boundary, or two
+    # copy arms sharing a clone fd number: the earliest of them still short of its per-fd count takes it, else it is
+    # ambiguous and attributed to none. An event whose fd no overlapping window owns (a wrong-fd sync, another file)
+    # is attributed to none ("foreign_fd"). So a window missing its own sync can never borrow a neighbour's, whatever
+    # the timing (fd-blind attribution let 394 of 394 planted windows read synced: tenth review HIGH 1). Blind spot,
+    # stated: an EXTRA sync on an arm's own fd, at a boundary between two windows of that same arm, can stand in for
+    # the next window's missing one; F1 holds the binary to its defined sync count under strace, which excludes it.
     starts = [x[0] for x in w]
-    inside, amb = {}, []
+    got = {}
+    amb, foreign, nofd = [], 0, 0
     for e in mine:
+        fd = e[7] if len(e) > 7 else None
+        if fd is None:
+            nofd += 1
+            continue
         lo, hi = e[0] - e[1], e[0] + e[1]
         k = bisect.bisect_right(starts, hi)
         poss = []
         j = k - 1
-        while j >= 0 and w[j][1] >= lo and len(poss) < 3:
+        while j >= 0 and w[j][1] >= lo and len(poss) < 4:
             poss.append(j)
             j -= 1
         poss.sort()
-        room = [j for j in poss if len(inside.get(j, [])) < expect[w[j][2]]]
-        if len(poss) == 1:
-            inside.setdefault(poss[0], []).append(e)  # wholly one window's: counted even beyond its definition
-        elif room:
-            inside.setdefault(room[0], []).append(e)
+        cand = [j for j in poss if fd in fdcap[w[j][2]]]
+        if not cand:
+            foreign += bool(poss)
+            continue
+        if len(cand) > 1:
+            room = [j for j in cand if got.get((j, fd), 0) < fdcap[w[j][2]][fd]]
+            if not room:
+                amb.append((e, cand))
+                continue
+            cand = room[:1]
             amb.append((e, poss))  # counted as ambiguous (informational), attributed as above
-        elif poss:
-            amb.append((e, poss))
-    res = {}
+        got[(cand[0], fd)] = got.get((cand[0], fd), 0) + 1
+    res, short = {}, {}
     for k, (t0, t1, a, i) in enumerate(w):
         r = res.setdefault(a, {"ops": 0, "syncs": 0, "windows_without_a_sync": 0, "ambiguous": 0})
         r["ops"] += 1
-        got = len(inside.get(k, []))
-        r["syncs"] += got
-        r["windows_without_a_sync"] += got == 0
+        mine_k = {fd: got.get((k, fd), 0) for fd in fdcap[a]}
+        n_k = sum(mine_k.values())
+        r["syncs"] += n_k
+        r["windows_without_a_sync"] += n_k == 0
+        short[a] = short.get(a, 0) + any(mine_k[fd] < c for fd, c in fdcap[a].items())
     for e, poss in amb:
         for a in sorted(set(w[j][2] for j in poss)):
             res[a]["ambiguous"] += 1
+    # the per-window shortfall (a window holding fewer than its arm's recorded syncs on some fd) and the events no
+    # window owns ride beside the per-arm records; report() merges the first into them as windows_short
+    res["_short"] = short
+    res["_unattributed"] = {"foreign_fd": foreign, "no_fd": nofd}
     return res
 
 
-def report(out, device=None, windows=None, pid=None):
+def report(out, device=None, windows=None, pid=None, summary=None):
     try:
         with open(os.path.join(out, "start.json")) as f:
             s = json.load(f)
@@ -499,7 +535,17 @@ def report(out, device=None, windows=None, pid=None):
         w = read_windows(windows)
         if pid is not None and s.get("syscall_events"):
             rep_sys["pid"] = pid
-            rep_sys["arms"] = sync_windows(sysev, w, pid)
+            if summary is None:  # no fd map, no per-arm sync record: post refuses (tenth review HIGH 1)
+                rep_sys["refused"] = "no probe summary (--summary): the syncs cannot be attributed by fd"
+            else:
+                try:
+                    arms_s = sync_windows(sysev, w, pid, sync_fds_of(summary))
+                    rep_sys["unattributed"] = arms_s.pop("_unattributed")
+                    for a, c in arms_s.pop("_short").items():
+                        arms_s[a]["windows_short"] = c
+                    rep_sys["arms"] = arms_s
+                except Refuse as e:
+                    rep_sys["refused"] = str(e)
         arms, amb, outside = per_arm(events, w)
         rep["windows"] = {"source": windows, "n_windows": len(w), "arms": arms, "ambiguous": len(amb),
                           "outside": len(outside),
@@ -699,6 +745,13 @@ def self_test():
     swd = swin(be2[0], cw2, 99)
     chk("sync windows by fd: cfr2b then nosync25 -> nosync25 holds none, cfr2b two",
         (swd.get("nosync25") or {}).get("syncs") == 0 and (swd.get("cfr2b") or {}).get("syncs") == 2, swd)
+    # (e) a cfr2b window holding its clone fsync (fd 17) but not its directory fsync (fd 13): one sync, so it is not
+    #     "without a sync", but it is short of its own (windows_short 1)
+    ew = [(1000000, 1100000, "cfr2b", 0)]
+    ee2, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001050", fd=17) + "\n", devs)[1:], None
+    swe2 = swin(ee2[0], ew, 99)
+    chk("sync windows by fd: cfr2b with its clone fsync and no directory fsync -> not without a sync, but short of its own",
+        (swe2.get("cfr2b") or {}).get("windows_without_a_sync") == 0 and (swe2.get("_short") or {}).get("cfr2b") == 1, swe2)
     # (d) a sync wholly inside an ow4k window but on append25's fd (3): not ow4k's own file, so ow4k lacks one
     dw = [(1000000, 1100000, "ow4k", 0)]
     de, _ = parse_trace_all(HDR % (1, 1) + sev("v3floor", 99, "0.001050", fd=3) + "\n", devs)[1:], None
@@ -762,7 +815,9 @@ def self_test():
                  and a in _ck.GATED and (r.get("windows_without_a_sync") != 0 or r.get("windows_short") != 0)}
         chk("real arm-xfs record (run 37845193906): nosync25 holds 0 syncs; every gated window holds exactly its own "
             "(windows_without_a_sync 0, windows_short 0)", isinstance(ra.get("nosync25"), dict) and ra["nosync25"].get("syncs") == 0
-            and not bad_g and len([a for a in ra if a in _ck.GATED]) == 7, (ra.get("nosync25"), bad_g, ra.get("error")))
+            and not bad_g and sorted(a for a in ra if a in _ck.GATED) == sorted(
+                a for a in _ck.GATED if a in {x[2] for x in read_windows(os.path.join(tdd, "raw.tsv"))}),
+            (ra.get("nosync25"), bad_g, ra.get("error")))
         # the plant: by the raw windows and each event's fd (read here, not by the subject), a gated window W whose own
         # sync lies wholly inside it while another window's sync event overlaps W; drop W's own and recount the header
         text = gzip.open(os.path.join(tdd, "trace.txt.gz"), "rt").read()
@@ -834,7 +889,7 @@ def main(argv):
             print(json.dumps(stop(argv[1])))
             return 0
         if len(argv) >= 2 and argv[0] == "report":
-            dev = win = pid = None
+            dev = win = pid = summ = None
             rest = argv[2:]
             while rest:
                 if rest[0] == "--device" and len(rest) >= 2:
@@ -843,16 +898,19 @@ def main(argv):
                     win, rest = rest[1], rest[2:]
                 elif rest[0] == "--pid" and len(rest) >= 2 and rest[1].isdigit():
                     pid, rest = int(rest[1]), rest[2:]
+                elif rest[0] == "--summary" and len(rest) >= 2:
+                    summ, rest = rest[1], rest[2:]
                 else:
-                    raise Refuse("usage: report OUT [--device D] [--windows RAW.tsv [--pid P]]")
-            print(json.dumps(report(argv[1], dev, win, pid), indent=1, sort_keys=True))
+                    raise Refuse("usage: report OUT [--device D] [--windows RAW.tsv [--pid P --summary SUMMARY.json]]")
+            print(json.dumps(report(argv[1], dev, win, pid, summ), indent=1, sort_keys=True))
             return 0
         if len(argv) == 4 and argv[0] == "gen" and argv[3].isdigit():
             gen(argv[1], argv[2], int(argv[3]))
             return 0
         if argv == ["self-test"]:
             return self_test()
-        raise Refuse("usage: blkflush.py start OUT [--buffer-kb K] | stop OUT | report OUT [--device D] [--windows RAW.tsv [--pid P]]"
+        raise Refuse("usage: blkflush.py start OUT [--buffer-kb K] | stop OUT | report OUT [--device D] [--windows RAW.tsv "
+                     "[--pid P --summary SUMMARY.json]]"
                      " | gen DEV OUT.tsv N | self-test")
     except Refuse as e:
         print(json.dumps({"refused": str(e)}))

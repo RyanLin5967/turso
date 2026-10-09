@@ -222,9 +222,36 @@ static int REQREG = 0;             /* --require-registered: rental mode refuses 
 #define REG_KEY_MAX 120
 #define REG_VAL_MAX 60   /* < d0val's and frame_reg's 64 */
 #define REG_REF_MAX 200  /* < d0ref's and frame_ref's 256: a ref is never truncated */
+#define REG_KEYS_MAX 64
+/* tenth review LOW 2: every line under the one rule, the same as check.py's: a key is frame_arm (an M0 append or
+ * overwrite arm other than append25) or d0_threshold/<ext4|xfs|btrfs>/<wb|wt|brd>/<vm|bare|nr> (a plain decimal above
+ * 1); any other key, or a key twice, breaks the rule (no last-wins) */
+static int reg_line_ok(const char *k, const char *v) {
+    if (!strcmp(k, "frame_arm"))
+        return !strcmp(v, "append64") || !strcmp(v, "ow4k") || !strcmp(v, "ow64k") || !strcmp(v, "ow1m");
+    static const char *FS[] = {"ext4", "xfs", "btrfs"}, *LC[] = {"wb", "wt", "brd"}, *VZ[] = {"vm", "bare", "nr"};
+    int known = 0;
+    for (int a = 0; a < 3 && !known; a++)
+        for (int b = 0; b < 3 && !known; b++)
+            for (int c = 0; c < 3 && !known; c++) {
+                char want[REG_KEY_MAX + 1];
+                snprintf(want, sizeof want, "d0_threshold/%s/%s/%s", FS[a], LC[b], VZ[c]);
+                known = !strcmp(k, want);
+            }
+    if (!known) return 0;
+    int dots = 0;
+    if (v[0] < '0' || v[0] > '9') return 0;
+    for (const char *c = v; *c; c++) {
+        if (*c == '.') dots++;
+        else if (*c < '0' || *c > '9') return 0;
+    }
+    return dots <= 1 && strtod(v, NULL) > 1.0;
+}
 static int reg_lookup(const char *path, const char *key, char *val, size_t vcap, char *ref, size_t rcap) {
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
+    static char seen[REG_KEYS_MAX][REG_KEY_MAX + 1];
+    int nseen = 0;
     char *line = NULL;
     size_t lcap = 0;
     ssize_t len;
@@ -246,6 +273,11 @@ static int reg_lookup(const char *path, const char *key, char *val, size_t vcap,
         *t2++ = 0;
         if (strlen(line) > REG_KEY_MAX || strlen(t1) > REG_VAL_MAX || strlen(t2) > REG_REF_MAX ||
             strlen(t1) >= vcap || strlen(t2) >= rcap) { bad = 1; break; }
+        if (!reg_line_ok(line, t1)) { bad = 1; break; }
+        for (int q = 0; q < nseen; q++)
+            if (!strcmp(seen[q], line)) bad = 1;
+        if (bad || nseen == REG_KEYS_MAX) { bad = 1; break; }
+        snprintf(seen[nseen++], sizeof seen[0], "%s", line);
         if (!strcmp(line, key)) {
             snprintf(val, vcap, "%s", t1);
             snprintf(ref, rcap, "%s", t2);
@@ -289,7 +321,27 @@ static const char *whyf(const char *fmt, ...) {
     va_end(ap);
     return WHY;
 }
-static void barrier(int fd) { if (!MUTANT && fsync(fd) == -1) die("fsync"); }
+/* The fds each arm's timed ops sync (tenth review HIGH 1): recorded per arm, with the number of calls on each, and
+ * written to summary.json as sync_fds, so blkflush attributes a traced fsync/fdatasync by its fd to the window of the
+ * arm that owns that fd instead of by time alone. Only the calls op() makes (CUR_ARM >= 0): setup and teardown syncs
+ * are not an op's. More distinct fds than SYNCFD_MAX on one arm marks the record overflowed (post then refuses). */
+#define SYNCFD_MAX 4
+static int CUR_ARM = -1, SYNC_OVERFLOW = 0;
+static int SYNC_FD[NARMS][SYNCFD_MAX], SYNC_NFD[NARMS];
+static uint64_t SYNC_CALLS[NARMS][SYNCFD_MAX];
+static void note_sync(int fd) {
+    if (CUR_ARM < 0) return;
+    for (int k = 0; k < SYNC_NFD[CUR_ARM]; k++)
+        if (SYNC_FD[CUR_ARM][k] == fd) { SYNC_CALLS[CUR_ARM][k]++; return; }
+    if (SYNC_NFD[CUR_ARM] == SYNCFD_MAX) { SYNC_OVERFLOW = 1; return; }
+    SYNC_FD[CUR_ARM][SYNC_NFD[CUR_ARM]] = fd;
+    SYNC_CALLS[CUR_ARM][SYNC_NFD[CUR_ARM]++] = 1;
+}
+static void barrier(int fd) {
+    if (MUTANT) return;
+    if (fsync(fd) == -1) die("fsync");
+    note_sync(fd);
+}
 static void setup_sync(int fd, const char *what) { if (fsync(fd) == -1) die(what); } /* never mutated */
 static uint64_t now(void) {
     struct timespec ts;
@@ -539,7 +591,13 @@ static void setup(int a, armst *s, int crash) {
     }
 }
 
+static void op_body(int a, armst *s, uint64_t i);
 static void op(int a, armst *s, uint64_t i) {
+    CUR_ARM = a;
+    op_body(a, s, i);
+    CUR_ARM = -1;
+}
+static void op_body(int a, armst *s, uint64_t i) {
     buf[i % 4096] ^= 1; /* every write differs */
     if (is_append(a)) {
         if (pwrite(s->fd, buf, s->rec, s->off) != (ssize_t)s->rec) die("append");
@@ -549,7 +607,12 @@ static void op(int a, armst *s, uint64_t i) {
         if (s->off + (off_t)s->rec > s->cap) s->off = 0;
         if (pwrite(s->fd, buf, s->rec, s->off) != (ssize_t)s->rec) die("overwrite");
         s->off += (off_t)s->rec;
-        if (a == FDATASYNC4K) { if (!MUTANT && fdatasync(s->fd) == -1) die("fdatasync"); }
+        if (a == FDATASYNC4K) {
+            if (!MUTANT) {
+                if (fdatasync(s->fd) == -1) die("fdatasync");
+                note_sync(s->fd);
+            }
+        }
         else barrier(s->fd);
     } else if (is_copy(a)) {
         char nm[32];
@@ -571,6 +634,7 @@ static void op(int a, armst *s, uint64_t i) {
         barrier(s->dfd);
     } else if (a == CLEAN) {
         if (fsync(s->fd) == -1) die("clean fsync"); /* the control is never mutated */
+        note_sync(s->fd);
     }
 }
 
@@ -1950,6 +2014,16 @@ int main(int argc, char **argv) {
                     "arms run\"}",
                     NAMES[sel[best]], sel[best] == FDATASYNC4K ? "fdatasync" : "fsync", p50[best] / 1e3);
     }
+    /* the fds each arm's ops synced, and how often (tenth review HIGH 1: blkflush attributes by fd) */
+    fprintf(f, ",\"sync_fds_overflow\":%s,\"sync_fds\":{", SYNC_OVERFLOW ? "true" : "false");
+    for (int j = 0; j < na; j++) {
+        int a = sel[j];
+        fprintf(f, "%s\"%s\":{", j ? "," : "", NAMES[a]);
+        for (int k = 0; k < SYNC_NFD[a]; k++)
+            fprintf(f, "%s\"%d\":%llu", k ? "," : "", SYNC_FD[a][k], (unsigned long long)SYNC_CALLS[a][k]);
+        fprintf(f, "}");
+    }
+    fprintf(f, "}");
     fprintf(f, "}\n");
     if (fclose(f) != 0) die("summary.json close");
     printf("v3floor n=%llu arms=%s refused=%d leaf=%s(%s,%s) -> %s (rc %d)\n", (unsigned long long)n, arms, nref,
