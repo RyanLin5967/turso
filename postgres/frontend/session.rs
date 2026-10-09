@@ -225,7 +225,7 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
     let b = sql.as_bytes();
     let mut i = 0;
     let ws = |i: &mut usize| {
-        while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b) {
+        while *i < b.len() && turso_pg_parser::pg_space(b[*i]) {
             *i += 1;
         }
     };

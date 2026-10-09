@@ -40,6 +40,7 @@ use turso_pg::{
     attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
     PgBranchCall, PgConnection, StatementTypes,
 };
+use turso_pg_parser::{pg_space, skip_blank, sql_comment};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
@@ -1981,13 +1982,6 @@ impl TxVerb {
     }
 }
 
-/// One byte of PostgreSQL's whitespace (its lexer's `space`); vertical tab included, which
-/// `is_ascii_whitespace` omits, and no byte of a multi-byte character, which PostgreSQL lexes as an
-/// identifier byte (wire review 13 item 1).
-fn pg_space(c: u8) -> bool {
-    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
-}
-
 /// The words of a statement for [`TxVerb::of`], each a slice of `sql`: a comment is whitespace
 /// wherever it stands (`--` to the line's end, `/* */` nested), as PostgreSQL's lexer reads one, so
 /// it also ends a word; a `"quoted"` name is one word, `,` a word of its own, and `$` continues a
@@ -1999,16 +1993,8 @@ fn pg_space(c: u8) -> bool {
 /// and `ROLLBACK /* c */` could never end a failed block (wire review 9 item 7, review 11 item 7).
 fn tx_words(sql: &str) -> Option<Vec<&str>> {
     let b = sql.as_bytes();
-    let mut i = 0;
-    loop {
-        while i < b.len() && pg_space(b[i]) {
-            i += 1;
-        }
-        match comment(&b[i..]) {
-            Some(len) => i += len?,
-            None => break,
-        }
-    }
+    // Whitespace, comments and empty statements (`;COMMIT`) before the verb (wire review 14 item 6).
+    let mut i = skip_blank(b, 0)?;
     let first_end = b[i..]
         .iter()
         .position(|c| !c.is_ascii_alphabetic())
@@ -2032,17 +2018,18 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
     let mut words = Vec::new();
     let mut ended = false;
     while i < b.len() {
-        if let Some(len) = comment(&b[i..]) {
+        if let Some(len) = sql_comment(&b[i..]) {
             i += len?;
             continue;
         }
         match b[i] {
             c if pg_space(c) => i += 1,
-            _ if ended => return None,
+            // A run of `;` ends the statement: `COMMIT;;` is COMMIT and an empty statement.
             b';' => {
                 ended = true;
                 i += 1;
             }
+            _ if ended => return None,
             b',' => {
                 words.push(&sql[i..i + 1]);
                 i += 1;
@@ -2069,7 +2056,7 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
                 while i < b.len()
                     && !pg_space(b[i])
                     && !matches!(b[i], b',' | b'"' | b'\'' | b';')
-                    && comment(&b[i..]).is_none()
+                    && sql_comment(&b[i..]).is_none()
                 {
                     i += 1;
                 }
@@ -2078,34 +2065,6 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
         }
     }
     Some(words)
-}
-
-/// The length of the SQL comment at the start of `b`, as PostgreSQL's lexer reads one (`--` to the
-/// line's end, `/* */` nested): None if none starts there, Some(None) for one that never ends.
-fn comment(b: &[u8]) -> Option<Option<usize>> {
-    if b.starts_with(b"--") {
-        let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
-        return Some(Some(end.map_or(b.len(), |p| p + 1)));
-    }
-    if !b.starts_with(b"/*") {
-        return None;
-    }
-    let (mut depth, mut i) = (0usize, 0usize);
-    while i < b.len() {
-        if b[i..].starts_with(b"/*") {
-            depth += 1;
-            i += 2;
-        } else if b[i..].starts_with(b"*/") {
-            depth -= 1;
-            i += 2;
-            if depth == 0 {
-                return Some(Some(i));
-            }
-        } else {
-            i += 1;
-        }
-    }
-    Some(None)
 }
 
 /// Whether a BEGIN or START TRANSACTION ([`TxVerb::Begin`]) asks for READ ONLY among its modes.
@@ -2263,14 +2222,19 @@ fn schema_ddl(sql: &str) -> Option<&str> {
 
 /// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
 /// form this does not read, e.g. one behind a comment, reaches the engine's PRAGMA path.
+/// Whether `sql` is CHECKPOINT alone, read as PostgreSQL's lexer reads it: whitespace (a vertical
+/// tab included), comments and empty statements around it. A comment was a second word, so
+/// `CHECKPOINT -- x` went to the engine as text (wire review 14 item 6).
 fn is_checkpoint(sql: &str) -> bool {
-    let mut words = sql
-        .split(|c: char| c.is_ascii_whitespace() || c == ';')
-        .filter(|w| !w.is_empty());
-    words
-        .next()
-        .is_some_and(|w| w.eq_ignore_ascii_case("CHECKPOINT"))
-        && words.next().is_none()
+    let b = sql.as_bytes();
+    let Some(start) = skip_blank(b, 0) else {
+        return false;
+    };
+    let end = b[start..]
+        .iter()
+        .position(|c| !c.is_ascii_alphabetic())
+        .map_or(b.len(), |p| start + p);
+    sql[start..end].eq_ignore_ascii_case("CHECKPOINT") && skip_blank(b, end) == Some(b.len())
 }
 
 fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
@@ -2486,19 +2450,7 @@ fn portal_not_found(name: &str) -> Box<ErrorInfo> {
 /// */` reached begin_implicit and the translator's "No statements found", which rolled a
 /// pipeline's earlier writes back (wire review 15 item 6).
 fn is_blank(sql: &str) -> bool {
-    let b = sql.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if pg_space(b[i]) || b[i] == b';' {
-            i += 1;
-            continue;
-        }
-        match comment(&b[i..]) {
-            Some(Some(len)) => i += len,
-            _ => return false,
-        }
-    }
-    true
+    skip_blank(sql.as_bytes(), 0) == Some(sql.len())
 }
 
 /// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.

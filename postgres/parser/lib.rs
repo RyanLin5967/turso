@@ -135,7 +135,59 @@ fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
 /// spaces, which PostgreSQL lexes as identifier bytes: `COMMIT<NBSP>` was trimmed to a COMMIT the
 /// engine ran, where PostgreSQL answers 42601 (wire review 13 item 1).
 pub fn pg_trim(s: &str) -> &str {
-    s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b'))
+    s.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8))
+}
+
+/// One byte of PostgreSQL's whitespace (its lexer's `space`): space, tab, newline, carriage return,
+/// form feed and vertical tab (which `is_ascii_whitespace` omits), and no byte of a multi-byte
+/// character, which PostgreSQL lexes as an identifier byte (wire review 13 item 1). The one
+/// definition the server's verb reader, empty-statement test and CHECKPOINT test and the
+/// branch-call fast path read (wire review 14 item 6).
+pub fn pg_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
+}
+
+/// The length of the SQL comment at the start of `b`, as PostgreSQL's lexer reads one (`--` to the
+/// line's end, `/* */` nested): None if none starts there, Some(None) for one that never ends.
+pub fn sql_comment(b: &[u8]) -> Option<Option<usize>> {
+    if b.starts_with(b"--") {
+        let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
+        return Some(Some(end.map_or(b.len(), |p| p + 1)));
+    }
+    if !b.starts_with(b"/*") {
+        return None;
+    }
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if b[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(Some(i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Some(None)
+}
+
+/// The index of the first byte at or after `i` that is neither PostgreSQL's whitespace, nor a
+/// comment, nor a `;` (an empty statement): where the next token starts, `b.len()` when none does.
+/// None inside a comment that never ends.
+pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        while i < b.len() && (pg_space(b[i]) || b[i] == b';') {
+            i += 1;
+        }
+        match sql_comment(&b[i..]) {
+            Some(len) => i += len?,
+            None => return Some(i),
+        }
+    }
 }
 
 /// Split a multi-statement SQL string into individual statements.
