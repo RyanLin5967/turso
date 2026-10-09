@@ -3311,6 +3311,35 @@ fn copy_from_runs_inside_the_block_it_is_in() {
     assert_eq!(count(&mut a), "4", "the failed block kept rows");
 }
 
+/// A statement the frontend performs while preparing it is refused before it runs when it holds a
+/// parameter: 42P02 over the simple protocol (nothing binds one), 0A000 over the extended one (no
+/// such statement takes parameters here); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
+/// has no WHERE. The COPY ran inside the prepare before any guard saw it, and its WHERE was never
+/// read, so `WHERE id > 5` and `WHERE v = $1` imported every row (wire review 13 item 9).
+#[test]
+fn a_prepare_time_statement_is_refused_before_it_runs() {
+    let dir = Scratch::new("copywhere");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cw(id INT, v TEXT)").ok("cw");
+    let rows = dir.0.join("rows.tsv");
+    std::fs::write(&rows, "1\tone\n7\tseven\n").unwrap();
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM cw").single("count");
+    let with_param = format!("COPY cw FROM '{}' WHERE v = $1", rows.display());
+    let r = a.q(&with_param);
+    assert_eq!(r.err("COPY with $1 by simple query").code, "42P02");
+    assert_eq!(count(&mut a), "0", "nothing imported");
+    let r = a.xt(&with_param, &[(25, 0, b"one")]);
+    assert_eq!(r.err("COPY with $1 by Bind").code, "0A000");
+    assert_eq!(count(&mut a), "0", "nothing imported");
+    let r = a.q(&format!("COPY cw FROM '{}' WHERE id > 5", rows.display()));
+    assert_eq!(r.err("COPY ... WHERE").code, "0A000");
+    assert_eq!(count(&mut a), "0", "nothing imported");
+    a.q(&format!("COPY cw FROM '{}'", rows.display()))
+        .ok("a plain COPY still imports");
+    assert_eq!(count(&mut a), "2");
+}
+
 /// An undeclared parameter has the type PostgreSQL infers from its context, the same at Describe
 /// and at Bind: the column it is compared with, assigned to or inserted into, an aggregate it is
 /// compared with, LIMIT's bigint, a cast's type; text where nothing says. A $n with an unused $k
