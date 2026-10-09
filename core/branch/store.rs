@@ -7708,6 +7708,10 @@ impl StoreInner {
             // holds a branch or a retained trunk version has pages of the old size and cannot.
             // (VACUUM and journal-mode changes are refused while a branch exists, so only the
             // empty case is reachable.)
+            // r11-restart-r3-anyret (PREREG A25/A25b) fixed this same liveness gap on its own base
+            // with an unconditional checkpoint first; main's narrower re-derivation below (engine
+            // review 9 #7) is kept, and A25/A25b's tests (`a_catalog_store_*_follows_a_new_page_size`)
+            // now check it, A25b through the `removed` arm of `deletable`.
             let mut catalog_retains = match self.catalog() {
                 Some(cat) => cat.any_retained()?,
                 None => false,
@@ -9747,6 +9751,128 @@ mod tests {
             .ensure_backing(1024)
             .expect("a store with no branch refused a new page size over rows its next checkpoint deletes");
         assert_eq!(inner.alloc_slot().unwrap(), 0, "the restarted arena does not start empty");
+    }
+
+    /// A catalog store that retained trunk versions for one branch, checkpointed them into the
+    /// catalog, then reaped the branch. It is logically empty (no branch, no retained version),
+    /// but the versions' rows are still in the catalog, marked reaped only in memory (`trunk_gone`)
+    /// until the next checkpoint deletes them. Every premise is asserted, so a changed path fails
+    /// loudly instead of passing vacuously.
+    fn catalog_store_emptied_since_its_checkpoint() -> (tempfile::TempDir, Arc<crate::Database>) {
+        use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        trunk.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+        let id = trunk.fork_branch().unwrap().into_id();
+        trunk.execute("UPDATE t SET v = 'after' WHERE id = 1").unwrap();
+        assert!(db.branch_trunk_retained() >= 1, "premise: the trunk write retained no version");
+        db.branch_compact_now().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        assert_eq!(db.branch_stats().unwrap().live_branches, 0, "premise: a branch is still live");
+        assert_eq!(db.branch_trunk_retained(), 0, "premise: a trunk version is still retained");
+        assert!(
+            db.branches.trunk_gone_len() >= 1,
+            "premise: the reap did not leave its trunk rows for the next checkpoint"
+        );
+        drop(trunk);
+        (dir, db)
+    }
+
+    /// PREREG A19's owed liveness case (A25). `any_retained` counts the reaped-but-uncheckpointed
+    /// trunk rows, so `ensure_backing` refuses the database's new page size for a store that holds
+    /// nothing. Predicted RED at d6a5fc100: "branch arena holds P-byte pages but the database now
+    /// uses 2P".
+    #[test]
+    fn a_catalog_store_emptied_since_its_checkpoint_follows_a_new_page_size() {
+        let (_dir, db) = catalog_store_emptied_since_its_checkpoint();
+        let mut inner = db.branches.inner.lock();
+        let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
+        eprintln!("A25 red: P = {current}, asking for {}", current * 2);
+        if let Err(e) = inner.ensure_backing(current * 2) {
+            panic!("A25: a logically empty catalog store refused the new page size (P = {current}): {e:?}");
+        }
+    }
+
+    /// Its control, predicted GREEN at d6a5fc100: the same store after one more checkpoint (which
+    /// deletes the reaped rows) follows the new page size. So the refusal above comes from the
+    /// uncheckpointed rows alone.
+    #[test]
+    fn a_catalog_store_emptied_and_checkpointed_follows_a_new_page_size() {
+        let (_dir, db) = catalog_store_emptied_since_its_checkpoint();
+        db.branch_compact_now().unwrap();
+        assert_eq!(db.branches.trunk_gone_len(), 0, "premise: the checkpoint left reaped rows");
+        let mut inner = db.branches.inner.lock();
+        let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
+        eprintln!("A25 control: P = {current}, asking for {}", current * 2);
+        if let Err(e) = inner.ensure_backing(current * 2) {
+            panic!("A25: an empty, checkpointed catalog store refused the new page size (P = {current}): {e:?}");
+        }
+    }
+
+    /// A25b (the fresh-context review of A25): the same liveness gap through a BRANCH's retained
+    /// versions. The trunk forks A; A writes its row, forks B, and writes it again, so A retains its
+    /// first version for B; a checkpoint puts that version in the catalog's `ret` table; B, then A,
+    /// is reaped. The store is logically empty and the trunk reaped nothing (`trunk_gone` is empty),
+    /// but A's `ret` rows stay until the next checkpoint deletes them, and `any_retained` counts
+    /// them. Predicted RED without a fix and with A25's narrow one; GREEN with A25b's.
+    #[test]
+    fn a_catalog_store_whose_branches_were_reaped_since_its_checkpoint_follows_a_new_page_size() {
+        use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        trunk.execute("INSERT INTO t VALUES (1, 'trunk')").unwrap();
+        let a = trunk.fork_branch().unwrap();
+        let a_conn = a.connect().unwrap();
+        a_conn.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+        let b = a_conn.fork_branch().unwrap();
+        a_conn.execute("UPDATE t SET v = 'a2' WHERE id = 1").unwrap();
+        drop(a_conn);
+        let (a, b) = (a.into_id(), b.into_id());
+        db.branch_compact_now().unwrap();
+        assert!(
+            db.branches.inner.lock().catalog().expect("a catalog store").any_retained().unwrap(),
+            "premise: A's version for B did not reach the catalog"
+        );
+        db.branch(b).unwrap().reap().unwrap();
+        db.branch(a).unwrap().reap().unwrap();
+        assert_eq!(db.branch_stats().unwrap().live_branches, 0, "premise: a branch is still live");
+        assert_eq!(db.branch_trunk_retained(), 0, "premise: the trunk retains a version");
+        assert_eq!(db.branches.trunk_gone_len(), 0, "premise: the trunk reaped a version");
+        drop(trunk);
+        let mut inner = db.branches.inner.lock();
+        assert!(
+            inner.catalog().expect("a catalog store").any_retained().unwrap(),
+            "premise: the reaped branches' rows already left the catalog"
+        );
+        let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
+        eprintln!("A25b red: P = {current}, asking for {}", current * 2);
+        if let Err(e) = inner.ensure_backing(current * 2) {
+            panic!("A25b: a catalog store whose branches were all reaped refused the new page size (P = {current}): {e:?}");
+        }
     }
 
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
