@@ -24,7 +24,8 @@
 #              drift fails). Each batch is judged by blockgate.py (review 2 item 5, rulings A14 and A16: every VOID
 #              fails), and the A16 plants run on copies of the BEFORE batch's real record; a batch blockgate fails, a
 #              plant that does not fire, or a V3L that is not VALID (v3l.py) fails the block's stage (items 5 and 6).
-#              After each run's teardown, settle() waits for its filesystem's device to go quiet. A failed block
+#              Before each run (every attempt), settle.sh fstrims and waits for the filesystem's device to go quiet
+#              (btrfs mounts nodiscard; a discard mount refuses). A failed block
 #              is recorded, its filesystem torn down, and the NEXT block runs (gate-6 review H1: one block's void
 #              must not lose the rest of a rental); the run exits 1 at the end.
 #   package    <out>.tar.gz + SHA256SUMS + summary.json (stages, blocks with their V3/V3L records, cells,
@@ -103,6 +104,9 @@ fi
 
 SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
+# settle_dev and settle (the quiet gap before every run); a missing file is caught by NEEDS before anything runs
+[ -f "$L/t3/settle.sh" ] && source "$L/t3/settle.sh"
+SETTLE_DEV=""
 if [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
   case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-cache-lie) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
@@ -163,6 +167,7 @@ finish() {
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
+  t3/settle.sh t3/settle_test.sh
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -423,9 +428,16 @@ fs_block() {
         ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEVICE" ;;
         *) echo "unknown fs $fs"; false ;;
       esac > "$o/mkfs.txt" 2>&1 || return 1
-      sudo mkdir -p "$mnt" && sudo mount "$DEVICE" "$mnt" && sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
+      # btrfs defaults to discard=async on SSDs, which discards freed extents 10-120 s later, inside a later run
+      sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEVICE" "$mnt" &&
+        sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
   esac
   findmnt -n -o SOURCE,FSTYPE,OPTIONS -T "$mnt" | tee -a "$o/mkfs.txt"
+  # no online discard on the filesystem under test (fourth lane review MED 5): settle.sh fstrims between runs instead
+  case ",$(findmnt -n -o OPTIONS -T "$mnt")," in
+    *,discard,*|*,discard=*) echo "REFUSED: $mnt mounts with online discard; mount it nodiscard"; return 1 ;;
+  esac
+  SETTLE_DEV=$(settle_dev "$mnt") || { echo "fs-$fs: settle cannot read its device's counters"; return 1; }
   bash "$L/t3/hwid.sh" "$o/hwid" "$mnt" > "$o/hwid.stdout" 2>&1 || return 1
   if [ $DRY = 0 ] && grep -q '"barrier": false' "$o/hwid/hwid.json"; then
     echo "REFUSED: $mnt has a nobarrier layer on its flush path"; return 1
@@ -478,41 +490,7 @@ block_cleanup() {
   return 0
 }
 
-# After a run's teardown, before the next run starts (gate-6 review 11; third lane review MED 5): sync the test
-# filesystem, then wait until the filesystem's own block device (the device itself, the loop of a loop block, the
-# ram disk of a brd block) has no request in flight, the page cache holds under 1 MiB dirty, AND that device's
-# completed write, discard and flush counters (stat fields 5, 12 and 16) have not moved, for 2 s running (11 polls
-# 0.2 s apart, every one equal to the first), at most 60 s. (Its own device, not the leaf: a loop block's leaf is
-# the runner's root disk, whose own traffic is not this run's.) A burst between polls
-# (btrfs async discard after the rm, a late writeback) moves a counter and restarts the window, where an instantaneous
-# in-flight sample could miss it. The settle time, whether it went quiet, and the counters are recorded per run
-# (settle.txt); summarize lists every run that did not go quiet.
-settle() { # settle MNT RUNDIR
-  local mnt=$1 d=$2 t0 q=0 n=0 inflight dirty dev st c c0=""
-  dev=$(findmnt -n -o SOURCE -T "$mnt" | sed 's/\[.*//')
-  dev=$(basename "$(readlink -f "$dev")")
-  sync -f "$mnt" 2>/dev/null || sync
-  t0=$(date +%s%N)
-  while [ $n -lt 300 ]; do
-    st=$(cat "/sys/class/block/$dev/stat" 2>/dev/null)
-    inflight=$(echo "$st" | awk '{print $9}')
-    c=$(echo "$st" | awk 'NF >= 16 {print $5 "/" $12 "/" $16}')
-    dirty=$(awk '/^Dirty:/ {print $2}' /proc/meminfo)
-    if [ "${inflight:-1}" = 0 ] && [ "${dirty:-999999}" -lt 1024 ] && [ -n "$c" ] && { [ $q = 0 ] || [ "$c" = "$c0" ]; }; then
-      [ $q = 0 ] && c0=$c
-      q=$((q + 1))
-    else
-      q=0
-    fi
-    [ $q -ge 11 ] && break
-    sleep 0.2
-    n=$((n + 1))
-  done
-  printf 'dev=%s settle_s=%s quiet=%s inflight=%s dirty_kb=%s writes/discards/flushes=%s\n' "$dev" \
-    "$(awk -v a="$t0" -v b="$(date +%s%N)" 'BEGIN { printf "%.2f", (b - a) / 1e9 }')" \
-    "$([ $q -ge 11 ] && echo yes || echo no)" "$inflight" "$dirty" "${c:-unreadable}" > "$d/settle.txt"
-}
-
+# The quiet gap before every run: settle.sh (sourced after L is set), called at the top of each attempt.
 # One cell run (the plan already holds one row per run): the sampler runs around the adapter, and the
 # void decision is made from its record BEFORE the cell's results are read. A VOID run is replaced once,
 # at most twice per cell (amendment 8); void runs are kept.
@@ -522,6 +500,9 @@ run_cell() {
     id="$fs-$cell-a$attempt"
     d="$o/cells/$cell/a$attempt"
     mkdir -p "$d"
+    # the gap BEFORE this run, so settle.txt belongs to the run it precedes: the block's first run (after V3L and
+    # the strace fire-check) and every replacement attempt included (fourth lane review MED 5)
+    settle "$mnt" "$SETTLE_DEV" "$d"
     python3 -B "$L/t3/foreign_cpu.py" sample "$d/foreign.tsv" --cell "$id" --stop-file "$d/.stop" &
     local sampler=$!
     sleep 2
@@ -553,7 +534,6 @@ run_cell() {
       break
     fi
     rm -rf "$mnt/work-$id"
-    settle "$mnt" "$d"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fs" "$cell" "$system" "$clients" "$attempt" "$rc" \
       "$([ $v = 0 ] && echo VALID || echo VOID)" >> "$OUT/cells.tsv"
     [ $v = 3 ] || break
@@ -571,6 +551,7 @@ selftests() {
   for t in foreign_cpu v3l summarize blockgate devguard; do
     python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
   done
+  timeout 120 bash "$L/t3/settle_test.sh" > "$OUT/settle-selftest.txt" 2>&1 || { echo "self-test settle FAILED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd want d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
     { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }

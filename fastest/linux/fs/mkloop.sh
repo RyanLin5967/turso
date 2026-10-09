@@ -39,7 +39,9 @@ case $fs in
       btrfs) sudo mkfs.btrfs -f -q "$dev"; want=btrfs ;;
     esac
     sudo mkdir -p "$mnt"
-    sudo mount "$dev" "$mnt"
+    # btrfs defaults to discard=async on a device that supports discard (a loop does): freed extents would be
+    # discarded 10-120 s later, inside a later measured run (fourth lane review MED 5); t3run fstrims between runs
+    if [ "$fs" = btrfs ]; then sudo mount -o nodiscard "$dev" "$mnt"; else sudo mount "$dev" "$mnt"; fi
     sudo chown "$me" "$mnt"
     echo "loop: dev=$dev backing=$back backing_fs=$(findmnt -n -o FSTYPE -T "$best")"
     losetup -l -O NAME,BACK-FILE,DIO,LOG-SEC "$dev"
