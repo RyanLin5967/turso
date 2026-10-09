@@ -93,6 +93,12 @@ struct Args {
     phases: usize,
 }
 
+/// `--warmup OPS:S:MAX_S` that does not parse (a function, not a closure: one closure has one return type, so
+/// reusing it across the usize and f64 parses did not compile, E0308; fourth lane review HIGH 1).
+fn bad_warmup(v: &str) -> ! {
+    not_a_result(&format!("--warmup OPS:S:MAX_S: {v} (OPS an integer, S and MAX_S finite seconds, MAX_S > 0)"))
+}
+
 fn not_a_result(msg: &str) -> ! {
     println!("NOT A RESULT: {msg}");
     std::process::exit(1)
@@ -120,6 +126,7 @@ fn parse_args() -> Args {
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
+    let mut ops_given = false;
     let val = |i: &mut usize| -> String {
         *i += 1;
         argv.get(*i).cloned().unwrap_or_else(|| not_a_result(&format!("{} needs a value", argv[*i - 1])))
@@ -148,19 +155,21 @@ fn parse_args() -> Args {
             }
             "--catalog" => a.catalog = true,
             "--clients" => a.clients = num(val(&mut i), "--clients"),
-            "--ops" => a.ops = num(val(&mut i), "--ops"),
+            "--ops" => {
+                a.ops = num(val(&mut i), "--ops");
+                ops_given = true;
+            }
             "--ops-total" => a.ops_total = Some(num(val(&mut i), "--ops-total")),
             "--warmup" => {
                 let v = val(&mut i);
                 let f: Vec<&str> = v.split(':').collect();
                 match f.as_slice() {
                     [o, s, m] => {
-                        let bad = || not_a_result(&format!("--warmup OPS:S:MAX_S: {v}"));
-                        let o: usize = o.parse().unwrap_or_else(|_| bad());
-                        let s: f64 = s.parse().unwrap_or_else(|_| bad());
-                        let m: f64 = m.parse().unwrap_or_else(|_| bad());
-                        if !(s >= 0.0 && m > 0.0) {
-                            bad();
+                        let o: usize = o.parse().unwrap_or_else(|_| bad_warmup(&v));
+                        let s: f64 = s.parse().unwrap_or_else(|_| bad_warmup(&v));
+                        let m: f64 = m.parse().unwrap_or_else(|_| bad_warmup(&v));
+                        if !(s.is_finite() && m.is_finite() && s >= 0.0 && m > 0.0) {
+                            bad_warmup(&v);
                         }
                         a.warm_rule = Some((o, s, m, v.clone()));
                     }
@@ -204,6 +213,9 @@ fn parse_args() -> Args {
     if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
         not_a_result("--phases is 1-4, and below 4 only in phases mode");
     }
+    if ops_given && a.ops_total.is_some() {
+        not_a_result("--ops (per client) and --ops-total (the run's total) are exclusive");
+    }
     if a.clients == 0 || a.ops == 0 || a.rows < 1 || a.ops_total == Some(0) {
         not_a_result("--clients, --ops, --ops-total and --rows must be at least 1");
     }
@@ -213,6 +225,13 @@ fn parse_args() -> Args {
     };
     if a.ops_of.contains(&0) {
         not_a_result("--ops-total below --clients leaves a client with no op");
+    }
+    if let Some(t) = a.ops_total {
+        // the split is exactly T (fourth lane review MED 6: a wrong split would otherwise only show downstream)
+        let got: usize = a.ops_of.iter().sum();
+        if got != t {
+            not_a_result(&format!("--ops-total {t} split into {got} ops"));
+        }
     }
     a
 }
@@ -305,14 +324,14 @@ impl Rng {
     }
 }
 
-/// Busy/SchemaUpdated retries per phase, over the whole run (warm-up included; the windows'
-/// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
-/// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
-/// operation's latency), and gives up at 30 s (PREREG: a failed operation).
 /// The warm-up rule (`--warmup OPS:S:MAX_S`): cycles done by every client, and the main thread's stop.
 static WARM_OPS: AtomicUsize = AtomicUsize::new(0);
 static WARM_STOP: AtomicBool = AtomicBool::new(false);
 
+/// Busy/SchemaUpdated retries per phase, over the whole run (warm-up included; the windows'
+/// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
+/// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
+/// operation's latency), and gives up at 30 s (PREREG: a failed operation).
 static RETRIES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
