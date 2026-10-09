@@ -31,8 +31,10 @@ Stated blind spot of the root rule: "/" is found only through lsblk's MOUNTPOINT
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ALLOWED = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+)$")
 # KNAME and PKNAME carry the walk (PKNAME names the parent's KERNEL name: dm-0, not the mapper name)
@@ -280,6 +282,52 @@ def self_test():
         rc, out = rootdisk_report(lsblk_text(devices))
         return rc != 0 and any(text in o for o in out), (rc, out)
 
+    tmp = tempfile.mkdtemp(prefix="devguard-selftest-")
+
+    def fake_sysfs(tree, root_dev):
+        """a fake /sys: TREE maps a device dir (under devices/) to "disk", "part" (it gets a partition file) or the
+        list of its slaves' dirs; dev/block/1:0 links to ROOT_DEV (None: "/" has no block device)"""
+        top = tempfile.mkdtemp(dir=tmp)
+        for d in sorted(tree):
+            os.makedirs(os.path.join(top, "devices", d, "slaves"))
+            if tree[d] == "part":
+                with open(os.path.join(top, "devices", d, "partition"), "w") as f:
+                    f.write("1\n")
+            elif isinstance(tree[d], list):
+                for s in tree[d]:
+                    os.symlink(os.path.join(top, "devices", s),
+                               os.path.join(top, "devices", d, "slaves", os.path.basename(s)))
+        os.makedirs(os.path.join(top, "dev", "block"))
+        if root_dev:
+            os.symlink(os.path.join(top, "devices", root_dev), os.path.join(top, "dev", "block", "1:0"))
+        return top
+
+    def sysfs(want, tree, root_dev):
+        got = sysfs_root_disks(fake_sysfs(tree, root_dev), "1:0")
+        return got == want, got
+
+    def sysfs_refuses(text, tree, root_dev):
+        try:
+            got = sysfs_root_disks(fake_sysfs(tree, root_dev), "1:0")
+        except CannotTell as e:
+            return text in str(e), f"CannotTell: {e}"
+        return False, got
+
+    def cli_rootdisk(devices):
+        """the real `devguard.py rootdisk` command line, with a fake lsblk first on PATH printing DEVICES"""
+        d = tempfile.mkdtemp(dir=tmp)
+        fx = os.path.join(d, "lsblk.json")
+        with open(fx, "w") as f:
+            json.dump({"blockdevices": devices}, f)
+        with open(os.path.join(d, "lsblk"), "w") as f:
+            f.write(f"#!/bin/sh\ncat '{fx}'\n")
+        os.chmod(os.path.join(d, "lsblk"), 0o755)
+        r = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), "rootdisk"], capture_output=True,
+                           text=True, timeout=60, env=dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", "")))
+        return r.returncode, r.stdout, r.stderr
+
+    pci = {"pci/nvme0n1": "disk", "pci/nvme0n1/nvme0n1p1": "part", "pci/nvme0n1/nvme0n1p2": "part",
+           "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
     cases = [
         ("a spare NVMe disk passes", lambda: passes("nvme1n1", devs, [], [])),
         ("the root disk is refused by the root rule", lambda: refuses(f"nvme0n1 {ROOT}", "nvme0n1", devs, [], [])),
@@ -339,16 +387,40 @@ def self_test():
         ("rootdisk: lsblk output that is not JSON cannot tell",
          lambda: rootdisk_refuses("is not JSON", "lsblk: unknown column: MOUNTPOINTS")),
         ("rootdisk: JSON with no blockdevices list cannot tell", lambda: rootdisk_refuses("no blockdevices list", "{}")),
+        ("rootdisk: MOUNTPOINTS that is not a list cannot tell (a string would match / as a substring)",
+         lambda: rootdisk_refuses("MOUNTPOINTS '/srv', not a list", [N("nvme0n1", "disk", children=[
+             dict(N("nvme0n1p1", "part", "nvme0n1"), mountpoints="/srv")])])),
+        ("rootdisk: children that is not a list cannot tell",
+         lambda: rootdisk_refuses("children 5, not a list", [dict(N("nvme0n1", "disk", mounts=["/"]), children=5)])),
+        ("rootdisk: a KNAME that is not a string cannot tell",
+         lambda: rootdisk_refuses("lacks KNAME or PKNAME", [N("nvme0n1", "disk", mounts=["/"], kname=["nvme0n1"])])),
+        ("rootdisk CLI: an md root prints both disks on stdout, nothing on stderr, exit 0",
+         lambda: (lambda r: (r == (0, "nvme0n1\nnvme1n1\n", ""), r))(cli_rootdisk(md))),
+        ("rootdisk CLI: nothing at / exits 2 with the reason on stderr and nothing on stdout",
+         lambda: (lambda r: (r[0] == 2 and r[1] == "" and TELL in r[2], r))(cli_rootdisk([spare]))),
+        # the second instrument t3run compares rootdisk against: the kernel's sysfs links, no lsblk
+        ("sysfs: / on a plain partition climbs to its disk", lambda: sysfs(["nvme0n1"], pci, "pci/nvme0n1/nvme0n1p1")),
+        ("sysfs: / on LVM over a partition climbs dm-0's slave, then the partition, to the disk",
+         lambda: sysfs(["nvme0n1"], dict(pci, **{"virtual/dm-0": ["pci/nvme0n1/nvme0n1p2"]}), "virtual/dm-0")),
+        ("sysfs: / on md RAID1 over two partitions climbs both slaves to both disks",
+         lambda: sysfs(["nvme0n1", "nvme1n1"],
+                       dict(pci, **{"virtual/md0": ["pci/nvme0n1/nvme0n1p2", "pci/nvme1n1/nvme1n1p2"]}), "virtual/md0")),
+        ("sysfs: / on a whole disk is that disk", lambda: sysfs(["nvme2n1"], pci, "pci/nvme2n1")),
+        ("sysfs: / with no block device (btrfs, overlay, NFS, tmpfs) cannot tell",
+         lambda: sysfs_refuses("has no block device in sysfs", pci, None)),
     ]
     bad = []
-    for n, fn in cases:
-        try:
-            ok, got = fn()
-        except Exception as e:  # a case that raises is a FAIL, never a crash of the whole self-test
-            ok, got = False, f"{type(e).__name__}: {e}"
-        print(f"DEVGUARD self-test {'PASS' if ok else 'FAIL'}: {n}" + ("" if ok else f" (got {got})"))
-        if not ok:
-            bad.append(n)
+    try:
+        for n, fn in cases:
+            try:
+                ok, got = fn()
+            except Exception as e:  # a case that raises is a FAIL, never a crash of the whole self-test
+                ok, got = False, f"{type(e).__name__}: {e}"
+            print(f"DEVGUARD self-test {'PASS' if ok else 'FAIL'}: {n}" + ("" if ok else f" (got {got})"))
+            if not ok:
+                bad.append(n)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print(f"DEVGUARD SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 
