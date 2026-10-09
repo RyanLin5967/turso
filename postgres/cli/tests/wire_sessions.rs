@@ -5157,6 +5157,71 @@ fn delete_using_deletes_only_the_joined_rows() {
     assert_eq!(left(&mut a), vec!["1", "4"], "nothing joins an empty table");
 }
 
+/// CREATE TABLE with a foreign key checks its parent as PostgreSQL does, in the column-constraint and
+/// the table-constraint form: a parent that does not exist is 42P01; a parent with no primary key
+/// to default to, or a parent key no UNIQUE or PRIMARY KEY covers, is 42830; each leaves no table
+/// behind. They were accepted, after which every INSERT into the child failed 'foreign key
+/// mismatch' and every later valid ALTER ADD FOREIGN KEY on it failed 42830 blaming its new parent
+/// (wire review 13 item 2; foreign_key.out:876-878). A key onto a unique column, the parent's
+/// primary key, or the table itself is accepted and enforced.
+#[test]
+fn create_table_checks_its_foreign_keys_parents() {
+    let dir = Scratch::new("createfk");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("INSERT INTO p VALUES (1, 5), (2, 5)").ok("p rows");
+    a.q("CREATE TABLE np(id INT)").ok("np: no primary key");
+    a.q("CREATE TABLE q(id INT PRIMARY KEY, code INT UNIQUE)")
+        .ok("q");
+    a.q("INSERT INTO q VALUES (1, 5)").ok("q row");
+    for (sql, code) in [
+        ("CREATE TABLE c(x INT REFERENCES p(code))", "42830"),
+        (
+            "CREATE TABLE c(x INT, FOREIGN KEY (x) REFERENCES p(code))",
+            "42830",
+        ),
+        ("CREATE TABLE c(x INT REFERENCES np)", "42830"),
+        (
+            "CREATE TABLE c(x INT, FOREIGN KEY (x) REFERENCES np)",
+            "42830",
+        ),
+        ("CREATE TABLE c(x INT REFERENCES nosuch(id))", "42P01"),
+        (
+            "CREATE TABLE c(x INT, FOREIGN KEY (x) REFERENCES nosuch(id))",
+            "42P01",
+        ),
+        (
+            "CREATE TABLE c(x INT, y INT, FOREIGN KEY (x, y) REFERENCES p(id))",
+            "42830",
+        ),
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, code, "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+        let r = a.q("SELECT * FROM c");
+        assert_eq!(r.err(&format!("after {sql}: no table c")).code, "42P01");
+    }
+    a.q("CREATE TABLE c(x INT REFERENCES q(code), y INT REFERENCES p)")
+        .ok("unique keys and a primary key");
+    assert_eq!(
+        a.q("INSERT INTO c VALUES (7, 1)").err("an orphan").code,
+        "23503"
+    );
+    a.q("INSERT INTO c VALUES (5, 1)").ok("a matching child");
+    a.q("CREATE TABLE tree(id INT PRIMARY KEY, parent INT REFERENCES tree(id))")
+        .ok("a self-reference");
+    a.q("INSERT INTO tree VALUES (1, NULL), (2, 1)")
+        .ok("tree rows");
+    // Inside a block the refusal fails the block, and its end leaves no table.
+    a.q("BEGIN").ok("begin");
+    let r = a.q("CREATE TABLE d(x INT REFERENCES p(code))");
+    assert_eq!(r.err("in a block").code, "42830");
+    assert_eq!(r.status, b'E');
+    a.q("ROLLBACK").ok("end");
+    assert_eq!(a.q("SELECT * FROM d").err("no table d").code, "42P01");
+}
+
 /// A multi-column foreign key declared MATCH FULL is refused (0A000), in CREATE TABLE and in ALTER
 /// TABLE ADD FOREIGN KEY, the child unchanged: the engine enforces MATCH SIMPLE only, under which a
 /// row with some key columns NULL is exempt where MATCH FULL refuses it. It was accepted, validated
