@@ -127,6 +127,7 @@ fn get_table_names(
                 let name = row.get_value(0).to_text().expect("table name must be text");
                 names.push(name.to_string());
             }
+            StepResult::Sleep { duration } if waits_out_busy() => stmt.wait_out_busy(duration)?,
             StepResult::IO | StepResult::Sleep { .. } => io.step()?,
             StepResult::Yield => continue,
             StepResult::Done => break,
@@ -137,6 +138,33 @@ fn get_table_names(
     }
 
     Ok(names)
+}
+
+/// Whether the step loops answer a busy handler's `StepResult::Sleep` by waiting out its backoff
+/// (`Statement::wait_out_busy`) and stepping again. Stepping the IO backend instead returned at
+/// once when nothing was in flight, so a busy wait spun a core for the whole timeout (engine review
+/// 11 MED 4); the busy statement has no IO of its own in flight then. Mutant `dbhash_sleep_spins`
+/// (test builds only): the IO step, as before.
+fn waits_out_busy() -> bool {
+    !fe_mutant("dbhash_sleep_spins")
+}
+
+/// dbhash's registered mutants (`FE_MUTANT`, the convention of turso_core's branch store): one
+/// names one deliberate defect, so each red can be shown to fail on its mutant from the same test
+/// binary. TEST BUILDS ONLY: a production binary has no mutant to switch on. Read once per process.
+fn fe_mutant(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("FE_MUTANT").ok())
+            .as_deref()
+            == Some(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
+    }
 }
 
 /// Hash all rows from a prepared statement.
@@ -163,6 +191,7 @@ fn hash_rows(
                     hasher.update(&buf);
                 }
             }
+            StepResult::Sleep { duration } if waits_out_busy() => stmt.wait_out_busy(duration)?,
             StepResult::IO | StepResult::Sleep { .. } => io.step()?,
             StepResult::Yield => continue,
             StepResult::Done => break,
