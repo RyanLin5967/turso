@@ -4625,7 +4625,63 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
     }
 }
 
-/// Engine review 16 LOW 12: a compaction marked what it made durable in the rewrite class read
+/// Engine review 18 HIGH 1 (review 19 MED 5): the held-free upgrade was led off the
+/// acknowledgement paths (engine review 13 MED 2) but still as an ordinary group flight: it took
+/// everything buffered and the group's one flight slot (`flushing`), so every D0 create, connect,
+/// first write and delete waited through its arena fsync, directory fsync and log sync, and those
+/// whose records were buffered at its take rode it. It syncs what is written and takes no flight
+/// slot: held once taken and before its sync, a create on another connection is acknowledged,
+/// having waited for nothing and synced nothing on its thread, and the held slots come free once
+/// it lands. The writer is first held where it found the upgrade due, so the create that armed it
+/// cannot be carried. Mutant `upgrade_takes_flight_slot`.
+#[test]
+fn a_create_does_not_wait_for_the_held_free_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-slot.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "catalog={catalog}: premise: x's release frees two slots, past the bound");
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("catalog={catalog}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        // Moving the hook releases the first stop; the writer then stops once its upgrade is taken.
+        db.branches.confirm_hold_for_test(super::store::HOLD_FLIGHT_TAKEN);
+        eventually(&format!("catalog={catalog}: premise: the background writer never took the upgrade"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let (waits, syncs) = (super::store::thread_waits(), super::store::thread_syncs());
+                let created = db.connect().and_then(|t| t.fork_branch()).map(|y| y.into_id());
+                let _ = tx.send((
+                    created.is_ok(),
+                    super::store::thread_waits() - waits,
+                    super::store::thread_syncs() - syncs,
+                ));
+            })
+        };
+        let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+        db.branches.confirm_hold_for_test(0);
+        creator.join().unwrap();
+        assert_eq!(
+            created,
+            Ok((true, 0, 0)),
+            "catalog={catalog}: a create during the held-free upgrade was not acknowledged at once \
+             (created, waits, syncs on its thread; a timeout: it waited for the upgrade)"
+        );
+        eventually(&format!("catalog={catalog}: the held slots never came free"), || {
+            slots.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+    }
+}
+
+/// Engine review 16 LOW 12:a compaction marked what it made durable in the rewrite class read
 /// AFTER the rewrite, whose own log reset clears the inherited floor: a D0 store over a log a D2
 /// run wrote compacted in FullFsync and said Off, so the next FULL trunk commit, whose barrier
 /// covers a Release the snapshot carries, led a flight for it. The class is read before the

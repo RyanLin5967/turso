@@ -410,6 +410,12 @@ const UPGRADE_HARD_CAP: usize = 4;
 #[cfg(test)]
 pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
 
+/// Test hook stage (`Group::confirm_hold`): the confirmation writer found a held-free upgrade due
+/// and has taken nothing for it yet (engine review 18 HIGH 1). Its upgrade, once taken, pauses at
+/// `HOLD_FLIGHT_TAKEN` on the same hook.
+#[cfg(test)]
+pub(crate) const HOLD_UPGRADE_DUE: u8 = 13;
+
 #[derive(Default)]
 struct GroupState {
     /// A flight is being written.
@@ -788,6 +794,8 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         let due = group.upgrade_due.load(Ordering::Acquire);
         if due != 0 && due != UPGRADE_IN_AIR && !group.poisoned() && !fe_mutant("upgrade_on_ack_path") {
             drop(g);
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_UPGRADE_DUE);
             BranchStore::lead_upgrade(&store, &group);
             g = group.lock();
             continue;
@@ -4415,7 +4423,12 @@ impl BranchStore {
             return;
         }
         let class = store.lock().free_class();
-        match Self::wait_durable_on(store, group, None, due, class) {
+        // Test builds: the store's confirmation hook (`HOLD_FLIGHT_TAKEN`; engine review 18 HIGH 1).
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        #[cfg(not(test))]
+        let hold = None;
+        match Self::wait_durable_on(store, group, hold, due, class) {
             Ok(()) => store.lock().mature_frees(group.durable(class)),
             Err(e) => tracing::warn!("branch store: the upgrade flight for held frees failed: {e}"),
         }
