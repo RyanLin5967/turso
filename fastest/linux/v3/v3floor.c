@@ -216,29 +216,41 @@ static const char *PLP = NULL;     /* --plp yes|no: the operator's power-loss-pr
 static const char *REGPATH = NULL; /* --registered: the registered thresholds and frame arm (A17, MED 5) */
 static int REQREG = 0;             /* --require-registered: rental mode refuses before any op without them (L7) */
 
-/* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. -> 0 when key was found (the last line
- * with it wins), 1 when absent, -1 when the file cannot be read, -2 when any line breaks the one strict rule. */
+/* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. Every line is under one rule, the same as
+ * check.py's (tenth review LOW 2), and each broken part of it refuses with its own code and text (V3 review 12 item 2:
+ * the value allowlist inside reg_lookup made a planted frame_arm append25 refuse with the generic byte/length text);
+ * the offending key and value are kept in REG_BAD_KEY and REG_BAD_VAL. reg_lookup ->
+ *   0  the key was found (a key appears at most once: a second line with it refuses, never last-wins)
+ *   1  the key is absent
+ *  -1  the file cannot be read
+ *  -2  the byte and shape rule: printable ASCII and TAB only, at most REG_LINE_MAX bytes per line, data lines exactly
+ *      three non-empty tab-separated fields within their caps
+ *  -3  a value outside its key's rule: frame_arm is an M0 append or overwrite arm other than append25 (append64, ow4k,
+ *      ow64k, ow1m); a d0 threshold is a plain decimal above 1
+ *  -4  a key given twice
+ *  -5  a key that is not frame_arm or d0_threshold/<ext4|xfs|btrfs>/<wb|wt|brd>/<vm|bare|nr> */
 #define REG_LINE_MAX 512 /* every line, comments included (ninth review M7): one cap, the same in check.py */
 #define REG_KEY_MAX 120
 #define REG_VAL_MAX 60   /* < d0val's and frame_reg's 64 */
 #define REG_REF_MAX 200  /* < d0ref's and frame_ref's 256: a ref is never truncated */
-#define REG_KEYS_MAX 64
-/* tenth review LOW 2: every line under the one rule, the same as check.py's: a key is frame_arm (an M0 append or
- * overwrite arm other than append25) or d0_threshold/<ext4|xfs|btrfs>/<wb|wt|brd>/<vm|bare|nr> (a plain decimal above
- * 1); any other key, or a key twice, breaks the rule (no last-wins) */
-static int reg_line_ok(const char *k, const char *v) {
-    if (!strcmp(k, "frame_arm"))
-        return !strcmp(v, "append64") || !strcmp(v, "ow4k") || !strcmp(v, "ow64k") || !strcmp(v, "ow1m");
+#define REG_NKEYS 28     /* frame_arm and the 27 d0 threshold keys: the seen set is a 28-bit mask (review 12 item 16) */
+static char REG_BAD_KEY[REG_KEY_MAX + 1], REG_BAD_VAL[REG_VAL_MAX + 1];
+/* the key's index (0 frame_arm, 1..27 the d0 threshold keys), -1 for any other key */
+static int reg_key_index(const char *k) {
+    if (!strcmp(k, "frame_arm")) return 0;
     static const char *FS[] = {"ext4", "xfs", "btrfs"}, *LC[] = {"wb", "wt", "brd"}, *VZ[] = {"vm", "bare", "nr"};
-    int known = 0;
-    for (int a = 0; a < 3 && !known; a++)
-        for (int b = 0; b < 3 && !known; b++)
-            for (int c = 0; c < 3 && !known; c++) {
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            for (int c = 0; c < 3; c++) {
                 char want[REG_KEY_MAX + 1];
                 snprintf(want, sizeof want, "d0_threshold/%s/%s/%s", FS[a], LC[b], VZ[c]);
-                known = !strcmp(k, want);
+                if (!strcmp(k, want)) return 1 + 9 * a + 3 * b + c;
             }
-    if (!known) return 0;
+    return -1;
+}
+static int reg_value_ok(int idx, const char *v) {
+    if (idx == 0)
+        return !strcmp(v, "append64") || !strcmp(v, "ow4k") || !strcmp(v, "ow64k") || !strcmp(v, "ow1m");
     int dots = 0;
     if (v[0] < '0' || v[0] > '9') return 0;
     for (const char *c = v; *c; c++) {
@@ -250,34 +262,35 @@ static int reg_line_ok(const char *k, const char *v) {
 static int reg_lookup(const char *path, const char *key, char *val, size_t vcap, char *ref, size_t rcap) {
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
-    static char seen[REG_KEYS_MAX][REG_KEY_MAX + 1];
-    int nseen = 0;
+    unsigned seen = 0; /* bit i: key index i already given */
     char *line = NULL;
     size_t lcap = 0;
     ssize_t len;
-    int found = 1, bad = 0;
-    while (!bad && (len = getline(&line, &lcap, fp)) != -1) {
+    int found = 1, code = 0;
+    REG_BAD_KEY[0] = REG_BAD_VAL[0] = 0;
+    while (!code && (len = getline(&line, &lcap, fp)) != -1) {
         if (len > 0 && line[len - 1] == '\n') line[--len] = 0;
-        /* one strict rule, the same as check.py's (eighth review L5, ninth review M7): printable ASCII and TAB only
-         * (no CR, no NUL, no byte >= 0x7f, which jstr would write as one \u00XX per byte while check.py decodes
-         * UTF-8), at most REG_LINE_MAX bytes on every line; data lines exactly three non-empty tab-separated fields
-         * within their caps. Anything else refuses the run (-2) rather than being skipped or truncated. */
-        if ((size_t)len != strlen(line) || len > REG_LINE_MAX) { bad = 1; break; }
-        for (ssize_t k = 0; k < len; k++)
-            if (!(line[k] == '\t' || (line[k] >= 0x20 && line[k] <= 0x7e))) { bad = 1; break; }
-        if (bad || len == 0 || line[0] == '#') continue;
+        /* the byte rule (eighth review L5, ninth review M7): printable ASCII and TAB only (no CR, no NUL, no byte >=
+         * 0x7f, which jstr would write as one \u00XX per byte while check.py decodes UTF-8), at most REG_LINE_MAX bytes */
+        if ((size_t)len != strlen(line) || len > REG_LINE_MAX) { code = -2; break; }
+        for (ssize_t k = 0; k < len && !code; k++)
+            if (!(line[k] == '\t' || (line[k] >= 0x20 && line[k] <= 0x7e))) code = -2;
+        if (code) break;
+        if (len == 0 || line[0] == '#') continue;
         char *t1 = strchr(line, '\t');
         char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
-        if (!t1 || !t2 || strchr(t2 + 1, '\t') || t1 == line || t2 == t1 + 1 || !t2[1]) { bad = 1; break; }
+        if (!t1 || !t2 || strchr(t2 + 1, '\t') || t1 == line || t2 == t1 + 1 || !t2[1]) { code = -2; break; }
         *t1++ = 0;
         *t2++ = 0;
         if (strlen(line) > REG_KEY_MAX || strlen(t1) > REG_VAL_MAX || strlen(t2) > REG_REF_MAX ||
-            strlen(t1) >= vcap || strlen(t2) >= rcap) { bad = 1; break; }
-        if (!reg_line_ok(line, t1)) { bad = 1; break; }
-        for (int q = 0; q < nseen; q++)
-            if (!strcmp(seen[q], line)) bad = 1;
-        if (bad || nseen == REG_KEYS_MAX) { bad = 1; break; }
-        snprintf(seen[nseen++], sizeof seen[0], "%s", line);
+            strlen(t1) >= vcap || strlen(t2) >= rcap) { code = -2; break; }
+        snprintf(REG_BAD_KEY, sizeof REG_BAD_KEY, "%s", line);
+        snprintf(REG_BAD_VAL, sizeof REG_BAD_VAL, "%s", t1);
+        int idx = reg_key_index(line);
+        if (idx < 0) { code = -5; break; }
+        if (!reg_value_ok(idx, t1)) { code = -3; break; }
+        if (seen & (1u << idx)) { code = -4; break; }
+        seen |= 1u << idx;
         if (!strcmp(line, key)) {
             snprintf(val, vcap, "%s", t1);
             snprintf(ref, rcap, "%s", t2);
@@ -286,7 +299,7 @@ static int reg_lookup(const char *path, const char *key, char *val, size_t vcap,
     }
     free(line);
     fclose(fp);
-    return bad ? -2 : found;
+    return code ? code : found;
 }
 static char buf[MIB];
 
@@ -311,6 +324,23 @@ static void refuse(const char *fmt, ...) {
     fputc('\n', stderr);
     va_end(ap);
     exit(2);
+}
+/* reg_lookup's refusal, one text per broken rule (V3 review 12 item 2); r is reg_lookup's code, 0 and 1 go on */
+static void reg_refuse(int r) {
+    if (r == -1) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
+    if (r == -2)
+        refuse("%s breaks the one strict rule: every line printable ASCII and TAB, at most %d bytes; data lines "
+               "'key<TAB>value<TAB>ref' within %d/%d/%d bytes (a comment starts with '#')", REGPATH, REG_LINE_MAX,
+               REG_KEY_MAX, REG_VAL_MAX, REG_REF_MAX);
+    if (r == -3 && !strcmp(REG_BAD_KEY, "frame_arm"))
+        refuse("%s: frame_arm '%s' is not an M0 append or overwrite arm other than append25 (append64, ow4k, ow64k, "
+               "ow1m)", REGPATH, REG_BAD_VAL);
+    if (r == -3) refuse("%s: %s = '%s' is not a plain decimal threshold above 1", REGPATH, REG_BAD_KEY, REG_BAD_VAL);
+    if (r == -4) refuse("%s: key '%s' is given twice (one line per key: a second line never wins)", REGPATH, REG_BAD_KEY);
+    if (r == -5)
+        refuse("%s: key '%s' is not frame_arm or a d0_threshold/<ext4|xfs|btrfs>/<wb|wt|brd>/<vm|bare|nr> key", REGPATH,
+               REG_BAD_KEY);
+    if (r < 0) refuse("%s: reg_lookup returned %d", REGPATH, r);
 }
 static char WHY[3 * PATH_MAX + 2048];
 static const char *whyf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1564,31 +1594,18 @@ int main(int argc, char **argv) {
     double d0_t = 10.0;
     int d0_registered = 0, frame_registered = 0;
     if (REGPATH) {
+        /* every line is judged by reg_lookup's one rule, each broken part refused with its own text (V3 review 12
+         * item 2): a d0 threshold found is already a plain decimal above 1, a frame arm found already an M0 append or
+         * overwrite arm other than append25 (the re-checks that stood here could no longer be reached) */
         int r = reg_lookup(REGPATH, d0key, d0val, sizeof d0val, d0ref, sizeof d0ref);
-        if (r == -1) refuse("cannot read the registered file %s: %s", REGPATH, strerror(errno));
-        if (r == -2) refuse("%s breaks the one strict rule: every line printable ASCII and TAB, at most %d bytes; data "
-                            "lines 'key<TAB>value<TAB>ref' within %d/%d/%d bytes (a comment starts with '#')", REGPATH,
-                            REG_LINE_MAX, REG_KEY_MAX, REG_VAL_MAX, REG_REF_MAX);
+        reg_refuse(r);
         if (r == 0) {
-            /* a plain decimal above 1 (no exponent, inf, nan or hex: the same rule as check.py's) */
-            int ok = d0val[0] >= '0' && d0val[0] <= '9', dots = 0;
-            for (const char *c = d0val; *c && ok; c++) {
-                if (*c == '.') dots++;
-                else if (*c < '0' || *c > '9') ok = 0;
-            }
-            d0_t = ok && dots <= 1 ? strtod(d0val, NULL) : 0;
-            if (!(d0_t > 1.0)) refuse("%s: %s = '%s' is not a plain decimal threshold above 1", REGPATH, d0key, d0val);
+            d0_t = strtod(d0val, NULL);
             d0_registered = 1;
         }
-        if (reg_lookup(REGPATH, "frame_arm", frame_reg, sizeof frame_reg, frame_ref, sizeof frame_ref) == 0) {
-            /* the M0 append and overwrite arms other than append25 (PREREG section 4; eighth review L1): append25 is
-             * already in the bound shape, which a frame arm append25 would name twice (ninth review L9) */
-            if (strcmp(frame_reg, "append64") && strcmp(frame_reg, "ow4k") && strcmp(frame_reg, "ow64k") &&
-                strcmp(frame_reg, "ow1m"))
-                refuse("%s: frame_arm '%s' is not an M0 append or overwrite arm other than append25 (append64, ow4k, "
-                       "ow64k, ow1m)", REGPATH, frame_reg);
-            frame_registered = 1;
-        }
+        r = reg_lookup(REGPATH, "frame_arm", frame_reg, sizeof frame_reg, frame_ref, sizeof frame_ref);
+        reg_refuse(r);
+        if (r == 0) frame_registered = 1;
     }
     /* rental mode (run.sh with V3_REQUIRE_T3=1): refuse here, before any op, what post would refuse after a batch of
      * 10000 (eighth review L7): an unregistered frame arm, or no registered threshold where the timing control applies */
