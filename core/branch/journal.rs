@@ -5339,6 +5339,31 @@ mod format_tests {
         );
     }
 
+    /// Engine review 16 MED 6: a D0 open of a log a compaction left stale behind its snapshot (what
+    /// a process killed at `compact.renamed` leaves: `End::Reset`) resets the log, and `reset_log`
+    /// cleared `dir_dirty` whatever its class, so neither the dead process's unsynced snapshot
+    /// rename nor the reset's own log rename was left to the next flight that syncs: a power cut
+    /// after that flight's acknowledgement could bring the old log back. Mutant
+    /// `reset_unsynced_rename_left_clean`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_open_that_resets_the_log_leaves_its_renames_to_the_next_syncing_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        {
+            let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+            let stopped = journal.compact(&SnapshotState::default(), &mut Arena::new(512), true);
+            assert!(stopped.is_err(), "premise: the compaction stopped after its snapshot rename");
+        }
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert_eq!(recovered.journal.len, LOG_HEADER_LEN as u64, "premise: the open reset the stale log");
+        assert!(
+            recovered.journal.dir_dirty,
+            "a D0 open that reset the log left its renames to no syncing flight"
+        );
+    }
+
     /// Engine review 10 #3: a log a D1 run synced (acknowledged in Fsync) reopened in D0 has
     /// rewrite class Off: its header was never raised, and the class recovery decided for it was
     /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
