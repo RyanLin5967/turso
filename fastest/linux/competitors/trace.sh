@@ -21,8 +21,8 @@
 #   strace_run OUT CMD...      run CMD under the same strace from its first instruction.
 # Each window writes OUT.strace (per-call lines stamped -ttt, then the -c table), OUT.strace.err and OUT.window (the
 # window's CLOCK_REALTIME bounds: t0 attach-complete to t1 detach-request, and strace's rc; an attach window's stamps
-# are clock pairs, tseize before strace starts and tend after it exits, see clock_pair; a launch window's are from
-# `date +%s.%N`).
+# are clock pairs, tseize before strace starts and tend after it exits, see clock_pair; a launch window's t0 and t1
+# are clock pairs too, t0 before strace starts and t1 after it exits (SMOKE.md erratum E4; they were `date` stamps).
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
 TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
 TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register

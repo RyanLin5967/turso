@@ -49,7 +49,9 @@
 #      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late; the t1 line repeated;
 #      the t1 line after strace_rc; the fsync table row removed or bumped; a loose pair; a 1.2 ms step with and without
 #      err widening; a table with no call lines. Each is REFUSED for its own reason, or ok where the err widens the
-#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
+#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc. On copies of F1's
+#      LAUNCH window: unmodified ok with coproc stamps; t1 stepped; the t0 pair line removed; every call stamp 5 s late;
+#      t1 after strace_rc; t1 repeated; only t0_mono stripped (E4's shape) -- each refused for its own reason.
 #   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
 #      reply in its pipe is skipped; the next top-level calls are served by the coproc; the stamper's fd numbers
 #      reopened onto decoys (a file and /dev/null, both and then each alone, and two anonymous pipes; the setup
@@ -705,17 +707,24 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
   # Launch windows (strace_run) carry clock pairs too (SMOKE.md erratum E4), on copies of F1's: (p) unmodified, ok
   # with F1's 10 flushes and t0/t1 from the stamper; (q) t1's realtime +0.1 s, refused for the step; (r) the t0 pair
-  # line removed, refused for the missing pair.
-  for k in p q r; do
+  # line removed, refused for the missing pair; and, so each launch-window check is forced to fire alone (lead review
+  # 62430d8bf..b49fb656a MED 8): (s) every call stamp +5 s, refused only for calls outside [t0, t1]; (t) the t1 line
+  # after strace_rc, refused for the order; (u) the t1 line repeated, refused for the repeated stamp; (v) only
+  # t0_mono= stripped from the t0 line (E4's own shape: t0 present, its pair half missing), refused for the pair.
+  for k in p q r s t u v; do
     for x in strace strace.err window cmd.err; do cp "$OUT/f1.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
   awk '/^t1=/ { split($1, a, "="); $1 = sprintf("t1=%.9f", a[2] + 0.1) } { print }' "$OUT/f1.window" >"$OUT/f13q.window"
   awk '!/^t0=/ { print }' "$OUT/f1.window" >"$OUT/f13r.window"
-  for k in a b c d e f g h i j k l m n p q r; do count "f13$k"; done
+  awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f1.strace" >"$OUT/f13s.strace"
+  awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f1.window" >"$OUT/f13t.window"
+  awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f1.window" >"$OUT/f13u.window"
+  awk '/^t0=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t0_mono=/) $i = "" } { print }' "$OUT/f1.window" >"$OUT/f13v.window"
+  for k in a b c d e f g h i j k l m n p q r s t u v; do count "f13$k"; done
   if python3 -c "
 import json, sys
 o = sys.argv[1]
-J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqr'}
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmnpqrstuv'}
 v = {k: r['verdict'] for k, r in J.items()}
 src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
@@ -729,14 +738,16 @@ ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
       v['c'] == 'ok' and J['c']['flushes'] == 10 and
       src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'} and
       v['p'] == 'ok' and J['p']['flushes'] == 10 and J['p'].get('clock_src') == {'t0': 'coproc', 't1': 'coproc'} and
-      refused('q', STEP) and refused('r', 'without its clock pair'))
-print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqr'), '| (l)', v['l'][:20], J['l']['flushes'],
+      refused('q', STEP) and refused('r', 'without its clock pair') and
+      refused('s', OUTSIDE, BACK, STEP) and refused('t', 't1 after its strace_rc') and
+      refused('u', 'repeated stamp') and refused('v', 'without its clock pair', STEP))
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijknqrstuv'), '| (l)', v['l'][:20], J['l']['flushes'],
       '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src,
       '| (p)', v['p'][:20], J['p']['flushes'], J['p'].get('clock_src'))
 sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
-    log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
+    log "PASS F13-clock-step-refused: $(head -c 2000 "$OUT/f13.txt")"
   else
-    log "FAIL F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"; fails=$((fails + 1))
+    log "FAIL F13-clock-step-refused: $(head -c 2000 "$OUT/f13.txt")"; fails=$((fails + 1))
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
