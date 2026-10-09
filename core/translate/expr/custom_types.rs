@@ -803,6 +803,168 @@ mod tests {
         }
     }
 
+    /// The `EXPLAIN QUERY PLAN` lines of `sql`, for a premise on the plan the planner chose.
+    fn plan(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+        conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+            .and_then(|mut stmt| stmt.run_collect_rows())
+            .expect("premise: the plan is explained")
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// Whether `sql` searches `table` through `index`.
+    fn seeks(conn: &Arc<crate::Connection>, sql: &str, table: &str, index: &str) -> bool {
+        plan(conn, sql).iter().any(|line| {
+            line.contains(&format!("SEARCH {table} USING")) && line.contains(&format!("INDEX {index}"))
+        })
+    }
+
+    /// Whether `sql` scans `table`.
+    fn scans(conn: &Arc<crate::Connection>, sql: &str, table: &str) -> bool {
+        plan(conn, sql)
+            .iter()
+            .any(|line| line.contains(&format!("SCAN {table}")))
+    }
+
+    /// Each `(predicate, parameter, rows)` answers `rows` through a seek of `index` and through a
+    /// scan (NOT INDEXED) of `table`, each plan asserted as a premise.
+    fn answers_by_both_plans(
+        conn: &Arc<crate::Connection>,
+        table: &str,
+        index: &str,
+        cases: &[(&str, Option<Value>, i64)],
+    ) {
+        for (pred, param, want) in cases {
+            let seek = format!("SELECT count(*) FROM {table} WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM {table} NOT INDEXED WHERE {pred}");
+            assert!(
+                seeks(conn, &seek, table, index),
+                "premise: {seek} seeks index {index}: {:?}",
+                plan(conn, &seek)
+            );
+            assert!(
+                scans(conn, &scan, table),
+                "premise: {scan} scans: {:?}",
+                plan(conn, &scan)
+            );
+            let by_scan = count(conn, &scan, param.clone());
+            assert!(
+                matches!(by_scan, Ok(n) if n == *want),
+                "premise: the scan answers {want} for {pred} ({param:?}): {by_scan:?}"
+            );
+            let by_seek = count(conn, &seek, param.clone());
+            assert!(
+                matches!(by_seek, Ok(n) if n == *want),
+                "the seek of {index} answered {by_seek:?} for {pred} ({param:?}), the scan {want}"
+            );
+        }
+    }
+
+    /// Engine review 16 HIGH 2 (review 14 MED 6): the seek path ENCODEs an equality's key with the
+    /// column's parameters and consumes the term, so the type's operator never re-checks a row the
+    /// seek returns, while a scan passes the operand to the operator as given (2fa04254c). On
+    /// numeric(10, 2) with an index on x, `x = 1.501` matched 1.50 through the seek (the key was cut
+    /// to the scale), and `x = ?1` bound to 1e9 raised "numeric value out of range"; a scan answers
+    /// 0 for both, which is PostgreSQL's answer. The index arm of
+    /// `a_numeric_operand_keeps_its_own_precision`. Mutant `seek_key_encodes_raising`.
+    #[test]
+    fn an_indexed_numeric_equality_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34), (3, 1.50)")
+            .unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tx",
+            &[
+                ("x = 1.50", None, 1),
+                ("x = ?1", Some(Value::from_f64(1.5)), 1),
+                ("x = 1.501", None, 0),
+                ("x = ?1", Some(Value::from_f64(1.509)), 0),
+                ("x = 1e9", None, 0),
+                ("x = ?1", Some(Value::from_f64(1e9)), 0),
+            ],
+        );
+    }
+
+    /// Register the type `sql` creates as a built-in type, as the wire registers its bpchar.
+    fn register_built_in(conn: &Arc<crate::Connection>, sql: &str) {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("premise: the type parses");
+        };
+        let def = crate::schema::TypeDef::from_create_type(&type_name, &body, true, sql.to_string())
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema
+                .type_registry
+                .insert(type_name.to_lowercase(), Arc::new(def))
+        })
+        .unwrap();
+    }
+
+    /// Engine review 16 HIGH 2 (review 14 MED 6): a length-checked type with a function '=' and a
+    /// UNIQUE index on the column: the seek ENCODEs an over-length key with the column's length and
+    /// raises 'value too long', where a scan compares it, false, and answers 0 rows (the wire's
+    /// `code = $1` shape). The UNIQUE v arm of
+    /// `an_over_length_comparison_operand_compares_instead_of_raising` (a user type, t) and of
+    /// `a_built_in_length_checked_type_compares_an_over_length_operand` (registered built-in, u).
+    /// Mutant `seek_key_encodes_raising`.
+    #[test]
+    fn an_indexed_length_checked_type_compares_an_over_length_operand() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        register_built_in(
+            &conn,
+            "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) \
+             <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type bpc') END DECODE \
+             value OPERATOR '=' instr",
+        );
+        for (table, ty, index) in [("t", "tag(3)", "tv"), ("u", "bpc(3)", "uv")] {
+            conn.execute(format!(
+                "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v {ty}) STRICT"
+            ))
+            .unwrap();
+            conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO {table} VALUES (1, 'abc')"))
+                .unwrap();
+            assert!(
+                conn.execute(format!("INSERT INTO {table} VALUES (2, 'abcdef')"))
+                    .is_err(),
+                "premise: {ty}'s own length check refuses an over-length value"
+            );
+            answers_by_both_plans(
+                &conn,
+                table,
+                index,
+                &[
+                    ("v = 'abc'", None, 1),
+                    ("v = ?1", Some(Value::build_text("abc")), 1),
+                    ("v = 'abcdef'", None, 0),
+                    ("v = ?1", Some(Value::build_text("abcdef")), 0),
+                ],
+            );
+        }
+    }
+
     /// Engine review 14 HIGH 2: 6b (b) bound every user type's parameters to NULL when encoding a
     /// comparison operand, on a contract nothing states: the documented length-check ENCODE then
     /// raised on every comparison, a user copy of numeric raised "precision must be an integer",
