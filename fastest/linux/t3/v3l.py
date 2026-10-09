@@ -610,7 +610,8 @@ def self_test():
                   c2["failed"] == 2 and c2["data_fsyncs"] == 2 and c2["io_uring_setup"] == 1))
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
-            timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1"):
+            timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
+            sectors=2 * N * 8, lab_sectors=2 * N * 8):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -622,6 +623,10 @@ def self_test():
              "arms": {"fsync": arm(fsyncs, lab_syncs, timed_syncs),
                       "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
+        # the drive's sectors-written count over each fsync run, as measure() records it since item 10's remainder
+        # (data plus filesystem metadata: 2 x the data by default)
+        r["arms"]["fsync"]["timed"]["sectors_written_delta"] = sectors
+        r["arms"]["fsync"]["timed"]["lab_sectors_written_delta"] = lab_sectors
         return r
 
     cases += [
@@ -814,6 +819,34 @@ def self_test():
         ("HIGH 3: a ram0 plant base keeps 'none (RAM)' in both states",
          _ok(lambda: [as_state(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0), wc)
                       ["leaf"]["drive_reports"] for wc in ("write back", "write through")] == ["none (RAM)"] * 2)),
+        # T3 runner review item 10 (its remainder): over a write-through drive the flush counter reads 0 whether or not
+        # an fsync reached the drive (a write-through loop above it sends none either), so the drive's sectors-written
+        # counter must show at least the fsynced data, N x 4 KiB = N x 8 sectors, inside EACH fsync run
+        ("item 10: a write-through drive whose timed fsync run wrote half the data's sectors VOIDs, on the write rule's text",
+         _has(gates(rec(wc="write through", delta=0, sectors=N * 4)), "drive nvme1n1:", "in the timed fsync run",
+              "did not reach the drive")),
+        ("item 10: a write-through drive whose labelling run wrote half the data's sectors VOIDs, on the write rule's text",
+         _has(gates(rec(wc="write through", delta=0, lab_sectors=N * 4)), "drive nvme1n1:", "in the labelling fsync run",
+              "did not reach the drive")),
+        ("item 10: a write-back drive whose timed run wrote half the data's sectors VOIDs (the rule holds in every state)",
+         _has(gates(rec(sectors=N * 4)), "drive nvme1n1:", "did not reach the drive")),
+        ("item 10: a record with no sectors-written count VOIDs", _has(gates(rec(sectors=None)), "drive nvme1n1:",
+                                                                       "no sectors-written count")),
+        ("item 10: a sectors-written count that is not an int ('160000') VOIDs",
+         _has(gates(rec(lab_sectors="160000")), "drive nvme1n1:", "no sectors-written count")),
+        ("item 10: exactly N x 8 sectors (the data alone) in both runs is VALID (the rule's edge)",
+         gates(rec(sectors=N * 8, lab_sectors=N * 8)) == []),
+        ("item 10: N x 8 - 1 sectors in the timed run VOIDs", _has(gates(rec(sectors=N * 8 - 1)), "did not reach the drive")),
+        ("item 10: a ram disk (brd) with no sectors-written count is VALID (brd: dry runs only, never credited)",
+         gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0", sectors=None, lab_sectors=None)) == []),
+        ("item 10: plant wt-unwritten fires on a write-back record, on the write rule's text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:", "did not reach the drive"))(
+             _plant(plants(rec(delta=20003))[0], "wt-unwritten")))),
+        ("item 10: plant wt-unwritten fires on a write-through record carrying labelling count 0",
+         _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten").get("fired") is True)),
+        ("item 10: plants() on a ram record runs no wt-unwritten plant and is still ok",
+         _ok(lambda: (lambda res: res[1] is True and _plant(res[0], "wt-unwritten") == {})(
+             plants(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0))))),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),

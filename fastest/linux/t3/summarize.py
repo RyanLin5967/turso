@@ -437,7 +437,9 @@ def self_test():
                             "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0},
                     "labelling_fio": {"writes": N, "syncs": syncs},
                     "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": bins[0] / 1e3 if syncs else None,
-                              "fsync_bins_ns": {str(bins[0]): bins[1]} if syncs else None, "flush_ios_delta": 2 * N}}
+                              "fsync_bins_ns": {str(bins[0]): bins[1]} if syncs else None, "flush_ios_delta": 2 * N,
+                              # what v3l.py measure() records since T3 item 10's remainder (data + metadata)
+                              "sectors_written_delta": 2 * N * 8, "lab_sectors_written_delta": 2 * N * 8}}
         r = {"verdict": "VALID" if lie else verdict, "void_reasons": [] if verdict == "VALID" or lie else ["planted"],
              "floor_kind": "x", "leaf": {"disk": "nvme0n1", "write_cache": "write back", "drive_reports": "write back",
                                          "layers": []},
