@@ -3798,6 +3798,45 @@ fn a_connect_racing_a_drop_is_refused_as_no_such_branch() {
     }
 }
 
+/// Engine review 14 LOW 12: `BranchInUse` gave a DROP the connect's reason ("a branch serves one
+/// connection at a time"), and 620e69a81's claim that the old texts were kept was false: the
+/// second connection's refusal lost why ("a second one's page cache would silently miss the first
+/// one's commits"). Each refusal gives its own reason, with the branch named in the message.
+/// Mutant `drop_refused_as_connect`.
+#[test]
+fn a_drop_in_use_is_refused_in_its_own_words() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("in-use-words.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("a").unwrap();
+        let c = db.connect_named("a").unwrap();
+        let connect = match db.connect_named("a") {
+            Ok(_) => panic!("catalog={catalog}: premise: a second connection is refused"),
+            Err(e) => e.to_string(),
+        };
+        let dropped = match db.drop_branch("a") {
+            Ok(_) => panic!("catalog={catalog}: premise: a drop while connected is refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            connect.contains("\"a\"") && connect.contains("page cache would silently miss"),
+            "catalog={catalog}: the second connection's refusal lost the branch or its reason: {connect}"
+        );
+        assert!(
+            dropped.contains("\"a\"") && dropped.contains("cannot be dropped"),
+            "catalog={catalog}: the drop's refusal does not say why a drop is refused: {dropped}"
+        );
+        assert!(
+            !dropped.contains("serves one connection at a time"),
+            "catalog={catalog}: the drop was refused with the connect's reason: {dropped}"
+        );
+        drop(c);
+    }
+}
+
 /// fastest-wire: the named-branch refusals are typed, so a server answers each with its own code
 /// without matching message text: `NameTaken` from `create_branch`, `NoSuchBranch` from
 /// `connect_named` and `drop_branch`, `BranchInUse` (the name, quoted) from a second
