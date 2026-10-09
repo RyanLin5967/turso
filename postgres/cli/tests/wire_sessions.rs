@@ -6104,6 +6104,87 @@ fn a_chained_or_read_only_transaction_is_refused() {
     a.q("COMMIT").ok("end");
 }
 
+/// BEGIN READ ONLY inside an open block is refused (0A000) as it is outside one, failing the block,
+/// so nothing commits: in a client's block, and in a simple query's implicit block. The in-block
+/// BEGIN arm answered 25001's warning before the translator could refuse the mode, and in an
+/// implicit block it handed the block to the client, whose COMMIT committed both writes; PostgreSQL
+/// 17.11 refuses the write (25006) and keeps nothing (wire review 15 item 3).
+#[test]
+fn a_read_only_begin_inside_a_block_is_refused() {
+    let dir = Scratch::new("readonlyinblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    let r = a.q("BEGIN READ ONLY");
+    assert_eq!(r.err("BEGIN READ ONLY in a block").code, "0A000");
+    assert_eq!(r.status, b'E', "the block failed");
+    assert_eq!(a.q("INSERT INTO t VALUES (2, 'two')").status, b'E');
+    a.q("COMMIT").ok("ends the failed block");
+    let r = a.q("INSERT INTO t VALUES (3, 'three'); BEGIN READ ONLY; INSERT INTO t VALUES (4, 'four'); COMMIT");
+    assert_eq!(r.err("BEGIN READ ONLY in an implicit block").code, "0A000");
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id > 1")
+            .single("nothing kept"),
+        "0"
+    );
+}
+
+/// SET accepts the parameters it can honour and refuses the rest: a read-only transaction asked
+/// for through `transaction_read_only` or `default_transaction_read_only` is 0A000 (the engine has
+/// no read-only transaction), so a block that asked for one keeps nothing; `off` changes nothing.
+/// A planner or client setting PostgreSQL has and this server need not act on (enable_seqscan,
+/// application_name) is accepted; one whose value would change how statements are read or
+/// answered (standard_conforming_strings off, a client_encoding other than UTF8) is 0A000; a name
+/// PostgreSQL does not know is 42704, and so is an engine pragma, which SET reached as PRAGMA
+/// `synchronous` and could change the engine's durability. Every SET became `PRAGMA name = value`,
+/// which the engine ignores for a name it does not know, so `transaction_read_only = on` answered
+/// SET and the block's writes committed; PostgreSQL 17.11 refuses them (25006) (wire review 15
+/// item 2).
+#[test]
+fn set_honours_or_refuses_each_parameter() {
+    let dir = Scratch::new("setallow");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    let r = a.q("SET transaction_read_only = on");
+    assert_eq!(r.err("SET transaction_read_only = on").code, "0A000");
+    assert_eq!(a.q("INSERT INTO t VALUES (2, 'two')").status, b'E');
+    a.q("ROLLBACK").ok("end");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2")
+            .single("nothing kept"),
+        "0"
+    );
+    let mut wrong = Vec::new();
+    for (sql, code) in [
+        ("SET default_transaction_read_only = on", Some("0A000")),
+        ("SET LOCAL transaction_read_only TO true", Some("0A000")),
+        ("SET default_transaction_read_only = off", None),
+        ("SET enable_seqscan = off", None),
+        ("SET application_name = 'bench'", None),
+        ("SET client_encoding = 'UTF8'", None),
+        ("SET client_encoding = 'LATIN1'", Some("0A000")),
+        ("SET standard_conforming_strings = off", Some("0A000")),
+        ("SET synchronous = off", Some("42704")),
+        ("SET no_such_parameter = 1", Some("42704")),
+    ] {
+        let r = a.q(sql);
+        let got = r.error.as_ref().map(|e| e.code.as_str());
+        if got != code {
+            wrong.push(format!("{sql}: {got:?}, want {code:?}"));
+        }
+    }
+    a.q("INSERT INTO t VALUES (3, 'three')")
+        .ok("writes still work");
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A transaction verb with a comment before, inside or after it is that verb (PostgreSQL's lexer
 /// reads a comment as whitespace): `ROLLBACK -- why` ends a failed block, `/* c */ BEGIN` in a
 /// block is BEGIN's warning (25001 "there is already a transaction in progress") with the block
