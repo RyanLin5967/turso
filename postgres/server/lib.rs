@@ -2792,6 +2792,20 @@ impl ExtendedQueryHandler for Session {
         let Some(portal) = client.portal_store().get_portal(name) else {
             return Err(PgWireError::UserError(portal_not_found(name)));
         };
+        // An empty statement is EmptyQueryResponse every time, before any portal-state check, as
+        // PostgreSQL's exec_execute_message answers an empty command; it is never marked done. Its
+        // second Execute was 55000 and rolled the pipeline back (wire review 15 item 1).
+        if is_blank(&portal.statement.statement.sql) {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+            if name == DEFAULT_NAME {
+                client.portal_store().rm_portal(name);
+            }
+            return Ok(());
+        }
         // A portal that ran without rows, or failed, does not run again (PostgreSQL's
         // PortalRun refuses one that is not ready); it ran again and wrote twice (wire review 12
         // item 5).
@@ -2824,7 +2838,6 @@ impl ExtendedQueryHandler for Session {
                             .await?;
                     }
                     Response::EmptyQuery => {
-                        self.portal_done(name);
                         client
                             .feed(PgWireBackendMessage::EmptyQueryResponse(
                                 EmptyQueryResponse::new(),
