@@ -474,6 +474,25 @@ def _lab(r, lab):
     return r
 
 
+def _ok(f):
+    """A case evaluated inside a guard: an exception is that case's FAIL (named), not a crash of the self-test."""
+    try:
+        return bool(f())
+    except Exception as e:  # noqa: BLE001
+        print(f"V3L self-test case raised {type(e).__name__}: {e}")
+        return False
+
+
+def _has(got, *subs):
+    """Some one failure message carries every one of `subs` (a rule's own text, not a prefix)."""
+    return any(all(s in x for s in subs) for x in got or [])
+
+
+def _plant(res, name):
+    """The named plant's entry in plants()' results, or {} when it was never run."""
+    return next((p for p in res if p.get("plant") == name), {})
+
+
 def self_test():
     data = "/mnt/t3-xfs/v3l-before/v3l-fsync.dat"
     trace = "\n".join([
@@ -559,6 +578,41 @@ def self_test():
         ("plants on a write-back record carrying its labelling count: all four fire",
          plants(_lab(rec(delta=20003), 20004))[1]),
         ("plants on a VOID record: NOT-RUN", not plants(rec(fsyncs=N - 1))[1]),
+        # item 3 (T3 runner review MED 3): the write-back rules apply whatever the labelling count is; a count below N
+        # is a labelling run with fewer than one flush per fsync, and VOIDs (PREREG line 180), drive and loop layer
+        ("item 3: a write-back drive whose labelling run rose N//2 (timed N+3) VOIDs, on the labelling rule's text",
+         _has(gates(_lab(rec(delta=N + 3), N // 2)), "write-back drive nvme1n1",
+              "fewer than one per fsync in the strace-checked run")),
+        ("item 3: a write-back drive whose labelling count is 0 (timed N+3) VOIDs, on the labelling rule's text",
+         _has(gates(_lab(rec(delta=N + 3), 0)), "write-back drive nvme1n1",
+              "fewer than one per fsync in the strace-checked run")),
+        ("item 3: a write-back drive whose labelling count is N-1 (timed N+3) VOIDs",
+         _has(gates(_lab(rec(delta=N + 3), N - 1)), "fewer than one per fsync in the strace-checked run")),
+        ("item 3: a write-back drive whose labelling count is N (timed N+3) is VALID", gates(_lab(rec(delta=N + 3), N)) == []),
+        ("item 3: a write-back loop layer whose labelling run rose N//2 (timed N+3) VOIDs, on the labelling rule's text",
+         _has(gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N + 3,
+                                 "lab_flush_ios_delta": N // 2}])),
+              "write-back loop layer loop3", "fewer than one per fsync in the strace-checked run")),
+        ("item 3: plant wb-lab-short fires on a write-back record, on the labelling rule's text",
+         _ok(lambda: _plant(plants(rec(delta=20003))[0], "wb-lab-short").get("fired") is True
+             and _has(_plant(plants(rec(delta=20003))[0], "wb-lab-short")["got"],
+                      "fewer than one per fsync in the strace-checked run"))),
+        ("item 3: plant wb-lab-short fires on a write-back record carrying its labelling count",
+         _ok(lambda: _plant(plants(_lab(rec(delta=20003), 20004))[0], "wb-lab-short").get("fired") is True)),
+        ("item 3: plant wb-lab-short fires on a write-through record carrying labelling count 0",
+         _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wb-lab-short").get("fired") is True)),
+        ("item 3: the write-back plant base keeps a real write-back drive's labelling count (N//2 stays N//2)",
+         _ok(lambda: as_state(_lab(rec(delta=N + 3), N // 2), "write back")
+             ["arms"]["fsync"]["timed"]["lab_flush_ios_delta"] == N // 2)),
+        ("item 3: the write-back plant base keeps a real write-back layer's labelling count (N//2 stays N//2)",
+         _ok(lambda: as_state(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N + 3,
+                                           "lab_flush_ios_delta": N // 2}]), "write back")
+             ["leaf"]["layers"][0]["lab_flush_ios_delta"] == N // 2)),
+        ("item 3: a write-back base derived from a write-through record (counts 0) synthesises 2 per fsync in both runs",
+         _ok(lambda: [as_state(_lab(rec(wc="write through", delta=0), 0), "write back")["arms"]["fsync"]["timed"][k]
+                      for k in ("flush_ios_delta", "lab_flush_ios_delta")] == [2 * N, 2 * N])),
+        ("item 3: a write-back base over a record with no labelling count fills it from the timed count (20003)",
+         _ok(lambda: as_state(rec(delta=20003), "write back")["arms"]["fsync"]["timed"]["lab_flush_ios_delta"] == 20003)),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
