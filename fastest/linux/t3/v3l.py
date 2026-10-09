@@ -735,7 +735,7 @@ def self_test():
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
             timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
-            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0))):
+            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0)), iostats="1"):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -743,7 +743,7 @@ def self_test():
                     "timed": {"writes": fio_w, "syncs": tsyncs, "fsync_p50_us": 300.0, "fsync_bins_ns": {"300000": tsyncs}}}
         # fio's own sync count is whatever it reports (9,999 or 10,000 with end_fsync); only agreement is gated
         r = {"leaf": {"disk": disk, "write_cache": wc, "layers": layers or [],
-                      "drive_reports": wc if drive == "same" else drive},
+                      "drive_reports": wc if drive == "same" else drive, "iostats": iostats},
              "arms": {"fsync": arm(fsyncs, lab_syncs, timed_syncs),
                       "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
@@ -971,6 +971,17 @@ def self_test():
              _plant(plants(rec(delta=20003))[0], "wt-unwritten")))),
         ("item 10: plant wt-unwritten fires on a write-through record carrying labelling count 0",
          _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten").get("fired") is True)),
+        # review 5 MED 2: with queue/iostats 0 the sectors-written counter never moves (flushes are counted either
+        # way), so such a leaf VOIDs on its own text, not as data that "did not reach the drive"
+        ("MED 2: a leaf with iostats 0 VOIDs on the iostats text, not on 'did not reach the drive'",
+         _ok(lambda: (lambda g: _has(g, "drive nvme1n1:", "iostats") and not _has(g, "did not reach the drive"))(
+             gates(rec(iostats="0", sectors=0, lab_sectors=0))))),
+        ("MED 2: a leaf with no iostats recorded VOIDs", _has(gates(rec(iostats=None)), "drive nvme1n1:", "iostats")),
+        ("MED 2: a ram disk (brd) with no iostats recorded is VALID (exempt with the write rule)",
+         gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0", iostats=None)) == []),
+        ("MED 2: measure() refuses iostats 0 and an unreadable iostats, before any run; 1 passes",
+         _ok(lambda: iostats_problem("1") is None and "iostats off" in (iostats_problem("0") or "")
+             and "cannot read" in (iostats_problem(None) or ""))),
         # annex A24 (the lead's ruling): every run is preceded by a sync outside its window, and the record says it ran
         # and its rc; on a drive, an fsync-arm run without a sync record, or with a failed one, VOIDs
         ("A24: an fsync-arm record with no sync record VOIDs, on the sync rule's text",
