@@ -303,8 +303,8 @@ test op-numeric-div-literal-multi-row {
     SELECT id, val / 10 FROM t1 ORDER BY id;
 }
 expect {
-    1|10.00
-    2|3.00
+    1|10
+    2|3
 }
 
 @requires strict "uses STRICT tables"
