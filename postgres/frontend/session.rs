@@ -1821,11 +1821,26 @@ mod tests {
         }
     }
 
-    /// Differential: whatever the fast path reads, libpg_query reads the same; every form it does
-    /// not read still reaches the same answer through libpg_query. The corpus crosses keyword case,
-    /// spacing, argument forms, casts, terminators and trailing junk.
+    /// Differential: whatever the fast path reads, libpg_query reads the same; every form, read
+    /// there or not, reaches PostgreSQL 18's answer: libpg_query's, except that a `$n` above
+    /// i32::MAX, which libpg_query's PostgreSQL 17 scanner wraps and PostgreSQL 18's refuses
+    /// ("parameter number too large", 42601), makes no call. That answer is read from the corpus's
+    /// argument by PostgreSQL's scanner rule, never from the code under test; against libpg_query
+    /// alone no implementation could pass, since `$4294967297` is `$1` there (wire review 14 item
+    /// 12; FLAGGED edit, lead pre-approval in DECISIONS, PG 18 recording owed). The corpus crosses
+    /// keyword case, spacing, argument forms, casts, terminators and trailing junk.
     #[test]
     fn the_fast_path_agrees_with_libpg_query() {
+        // PostgreSQL 18's scanner refuses a `$n` whose number is above i32::MAX.
+        let pg18_refuses = |arg: &str| {
+            arg.strip_prefix('$').is_some_and(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                !digits.is_empty()
+                    && digits
+                        .parse::<u128>()
+                        .map_or(true, |n| n > i32::MAX as u128)
+            })
+        };
         let selects = ["SELECT", "select", "SeLeCt"];
         let names = [
             "turso_branch_create",
@@ -1892,11 +1907,17 @@ mod tests {
                             let sql = format!("{sel} {name}{g}({g}{arg}{g}){end}");
                             n += 1;
                             let slow = slow(&sql);
+                            let want = if pg18_refuses(arg) {
+                                None
+                            } else {
+                                slow.clone()
+                            };
                             if let Some(fast) = fast_branch_call(&sql) {
                                 fast_hits += 1;
-                                assert_eq!(Some(fast), slow, "{sql:?}");
+                                assert_eq!(Some(fast.clone()), slow, "libpg_query, {sql:?}");
+                                assert_eq!(Some(fast), want, "{sql:?}");
                             }
-                            assert_eq!(branch_call(&sql), slow, "{sql:?}");
+                            assert_eq!(branch_call(&sql), want, "{sql:?}");
                         }
                     }
                 }
@@ -1939,6 +1960,13 @@ mod tests {
             assert_eq!(fast_branch_call(&sql), None, "fast path, {sql:?}");
             assert_eq!(branch_call(&sql), None, "branch_call, {sql:?}");
         }
+        // The reference's wrap, the wrong call the check above exists to stop (wire review 14
+        // item 12): libpg_query reads $4294967297 as $1.
+        assert_eq!(
+            slow("SELECT turso_branch_create($4294967297)"),
+            call(create, vec![Param(1)]),
+            "libpg_query's wrap"
+        );
         for (sql, n) in [
             ("SELECT turso_branch_create($65535)", 65535),
             ("SELECT turso_branch_create($0001)", 1),
