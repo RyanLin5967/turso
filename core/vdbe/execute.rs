@@ -4807,6 +4807,22 @@ pub fn op_transaction_inner(
     }
 }
 
+/// SQLite's OP_AutoCommit on SQLITE_BUSY (vdbe.c: `db->autoCommit = 1-desiredAutoCommit`): a COMMIT
+/// whose `commit_txn` returned Busy with `commit_state` still `Ready` (the trunk's copy-decision
+/// pass refused it before any frame) has committed nothing, so its transition is undone. The
+/// transaction is explicit again in the gap (siblings, BEGIN, ROLLBACK and `get_auto_commit` all
+/// see it open), and the re-stepped COMMIT makes the transition anew with every guard
+/// (StatementsInProgress, the poison mark, deferred FKs). Engine review 16 HIGH 1, which replaces
+/// 795295c09's commit-started flag. Mutant `busy_commit_keeps_autocommit` (test builds only): the
+/// transition stays, so the re-step reads "no transaction is active".
+fn undo_commit_transition_after_busy(conn: &Connection, state: &mut ProgramState) {
+    if crate::branch::store::fe_mutant("busy_commit_keeps_autocommit") {
+        return;
+    }
+    conn.auto_commit.store(false, Ordering::SeqCst);
+    state.auto_txn_cleanup = TxnCleanup::None;
+}
+
 pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
@@ -4837,12 +4853,12 @@ pub fn op_auto_commit(
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
-        // The commit finished, or failed for good: a later step is not its re-entry.
-        if !matches!(
-            res,
-            Ok(InsnFunctionStepResult::IO(_)) | Err(LimboError::Busy)
-        ) {
-            state.commit_started = false;
+        // A resumed commit (after a view merge's yield) refused before its pager commit began.
+        if matches!(res, Err(LimboError::Busy))
+            && !*rollback
+            && matches!(state.commit_state, CommitState::Ready)
+        {
+            undo_commit_transition_after_busy(&conn, state);
         }
         // Only clear after a final, successful non-rollback COMMIT.
         if fk_on
@@ -4889,17 +4905,6 @@ pub fn op_auto_commit(
             ));
         }
     };
-
-    // A COMMIT stepped again after its `commit_txn` returned Busy before recording any
-    // `commit_state` (a trunk commit's refused copy-decision pass) made its transition on the
-    // first step: `auto_commit` is still true from it, so it only drives `commit_txn` again (wire
-    // review 7 HIGH 3). Had a BEGIN on this connection cleared `auto_commit` in between, the
-    // COMMIT is an ordinary one again and makes the transition anew. Mutant
-    // `commit_restarts_after_busy` (test builds only): the re-entry is judged as a new COMMIT, as
-    // before, and reads "no transaction is active".
-    let resuming_commit = state.commit_started
-        && had_autocommit
-        && !crate::branch::store::fe_mutant("commit_restarts_after_busy");
 
     // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
     // or COMMIT/ROLLBACK without one) is invalid.
@@ -4953,7 +4958,6 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                state.commit_started = true;
             }
             TxOp::Begin => {
                 turso_assert!(
@@ -4964,7 +4968,7 @@ pub fn op_auto_commit(
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
-    } else if !resuming_commit {
+    } else {
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
@@ -4987,26 +4991,27 @@ pub fn op_auto_commit(
     // Index-method staging is a per-statement Halt responsibility (each
     // statement stages its writes at its own halt and hands its cursors to
     // the connection), so the COMMIT program has nothing to stage here. A
-    // yield point at this spot would also be unsafe: `conn.auto_commit` was
-    // already flipped above, and re-entering this opcode from the top after
-    // an IO yield would then fail `valid_transition` with a torn-down
-    // transaction.
+    // yield point here, between the transition above and `commit_txn`, would
+    // be unsafe: it records no `commit_state`, so the re-entry would judge
+    // the COMMIT anew while `conn.auto_commit` is already flipped and fail
+    // `valid_transition`.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
         .map(Into::<InsnFunctionStepResult>::into)
     {
         Ok(res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step)) => res,
-        // An IO yield records its `commit_state`, whose re-entry is driven above.
+        // Every IO yield inside `commit_txn` records its `commit_state` (a view merge's as
+        // `ApplyingViewDeltas`), so the re-entry is driven by the block at the top.
         Ok(res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row)) => return Ok(res),
-        // Retried at this pc: a COMMIT keeps `commit_started` and resumes.
-        Err(LimboError::Busy) => return Err(LimboError::Busy),
-        Err(err) => {
-            state.commit_started = false;
-            return Err(err);
+        Err(LimboError::Busy) => {
+            if !*rollback && matches!(state.commit_state, CommitState::Ready) {
+                undo_commit_transition_after_busy(&conn, state);
+            }
+            return Err(LimboError::Busy);
         }
+        Err(err) => return Err(err),
     };
-    state.commit_started = false;
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;

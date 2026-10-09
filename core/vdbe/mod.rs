@@ -201,6 +201,10 @@ pub enum StepResult {
 ///   primarily to the WAL, but also possibly checkpointing the WAL to the database file.
 enum CommitState {
     Ready,
+    /// `commit_txn`'s materialized-view merge yielded IO before the pager commit began, so a
+    /// re-entry resumes the merge (`view_delta_state`) instead of starting a new commit (engine
+    /// review 16 HIGH 1). Back to `Ready` once the deltas are applied.
+    ApplyingViewDeltas,
     Committing,
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
@@ -224,7 +228,10 @@ impl CommitState {
             CommitState::CommittingAttachedMvcc { state_machine, .. } => {
                 state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
             }
-            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+            CommitState::Ready
+            | CommitState::ApplyingViewDeltas
+            | CommitState::Committing
+            | CommitState::CommittingAttached => {}
         }
     }
 
@@ -848,13 +855,6 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
-    /// An explicit COMMIT has made its transition (`auto_commit` set, deferred FKs checked) and
-    /// called `commit_txn`, which has not finished. A `commit_txn` that returns `Busy` before it
-    /// records any `commit_state` (a trunk commit's refused copy-decision pass) leaves the state
-    /// `Ready`, so this flag is what tells the re-stepped `AutoCommit` to drive `commit_txn` again
-    /// rather than read `auto_commit` as "no transaction is active" (wire review 7 HIGH 3).
-    /// Cleared when the commit finishes or fails for good, and on reset.
-    pub(crate) commit_started: bool,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
     /// entry and drives it one step per opcode call, yielding
@@ -990,7 +990,6 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
-            commit_started: false,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
@@ -1141,7 +1140,6 @@ impl ProgramState {
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.commit_state = CommitState::Ready;
-        self.commit_started = false;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
         // (we handle that on every code path inside
@@ -2337,10 +2335,21 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
+        // Apply view deltas with I/O handling. A yield is recorded in `commit_state`, so the
+        // statement's re-entry resumes this commit rather than judging it a new one (an explicit
+        // COMMIT has already made its transition; engine review 16 HIGH 1).
         match self.apply_view_deltas(program_state, rollback, &pager)? {
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            IOResult::Done(_) => {}
+            IOResult::IO(io) => {
+                if matches!(program_state.commit_state, CommitState::Ready) {
+                    program_state.commit_state = CommitState::ApplyingViewDeltas;
+                }
+                return Ok(IOResult::IO(io));
+            }
+            IOResult::Done(_) => {
+                if matches!(program_state.commit_state, CommitState::ApplyingViewDeltas) {
+                    program_state.commit_state = CommitState::Ready;
+                }
+            }
         }
 
         // Reset state for next use
