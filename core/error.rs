@@ -45,10 +45,20 @@ pub enum LimboError {
     NameTaken(String),
     /// A branch already has an open connection: a second connection is refused (a branch serves
     /// one at a time, because a second one's page cache would silently miss the first one's
-    /// commits), and so is `Database::drop_branch` until it closes. The branch's name, quoted, or
-    /// its id for an unnamed one.
-    #[error("branch {0} already has an open connection: a branch serves one connection at a time")]
-    BranchInUse(String),
+    /// commits), and so is `Database::drop_branch` until it closes (`op` says which was refused,
+    /// and each has its own reason). `name` is the branch's name as given, unquoted, as
+    /// `NoSuchBranch` and `NameTaken` carry it (None for an unnamed branch); `id` its id. The
+    /// message quotes the name (or gives the id) (engine review 14 LOW 12).
+    #[error(
+        "branch {} already has an open connection; {}",
+        branch_subject(.name, .id),
+        branch_op_reason(.op)
+    )]
+    BranchInUse {
+        name: Option<String>,
+        id: u64,
+        op: BranchOp,
+    },
     #[error("Parse error: {0}")]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error("Parse error: {0}")]
@@ -137,6 +147,32 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+}
+
+/// The operation a `LimboError::BranchInUse` refused (engine review 14 LOW 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchOp {
+    /// A second connection on the branch.
+    Connect,
+    /// `Database::drop_branch` of the branch.
+    Drop,
+}
+
+/// The branch a `BranchInUse` names in its message: its name, quoted, or its id.
+fn branch_subject(name: &Option<String>, id: &u64) -> String {
+    name.as_ref()
+        .map_or_else(|| id.to_string(), |name| format!("{name:?}"))
+}
+
+/// Why a `BranchInUse` refused its operation.
+fn branch_op_reason(op: &BranchOp) -> &'static str {
+    match op {
+        BranchOp::Connect => {
+            "a branch serves one connection at a time, because a second one's page cache would \
+             silently miss the first one's commits"
+        }
+        BranchOp::Drop => "it cannot be dropped until that connection closes",
+    }
 }
 
 impl LimboError {
