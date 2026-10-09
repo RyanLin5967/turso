@@ -17,10 +17,12 @@ claimed >= OPS and el >= S x 1e9 (done), or when el >= MAX_S x 1e9 (capped); cap
 claim that meets both reads capped=0. Seconds become nanoseconds by truncation, as (uint64_t)(S * 1e9) does. Every
 claim before the stop is a warm-up op, so warm_ops == stop_at.
 
-  warmup_conformance.py run [--bbload BIN] [--clonebench BIN] [--fastest-profile BIN]
+  warmup_conformance.py run [--bbload BIN] [--clonebench BIN] [--fastest-profile BIN] [--record FILE]
         exit 0: all three given and every one matches every case; 3: every given one matches, but not all three
         were given (PARTIAL, never a conformance verdict); 1: a mismatch; 2: refused (none given, a driver missing,
-        timed out, or printing anything but one result line)
+        two roles naming one file or one sha256, timed out, or printing anything but one result line). Each
+        driver is reported by realpath and sha256; --record writes the verdict as JSON (rc, verdict, cases, and per
+        role path, realpath, sha256), which summarize binds to the binaries a package ran (review 5 MED 6, 7)
   warmup_conformance.py self-test
         the harness on fake replayers: a correct one passes, and four wrong ones (> for >=, capped winning over
         done, the stop claim counted, rounding instead of truncating) each fail on a named case
@@ -80,11 +82,46 @@ def replay(binary, rule, trace):
     return (None if stop == "none" else int(stop), int(warm), None if capped == "none" else int(capped))
 
 
-def run(drivers):
-    """drivers: {name: binary}; returns (rc, report lines)"""
-    out, bad = [], 0
+def identity(binary):
+    """(realpath, sha256) of a driver binary; OSError when it cannot be read"""
+    rp = os.path.realpath(binary)
+    with open(rp, "rb") as f:
+        return rp, hashlib.sha256(f.read()).hexdigest()
+
+
+VERDICTS = {0: "PASS", 1: "FAIL", 2: "REFUSED", 3: "PARTIAL"}
+
+
+def run(drivers, record=None):
+    """drivers: {role: binary}; returns (rc, report lines). Each role's binary is named by realpath and sha256, and
+    two roles resolving to one file or to one sha256 are REFUSED (review 5 MED 7: the same binary under all three roles
+    gave rc 0). RECORD, when given, receives the verdict as JSON: rc, verdict, the case count, and per role its path,
+    realpath and sha256, so a package can bind the verdict to the binaries it ran (review 5 MED 6)."""
+    out, bad, ids = [], 0, {}
+
+    def done(rc, lines):
+        if record:
+            with open(record, "w") as f:
+                json.dump({"rc": rc, "verdict": VERDICTS[rc], "cases": len(CASES),
+                           "drivers": {r: {"path": drivers[r], "realpath": ids[r][0], "sha256": ids[r][1]}
+                                       for r in ids}, "report": lines[-1] if lines else ""}, f, indent=1)
+        return rc, lines
+
     if not drivers:
-        return 2, ["warmup conformance: REFUSED: no driver given"]
+        return done(2, ["warmup conformance: REFUSED: no driver given"])
+    try:
+        for role, binary in drivers.items():
+            ids[role] = identity(binary)
+    except OSError as e:
+        return done(2, [f"warmup conformance: REFUSED: a driver cannot be read: {e}"])
+    roles = sorted(ids)
+    for i, a in enumerate(roles):
+        for b in roles[i + 1:]:
+            if ids[a][0] == ids[b][0] or ids[a][1] == ids[b][1]:
+                return done(2, [f"warmup conformance: REFUSED: {a} and {b} are the same driver ({ids[a][0]}, sha256 "
+                                f"{ids[a][1][:12]}...): one verdict cannot stand for two drivers"])
+    for role in roles:
+        out.append(f"warmup conformance: driver {role}: {ids[role][0]} sha256 {ids[role][1]}")
     got = {}
     try:
         for name, binary in drivers.items():
@@ -95,7 +132,7 @@ def run(drivers):
                 bad += not ok
                 out.append(f"warmup conformance {'PASS' if ok else 'FAIL'}: {name}: {case} ({rule}): got {g}, want {want}")
     except Refused as e:
-        return 2, out + [f"warmup conformance: REFUSED: {e}"]
+        return done(2, out + [f"warmup conformance: REFUSED: {e}"])
     names = sorted(drivers)
     for case, _, _, _ in CASES:  # pairwise, so a report names who disagrees with whom even when both are wrong
         vals = {n: got[(n, case)] for n in names}
@@ -104,12 +141,12 @@ def run(drivers):
     missing = [n for n in ("bbload", "clonebench", "fastest_profile") if n not in drivers]
     if bad:
         out.append(f"warmup conformance: FAIL ({bad} mismatches over {len(drivers)} drivers x {len(CASES)} cases)")
-        return 1, out
+        return done(1, out)
     if missing:
         out.append(f"warmup conformance: PARTIAL: {len(drivers)} x {len(CASES)} match; not given: {missing}")
-        return 3, out
+        return done(3, out)
     out.append(f"warmup conformance: PASS: 3 drivers x {len(CASES)} cases match the rule")
-    return 0, out
+    return done(0, out)
 
 
 FAKE = r'''#!/usr/bin/env python3
@@ -215,13 +252,16 @@ def main(a):
         return self_test()
     if a[1:2] == ["run"]:
         flags = {"--bbload": "bbload", "--clonebench": "clonebench", "--fastest-profile": "fastest_profile"}
-        rest, drivers = a[2:], {}
-        if len(rest) % 2 or any(rest[i] not in flags for i in range(0, len(rest), 2)):
+        rest, drivers, record = a[2:], {}, None
+        if len(rest) % 2 or any(rest[i] not in flags and rest[i] != "--record" for i in range(0, len(rest), 2)):
             print(__doc__, file=sys.stderr)
             return 2
         for i in range(0, len(rest), 2):
-            drivers[flags[rest[i]]] = rest[i + 1]
-        rc, rep = run(drivers)
+            if rest[i] == "--record":
+                record = rest[i + 1]
+            else:
+                drivers[flags[rest[i]]] = rest[i + 1]
+        rc, rep = run(drivers, record)
         print("\n".join(rep))
         return rc
     print(__doc__, file=sys.stderr)

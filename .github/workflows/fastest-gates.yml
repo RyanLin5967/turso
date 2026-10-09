@@ -171,8 +171,10 @@ jobs:
           refuse zero-max --class full --warmup 10:0:0
           echo "driver contract: 2 records kept, 6 refusals refused"
           # one warm-up rule for every driver (fourth lane review LOW 14): the driver replays bbload's OPS:S:MAX_S rule
-          # on the shared cases. bbload and clonebench are macOS builds, so here the verdict can only be PARTIAL (rc 3:
-          # every case matches, not all three drivers given); the three-driver run is on the Mac
+          # on the shared cases. This job builds fastest_profile only, so here the verdict can only be PARTIAL (rc 3:
+          # every case matches, not all three drivers given). The three-driver verdict (rc 0) is the T3 runner's
+          # envchecks stage on the integration branch, over the Linux ports of bbload and clonebench it builds there
+          # (PREREG annex A23-AM1; review 5 MED 7), bound by sha256 to the binaries the package ran (MED 6)
           W=fastest/linux/gates/warmup_conformance.py
           python3 -B $W self-test | tail -1
           rc=0; python3 -B $W run --fastest-profile dist/fastest_profile > dist/warmup-conformance.txt || rc=$?
