@@ -5330,7 +5330,8 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
 /// An IO whose WAL file's next sync fails, once (review 6 #2): `armed` 1 fails it at once, as
 /// UnixIO's F_FULLFSYNC does on Apple, 2 fails its completion before returning it, 3 returns it
 /// unfinished and fails it at the IO's next step, after the statement yielded on it (engine review
-/// 9 #10); it reads 0 once spent. Every other file, and every other call, is the platform's.
+/// 9 #10); 4, 5 and 6 pass one sync and fail the next as 1, 2 and 3 do; it reads 0 once spent.
+/// Every other file, and every other call, is the platform's.
 struct FailWalSyncIo {
     inner: Arc<dyn IO>,
     armed: Arc<std::sync::atomic::AtomicU8>,
@@ -5407,6 +5408,14 @@ impl crate::io::File for FailWalSyncFile {
             4 => {
                 if let Some(a) = self.armed.as_ref() {
                     a.store(1, std::sync::atomic::Ordering::Release);
+                }
+                self.inner.sync(c, sync_type)
+            }
+            // This sync passes; the next one fails as mode 2 (5) or mode 3 (6) does: a site after
+            // another sync, failing after its issue (engine review 19 HIGH 1).
+            m @ (5 | 6) => {
+                if let Some(a) = self.armed.as_ref() {
+                    a.store(m - 3, std::sync::atomic::Ordering::Release);
                 }
                 self.inner.sync(c, sync_type)
             }
@@ -5693,6 +5702,109 @@ fn a_failed_shutdown_wal_sync_fail_stops_a_snapshot_store() {
 #[test]
 fn a_failed_shutdown_wal_sync_fail_stops_a_catalog_store() {
     a_wal_internal_sync_failure_fail_stops(true, "shutdown", "close");
+}
+
+/// Engine review 19 HIGH 1: 910dbf21c acts at issue on the syncs the WAL issues itself (a
+/// checkpoint's sync before its backfill, a TRUNCATE checkpoint's of the truncated log), but no
+/// longer notes a completion it returned, so one that fails after it yielded (io_uring, an
+/// extension VFS) reached the checkpoint-failure path with nothing noted, and the store stayed
+/// live over a failed drain. A D0 store, whose fork is written and never drained on every target,
+/// under a fullfsync trunk (so the sync is a drain on Apple too); the armed sync's completion
+/// fails before it is returned (mode 2) or after the statement yielded on it (mode 3), at the
+/// checkpoint's sync, or at the truncate's once the checkpoint's passed (modes 5 and 6). The PRAGMA
+/// reports it (an error, or a busy row) and the API returns an error; either way a fork from a
+/// fresh connection and another connection's trunk commit are refused after it. Mutant
+/// `yielded_wal_sync_unnoted` (test builds only).
+fn a_yielded_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way: &str, mode: u8) {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let what = format!("catalog={catalog} site={site} way={way} mode={mode}");
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, armed) = open_failing_wal(&dir.path().join("walyield.db"), opts(catalog, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+    // Frames in the WAL, then a D0 fork: written, not drained.
+    trunk.execute("UPDATE t SET v = 'walled' WHERE id = 7").unwrap();
+    let _b = trunk.fork_branch().unwrap().into_id();
+    assert!(
+        drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+        "{what}: premise: the fork is written and not drained"
+    );
+    crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+    armed.store(if site == "truncate" { mode + 3 } else { mode }, O::Release);
+    let truncate = site == "truncate";
+    match way {
+        "pragma" => {
+            let checkpoint = if truncate { "TRUNCATE" } else { "PASSIVE" };
+            let reported = trunk
+                .prepare(format!("PRAGMA wal_checkpoint({checkpoint})"))
+                .and_then(|mut s| s.run_collect_rows());
+            assert!(
+                reported.as_ref().map_or(true, |rows| rows[0][0].as_int() == Some(1)),
+                "{what}: premise: the PRAGMA reported the failed sync (an error, or busy=1): {reported:?}"
+            );
+        }
+        _ => {
+            let checkpoint = if truncate {
+                crate::CheckpointMode::Truncate { upper_bound_inclusive: None }
+            } else {
+                crate::CheckpointMode::Passive { upper_bound_inclusive: None }
+            };
+            assert!(trunk.checkpoint(checkpoint).is_err(), "{what}: premise: the failed sync failed the checkpoint");
+        }
+    }
+    assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the armed sync was reached");
+    assert_eq!(
+        crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+        site,
+        "{what}: premise: the failure reached its site"
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        &format!("{what}: the next fork after a WAL-internal drain that failed after it yielded"),
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().execute("UPDATE t SET v = 'later' WHERE id = 9"),
+        &format!("{what}: another connection's trunk commit after a WAL-internal drain that failed after it yielded"),
+    );
+}
+
+#[test]
+fn a_yielded_checkpoint_wal_sync_failure_reported_by_the_pragma_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "checkpoint", "pragma", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_checkpoint_wal_sync_failure_reported_by_the_api_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "checkpoint", "api", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_truncate_wal_sync_failure_reported_by_the_pragma_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "truncate", "pragma", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_truncate_wal_sync_failure_reported_by_the_api_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "truncate", "api", mode);
+        }
+    }
 }
 
 /// Engine review 8 #14 (review 3 #9's pager half): a trunk commit with no frames to sync whose
