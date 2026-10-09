@@ -646,6 +646,15 @@ def _has(got, *subs):
 _BRD_B0 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "v3l-37812992594-brd-xfs-b0", "v3l.json")
 
 
+def _raises(f, text):
+    """f() raises, with `text` in the message"""
+    try:
+        f()
+    except Exception as e:  # noqa: BLE001
+        return text in str(e)
+    return False
+
+
 def _block_of(r):
     """block() over one record written as both its before and its after file (a temp dir, removed)"""
     d = tempfile.mkdtemp(prefix="v3l-st-")
@@ -691,7 +700,7 @@ def self_test():
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
             timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
-            sectors=2 * N * 8, lab_sectors=2 * N * 8):
+            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0))):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -707,6 +716,9 @@ def self_test():
         # (data plus filesystem metadata: 2 x the data by default)
         r["arms"]["fsync"]["timed"]["sectors_written_delta"] = sectors
         r["arms"]["fsync"]["timed"]["lab_sectors_written_delta"] = lab_sectors
+        # the sync before each run, as measure() records it since annex A24
+        if sync is not None:
+            r["arms"]["fsync"]["sync"] = {"labelling": dict(sync), "timed": dict(sync)}
         return r
 
     cases += [
@@ -924,6 +936,21 @@ def self_test():
              _plant(plants(rec(delta=20003))[0], "wt-unwritten")))),
         ("item 10: plant wt-unwritten fires on a write-through record carrying labelling count 0",
          _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten").get("fired") is True)),
+        # annex A24 (the lead's ruling): every run is preceded by a sync outside its window, and the record says it ran
+        # and its rc; on a drive, an fsync-arm run without a sync record, or with a failed one, VOIDs
+        ("A24: an fsync-arm record with no sync record VOIDs, on the sync rule's text",
+         _has(gates(rec(sync=None)), "drive nvme1n1:", "no sync record")),
+        ("A24: a sync that failed (rc 1) before the timed run VOIDs",
+         _ok(lambda: _has(gates((lambda r: (r["arms"]["fsync"]["sync"]["timed"].__setitem__("rc", 1), r)[1])(rec())),
+                          "drive nvme1n1:", "the sync before the timed fsync run"))),
+        ("A24: a ram disk (brd) with no sync record is VALID (exempt, as from the write rule)",
+         gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0", sync=None)) == []),
+        ("A24: sync_record() on a sync that exits 0 records it ran and rc 0",
+         _ok(lambda: (lambda r: r["ran"] is True and r["rc"] == 0 and isinstance(r["secs"], float))(
+             sync_record(lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))))),
+        ("A24: sync_record() on a sync that exits 1 refuses the measurement",
+         _ok(lambda: _raises(lambda: sync_record(lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "boom")),
+                             "sync before a V3L run failed"))),
         ("item 10: plants() on a ram record runs no wt-unwritten plant and is still ok",
          _ok(lambda: (lambda res: res[1] is True and _plant(res[0], "wt-unwritten") == {})(
              plants(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0))))),

@@ -452,6 +452,9 @@ def self_test():
                                          "drive_reports": "none (RAM)" if brd else "write back", "layers": []},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
+        # the sync before each run, as v3l.py measure() records it since annex A24
+        for a in r["arms"].values():
+            a["sync"] = {"labelling": {"ran": True, "rc": 0}, "timed": {"ran": True, "rc": 0}}
         return json.dumps(r)
 
     def v3sum(rc, block, plp="no", a25=300.0, void=None):
