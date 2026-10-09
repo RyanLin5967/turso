@@ -672,6 +672,75 @@ def self_test():
             shutil.rmtree(d, ignore_errors=True)
     cases.append(("review 29: read_verdict refuses an unknown kind or verdict and an info row that PASSes or FAILs",
                   guarded(case_verdict_file_kinds)))
+    # review 5 MED 10: the artifact fallback compares EVERY C=1 arm it holds, per arm; an artifact arm the head lacks is
+    # a regression FAIL, a head arm the artifact lacks (a new arm) is info. MED 12: the artifact is refused unless it ran
+    # the same driver, profile script, sizes, image and valgrind as this run. MED 11: a base whose run failed is
+    # dropped, and everything is compared against the artifact.
+    ident = {"driver_sha": "d" * 40, "profile_sh": "p" * 40, "profile_ops": "200:20:100", "image": "20261004.327.1",
+             "valgrind": "valgrind-3.22.0"}
+    art2 = {"sha": art_sha, "cpu": "cpu-A", "identity": ident, "ir_create": 1000.0,
+            "create_syscalls_per_op": {"fsync": 1.0, "futex": 1.0, "pwrite64": 1.0},
+            "arms": {a: {"ir_create": 1000.0, "create_syscalls_per_op": {"fsync": 1.0, "futex": 1.0, "pwrite64": 1.0}}
+                     for a in ("full-snap-c1", "full-cat-c1")}}
+
+    def case_m10_every_arm():
+        cat = arm_of(trace(1), 10)
+        cat["strace"]["windows"]["create"]["syscalls_per_op"]["fstat"] = 1.0
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": cat}, None, budget, art2, cpu="cpu-A",
+                     identity=ident)
+        r = by_id(rows).get("syscalls-vs-base/full-cat-c1")
+        return r is not None and r[3] == "FAIL" and r[4] == "regression" and "fstat" in r[2] and not regression_green(rows)
+    cases.append(("MED 10: no in-job base, an artifact holding full-snap-c1 and full-cat-c1: a new syscall on full-cat-c1 "
+                  "FAILs regression-kind against it, regression_green false", guarded(case_m10_every_arm)))
+
+    def case_m10_head_lost_arm():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art2, cpu="cpu-A", identity=ident)
+        r = by_id(rows).get("syscalls-vs-base/full-cat-c1")
+        return r is not None and r[3] == "FAIL" and r[4] == "regression" and not regression_green(rows)
+    cases.append(("MED 10: an artifact arm the head no longer runs (full-cat-c1) FAILs regression-kind",
+                  guarded(case_m10_head_lost_arm)))
+
+    def case_m10_new_arm():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": arm_of(trace(1), 10),
+                      "off-snap-c1": arm_of(trace(1), 10)}, None,
+                     dict(budget, classes=dict(budget["classes"], off=budget["classes"]["full"])), art2, cpu="cpu-A",
+                     identity=ident)
+        r = by_id(rows).get("syscalls-vs-base/off-snap-c1")
+        return r is not None and r[3] == "NOT-RUN" and r[4] == "info"
+    cases.append(("MED 10: a head arm the artifact does not hold (a new arm) is info NOT-RUN",
+                  guarded(case_m10_new_arm)))
+
+    def case_m12_other_driver():
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, art2, cpu="cpu-A",
+                     identity=dict(ident, driver_sha="e" * 40))
+        r = by_id(rows)
+        sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
+        return (sv is not None and sv[3] == "FAIL" and "driver_sha" in sv[2]
+                and ins is not None and ins[3] == "FAIL" and "driver_sha" in ins[2])
+    cases.append(("MED 12: an artifact whose driver_sha differs from the head's is refused on both regression rows",
+                  guarded(case_m12_other_driver)))
+
+    def case_m12_no_identity():
+        a = {k: x for k, x in art2.items() if k != "identity"}
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, a, cpu="cpu-A", identity=ident)
+        r = by_id(rows)
+        return r["syscalls-vs-base/full-snap-c1"][3] == "FAIL" and r["instructions/create"][3] == "FAIL"
+    cases.append(("MED 12: an artifact that records no identity is refused on both regression rows",
+                  guarded(case_m12_no_identity)))
+
+    def case_m11_failed_base_dropped():
+        partial = arm_of(trace(1), 10)
+        del partial["strace"]
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": partial}, budget, art2, cpu="cpu-A",
+                     identity=ident, base_ok=False)
+        r = by_id(rows)
+        sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
+        return (sv is not None and sv[3] == "PASS" and f"baseline artifact of {art_sha}" in sv[1]
+                and ins is not None and ins[3] == "PASS" and f"baseline artifact of {art_sha}" in ins[1]
+                and regression_green(rows) and any(x[0] == "base/run" and x[4] == "info" for x in rows))
+    cases.append(("MED 11: a base whose run failed is dropped: a partial base, the artifact on cpu-A: both premises "
+                  "compare against the artifact and PASS, regression_green true, an info row names the dropped base",
+                  guarded(case_m11_failed_base_dropped)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
