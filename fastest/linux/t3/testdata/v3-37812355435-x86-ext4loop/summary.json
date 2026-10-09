@@ -127,8 +127,7 @@
   "ow64k",
   "ow1m",
   "clone2b",
-  "cfr2b",
-  "fdatasync4k"
+  "cfr2b"
  ],
  "arms_gated_run": [
   "append25",
@@ -227,7 +226,6 @@
  "exe_sha256": "47025d72f07965ea543c98f1443d0a497595fd46ba4fdaae67ba561e452475aa",
  "floor_claim": "per stack: a clean fsync (a bare flush) plus the measured delta, only where the device flush record shows the clean arm issuing a flush per op (floor_claim_from_counts); never 'one drive flush' without that count; on a virtual drive: reach to media unknown",
  "floor_claim_from_counts": "clean fsync (a bare flush: a bare flush request at the leaf in 200 of 200 clean windows) plus the measured delta, per stack; a virtual drive: reach to media unknown",
- "floor_frame_variant": "no frame arm registered",
  "floor_kind": "virtual drive flush: reach to media unknown",
  "floor_reference": {
   "arm": "fdatasync4k",
@@ -262,7 +260,7 @@
    "timing_gated": false
   },
   "fdatasync4k": {
-   "gated": true,
+   "gated": false,
    "pass": true,
    "ratio": 67.3,
    "timing_gated": false
@@ -488,7 +486,6 @@
   "append25"
  ],
  "trace_clock": 0,
- "traced": false,
  "uname": "Linux 6.17.0-1022-azure x86_64",
  "virtualization": {
   "basis": "4 piece(s) of VM evidence",

@@ -54,7 +54,7 @@ jobs:
           - {block: brd, plant: ""}
           - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
           - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID (block 1): &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
-          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose||V3L VOID (block 1): &&disagrees with the drive's own report"}
+          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose"}
     env:
       PLANT: ${{ matrix.plant }}
       EXPECT: ${{ matrix.expect }}
@@ -72,8 +72,9 @@ jobs:
                 ${PLANT:+--plant "$PLANT"} --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}" || rc=$?
           echo "one-command wall seconds: $(( $(date +%s) - start )) rc=$rc block=${{ matrix.block }} plant=${PLANT:-none}" | tee "$HOME/t3-wall.txt"
           echo "$rc" > "$HOME/t3-rc.txt"
-          # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason
-          if [ -n "$PLANT" ]; then [ "$rc" = 1 ]; else exit $rc; fi
+          # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason. A draw the plant
+          # cannot reach (plant-notrun.txt) runs unplanted, and the Summary step requires every block to pass
+          if [ -n "$PLANT" ]; then [ "$rc" = 1 ] || [ -f "$HOME/t3-out/plant-notrun.txt" ]; else exit $rc; fi
       - name: Summary
         if: always()
         run: |
@@ -98,6 +99,13 @@ jobs:
                    "v3l": b.get("v3l", {}).get("published"),
                    "v3l_verdict": b.get("v3l", {}).get("verdict")}))
           plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
+          notrun = os.path.join(os.path.dirname(sys.argv[1]), "plant-notrun.txt")
+          if plant and os.path.exists(notrun):
+              # a draw the plant cannot reach (v3l-cache-lie on a write-through drive: T3 runner review item 10) is
+              # NOT-RUN, said so, and passes only if every block then passed with nothing planted
+              print("PLANT", plant, open(notrun).read().strip())
+              blocks = s.get("blocks") or []
+              sys.exit(0 if blocks and all(b.get("ok") for b in blocks) and not s["failed_stages"] else 1)
           if plant:
               # the plant must be the reason, at the first block; the second block must pass (review H1)
               blocks = s.get("blocks") or [{}]
@@ -114,8 +122,9 @@ jobs:
               ok = all(checks.values())
               print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
               sys.exit(0 if ok else 1)
-          sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or s.get("failed_blocks")
-                         or s.get("parity_refusals") or s.get("normaliser_missing") or not s["planned_runs"]) else 0)
+          # summarize's own verdict, not a hand copy of its terms (fourth lane review LOW 23)
+          print("summarize ok:", s.get("ok"), "fixture_refusals", s.get("fixture_refusals"))
+          sys.exit(0 if s.get("ok") is True else 1)
           PY
       - name: Upload the package
         if: always()
