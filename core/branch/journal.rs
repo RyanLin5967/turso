@@ -5778,6 +5778,36 @@ mod format_tests {
         }
     }
 
+    /// Engine review 17 MED 4: an ORDERED end tag says the flight's slots were barriered ahead of
+    /// its records, so open skips the last flight's slot check for it. A flight that carries no
+    /// arena handle (a fuzzy checkpoint's `settle_arena` took the dirty mark and only plain-fsynced
+    /// the slot, which on Apple orders nothing) has not barriered the slots its records name, yet
+    /// was tagged ordered. It is tagged as a synced flight instead, slot-checked at open; a flight
+    /// naming no slot keeps the ordered tag. Mutant `ordered_tag_without_barrier`.
+    #[test]
+    fn an_ordered_flight_without_an_arena_barrier_over_named_slots_is_not_tagged_ordered() {
+        for (names_slots, ordered_tag) in [(true, false), (false, true)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+            let mut arena = Arena::new(512);
+            if names_slots {
+                journal.buffer(&Record::TrunkRetain { page: 2, born: 0, died: 1, slot: 7, crc: 0 }).unwrap();
+            } else {
+                journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+            }
+            let flight = journal.take_flight(&mut arena, SyncClass::FullFsync, false).unwrap();
+            flight.ordered().write().unwrap();
+            let bytes = std::fs::read(&files.log).unwrap();
+            let kind = EndKind::from_tag(bytes[bytes.len() - END_PAYLOAD_LEN]).expect("premise: the log ends with an end frame");
+            assert_eq!(
+                kind.ordered(),
+                ordered_tag,
+                "names_slots={names_slots}: an ordered flight with no arena barrier was tagged {kind:?}"
+            );
+        }
+    }
+
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
     /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
     /// stays synced only when the rewrite syncs too.
