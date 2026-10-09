@@ -487,6 +487,59 @@ def self_test():
                 and ins is not None and ins[3] == "PASS" and "base built in this job" in ins[1] and regression_green(rows))
     cases.append(("review 7b: an in-job base outranks the artifact (a different-cpu artifact is never consulted)",
                   guarded(case_injob_outranks)))
+
+    # review 28: the budget job (yml:224) went green on ANY arm's PASS, even when the budget-syscalls/full-snap-c1 row,
+    # the one the absolute budget binds to, was absent. Its verdict is budget_verdict(), read from verdict.tsv.
+    def case_budget_needs_baseline_arm():
+        ok, why = budget_verdict(gates({"full-cat-c1": arm_of(trace(1), 10)}, None, budget, None))
+        ok2, _ = budget_verdict(gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None))
+        ok3, _ = budget_verdict(gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": arm_of(trace(1), 10)},
+                                      None, budget, None))
+        return not ok and any("budget-syscalls/full-snap-c1" in w for w in why) and ok2 and ok3
+    cases.append(("review 28: the budget verdict refuses when budget-syscalls/full-snap-c1 is absent, even beside "
+                  "another arm's PASS, and passes with it present", guarded(case_budget_needs_baseline_arm)))
+
+    def case_budget_fails():
+        a, _ = budget_verdict(gates({"full-snap-c1": arm_of(trace(2), 20)}, None, budget, None))
+        b, why = budget_verdict(gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": arm_of(trace(2), 20)},
+                                      None, budget, None))
+        return not a and not b and any("budget-syscalls/full-cat-c1" in w for w in why)
+    cases.append(("review 28: a budget FAIL on full-snap-c1, or on any other arm beside its PASS, fails the verdict",
+                  guarded(case_budget_fails)))
+
+    def case_budget_unevaluated():
+        ok, why = budget_verdict(gates({"full-snap-c1": arm_of(trace(1), 10, clients=64)}, None, budget, None))
+        return not ok and any("budget-syscalls/full-snap-c1" in w for w in why)
+    cases.append(("review 28: a budget-syscalls/full-snap-c1 row that is not PASS or FAIL (INFO) is refused",
+                  guarded(case_budget_unevaluated)))
+
+    def case_verdict_file():
+        import shutil
+        import tempfile
+
+        def raises(fn):
+            try:
+                fn()
+            except (OSError, ValueError):
+                return True
+            return False
+        d = tempfile.mkdtemp(prefix="analyze-selftest-")
+        try:
+            rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, None)
+            p = os.path.join(d, "verdict.tsv")
+            write_verdict(p, rows)
+            same = [tuple(r) for r in read_verdict(p)] == [tuple(r) for r in rows]
+            tab = raises(lambda: write_verdict(os.path.join(d, "tab.tsv"), [rows[0][:2] + ("a\tb",) + rows[0][3:]]))
+            open(p, "w").write("")
+            empty = raises(lambda: read_verdict(p))
+            open(p, "w").write("budget-syscalls/full-snap-c1\t<= 3 syscalls per create\tPASS\n")
+            short = raises(lambda: read_verdict(p))
+            missing = raises(lambda: read_verdict(os.path.join(d, "absent.tsv")))
+            return same and tab and empty and short and missing
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    cases.append(("review 28: verdict.tsv round-trips through write_verdict/read_verdict; a tab inside a field, an empty "
+                  "or missing file, and a short line are refused", guarded(case_verdict_file)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
