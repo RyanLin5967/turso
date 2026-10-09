@@ -361,9 +361,11 @@ pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
 /// (`typed_operand_compatible`: a literal, through its parentheses and sign, or a CAST to a
 /// compatible type), or a bound parameter, whose value's type is known only when it runs
 /// (fastest-wire, wire review 2 item 3: a parameter got the plain comparison, so `code = $1` from
-/// every extended-protocol client missed what the literal finds). Anything else, a function call,
-/// a concatenation, a COLLATE operand, takes the plain comparison, as an incompatible literal does
-/// (engine review 16 MED 10: 2fa04254c passed every constant unchecked, so `v = ('abc')` raised in
+/// every extended-protocol client missed what the literal finds). A type whose input is `any`
+/// (numeric) takes any constant but a COLLATE one: there is no type to check. Anything else, a
+/// function call, a concatenation, a COLLATE operand, takes the plain comparison, as an
+/// incompatible literal does (engine review 16 MED 10: 2fa04254c passed every constant
+/// unchecked, so `v = ('abc')` raised in
 /// the operator where `v = 'abc'` compared plainly, and a COLLATE was dropped). Mutant
 /// `param_skips_type_operator` (test builds only): a parameter is not one, as before 6b. Mutant
 /// `operand_any_constant` (test builds only): any constant is one, as 2fa04254c had it.
@@ -372,6 +374,9 @@ fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resol
         return !crate::branch::store::fe_mutant("param_skips_type_operator");
     }
     typed_operand_compatible(expr, value_input_type)
+        || (value_input_type.eq_ignore_ascii_case("any")
+            && !matches!(expr, ast::Expr::Literal(_) | ast::Expr::Collate(..))
+            && expr.is_constant(resolver))
         || (crate::branch::store::fe_mutant("operand_any_constant")
             && !matches!(expr, ast::Expr::Literal(_))
             && expr.is_constant(resolver))
