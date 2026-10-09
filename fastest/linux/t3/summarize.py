@@ -30,6 +30,8 @@ settle (taken before it started) did not go quiet, fails (unquiet_runs; fourth l
 Exit 1 if any planned run is not complete, any block is not OK or never ran (fslist.txt names every block), a
 stage failed, a parity check failed, a run is unsettled, or nothing was planned: a run that collected nothing has
 not passed.
+PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-v1-FINAL-CANDIDATE.md, the text the
+rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 """
 import glob
 import hashlib
@@ -111,17 +113,17 @@ def block_record(out, fs, plp="no"):
     # review LOW 11: a stored all_fired is not trusted); the two must agree.
     pl = os.path.join(fsdir, "blockgate-plants.json")
     try:
-        rec["a14_plants"] = json.load(open(pl))
+        rec["a16_plants"] = json.load(open(pl))
     except (OSError, ValueError) as e:
-        rec["a14_plants"] = None
+        rec["a16_plants"] = None
         if rec["v3"].get("before", {}).get("ok"):
             rec["why"].append(f"A16 plants: no record ({type(e).__name__})")
-    if rec["a14_plants"] is not None:
+    if rec["a16_plants"] is not None:
         sj, raw = blockgate.load(os.path.join(fsdir, "v3-before"))
         again, ok_again = blockgate.plants(sj, raw, rcs.get("before", 0), plp, os.path.join(fsdir, "v3-before"))
         fired = {p["plant"]: p["fired"] for p in again}
-        rec["a14_plants_rederived"] = fired
-        if not ok_again or not rec["a14_plants"].get("all_fired"):
+        rec["a16_plants_rederived"] = fired
+        if not ok_again or not rec["a16_plants"].get("all_fired"):
             rec["why"].append(f"A16 plants: not every plant was decided as planted (re-derived {fired})")
     # V3L at every block boundary (gate-6 review 9): b0 before block 1, bK after block K. The plan names the blocks.
     plan = os.path.join(fsdir, "plan.tsv")
@@ -637,7 +639,7 @@ def self_test():
         ("MED 2: a drift record that disagrees with the batches' own append25 p50s fails the block",
          {"a25_after": 400.0, "drift_json_us": 0.0}, False, lambda s: "V3 drift: append25 0.0" in s["failed_blocks"][0]),
         ("MED 6: a bound batch's plants are re-derived with its directory: wt-tampered fires",
-         {"bound": True}, True, lambda s: s["blocks"][0]["a14_plants_rederived"].get("wt-tampered") is True),
+         {"bound": True}, True, lambda s: s["blocks"][0]["a16_plants_rederived"].get("wt-tampered") is True),
         ("HIGH 4 (fixture parity): ours recording no fixture fails", {"ours_fixture": None}, False,
          lambda s: any("no fixture record" in x for x in s["fixture_refusals"])),
         ("HIGH 4: ours whose fixture differs from its plan row (live 10 vs 20) fails",

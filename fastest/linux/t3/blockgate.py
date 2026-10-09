@@ -21,8 +21,10 @@ Every class first:
     control FAILed (a foreign writer: nosync25 p50 >= 50 us), or batchgate.post recorded a void in
     flush_gate.voids (the flush gate, a write-back layer's window with no flush-carrying request, a gated window
     with no fsync by the probe). rc 3 with no void recorded FAILs; so does rc 0 with one. The D0 control must read
-    "pass". (Fail closed: PREREG :177 gives the D0 void to T1 and V3 review 2 item 6 kept it off T3, but the probe
-    now evaluates it on every batch, and a foreign writer on the leaf also inflates the flush counter below.)
+    "pass". Annex A20 (the lead's ruling): on T3 a D0 foreign-writer void FAILS the block, because a foreign writer
+    on the leaf also inflates the flush counter A16 relies on. A11's "brd VOID recorded" is narrowed by the same
+    change: the probe has not voided brd on timing since c225124ae, so every brd void is a real one (annex row for
+    A11 owed by the lead; fourth lane review LOW 18).
   - the probe's timing control must read what A14 gives the class: "pass" (write back, no PLP), "not applicable:
     PLP" (write back, --plp yes), "not applicable: no volatile cache" (write through), "not applicable: brd".
 A16 (annex row, 2026-10-08) makes A14's counter gate conditional on the cross-checked write-cache state:
@@ -63,6 +65,8 @@ On an unbound (smoke, brd) batch the plant base assumes the app-sync evidence, s
 a brd record the base is first made a drive (write through, drive agreeing, its timing control as for that class).
 The branch the real drive is not on is reached by setting both kernel and drive to that state (and the timing
 control to that class's); the counts stay the record's own except the one planted field.
+PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-v1-FINAL-CANDIDATE.md, the text the
+rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 """
 import copy
 import hashlib

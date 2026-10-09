@@ -63,6 +63,8 @@
 # every target mounts with barriers.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
 # system (competitors/timedrun.py rule at the 1800 s cap, OPS:S:MAX_S) goes to fastest_profile and run_system.sh alike.
+# PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-v1-FINAL-CANDIDATE.md, the text the
+# rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
