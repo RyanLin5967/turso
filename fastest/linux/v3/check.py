@@ -1258,6 +1258,26 @@ def self_test():
         got = wcp(a0, b1, devs) if wcp else ["(no write_cache_problems in stamp.py)"]
         ok = (got == []) if want is None else (bool(got) and all(want in x for x in got))
         chk("stamp write cache (ninth review L12): %s -> %s" % (name, "no problem" if want is None else want), ok, got)
+    # V3 review 12 item 5: P_nest_modes' n1 image against the CELL's own directory, which firecheck derives from the
+    # work dir's mount (a /dev/loop source: its backing file's directory; otherwise the mount target), both sides
+    # canonical: a loop cell's '/' must give /v3fx-n1.img (the raw '//v3fx-n1.img' compare was a false red on 6/6
+    # loop cells), and an f_nest that ignores V3_NEST_DIR must fail on a block cell (the old check read the dir back
+    # from the n1 it judged, so it could not)
+    nnp = globals().get("nest_n1_problems")
+    for name, cdir, first, rebuilt, ok in (
+            ("a loop cell, dir '/': n1 /v3fx-n1.img both builds", "/", "/v3fx-n1.img", "/v3fx-n1.img", True),
+            ("a block cell: n1 on the cell's filesystem both builds", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
+            ("a cell dir with a trailing slash and a '..'", "/mnt/a/../fastest-v3-xfs/", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
+            ("a block cell whose f_nest ignored V3_NEST_DIR (n1 at /)", "/mnt/fastest-v3-xfs", "/v3fx-n1.img", "/v3fx-n1.img",
+             False),
+            ("a block cell whose rebuild ignored V3_NEST_DIR", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/v3fx-n1.img", False),
+            ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
+            ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
+        got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
+        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
     # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are) and a losetup that fails (which must
