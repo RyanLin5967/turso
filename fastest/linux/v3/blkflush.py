@@ -641,6 +641,17 @@ def self_test():
     swc = sync_windows(ce[0], cw, 99)
     chk("sync windows: clean's fast fsync straddling into an append25 window with no sync -> append25 still lacks one",
         (swc.get("append25") or {}).get("windows_without_a_sync") == 1, swc)
+    # run 37845193906 (the later-window rule of d455aa885): clone2b's SECOND fsync, returning within 0.5 us of its
+    # window's end, overlapped the following nosync25 window and was given to it ("nosync25's windows hold a sync").
+    # Windows here: clone2b 1.000-1.0999 ms holding its first fsync wholly inside and its second at its very end, then
+    # nosync25 from 1.10002 ms: nosync25 must hold none, clone2b both
+    c2w = [(1000000, 1099990, "clone2b", 0), (1100010, 1103000, "nosync25", 0)]
+    c2e, _ = parse_trace_all(HDR % (2, 2) + "\n".join([sev("v3floor", 99, "0.001050"), sev("v3floor", 99, "0.001100")]) + "\n",
+                             devs)[1:], None
+    swn = sync_windows(c2e[0], c2w, 99)
+    chk("sync windows: clone2b's second fsync at its window's end beside a nosync25 window -> nosync25 holds none, "
+        "clone2b two (run 37845193906)",
+        (swn.get("nosync25") or {}).get("syncs") == 0 and (swn.get("clone2b") or {}).get("syncs") == 2, swn)
     chk("sync windows: pid 99 synced in w0 (2 syncs) and in no other window; another pid's fsync in w2 does not count",
         sw.get("append25") == {"ops": 2, "syncs": 2, "windows_without_a_sync": 1, "ambiguous": 0}
         and sw.get("nosync25", {}).get("windows_without_a_sync") == 1, sw)
