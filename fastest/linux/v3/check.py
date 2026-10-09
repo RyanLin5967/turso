@@ -1920,7 +1920,10 @@ def main(argv):
     at = rd(os.path.join(nm, "after_teardown.txt"))
     ar = rd(os.path.join(nm, "after_rebuild.txt"))
     rb1 = (rd(os.path.join(nm, "rebuilt_n1_backing.txt")) or "").strip()
-    wb1 = (rd(os.path.join(nm, "want_n1_backing.txt")) or "MISSING").strip()
+    # V3 review 12 item 5: both builds' n1 image against the cell's own directory (firecheck derives it from the work
+    # dir's mount, independently of the n1 it judges)
+    n1p = nest_n1_problems((rd(os.path.join(nm, "cell_nest_dir.txt")) or "").strip(),
+                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1)
     ast = rd(os.path.join(nm, "after_stray.txt"))
     # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
     # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
@@ -1931,14 +1934,14 @@ def main(argv):
           and plant_ok
           and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
           and sorted(ar.split("\n")[:-1]) == ["n%d mounted ok" % k for k in (1, 2, 3, 4)]
-          and rb1 == wb1  # tenth review MED 1: the rebuilt n1's image is the nest dir's
+          and not n1p  # tenth review MED 1, review 12 item 5: n1 on the cell's own filesystem, both builds
           and rc_of(os.path.join(nm, "probe.rc")) in (0, 3) and pj.get("layers") == 4 and pj.get("loop_layers") == 3
           # tenth review MED 2: a stray loop on n1, never mounted, is detached by the teardown, which leaves no loop on
           # the chain and nothing mounted
           and bool((rd(os.path.join(nm, "stray.dev")) or "").strip()) and rc_of(os.path.join(nm, "stray_teardown.rc")) == 0
           and ast is not None and ast.strip() == "",
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
-           "rebuilt_n1_backing": rb1, "want_n1_backing": wb1, "after_stray": ast,
+           "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
            "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
@@ -2459,6 +2462,26 @@ def check_real(o3, rc, kv, leaf):
 
 FRAME_VARIANT = {None: "no frame arm registered", "ow4k": "fdatasync4k (ow4k + fdatasync)"}
 FRAME_VARIANT_NONE = "none in this probe: the registered frame arm has no fdatasync variant arm (A18 needs one)"
+
+
+def canon_path(p):
+    """A path made canonical lexically, as `readlink -m` makes one that does not exist: runs of '/' collapsed (POSIX
+    normpath keeps a leading '//'), '.' and '..' resolved; '' stays ''."""
+    p = re.sub(r"/+", "/", (p or "").strip())
+    return os.path.normpath(p) if p else ""
+
+
+def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
+    """V3 review 12 item 5: P_nest_modes' n1 image, first built and rebuilt, against the CELL's own directory, which
+    firecheck derives from the work dir's mount (a /dev/loop source: its backing file's directory; else the mount
+    target), never from the n1 under test (the old check read the directory back from it, so an f_nest that ignored
+    V3_NEST_DIR passed, and a loop cell's '//v3fx-n1.img' was a false red). [] when both are cell_dir/v3fx-n1.img."""
+    cd = canon_path(cell_dir)
+    if not cd.startswith("/"):
+        return ["no cell directory was derived (%r)" % (cell_dir,)]
+    want = canon_path(cd + "/v3fx-n1.img")
+    return ["the %s n1 image is %r, not the cell's %s" % (what, got, want)
+            for what, got in (("first-built", first_n1), ("rebuilt", rebuilt_n1)) if canon_path(got) != want]
 
 
 def f1b_window_syncs(text):

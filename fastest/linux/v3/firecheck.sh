@@ -723,14 +723,25 @@ NM=$OUT/F4/P_nest_modes
 mkdir -p "$NM"
 if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
-  echo "$nd" > "$NM/nest_dir"
+  echo "$nd" > "$NM/nest_dir"  # information only: read back from the n1 under test, so it judges nothing
+  # V3 review 12 item 5: the CELL's own directory for n1, derived here from the work dir's mount, never from the n1
+  # under test: a /dev/loop source's backing file's directory, otherwise the mount target; canonical (readlink -m)
+  wsrc=$(findmnt -n -o SOURCE -T "$W" | tail -1)
+  case $wsrc in
+    /dev/loop*) cdir=$(dirname "$(losetup -n -O BACK-FILE "$wsrc" | xargs)") ;;
+    *) cdir=$(findmnt -n -o TARGET -T "$W" | tail -1) ;;
+  esac
+  cdir=$(readlink -m "$cdir")
+  echo "$cdir" > "$NM/cell_nest_dir.txt"
+  first1=$(readlink -m "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
+  echo "$first1" > "$NM/first_n1_backing.txt"
   # the loops still backed by a file of the chain, judged against a list derived HERE, not by the shared matcher
   # (V3 review 12 item 1: a matcher copied verbatim cannot catch its own error): n1's image as built, and the level
   # images $FX/n1..n3/x.img, each " (deleted)" or not; a losetup that fails is reported, never "nothing attached"
   FXC=$(readlink -m "$FX")
   chainloops() {
     local l w1
-    w1=$(readlink -m "$nd/v3fx-n1.img")
+    w1=$first1
     l=$(loop_list) || { echo "losetup --list failed: the loops cannot be listed"; return 0; }
     [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, ""); p = $0
       sub(/ \(deleted\)$/, "", p)
@@ -750,11 +761,11 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   sudo umount "$FX/nbplant" 2>/dev/null; [ -n "$pl" ] && sudo losetup -d "$pl" 2>/dev/null; sudo rm -f "$FX/nb/teardown-plant.img"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
     [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops | sed 's/^/loop still attached: /'; } > "$NM/after_teardown.txt"
-  timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$nd" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
+  timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$cdir" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && [ -f "$FX/n$k.ok" ] && echo "n$k mounted ok"; done; } > "$NM/after_rebuild.txt"
   # the rebuilt n1's image is on the nest dir given, not anywhere else (tenth review MED 1)
-  losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" 2>/dev/null | xargs > "$NM/rebuilt_n1_backing.txt"
-  echo "$nd/v3fx-n1.img" > "$NM/want_n1_backing.txt"
+  rb=$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" 2>/dev/null | xargs)
+  if [ -n "$rb" ]; then readlink -m "$rb"; fi > "$NM/rebuilt_n1_backing.txt"
   timeout 300 "$V3" --dir "$FX/n3/w" --out "$NM/probe.out" --n 5 --arms append25,nosync25 > "$NM/probe.txt" 2>&1; echo $? > "$NM/probe.rc"
   # tenth review MED 2's plant: a loop attached to a file on n1 and never mounted; --teardown-nest must detach it and
   # leave no loop backed by the chain
