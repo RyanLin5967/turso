@@ -2782,11 +2782,13 @@ impl ExtendedQueryHandler for Session {
         check_bind(&message).map_err(PgWireError::UserError)?;
         // A statement's parameter count, where it is known from the text, is checked here, as
         // PostgreSQL checks every statement's at Bind: a branch call's (its $n), and that of a
-        // statement the server answers without the engine (CHECKPOINT, a transaction verb), which
-        // has none but those Parse declared. Neither was checked, so two values for
-        // turso_branch_create($1) created the branch (wire review 10 item 5) and a value for
-        // CHECKPOINT or BEGIN ran it (wire review 12 item 2). An engine statement's count is known
-        // once it is prepared, and is checked at Execute (E5-QUEUE R2).
+        // statement with no `$n`, a CHECKPOINT or a transaction verb, which has none but those
+        // Parse declared (each with a type: 42P18 for one declared unspecified). Neither was
+        // checked, so two values for turso_branch_create($1) created the branch (wire review 10
+        // item 5), a value for CHECKPOINT or BEGIN ran it (wire review 12 item 2), and a SET
+        // with a value was performed by the prepare before Execute's check refused it (wire review
+        // 14 item 4). A statement with a `$n` has its count from its parse, checked at Execute
+        // (E5-QUEUE R2).
         let sql = &statement.statement.sql;
         let required = if let Some(call) = &statement.statement.call {
             Some(
@@ -2794,14 +2796,25 @@ impl ExtendedQueryHandler for Session {
                     .map_err(PgWireError::UserError)?
                     .len(),
             )
-        } else if TxVerb::of(sql) != TxVerb::Other || is_checkpoint(sql) {
-            Some(statement.parameter_types.len())
+        } else if !sql.contains('$') || TxVerb::of(sql) != TxVerb::Other || is_checkpoint(sql) {
+            Some(
+                parameter_types(&StatementTypes::default(), &statement.parameter_types)
+                    .map_err(PgWireError::UserError)?
+                    .len(),
+            )
         } else {
             None
         };
         if let Some(required) = required {
             check_bind_arity(message.parameters.len(), &statement.id, required)
                 .map_err(PgWireError::UserError)?;
+        }
+        // In a failed block only a block exit with no values may be bound, as PostgreSQL's
+        // exec_bind_message refuses the rest (25P02); a ROLLBACK with a value was run, ending the
+        // block (wire review 14 item 4).
+        if self.state().aborted && (!TxVerb::of(sql).ends_block() || !message.parameters.is_empty())
+        {
+            return Err(PgWireError::UserError(aborted_error()));
         }
         let portal = Portal::try_new(&message, statement)?;
         if portal.name != DEFAULT_NAME {
