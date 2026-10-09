@@ -1181,6 +1181,46 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
     }
 }
 
+/// Review 2 L6's cell (`first_create`): per round, a fresh small database forked once
+/// (`first_fresh`: this create creates the store's catalog) and, as the reference, one whose catalog
+/// a throwaway branch created before a reopen (`first_reopened`, the schema-window bootstrap: the same
+/// first-child path, no catalog to make). Per create, on the creating thread: the SQL-layer counters
+/// (`wal_locks` counts every write transaction, the trunk's and the catalog's; `held_prepares` the
+/// statements compiled under a store mutex), and the process's flushes (reported).
+fn first_create(cell: &str, out: &mut String) {
+    for i in 0..SCHEMA_ROUNDS {
+        for op in ["first_fresh", "first_reopened"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("first-create.db");
+            let db = if op == "first_reopened" {
+                let built = {
+                    let db = open_at(&path);
+                    let trunk = db.connect().unwrap();
+                    seed(&trunk, false);
+                    trunk.create_branch("boot").unwrap();
+                    db.drop_branch("boot").unwrap();
+                    db.incarnation
+                };
+                let db = open_at(&path);
+                assert_ne!(db.incarnation, built, "{cell}: {op}: premise: the registry returned the old Database, not a reopen");
+                db
+            } else {
+                let db = open_at(&path);
+                seed(&db.connect().unwrap(), false);
+                db
+            };
+            let trunk = db.connect().unwrap();
+            let (c0, f0) = (probe::sql_counts(), sync_counts());
+            trunk.create_branch("m-0000").unwrap();
+            let (c1, f1) = (probe::sql_counts(), sync_counts());
+            let mut s = sql_sample(&c0, &c1);
+            s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
+            s.insert("fsync", f1.fsync - f0.fsync);
+            line(out, cell, op, i, &s);
+        }
+    }
+}
+
 /// The first-connect keys of a schema-window sample (`sql_sample`'s, prefixed).
 const CONNECT_KEYS: [&str; 4] = ["connect_prepares", "connect_page_reads", "connect_schema_rows", "connect_wal_locks"];
 
@@ -1532,6 +1572,8 @@ fn budget_child() {
         open_flush(&spec, &mut text);
     } else if let Some(&(_, tables)) = SCHEMA_TABLES.iter().find(|(c, _)| *c == spec) {
         schema_window(&spec, tables, &mut text);
+    } else if spec == "first_create" {
+        first_create(&spec, &mut text);
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
@@ -2903,7 +2945,16 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
     if d > 3 {
         let _ = writeln!(failures, "  syscalls: written - reference reached {d} in a round; budget <= 3 (the landing's wake, one pwrite, one wait)");
     }
-    assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
+    // Review 2 L14: the held per-op cells leave the word out, so the figure to quote for one idle-tail
+    // create against PostgreSQL 18 is the written window's own total, word included.
+    let total = |k: &str| {
+        let v: Vec<u64> = pairs.iter().map(|(w, _)| w[k]).collect();
+        (*v.iter().min().unwrap(), *v.iter().max().unwrap())
+    };
+    let ((s0, s1), (f0, f1), (p0, p1)) = (total("syscalls"), total("full_fsync"), total("fsync"));
+    let quote = format!("an idle-tail create, word included: {s0}..{s1} syscalls, {f0}..{f1} F_FULLFSYNC, {p0}..{p1} fsync over {} quiet rounds", pairs.len());
+    println!("{quote}");
+    assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}({quote})");
 }
 
 /// Review 2 H2 (an engine SHAVE, filed by the lead): an idle-tail create whose flight lands with no
@@ -3112,6 +3163,99 @@ fn a_schema_window_adds_nothing_under_the_wal_write_lock() {
         let _ = writeln!(failures, "  first_control under the WAL write lock (page reads, prepares, schema rows): {:?} at {}, {:?} at {}; budget equal", (a.1, a.2, a.3), a.0, (b.1, b.2, b.3), b.0);
     }
     assert!(failures.is_empty(), "the schema window under the WAL write lock [engine 2b]:\n{failures}");
+}
+
+/// Review 2 L5: the schema re-read's allocations, budgeted by their slope in tables. On each path the
+/// window's extra bytes over its control (the create's and the child's first connection's, each on
+/// its own thread) per table at 10^3 tables may exceed the per-table extra at 10 tables by at most
+/// 64 B. A cost linear in tables with a fixed part meets this (the fixed part only raises the
+/// 10-table figure); one that grows faster than the tables does not (a schema copied once per parsed
+/// row costs about tables/2 copies per table). Read generously: the 10^3 cell's smallest extra (its
+/// window's least minus its control's most) against the 10 cell's largest. Mutant
+/// `schema_parse_quadratic`. WRITTEN NOT RUN.
+#[test]
+fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let [(small, n_small), (large, n_large)] = SCHEMA_TABLES;
+    let (cs, cl) = (cell(small), cell(large));
+    let (cs, cl) = (&*cs, &*cl);
+    let bytes = |c: &CellData, op: &str| -> Vec<u64> {
+        schema_samples(c, op).into_iter().map(|s| s["alloc_bytes"] + s["connect_alloc_bytes"]).collect()
+    };
+    for path in ["first", "lockfree"] {
+        let (op, control) = (format!("{path}_window"), format!("{path}_control"));
+        for c in [cs, cl] {
+            schema_premises(c, &op, &mut failures);
+            schema_premises(c, &control, &mut failures);
+        }
+        let hi_small = bytes(cs, op.as_str()).into_iter().max().unwrap().saturating_sub(bytes(cs, control.as_str()).into_iter().min().unwrap());
+        let lo_large = bytes(cl, op.as_str()).into_iter().min().unwrap().saturating_sub(bytes(cl, control.as_str()).into_iter().max().unwrap());
+        // Per table, in integers: lo_large / n_large <= hi_small / n_small + 64.
+        if lo_large * n_small > (hi_small + 64 * n_small) * n_large {
+            let _ = writeln!(
+                failures,
+                "  {path}: the window's extra bytes per table: at least {} at {n_large} tables against at most {} at {n_small}; budget <= the {n_small}-table figure + 64 B",
+                lo_large / n_large,
+                hi_small / n_small
+            );
+        }
+    }
+    assert!(failures.is_empty(), "the schema re-read's allocations grow faster than the tables [engine 2b, review 2 L5]:\n{failures}");
+}
+
+/// Review 2 L6 (an engine FIX, one-time per database): a store's first create creates its catalog,
+/// under the store mutex: `Catalog::open` runs 13 `CREATE ... IF NOT EXISTS` statements, each its
+/// own commit, sets 2 pragmas and prepares 42 statements, then the meta row commits in a transaction
+/// of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
+/// first child, so both take the trunk's WAL write lock once):
+/// * the catalog is created in ONE commit: the fresh create's write transactions exceed the
+///   reference's by at most 1 (the schema and the meta row together; today 13 + 1);
+/// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
+///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
+///   prepared before the mutex is taken, or at the open).
+/// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
+/// RED today. The review's split-transaction mutant is today's code, so this red at base is its
+/// kill; once the FIX lands, mutant `catalog_schema_split` splits the transaction again (registered
+/// against the fixed code). WRITTEN NOT RUN.
+#[test]
+fn a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex() {
+    if in_child() {
+        return;
+    }
+    let c = cell("first_create");
+    let mut failures = String::new();
+    let fresh = schema_samples(&c, "first_fresh");
+    let reference = schema_samples(&c, "first_reopened");
+    for (i, s) in reference.iter().enumerate() {
+        if s["wal_locks"] != 1 {
+            let _ = writeln!(failures, "  first_reopened #{i}: wal_locks {}; premise: exactly 1 (the trunk's first child, no catalog write)", s["wal_locks"]);
+        }
+    }
+    let most = |v: &[&Map], k: &str| v.iter().map(|s| s[k]).max().unwrap();
+    let least = |v: &[&Map], k: &str| v.iter().map(|s| s[k]).min().unwrap();
+    let commits = least(&fresh[..], "wal_locks").saturating_sub(most(&reference[..], "wal_locks"));
+    if commits > 1 {
+        let _ = writeln!(failures, "  the catalog's creation committed {commits} times (fresh {}..{} write transactions, reference {}..{}); budget <= 1", least(&fresh[..], "wal_locks"), most(&fresh[..], "wal_locks"), least(&reference[..], "wal_locks"), most(&reference[..], "wal_locks"));
+    }
+    let held = least(&fresh[..], "held_prepares").saturating_sub(most(&reference[..], "held_prepares"));
+    if held > 0 {
+        let _ = writeln!(failures, "  the catalog's creation compiled {held} statements under the store mutex; budget 0");
+    }
+    println!(
+        "first create: fresh {}..{} F_FULLFSYNC, {}..{} fsync; reopened {}..{} F_FULLFSYNC, {}..{} fsync",
+        least(&fresh[..], "full_fsync"),
+        most(&fresh[..], "full_fsync"),
+        least(&fresh[..], "fsync"),
+        most(&fresh[..], "fsync"),
+        least(&reference[..], "full_fsync"),
+        most(&reference[..], "full_fsync"),
+        least(&reference[..], "fsync"),
+        most(&reference[..], "fsync")
+    );
+    assert!(failures.is_empty(), "a first create's catalog [review 2 L6, engine FIX]:\n{failures}");
 }
 
 // ---- contention: C clients creating at once (the shared-flight cells, `SHARED_CS`) ----
