@@ -3235,6 +3235,69 @@ fn terminate_ends_the_session_and_frees_its_branch_first() {
         .ok("a delete right after the close, first try");
 }
 
+/// The connect form's close frees the branch at once, seen in time and not only in outcome: after
+/// a session that wrote on a branch sends Terminate and the server closes, the next create, a new
+/// session on the branch and the delete each answer within 500 ms, with the server's lock wait at
+/// 300 ms so that no wait can be absorbed by a retry. a_branch_session_that_wrote_closes_at_terminate
+/// bounds only the close: the claim and delete wait up to 5 s and a create retries for the lock
+/// wait (60 s by default), and a read that times out returns an empty reply that `.ok()` accepts,
+/// so the dry run's 1-2 s create passed it (wire review 16 item 8). Mutants that must turn it red
+/// (LOUD-owed): drop the socket before the session's end, and release the branch on a deferred
+/// thread.
+#[test]
+fn a_branch_session_that_wrote_frees_its_branch_at_once() {
+    let dir = Scratch::new("terminatetimed");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = seeded(&server);
+    let bound = Duration::from_millis(500);
+    let timed = |what: &str, f: &mut dyn FnMut()| {
+        let started = Instant::now();
+        f();
+        let took = started.elapsed();
+        assert!(took < bound, "{what} took {took:?}");
+    };
+    for (name, in_block) in [("t0", false), ("t1", true)] {
+        a.q(&format!("SELECT turso_branch_create('{name}')"))
+            .ok("create");
+        let mut c = server
+            .connect_to(&format!("postgres/{name}"))
+            .expect("startup on the branch");
+        if in_block {
+            c.q("BEGIN").ok("begin");
+        }
+        c.q("UPDATE t SET v = 'branch' WHERE id = 1").ok("update");
+        c.send(b'X', &[]);
+        c.s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 1];
+        let read = c.s.read(&mut buf);
+        assert!(
+            matches!(read, Ok(0)),
+            "{name}: no close within 2 s: {read:?}"
+        );
+        timed(&format!("{name}: the next create"), &mut || {
+            a.q(&format!("SELECT turso_branch_create('{name}n')"))
+                .ok("the next create");
+        });
+        timed(&format!("{name}: a new session on the branch"), &mut || {
+            let mut r = server
+                .connect_to(&format!("postgres/{name}"))
+                .expect("a new session on the branch");
+            r.q("SELECT 1").ok("select");
+            r.send(b'X', &[]);
+            r.s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 1];
+            assert!(
+                matches!(r.s.read(&mut buf), Ok(0)),
+                "{name}: the second close"
+            );
+        });
+        timed(&format!("{name}: the delete"), &mut || {
+            a.q(&format!("SELECT turso_branch_delete('{name}')"))
+                .ok("the delete");
+        });
+    }
+}
+
 /// The create-latency pilot's connect form: a session started on a new branch runs SELECT 1 and an
 /// UPDATE, then sends Terminate and reads to EOF with its own end open, as bbload's synchronous
 /// close does. The server closes within 2 s, having kept the UPDATE (or rolled back the block it
