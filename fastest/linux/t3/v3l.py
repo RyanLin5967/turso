@@ -248,7 +248,7 @@ def counter_gate(what, wc, timed, lab):
       has written one for the drive and every loop layer since 7dc4d4c04, so only a record from before then, or a
       hand-made one, is judged that way;
     write through: the counter must read 0 in both runs (the block layer sends no flush; a count contradicts the
-      recorded state and VOIDs)."""
+      recorded state and VOIDs), each run judged on its own and reported in its own words (T3 runner review item 4)."""
     bad = []
     if wc == "write back":
         short = timed is None or timed < N
@@ -263,8 +263,11 @@ def counter_gate(what, wc, timed, lab):
             bad.append(f"write-back {what}: its flush counter rose {timed} in the timed run, fewer than the "
                        f"{lab // N} per fsync the labelling run showed ({lab} across {N})")
     elif wc == "write through":
-        if timed != 0 or (lab is not None and lab != 0):
-            bad.append(f"write-through {what}: its flush counter rose {timed} (labelling {lab}); a write-through queue "
+        if timed != 0:
+            bad.append(f"write-through {what}: its flush counter rose {timed} in the timed run; a write-through queue "
+                       "gets no flush request, so a count contradicts the recorded state (A16)")
+        if lab is not None and lab != 0:
+            bad.append(f"write-through {what}: its flush counter rose {lab} in the labelling run; a write-through queue "
                        "gets no flush request, so a count contradicts the recorded state (A16)")
     return bad
 
@@ -448,8 +451,10 @@ def plants(rec):
         out.append({"plant": "all", "fired": False, "why": "NOT-RUN: the real record is not VALID"})
         return out, False
 
-    def arm(name, base_wc, mutate, want):
+    def arm(name, base_wc, mutate, want, extra=None):
         r = as_state(rec, base_wc)
+        if extra:
+            extra(r)  # part of the base, so the base check below covers it
         if gates(r):
             out.append({"plant": name, "fired": False, "why": f"NOT-RUN: the {base_wc} base does not pass: {gates(r)}"})
             return
@@ -469,6 +474,20 @@ def plants(rec):
         (f"write-back drive {disk}:", "fewer than one per fsync in the strace-checked run"))
     arm("wt-one-flush", "write through", lambda r: r["arms"]["fsync"]["timed"].__setitem__("flush_ios_delta", 1),
         "write-through drive")
+    # item 4 (a): the labelling half of the write-through rule, on its own text
+    arm("wt-lab-flush", "write through",
+        lambda r: r["arms"]["fsync"]["timed"].__setitem__("lab_flush_ios_delta", 1),
+        (f"write-through drive {disk}:", "in the labelling run; a write-through queue"))
+
+    # item 4 (b): the per-layer floor rule. Real T3 records have no loop layer (V3L_REAL refuses loops), so the base
+    # carries one synthetic write-back layer at 2 per fsync in both runs; the plant drops its timed run to 1.5 per fsync
+    def plant_layer(r):
+        r["leaf"].setdefault("layers", []).append({"name": "loop-plant", "write_cache": "write back",
+                                                   "flush_ios_delta": 2 * N, "lab_flush_ios_delta": 2 * N})
+
+    arm("wb-layer-half", "write back",
+        lambda r: r["leaf"]["layers"][-1].__setitem__("flush_ios_delta", 3 * N // 2),
+        ("write-back loop layer loop-plant:", "per fsync the labelling run showed"), extra=plant_layer)
     arm("timed-half-syncs", rec["leaf"]["write_cache"],
         lambda r: r["arms"]["fsync"]["timed"].__setitem__("syncs", r["arms"]["fsync"]["timed"]["syncs"] // 2),
         "they must agree")
