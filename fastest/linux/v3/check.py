@@ -563,10 +563,13 @@ def canon(a):
     return a
 
 
-def parse_trace(text):
+def parse_trace(text, sync_fd=None):
     """-> (calls, other, pids): every syscall line as (name, canonical text), the lines that are not syscalls, and the
     pids seen. strace 6.8 prints FICLONE as "BTRFS_IOC_CLONE or FICLONE" (one ioctl number) with its source fd as a
-    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned."""
+    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned.
+    sync_fd, when given a dict, receives {index in calls: the fd number} for every fsync and fdatasync (None when its
+    first argument is not fd<path>): the canonical text drops fd numbers, which f1b_window_syncs needs (V3 review 12
+    item 15: one strace parser, not two)."""
     calls, other, fds, pids = [], [], {}, set()
     for line in text.splitlines():
         m = LINE.match(line)
@@ -590,6 +593,9 @@ def parse_trace(text):
             t = "ioctl %s %s %s = %s" % (canon(args[0]), cmd, src, ret)
         else:
             t = name + " " + " ".join(canon(x) for x in args) + " = " + ret
+        if sync_fd is not None and name in ("fsync", "fdatasync"):
+            a0 = re.fullmatch(r"(\d+)<.*>", args[0].strip()) if args else None
+            sync_fd[len(calls)] = int(a0.group(1)) if a0 else None
         calls.append((name, t))
     return calls, other, pids
 
@@ -2540,45 +2546,40 @@ def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
 
 
 def f1b_window_syncs(text):
-    """eleventh review MED 2: ({arm: fds}, problems) for the fsync and fdatasync calls INSIDE the timed windows of an
-    F1b strace -f -y trace: between a window's opening and closing clock_gettime(CLOCK_MONOTONIC_RAW), the only clock
-    reads the loop makes (sequence_problems holds F1b:real-all to exactly 2 x n x arms of them). Setup and teardown
-    syncs are outside every window and not counted. A sync split by strace (<unfinished ...>) counts by its opening
-    half. The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>, for an arm this
-    probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd (V3 review 12
-    item 11: it was keyed by its basename and never compared). -> (seen {arm: fds}, problems, odd paths)"""
-    seen, clocks, probs, odd = {}, 0, [], []
+    """eleventh review MED 2: the fsync and fdatasync calls INSIDE the timed windows of an F1b strace -f -y trace, read
+    through parse_trace and sliced as sequence_problems slices them (V3 review 12 item 15: this was a second strace
+    parser, whose split-line and parity branches no trace F1b:real-all accepts can reach): a window is the calls
+    between its opening and closing clock_gettime, the only clock reads the loop makes. Setup and teardown syncs are
+    outside every window. A split (<unfinished ...>) line is not a call (parse_trace keeps it in `other`, which
+    F1b:real-all refuses). The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>,
+    for an arm this probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd
+    (review 12 item 11). An odd number of clock reads, or an in-window sync whose first argument is not fd<path>, is a
+    problem. -> (seen {arm: fds}, problems, odd paths)"""
+    seen, probs, odd, fdmap = {}, [], [], {}
     known = set(ALL.split(","))
-    for line in text.splitlines():
-        m = LINE.match(line)
-        if m and "<unfinished ...>" not in line and "resumed>" not in line:
-            name, args = m.group(2), m.group(3)
-        else:
-            u = re.match(r"^\d+\s+(fsync|fdatasync)\((.*?)\s*<unfinished \.\.\.>$", line)
-            if not u:
+    calls, _other, _pids = parse_trace(text, fdmap)
+    clocks = [k for k, (name, _) in enumerate(calls) if name == "clock_gettime"]
+    if not clocks or len(clocks) % 2:
+        return {}, ["%d clock reads: the trace holds no whole timed windows" % len(clocks)], []
+    for w in range(len(clocks) // 2):
+        for k in range(clocks[2 * w] + 1, clocks[2 * w + 1]):
+            name, t = calls[k]
+            if name not in ("fsync", "fdatasync"):
                 continue
-            name, args = u.group(1), u.group(2)
-        if name == "clock_gettime":
-            clocks += 1
-            continue
-        if name not in ("fsync", "fdatasync") or clocks % 2 == 0:
-            continue
-        a = re.fullmatch(r"(\d+)<([^>]+)>", args.strip())
-        if not a:
-            probs.append("an in-window sync without fd<path>: " + line[:120])
-            continue
-        path, base = a.group(2), os.path.basename(a.group(2))
-        if re.fullmatch(r"c\d+", base):
-            par = os.path.basename(os.path.dirname(path))
-            arm = par[:-len(".clones")] if par.endswith(".clones") else None
-        else:
-            arm = base[:-len(".clones")] if base.endswith(".clones") else base
-        if arm not in known:
-            odd.append(path)
-            continue
-        seen.setdefault(arm, set()).add(int(a.group(1)))
-    if clocks == 0 or clocks % 2:
-        probs.append("%d clock reads: the trace holds no whole timed windows" % clocks)
+            pm = re.match(r"^(?:fsync|fdatasync) <(.*)> = ", t)
+            if fdmap.get(k) is None or not pm:
+                probs.append("an in-window sync without fd<path>: " + t[:120])
+                continue
+            path, base = pm.group(1), os.path.basename(pm.group(1))
+            if re.fullmatch(r"c\d+", base):
+                par = os.path.basename(os.path.dirname(path))
+                arm = par[:-len(".clones")] if par.endswith(".clones") else None
+            else:
+                arm = base[:-len(".clones")] if base.endswith(".clones") else base
+            if arm not in known:
+                odd.append(path)
+                continue
+            seen.setdefault(arm, set()).add(fdmap[k])
     return seen, probs, odd
 
 
