@@ -4819,6 +4819,63 @@ mod tests {
         });
     }
 
+    /// Wire review 16 item 3: the parameter-type walk reads each view at most once per statement,
+    /// cycles included. Eight views that each list all eight in FROM (the engine checks no view's
+    /// relations at CREATE VIEW) cost about e*7! = 13,700 libpg_query parses at one Describe: a
+    /// view on the walk's stack was cut, and a view whose reading saw a cut was kept nowhere, so
+    /// each sibling FROM item read its view again. The chain v1..v8, each view's scalar subquery
+    /// reading the one before through a derived table, doubled per level under 86aed81f8's second
+    /// FROM walk (511 parses at 4db63aca4) and is linear since 14b253e05's memo: this arm pins
+    /// that. At most 9 calls each: 8 views and the statement.
+    #[test]
+    fn a_view_is_read_once_per_statement_cycles_included() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, x INT)");
+        let all = (1..=8)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for i in 1..=8 {
+            ok(&s, &format!("CREATE VIEW w{i} AS SELECT w1.x FROM {all}"));
+        }
+        ok(&s, "CREATE VIEW v1 AS SELECT id, x FROM t");
+        for k in 2..=8 {
+            ok(
+                &s,
+                &format!(
+                    "CREATE VIEW v{k} AS SELECT id, (SELECT max(d.x) FROM (SELECT x FROM v{p}) AS d) AS x FROM t",
+                    p = k - 1
+                ),
+            );
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for sql in [
+                "SELECT * FROM w1 WHERE x = $1",
+                "SELECT * FROM v8 WHERE x = $1",
+            ] {
+                let mut c = MemClient::new();
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let before = turso_pg_parser::libpg_query_calls();
+                // The cycle's Describe is refused (the engine's circular view); the walk before
+                // the refusal is what is counted.
+                let _ = s
+                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await;
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                assert!(
+                    calls <= 9,
+                    "{sql}: {calls} libpg_query calls at Describe, want at most 9"
+                );
+            }
+        });
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {

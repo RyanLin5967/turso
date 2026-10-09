@@ -5885,6 +5885,37 @@ fn a_join_merged_column_types_its_parameter() {
     );
 }
 
+/// A dense cycle of views costs one read of each view per statement: ten views that each list all
+/// ten in FROM cost about e*9! (986k) libpg_query parses at one Describe, which pinned the session
+/// thread with no cancel. The Describe is answered (refused: the views are circular) within 2 s, and
+/// another session is served (wire review 16 item 3).
+#[test]
+fn a_dense_view_cycle_is_described_at_once() {
+    let dir = Scratch::new("viewcycle");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x INT)").ok("t");
+    let all = (1..=10)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for i in 1..=10 {
+        let sql = format!("CREATE VIEW w{i} AS SELECT w1.x FROM {all}");
+        a.q(&sql).ok(&format!("premise: {sql}"));
+    }
+    let started = Instant::now();
+    let r = a.describe_statement("SELECT * FROM w1 WHERE x = $1");
+    let took = started.elapsed();
+    assert!(
+        r.error.is_some(),
+        "a circular view was described: {:?}",
+        r.params
+    );
+    assert!(took < Duration::from_secs(2), "the Describe took {took:?}");
+    let mut b = server.connect();
+    assert_eq!(b.q("SELECT 1").single("a second session"), "1");
+}
+
 /// A circular view is answered with an error and the server serves on. The inference walk opened a
 /// view by walking its query, which reached the view again: with no visited set it recursed until
 /// the session thread's 8 MiB stack overflowed, which aborts the process, every session with it,
