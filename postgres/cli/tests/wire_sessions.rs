@@ -2629,6 +2629,62 @@ fn schema_ddl_is_refused_in_server_mode() {
         .ok("a create in the session that asked");
 }
 
+/// CREATE INDEX on a schema-qualified table indexes that table, in its schema, as PostgreSQL does:
+/// a UNIQUE index on s.t refuses a duplicate in s.t (23505) and leaves public.t's duplicates
+/// alone; one on public.t refuses public.t's. The translator dropped the table's schema, so the
+/// index went onto whichever t the unqualified name found (public's, with the default path): s.t
+/// took duplicates its UNIQUE index forbids, and public.t refused rows nothing forbids. Schema s is
+/// made by the non-server CLI before the server starts. Found writing wire review 17 item 1's fix.
+#[test]
+fn an_index_on_a_qualified_table_is_that_tables() {
+    let dir = Scratch::new("qualindex");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+              CREATE SCHEMA s;\n\
+              CREATE TABLE s.t(id INT PRIMARY KEY, c INT);\n",
+        )
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE UNIQUE INDEX su ON s.t (c)").ok("index on s.t");
+    a.q("INSERT INTO s.t VALUES (1, 7)").ok("s.t row");
+    let sql = "INSERT INTO s.t VALUES (2, 7)";
+    assert_eq!(
+        a.q(sql).err("a duplicate in s.t").code,
+        "23505",
+        "s.t's UNIQUE index did not hold: {sql}"
+    );
+    a.q("INSERT INTO public.t VALUES (1, 7)").ok("public.t row");
+    a.q("INSERT INTO public.t VALUES (2, 7)")
+        .ok("public.t's duplicate, which no index forbids");
+    // Control: an index on public.t holds there.
+    a.q("DELETE FROM public.t WHERE id = 2")
+        .ok("drop the duplicate");
+    a.q("CREATE UNIQUE INDEX pu ON public.t (c)")
+        .ok("index on public.t");
+    let sql = "INSERT INTO public.t VALUES (3, 7)";
+    assert_eq!(a.q(sql).err(sql).code, "23505");
+    assert_eq!(
+        a.q("SELECT count(*) FROM s.t").single("s.t rows"),
+        "1",
+        "s.t holds its one row"
+    );
+}
+
 /// An explicit `public.` names public's relation whatever the search path, as in PostgreSQL. With
 /// public.t(c int) and s.t(c text) under `SET search_path TO s, public`, a literal INSERT, an UPDATE,
 /// a DELETE and an INSERT of an undeclared '007' (typed int4 from public.t, stored 7) all reach
