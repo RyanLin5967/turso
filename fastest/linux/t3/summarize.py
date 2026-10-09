@@ -17,7 +17,11 @@ ops_total == ops_total_asked == the plan's ops; a competitor: every timed run's 
 and its N == the plan's ops; a run ended by the registered cap is complete with reduced n, in runs[].reduced_n,
 fourth lane review MED 4). Totals are NOT
 compared across systems: the PREREG sizes n_run per system (fourth lane review HIGH 2 overrides gate-6 item 12).
-Any difference is listed in parity_refusals and fails.
+Any difference is listed in parity_refusals and fails. The warm-up is creditable (warmup_creditable) only with t3run's
+three-driver conformance record (warmup-conformance.json, rc 0) naming this package's own bbload, clonebench and
+fastest_profile by sha256 (binaries.txt), and with no competitor warm-up claim judged out of time order
+(warmup_backsteps 0 in either loop mode; the loop is reported in runs[].warmup_loops): otherwise a parity refusal and
+a loud_owed line (review 5 MED 6; PREREG annex A23).
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
 VOID fails), the A16 plants re-derived on its real BEFORE record all fire (blockgate-plants.json stored and
 re-run), the before-to-after drift was taken (batchgate.py drift; REFUSED fails; a VOID is published, not a gate on
@@ -37,6 +41,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -209,7 +214,7 @@ def run_parity(d, system):
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
     # the validated rule that also accepts a run ended by the registered cap with >= 1000 ok ops (PREREG :212,
     # "completed with reduced n"; fourth lane review MED 4); summarize compares the warm-up rule and N to the plan.
-    rules, ops, verdicts, reduced, seen = [], [], [], {}, set()
+    rules, ops, verdicts, reduced, seen, backsteps, loops = [], [], [], {}, set(), [], []
     for t in sorted(glob.glob(os.path.join(d, "result", "cells", "*", "timed", "summary.json"))):
         cell = os.path.basename(os.path.dirname(os.path.dirname(t)))
         try:
@@ -222,6 +227,8 @@ def run_parity(d, system):
             tj = None
         rules.append(j.get("warmup_rule"))
         ops.append((tj or {}).get("ops"))
+        backsteps.append((cell, j.get("warmup_backsteps")))  # PREREG annex A23 (comp 12f79726b's field)
+        loops.append(j.get("loop"))
         seen.add(cell)
         verdicts.append((cell, "no timed.json" if tj is None else tj.get("verdict")))
         if j.get("capped") and isinstance(j.get("measured_ops"), int):
@@ -236,7 +243,38 @@ def run_parity(d, system):
     except OSError:
         missing = ["no expected-cells.txt: the cells this run had to produce are unknown"]
     return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None,
-            "expected_missing": missing}
+            "expected_missing": missing, "warmup_backsteps": backsteps, "warmup_loops": loops}
+
+
+def conformance_problems(out):
+    """Why the package's warm-up is not creditable under PREREG annex A23 (review 5 MED 6), as a list: t3run's
+    three-driver conformance record (warmup-conformance.json, from warmup_conformance.py run --record) must say rc 0,
+    PASS, and name bbload, clonebench and fastest_profile each by the sha256 of the binary this package built and ran
+    (binaries.txt, the build stage's sha256sum)."""
+    try:
+        rec = json.load(open(os.path.join(out, "warmup-conformance.json")))
+    except (OSError, ValueError) as e:
+        return [f"no readable warm-up conformance record (warmup-conformance.json: {type(e).__name__}): A23 unchecked"]
+    bad = []
+    if rec.get("rc") != 0 or rec.get("verdict") != "PASS":
+        bad.append(f"warm-up conformance rc {rec.get('rc')!r} ({rec.get('verdict')!r}), not 0 with all three drivers")
+    shas = {}
+    try:
+        for line in open(os.path.join(out, "binaries.txt")):
+            m = re.match(r"^([0-9a-f]{64})  (\S+)$", line.strip())
+            if m:
+                shas[m.group(2)] = m.group(1)
+    except OSError:
+        bad.append("no binaries.txt: the conformance record cannot be bound to the package's binaries")
+    drivers = rec.get("drivers") if isinstance(rec.get("drivers"), dict) else {}
+    for role in ("bbload", "clonebench", "fastest_profile"):
+        got = (drivers.get(role) or {}).get("sha256")
+        if not got:
+            bad.append(f"the conformance record names no {role}")
+        elif got != shas.get(role):
+            bad.append(f"the conformance record's {role} sha256 {got[:12]}... is not the package's binary's "
+                       f"({(shas.get(role) or 'absent from binaries.txt')[:12]}...)")
+    return bad
 
 
 def fixture_check(d, system, plan, dry):
@@ -356,6 +394,12 @@ def summarize(out, sha, dry, manifest):
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
             for x in r.get("expected_missing") or []:
                 parity.append(f"{fs}/{cell}: {x}")
+            # A23: no claim judged out of time order, in either loop mode (the lead's ruling, DECISIONS 0be36a068b);
+            # the loop is reported in runs[].warmup_loops, never used to excuse one
+            for tcell, b in r.get("warmup_backsteps") or []:
+                if type(b) is not int or b != 0:
+                    parity.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
+                                  "order (PREREG annex A23; refused in either loop mode)")
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
         runs.append(r)
         if not result:
@@ -401,6 +445,12 @@ def summarize(out, sha, dry, manifest):
                "parity_refusals": parity, "fixture_refusals": fixture, "normaliser_missing": normaliser,
                "unquiet_runs": unquiet,
                "failed_stages": failed, "blocks": blocks, "runs": runs}
+    # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
+    conf = conformance_problems(out)
+    parity += [f"warm-up (A23): {x}" for x in conf]
+    summary["warmup_creditable"] = not conf
+    summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
+                             "bbload, clonebench and fastest_profile"] if conf else [])
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \

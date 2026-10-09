@@ -707,7 +707,8 @@ stage v3fixtures v3fixtures
 warmup_conformance() {
   local rc=0
   timeout 300 python3 -B "$L/gates/warmup_conformance.py" run --bbload "$DIST/bbload" --clonebench "$DIST/clonebench" \
-    --fastest-profile "$DIST/fastest_profile" > "$OUT/warmup-conformance.txt" 2>&1 || rc=$?
+    --fastest-profile "$DIST/fastest_profile" --record "$OUT/warmup-conformance.json" > "$OUT/warmup-conformance.txt" 2>&1 ||
+    rc=$?
   [ $rc = 0 ] || { tail -5 "$OUT/warmup-conformance.txt"; echo "envchecks: warm-up conformance rc $rc, want 0"; return 1; }
 }
 envchecks() { fcenv_check && warmup_conformance; }
