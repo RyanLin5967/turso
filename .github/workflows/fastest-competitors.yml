@@ -108,6 +108,19 @@ jobs:
         run: bash fastest/linux/hw/record.sh "$RUNNER_TEMP/build-hw" "$RUNNER_TEMP/hw-target" 15
       - name: Build bbload, clonebench, sqlite3 (BB_HOOKS=0)
         run: timeout 1500 bash fastest/linux/competitors/build.sh dist
+      # PREREG annex A23 / A23-AM1: the warm-up rule OPS:S:MAX_S is the macOS bbload's claim_op decision (warm_ends at
+      # artie 4010ff3b06), and every driver must make the same decision on the same claims. The shared harness
+      # (fastest/linux/gates/warmup_conformance.py, verbatim from fastest-branching b736990a9) replays its 12
+      # hand-derived cases through each built driver's --warmup-replay. fastest_profile is not built here, so the
+      # verdict for these two is PARTIAL, rc 3, which requires every case to match for both; anything else fails the
+      # build. The three-driver run (rc 0) is the integration branch's.
+      - name: A23 warm-up conformance (bbload, clonebench)
+        run: |
+          timeout 120 python3 -B fastest/linux/gates/warmup_conformance.py self-test | tail -1
+          rc=0
+          timeout 300 python3 -B fastest/linux/gates/warmup_conformance.py run --bbload dist/bbload \
+            --clonebench dist/clonebench || rc=$?
+          [ "$rc" = 3 ] || { echo "warm-up conformance rc=$rc, want 3 (both drivers match every case)"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: competitor-tools-${{ matrix.runner }}

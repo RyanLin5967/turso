@@ -487,8 +487,11 @@ jf() { python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get(s
 # cap_plants -- PG only, before the cells (lead review 62430d8bf..b49fb656a MED 5): the registered cap's code path on
 # the real binary, which CI otherwise never reaches. Three closed-loop runs ended by --max-window-s 1 (ops of about 0,
 # 5 and 20 ms) must each exit 0 with capped: true and verdict "capped", and timedrun.py must put them in the tiers
-# complete (>= 1000 ok), p50_only (100-999) and failed (< 100); and a --warmup 1000:1:0 run must leave its warm-up only
-# when BOTH 1000 ops and 1 s are reached (the OPS-and-S clause; MAX_S 0 = no limit).
+# complete (>= 1000 ok), p50_only (100-999) and failed (< 100). Then the warm-up rule of PREREG annex A23 (the macOS
+# bbload's claim_op, decided at each claim by warm_ends) on the real binary: --warmup 1000:1:60 must leave its warm-up
+# done, not capped, only when BOTH 1000 ops and 1 s are reached (the OPS-and-S clause); and, since A23-AM1 gives MAX_S 0
+# no "no limit" meaning, --warmup 1000:1:0 must end it at the first claim, capped, with 0 warm-up ops (this plant used
+# 1000:1:0 for the OPS-and-S clause, reading MAX_S 0 as no limit).
 cap_plants() {
   local sw spec want d rc
   mkdir -p "$RAW/plants"
@@ -503,10 +506,15 @@ cap_plants() {
   done
   d="$RAW/plants/warmup-ops-and-s" rc=0
   timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 100 --set port="$PORT" \
+    --set rows="$ROWS" --stall-s 60 --warmup 1000:1:60 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant --warmup 1000:1:60: rc|warmup_ops >= 1000|warmup_s >= 1|warmup_capped" \
+    "$rc|$(python3 -B -c 'import json, sys; s = json.load(open(sys.argv[1])); print(s.get("warmup_ops", -1) >= 1000, s.get("warmup_s", -1) >= 1.0, s.get("warmup_capped"))' "$d/summary.json" 2>/dev/null | tr ' ' '|')" \
+    "0|True|True|False"
+  d="$RAW/plants/warmup-max0" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
     --set rows="$ROWS" --stall-s 60 --warmup 1000:1:0 >"$d.txt" 2>&1 || rc=$?
-  expect "warm-up plant --warmup 1000:1:0: rc|warmup_ops >= 1000|warmup_s >= 1" \
-    "$rc|$(python3 -B -c 'import json, sys; s = json.load(open(sys.argv[1])); print(s.get("warmup_ops", -1) >= 1000, s.get("warmup_s", -1) >= 1.0)' "$d/summary.json" 2>/dev/null | tr ' ' '|')" \
-    "0|True|True"
+  expect "warm-up plant --warmup 1000:1:0 (A23: MAX_S 0 ends at the first claim): rc|warmup_ops|warmup_capped" \
+    "$rc|$(jf "$d/summary.json" warmup_ops)|$(jf "$d/summary.json" warmup_capped)" "0|0|True"
   # MED 7: --warmup with a legacy flag is refused (rc 2), and the recorded rule is the EFFECTIVE one
   d="$RAW/plants/warmup-mixed" rc=0
   timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
@@ -515,7 +523,9 @@ cap_plants() {
   d="$RAW/plants/warmup-legacy" rc=0
   timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
     --warmup-ops 20 --warmup-s 0 >"$d.txt" 2>&1 || rc=$?
-  expect "warm-up plant --warmup-ops 20 alone: rc|recorded warmup_rule" "$rc|$(jf "$d/summary.json" warmup_rule)" "0|20:0:0"
+  # the legacy flags take MAX_S as 0.1 x the run's window bound, as the macOS bbload takes 0.1 x its run cap (A23-AM1:
+  # MAX_S is finite); with --max-window-s at its default 3600 s that is 360 s
+  expect "warm-up plant --warmup-ops 20 alone: rc|recorded warmup_rule" "$rc|$(jf "$d/summary.json" warmup_rule)" "0|20:0:360"
 }
 # designate SPEC -- after the cells: ONE op of SPEC (C=1, no warm-up) with its after-steps skipped, so its branch
 # stays for the functional checks to read (the isolation read, the clone proof); prints the branch name. Untraced,
@@ -738,6 +748,20 @@ b1_main() {
   expect "cap plant b1 (clonebench d0 ended by --max-window-s 1): rc|capped|verdict" \
     "$rcp|$(jf "$cpd/summary.json" capped)|$(jf "$cpd/summary.json" verdict)" "0|True|capped"
   expect "cap plant b1: its branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
+  # PREREG annex A23 on clonebench's live claim path (d0, every branch dropped): --warmup 50:0.2:60 ends done, not
+  # capped, with >= 50 ops and >= 0.2 s; --warmup 1000:1:0 ends at the first claim, capped, with 0 warm-up ops
+  local wpd="$RAW/plants/warmup-b1" wpz="$RAW/plants/warmup-b1-max0" rcw=0 rcz=0
+  mkdir -p "$ROOT/branches/warmup-plant"
+  timeout 120 "$CB" run --mode b1 --op m1c --sync d0 --parent "$ROOT/parent.db" --dir "$ROOT/branches/warmup-plant" \
+    --clients 1 --max-ops 5 --rows "$ROWS" --warmup 50:0.2:60 --drop --out "$wpd" >"$wpd.txt" 2>&1 || rcw=$?
+  expect "warm-up plant b1 --warmup 50:0.2:60: rc|warmup_ops >= 50|warmup_s >= 0.2|warmup_capped" \
+    "$rcw|$(python3 -B -c 'import json, sys; s = json.load(open(sys.argv[1])); print(s.get("warmup_ops", -1) >= 50, s.get("warmup_s", -1) >= 0.2, s.get("warmup_capped"))' "$wpd/summary.json" 2>/dev/null | tr ' ' '|')" \
+    "0|True|True|False"
+  timeout 120 "$CB" run --mode b1 --op m1c --sync d0 --parent "$ROOT/parent.db" --dir "$ROOT/branches/warmup-plant" \
+    --clients 1 --max-ops 5 --rows "$ROWS" --warmup 1000:1:0 --drop --out "$wpz" >"$wpz.txt" 2>&1 || rcz=$?
+  expect "warm-up plant b1 --warmup 1000:1:0 (A23: MAX_S 0 ends at the first claim): rc|warmup_ops|warmup_capped" \
+    "$rcz|$(jf "$wpz/summary.json" warmup_ops)|$(jf "$wpz/summary.json" warmup_capped)" "0|0|True"
+  expect "warm-up plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \

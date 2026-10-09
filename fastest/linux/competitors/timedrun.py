@@ -324,8 +324,12 @@ def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100"):
 
 CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # MED 6: what the binaries record about the warm-up and the window they actually ran (a warm-up that met OPS 1000 and
-# S 10 of the rule 1000:10:180; an uncapped 5 s window under the 1800 s cap)
-RUN = {"warmup_ops": 1500, "warmup_s": 10.2, "max_window_s": 1800.0, "window_s": 5.0}
+# S 10 of the rule 1000:10:180; an uncapped 5 s window under the 1800 s cap). PREREG annex A23: the warm-up ends at a
+# claim, so the record names that claim's time (warmup_end_ns, ns since t0), whether it ended capped, and the time of
+# the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
+# 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done.
+RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
+       "warmup_last_claim_ns": 9_999_800_000, "max_window_s": 1800.0, "window_s": 5.0}
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
@@ -444,20 +448,51 @@ def selftest():
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"measured_ok": 50},
               check_n=5000), False),
         ("a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)",
-         dict(tracer=clean, timed_extra={"warmup_s": 1.0}), False),
+         dict(tracer=clean, timed_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
+                                         "warmup_last_claim_ns": 999_000_000}), False),
         ("a warm-up that left before OPS and before MAX_S (500 ops, 12 s)",
-         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 12.0}), False),
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 12.0, "warmup_end_ns": 12_000_000_000,
+                                         "warmup_last_claim_ns": 11_900_000_000}), False),
         ("a warm-up ended by MAX_S (500 ops, 180.0 s)",
-         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.0}), True),
-        ("a warm-up past MAX_S plus the slack (181 s)",
-         dict(tracer=clean, timed_extra={"warmup_ops": 50000, "warmup_s": 181.0}), False),
-        ("the labelling run's warm-up left early", dict(tracer=clean, lab_extra={"warmup_s": 1.0}), False),
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.0, "warmup_capped": True,
+                                         "warmup_end_ns": 180_000_000_000, "warmup_last_claim_ns": 179_900_000_000}),
+         True),
+        # PREREG annex A23 (the macOS claim_op rule, decided at each claim): the old "MAX_S plus 0.05 s of slack"
+        # bound was the 1 ms poll's; at a claim a capped warm-up ends at the first claim at or after MAX_S, up to one
+        # op later, and the exact bound is that no warm-up op was claimed at or after MAX_S
+        ("A23: a warm-up op claimed at or after MAX_S (500 ops, the last at 180.0 s)",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.1, "warmup_capped": True,
+                                         "warmup_end_ns": 180_100_000_000, "warmup_last_claim_ns": 180_000_000_000}),
+         False),
+        ("A23: capped, ending one 0.4 s op after MAX_S, every warm-up claim before it: accepted",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.4, "warmup_capped": True,
+                                         "warmup_end_ns": 180_400_000_000, "warmup_last_claim_ns": 179_999_999_999}),
+         True),
+        ("A23: no warmup_capped in the record", dict(tracer=clean, timed_extra={"warmup_capped": None}), False),
+        ("A23: says capped although OPS and S were met at the ending claim (done wins)",
+         dict(tracer=clean, timed_extra={"warmup_capped": True}), False),
+        ("A23: says done, but ended by MAX_S before OPS",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.0, "warmup_capped": False,
+                                         "warmup_end_ns": 180_000_000_000, "warmup_last_claim_ns": 179_900_000_000}),
+         False),
+        ("A23: the warm-up should have ended at its last claim (OPS and S already met there)",
+         dict(tracer=clean, timed_extra={"warmup_last_claim_ns": 10_000_100_000}), False),
+        ("A23: warmup_s is not the ending claim's time", dict(tracer=clean, timed_extra={"warmup_s": 12.0}), False),
+        ("A23: the last warm-up claim after the ending claim (1000 ops, so OPS was not met at that claim)",
+         dict(tracer=clean, timed_extra={"warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}), False),
+        ("A23: warm-up ops but no last claim time", dict(tracer=clean, timed_extra={"warmup_last_claim_ns": None}),
+         False),
+        ("the labelling run's warm-up left early",
+         dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
+                                       "warmup_last_claim_ns": 999_000_000}), False),
         ("a window bound that is not the registered cap", dict(tracer=clean, timed_extra={"max_window_s": 20.0}),
          False),
         ("capped although the window was shorter than its bound",
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"window_s": 300.0},
               check_n=5000), False),
-        ("no warm-up record", dict(tracer=clean, timed_extra={"warmup_ops": None, "warmup_s": None}), False),
+        ("no warm-up record", dict(tracer=clean, timed_extra={"warmup_ops": None, "warmup_s": None,
+                                                               "warmup_capped": None, "warmup_end_ns": None,
+                                                               "warmup_last_claim_ns": None}), False),
         # lead review 62430d8bf..b49fb656a HIGH 1: the live-branch count N is held fixed and recorded around both runs
         ("N held at 21 around both runs", dict(tracer=clean), True),
         ("the labelling run at N=20, the timed run at N=1020",
@@ -509,6 +544,29 @@ def selftest():
     for cap, want in ((1800, "1000:10:180"), (60, "1000:10:6"), (3600, "1000:10:360")):
         got = rule(cap)
         ok(got == want, f"rule({cap}) = {got!r}, want {want!r}")
+    # PREREG annex A23 / A23-AM1 on run_problems alone (no window bound): the record of a warm-up decided at each claim
+    # by warm_ends, in integer ns with S and MAX_S truncated as (uint64_t)(S * 1e9). Expected values by hand from the
+    # rule's text (the same edges as the shared harness's cases), never from a driver.
+    def wrec(ops, end_ns, capped, last_ns):
+        return {"warmup_ops": ops, "warmup_s": end_ns / 1e9, "warmup_capped": capped, "warmup_end_ns": end_ns,
+                "warmup_last_claim_ns": last_ns}
+    for rule_in, rec, want, what in (
+            ("1000:1:0", wrec(0, 0, True, None), True, "MAX_S 0 ends at the first claim, capped (no 'no limit')"),
+            ("1000:1:0", wrec(1000, 1_200_000_000, False, 1_190_000_000), False,
+             "MAX_S 0 read as no limit (1000 ops, 1.2 s) is refused"),
+            ("0:0:0", wrec(0, 0, False, None), True, "the no-warm-up rule: done at the first claim"),
+            ("3:5:100", wrec(3, 5_000_000_000, False, 2_000_000_000), True, "OPS and S both met exactly (>=)"),
+            ("3:5:100", wrec(3, 4_999_999_999, False, 2_000_000_000), False, "1 ns before S is not done"),
+            ("3:5:5", wrec(3, 5_000_000_000, False, 2_000_000_000), True, "done and capped at one claim reads done"),
+            ("3:5:5", wrec(3, 5_000_000_000, True, 2_000_000_000), False, "... and capped there is refused"),
+            ("3:5:5", wrec(2, 5_000_000_000, True, 1_000_000_000), True, "capped before OPS"),
+            ("1:1.0000000009:100", wrec(1, 1_000_000_000, False, 0), True,
+             "S 1.0000000009 s truncates to 1000000000 ns"),
+            ("2:0:100", wrec(2, 0, False, 0), True, "claims at one instant count one by one"),
+            ("0:0:180", wrec(0, 10, False, 5), False, "no warm-up op, yet a last claim time"),
+            ("1000:10:180", wrec(1500, 10_000_500_000, False, None), False, "warm-up ops, no last claim time")):
+        why = run_problems("timed", rec, rule_in, None)
+        ok((not why) == want, f"A23 run_problems {what} ({rule_in}) -> {'accepted' if not why else why}")
     # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
     # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
     # Both values are compared as EXACT strings (review of e11a3c993, finding 5: "1.8e3" passed a numeric check and then
