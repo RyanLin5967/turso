@@ -5170,6 +5170,51 @@ fn delete_using_reads_one_namespace() {
     assert_eq!(a.q("SELECT id FROM d").single("one row left"), "1");
 }
 
+/// DELETE ... USING deletes exactly the target rows that join when the target declares a column
+/// named rowid (PostgreSQL reserves no such name): the rewrite names the table's own row by the
+/// first of rowid, _rowid_ and oid the table does not declare. The declared column shadowed the
+/// real rowid on both sides of the rewrite, so with duplicates and a NULL in it a row that joined
+/// nothing was deleted and a joined row was kept, under the same tag DELETE 2 (wire review 13
+/// item 5). A table that declares all three is refused 0A000, deleting nothing.
+#[test]
+fn delete_using_reaches_the_row_behind_a_rowid_column() {
+    let dir = Scratch::new("deleterowid");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE u(k INT)").ok("u");
+    a.q("INSERT INTO u VALUES (1), (3)").ok("u rows");
+    for (t, columns) in [("r1", "rowid INT"), ("r2", "rowid INT, _rowid_ INT")] {
+        a.q(&format!("CREATE TABLE {t}(id INT PRIMARY KEY, {columns})"))
+            .ok("create");
+        let values = if t == "r1" {
+            "(1, 7), (2, 7), (3, NULL)"
+        } else {
+            "(1, 7, 7), (2, 7, 7), (3, NULL, NULL)"
+        };
+        a.q(&format!("INSERT INTO {t} VALUES {values}")).ok("rows");
+        let r = a
+            .q(&format!("DELETE FROM {t} USING u WHERE {t}.id = u.k"))
+            .ok("delete");
+        assert_eq!(r.tags, vec!["DELETE 2".to_string()], "{t}");
+        assert_eq!(
+            a.q(&format!("SELECT id FROM {t}"))
+                .single("the row that joined nothing"),
+            "2",
+            "{t}"
+        );
+    }
+    a.q("CREATE TABLE r3(id INT, rowid INT, _rowid_ INT, oid INT)")
+        .ok("all three names declared");
+    a.q("INSERT INTO r3 VALUES (1, 1, 1, 1), (2, 2, 2, 2)")
+        .ok("r3 rows");
+    let r = a.q("DELETE FROM r3 USING u WHERE r3.id = u.k");
+    assert_eq!(r.err("no name left for the row").code, "0A000");
+    assert_eq!(
+        a.q("SELECT count(*) FROM r3").single("nothing deleted"),
+        "2"
+    );
+}
+
 /// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
 /// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
 /// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
