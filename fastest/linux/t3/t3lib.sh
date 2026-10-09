@@ -13,13 +13,21 @@
 #   plp_drive_id SYS DEV                "model<TAB>firmware" from SYS/block/DEV/device: firmware_rev (NVMe) or rev (SCSI,
 #                                       SATA); returns 2 when either field is missing or empty
 #   plp_listed SYS DEV FILE             DEV's identity is a whole line of FILE (t3/PLP-DRIVES)
-#   dev_unmoved PATH REAL               PATH still resolves to REAL, the device node preflight resolved and devguard
-#                                       checked (devguard round-2 attack LOW 4: a hotplug or controller reset can
-#                                       re-enumerate /dev/nvmeXnY between preflight and a block's mkfs hours later).
-#                                       Prints the reason and returns 2 on a refusal
-#   fs_is_ours PATH REAL FS             block_cleanup may wipe REAL: PATH is unmoved and blkid's low-level probe finds
-#                                       exactly the FS this block made on it (T3_BLKID overrides `sudo -n blkid -p`,
-#                                       for t3lib_test.sh only). Returns 2 on a refusal
+#   dev_unmoved PATH REAL               PATH still resolves to REAL, the device node preflight resolved. Path text
+#                                       only: for a plain /dev/nvmeXnY it always holds, so it is never the identity
+#                                       check (review 5 MED 3); dev_unchanged is. Returns 2 on a refusal
+#   dev_identity SYS DEV                the drive behind DEV, one field per line: wwid (block/wwid, else device/wwid:
+#                                       the NVMe EUI/NGUID or SCSI VPD 0x83 name), dev (MAJ:MIN), model, serial
+#                                       (device/serial, else the printable part of device/vpd_pg80), firmware
+#                                       (firmware_rev, else rev). Any empty field refuses (rc 2, naming it)
+#   dev_unchanged PATH REAL SYS DEV ID  PATH is unmoved AND the drive behind DEV is the one preflight recorded in ID
+#                                       (device-id.txt). A controller reset keeps the instance number (inferred); a
+#                                       remove plus re-add can give the name to another drive, which only the identity
+#                                       shows. t3run re-checks it before every mkfs, mount and wipefs. Returns 2
+#   t3_blkid TAG DEV                    one tag's value from blkid's low-level probe of DEV (`sudo -n blkid -p`);
+#                                       t3lib_test.sh redefines the function, production reads no override (LOW 22)
+#   fs_is_ours PATH REAL FS UUID        block_cleanup may wipe REAL: PATH is unmoved, and the probe finds exactly the FS
+#                                       this block made AND the UUID its mkfs gave it (review 5 MED 3). Returns 2
 
 drift_ok() { case $1 in 0|3) return 0 ;; *) return 1 ;; esac; }
 
@@ -63,10 +71,42 @@ dev_unmoved() { # dev_unmoved PATH REAL
     { echo "REFUSED: $1 resolved to '$2' at preflight and resolves to '$now' now: not the device devguard checked"; return 2; }
 }
 
-fs_is_ours() { # fs_is_ours PATH REAL FS
-  local t
+t3_first_line() { [ -r "$1" ] && awk 'NR == 1 { gsub(/^[ \t]+|[ \t]+$/, ""); print }' "$1"; }
+
+dev_identity() { # dev_identity SYS DEV
+  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f
+  wwid=$(t3_first_line "$b/wwid"); [ -n "$wwid" ] || wwid=$(t3_first_line "$d/wwid")
+  dev=$(t3_first_line "$b/dev")
+  model=$(t3_first_line "$d/model")
+  serial=$(t3_first_line "$d/serial")
+  [ -n "$serial" ] || serial=$(tr -cd '[:print:]' 2>/dev/null < "$d/vpd_pg80" | awk '{ gsub(/^ +| +$/, ""); print }')
+  fw=$(t3_first_line "$d/firmware_rev"); [ -n "$fw" ] || fw=$(t3_first_line "$d/rev")
+  for f in wwid dev model serial fw; do
+    [ -n "${!f}" ] || { echo "REFUSED: cannot read $2's ${f/fw/firmware} under $1/block/$2" >&2; return 2; }
+  done
+  printf 'wwid=%s\ndev=%s\nmodel=%s\nserial=%s\nfirmware=%s\n' "$wwid" "$dev" "$model" "$serial" "$fw"
+}
+
+dev_unchanged() { # dev_unchanged PATH REAL SYS DEV ID
+  local now
   dev_unmoved "$1" "$2" || return 2
-  t=$(${T3_BLKID:-sudo -n blkid -p} -o value -s TYPE "$2" 2>/dev/null)
+  [ -s "$5" ] || { echo "REFUSED: no identity recorded for $4 ($5)"; return 2; }
+  now=$(dev_identity "$3" "$4") || return 2
+  [ "$now" = "$(cat "$5")" ] ||
+    { echo "REFUSED: $4 is not the drive preflight recorded in $5; now: $(printf '%s\n' "$now" | grep -vxF -f "$5" | tr '\n' ' ')"
+      return 2; }
+}
+
+t3_blkid() { # t3_blkid TAG DEV
+  sudo -n blkid -p -o value -s "$1" "$2"
+}
+
+fs_is_ours() { # fs_is_ours PATH REAL FS UUID
+  local t u
+  dev_unmoved "$1" "$2" || return 2
+  [ -n "$4" ] || { echo "REFUSED: no UUID recorded for the '$3' this block made: not wiped"; return 2; }
+  t=$(t3_blkid TYPE "$2"); u=$(t3_blkid UUID "$2")
   [ -n "$3" ] && [ "$t" = "$3" ] ||
     { echo "REFUSED: $2 carries '$t', not the '$3' this block made: not wiped"; return 2; }
+  [ "$u" = "$4" ] || { echo "REFUSED: $2's UUID is '$u', not the '$4' this block's mkfs gave it: not wiped"; return 2; }
 }
