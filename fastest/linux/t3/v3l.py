@@ -569,6 +569,10 @@ def _has(got, *subs):
     return any(all(s in x for s in subs) for x in got or [])
 
 
+# a real brd V3L record (fourth lane review HIGH 3); provenance in testdata/README.md
+_BRD_B0 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "v3l-37812992594-brd-xfs-b0", "v3l.json")
+
+
 def _plant(res, name):
     """The named plant's entry in plants()' results, or {} when it was never run."""
     return next((p for p in res if p.get("plant") == name), {})
@@ -789,6 +793,21 @@ def self_test():
              "no volatile cache: no flush request sent (counter 0 checked in the timed run; no labelling count)",
              "write-through queue with flushes counted (VOID)",
              "write cache unknown (VOID)"))),
+        # fourth lane review HIGH 3: on a ram disk the gate wants the probe's 'none (RAM)', so a plant base must keep it;
+        # the banked record is dry run 37812992594's brd job, xfs, b0 (testdata/README.md)
+        ("HIGH 3: the banked brd record (run 37812992594, xfs b0: ram0, write through, 'none (RAM)') is VALID",
+         _ok(lambda: gates(json.load(open(_BRD_B0))) == [])),
+        ("HIGH 3: plants() on the banked brd record runs every plant and every one fires (ok True)",
+         _ok(lambda: plants(json.load(open(_BRD_B0)))[1] is True)),
+        ("HIGH 3: drive-mismatch on the banked brd record flips the report and fires on the agreement rule's text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive ram0:",
+                                                                  "disagrees with the drive's own report"))(
+             _plant(plants(json.load(open(_BRD_B0)))[0], "drive-mismatch")))),
+        ("HIGH 3: plants() on a hand-made ram0 record (write through, 'none (RAM)', counts 0) is ok True",
+         _ok(lambda: plants(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0))[1] is True)),
+        ("HIGH 3: a ram0 plant base keeps 'none (RAM)' in both states",
+         _ok(lambda: [as_state(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0), wc)
+                      ["leaf"]["drive_reports"] for wc in ("write back", "write through")] == ["none (RAM)"] * 2)),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
