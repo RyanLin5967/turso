@@ -142,6 +142,11 @@ def readback_sql(dialect):
     raise ValueError(f"unknown dialect {dialect}")
 
 
+def facts(rows, updates=0, seed=1):
+    """RED stub."""
+    return {}
+
+
 def expect(rows, updates=0, seed=1):
     """'count|sum|row_hash' the engine must read back from t after loading these streams."""
     return f"{rows}|{aged_sum(rows, updates, seed)}|{row_hash(rows, updates, seed)}"
@@ -207,6 +212,14 @@ def selftest():
     ok("SQLite read back the generator's triple", f"{cnt}|{sv}|{rh}" == expect(2500, 300, 1))
     db.close()
     ok("stream digests differ between aged and fresh", sd["age"] != stream_digests(2500, 0, 1)["age"])
+    # MED 12: everything a fixture records about the generator in ONE pass over the stream (the 10 GiB tier makes each
+    # pass ~30 min), against the pinned known answers above
+    fx = facts(2500, 300, 1)
+    ok("facts(): count, sum, row hash = the engines' read-back (2500|131727070|21429546430)",
+       (fx.get("count"), fx.get("sum"), fx.get("row_hash")) == (2500, 131727070, 21429546430))
+    f10 = facts(10000)
+    ok("facts(): the stream digests and the combined digest in the same pass",
+       f10.get("streams") == stream_digests(10000) and f10.get("digest") == digest(10000))
     # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
