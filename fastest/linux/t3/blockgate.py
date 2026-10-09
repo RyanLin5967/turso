@@ -374,7 +374,7 @@ def evidence_cases(tmp):
                                                                {"id": "F1b:real-4k", "pass": f1b[1]},
                                                                {"id": "F3:complete", "pass": True}]})
 
-    def batch(name, vtext, bound="fire-checked: {v}", sha=None, write_verdict=True, where="abs"):
+    def batch(name, vtext, bound="fire-checked: {v}", sha=None, write_verdict=True, where="abs", exe_line=None):
         fs = os.path.join(tmp, name)
         out = os.path.join(fs, "v3-before")
         vpath = os.path.join(fs, "v3-firecheck", "verdict.json")
@@ -383,7 +383,8 @@ def evidence_cases(tmp):
         named = vpath if where == "abs" else os.path.join("/nonexistent-runner-path", "fs-x", "v3-firecheck",
                                                          "verdict.json")
         s = sha if sha is not None else hashlib.sha256(vtext.encode()).hexdigest()
-        _write(os.path.join(out, "binary.txt"), f"v3floor_sha256={exe}\nbound={bound.format(v=named)}\n"
+        xl = f"v3floor_sha256={exe}\n" if exe_line is None else exe_line
+        _write(os.path.join(out, "binary.txt"), f"{xl}bound={bound.format(v=named)}\n"
                                                 f"verdict_sha256={s}\nplp=no\n")
         return app_sync_evidence(out)
 
@@ -398,6 +399,9 @@ def evidence_cases(tmp):
         "smoke": batch("smoke", good, bound="smoke: V3_SMOKE=1, not bound to a fire-check, never credited"),
         "missing-verdict": batch("missing", good, write_verdict=False),
         "garbage-verdict": batch("garbage", "[1, 2"),
+        # T3 runner review item 15: two absent shas, or two equal non-sha strings, compared equal and passed
+        "no-exe-sha": batch("noexe", json.dumps({"checks": json.loads(good)["checks"]}), exe_line=""),
+        "non-hex-sha": batch("nonhex", verdict(exe_="x"), exe_line="v3floor_sha256=x\n"),
     }
     os.makedirs(os.path.join(tmp, "nobin", "v3-before"))
     e["no-binary"] = app_sync_evidence(os.path.join(tmp, "nobin", "v3-before"))
@@ -413,6 +417,10 @@ def evidence_cases(tmp):
         ("app_sync_evidence: a missing verdict file is not evidence", e["missing-verdict"]["f1b_real"] is False),
         ("app_sync_evidence: an unparseable verdict is not evidence", e["garbage-verdict"]["f1b_real"] is False),
         ("app_sync_evidence: no binary.txt is unbound", e["no-binary"]["bound"] is False and not e["no-binary"]["f1b_real"]),
+        ("item 15: a binary.txt and a verdict that both lack v3floor_sha256 are not evidence (None is not a sha)",
+         e["no-exe-sha"]["f1b_real"] is False),
+        ("item 15: a binary.txt and a verdict that both carry the same non-sha string are not evidence",
+         e["non-hex-sha"]["f1b_real"] is False),
     ], os.path.join(tmp, "good", "v3-before")
 
 

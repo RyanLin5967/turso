@@ -698,6 +698,10 @@ def self_test():
          lambda s: any("v3l-b1" in x for x in s["failed_blocks"])),
         ("LOW 11: K=3 blocks, all VALID: every run carries its own block's normaliser", {"k": 3}, True,
          lambda s: [r["block_k"] for r in s["runs"]] == [1, 2, 3] and all(r["v3l_pooled_fsync_p50_us"] == 10.0 for r in s["runs"])),
+        ("T3 runner item 20: K=3 blocks, all VALID: every run carries its block's V3L verdict", {"k": 3}, True,
+         lambda s: [r.get("v3l_block_verdict") for r in s["runs"]] == ["VALID"] * 3),
+        ("T3 runner item 20: K=3 with a VOID b1: runs 1 and 2 carry VOID, run 3 VALID", {"k": 3, "after_v3l": "VOID"},
+         False, lambda s: [r.get("v3l_block_verdict") for r in s["runs"]] == ["VOID", "VOID", "VALID"]),
         ("LOW 11: K=3 with a VOID b1 fails blocks 1 and 2 and leaves their runs without a normaliser", {"k": 3, "after_v3l": "VOID"},
          False, lambda s: [r["v3l_pooled_fsync_p50_us"] for r in s["runs"]] == [None, None, 10.0]
          and len(s["normaliser_missing"]) == 2 and "V3L VOID (block 1)" in s["failed_blocks"][0]

@@ -922,6 +922,17 @@ def self_test():
                       and _has(r["before"]["void_reasons"], "disagrees with the gates re-run"))(
              _block_of(dict(rec(fsyncs=N - 1), verdict="VALID", void_reasons=[], floor_kind="x",
                             published={"fsync_p50_us": 300.0, "fsync_over_control_write_p50": 1.0}))))),
+        # T3 runner review item 14: a real run (V3L_REAL=1) must carry the V3 batch's leaf record, so the drive's own
+        # cache report is always there to cross-check; a dry run may go without it
+        ("item 14: a real run without a leaf record is refused",
+         _ok(lambda: "leaf record" in (real_mode_problem("1", ["nvme1n1"], "nvme1n1", None) or ""))),
+        ("item 14: a real run with a leaf record on a drive passes",
+         _ok(lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "/x/summary.json") is None)),
+        ("item 14: a real run on a loop or a ram disk is refused (the earlier rule, kept)",
+         _ok(lambda: real_mode_problem("1", ["loop3", "nvme1n1"], "nvme1n1", "/x/summary.json") is not None
+             and real_mode_problem("1", ["ram0"], "ram0", "/x/summary.json") is not None)),
+        ("item 14: a dry run (V3L_REAL unset) needs no leaf record",
+         _ok(lambda: real_mode_problem(None, ["loop3", "nvme1n1"], "nvme1n1", None) is None)),
         ("item 6: block() over a truthful VALID file is VALID (the negative control)",
          _ok(lambda: _block_of(dict(rec(), verdict="VALID", void_reasons=[], floor_kind="x",
                                     published={"fsync_p50_us": 300.0, "fsync_over_control_write_p50": 1.0}))
