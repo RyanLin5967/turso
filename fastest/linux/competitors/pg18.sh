@@ -9,7 +9,7 @@
 # the kernel can, a silent byte copy when it cannot, which is why the driver proves the clone from shared extents.
 # Amendment 14's "FILE_COPY with file_copy_method=clone ... at its defaults" is MODE d1clone; on Linux it configures
 # the same server as d2 (every d2 line but file_copy_method is a Linux default), which `settings` dumps to show.
-#   pg18.sh settings DATA             every pg_settings row (name, setting, source) as TSV
+#   pg18.sh settings DATA             every pg_settings row (name, setting, unit, source) as TSV
 #   pg18.sh writethrough DATA         ask this postgres binary to accept wal_sync_method=fsync_writethrough
 #                                     (postgres -C); prints its output and rc -- Linux builds refuse it
 #
@@ -94,7 +94,8 @@ seed)
   ;;
 settings)
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
-  psqlc -d postgres -At -F $'\t' -c "SELECT name, setting, source FROM pg_settings ORDER BY name"
+  # name, setting, unit, source (LOW 21: the unit column, so a setting's bytes are read, never guessed)
+  psqlc -d postgres -At -F $'\t' -c "SELECT name, setting, coalesce(unit, ''), source FROM pg_settings ORDER BY name"
   ;;
 writethrough)
   # Not started: postgres -C reads the config, applies -c, prints the value and exits. rc is the evidence.

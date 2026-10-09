@@ -10,3 +10,11 @@ dolt	2.4.1	arm64	tarball_sha256	4ec68affe22be060f008ff7135b33362a46befefc26a76df
 doltgres	1.4.0	amd64	tarball_sha256	3868d1293ce6b24680d29c31a8661a913656459e02c3ef8f61cb737908d6d667
 doltgres	1.4.0	arm64	tarball_sha256	bdb379fe00829eb2c18b277cc12ba01ab3f6c0a813ee75e78877e04c08830af3
 postgresql	18.6	any	pgdg_package	18.6-1.pgdg24.04+2
+# binary_sha256: the sha256 of the binary each job runs, as run 37841577896 recorded it on both arches (every job of
+# an arch alike; run/version.txt line 2; LOW 19): run_system.sh refuses a server binary that differs before it starts.
+dolt	2.4.1	amd64	binary_sha256	2378203229d3189335af584a7a8a64ca58ed3058497d125a56f17966c31bb1e2
+dolt	2.4.1	arm64	binary_sha256	2a38a5ef24a8da45698c974a6d67f7c304b8c982811ebb2af7cd6dbd543b6376
+doltgres	1.4.0	amd64	binary_sha256	76f8107630dfc7dddf51862ece428aa6a7a2818842ac2f449ecfcd10eddab21c
+doltgres	1.4.0	arm64	binary_sha256	8177fc96f976df19a6c173eab705ecfb0db087aa1d6ef09b8f034024510360ec
+postgresql	18.6	amd64	binary_sha256	492c356851c073d65e77b8cc5d22d10e05a07d54699c6427dcb01d36567af7d5
+postgresql	18.6	arm64	binary_sha256	a2c8c9c6dec6901b9103c62ccd177bd341104b08843fa65ffe432244bf43d5d4

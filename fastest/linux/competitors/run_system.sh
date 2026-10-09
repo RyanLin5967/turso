@@ -547,6 +547,14 @@ server_main() {
       pass "Linux PG refuses wal_sync_method=fsync_writethrough ($(grep -m1 'invalid value' "$RAW/fsync_writethrough-probe.txt" | cut -c1-160); $(tail -1 "$RAW/fsync_writethrough-probe.txt"))"
     fi
   fi
+  # LOW 19: the server binary is the registered one (versions.tsv binary_sha256 for this arch), checked before it starts
+  local bin pin_sys pin_arch
+  case $KIND in pg) bin="$FT_PG18/postgres" pin_sys=postgresql ;; dolt) bin=$FT_DOLT pin_sys=dolt ;;
+    doltgres) bin=$FT_DOLTGRES pin_sys=doltgres ;; esac
+  case $(uname -m) in x86_64) pin_arch=amd64 ;; aarch64) pin_arch=arm64 ;; *) pin_arch=$(uname -m) ;; esac
+  python3 -B "$HERE/pins.py" check-binary "$pin_sys" "$pin_arch" "$bin" >"$RAW/binary-check.txt" 2>&1 ||
+    { fail "server binary: $(cat "$RAW/binary-check.txt")"; return; }
+  pass "server binary: $(cat "$RAW/binary-check.txt")"
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
   srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { cp "$DATA".gc.* "$RAW/" 2>/dev/null; fail "seed"; return; }
   # the GC's own record, banked with the job (MED 9: gc.txt was never banked): client output, log slice, verdict

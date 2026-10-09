@@ -82,6 +82,7 @@ jobs:
           timeout 120 python3 -B fastest/linux/competitors/stracecount.py selftest | tail -1
           timeout 120 python3 -B fastest/linux/competitors/gen_seed.py selftest | tail -1
           timeout 120 python3 -B fastest/linux/competitors/fthelp.py selftest | tail -1  # MED 9: the GC verdict
+          timeout 120 python3 -B fastest/linux/competitors/pins.py selftest | tail -1    # LOW 20: CI never ran it
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
           # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
           # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.

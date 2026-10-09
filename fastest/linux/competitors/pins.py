@@ -4,11 +4,12 @@ and 15). Every value comes from versions.tsv (one table) or /proc/meminfo, and e
 
   pins.py get SYSTEM ARCH KIND          the table's value (exit 2 if absent): e.g. dolt amd64 tarball_sha256
   pins.py version SYSTEM                the registered version
-  pins.py check-version SYSTEM FILE     exit 0 only when FILE (a version command's output) names the registered
-                                        version as a whole word
+  pins.py check-version SYSTEM FILE     exit 0 only when FILE (a version command's output) has, on its FIRST line and
+                                        in that command's own form (FIRST_LINE), exactly the registered version
+  pins.py check-binary SYSTEM ARCH FILE exit 0 only when FILE's sha256 is the table's binary_sha256 for SYSTEM, ARCH
   pins.py shared-buffers MEMINFO        PG's shared_buffers, 25% of MemTotal, as "<N>MB" (N rounded down)
-  pins.py check-pg TSV MEMINFO          exit 0 only when pg_settings (name, setting, unit... TSV) has shared_buffers
-                                        equal to that 25%
+  pins.py check-pg TSV MEMINFO          exit 0 only when pg18.sh settings' dump (name, setting, unit, source TSV) has
+                                        shared_buffers in 8kB pages equal to that 25%
   pins.py selftest
 """
 import hashlib
@@ -45,14 +46,34 @@ def version(system, path=TABLE):
     return vs.pop() if len(vs) == 1 else None  # two versions of one system in the table is no registration
 
 
+# Each version command's FIRST line, with the version as its own field (LOW 19: a whole-word search anywhere accepted
+# 2.4.1-rc1, +dirty, 18.6devel and a later line that only mentioned the version)
+FIRST_LINE = {"dolt": r"dolt version (\S+)", "doltgres": r"Doltgres version (\S+)",
+              "postgresql": r"postgres \(PostgreSQL\) (\S+)(?: \(.*\))?"}
+
+
 def check_version(system, text, path=TABLE):
     v = version(system, path)
-    return bool(v) and re.search(r"(?<![\w.])" + re.escape(v) + r"(?![\w.]*\d)", text) is not None
+    pat = FIRST_LINE.get(system)
+    first = text.splitlines()[0].strip() if text.strip() else ""
+    m = re.fullmatch(pat, first) if pat else None
+    return bool(v) and m is not None and m.group(1) == v
 
 
 def check_binary(system, arch, path, table_path=TABLE):
-    """RED stub: accepts every binary."""
-    return True
+    """True only when the binary at PATH has versions.tsv's binary_sha256 for (SYSTEM, ARCH) (LOW 19: the tarball was
+    checked at fetch time and the binary never again)."""
+    want = get(system, arch, "binary_sha256", table_path)
+    if not want:
+        return False
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return False
+    return h.hexdigest() == want
 
 
 def mem_total_kb(meminfo_text):
@@ -75,10 +96,12 @@ def check_pg(settings_tsv_text, meminfo_text):
     row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
     if row is None or len(row) < 2 or not row[1].isdigit():
         return ["no shared_buffers row in pg_settings"]
-    # pg18.sh settings dumps (name, setting, source); pg_settings reports shared_buffers in 8 kB pages
-    units = {"8kB": 8 * 1024, "kB": 1024, "MB": 1 << 20}
-    per = units.get(row[2], 8 * 1024) if len(row) > 2 else 8 * 1024
-    got = int(row[1]) * per
+    # pg18.sh settings dumps (name, setting, unit, source) (LOW 21: the old dump had no unit column, and a dict keyed
+    # by the source column fell back to 8 kB for every value); shared_buffers is reported in 8kB pages, and any other
+    # or missing unit is refused rather than guessed
+    if len(row) < 3 or row[2] != "8kB":
+        return [f"shared_buffers unit {row[2] if len(row) > 2 else None!r} is not 8kB"]
+    got = int(row[1]) * 8 * 1024
     if got != want_mb << 20:
         why.append(f"shared_buffers {got >> 20} MB, not 25% of MemTotal = {want_mb} MB")
     return why
@@ -177,6 +200,13 @@ if __name__ == "__main__":
             print(f"ok: {a[1]} {version(a[1])}")
             sys.exit(0)
         print(f"REFUSED: {a[1]} is not the registered {version(a[1])}: {t.strip()[:200]}")
+        sys.exit(1)
+    if len(a) == 4 and a[0] == "check-binary":
+        if check_binary(a[1], a[2], a[3]):
+            print(f"ok: {a[1]} {a[2]} binary {a[3]} is the registered one")
+            sys.exit(0)
+        print(f"REFUSED: {a[3]} is not the registered {a[1]} {a[2]} binary (versions.tsv binary_sha256 "
+              f"{get(a[1], a[2], 'binary_sha256')})")
         sys.exit(1)
     if len(a) == 2 and a[0] == "shared-buffers":
         print(f"{shared_buffers_mb(open(a[1]).read())}MB")
