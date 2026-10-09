@@ -1453,6 +1453,13 @@ pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
 /// (engine review 8 #14: a trunk commit's barrier then orders the Release).
 #[cfg(test)]
 pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): `Database::drop_branch`
+/// waits here, the name looked up, before its release takes the store mutex (engine review 14
+/// MED 7: the open check and the release are one hold). 10 is left for review 16 #14's
+/// schema-publish stage.
+#[cfg(test)]
+pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -5190,6 +5197,25 @@ impl BranchStore {
     /// instead.
     pub(crate) fn release_named(&self, id: BranchId) -> Result<Reaped> {
         self.release_checked(id, true)
+    }
+
+    /// `Database::drop_branch` waits at `HOLD_DROP_LOOKED_UP` (test builds only; a no-op
+    /// otherwise), between its lookup and its release (engine review 14 MED 7).
+    pub(crate) fn pause_drop_looked_up(&self) {
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_DROP_LOOKED_UP);
+    }
+
+    /// Mutant `drop_check_separate_hold` only (`Database::drop_branch`): the open check in a
+    /// store-mutex hold of its own, apart from the release (engine review 14 MED 7's regression,
+    /// check-then-act across two holds).
+    pub(crate) fn refuse_if_open(&self, id: BranchId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.ensure(id)?;
+        match inner.branches.get(&id) {
+            Some(st) if st.open => Err(in_use(id, st.name.as_deref())),
+            _ => Ok(()),
+        }
     }
 
     fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {

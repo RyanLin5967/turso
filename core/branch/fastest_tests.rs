@@ -3395,6 +3395,52 @@ fn a_named_branch_with_an_open_connection_is_not_dropped() {
     }
 }
 
+/// Engine review 14 MED 7: nothing showed that `Database::drop_branch`'s open check and its
+/// release are one hold of the store mutex. Under a regression to check-then-act across two holds,
+/// a drop and a concurrent `connect_named` would both succeed and the Release would be written
+/// under a live connection. A drop parked between its lookup and its release
+/// (`HOLD_DROP_LOOKED_UP`) while a `connect_named` runs on this thread: the connect wins, and the
+/// drop is then refused as `BranchInUse`; the two never both succeed. Mutant
+/// `drop_check_separate_hold`.
+#[test]
+fn a_drop_and_a_connect_never_both_win_a_named_branch() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-race.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("race").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_DROP_LOOKED_UP, std::sync::atomic::Ordering::Release);
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("race").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_DROP_LOOKED_UP);
+        let conn = db.connect_named("race");
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let dropped = dropper.join().unwrap();
+        assert!(
+            !(conn.is_ok() && dropped.is_ok()),
+            "catalog={catalog}: the drop and the connect both succeeded: a Release under a live connection"
+        );
+        assert!(
+            conn.is_ok(),
+            "catalog={catalog}: premise: the connect, made while the drop waited before its release, succeeds: {:?}",
+            conn.as_ref().err()
+        );
+        assert!(
+            matches!(dropped, Err(LimboError::BranchInUse(ref n)) if n == "\"race\""),
+            "catalog={catalog}: the drop after the connect was not refused as BranchInUse: {dropped:?}"
+        );
+        assert!(
+            db.branch_named("race").unwrap().is_some(),
+            "catalog={catalog}: the refused drop released the branch"
+        );
+    }
+}
+
 /// fastest-wire: the named-branch refusals are typed, so a server answers each with its own code
 /// without matching message text: `NameTaken` from `create_branch`, `NoSuchBranch` from
 /// `connect_named` and `drop_branch`, `BranchInUse` (the name, quoted) from a second
