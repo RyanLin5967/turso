@@ -4437,15 +4437,12 @@ fn a_fuzzy_install_marks_its_commit_in_the_class_it_synced_in() {
     let trunk = db.connect().unwrap();
     seed(&trunk);
     trunk.fork_branch().unwrap().reap().unwrap();
-    let _y = trunk.fork_branch().unwrap().into_id();
     assert!(!db.branches.rewrite_class_for_test().syncs(), "premise: the D0 store is not raised at the capture");
     db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
-    let t = std::time::Instant::now();
-    while db.branch_checkpoint_held() != super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never committed");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    eventually("the checkpoint never committed", || {
+        db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED
+    });
     let full_before = db.branches.durable_for_test(SyncClass::FullFsync);
     trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("PRAGMA fullfsync = ON").unwrap();
@@ -4462,6 +4459,12 @@ fn a_fuzzy_install_marks_its_commit_in_the_class_it_synced_in() {
         db.branches.durable_for_test(SyncClass::FullFsync),
         full_before,
         "the fuzzy install marked its Off catalog commit FullFsync-durable on a fail-stopped store"
+    );
+    // The consequence (engine review 17 MED 6): with no live child, the next FULL trunk commit's
+    // barrier covers only the pre-capture Release, which nothing made FullFsync-durable.
+    assert_fail_stopped(
+        trunk.execute("UPDATE t SET v = 'again' WHERE id = 9").map(|_| ()),
+        "the next childless FULL trunk commit over a Release the install did not make durable",
     );
 }
 
