@@ -427,22 +427,27 @@ def self_test():
     N = v3l.N
     RULE = "1000:10:180"
 
-    def v3lj(verdict="VALID", lie=False, bins=(10000, 5)):
+    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop"):
         """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
-        over VOID arms (review L5)."""
+        over VOID arms (review L5). A brd block's record is a ram disk's, as the real one is (ram0, write through, the
+        probe's 'none (RAM)', no flush counted: fourth lane review HIGH 3's second half); any other is a write-back
+        nvme0n1."""
         fs = N if verdict == "VALID" and not lie else N // 2
+        brd = block == "brd"
 
         def arm(fsyncs, syncs):
             return {"v1l": {"data_writes": N, "data_fsyncs": fsyncs, "other_fsyncs": 0, "failed": 0, "io_uring_setup": 0,
                             "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0},
                     "labelling_fio": {"writes": N, "syncs": syncs},
                     "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": bins[0] / 1e3 if syncs else None,
-                              "fsync_bins_ns": {str(bins[0]): bins[1]} if syncs else None, "flush_ios_delta": 2 * N,
+                              "fsync_bins_ns": {str(bins[0]): bins[1]} if syncs else None,
+                              "flush_ios_delta": 0 if brd else 2 * N, **({"lab_flush_ios_delta": 0} if brd else {}),
                               # what v3l.py measure() records since T3 item 10's remainder (data + metadata)
                               "sectors_written_delta": 2 * N * 8, "lab_sectors_written_delta": 2 * N * 8}}
         r = {"verdict": "VALID" if lie else verdict, "void_reasons": [] if verdict == "VALID" or lie else ["planted"],
-             "floor_kind": "x", "leaf": {"disk": "nvme0n1", "write_cache": "write back", "drive_reports": "write back",
-                                         "layers": []},
+             "floor_kind": "x", "leaf": {"disk": "ram0" if brd else "nvme0n1",
+                                         "write_cache": "write through" if brd else "write back",
+                                         "drive_reports": "none (RAM)" if brd else "write back", "layers": []},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
         return json.dumps(r)
@@ -551,11 +556,11 @@ def self_test():
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
         bounds = [f"b{i}" for i in range(k + 1)]
         bb = boundary_bins or [(10000, 5)] * (k + 1)
-        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0]))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block))
         for i, b in enumerate(bounds[1:], 1):
             if i == 1 and after_v3l is None:
                 continue
-            w(f"{f}/v3l-{b}/v3l.json", v3lj(after_v3l if i == 1 else "VALID", bins=bb[i]))
+            w(f"{f}/v3l-{b}/v3l.json", v3lj(after_v3l if i == 1 else "VALID", bins=bb[i], block=block))
         for b in bounds:  # what t3run's v3l() writes after each measurement
             if os.path.exists(f"{f}/v3l-{b}/v3l.json"):
                 res, ok = v3l.plants(json.load(open(f"{f}/v3l-{b}/v3l.json")))
@@ -585,6 +590,10 @@ def self_test():
         ("third lane review HIGH 1 / LOW 8: a VOID (rc 3) V3 batch fails a brd block too (no RECORDED)",
          {"before_rc": 3, "void": "d0", "block": "brd"}, False, None),
         ("a brd block with rc 0 passes", {"block": "brd"}, True, None),
+        ("fourth lane review HIGH 3: a brd block's V3L records are ram0's (write through, 'none (RAM)'), and every "
+         "plant summarize re-derives on them fires", {"block": "brd"}, True,
+         lambda s: s["blocks"][0]["v3l"]["before"]["leaf"]["disk"] == "ram0"
+         and s["blocks"][0]["v3l_plants"] and all(all(v.values()) for v in s["blocks"][0]["v3l_plants"].values())),
         ("a refused (rc 2) V3 batch fails a brd block too", {"before_rc": 2, "block": "brd"}, False, None),
         ("A16: PLP declared, rc 0 with the flush counter met passes", {"plp": "yes"}, True, None),
         ("third lane review HIGH 1: PLP declared, a D0 foreign-writer VOID fails", {"plp": "yes", "before_rc": 3, "void": "d0"},
