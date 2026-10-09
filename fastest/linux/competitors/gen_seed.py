@@ -5,11 +5,17 @@ ours: gate-6 review, t3run item 4). The table: t(id INT PRIMARY KEY, v INT NOT N
 SQLite; INSERTs in batches of 1000 rows.
 
   gen_seed.py ROWS                        the parent SQL (unchanged form, used by pg18.sh, dolt.sh, doltgres.sh)
-  gen_seed.py sql --rows R                the same
-  gen_seed.py age --rows R --updates K [--seed S]
+  gen_seed.py sql --rows R [--digest-out FILE]
+                                          the same; --digest-out: the sha256 of the bytes written, into FILE (MED 3)
+  gen_seed.py age --rows R --updates K [--seed S] [--digest-out FILE]
                                           K random single-row UPDATEs, one statement each (autocommit: each committed),
                                           the same ids and values for every system (PREREG §7 / amendment 52 ages with
-                                          1e5); deterministic for (R, K, S)
+                                          1e5); deterministic for (R, K, S); K = 0 writes nothing
+  gen_seed.py expect --rows R [--updates K] [--seed S]
+                                          'count|sum|row_hash' the engine must read back from t
+  gen_seed.py readback-sql --dialect pg|mysql
+                                          the engine's own read-back query of that triple (pg: PostgreSQL, Doltgres)
+  gen_seed.py readback-sqlite FILE        the same triple read from an SQLite file
   gen_seed.py digest --rows R [--updates K] [--seed S]
                                           sha256 of the exact SQL stream (parent, then aging): fixture.json's
                                           gen_seed_sha256, the same for every system that loaded it
@@ -83,13 +89,54 @@ def rows_for(nbytes):
 # ---- what the engine must READ BACK (lead review 62430d8bf..b49fb656a MED 3: the fixture guard compared its own
 # inputs; now each job records the digest of the bytes it actually piped and the engine's own read-back of t)
 def stream_digests(rows, updates=0, seed=1):
-    """RED stub."""
-    return {"sql": None, "age": None}
+    """sha256 of each stream exactly as `gen_seed.py sql` and `gen_seed.py age` write it (every line + "\\n")."""
+    out = {}
+    for k, lines in (("sql", sql_lines(rows)), ("age", age_lines(rows, updates, seed))):
+        h = hashlib.sha256()
+        for ln in lines:
+            h.update(ln.encode() + b"\n")
+        out[k] = h.hexdigest()
+    return out
+
+
+def hash_row(i, v, pad):
+    return int(hashlib.md5(f"{i}:{v}:{pad}".encode()).hexdigest()[:6], 16)
 
 
 def row_hash(rows, updates=0, seed=1):
-    """RED stub."""
-    return 0
+    """The order-independent row hash: sum over t of the first 6 hex digits of md5("id:v:pad") (exact in every engine:
+    a 24-bit term, so 5e8 rows stay below 2^53, where Dolt's SUM is a double). Streams the parent once, holding only
+    the aged rows' final values (O(K) memory, not O(rows))."""
+    last = {}
+    for ln in age_lines(rows, updates, seed):
+        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
+        last[int(i)] = int(v)
+    total = 0
+    for ln in sql_lines(rows):
+        if ln.startswith("INSERT"):
+            for tup in ln[ln.index("VALUES ") + 7:-1].split("),("):
+                i, v, pad = tup.strip("()").split(",", 2)
+                i = int(i)
+                total += hash_row(i, last.get(i, int(v)), pad.strip("'"))
+    return total
+
+
+def readback_sql(dialect):
+    """The engine's own read-back of t as 'count|sum|row_hash', in its dialect (pg: PostgreSQL and Doltgres, which has
+    no bit casts or get_byte, so the hex digits are decoded with ascii(); mysql: Dolt, whose SUM over integers is a
+    double, so both sums are CAST to DECIMAL(20,0) to print as integers)."""
+    if dialect == "mysql":
+        return ("SELECT count(*), CAST(SUM(v) AS DECIMAL(20,0)), "
+                "CAST(SUM(CONV(SUBSTR(MD5(CONCAT(id, ':', v, ':', pad)), 1, 6), 16, 10)) AS DECIMAL(20,0)) FROM t")
+    if dialect == "pg":
+        h = "md5(id::text || ':' || v::text || ':' || pad)"
+
+        def dig(k):
+            c = f"ascii(substr({h}, {k}, 1))"
+            return f"(CASE WHEN {c} > 57 THEN {c} - 87 ELSE {c} - 48 END)"
+        expr = " + ".join(f"{dig(k)} * {16 ** (6 - k)}" for k in range(1, 7))
+        return f"SELECT count(*), sum(v), sum({expr}) FROM t"
+    raise ValueError(f"unknown dialect {dialect}")
 
 
 def expect(rows, updates=0, seed=1):
@@ -166,15 +213,35 @@ if __name__ == "__main__":
     cmd = av[0]
     if cmd == "selftest":
         sys.exit(selftest())
-    if cmd == "sql":
+    if cmd in ("sql", "age"):
         r = arg(av, "--rows")
         if r < 1:
             sys.exit("gen_seed.py: ROWS must be >= 1")
-        for ln in sql_lines(r):
-            out.write(ln + "\n")
-    elif cmd == "age":
-        for ln in age_lines(arg(av, "--rows"), arg(av, "--updates"), arg(av, "--seed", 1)):
-            out.write(ln + "\n")
+        lines = sql_lines(r) if cmd == "sql" else age_lines(r, arg(av, "--updates"), arg(av, "--seed", 1))
+        # --digest-out FILE: the sha256 of the bytes this process WROTE (MED 3: the write path's own record of what
+        # it piped), written only after the last byte went out
+        h = hashlib.sha256()
+        for ln in lines:
+            b = ln + "\n"
+            out.write(b)
+            h.update(b.encode())
+        out.flush()
+        if "--digest-out" in av:
+            with open(av[av.index("--digest-out") + 1], "w") as f:
+                f.write(h.hexdigest() + "\n")
+    elif cmd == "expect":
+        print(expect(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
+    elif cmd == "readback-sql":
+        print(readback_sql(arg(av, "--dialect", conv=str)))
+    elif cmd == "readback-sqlite" and len(av) == 2:
+        import sqlite3
+        # a plain connection: a read-only open of a WAL database can fail for want of its -shm; only SELECTs run here
+        con = sqlite3.connect(av[1])
+        n = s = hsum = 0
+        for i, v, pad in con.execute("SELECT id, v, pad FROM t"):
+            n, s, hsum = n + 1, s + v, hsum + hash_row(i, v, pad)
+        con.close()
+        print(f"{n}|{s}|{hsum}")
     elif cmd == "digest":
         print(digest(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     elif cmd == "rows-for":

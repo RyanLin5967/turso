@@ -423,9 +423,19 @@ server_fixture() {
       why="Doltgres has no working pg_database_size; du only"
       ext=("$DATA"/databases/*/.dolt/noms/*) ;;
   esac
+  # MED 3: what the engine READS BACK from the parent (count, exact sum, order-independent row hash: gen_seed.py
+  # readback-sql in its dialect), against what the generator wrote; and the digests the seed's own write path recorded
+  local rb dial=pg
+  [ "$KIND" = dolt ] && dial=mysql
+  rb=$(sqlp "$(python3 -B "$HERE/gen_seed.py" readback-sql --dialect "$dial")" | tr '\t' '|' | tail -1)
+  echo "$rb" >"$RAW/readback.txt"
+  expect "parent read back by the engine (count|sum|row hash)" "$rb" \
+    "$(python3 -B "$HERE/gen_seed.py" expect --rows "$ROWS" --updates "$AGE")"
+  cp "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" "$RAW/" 2>/dev/null || fail "seed stream digests missing"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} \
-    ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" >/dev/null || fail "fixture.json"
+    ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" \
+    --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null || fail "fixture.json"
 }
 # designate SPEC -- after the cells: ONE op of SPEC (C=1, no warm-up) with its after-steps skipped, so its branch
 # stays for the functional checks to read (the isolation read, the clone proof); prints the branch name. Untraced,
@@ -599,8 +609,14 @@ b1_main() {
   mkdir -p "$ROOT/branches"
   # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
   # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
-  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" | tee "$RAW/mkparent.json" ||
-    { fail "parent (fixture.py sqlite)"; return; }
+  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
+    tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
+  # MED 3: the parent as SQLite reads it back (count, sum, row hash) against what the generator wrote
+  local rb
+  rb=$(python3 -B "$HERE/gen_seed.py" readback-sqlite "$ROOT/parent.db")
+  echo "$rb" >"$RAW/readback.txt"
+  expect "parent read back from the SQLite file (count|sum|row hash)" "$rb" \
+    "$(python3 -B "$HERE/gen_seed.py" expect --rows "$ROWS" --updates "$AGE")"
   # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
   # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
   # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
@@ -616,7 +632,7 @@ b1_main() {
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
     --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
-    >/dev/null || fail "fixture.json"
+    --streams "$RAW/seed-sql.sha256" "$RAW/seed-age.sha256" --readback "$rb" >/dev/null || fail "fixture.json"
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}

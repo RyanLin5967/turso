@@ -47,12 +47,14 @@ seed)
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | my bench
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
   # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each its own autocommitted
-  # statement, then Dolt's documented maintenance: dolt_commit, then dolt_gc.
+  # statement (AGE=0 pipes an empty stream, whose digest is recorded too), then Dolt's documented maintenance:
+  # dolt_commit, then dolt_gc.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | my bench
   if [ "$AGE" -gt 0 ]; then
-    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | my bench
     my -N bench -e "CALL DOLT_COMMIT('-am', 'age')" >/dev/null
     # DOLT_GC ends the calling session in sql-server mode, so success is checked by a new connection afterwards; a
     # failed GC fails the seed (the recorded maintenance must be what ran).

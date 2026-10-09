@@ -17,13 +17,19 @@ cells (each with one private write: the system's own M1 op, untimed). Each job w
                    --engine-why W] [--extents FILE...] [--maintenance TEXT]
                                OUT = fixture.json: du_bytes = `du -sB1` over the PATHs (allocated bytes), extents =
                                filefrag's count per FILE, gen_seed_sha256 = gen_seed.py's digest for (R, K, seed 1)
-  fixture.py sqlite FILE --rows R --age K --sqlite3 BIN
+  fixture.py sqlite FILE --rows R --age K --sqlite3 BIN [--digest-dir DIR]
                                the parent as an SQLite file, the way B1 (and ours, which opens SQLite files) get it:
                                journal_mode=WAL, gen_seed.py's SQL, its K aging UPDATEs (each autocommitted), then
                                the documented maintenance, a TRUNCATE checkpoint; prints the engine's size
-                               (page_count x page_size)
+                               (page_count x page_size) and the fed streams' digests (also DIR/seed-{sql,age}.sha256)
+  fixture.py write ... --streams SQL.sha256 AGE.sha256 --readback 'COUNT|SUM|ROW_HASH'
+                               (MED 3) the write path's own stream digests and the engine's read-back of t (gen_seed.py
+                               readback-sql / readback-sqlite), recorded beside the generator's expected values;
+                               compare refuses a job where either differs. The size tolerance against ours is not
+                               implemented here (competitor half only; ours is fastest-linux's)
   fixture.py selftest          known-answer fixtures for compare
 """
+import hashlib
 import json
 import os
 import re
@@ -35,7 +41,7 @@ sys.path.insert(0, HERE)
 import gen_seed  # noqa: E402
 
 
-KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256")
+KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "stream_sha256", "readback")
 
 
 def compare(fixtures):
@@ -57,6 +63,12 @@ def compare(fixtures):
         # excluded) and must be the requested one
         if f.get("live_branches") is not None and f.get("live_branches") != f.get("prebranch"):
             why.append(f"{s}: {f.get('live_branches')} live branches measured, {f.get('prebranch')} requested")
+        # MED 3: what the write path piped, and what the engine read back, each against the generator
+        if f.get("stream_sha256") is not None and f.get("stream_sha256") != f.get("expected_streams"):
+            why.append(f"{s}: piped stream digests {f.get('stream_sha256')} are not the generator's "
+                       f"{f.get('expected_streams')}")
+        if f.get("readback") is not None and f.get("readback") != f.get("expected_readback"):
+            why.append(f"{s}: the engine read back {f.get('readback')}, the generator wrote {f.get('expected_readback')}")
         if not isinstance(f.get("du_bytes"), int) or f["du_bytes"] <= 0:
             why.append(f"{s}: no du_bytes")
         eb = f.get("engine_bytes")
@@ -65,7 +77,7 @@ def compare(fixtures):
     return why
 
 
-def opts(av, multi=("--du", "--extents")):
+def opts(av, multi=("--du", "--extents", "--streams")):
     o, i, key = {}, 0, None
     while i < len(av):
         a = av[i]
@@ -108,6 +120,19 @@ def write(av):
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,
           "extents": {p: extent_count(p) for p in o.get("--extents", [])},
           "maintenance": o.get("--maintenance", "")}
+    # MED 3: the write path's own digest files (gen_seed.py --digest-out, or fixture.py sqlite's) and the engine's
+    # read-back triple, recorded beside what the generator says they must be
+    sd = {}
+    for k, p in zip(("sql", "age"), o.get("--streams", [])):
+        try:
+            sd[k] = open(p).read().strip() or None
+        except OSError:
+            sd[k] = None
+    fx["stream_sha256"] = sd if len(sd) == 2 and all(sd.values()) else None
+    fx["expected_streams"] = gen_seed.stream_digests(rows, age, 1)
+    m = re.fullmatch(r"(\d+)\|(\d+)\|(\d+)", o.get("--readback", "").strip())
+    fx["readback"] = dict(zip(("count", "sum", "row_hash"), map(int, m.groups()))) if m else None
+    fx["expected_readback"] = dict(zip(("count", "sum", "row_hash"), map(int, gen_seed.expect(rows, age, 1).split("|"))))
     if fx["engine_bytes"] is None:
         fx["engine_bytes_why"] = o.get("--engine-why") or f"engine size not read ({o.get('--engine-bytes')!r})"
         if not o.get("--engine-why"):
@@ -122,8 +147,14 @@ def sqlite(av):
     rows, age, sq3 = int(o["--rows"]), int(o["--age"]), o["--sqlite3"]
     if os.path.exists(path):
         sys.exit(f"fixture.py sqlite: {path} exists")
-    feed = ["PRAGMA journal_mode=WAL;"] + list(gen_seed.sql_lines(rows)) + list(gen_seed.age_lines(rows, age, 1)) + \
-        ["PRAGMA wal_checkpoint(TRUNCATE);"]
+    sql, aging = list(gen_seed.sql_lines(rows)), list(gen_seed.age_lines(rows, age, 1))
+    # MED 3: the digest of each stream as this write path feeds it (the same framing as gen_seed.py --digest-out)
+    dg = {k: hashlib.sha256("".join(ln + "\n" for ln in ls).encode()).hexdigest() for k, ls in (("sql", sql), ("age", aging))}
+    if o.get("--digest-dir"):
+        for k, h in dg.items():
+            with open(os.path.join(o["--digest-dir"], f"seed-{k}.sha256"), "w") as f:
+                f.write(h + "\n")
+    feed = ["PRAGMA journal_mode=WAL;"] + sql + aging + ["PRAGMA wal_checkpoint(TRUNCATE);"]
     r = subprocess.run([sq3, path], input="\n".join(feed) + "\n", capture_output=True, text=True, timeout=3600)
     if r.returncode != 0:
         sys.exit(f"fixture.py sqlite: {sq3} rc {r.returncode}: {r.stderr[-400:]}")
@@ -132,7 +163,7 @@ def sqlite(av):
     lines = q.stdout.split()
     eng = int(lines[0]) * int(lines[1]) if q.returncode == 0 and len(lines) >= 3 else None
     print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng,
-                      "count_sum": lines[2] if len(lines) >= 3 else None,
+                      "count_sum": lines[2] if len(lines) >= 3 else None, "stream_sha256": dg,
                       "maintenance": "journal_mode=WAL; load; aged %d; wal_checkpoint(TRUNCATE)" % age}))
 
 

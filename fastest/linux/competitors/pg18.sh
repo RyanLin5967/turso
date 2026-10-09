@@ -81,11 +81,13 @@ seed)
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
   psqlc -d postgres -c "CREATE DATABASE p"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | psqlc -d p
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | psqlc -d p
   psqlc -d p -c "CHECKPOINT"
   # Aged parent (gate-6 review, t3run item 4; PREREG §7 / amendment 52): AGE committed single-row UPDATEs (psql
-  # autocommits each statement), the same stream for every system, then PG's documented maintenance.
-  [ "$AGE" -gt 0 ] && { "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc -d p; }
+  # autocommits each statement), the same stream for every system, then PG's documented maintenance. AGE=0 pipes an
+  # empty stream, so its digest is recorded too.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc -d p
   psqlc -d p -c "VACUUM ANALYZE t" -c "CHECKPOINT"
   echo "maintenance: CHECKPOINT; aged $AGE; VACUUM ANALYZE; CHECKPOINT"
   echo "seeded p.t rows=$(psqlc -d p -At -c 'SELECT count(*) FROM t') size=$(psqlc -d p -At -c "SELECT pg_size_pretty(pg_database_size('p'))")"

@@ -61,12 +61,13 @@ seed)
   [ -n "$ROWS" ] || die "usage: doltgres.sh seed DATA ROWS"
   alive "$PIDF" "$CONF" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" | psqlc
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | psqlc
   psqlc -At -c "SELECT dolt_commit('-Am', 'seed')"
-  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each autocommitted, then the
-  # documented maintenance: dolt_commit, then dolt_gc.
+  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each autocommitted (AGE=0 pipes
+  # an empty stream, whose digest is recorded too), then the documented maintenance: dolt_commit, then dolt_gc.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc
   if [ "$AGE" -gt 0 ]; then
-    "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" | psqlc
     psqlc -At -c "SELECT dolt_commit('-am', 'age')"
     # dolt_gc may end the calling session, so success is checked by a new connection afterwards; a failed GC fails
     # the seed (the recorded maintenance must be what ran).
