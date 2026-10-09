@@ -5343,12 +5343,19 @@ fn untyped_contexts_type_their_parameters() {
             "79",
             vec!["1"],
         ),
-        // 'true', so a parameter bound as text ('true' is not the boolean) would return row 1 only.
+        // 'true', so a parameter bound as text ('true' is not the boolean) would return row 1 only;
+        // and 'false', the arm 8570d4847 replaced (wire review 15 item 13: kept, not replaced).
         (
             "SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id",
             BOOL,
             "true",
             vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id",
+            BOOL,
+            "false",
+            vec!["1"],
         ),
         (
             "SELECT c FROM (SELECT count(*) AS c FROM p) AS d WHERE c > $1",
@@ -5389,8 +5396,11 @@ fn untyped_contexts_type_their_parameters() {
             ));
         }
     }
-    // A Describe for each further context 935586643 types (PostgreSQL's types by these fixtures'
-    // semantics; the PG18 recording is owed with E5-QUEUE P7).
+    // Describes of further contexts the walk types (PostgreSQL's types by these fixtures'
+    // semantics; the PG18 recording is owed with E5-QUEUE P7). A TEXT expectation cannot tell a
+    // typed context from the text fallback; those rows guard against a refusal only (wire review 15
+    // items 14 and 28: the shadowing row now expects int8, the SET rows include two non-text
+    // columns, and the condition, OFFSET and arithmetic contexts are added).
     for (sql, want) in [
         ("SELECT count(*) FROM p GROUP BY n > $1", vec![INT4]),
         ("SELECT id FROM p ORDER BY n = $1, id", vec![INT4]),
@@ -5408,9 +5418,24 @@ fn untyped_contexts_type_their_parameters() {
             vec![INT4, TEXT],
         ),
         (
-            "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT 'x' AS n) AS q WHERE n = $1)",
-            vec![TEXT],
+            "UPDATE p SET (id, n) = ($1, $2) WHERE id = 1",
+            vec![INT4, INT4],
         ),
+        (
+            "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT count(*) AS n FROM p) AS q \
+             WHERE n = $1)",
+            vec![INT8],
+        ),
+        (
+            "SELECT p.id FROM p JOIN p AS q ON $1 WHERE p.id = 1",
+            vec![BOOL],
+        ),
+        ("SELECT id FROM p WHERE $1 AND id = 1", vec![BOOL]),
+        ("SELECT id FROM p WHERE NOT $1", vec![BOOL]),
+        ("SELECT CASE WHEN $1 THEN 1 ELSE 0 END FROM p", vec![BOOL]),
+        ("SELECT id FROM p WHERE $1 IS TRUE", vec![BOOL]),
+        ("SELECT id FROM p ORDER BY id OFFSET $1", vec![INT8]),
+        ("SELECT id FROM p WHERE n + $1 = 11", vec![INT4]),
         (
             "WITH w(a) AS (SELECT n FROM p) SELECT a FROM w WHERE a = $1",
             vec![INT4],
@@ -5442,7 +5467,9 @@ fn untyped_contexts_type_their_parameters() {
     }
     // Compared with something no context types (a function the engine has, which the walk does not
     // type): exactly 42P18, the lead's fail-closed rule, where the base served it as text; a
-    // function that does not exist is the engine's 42883.
+    // function that does not exist is the engine's 42883. ENGINE-ONLY: PostgreSQL has no typeof
+    // and answers 42883 for the first row too, so a PG18 re-recording of E5-QUEUE P7 must not
+    // "correct" it; it is the only fail-closed probe here (wire review 15 item 27).
     for (sql, code) in [
         ("SELECT id FROM p WHERE typeof(name) = $1", "42P18"),
         ("SELECT id FROM p WHERE no_such_typing(name) = $1", "42883"),
