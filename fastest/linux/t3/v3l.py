@@ -592,7 +592,7 @@ def self_test():
 
     cases += [
         ("a clean write-back record is VALID", gates(rec()) == []),
-        ("a clean write-through record is VALID (no counter gate)", gates(rec(wc="write through", delta=0)) == []),
+        ("a clean write-through record (counter 0 in the timed run) is VALID", gates(rec(wc="write through", delta=0)) == []),
         ("9,999 fsyncs VOIDs", gates(rec(fsyncs=N - 1)) != []),
         ("one control fsync VOIDs", gates(rec(ctl_fsyncs=1)) != []),
         ("an fsync of another file VOIDs", gates(rec(other=1)) != []),
@@ -612,7 +612,7 @@ def self_test():
          gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": 0}])) != []),
         ("M3: a write-back loop layer with 10,000 flushes is VALID",
          gates(rec(layers=[{"name": "loop3", "write_cache": "write back", "flush_ios_delta": N}])) == []),
-        ("M3: a write-through loop layer is not gated on its own counter",
+        ("M3: a write-through loop layer whose counter reads 0 is VALID",
          gates(rec(layers=[{"name": "loop3", "write_cache": "write through", "flush_ios_delta": 0}])) == []),
         ("M6: kernel write through over a drive reporting write back VOIDs",
          gates(rec(wc="write through", delta=0, drive="write back")) != []),
@@ -628,11 +628,11 @@ def self_test():
          gates(rec(layers=[{"name": "loop3", "write_cache": "write through", "flush_ios_delta": 3}])) != []),
         ("floor rule: labelling 2 per fsync, timed 1.5 per fsync VOIDs", gates(_lab(rec(delta=15000), 20004)) != []),
         ("floor rule: labelling 2 per fsync, timed 2 per fsync is VALID", gates(_lab(rec(delta=20003), 20004)) == []),
-        ("plants on a VALID write-back record: control passes and all four fire", plants(rec(delta=20003))[1]),
-        ("plants on a VALID write-through record: all four fire", plants(rec(wc="write through", delta=0))[1]),
-        ("plants on a write-through record carrying labelling count 0 (as measured now): all four fire",
+        ("plants on a VALID write-back record: control passes and every plant fires", plants(rec(delta=20003))[1]),
+        ("plants on a VALID write-through record: every plant fires", plants(rec(wc="write through", delta=0))[1]),
+        ("plants on a write-through record carrying labelling count 0 (as measured now): every plant fires",
          plants(_lab(rec(wc="write through", delta=0), 0))[1]),
-        ("plants on a write-back record carrying its labelling count: all four fire",
+        ("plants on a write-back record carrying its labelling count: every plant fires",
          plants(_lab(rec(delta=20003), 20004))[1]),
         ("plants on a VOID record: NOT-RUN", not plants(rec(fsyncs=N - 1))[1]),
         # item 3 (T3 runner review MED 3): the write-back rules apply whatever the labelling count is; a count below N
@@ -729,6 +729,42 @@ def self_test():
         ("item 18: a missing count publishes None, not a crash",
          _ok(lambda: (lambda p: p["flush_ios_per_fsync"] is None and p["lab_flush_ios_per_fsync"] is None)(
              publish(rec(delta=None))))),
+        # item 19 (T3 runner review LOW 19): floor_kind names only what was checked, one branch per state; an unknown
+        # or VOID state never reads "counter 0 checked"; the module docstring names every text the code writes
+        ("item 19: floor_kind of a ram disk (brd) is the brd text",
+         _ok(lambda: floor_kind(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"))
+             == "brd: no drive (dry runs only, never credited)")),
+        ("item 19: floor_kind of a write-back drive is the write-back text",
+         _ok(lambda: floor_kind(_lab(rec(delta=20003), 20004)) == "write-back drive: flush requests completed by the "
+             "driver (issued and acknowledged, not persistence)")),
+        ("item 19: floor_kind of a write-through drive at 0 in both runs says counter 0 checked in both runs",
+         _ok(lambda: floor_kind(_lab(rec(wc="write through", delta=0), 0))
+             == "no volatile cache: no flush request sent (counter 0 checked in both runs)")),
+        ("item 19: floor_kind of a write-through drive with no labelling count says the timed run only",
+         _ok(lambda: floor_kind(rec(wc="write through", delta=0))
+             == "no volatile cache: no flush request sent (counter 0 checked in the timed run; no labelling count)")),
+        ("item 19: floor_kind of a write-through drive whose timed counter rose is VOID, not 'counter 0 checked'",
+         _ok(lambda: floor_kind(_lab(rec(wc="write through", delta=1), 0))
+             == "write-through queue with flushes counted (VOID)")),
+        ("item 19: floor_kind of a write-through drive whose labelling counter rose is VOID, not 'counter 0 checked'",
+         _ok(lambda: floor_kind(_lab(rec(wc="write through", delta=0), 1))
+             == "write-through queue with flushes counted (VOID)")),
+        ("item 19: floor_kind of an unreadable write_cache (None) is 'write cache unknown (VOID)'",
+         _ok(lambda: floor_kind(rec(wc=None, delta=0)) == "write cache unknown (VOID)")),
+        ("item 19: floor_kind of an unknown write_cache ('write through, sometimes') is 'write cache unknown (VOID)'",
+         _ok(lambda: floor_kind(rec(wc="write through, sometimes", delta=0)) == "write cache unknown (VOID)")),
+        ("item 19: floor_kind appends the virtualization note to its branch's text",
+         _ok(lambda: floor_kind(dict(_lab(rec(delta=20003), 20004), virtualization={"virtualized": "kvm"}))
+             == "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence); "
+                "virtualized 'kvm': reach to media unknown")),
+        ("item 19: the module docstring names every floor_kind text the code writes",
+         all(s in " ".join((__doc__ or "").split()) for s in (
+             "brd: no drive (dry runs only, never credited)",
+             "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence)",
+             "no volatile cache: no flush request sent (counter 0 checked in both runs)",
+             "no volatile cache: no flush request sent (counter 0 checked in the timed run; no labelling count)",
+             "write-through queue with flushes counted (VOID)",
+             "write cache unknown (VOID)"))),
         ("pooled p50 of {100:3} and {200:3, 300:1}: 200", pooled_p50_ns([{"100": 3}, {"200": 3, "300": 1}]) == 200),
         ("pooled p50 with a missing histogram: None", pooled_p50_ns([{"100": 3}, None]) is None),
         ("block with a missing after file: MISSING", block("/nonexistent/b.json", "/nonexistent/a.json")["verdict"] == "MISSING"),
