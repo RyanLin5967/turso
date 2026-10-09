@@ -5547,6 +5547,55 @@ fn a_parameter_is_typed_by_every_kind_of_from_item() {
     );
 }
 
+/// A bare column a join merges (USING, NATURAL) is typed from the merged column: `JOIN q USING
+/// (id) WHERE id = $1` and the NATURAL form type $1 int4. One found in two relations of a level was
+/// read as not found, so $1 fell to text (wire review 14 item 9). A column two relations have that
+/// no join merges stays PostgreSQL's 42702.
+#[test]
+fn a_join_merged_column_types_its_parameter() {
+    const INT4: u32 = 23;
+    let dir = Scratch::new("joinusing");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE jp(id INT PRIMARY KEY, n INT)").ok("jp");
+    a.q("CREATE TABLE jq(id INT PRIMARY KEY, flag BOOLEAN)")
+        .ok("jq");
+    a.q("INSERT INTO jp VALUES (1, 10), (2, 20)").ok("jp rows");
+    a.q("INSERT INTO jq VALUES (1, true), (2, false)")
+        .ok("jq rows");
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT n FROM jp JOIN jq USING (id) WHERE id = $1",
+        "SELECT n FROM jp NATURAL JOIN jq WHERE id = $1",
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(vec![INT4]) {
+            wrong.push(format!(
+                "{sql}: {:?} {:?}, want [{INT4}]",
+                r.params, r.error
+            ));
+        }
+        let r = a.xt(sql, &[(0, 0, b"2")]);
+        if r.error.is_some() || r.rows != vec![vec![Some("20".to_string())]] {
+            wrong.push(format!(
+                "{sql} with 2: {:?} {:?}, want [20]",
+                r.rows, r.error
+            ));
+        }
+    }
+    let sql = "SELECT n FROM jp JOIN jq ON true WHERE id = $1";
+    let r = a.describe_statement(sql);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42702") {
+        wrong.push(format!("{sql}: {:?} {:?}, want 42702", r.params, r.error));
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A circular view is answered with an error and the server serves on. The inference walk opened a
 /// view by walking its query, which reached the view again: with no visited set it recursed until
 /// the session thread's 8 MiB stack overflowed, which aborts the process, every session with it,
