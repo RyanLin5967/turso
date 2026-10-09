@@ -1149,28 +1149,31 @@ impl Connection {
         // The branch starts with the schema that matches the committed pages it will read. The
         // connection's own snapshot or the shared one is that schema whenever the cookie agrees.
         // If neither does, a DDL commit is between publishing its pages and its schema, and the
-        // fork re-reads the schema its snapshot holds rather than refuse (engine 2b: refused, a
-        // create failed whenever it met that window). Mutant `fork_refuses_schema_window` (test
-        // builds only): refused with SchemaUpdated, as before.
+        // child is registered with none: it reads its own from its pages at its first connection,
+        // as any fork after a trunk commit does (engine 2b: refused, a create failed whenever it
+        // met that window; engine review 16 MED 8: re-read here, the whole schema into the
+        // forker's connection, sometimes under the WAL write lock). Mutants (test builds only):
+        // `fork_refuses_schema_window` (refused with SchemaUpdated, as before 2b) and
+        // `fork_rereads_schema_window` (re-read here, as before MED 8).
         let in_hand = [self.schema.read().clone(), self.db.clone_schema()]
             .into_iter()
             .find(|schema| schema.schema_version == cookie);
         let schema = match in_hand {
-            Some(schema) => schema,
+            Some(schema) => Some(schema),
             None if store::fe_mutant("fork_refuses_schema_window") => {
                 return Err(LimboError::SchemaUpdated)
             }
-            None => self.reread_schema_at_snapshot(cookie)?,
+            None if store::fe_mutant("fork_rereads_schema_window") => Some(self.reread_schema_at_snapshot(cookie)?),
+            None => None,
         };
         let page_size = pager.get_page_size_unchecked().get() as usize;
         self.db.branches.fork_trunk(schema, page_size, seen, name)
     }
 
-    /// The schema this connection's open read snapshot holds, when no schema in hand matches its
-    /// cookie (`fork_trunk_registered`): re-read from the snapshot's pages into the connection, as
-    /// SQLite re-reads its schema on SQLITE_SCHEMA, and not published (the DDL commit that wrote it
-    /// publishes its own). A failed re-read leaves the connection the schema it had. Costs one
-    /// `sqlite_schema` scan, only on a fork that meets a DDL commit's publication window.
+    /// The schema this connection's open read snapshot holds, re-read from its pages into the
+    /// connection: mutant `fork_rereads_schema_window`'s path only (engine review 16 MED 8 moved
+    /// the read to the child's first connection). A failed re-read leaves the connection the
+    /// schema it had.
     fn reread_schema_at_snapshot(
         self: &Arc<Connection>,
         cookie: u32,
@@ -1386,8 +1389,23 @@ impl Database {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
-        self.connect_branch(id)
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
+        self.branches.pause_connect_looked_up();
+        // A drop that lands between the lookup and the open leaves the open an untyped error (the
+        // branch gone, or reaped): the name no longer names an unreleased branch, which is
+        // NoSuchBranch, as the lookup would now answer (engine review 14 MED 9). Error path only:
+        // the success path is unchanged. Mutant `connect_race_untyped` (test builds only): the
+        // open's own error, as before.
+        self.connect_branch(id).map_err(|e| {
+            if crate::branch::store::fe_mutant("connect_race_untyped")
+                || matches!(e, LimboError::NoSuchBranch(_))
+                || !self.branches.is_gone_or_released(id)
+            {
+                e
+            } else {
+                store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+            }
+        })
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
@@ -1399,11 +1417,22 @@ impl Database {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
-        // branch is never touched (its id differs).
+        // branch is never touched (its id differs). A connect between the lookup and the release
+        // is refused by the release's own open check, made under the same store-mutex hold as the
+        // release (engine review 14 MED 7). Mutant `drop_check_separate_hold` (test builds only):
+        // the open check in a hold of its own before that window, the release unchecked after it.
+        let separate = crate::branch::store::fe_mutant("drop_check_separate_hold");
+        if separate {
+            self.branches.refuse_if_open(id)?;
+        }
+        self.branches.pause_drop_looked_up();
+        if separate {
+            return self.branches.release_handle(id);
+        }
         self.branches.release_named(id)
     }
 

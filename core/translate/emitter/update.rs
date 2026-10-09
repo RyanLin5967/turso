@@ -593,6 +593,48 @@ fn emit_notnull_constraint_check(
     Ok(())
 }
 
+/// fastest-engine 4c: in a table whose rowid alias is NOT NULL (a PG-frontend table's INTEGER
+/// PRIMARY KEY, `BTreeTable::rowid_alias_refuses_null`), a new key that is NULL (`SET id = NULL`,
+/// a bound NULL, or `SET rowid = NULL`) raises the NOT NULL constraint on the alias column, under
+/// the UPDATE's OR clause as any NOT NULL column. Emitted where `MustBeInt` would otherwise raise
+/// "datatype mismatch" for the NULL, so nothing else moves. No-op for every other table.
+fn emit_rowid_alias_not_null_check(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    column_ctx: &UpdateColumnCtx<'_>,
+    key_reg: usize,
+    skip_row_label: BranchOffset,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if column_ctx.is_virtual_table {
+        return Ok(());
+    }
+    let Some(btree) = column_ctx.target_table.table.btree() else {
+        return Ok(());
+    };
+    if !btree.rowid_alias_refuses_null() {
+        return Ok(());
+    }
+    let Some(alias) = btree.columns().iter().find(|c| c.is_rowid_alias()) else {
+        return Ok(());
+    };
+    let conflict = if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        alias.notnull_conflict_clause.unwrap_or(ResolveType::Abort)
+    };
+    emit_notnull_constraint_check(
+        program,
+        table_references,
+        key_reg,
+        alias,
+        column_ctx.table_name(),
+        conflict,
+        skip_row_label,
+        resolver,
+    )
+}
+
 /// Build the `TriggerContext` used to fire BEFORE/AFTER row triggers for this
 /// UPDATE. Carries the NEW and OLD register snapshots the trigger body will
 /// read, and propagates a conflict-resolution override when one is in effect:
@@ -775,6 +817,14 @@ fn emit_update_column_values<'a>(
                 rowid_set_clause_reg,
                 &t_ctx.resolver,
             )?;
+            emit_rowid_alias_not_null_check(
+                program,
+                table_references,
+                column_ctx,
+                rowid_set_clause_reg,
+                skip_row_label,
+                &t_ctx.resolver,
+            )?;
             program.emit_insn(Insn::MustBeInt {
                 reg: rowid_set_clause_reg,
                 target_pc: None,
@@ -821,6 +871,14 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
 
+                    emit_rowid_alias_not_null_check(
+                        program,
+                        table_references,
+                        column_ctx,
+                        rowid_set_clause_reg,
+                        skip_row_label,
+                        &t_ctx.resolver,
+                    )?;
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
                         target_pc: None,

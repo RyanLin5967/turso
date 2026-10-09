@@ -449,11 +449,18 @@ mod census_tests {
     }
 }
 
+/// Test builds: the IO the next `Catalog::open` uses instead of a platform IO, taken once (engine
+/// review 17 MED 3: a catalog whose WAL sync fails).
+#[cfg(test)]
+pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<Arc<dyn IO>>> = std::sync::Mutex::new(None);
+
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    /// The class this handle's commits sync in (`prepared`, `raise_sync`).
+    /// The class this handle's commits sync in (`prepared`, `set_commit_sync`), and the one it was
+    /// opened in, below which `set_commit_sync` never goes.
     sync: SyncClass,
+    opened_sync: SyncClass,
     pub(crate) counters: CatalogCounters,
     /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
     pub(crate) prewarm: PrewarmStats,
@@ -506,7 +513,14 @@ impl Catalog {
     /// `synchronous = FULL`, so a checkpoint's commit is durable before the log starts over; `Off`
     /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
     pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        #[cfg(test)]
+        let hooked = NEXT_CATALOG_IO.lock().unwrap().take();
+        #[cfg(not(test))]
+        let hooked: Option<Arc<dyn IO>> = None;
+        let io: Arc<dyn IO> = match hooked {
+            Some(io) => io,
+            None => Arc::new(PlatformIO::new()?),
+        };
         let path = path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
         })?;
@@ -630,20 +644,24 @@ impl Catalog {
             conn,
             _db: db,
             sync,
+            opened_sync: sync,
         })
     }
 
-    /// Sync this handle's commits in `class` from now on, if it is stronger than their class:
-    /// a checkpoint replaces log records that were made durable in a raised class, and its commit
-    /// must keep them that durable (fastest-engine review B-F3).
-    pub(crate) fn raise_sync(&mut self, class: SyncClass) -> Result<()> {
-        if !class.syncs() || class <= self.sync {
+    /// Sync this handle's commits in `class`, or in the class it was opened in if that is
+    /// stronger: a checkpoint replaces log records that were made durable in `class`, and its
+    /// commit must keep them that durable (fastest-engine review B-F3) and no more, so the class
+    /// the install claims for the commit is the one it synced in (engine review 16 LOW 13, review
+    /// 17 #14: this only raised, while the class a capture needs can drop). Blind spot: at
+    /// 8f11fa2af a capture's class never drops within a process (`synced_base` is sticky in the
+    /// free class), so no test reaches the lowering arm.
+    pub(crate) fn set_commit_sync(&mut self, class: SyncClass) -> Result<()> {
+        let class = class.max(self.opened_sync);
+        if class == self.sync {
             return Ok(());
         }
-        self.conn.execute("PRAGMA synchronous = FULL")?;
-        if class == SyncClass::FullFsync {
-            self.conn.execute("PRAGMA fullfsync = ON")?;
-        }
+        self.conn.execute(if class.syncs() { "PRAGMA synchronous = FULL" } else { "PRAGMA synchronous = OFF" })?;
+        self.conn.execute(if class == SyncClass::FullFsync { "PRAGMA fullfsync = ON" } else { "PRAGMA fullfsync = OFF" })?;
         self.sync = class;
         Ok(())
     }
@@ -976,6 +994,17 @@ impl Catalog {
             tracing::warn!("branch catalog read snapshot not ended: {e}");
             self.rollback();
         }
+    }
+
+    /// The failed syncs of this catalog's own files: its pager reports them, acting at issue, to
+    /// its Database's own (volatile) branch store, which counts them (engine review 17 MED 3).
+    pub(crate) fn sync_failures(&self) -> u64 {
+        self._db.branches.sync_failures()
+    }
+
+    /// The class this handle's commits sync in (`set_commit_sync`).
+    pub(crate) fn commit_sync(&self) -> SyncClass {
+        self.sync
     }
 
     /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block

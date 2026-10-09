@@ -300,6 +300,10 @@ pub(crate) struct BranchStore {
     /// Group commit with the flush outside the store mutex (fastest-engine M1 item 2); see
     /// [`Group`]. Shared with a fuzzy checkpoint's thread, whose install rewrites the log.
     group: Arc<Group>,
+    /// Failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`): a branch
+    /// catalog's own volatile store counts its catalog's, which the main store routes through its
+    /// at-risk decision (`truncate_catalog_wal`; engine review 17 MED 3).
+    sync_failures: AtomicU64,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
     /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
@@ -511,6 +515,42 @@ impl Group {
         self.cv.notify_all();
     }
 
+    /// A sync on the branch files' device failed; `drains`: it was a drain of the device (an
+    /// F_FULLFSYNC on Apple, any sync elsewhere). What that drain covered may be lost, and a later
+    /// successful flush would report it durable. So the store fail-stops, as after a failed
+    /// flight — every waiter, the riders the flush would have made durable among them, gets the
+    /// error — exactly when it holds records the drain could have lost: written and not yet
+    /// drained by a full flush (on Apple fsync(2) drains nothing, elsewhere it does) and counted
+    /// by `undrained_counts(drained)` (always, outside the store's mutants), an ordered flight, one
+    /// waiting for this very flush (`pending_full`), or a flight in the air, a fuzzy checkpoint's
+    /// arena sync included (engine review 9 #8). The trunk's WAL syncs and a branch catalog's own
+    /// (engine review 17 MED 3) both come here. Mutant `drain_failure_ignores_risk` (test builds
+    /// only): it always stops.
+    fn drain_failed(&self, drains: bool, undrained_counts: impl FnOnce(u64) -> bool) {
+        let mut g = self.lock();
+        let full = g.durable[class_index(SyncClass::FullFsync)];
+        let drained = if cfg!(target_vendor = "apple") {
+            full
+        } else {
+            g.durable[class_index(SyncClass::Fsync)].max(full)
+        };
+        // Any record written and not drained is at risk, whatever it is (engine review 15 HIGH 1):
+        // recovery replays the log as a prefix and stops at the first damaged frame, so a lost
+        // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
+        let at_risk = (g.durable[0] > drained && undrained_counts(drained))
+            || g.ordered > full
+            || g.pending_full.is_some()
+            || g.flushing
+            || g.arena_syncing;
+        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
+        if !stop {
+            return;
+        }
+        tracing::warn!("branch store fail-stopped: a sync on the branch files' device failed with branch records not yet drained");
+        g.pending_full = None;
+        self.fail(&mut g);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -701,6 +741,16 @@ fn rewritten_class(journal: &Journal) -> SyncClass {
     }
 }
 
+/// What a rewrite marks durable in: `before`, its `rewritten_class` read before it ran, since a
+/// rewrite's own log reset or cut clears the inherited floor it synced in (engine review 16 LOW
+/// 12). Mutant `rewrite_class_read_after` (test builds only): read after, as before.
+fn rewrite_class_marked(before: Option<SyncClass>, journal: &Journal) -> SyncClass {
+    match before {
+        Some(class) if !fe_mutant("rewrite_class_read_after") => class,
+        _ => rewritten_class(journal),
+    }
+}
+
 
 /// How long the group must stay idle (no flight landed) before the confirmation writer writes the
 /// last flight's word (review 6 #1). Under load a whole later flight proves each earlier one
@@ -732,9 +782,11 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             return;
         }
         // The held-free upgrade a raised D0 store owes (engine review 13 MED 2): led here, off
-        // every acknowledgement path, holding no lock while it runs.
+        // every acknowledgement path, holding no lock while it runs. Under mutant
+        // `upgrade_on_ack_path` (test builds only) not here, as before: only the next waiter leads
+        // it, so the mutant's create leads it every time rather than when it wins a race.
         let due = group.upgrade_due.load(Ordering::Acquire);
-        if due != 0 && due != UPGRADE_IN_AIR && !group.poisoned() {
+        if due != 0 && due != UPGRADE_IN_AIR && !group.poisoned() && !fe_mutant("upgrade_on_ack_path") {
             drop(g);
             BranchStore::lead_upgrade(&store, &group);
             g = group.lock();
@@ -1417,9 +1469,12 @@ pub(crate) enum TrunkFork {
 }
 
 /// F-FZ hook stages (`BranchStore::checkpoint_hold`): the writer has written the captured rows and
-/// not committed; or it has committed and the install has not run.
+/// not committed; or it has committed and the install has not run; or the install has run and
+/// phase 4 (the catalog WAL's PASSIVE and TRUNCATE checkpoints) has not (engine review 17 MED 3).
 pub(crate) const HOLD_BEFORE_COMMIT: u8 = 2;
 pub(crate) const HOLD_AFTER_COMMIT: u8 = 3;
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_WAL_TRUNCATE: u8 = 4;
 
 /// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
 pub(crate) const HOLD_ARRIVED: u8 = 0x80;
@@ -1457,6 +1512,25 @@ pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
 /// (engine review 8 #14: a trunk commit's barrier then orders the Release).
 #[cfg(test)]
 pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a DDL commit on this
+/// store's trunk waits here after publishing its pages and before publishing its schema
+/// (`Pager::commit_tx`; engine 2b: a trunk fork in that window). Per store (engine review 16 #14:
+/// the process-wide `SCHEMA_PUBLISH_HOLD` it replaces could catch any test's DDL commit).
+#[cfg(test)]
+pub(crate) const HOLD_SCHEMA_PUBLISH: u8 = 10;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): `Database::drop_branch`
+/// waits here, the name looked up, before its release takes the store mutex (engine review 14
+/// MED 7: the open check and the release are one hold).
+#[cfg(test)]
+pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic):
+/// `Database::connect_named` waits here, the name looked up, before it opens the branch (engine
+/// review 14 MED 9: a drop that lands in between).
+#[cfg(test)]
+pub(crate) const HOLD_CONNECT_LOOKED_UP: u8 = 12;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -1472,25 +1546,6 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 #[cfg(test)]
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Test builds: while it holds 1, a DDL commit on the trunk waits after publishing its pages and
-/// before publishing its schema (`Pager::commit_tx`), having marked its arrival (`| HOLD_ARRIVED`);
-/// stored 0 to release it (engine 2b: a trunk fork in that window). Process-wide.
-#[cfg(test)]
-pub(crate) static SCHEMA_PUBLISH_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// A DDL commit waits at `SCHEMA_PUBLISH_HOLD` (test builds only).
-pub(crate) fn pause_schema_publish() {
-    #[cfg(test)]
-    {
-        use std::sync::atomic::Ordering as O;
-        let arrived = 1 | HOLD_ARRIVED;
-        if SCHEMA_PUBLISH_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
-            while SCHEMA_PUBLISH_HOLD.load(O::Acquire) == arrived {
-                crate::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-}
 
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
@@ -2534,7 +2589,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
     }
     // And the commit as durable as any record it replaces (review B-F3).
-    catalog.raise_sync(cap.arena_sync)?;
+    catalog.set_commit_sync(cap.arena_sync)?;
     catalog.begin()?;
     let written = (|| -> Result<()> {
         for (b, what) in &cap.rows {
@@ -2608,8 +2663,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
 /// PASSIVE backfill first, which waits for no reader, then a TRUNCATE attempt. The checkpoint is
-/// already durable, so a failure costs only WAL length: it is logged, not returned.
-fn truncate_catalog_wal(catalog: &mut Catalog) {
+/// already durable, so a busy or failed checkpoint costs only WAL length: it is logged, not
+/// returned. But its syncs are on the branch files' device: one that failed (counted by the
+/// catalog's own store, `Catalog::sync_failures`) is a failed drain when it drains the device (the
+/// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
+/// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
+/// (test builds only): logged only, as before.
+fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group) {
+    let failed_before = catalog.sync_failures();
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
@@ -2619,6 +2680,10 @@ fn truncate_catalog_wal(catalog: &mut Catalog) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
+    }
+    if catalog.sync_failures() > failed_before && !fe_mutant("catalog_sync_failure_logged") {
+        let drains = !cfg!(target_vendor = "apple") || catalog.commit_sync() == SyncClass::FullFsync;
+        group.drain_failed(drains, |_| true);
     }
 }
 
@@ -2721,7 +2786,7 @@ fn run_flight(
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
-        // The class the catalog commit synced in: the capture's rewrite class (`raise_sync`), not
+        // The class the catalog commit synced in: the capture's commit class (`set_commit_sync`), not
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
@@ -2772,9 +2837,11 @@ fn run_flight(
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
         Ok(()) => {
+            #[cfg(test)]
+            pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                truncate_catalog_wal(&mut writer.lock())
+                truncate_catalog_wal(&mut writer.lock(), &group)
             }));
             truncating.store(false, Ordering::Release);
             if truncated.is_err() {
@@ -3134,6 +3201,7 @@ impl BranchStore {
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            sync_failures: AtomicU64::new(0),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3395,6 +3463,7 @@ impl BranchStore {
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            sync_failures: AtomicU64::new(0),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3959,6 +4028,15 @@ impl BranchStore {
             return Ok(None);
         };
         journal.take_flight(arena, class, upgrade).map(Some)
+    }
+
+    /// `take_flight` for a trunk commit's ordered flight (`order_for_trunk`;
+    /// `Journal::take_ordered_flight`).
+    fn take_ordered_flight(inner: &mut StoreInner, class: SyncClass, upgrade: bool) -> Result<Option<Flight>> {
+        let (Some(journal), Some(arena)) = (inner.journal.as_mut(), inner.arena.as_mut()) else {
+            return Ok(None);
+        };
+        journal.take_ordered_flight(arena, class, upgrade).map(Some)
     }
 
     /// Flush everything buffered, under the store mutex the caller holds, in at least `class`. A
@@ -4816,6 +4894,9 @@ impl BranchStore {
                 .as_ref()
                 .map(|j| (j.lsn(), j.rewrite_class()));
             let generation = inner.cat.as_ref().map(|c| c.generation);
+            // The class the cut rewrites the log in, read before the cut clears the inherited
+            // floor (engine review 16 LOW 12).
+            let cut_class = inner.journal.as_ref().map(rewritten_class);
             let checkpointed = inner.checkpoint_catalog(fail_after_rename);
             if let Some((lsn, class)) = covered {
                 let committed = inner.cat.as_ref().map(|c| c.generation) != generation;
@@ -4827,8 +4908,8 @@ impl BranchStore {
             if let Some(journal) = inner.journal.as_ref() {
                 // The catalog holds what preceded the capture; the cut log holds, synced, what
                 // followed it in the file.
-                self.group
-                    .mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
+                let class = rewrite_class_marked(cut_class, journal);
+                self.group.mark_durable(journal.lsn() - journal.pending_len(), class);
             }
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
@@ -4847,8 +4928,9 @@ impl BranchStore {
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
+        let class = rewritten_class(journal);
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), rewritten_class(journal));
+        self.group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -4900,7 +4982,10 @@ impl BranchStore {
             .store(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Release);
     }
 
-    /// Fork a child of the trunk.
+    /// Fork a child of the trunk. `schema`: the one the caller's snapshot holds, or `None` when the
+    /// caller has none matching its snapshot's cookie (a DDL commit between publishing its pages and
+    /// its schema; engine 2b, review 16 MED 8): the child then reads its own at its first
+    /// connection, as after a commit decided since the snapshot (below).
     ///
     /// `seen: None`: the caller holds the trunk's WAL write lock, so no trunk write transaction is
     /// in flight, and its snapshot (the latest commit) gives the child its schema.
@@ -4923,7 +5008,7 @@ impl BranchStore {
     /// store-mutex hold.
     pub(crate) fn fork_trunk(
         &self,
-        schema: Arc<Schema>,
+        schema: Option<Arc<Schema>>,
         page_size: usize,
         seen: Option<u64>,
         name: Option<&str>,
@@ -4946,17 +5031,19 @@ impl BranchStore {
             // mutex.
             drop(self.group.quiesce());
         }
+        let restart_class = inner.journal.as_ref().map(rewritten_class);
         inner.ensure_backing(page_size)?;
         if restart {
-            // It did (it refuses otherwise): the empty state supersedes everything buffered.
+            // It did (it refuses otherwise): the empty state supersedes everything buffered, in
+            // the class read before its rewrite cleared the inherited floor (review 16 LOW 12).
             if let Some(journal) = inner.journal.as_ref() {
-                self.group.mark_durable(journal.lsn(), rewritten_class(journal));
+                self.group.mark_durable(journal.lsn(), rewrite_class_marked(restart_class, journal));
             }
         }
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
-        let mut schema = Some(schema);
+        let mut schema = schema;
         let mut after = None;
         // A fork under the WAL write lock moves the gate's count (lead review 1 item 10): a commit
         // made while the trunk had no child opened no gate, so a lock-free fork whose snapshot
@@ -5018,7 +5105,7 @@ impl BranchStore {
     /// store's model tests, which drive the store without a pager: it always registers.
     #[cfg(test)]
     pub(crate) fn fork_trunk_locked(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        match self.fork_trunk(schema, page_size, None, None)? {
+        match self.fork_trunk(Some(schema), page_size, None, None)? {
             TrunkFork::Forked { id, lsn, .. } => {
                 self.wait_durable(lsn, self.sync_class())?;
                 Ok(id)
@@ -5132,7 +5219,7 @@ impl BranchStore {
             )));
         }
         if st.open {
-            return Err(in_use(id, st.name.as_deref()));
+            return Err(in_use(id, st.name.as_deref(), crate::error::BranchOp::Connect));
         }
         st.open = true;
         Ok(st.schema.clone())
@@ -5196,6 +5283,47 @@ impl BranchStore {
         self.release_checked(id, true)
     }
 
+    /// `Database::drop_branch` waits at `HOLD_DROP_LOOKED_UP` (test builds only; a no-op
+    /// otherwise), between its lookup and its release (engine review 14 MED 7).
+    pub(crate) fn pause_drop_looked_up(&self) {
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_DROP_LOOKED_UP);
+    }
+
+    /// `Database::connect_named` waits at `HOLD_CONNECT_LOOKED_UP` (test builds only; a no-op
+    /// otherwise), between its lookup and its open (engine review 14 MED 9).
+    pub(crate) fn pause_connect_looked_up(&self) {
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_CONNECT_LOOKED_UP);
+    }
+
+    /// Whether branch `id` is gone or released (`Handle::is_released`): what a drop that landed
+    /// after `connect_named`'s lookup leaves (engine review 14 MED 9). Called on the connect's
+    /// error path only. A failed lookup counts as not gone, so the connect's own error stands.
+    pub(crate) fn is_gone_or_released(&self, id: BranchId) -> bool {
+        let mut inner = self.inner.lock();
+        match inner.ensure(id) {
+            Ok(false) => true,
+            Ok(true) => inner
+                .branches
+                .get(&id)
+                .is_none_or(|st| st.handle.is_released()),
+            Err(_) => false,
+        }
+    }
+
+    /// Mutant `drop_check_separate_hold` only (`Database::drop_branch`): the open check in a
+    /// store-mutex hold of its own, apart from the release (engine review 14 MED 7's regression,
+    /// check-then-act across two holds).
+    pub(crate) fn refuse_if_open(&self, id: BranchId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.ensure(id)?;
+        match inner.branches.get(&id) {
+            Some(st) if st.open => Err(in_use(id, st.name.as_deref(), crate::error::BranchOp::Drop)),
+            _ => Ok(()),
+        }
+    }
+
     fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
@@ -5234,7 +5362,14 @@ impl BranchStore {
         }
         // Mutant `drop_while_open` (test builds only): a drop releases a branch in use, as before.
         if refuse_open && st.open && !fe_mutant("drop_while_open") {
-            return Err(in_use(id, st.name.as_deref()));
+            // Mutant `drop_refused_as_connect` (test builds only): refused with the connect's
+            // reason, as before (engine review 14 LOW 12).
+            let op = if fe_mutant("drop_refused_as_connect") {
+                crate::error::BranchOp::Connect
+            } else {
+                crate::error::BranchOp::Drop
+            };
+            return Err(in_use(id, st.name.as_deref(), op));
         }
         let record = inner.release_record(id);
         let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
@@ -5775,22 +5910,13 @@ impl BranchStore {
     /// `no_wal_fail_stop` (it never stops, as before review 6 #2) and `drain_failure_ignores_risk`
     /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
+        self.sync_failures.fetch_add(1, Ordering::AcqRel);
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
         // Mutant `drain_risk_ignores_held_frees` (test builds only) reads the newest fork's mark,
         // under the store mutex and so before the group's lock (the order `mature` takes them in).
         let fork = if fe_mutant("drain_risk_ignores_held_frees") { self.inner.lock().last_fork_lsn } else { 0 };
-        let mut g = self.group.lock();
-        let full = g.durable[class_index(SyncClass::FullFsync)];
-        let drained = if cfg!(target_vendor = "apple") {
-            full
-        } else {
-            g.durable[class_index(SyncClass::Fsync)].max(full)
-        };
-        // Any record written and not drained is at risk, whatever it is (engine review 15 HIGH 1):
-        // recovery replays the log as a prefix and stops at the first damaged frame, so a lost
-        // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
         // Mutants (test builds only): `drain_risk_by_store_class` (only in a store whose class
         // syncs, as before engine review 10 #6), `drain_risk_release_only` (or when the newest
         // Release is undrained, as before this), `drain_risk_barrier_floor_only` (or the newest
@@ -5799,29 +5925,24 @@ impl BranchStore {
         // free left out). Marks are not the rule: `durable[Off]` past the drain covers every kind.
         let release = self.last_release_lsn.load(Ordering::Acquire);
         let retain = self.retain_floor.load(Ordering::Acquire);
-        let undrained_counts = if fe_mutant("drain_risk_by_store_class") {
-            self.class.syncs()
-        } else if fe_mutant("drain_risk_release_only") {
-            self.class.syncs() || release > drained
-        } else if fe_mutant("drain_risk_barrier_floor_only") {
-            self.class.syncs() || release.max(retain) > drained
-        } else if fe_mutant("drain_risk_ignores_held_frees") {
-            self.class.syncs() || release.max(retain).max(fork) > drained
-        } else {
-            true
-        };
-        let at_risk = (g.durable[0] > drained && undrained_counts)
-            || g.ordered > full
-            || g.pending_full.is_some()
-            || g.flushing
-            || g.arena_syncing;
-        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
-        if !stop {
-            return;
-        }
-        tracing::warn!("branch store fail-stopped: a trunk file's sync failed with branch records not yet drained");
-        g.pending_full = None;
-        self.group.fail(&mut g);
+        self.group.drain_failed(drains, |drained| {
+            if fe_mutant("drain_risk_by_store_class") {
+                self.class.syncs()
+            } else if fe_mutant("drain_risk_release_only") {
+                self.class.syncs() || release > drained
+            } else if fe_mutant("drain_risk_barrier_floor_only") {
+                self.class.syncs() || release.max(retain) > drained
+            } else if fe_mutant("drain_risk_ignores_held_frees") {
+                self.class.syncs() || release.max(retain).max(fork) > drained
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`).
+    pub(crate) fn sync_failures(&self) -> u64 {
+        self.sync_failures.load(Ordering::Acquire)
     }
 
     pub(crate) fn end_trunk_commit(&self) {
@@ -6114,7 +6235,7 @@ impl BranchStore {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
-                match Self::take_flight(&mut inner, SyncClass::FullFsync, upgrade) {
+                match Self::take_ordered_flight(&mut inner, SyncClass::FullFsync, upgrade) {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
@@ -6611,6 +6732,13 @@ impl BranchStore {
         self.group.lock().settle_syncs
     }
 
+    /// Test builds: a DDL commit on this store's trunk, its pages published, waits at
+    /// `HOLD_SCHEMA_PUBLISH` before publishing its schema (`Pager::commit_tx`).
+    #[cfg(test)]
+    pub(crate) fn pause_schema_publish(&self) {
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_SCHEMA_PUBLISH);
+    }
+
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {
             let _ = build.join();
@@ -7081,13 +7209,41 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
 }
 
 fn name_taken(name: &str) -> LimboError {
-    LimboError::NameTaken(name.to_string())
+    untyped_branch_error(LimboError::NameTaken(name.to_string()))
 }
 
-/// Branch `id` (named `name`, if it is) already has an open connection (fastest-wire's typed
-/// refusal, `LimboError::BranchInUse`): its name, quoted, or its id.
-fn in_use(id: BranchId, name: Option<&str>) -> LimboError {
-    LimboError::BranchInUse(name.map_or_else(|| id.0.to_string(), |n| format!("{n:?}")))
+/// Every typed named-branch refusal (`NoSuchBranch`, `NameTaken`, `BranchInUse`) is built through
+/// this, on its failure path only. Mutant `untyped_branch_errors` (test builds only; engine review
+/// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
+/// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
+pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
+    if !fe_mutant("untyped_branch_errors") {
+        return e;
+    }
+    match e {
+        LimboError::NoSuchBranch(name) => {
+            LimboError::InvalidArgument(format!("no branch is named {name:?}"))
+        }
+        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
+            "branch name {name:?} already names an unreleased branch"
+        )),
+        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+            "branch {id} already has an open connection; a branch serves one connection at a \
+             time, because a second one's page cache would silently miss the first one's commits"
+        )),
+        other => other,
+    }
+}
+
+/// Branch `id` (named `name`, if it is) already has an open connection, so `op` is refused
+/// (fastest-wire's typed refusal, `LimboError::BranchInUse`): the name as given, unquoted, its id,
+/// and the operation, whose reason the message gives (engine review 14 LOW 12).
+fn in_use(id: BranchId, name: Option<&str>, op: crate::error::BranchOp) -> LimboError {
+    untyped_branch_error(LimboError::BranchInUse {
+        name: name.map(str::to_string),
+        id: id.0,
+        op,
+    })
 }
 
 fn reaped(id: BranchId) -> LimboError {
@@ -8118,7 +8274,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w);
+            truncate_catalog_wal(&mut w, &self.group);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {

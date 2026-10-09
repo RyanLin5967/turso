@@ -707,18 +707,20 @@ fn sql_sample(a: &probe::SqlCounts, b: &probe::SqlCounts) -> Sample {
     ])
 }
 
-/// Clears `store::SCHEMA_PUBLISH_HOLD` when dropped, so a failed sample releases its DDL commit.
-struct SchemaHoldDisarm;
+/// Clears the store's own test hold (`BranchStore::trunk_commit_hold`, stage
+/// `store::HOLD_SCHEMA_PUBLISH`; engine review 16 #14) when dropped, so a failed sample releases its
+/// DDL commit.
+struct SchemaHoldDisarm(Arc<std::sync::atomic::AtomicU8>);
 
 impl Drop for SchemaHoldDisarm {
     fn drop(&mut self) {
-        super::store::SCHEMA_PUBLISH_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        self.0.store(0, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// Engine 2b (fastest-engine 00340537c, red 4f9f83ece; its request of 2026-10-09): a trunk fork
 /// whose snapshot's schema cookie matches neither its connection's schema nor the shared one — a DDL
-/// commit between publishing its pages and its schema, parked there by `store::SCHEMA_PUBLISH_HOLD`
+/// commit between publishing its pages and its schema, parked there by its store's own hold
 /// — re-reads the schema from its snapshot (`Connection::reparse_schema`). This arm counts that
 /// re-read on the forking thread with the SQL-layer counters (`probe::sql_counts`).
 ///
@@ -764,13 +766,14 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     forker.create_branch("anchor").unwrap();
                 }
                 let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7";
-                let _disarm = SchemaHoldDisarm;
+                let hold = db.branches.trunk_commit_hold.clone();
+                let _disarm = SchemaHoldDisarm(hold.clone());
                 let parked = if window {
-                    super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+                    hold.store(super::store::HOLD_SCHEMA_PUBLISH, O::Release);
                     let ddl = ddl.clone();
                     let commit = std::thread::spawn(move || ddl.execute(alter).map(|_| ()).map_err(|e| e.to_string()));
                     let t = std::time::Instant::now();
-                    while super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+                    while hold.load(O::Acquire) != (super::store::HOLD_SCHEMA_PUBLISH | super::store::HOLD_ARRIVED) {
                         assert!(
                             t.elapsed() < std::time::Duration::from_secs(10),
                             "{cell}: {op}: premise: the DDL commit never reached its schema publication"
@@ -798,7 +801,7 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 let waited = !fork.is_finished();
-                super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+                hold.store(0, O::Release);
                 let (made, mut s) = fork.join().unwrap();
                 if let Some(commit) = parked {
                     commit.join().unwrap().unwrap_or_else(|e| panic!("{cell}: {op}: the parked ALTER failed: {e}"));
