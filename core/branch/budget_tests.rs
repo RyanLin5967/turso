@@ -67,12 +67,26 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 /// D2, except in a `*_d0` cell (the instruction arm: no device flush, whose kernel work makes an
-/// operation's instruction count vary by ~15% from one process to the next).
+/// operation's instruction count vary by ~15% from one process to the next) and a `*_d1` cell (D1,
+/// plain fsync). A catalog store, except in the open-flush cells `open_d*` and their writer
+/// `open_writer_*`, which use the snapshot store (`Durable`): its open of a whole log takes the
+/// kept-log arm the open-flush budgets are about (see `open_flush`).
 fn opts() -> DatabaseOpts {
-    let d0 = std::env::var("FE_BUDGET_CHILD").is_ok_and(|s| s.ends_with("_d0"));
-    let sync = if d0 { SyncClass::Off } else { SyncClass::FullFsync };
+    let spec = std::env::var("FE_BUDGET_CHILD").unwrap_or_default();
+    let sync = if spec.ends_with("_d0") {
+        SyncClass::Off
+    } else if spec.ends_with("_d1") {
+        SyncClass::Fsync
+    } else {
+        SyncClass::FullFsync
+    };
+    let durability = if spec.starts_with("open_d") || spec.starts_with("open_writer") {
+        BranchDurability::Durable { sync }
+    } else {
+        BranchDurability::Catalog { sync }
+    };
     DatabaseOpts::new()
-        .with_branch_durability(BranchDurability::Catalog { sync })
+        .with_branch_durability(durability)
         .with_branch_checkpoint(BranchCheckpoint::Fuzzy)
 }
 
@@ -780,7 +794,168 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     hold_word(true);
 }
 
-/// The schema-window cells' table counts (`schema_t10`, `schema_t1e3`), and the samples per path and
+/// The open-flush cells (lead order, DECISIONS 1334833a4d; review 16 LOW 11's a9ba5adb8): a store's
+/// open of a whole log it KEEPS (the kept-log arm of `Scanned::finish`), counted absolutely, because
+/// the recovery budgets compare cells and a regression hitting every open equally passes them, and
+/// because the recovery cells' opens take another arm (BUDGETS.md, fixture findings). Cells:
+/// * `open_d2_unconfirmed`: a snapshot store at D2 whose last flight carries no confirmation word: a
+///   writer grandchild (`open_writer_d2`) builds it and is SIGKILLed before it closes, so no close
+///   writes the word; one reopen measured per sample, 3 samples;
+/// * `open_d2_confirmed`, `open_cat_d2`, `open_d1`: built in this process and closed cleanly (the
+///   close writes the word where the class proves stable storage: D2 on Apple, never D1), then
+///   reopened 5 times, each reopen closed cleanly again.
+/// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
+/// by the class asked (`journal::CLASS_SYNCS`) and directory syncs (`journal::DIR_SYNCS`), and the
+/// premises: the log's inode and length unchanged across the open (it was kept: no rewrite, no
+/// cut, no reset) and whether its header's word confirms its last flight (`confirmed`). Each line
+/// of the confirmed D2 cells also carries this process's fcntl(F_FULLFSYNC) on a directory
+/// descriptor of the cell's own temp dir, outside every measured open (`dir_full_rc`,
+/// `dir_full_errno`; review of the confirmed budget's minimum: it rests on that call working).
+fn open_flush(cell: &str, out: &mut String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("open.db");
+    let (opens, unconfirmed) = if cell == "open_d2_unconfirmed" { (3, true) } else { (5, false) };
+    let probe_dir = dir_full_fsync(dir.path());
+    let mut log = None;
+    if !unconfirmed {
+        let db = open_at(&path);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, false);
+        for i in 0..4 {
+            trunk.create_branch(&format!("o-{i}")).unwrap();
+        }
+        log = db.branch_log_path();
+    }
+    for r in 0..opens {
+        if unconfirmed {
+            let sample = tempfile::TempDir::new_in(dir.path()).unwrap();
+            log = Some(open_writer_killed(cell, sample.path()));
+            let mut s = open_once(&sample.path().join("open.db"), log.as_ref().unwrap());
+            s.insert("dir_full_rc", probe_dir.0);
+            s.insert("dir_full_errno", probe_dir.1);
+            line(out, cell, "open", r, &s);
+        } else {
+            let mut s = open_once(&path, log.as_ref().expect("the built store's log"));
+            s.insert("dir_full_rc", probe_dir.0);
+            s.insert("dir_full_errno", probe_dir.1);
+            line(out, cell, "open", r, &s);
+        }
+    }
+}
+
+/// fcntl(F_FULLFSYNC) on a directory descriptor (Apple): `(rc, errno)`, `rc` 0 or 1 for -1; elsewhere
+/// `(2, 0)`, not applicable.
+fn dir_full_fsync(dir: &Path) -> (u64, u64) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let d = std::fs::File::open(dir).unwrap();
+        // SAFETY: the descriptor is owned by `d` and open for the duration of the call.
+        let rc = unsafe { libc::fcntl(d.as_raw_fd(), libc::F_FULLFSYNC) };
+        let errno = if rc == -1 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u64 } else { 0 };
+        (u64::from(rc == -1), errno)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = dir;
+        (2, 0)
+    }
+}
+
+/// The header word of `log` and the word that would confirm its last flight (`journal::confirm_word`
+/// of its last 4 bytes, the end frame's checksum, and its length), read before an open.
+fn log_confirmed(log: &Path) -> u64 {
+    let bytes = std::fs::read(log).unwrap();
+    // HEADER_CONFIRM_AT (journal.rs): the word sits at bytes 36..40 of the header.
+    let word = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+    u64::from(word != 0 && word == super::journal::confirm_word(crc, bytes.len() as u64))
+}
+
+/// One measured open of the store at `path`, whose log is `log`, then a clean close.
+fn open_once(path: &Path, log: &Path) -> Sample {
+    use std::os::unix::fs::MetadataExt;
+    let (m0, confirmed) = (std::fs::metadata(log).unwrap(), log_confirmed(log));
+    let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+    let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+    let (s0, c0, d0) = (sync_counts(), classes(), dirs());
+    let db = open_at(path);
+    let (s1, c1, d1) = (sync_counts(), classes(), dirs());
+    let m1 = std::fs::metadata(log).unwrap();
+    drop(db);
+    Sample::from([
+        ("full_fsync", s1.full_fsync - s0.full_fsync),
+        ("fsync", s1.fsync - s0.fsync),
+        ("barrier", s1.barrier - s0.barrier),
+        ("thread_plain", c1[0] - c0[0]),
+        ("thread_full", c1[1] - c0[1]),
+        ("dir_syncs", d1 - d0),
+        ("same_inode", u64::from(m0.ino() == m1.ino())),
+        ("same_len", u64::from(m0.len() == m1.len())),
+        ("confirmed", confirmed),
+    ])
+}
+
+/// Kills a writer grandchild when dropped, so no test failure leaves it running.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `open_d2_unconfirmed`'s writer: this binary again, as the child `open_writer_d2` building the
+/// store in `dir`; SIGKILLed once it reports ready, so it never closes the store. Returns its log.
+fn open_writer_killed(cell: &str, dir: &Path) -> PathBuf {
+    let ready = dir.join("ready");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::budget_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_BUDGET_CHILD", "open_writer_d2")
+        .env("FE_BUDGET_OUT", &ready)
+        .env("FE_BUDGET_DIR", dir)
+        .env_remove("FE_BUDGET_RAW_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = KillOnDrop(child);
+    let t = std::time::Instant::now();
+    let log = loop {
+        if let Ok(text) = std::fs::read_to_string(&ready) {
+            if let Some(log) = text.strip_prefix("ready ").map(|l| l.trim_end().to_string()) {
+                break PathBuf::from(log);
+            }
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(120), "{cell}: the writer never reported ready");
+        assert!(child.0.try_wait().unwrap().is_none(), "{cell}: the writer exited before it was killed");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // SIGKILL: no destructor, so no close writes the confirmation word.
+    child.0.kill().unwrap();
+    let _ = child.0.wait();
+    log
+}
+
+/// The writer child (`open_writer_d2`): builds a snapshot store at D2 with the word held (no idle
+/// writer), reports its log, and parks until it is killed; it exits by itself after 120 s, without
+/// running a destructor, so it can never orphan and never closes the store.
+fn open_writer(out: &str) -> ! {
+    let dir = PathBuf::from(std::env::var("FE_BUDGET_DIR").unwrap());
+    let db = open_at(&dir.join("open.db"));
+    let trunk = db.connect().unwrap();
+    seed(&trunk, false);
+    for i in 0..4 {
+        trunk.create_branch(&format!("o-{i}")).unwrap();
+    }
+    let log = db.branch_log_path().unwrap();
+    std::fs::write(out, format!("ready {}\n", log.display())).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
+    std::process::exit(0)
+}
+
+/// The schema-window cells' table counts/// The schema-window cells' table counts (`schema_t10`, `schema_t1e3`), and the samples per path and
 /// mode.
 const SCHEMA_TABLES: [(&str, u64); 2] = [("schema_t10", 10), ("schema_t1e3", 1000)];
 const SCHEMA_ROUNDS: u64 = 3;
@@ -1250,8 +1425,13 @@ fn budget_child() {
     // syscalls 17..19, held syscalls 4..6, in one cell).
     hold_word(spec != "confirm_n10" && spec != "confirm_load");
     let mut text = String::new();
+    if spec == "open_writer_d2" {
+        open_writer(&out);
+    }
     if spec == "instruments" {
         text = run_instruments(&spec);
+    } else if spec.starts_with("open_d") || spec.starts_with("open_cat") {
+        open_flush(&spec, &mut text);
     } else if let Some(&(_, tables)) = SCHEMA_TABLES.iter().find(|(c, _)| *c == spec) {
         schema_window(&spec, tables, &mut text);
     } else {
@@ -2944,4 +3124,130 @@ fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
         }
     }
     assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
+}
+
+// ---- the open's flushes, absolutely (lead order 2026-10-09, DECISIONS 1334833a4d; the open_* cells) ----
+
+/// The premises of an open-flush cell's samples (the log kept: same inode and length; and the tail's
+/// confirmation state the cell is built for), each failure one line. `None`: any.
+fn open_premises(c: &CellData, confirmed: Option<u64>, failures: &mut String) -> Vec<Map> {
+    let v: Vec<Map> = c.ops.get("open").cloned().unwrap_or_default();
+    assert!(!v.is_empty(), "{}: no open sample", c.name);
+    for (i, s) in v.iter().enumerate() {
+        if s["same_inode"] != 1 || s["same_len"] != 1 {
+            let _ = writeln!(failures, "  {}: open #{i}: the log was not kept (same inode {}, same length {}); premise", c.name, s["same_inode"], s["same_len"]);
+        }
+        if let Some(want) = confirmed {
+            if s["confirmed"] != want {
+                let _ = writeln!(failures, "  {}: open #{i}: confirmed {}; premise {want}", c.name, s["confirmed"]);
+            }
+        }
+    }
+    v
+}
+
+/// Every open sample's flushes against the budget `(full_fsync, fsync, thread_full, thread_plain,
+/// dir_syncs)`, exact both ways.
+fn open_exact(c: &CellData, v: &[Map], want: [u64; 5], why: &str, failures: &mut String) {
+    let keys = ["full_fsync", "fsync", "thread_full", "thread_plain", "dir_syncs"];
+    for (i, s) in v.iter().enumerate() {
+        let got: Vec<u64> = keys.iter().map(|k| s[*k]).collect();
+        if got[..] != want[..] {
+            let _ = writeln!(failures, "  {}: open #{i}: (full_fsync, fsync, thread_full, thread_plain, dir_syncs) = {got:?}; budget {want:?} [{why}]", c.name);
+        }
+    }
+}
+
+/// Engine review 16 LOW 11 (a9ba5adb8: "a syncing open makes one device flush, not two"): a D2 open of
+/// a whole log whose last flight is UNCONFIRMED (the writer was killed before its close, so no word
+/// proves the flight's sync returned) makes exactly 1 F_FULLFSYNC — the log's, which drains the
+/// device after both writes — and exactly 1 plain fsync, the directory's, made first; on the opening
+/// thread 1 FullFsync-class sync, 1 Fsync-class sync, 1 directory sync. That is the minimum: the open
+/// must make durable the log's bytes (the dead writer may never have synced its last flight) and the
+/// log's name (a rename it may not have synced), and on Apple only F_FULLFSYNC drains the device.
+/// Mutants env `open_dir_sync_in_class` (the second device flush back) and
+/// `open_forgets_unsynced_rename` (no directory sync). WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_open_of_an_unconfirmed_log_makes_one_device_flush_and_one_directory_sync() {
+    if in_child() {
+        return;
+    }
+    let c = cell("open_d2_unconfirmed");
+    let mut failures = String::new();
+    let v = open_premises(&c, Some(0), &mut failures);
+    open_exact(&c, &v, [1, 1, 1, 1, 1], "a9ba5adb8: the directory in Fsync, then the log in FullFsync", &mut failures);
+    assert!(failures.is_empty(), "a D2 open of an unconfirmed log:\n{failures}");
+}
+
+/// The confirmed case (lead, DECISIONS 1334833a4d): a D2 open of a whole log whose header's word
+/// confirms its last flight (its sync returned in FullFsync: the word proves it) owes the log's bytes
+/// nothing; only the log's name (a rename the closing process may not have synced) remains, so the
+/// principled minimum is the directory's sync alone, in a class that drains the device. Which number
+/// that is depends on one fact this process records outside every measured open (`dir_full_rc`):
+/// * fcntl(F_FULLFSYNC) on a directory descriptor succeeds: exactly 1 F_FULLFSYNC, 0 plain fsync, 1
+///   directory sync (on the opening thread 1 FullFsync-class, 0 Fsync-class). RED today: the open
+///   re-syncs the log (1 F_FULLFSYNC + 1 fsync), the restart-path engine SHAVE the lead filed;
+/// * it fails: a directory cannot be drained directly, so its entry reaches the device only through
+///   a device flush after its plain fsync, and today's 1 F_FULLFSYNC + 1 fsync is the minimum.
+/// No default: a line without `dir_full_rc` refuses. `open_cat_d2` (a catalog store) is the same case
+/// and is held to the same budget when its premises hold; when they do not (its open rewrites the
+/// log), its numbers stand in the raw as an observation and the test does not fail on it. Mutant env
+/// `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["open_d2_confirmed", "open_cat_d2"] {
+        let c = cell(spec);
+        let mut premise = String::new();
+        let v = open_premises(&c, Some(1), &mut premise);
+        if !premise.is_empty() {
+            if spec == "open_cat_d2" {
+                continue;
+            }
+            failures.push_str(&premise);
+            continue;
+        }
+        let rc = v.iter().map(|s| *s.get("dir_full_rc").unwrap_or_else(|| panic!("{spec}: no dir_full_rc recorded (no default)"))).collect::<Vec<_>>();
+        assert!(rc.iter().all(|&x| x == rc[0]), "{spec}: dir_full_rc changed between opens: {rc:?}");
+        let want = match rc[0] {
+            0 => [1, 0, 1, 0, 1],
+            1 => [1, 1, 1, 1, 1],
+            other => panic!("{spec}: dir_full_rc {other}: not applicable on this platform"),
+        };
+        let why = if rc[0] == 0 {
+            "the directory alone, drained by F_FULLFSYNC on its descriptor (which this Mac accepts)"
+        } else {
+            "F_FULLFSYNC on a directory is refused here, so the log's device flush after the directory's fsync is the minimum"
+        };
+        open_exact(&c, &v, want, why, &mut failures);
+    }
+    assert!(failures.is_empty(), "a D2 open of a confirmed log [the confirmed-tail SHAVE when F_FULLFSYNC on a directory works]:\n{failures}");
+}
+
+/// A D1 open of a whole log makes exactly 2 plain fsyncs and no F_FULLFSYNC: the directory's, then
+/// the log's; on the opening thread 2 Fsync-class syncs, 1 of them a directory sync. Derivation (lead,
+/// accepted): an open that keeps a log it cannot prove durable exposes its records and appends after
+/// them, so it must first make durable (a) the log's bytes, whose last flight the previous process may
+/// never have synced, and (b) the log's name, whose rename it may never have synced. POSIX:
+/// fsync(file) does not make the file's directory entry durable, and fsync(dir) does not make the
+/// file's data durable, so these are two syncs. At D1 on Apple nothing proves (a): the confirmation
+/// word is written only for a class that proves stable storage (`journal::proves_stable`: only
+/// FullFsync on Apple), so a D1 log's tail is never confirmed. Minimum 2; the engine issues 2.
+/// Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d1_open_makes_two_plain_fsyncs() {
+    if in_child() {
+        return;
+    }
+    let c = cell("open_d1");
+    let mut failures = String::new();
+    let v = open_premises(&c, Some(0), &mut failures);
+    open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
+    assert!(failures.is_empty(), "a D1 open:\n{failures}");
 }
