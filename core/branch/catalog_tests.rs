@@ -672,6 +672,16 @@ fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
             assert!(calls < 10, "no fuzzy checkpoint after {calls} settle batches");
         }
         wait_held(&db, store::HOLD_AFTER_COMMIT);
+        // SEMANTIC CONFLICT (merge note, resolve-durable-churn-restart; no assertion changed): this
+        // premise held on the test's base 9ab504b33, whose fuzzy writer committed the catalog
+        // without waiting. On main, `run_flight` first waits until everything the capture covers
+        // is durable (`BranchStore::wait_durable_on(cap.deferred_lsn, cap.settle_class)`,
+        // fastest-engine review 4 #1). `deferred_lsn` is read after the capture buffers its own
+        // `Record::Checkpoint`, and this store syncs (`catalog()` is Fsync), so a group flight
+        // appends that marker to the log before the commit. Expected (by reading, not run) to fail
+        // here on main, before the never-reuse assertion; the crash state the test aims at (catalog
+        // committed, its own marker absent from the log) is not reached by this path any more.
+        // Re-aiming or retiring the test is a flagged test edit, left to the lead.
         // Premise: nothing reached the log after this capture, so its own marker is not there.
         assert_eq!(
             std::fs::metadata(&log).unwrap().len(),
