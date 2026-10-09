@@ -320,12 +320,14 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     let c1 = db.branch_confirm_counts();
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
-    let confirms = c1[0] - c0[0];
+    let confirms = delta(c0[0], c1[0]);
     s.insert("confirms_written", confirms);
+    // Review 2 L10: a failed confirmation write is a fault, never a non-quiet sample to drop.
+    assert_eq!(c1[1], c0[1], "a confirmation word failed to write inside a measured window");
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && absorbed && c1[1] == c0[1] && (left || s["allocs_process"] == s["allocs"]);
+    let quiet = settled && back && absorbed && (left || s["allocs_process"] == s["allocs"]);
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
     (r, s)
@@ -679,8 +681,10 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
 
 /// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
 /// writer): `k` rounds of a create whose window counts the word's write (`confirm_written`), then
-/// the same create with the word held back (`confirm_held`, the engine's test knob). The difference
-/// is the word's cost. A held window leaves the writer parked with the word pending and no deadline,
+/// the same create with the word held back (`confirm_held`, the engine's test knob), then a second
+/// held create (`confirm_reference`, review 2 H2), which lands on the first's pending word and so
+/// wakes no thread at its landing. Written minus reference is the word's cost with the landing's
+/// wake; held minus reference is the wake alone. A held window leaves the writer parked with the word pending and no deadline,
 /// and a landing wakes it only when nothing provable was pending, so each round first takes the
 /// pending word away with a checkpoint (`mark_durable`) and makes one unmeasured create (which pays
 /// the checkpoint's deferred directory sync and is written as usual).
@@ -694,9 +698,14 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
         let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
         hold_word(true);
         let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
+        // Review 2 H2: the reference. `h` landed with no proved word pending (w's was written), so its
+        // landing woke the parked writer (`confirm_cv.notify_one`, on the acknowledging thread); this
+        // second held create lands on h's pending word and wakes no one.
+        let (_, s_reference) = measure(db, base, || trunk.create_branch(&format!("r-{i:04}")).unwrap());
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
+            line(out, cell, "confirm_reference", i - WARMUP, &s_reference);
         }
     }
     hold_word(false);
@@ -2540,14 +2549,36 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");
 }
 
+/// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the
+/// rounds are paired by index and the LARGEST difference is budgeted; comparing two minimums hid a
+/// cost paid in all but one round). Samples are kept in the order they were measured, one of each op
+/// per round, so the j-th of each op is the j-th round. Refused when fewer than half the pairs are
+/// quiet, as `quiet` refuses.
+fn confirm_pairs<'a>(c: &'a CellData, op: &str) -> Vec<(&'a Map, &'a Map)> {
+    let (a, r) = (&c.ops[op], &c.ops["confirm_reference"]);
+    assert_eq!(a.len(), r.len(), "{}: {op} and confirm_reference rounds differ", c.name);
+    let q = |s: &Map| s.get("quiet").copied().unwrap_or(1) == 1;
+    let pairs: Vec<(&Map, &Map)> = a.iter().zip(r).filter(|(x, y)| q(x) && q(y)).collect();
+    assert!(!pairs.is_empty() && 2 * pairs.len() >= a.len(), "{}: {op}: {} of {} round pairs quiet", c.name, pairs.len(), a.len());
+    pairs
+}
+
+/// The largest `x[k] - y[k]` over the pairs, as a signed number.
+fn worst_diff(pairs: &[(&Map, &Map)], k: &str) -> i64 {
+    pairs.iter().map(|(x, y)| x[k] as i64 - y[k] as i64).max().unwrap()
+}
+
 /// Review 6 #1's ruling: the flight's confirmation word leaves the create path for a background
 /// writer, which writes it with ONE unsynced pwrite once the group is idle, under no store mutex.
-/// An idle-tail create whose word is written costs, beyond the same create with the word held, at
-/// most two syscalls (the pwrite, and the writer's one wait to park again) and no sync, no
-/// store-mutex acquisition and no syscall under it, on any thread. A word that owns a duplicated
-/// descriptor adds its close (and std's debug-build F_GETFD at that close): base13 read +4, and an
-/// lldb trace of the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`;
-/// review 1 #14 / review 2 #6 (one shared descriptor, no dup per flight) remove the close.
+/// An idle-tail create whose word is written costs, beyond the reference create that lands on a
+/// pending word (review 2 H2), at most three syscalls — the landing's wake of the parked writer
+/// (`confirm_cv.notify_one`), the pwrite, and the writer's one wait to park again — and no sync, no
+/// store-mutex acquisition and no syscall under it, on any thread; in EVERY quiet round, paired by
+/// index (review 2 H6). A word that owns a duplicated descriptor adds its close (and std's
+/// debug-build F_GETFD at that close): base13 read +4 against the held create, and an lldb trace of
+/// the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`; review 1 #14 /
+/// review 2 #6 (one shared descriptor, no dup per flight) remove the close. Mutant
+/// `confirm_sync_alternate` (a device flush on every other word). WRITTEN NOT RUN in this form.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
@@ -2555,22 +2586,40 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
         return;
     }
     let c = cell("confirm_n10");
-    let (held, written) = (quiet(&c, "confirm_held"), quiet(&c, "confirm_written"));
-    assert!(written.iter().all(|s| s["confirms_written"] == 1), "premise: every written window wrote one word");
-    assert!(held.iter().all(|s| s["confirms_written"] == 0), "premise: no held window wrote a word");
-    let min = |v: &[&Map], k: &str| values(&c, "confirm", v, k).into_iter().min().unwrap();
+    let pairs = confirm_pairs(&c, "confirm_written");
+    assert!(pairs.iter().all(|(w, _)| w["confirms_written"] == 1), "premise: every written window wrote one word");
+    assert!(pairs.iter().all(|(_, r)| r["confirms_written"] == 0), "premise: no reference window wrote a word");
     let mut failures = String::new();
-    for (k, extra) in [("full_fsync", 0u64), ("fsync", 0), ("barrier", 0), ("locks_process", 0), ("held_syscalls", 0)] {
-        let (h, w) = (min(&held, k), min(&written, k));
-        if w != h + extra {
-            let _ = writeln!(failures, "  {k}: held {h}, written {w}; budget held + {extra}");
+    for k in ["full_fsync", "fsync", "barrier", "locks_process", "held_syscalls"] {
+        let d = worst_diff(&pairs, k);
+        if d > 0 {
+            let _ = writeln!(failures, "  {k}: written - reference reached {d} in a round; budget 0");
         }
     }
-    let (h, w) = (min(&held, "syscalls"), min(&written, "syscalls"));
-    if w > h + 2 {
-        let _ = writeln!(failures, "  syscalls: held {h}, written {w}; budget held + 2 (one pwrite, one wait)");
+    let d = worst_diff(&pairs, "syscalls");
+    if d > 3 {
+        let _ = writeln!(failures, "  syscalls: written - reference reached {d} in a round; budget <= 3 (the landing's wake, one pwrite, one wait)");
     }
     assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
+}
+
+/// Review 2 H2 (an engine SHAVE, filed by the lead): an idle-tail create whose flight lands with no
+/// proved word pending wakes the parked confirmation writer on its own acknowledging thread
+/// (`confirm_cv.notify_one` under the group lock, before the create returns): one BSD syscall that
+/// no held per-op cell sees, since a word is always pending there. Budget: the acknowledgement wakes
+/// no thread — held minus reference is 0 syscalls in every quiet round. Expected RED today (+1, the
+/// notify); the SHAVE moves the wake off the acknowledgement path. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_idle_tail_create_wakes_no_thread_on_its_acknowledgement() {
+    if in_child() {
+        return;
+    }
+    let c = cell("confirm_n10");
+    let pairs = confirm_pairs(&c, "confirm_held");
+    assert!(pairs.iter().all(|(h, r)| h["confirms_written"] == 0 && r["confirms_written"] == 0), "premise: no held or reference window wrote a word");
+    let d = worst_diff(&pairs, "syscalls");
+    assert!(d <= 0, "an idle-tail create's acknowledgement paid {d} syscalls more than a create landing on a pending word (the writer's wake on the ack path) [review 2 H2, engine SHAVE]; budget 0");
 }
 
 // ---- engine 2b: a trunk fork inside a DDL commit's schema window (00340537c, then MED 8 678b18ba4) ----
