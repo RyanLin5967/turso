@@ -1671,6 +1671,12 @@ mod fastest_tests;
 #[cfg(all(test, feature = "fs"))]
 mod crash_tests;
 
+// fastest-budgets' test-only counters and their hook lines, carried here so its tree merges this one
+// cleanly (its d1230e45d); its suite (`budget_tests`) stays in its own tree and reads the rest.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod budget_probe;
+
 #[cfg(test)]
 mod tests {
     use super::*;

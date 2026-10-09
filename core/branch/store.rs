@@ -907,6 +907,9 @@ impl StoreMutex {
         let guard = self.0.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
+        // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
+        #[cfg(test)]
+        super::budget_probe::store_locked();
         StoreGuard(guard)
     }
 }
@@ -930,6 +933,7 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
+        super::budget_probe::store_unlocked();
     }
 }
 
