@@ -213,7 +213,7 @@ except ValueError:
     sys.exit(2)
 if not ok or not (math.isfinite(s) and math.isfinite(m)) or s < 0 or {maxcheck}:
     sys.exit(2)
-s_ns, m_ns = {conv}(s * 1e9), {conv}(m * 1e9)
+s_ns, m_ns = {conv}({sx} * 1e9), {conv}({mx} * 1e9)
 claimed = 0
 for line in sys.stdin:
     el = int(line)
@@ -235,11 +235,11 @@ def _safe(f):
 
 
 def fake(d, name, conv="int", cmp=">=", extra=0, capped_expr="0 if done else 1", maxcheck="m <= 0",
-         capped_cond="el >= m_ns"):
+         capped_cond="el >= m_ns", sx="s", mx="m"):
     p = os.path.join(d, name)
     with open(p, "w") as f:
         f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr, name=name, maxcheck=maxcheck,
-                            capped_cond=capped_cond))
+                            capped_cond=capped_cond, sx=sx, mx=mx))
     os.chmod(p, 0o755)
     return p
 
@@ -313,6 +313,30 @@ def _self_test(d):
     lax = fake(d, "lax", maxcheck="m < 0")
     rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": lax})
     cases.append(("MED 9: a fake accepting MAX_S 0 at all (it prints a result) FAILS (rc 1)", rc == 1, rep[-1]))
+    # review 5 LOW 13: a driver that keeps whole seconds of S and MAX_S passed all 12 cases (their fractional S case
+    # did not discriminate); it must fail
+    whole = fake(d, "whole-seconds", sx="float(int(s))", mx="float(int(m))")
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": whole})
+    cases.append(("LOW 13: a fake that keeps whole seconds of S and MAX_S FAILS (rc 1)", rc == 1, rep[-1]))
+    # review 5 LOW 14: each refusal branch of replay() fired by its own fake (rc 2): no output at all, a result line
+    # then exit 1, a result line then another line, and a driver that does not answer within the timeout
+    for nm, body, what in (("silent", "#!/bin/sh\nexit 0\n", "no output at all"),
+                           ("line-rc1", "#!/bin/sh\necho stop_at=0 warm_ops=0 capped=0\nexit 1\n",
+                            "a result line, then exit 1"),
+                           ("line-extra", "#!/bin/sh\necho stop_at=0 warm_ops=0 capped=0\necho more\n",
+                            "a result line, then another line")):
+        fp = os.path.join(d, nm)
+        with open(fp, "w") as f:
+            f.write(body)
+        os.chmod(fp, 0o755)
+        rc, rep = run({"fastest_profile": fp})
+        cases.append((f"LOW 14: a driver printing {what} is REFUSED (rc 2)", rc == 2, rep[-1]))
+    slow = os.path.join(d, "slow")
+    with open(slow, "w") as f:
+        f.write("#!/bin/sh\nsleep 5\necho stop_at=0 warm_ops=0 capped=0\n")
+    os.chmod(slow, 0o755)
+    cases.append(("LOW 14: a driver that does not answer within the timeout is REFUSED (rc 2)",
+                  _safe(lambda: run({"fastest_profile": slow}, timeout=1)[0] == 2), ""))
     # review 5 MED 8: the LIVE loop -- a driver's run records the claims it judged (ns since its warm-up began) and the
     # decision it made; live_check replays those claims through the same driver's --warmup-replay and compares
     live = os.path.join(d, "live.json")
