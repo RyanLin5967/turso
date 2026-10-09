@@ -129,8 +129,9 @@ def sqlite(av):
 
 
 def selftest():
-    base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "gen_seed_sha256": "ab" * 32,
-            "du_bytes": 9000000, "engine_bytes": 8900000, "extents": {"t": 3}, "maintenance": ["VACUUM", "CHECKPOINT"]}
+    base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "live_branches": 0,
+            "gen_seed_sha256": "ab" * 32, "du_bytes": 9000000, "engine_bytes": 8900000, "extents": {"t": 3},
+            "maintenance": ["VACUUM", "CHECKPOINT"]}
 
     def v(**kw):
         d = dict(base)
@@ -149,6 +150,14 @@ def selftest():
         ("engine size missing with a reason", [v(), v(system="dolt", engine_bytes=None,
                                                          engine_bytes_why="Dolt reports no database size")], True),
         ("no fixture at all", [], False),
+        # lead review 62430d8bf..b49fb656a HIGH 1: the live-branch count every cell runs at, MEASURED after prebranch
+        # (count_branches, main excluded), is the same on every system and is the requested PREBRANCH
+        ("a system's measured live branches differ", [v(), v(system="dolt", live_branches=24)], False),
+        ("measured live branches are not the requested prebranch",
+         [v(prebranch=20, live_branches=24), v(system="dolt", prebranch=20, live_branches=24)], False),
+        ("no measured live branches", [v(live_branches=KeyError), v(system="dolt", live_branches=KeyError)], False),
+        ("20 requested, 20 measured on every system",
+         [v(prebranch=20, live_branches=20), v(system="dolt", prebranch=20, live_branches=20)], True),
     ]
     bad = 0
     for name, fx, want in cases:

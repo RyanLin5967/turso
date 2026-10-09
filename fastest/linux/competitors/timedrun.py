@@ -7,11 +7,14 @@ TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver 
 that serves the timed run (the server's processes, or the embedded clonebench process) at its start and at its end
 into CELLDIR/timed.tracer.tsv ("phase pid tid tracerpid"), and writes the run's exit status to CELLDIR/timed.rc.
 
-  timedrun.py check CELLDIR N RULE
+  timedrun.py check CELLDIR N RULE LIVE
                                 CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
                                 exactly N ops like the labelling run, every sampled task, at start and at end, had
-                                TracerPid 0 (no sample at either end is not a pass), and both runs recorded the
-                                warm-up RULE
+                                TracerPid 0 (no sample at either end is not a pass), both runs recorded the
+                                warm-up RULE, and the live-branch count held at LIVE: CELLDIR/live.tsv's four
+                                counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
+                                review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
+                                so N is the same before and after each run and the same for every cell)
   timedrun.py ops C N1 N4 [TOTAL]
                                 the run's ops total: TOTAL (FT_OPS_TOTAL) for every C when given, else N1 at C=1 and
                                 N4 otherwise (gate-6 review, t3run item 12). A run capped by the registered window
@@ -88,7 +91,10 @@ def real_problem(cap_s, warmup):
     return "; ".join(why) or None
 
 
-def check(celldir, n, warm_rule=None):
+LIVE_KEYS = ("label_before", "label_after", "timed_before", "timed_after")
+
+
+def check(celldir, n, warm_rule=None, live=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
     lab = load(os.path.join(celldir, "bb", "summary.json"))
@@ -153,10 +159,18 @@ def write_verdict(celldir, n, why):
 RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 
 
+LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
+
+
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
-            lab_ops=None, capped=False):
+            lab_ops=None, capped=False, live="held"):
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
+    if live == "held":
+        live = {k: LIVE for k in LIVE_KEYS}
+    if live is not None:  # None: no live.tsv at all
+        with open(os.path.join(d, "live.tsv"), "w") as f:
+            f.write("".join(f"{k}\t{v}\n" for k, v in live.items()))
     lo = n if lab_ops is None else lab_ops
     with open(os.path.join(d, "bb", "summary.json"), "w") as f:
         json.dump({"verdict": "ok", "rc": 0, "measured_ops": lo, "measured_ok": lo, "warmup_rule": lab_rule,
@@ -199,12 +213,26 @@ def selftest():
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1500), True),
         ("a capped run with < 1000 ops", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800), False),
         ("an uncapped run short of N", dict(tracer=clean, lab_ops=1200, timed_ops=1500), False),
+        # lead review 62430d8bf..b49fb656a HIGH 1: the live-branch count N is held fixed and recorded around both runs
+        ("N held at 21 around both runs", dict(tracer=clean), True),
+        ("the labelling run at N=20, the timed run at N=1020",
+         dict(tracer=clean, live={"label_before": 20, "label_after": 20, "timed_before": 1020, "timed_after": 1020}),
+         False),
+        ("N grew by the run's creates inside the timed run (no delete)",
+         dict(tracer=clean, live={"label_before": LIVE, "label_after": LIVE, "timed_before": LIVE,
+                                  "timed_after": LIVE + 200}), False),
+        ("no live-branch record", dict(tracer=clean, live=None), False),
+        ("a live-branch count missing", dict(tracer=clean, live={"label_before": LIVE, "label_after": LIVE,
+                                                                 "timed_before": LIVE}), False),
+        ("a live-branch count that is not a count", dict(tracer=clean, live={"label_before": LIVE, "label_after": "x",
+                                                                             "timed_before": LIVE, "timed_after": LIVE}),
+         False),
     ]
     bad = 0
     with tempfile.TemporaryDirectory() as root:
         for i, (name, kw, want) in enumerate(cases):
             d = fixture(root, f"c{i}", **kw)
-            why = check(d, 5000 if "capped" in name or "short of N" in name else 200, RULE)
+            why = check(d, 5000 if "capped" in name or "short of N" in name else 200, RULE, LIVE)
             got = not why
             print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
             bad += got != want
@@ -249,9 +277,9 @@ def selftest():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "check":
+    if len(sys.argv) == 6 and sys.argv[1] == "check":
         n = int(sys.argv[3])
-        why = check(sys.argv[2], n, sys.argv[4])
+        why = check(sys.argv[2], n, sys.argv[4], sys.argv[5])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
     if len(sys.argv) in (5, 6) and sys.argv[1] == "ops":

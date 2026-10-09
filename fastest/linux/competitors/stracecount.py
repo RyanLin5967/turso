@@ -72,6 +72,25 @@ BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, (\d+)\): (?:No such process|
 DESYNC = re.compile(r"pid (\d+): (entering|exiting), ptrace_syscall_info\.op == (\d+)")
 
 
+# The C=1 phase split (lead review 62430d8bf..b49fb656a HIGH 1, ruling in DECISIONS): with an untimed delete after
+# every create, a load window holds create AND delete flushes. At C=1 only, each counted flush is placed by its -ttt
+# start stamp, mapped onto CLOCK_MONOTONIC through the window's t0 clock pair, against the load generator's raw.tsv
+# (start_ns, end_ns, after_ns, CLOCK_MONOTONIC): "create" in [start, end] (the timed op: create [+ switch]
+# [+ first write]), "delete" in (end, end + after] (the untimed after-steps: closing the branch connection and the
+# delete), "between" anywhere else. At C>1 ops overlap, so no split is made and only per-cycle figures exist.
+PHASES = ("create", "delete", "between")
+
+
+def load_intervals(raw):
+    """RED stub: no intervals."""
+    return []
+
+
+def phase_of(t_ns, iv):
+    """RED stub."""
+    return "between"
+
+
 def parse_summary(text):
     rows, seen = {}, False
     for line in text.splitlines():
@@ -185,7 +204,7 @@ def attribute(by_tid, spawned, window, main, clients, attached):
             "top_processes": sorted(([p, e["role"], e["flushes"]] for p, e in by_proc.items()), key=lambda x: -x[2])[:20]}
 
 
-def count(trace, extras, root, window=None, clients=frozenset(), part=None):
+def count(trace, extras, root, window=None, clients=frozenset(), part=None, phases=None):
     """Count one strace window. part=None counts the whole trace; part="pre"/"post" counts only the calls that
     STARTED before/after the window's tsplit stamp (strace_mark), so one attach can hold a load window and the
     CHECKPOINT after it (second review, finding 2). The table-vs-lines check always covers the whole trace."""
@@ -667,6 +686,80 @@ def table(d):
             print("\t".join([os.path.relpath(root, d)] + [str(x) for x in table_row(c)]))
 
 
+def selftest():
+    """Known answers for the C=1 phase split: phase_of over synthetic intervals, load_intervals' refusals, and a
+    planted launch window through count() itself (a flush stamped inside a create window must land in create, one
+    inside a delete window in delete, one between ops in between)."""
+    import tempfile
+    bad, n = 0, 0
+
+    def ok(name, cond, why=""):
+        nonlocal bad, n
+        n += 1
+        print(("PASS" if cond else "FAIL"), name, ("" if cond else f"-> {why}"))
+        bad += not cond
+    hdr = "client\tseq\tphase\tok\tintended_ns\tstart_ns\tend_ns\tlat_ns\tafter_ns\terr\n"
+
+    def raw(rows, header=hdr):
+        return header + "".join("\t".join(str(x) for x in r) + "\n" for r in rows)
+    # op k: start 1000.05 + 0.2k s, end + 0.1 s, after 0.1 s (ns, CLOCK_MONOTONIC)
+    rows = [(0, k, "measure", 1, 0, 1000050000000 + k * 200000000, 1000150000000 + k * 200000000, 100000000,
+             100000000, -1) for k in range(3)]
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "raw.tsv")
+        open(p, "w").write(raw(rows))
+        try:
+            iv = load_intervals(p)
+        except ValueError as e:
+            iv, e1 = [], str(e)
+        ok("load_intervals reads 3 ops", len(iv) == 3, iv)
+        for t, want in ((1000100000000, "create"), (1000150000000, "create"), (1000150000001, "delete"),
+                        (1000250000000, "delete"), (1000250000001, "between"), (1000000000000, "between"),
+                        (1000500000000, "create"), (1000700000000, "between")):
+            ok(f"phase_of({t}) = {want}", phase_of(t, iv) == want, phase_of(t, iv))
+        for name, text in (("two clients (C>1: no split)", raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)])),
+                           ("no after_ns column", raw([r[:8] + r[9:] for r in rows],
+                                                      hdr.replace("\tafter_ns", ""))),
+                           ("no ops", raw([]))):
+            open(p, "w").write(text)
+            try:
+                load_intervals(p)
+                ok(f"load_intervals refuses {name}", False, "accepted")
+            except ValueError:
+                ok(f"load_intervals refuses {name}", True)
+        # The plant: a launch window (strace_run's shape) whose t0 pair maps realtime 1700000000.0 to monotonic 1000.0.
+        open(p, "w").write(raw(rows))
+        w = os.path.join(d, "load.window")
+        open(w, "w").write("cmd=planted\nt0=1700000000.000000000 t0_mono=1000.000000000 t0_err=0.000000500 "
+                           "t0_src=coproc\nt1=1700000001.000000000 t1_mono=1001.000000000 t1_err=0.000000500 "
+                           "t1_src=coproc\nstrace_rc=0\n")
+        tr = os.path.join(d, "load.strace")
+        open(tr, "w").write(
+            "100 1700000000.100000 fsync(3</x/branch.db>) = 0\n"          # create window of op 0 -> create
+            "100 1700000000.200000 fsync(4</x>) = 0\n"                    # delete window of op 0 -> delete
+            "100 1700000000.420000 fdatasync(3</x/branch.db>) = 0\n"      # create window of op 1 -> create
+            "100 1700000000.900000 fsync(3</x/other>) = 0\n"              # after the last op -> between
+            "% time     seconds  usecs/call     calls    errors syscall\n"
+            "------ ----------- ----------- --------- --------- ----------------\n"
+            " 75.00    0.000003           1         3           fsync\n"
+            " 25.00    0.000001           1         1           fdatasync\n"
+            "------ ----------- ----------- --------- --------- ----------------\n"
+            "100.00    0.000004           1         4           total\n")
+        r = count(tr, [], "/x", w, phases=p)
+        ok("planted window counts 4 flushes", r.get("flushes") == 4, r.get("flushes"))
+        ok("plant: create 2, delete 1, between 1", r.get("flush_by_phase") == {"create": 2, "delete": 1, "between": 1},
+           r.get("flush_by_phase"))
+        ok("plant: the window itself is ok", r.get("verdict") == "ok", r.get("verdict"))
+        r2 = count(tr, [], "/x", w)
+        ok("no split unless asked", "flush_by_phase" not in r2, r2.get("flush_by_phase"))
+        open(p, "w").write(raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)]))
+        r3 = count(tr, [], "/x", w, phases=p)
+        ok("a split asked over a C>1 run is refused", r3.get("verdict", "").startswith("REFUSED")
+           and "phase split" in r3.get("verdict", ""), r3.get("verdict"))
+    print(f"stracecount selftest: {n - bad}/{n}")
+    return 1 if bad else 0
+
+
 def clients_of(path):
     """The load generator's PG backend pids from bbload's backends.tsv (MySQL-protocol connection ids are not
     process ids and are not used)."""
@@ -700,7 +793,7 @@ def main():
     if cmd == "count" and len(sys.argv) >= 3:
         a = kv(sys.argv[3:])
         r = count(sys.argv[2], a.get("extra", []), a.get("root"), a.get("window"), clients_of(a.get("clients")),
-                  a.get("part"))
+                  a.get("part"), a.get("phases"))
         print(json.dumps(r, indent=1))
         sys.exit(0 if not r["verdict"].startswith("REFUSED") else 3)
     if cmd == "cell":
@@ -710,6 +803,8 @@ def main():
     if cmd == "table" and len(sys.argv) == 3:
         table(sys.argv[2])
         return
+    if cmd == "selftest" and len(sys.argv) == 2:
+        sys.exit(selftest())
     sys.exit(__doc__)
 
 
