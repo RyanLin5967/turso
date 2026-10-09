@@ -6804,3 +6804,49 @@ fn a_commented_transaction_verb_is_its_verb() {
         assert_eq!(codes, vec!["25P01"], "{end}: {:?}", r.notices);
     }
 }
+
+/// A transaction verb or CHECKPOINT is read as PostgreSQL's lexer reads it: runs of `;` before
+/// and after it are empty statements, a vertical tab is whitespace, and a comment after
+/// CHECKPOINT is whitespace. `;COMMIT` and `COMMIT;;` by Parse end a failed block with ROLLBACK
+/// and commit an open one; `\vBEGIN` begins one; `CHECKPOINT -- x` is the server's CHECKPOINT, and
+/// with a value bound it is 08P01. Read as ordinary statements, the failed block refused them
+/// (25P02) and the engine ran `CHECKPOINT -- x` as text (wire review 14 item 6).
+#[test]
+fn a_verb_beside_empty_statements_is_its_verb() {
+    let dir = Scratch::new("verbsemis");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [";COMMIT", "COMMIT;;"] {
+        a.q("BEGIN").ok("begin");
+        assert_eq!(a.q("SELECT 1/0").status, b'E', "premise: the block failed");
+        let r = a.x(sql, &[]).ok(sql);
+        assert_eq!(
+            r.tags,
+            vec!["ROLLBACK".to_string()],
+            "{sql} ends the failed block"
+        );
+        assert_eq!(r.status, b'I', "{sql}");
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'two')").ok("a write");
+        let r = a.x(sql, &[]).ok(sql);
+        assert_eq!(r.status, b'I', "{sql} commits");
+        assert_eq!(
+            a.q("SELECT count(*) FROM t WHERE id = 2").single("kept"),
+            "1",
+            "{sql}"
+        );
+        a.q("DELETE FROM t WHERE id = 2").ok("undo");
+    }
+    let r = a.x("\u{b}BEGIN", &[]).ok("\\vBEGIN");
+    assert_eq!(r.status, b'T');
+    a.q("ROLLBACK").ok("end");
+    let r = a.q("CHECKPOINT -- x").ok("a commented CHECKPOINT");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    // Parse declaring no parameter, Bind with one value: a bad count.
+    a.send(b'P', b"\0CHECKPOINT -- x\0\0\0");
+    a.send(b'B', b"\0\0\0\0\0\x01\0\0\0\x01v\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err("CHECKPOINT -- x with a value").code, "08P01");
+}
