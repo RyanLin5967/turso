@@ -105,7 +105,38 @@ def selftest(path):
     return r.returncode, fails, total, r.stderr
 
 
+def self_test():
+    """the table guard on synthetic sources (review 5 MED 5): a mutant that does not compile, an indented target that
+    matches inside a deeper indentation, and a target found twice are each refused as a stale table; a clean row and
+    the real table on the real v3l.py are not"""
+    src = "def f(a):\n    if a:\n        y = 2\n    return a\n"
+    row = lambda old, new: [("t", "synthetic", old, new, "")]
+    cases = [
+        ("a mutant whose source does not compile is a stale table",
+         lambda: any("does not compile" in x for x in table_problems(src, row("        y = 2\n", "")))),
+        ("an indented target matching inside a deeper indentation is a stale table",
+         lambda: any("line start" in x for x in table_problems(src, row("    y = 2\n", "    pass\n")))),
+        ("a target found twice is a stale table",
+         lambda: any("2 times" in x for x in table_problems(src + src, row("    return a\n", "    return 0\n")))),
+        ("a clean row is not refused", lambda: table_problems(src, row("        y = 2\n", "        pass\n")) == []),
+        ("the real table on the real v3l.py is not refused", lambda: table_problems(open(SRC).read(), MUTANTS) == []),
+    ]
+    bad = 0
+    for name, f in cases:
+        try:
+            ok = bool(f())
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            print(f"V3L-MUTANTS self-test case raised {type(e).__name__}: {e}")
+        bad += not ok
+        print(f"V3L-MUTANTS self-test {'PASS' if ok else 'FAIL'}: {name}")
+    print(f"V3L-MUTANTS SELF-TEST {len(cases) - bad}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
+    return 0 if not bad else 1
+
+
 def main(argv):
+    if argv[1:] == ["self-test"]:
+        return self_test()
     names = argv[1:]
     known = {m[0] for m in MUTANTS}
     if [n for n in names if n not in known]:
