@@ -30,9 +30,11 @@ Gates (any failure makes the measurement VOID, and the block with it):
   - fio reports exactly 10,000 writes on every run, no sync on the control's, and on the fsync arm the same sync count
     in the timed run as in the V1L-checked labelling run (the timed run has no tracer; this ties it to the checked one);
   - the drive's queue/write_cache reads "write back" or "write through" (anything else VOIDs); on "write back" the flush
-    counter rises by at least 10,000 across the timed fsync run (a lower bound: another process's flushes can pad
-    it, never shrink it). Every LOOP layer whose queue reads "write back" is gated the same way on its own counter
-    (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
+    counter rises by at least 10,000 across the timed fsync run AND across the strace-checked labelling run (a lower
+    bound: another process's flushes can pad it, never shrink it; T3 runner review item 3), and the timed run makes
+    at least the labelling run's whole flushes per fsync; on "write through" it reads 0 in both runs. Every LOOP layer
+    is gated the same way on its own counter (gate-6 review M3), so a write-through layer above the drive shows as a
+    drive counter that did not rise;
   - the timed fsync run carries fio's own sync count (N-1 or N; fio 3.36 does not count the end_fsync), a p50 and
     the histogram bins (review M1: no measurement, no normaliser, no VALID).
 Published, not gates (lines 180 and 553): the fsync p50, the fsync/control write p50 ratio, the before-to-after
@@ -45,6 +47,7 @@ whole drive's, so concurrent work on that drive pads it; a filesystem behind dev
 resolved, and so is a native-multipath NVMe head (its counter may live on the path devices); a loop is followed
 through its backing file to the drive under it. Every fio argv is recorded in v3l.json (review M7).
 """
+import copy
 import json
 import os
 import re
@@ -235,18 +238,28 @@ def gates(rec):
 
 
 def counter_gate(what, wc, timed, lab):
-    """One device's flush counter over the timed fsync run (A16):
-    write back: at least one flush per fsync, AND at least the whole flushes per fsync the strace-checked labelling run
-      showed this stack making (floor(lab / N), e.g. 2 through a loop), so a timed run that lost part of its fsyncs
-      cannot pass on a stack that makes 2 per fsync (gate-6 review 7, lane review MED 3). Absent a labelling count
-      (records before it was taken) only the first rule applies;
+    """One device's flush counter over the timed fsync run (`timed`) and the strace-checked labelling run (`lab`), A16:
+    write back: at least one flush per fsync in the timed run; at least one per fsync in the labelling run (a count
+      below N VOIDs, whatever the timed run did: PREREG line 180 voids "fewer than one per fsync" in the run whose
+      fsyncs strace checked; T3 runner review item 3); a count that is not an int is unreadable and VOIDs; and at least
+      the whole flushes per fsync the labelling run showed this stack making (floor(lab / N), e.g. 2 through a loop), so
+      a timed run that lost part of its fsyncs cannot pass on a stack that makes 2 per fsync (gate-6 review 7, lane
+      review MED 3). Blind spot, stated: a record with NO labelling count (None) gets the timed rule only; measure()
+      has written one for the drive and every loop layer since 7dc4d4c04, so only a record from before then, or a
+      hand-made one, is judged that way;
     write through: the counter must read 0 in both runs (the block layer sends no flush; a count contradicts the
       recorded state and VOIDs)."""
     bad = []
     if wc == "write back":
-        if timed is None or timed < N:
+        short = timed is None or timed < N
+        if short:
             bad.append(f"write-back {what}: its flush counter rose {timed} across {N} fsyncs (fewer than one per fsync)")
-        elif isinstance(lab, int) and lab >= N and timed < (lab // N) * N:
+        if lab is not None and (not isinstance(lab, int) or isinstance(lab, bool)):
+            bad.append(f"write-back {what}: labelling count unreadable ({lab!r}): not absent, so not judged as absent")
+        elif isinstance(lab, int) and lab < N:
+            bad.append(f"write-back {what}: its flush counter rose {lab} across the {N} fsyncs of the labelling run "
+                       "(fewer than one per fsync in the strace-checked run)")
+        elif isinstance(lab, int) and not short and timed < (lab // N) * N:
             bad.append(f"write-back {what}: its flush counter rose {timed} in the timed run, fewer than the "
                        f"{lab // N} per fsync the labelling run showed ({lab} across {N})")
     elif wc == "write through":
@@ -399,45 +412,41 @@ def block(b, a):
     return rec
 
 
+def as_state(rec, wc):
+    """The plant base: a copy of `rec` with its drive and every loop layer in state `wc` (T3 runner review item 3).
+    A device's counts are synthesised only where the base is DERIVED, i.e. that device's real state is the other one
+    (write back: 2 per fsync in both runs; write through: 0 in both), or where the record carries no labelling count
+    at all (filled from the device's own timed count, so both runs show one flushes-per-fsync). A count a real record
+    carries for its own state is never rewritten: a real labelling count below N stays below N, and the control VOIDs."""
+    r = copy.deepcopy(rec)
+
+    def put(d, real):
+        if real != wc:
+            d["flush_ios_delta"] = d["lab_flush_ios_delta"] = 2 * N if wc == "write back" else 0
+        elif d.get("lab_flush_ios_delta") is None:
+            d["lab_flush_ios_delta"] = d.get("flush_ios_delta")
+
+    put(r["arms"]["fsync"]["timed"], rec["leaf"].get("write_cache"))
+    r["leaf"]["write_cache"] = wc
+    r["leaf"]["drive_reports"] = wc
+    for lay in r["leaf"].get("layers") or []:
+        put(lay, lay.get("write_cache"))
+        lay["write_cache"] = wc
+    return r
+
+
 def plants(rec):
     """The V3L counter and agreement gates forced to fire on copies of a real record (gate-6 review 7, lane review
-    MED 3/4): each plant is one field changed on a record whose control passes gates(). The branch the real drive is
-    not on is reached by setting the leaf (and its loop layers) to that state with consistent counts (write back: the
-    real per-fsync counts if any, else 2 per fsync; write through: 0), then changing one field.
+    MED 3/4): each plant is one field changed on a base whose gates pass. The branch the real drive is not on is
+    reached through as_state(), which sets the leaf (and its loop layers) to that state with consistent counts.
+    A plant fires only on a failure message carrying every one of its `want` texts (its own rule's text).
     Returns (results, ok); a control that does not pass makes every plant NOT-RUN (ok False)."""
-    import copy as _c
     out = []
     again = gates(rec)
     out.append({"plant": "control", "want": "VALID", "got": again or "VALID", "fired": not again})
     if again:
         out.append({"plant": "all", "fired": False, "why": "NOT-RUN: the real record is not VALID"})
         return out, False
-
-    def as_state(r, wc):
-        r = _c.deepcopy(r)
-        r["leaf"]["write_cache"] = wc
-        r["leaf"]["drive_reports"] = wc
-        t = r["arms"]["fsync"]["timed"]
-        if wc == "write through":
-            t["flush_ios_delta"] = t["lab_flush_ios_delta"] = 0
-        else:
-            if not t.get("flush_ios_delta"):
-                t["flush_ios_delta"] = 2 * N
-            # a write-through record's labelling count is 0, and older records have none: the base takes the timed
-            # count, so the labelling run shows the same flushes per fsync (dry run 37812992594: a 0 kept here left
-            # the floor rule unarmed and the half-flushes plant could not fire)
-            if not t.get("lab_flush_ios_delta") or t["lab_flush_ios_delta"] < N:
-                t["lab_flush_ios_delta"] = t["flush_ios_delta"]
-        for lay in r["leaf"].get("layers") or []:
-            lay["write_cache"] = wc
-            if wc == "write through":
-                lay["flush_ios_delta"] = lay["lab_flush_ios_delta"] = 0
-            else:
-                if not lay.get("flush_ios_delta"):
-                    lay["flush_ios_delta"] = 2 * N
-                if not lay.get("lab_flush_ios_delta") or lay["lab_flush_ios_delta"] < N:
-                    lay["lab_flush_ios_delta"] = lay["flush_ios_delta"]
-        return r
 
     def arm(name, base_wc, mutate, want):
         r = as_state(rec, base_wc)
@@ -446,13 +455,18 @@ def plants(rec):
             return
         mutate(r)
         got = gates(r)
-        out.append({"plant": name, "want": want, "got": got, "fired": any(want in x for x in got)})
+        wants = (want,) if isinstance(want, str) else tuple(want)
+        out.append({"plant": name, "want": want, "got": got, "fired": any(all(w in x for w in wants) for x in got)})
 
     def half_timed(r):
         t = r["arms"]["fsync"]["timed"]
         t["flush_ios_delta"] = t["flush_ios_delta"] // 2
 
+    disk = rec["leaf"].get("disk")
     arm("wb-half-flushes", "write back", half_timed, "write-back drive")
+    arm("wb-lab-short", "write back",
+        lambda r: r["arms"]["fsync"]["timed"].__setitem__("lab_flush_ios_delta", N // 2),
+        (f"write-back drive {disk}:", "fewer than one per fsync in the strace-checked run"))
     arm("wt-one-flush", "write through", lambda r: r["arms"]["fsync"]["timed"].__setitem__("flush_ios_delta", 1),
         "write-through drive")
     arm("timed-half-syncs", rec["leaf"]["write_cache"],
