@@ -549,27 +549,59 @@ async fn serve_session(
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
             break Ok(());
         }
-        // A Sync or simple Query whose body is malformed ends any skip, fails the block it arrives
-        // in, and is answered with its ERROR and ReadyForQuery carrying the session's real state,
-        // as PostgreSQL answers them (it clears the skip and the extended flag before it reads
-        // either body). A malformed Sync got no ReadyForQuery, so the client hung; a malformed
-        // Query's error never reached the session's block, so COMMIT committed (wire review 12
-        // items 6 and 7). A malformed CopyFail outside COPY is ignored, as PostgreSQL ignores a
-        // stray CopyFail.
+        // A Sync whose body is malformed ends any skip; a simple Query whose body is malformed is
+        // ignored during one, as PostgreSQL ignores every message but Sync there before reading
+        // its body (it ended the skip, and the extended messages after it ran: wire review 15
+        // item 5). Outside a skip either fails the block it arrives in and ends its round as
+        // on_sync does (Session::end_round, then the ended transaction's named portals dropped:
+        // the round's portals outlived it, wire review 15 item 4), answered with its ERROR and
+        // ReadyForQuery carrying the session's real state, as PostgreSQL answers them. A malformed
+        // Sync got no ReadyForQuery, so the client hung; a malformed Query's error never reached
+        // the session's block, so COMMIT committed (wire review 12 items 6 and 7). Before startup
+        // completes there is no round: FATAL 08P01 (wire review 15 item 19). A malformed CopyFail
+        // outside COPY is ignored, as PostgreSQL ignores a stray CopyFail.
         if let PgWireFrontendMessage::Malformed(kind, code, ref message) = msg {
-            let copying = matches!(socket.state(), PgWireConnectionState::CopyInProgress(_));
+            let state = socket.state();
+            let copying = matches!(state, PgWireConnectionState::CopyInProgress(_));
+            if kind == b'Q' && matches!(state, PgWireConnectionState::AwaitingSync) {
+                continue;
+            }
             if matches!(kind, b'S' | b'Q') && !copying {
-                session.fail_block();
                 let info = ErrorInfo::from(PgWireError::MalformedMessage {
                     code,
                     message: message.clone(),
                 });
+                if matches!(
+                    state,
+                    PgWireConnectionState::AwaitingSslRequest
+                        | PgWireConnectionState::AwaitingStartup
+                        | PgWireConnectionState::AuthenticationInProgress
+                ) {
+                    let mut info = info;
+                    info.severity = "FATAL".to_string();
+                    let _ = socket
+                        .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                        .await;
+                    break Ok(());
+                }
+                session.fail_block();
                 socket.set_state(PgWireConnectionState::ReadyForQuery);
-                let status = session.transaction_status();
+                let (notices, status) = session.end_round();
+                socket.set_transaction_status(status);
+                for name in session.ended_portals() {
+                    socket.portal_store().rm_portal(&name);
+                }
                 let sent = async {
                     socket
                         .feed(PgWireBackendMessage::ErrorResponse(info.into()))
                         .await?;
+                    for notice in notices {
+                        socket
+                            .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                *notice,
+                            )))
+                            .await?;
+                    }
                     socket
                         .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                             status,
@@ -865,6 +897,19 @@ impl Session {
         if name != DEFAULT_NAME {
             self.state().done_portals.insert(name.to_string());
         }
+    }
+
+    /// The end of an extended-protocol round, at a Sync whether or not its body was well formed
+    /// (wire review 15 item 4): the extended protocol's results were fed as each Execute ran, so
+    /// what is left is its notices, to go out now, a statement a Describe kept but no Execute ran,
+    /// dropped, and the transaction status ReadyForQuery carries.
+    fn end_round(&self) -> (Vec<Box<ErrorInfo>>, TransactionStatus) {
+        let notices = {
+            let mut st = self.state();
+            st.described = None;
+            std::mem::take(&mut st.notices)
+        };
+        (notices, self.transaction_status())
     }
 
     /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
@@ -3047,13 +3092,7 @@ impl ExtendedQueryHandler for Session {
                 .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                 .await?;
         }
-        // The extended protocol's results were fed as each Execute ran; its notices go out here, and
-        // a statement a Describe kept but no Execute ran is dropped.
-        let notices = {
-            let mut st = self.state();
-            st.described = None;
-            std::mem::take(&mut st.notices)
-        };
+        let (notices, status) = self.end_round();
         for notice in notices {
             client
                 .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
@@ -3061,7 +3100,6 @@ impl ExtendedQueryHandler for Session {
                 )))
                 .await?;
         }
-        let status = self.transaction_status();
         client.set_transaction_status(status);
         send_ready_for_query(client, status).await?;
         Ok(())
