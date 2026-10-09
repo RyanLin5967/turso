@@ -3754,7 +3754,11 @@ fn a_drop_and_a_connect_never_both_win_a_named_branch() {
             conn.as_ref().err()
         );
         assert!(
-            matches!(dropped, Err(LimboError::BranchInUse(ref n)) if n == "\"race\""),
+            matches!(
+                dropped,
+                Err(LimboError::BranchInUse { ref name, op: crate::BranchOp::Drop, .. })
+                    if name.as_deref() == Some("race")
+            ),
             "catalog={catalog}: the drop after the connect was not refused as BranchInUse: {dropped:?}"
         );
         assert!(
@@ -3839,8 +3843,9 @@ fn a_drop_in_use_is_refused_in_its_own_words() {
 
 /// fastest-wire: the named-branch refusals are typed, so a server answers each with its own code
 /// without matching message text: `NameTaken` from `create_branch`, `NoSuchBranch` from
-/// `connect_named` and `drop_branch`, `BranchInUse` (the name, quoted) from a second
-/// `connect_named` and from `drop_branch` while connected.
+/// `connect_named` and `drop_branch`, `BranchInUse` (the name as given, and the refused
+/// operation: engine review 14 LOW 12) from a second `connect_named` and from `drop_branch` while
+/// connected.
 #[test]
 fn named_branch_refusals_are_typed() {
     let _s = serial();
@@ -3864,11 +3869,19 @@ fn named_branch_refusals_are_typed() {
         );
         let c = db.connect_named("a").unwrap();
         assert!(
-            matches!(db.connect_named("a"), Err(LimboError::BranchInUse(ref n)) if n == "\"a\""),
+            matches!(
+                db.connect_named("a"),
+                Err(LimboError::BranchInUse { ref name, op: crate::BranchOp::Connect, .. })
+                    if name.as_deref() == Some("a")
+            ),
             "catalog={catalog}: a second connection was not refused as BranchInUse"
         );
         assert!(
-            matches!(db.drop_branch("a"), Err(LimboError::BranchInUse(ref n)) if n == "\"a\""),
+            matches!(
+                db.drop_branch("a"),
+                Err(LimboError::BranchInUse { ref name, op: crate::BranchOp::Drop, .. })
+                    if name.as_deref() == Some("a")
+            ),
             "catalog={catalog}: a drop while connected was not refused as BranchInUse"
         );
         drop(c);

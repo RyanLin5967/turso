@@ -5147,7 +5147,7 @@ impl BranchStore {
             )));
         }
         if st.open {
-            return Err(in_use(id, st.name.as_deref()));
+            return Err(in_use(id, st.name.as_deref(), crate::error::BranchOp::Connect));
         }
         st.open = true;
         Ok(st.schema.clone())
@@ -5247,7 +5247,7 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         inner.ensure(id)?;
         match inner.branches.get(&id) {
-            Some(st) if st.open => Err(in_use(id, st.name.as_deref())),
+            Some(st) if st.open => Err(in_use(id, st.name.as_deref(), crate::error::BranchOp::Drop)),
             _ => Ok(()),
         }
     }
@@ -5290,7 +5290,14 @@ impl BranchStore {
         }
         // Mutant `drop_while_open` (test builds only): a drop releases a branch in use, as before.
         if refuse_open && st.open && !fe_mutant("drop_while_open") {
-            return Err(in_use(id, st.name.as_deref()));
+            // Mutant `drop_refused_as_connect` (test builds only): refused with the connect's
+            // reason, as before (engine review 14 LOW 12).
+            let op = if fe_mutant("drop_refused_as_connect") {
+                crate::error::BranchOp::Connect
+            } else {
+                crate::error::BranchOp::Drop
+            };
+            return Err(in_use(id, st.name.as_deref(), op));
         }
         let record = inner.release_record(id);
         let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
@@ -7140,10 +7147,15 @@ fn name_taken(name: &str) -> LimboError {
     LimboError::NameTaken(name.to_string())
 }
 
-/// Branch `id` (named `name`, if it is) already has an open connection (fastest-wire's typed
-/// refusal, `LimboError::BranchInUse`): its name, quoted, or its id.
-fn in_use(id: BranchId, name: Option<&str>) -> LimboError {
-    LimboError::BranchInUse(name.map_or_else(|| id.0.to_string(), |n| format!("{n:?}")))
+/// Branch `id` (named `name`, if it is) already has an open connection, so `op` is refused
+/// (fastest-wire's typed refusal, `LimboError::BranchInUse`): the name as given, unquoted, its id,
+/// and the operation, whose reason the message gives (engine review 14 LOW 12).
+fn in_use(id: BranchId, name: Option<&str>, op: crate::error::BranchOp) -> LimboError {
+    LimboError::BranchInUse {
+        name: name.map(str::to_string),
+        id: id.0,
+        op,
+    }
 }
 
 fn reaped(id: BranchId) -> LimboError {
