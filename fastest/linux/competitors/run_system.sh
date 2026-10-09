@@ -421,20 +421,32 @@ run_server_cell() { # run_server_cell SPEC C
 server_fixture() {
   local du=() ext=() eb="" why="" maint
   maint=$(sed -n 's/^maintenance: //p' "$RAW/seed.txt" | tail -1)
+  # LOW 18: the extent record covers every data file: PG every fork (_fsm, _vm, _init) and segment (.1, .2, ...) of t
+  # and t_pkey (it had segment 0 of t's main fork only); Dolt and Doltgres every regular file under noms, recursively
+  # (it missed oldgen/*.darc after the GC). LOW 26: an empty or non-numeric oid or file path fails the job (it made du
+  # cover all of base/).
+  local oid rel rp f
   case $KIND in
     pg)
-      du=("$DATA/base/$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")")
+      oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")
+      [[ $oid =~ ^[0-9]+$ ]] || { fail "fixture: template p's oid [$oid] is not a number"; return; }
+      du=("$DATA/base/$oid")
       eb=$(sqlq "SELECT pg_database_size('p')")
-      ext=("$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")") ;;
+      for rel in t t_pkey; do
+        rp=$(srv sql "$DATA" p "SELECT pg_relation_filepath('$rel')")
+        [[ $rp =~ ^base/[0-9]+/[0-9]+$ ]] || { fail "fixture: $rel's file path [$rp] is not base/<oid>/<file>"; return; }
+        for f in "$DATA/$rp" "$DATA/$rp".[0-9]* "$DATA/$rp"_*; do [ -f "$f" ] && ext+=("$f"); done
+      done ;;
     dolt)
       du=("$DATA/dbs/bench")
       why="Dolt has no SQL function for a database's size; du only"
-      ext=("$DATA"/dbs/bench/.dolt/noms/*) ;;
+      mapfile -t ext < <(find "$DATA/dbs/bench/.dolt/noms" -type f | sort) ;;
     doltgres)
       du=("$DATA/databases")
       why="Doltgres has no working pg_database_size; du only"
-      ext=("$DATA"/databases/*/.dolt/noms/*) ;;
+      mapfile -t ext < <(find "$DATA/databases" -path '*/.dolt/noms/*' -type f | sort) ;;
   esac
+  [ ${#ext[@]} -gt 0 ] || { fail "fixture: no data file found for the extent record"; return; }
   # MED 3: what the engine READS BACK from the parent (count, exact sum, order-independent row hash: gen_seed.py
   # readback-sql in its dialect), against what the generator wrote; and the digests the seed's own write path recorded
   local rb dial=pg
