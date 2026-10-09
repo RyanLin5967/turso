@@ -338,9 +338,11 @@ static WORD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// confirmation thread write it after `confirm_quiet()` (5 ms) of idle, the default. Held, the writer
 /// is woken by the first landing only and then sleeps with the word pending, so no background
 /// thread runs in any later window and every count is the operation's own: each landing replaces
-/// the pending word and closes its descriptor on the landing thread, as under load, when a later
-/// flight lands inside the quiet period. That is every cell's regime but `confirm_n10`'s, which
-/// measures the idle tail's write against it.
+/// the pending word and closes its descriptor on the landing thread. That is NOT the engine under
+/// load (review 2 H1): with the shipped quiet period the writer also wakes on the group's condition
+/// variable at every landing while flights overlap, and those wake-ups never happen in a held cell.
+/// Held is every cell's regime but `confirm_n10`'s (the idle tail's write against it) and
+/// `confirm_load`'s (the writer under load, shipped quiet period).
 fn hold_word(held: bool) {
     use std::sync::atomic::Ordering::Release;
     super::store::CONFIRM_QUIET_MS.store(if held { CONFIRM_HELD_MS } else { 0 }, Release);
@@ -700,6 +702,75 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
     hold_word(false);
 }
 
+/// The clients per burst of the confirmation writer's load arm (`confirm_load`).
+const CONFIRM_LOAD_CS: [u64; 3] = [1, 8, 64];
+
+/// Review 2 H1: the confirmation writer under load, with the shipped quiet period (the word NOT
+/// held). For each C in `CONFIRM_LOAD_CS`, C clients make back-to-back creates (`shared_rounds(C)`
+/// each, started together), then the cell waits out the idle tail: at most 1 s for the word the tail
+/// owes, and 20 ms more for a second one that must not come (wall time only to settle; nothing timed
+/// is measured). One line per C (`load_c{C}`): acknowledgements, flights (`group_counters()[0]`),
+/// words written during the burst (`confirms_burst`) and by the end of the tail
+/// (`confirms_total`), and the writer's wake-ups with a word pending
+/// (`confirm_wakeups_for_test`) during the burst.
+fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
+    hold_word(false);
+    let words = || db.branch_confirm_counts()[0];
+    let settle = |since: u64| {
+        let t = std::time::Instant::now();
+        while words() == since && t.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // The population's own tail word is written before the first burst starts.
+    settle(words());
+    for c in CONFIRM_LOAD_CS {
+        let rounds = shared_rounds(c);
+        let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
+        let go = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let mut clients = Vec::new();
+            for t in 0..c {
+                let go = &go;
+                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                    let trunk = db.connect();
+                    while !go.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let trunk = trunk.unwrap();
+                    for i in 0..rounds {
+                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                    }
+                });
+                match spawned {
+                    Ok(h) => clients.push(h),
+                    Err(e) => {
+                        go.store(true, std::sync::atomic::Ordering::Release);
+                        panic!("{cell}: a thread of {c} did not start: {e}");
+                    }
+                }
+            }
+            go.store(true, std::sync::atomic::Ordering::Release);
+            for h in clients {
+                h.join().unwrap();
+            }
+        });
+        let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
+        settle(w1);
+        let w2 = words();
+        let mut m = Sample::new();
+        m.insert("threads", c);
+        m.insert("acks", c * rounds);
+        m.insert("flights", delta(f0, f1));
+        m.insert("confirms_burst", delta(w0, w1));
+        m.insert("confirms_total", delta(w0, w2));
+        m.insert("wakeups_burst", delta(k0, k1));
+        line(out, cell, &format!("load_c{c}"), 0, &m);
+    }
+    hold_word(true);
+}
+
 /// The schema-window cells' table counts (`schema_t10`, `schema_t1e3`), and the samples per path and
 /// mode.
 const SCHEMA_TABLES: [(&str, u64); 2] = [("schema_t10", 10), ("schema_t1e3", 1000)];
@@ -1039,6 +1110,29 @@ fn run_instruments(cell: &str) -> String {
     s.insert("spinning_seen_running", u64::from(seen_running));
     stop.store(true, std::sync::atomic::Ordering::Release);
     let _ = spinning.join();
+    // Review 2 H1: a RUNNING thread named as a persistent store thread (the confirmation writer at
+    // work) is not blocked: the persistent-name allowlist exempts such a thread from the thread
+    // count, never from the blocked check.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinning_named = {
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name(probe::PERSISTENT_THREADS[0].to_string())
+            .spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            })
+            .unwrap()
+    };
+    let t = std::time::Instant::now();
+    let mut seen_running = false;
+    while t.elapsed() < std::time::Duration::from_millis(500) && !seen_running {
+        seen_running = probe::others_blocked() == Some(false);
+    }
+    s.insert("persistent_spinning_seen_running", u64::from(seen_running));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = spinning_named.join();
     tx.send(()).unwrap();
     let _ = named.join();
     put("fc_thread_count", &s);
@@ -1145,7 +1239,7 @@ fn budget_child() {
     // (`hold_word`). base12 counted it where it was written instead, and the writer's wake and wait
     // then landed inside the operation's own store-mutex holds as the timing made (first write's
     // syscalls 17..19, held syscalls 4..6, in one cell).
-    hold_word(spec != "confirm_n10");
+    hold_word(spec != "confirm_n10" && spec != "confirm_load");
     let mut text = String::new();
     if spec == "instruments" {
         text = run_instruments(&spec);
@@ -1154,7 +1248,7 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "confirm_n10" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
@@ -1180,7 +1274,9 @@ fn budget_child() {
             return;
         }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if spec == "confirm_n10" {
+        if spec == "confirm_load" {
+            confirm_load(&spec, &db, &mut text);
+        } else if spec == "confirm_n10" {
             confirm(&spec, &db, base, k, &mut text);
         } else if let Some(c) = spec.strip_prefix("shared_c") {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
@@ -1591,6 +1687,7 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
         assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
         assert_eq!(get("fc_thread_count", "spinning_seen_running"), 1, "a spinning thread read as blocked");
+        assert_eq!(get("fc_thread_count", "persistent_spinning_seen_running"), 1, "a running thread named as a persistent store thread read as blocked");
     }
     #[cfg(target_vendor = "apple")]
     {
@@ -2759,4 +2856,43 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
         }
     }
     assert!(failures.is_empty(), "flight waiters took the store mutex to lead and led nothing [review 1 #9]:\n{failures}");
+}
+
+// ---- the confirmation writer under load (review 2 H1; the `confirm_load` cell) ----
+
+/// Review 2 H1 and DECISIONS (review 6 #1's ruling: "under load, no confirmation word at all"): with
+/// the shipped 5 ms quiet period and C clients making back-to-back creates,
+/// * while flights overlap (C >= 8) the writer writes no word during the burst;
+/// * the idle tail after a burst gets at most one word, at every C;
+/// * the writer wakes, with a word pending, at most twice per flight during the burst: once at the
+///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
+///   between two flights (a stated constant: a poll wakes many times per flight).
+/// At C = 1 the burst's words are reported and not budgeted: one client's creates do not overlap,
+/// and a gap of 5 ms between two of them is a legitimate idle tail. Mutants `confirm_quiet_zero`,
+/// env `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
+#[test]
+fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for c in CONFIRM_LOAD_CS {
+        let op = format!("load_c{c}");
+        let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
+        let (flights, burst, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_total"], s["wakeups_burst"]);
+        assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
+        let _ = write!(seen, " C={c}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
+        if c >= 8 && burst != 0 {
+            let _ = writeln!(failures, "  C={c}: {burst} confirmation words written while flights overlapped; budget 0");
+        }
+        if total - burst > 1 {
+            let _ = writeln!(failures, "  C={c}: {} words in the idle tail after the burst; budget <= 1", total - burst);
+        }
+        if wakes > 2 * flights {
+            let _ = writeln!(failures, "  C={c}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
+        }
+    }
+    assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
 }
