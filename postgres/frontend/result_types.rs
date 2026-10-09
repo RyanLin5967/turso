@@ -229,6 +229,7 @@ pub fn parameter_types(
     schema: &std::sync::Arc<Schema>,
     search_path: &[String],
     cache: &std::sync::Mutex<ViewCache>,
+    attached: &Attached<'_>,
 ) -> (
     std::collections::BTreeMap<u32, u32>,
     std::collections::BTreeSet<u32>,
@@ -248,7 +249,7 @@ pub fn parameter_types(
         std::mem::take(&mut cache.views)
     };
     let view_memo = std::rc::Rc::new(std::cell::RefCell::new(memo));
-    let result = parameter_types_with(parse, schema, search_path, &view_memo);
+    let result = parameter_types_with(parse, schema, search_path, &view_memo, attached);
     cache.lock().unwrap_or_else(|e| e.into_inner()).views = view_memo.take();
     result
 }
@@ -268,11 +269,21 @@ pub struct ViewCache {
 
 type ViewMemo = std::collections::HashMap<String, Option<Vec<(String, Option<u32>)>>>;
 
+/// The session's attached schemas, for the walk's unqualified names ([`Infer::main_relname`]):
+/// their names, and `holds(schema, relation)`, whether one holds a relation of the name. The walk
+/// cannot read an attached schema's relations, but it must know which schema the engine resolves a
+/// name to: the engine passes over an attached schema that lacks the name (wire review 17 item 3).
+pub struct Attached<'a> {
+    pub names: &'a [String],
+    pub holds: &'a dyn Fn(&str, &str) -> bool,
+}
+
 fn parameter_types_with(
     parse: &ParseResult,
     schema: &Schema,
     search_path: &[String],
     view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    attached: &Attached<'_>,
 ) -> (
     std::collections::BTreeMap<u32, u32>,
     std::collections::BTreeSet<u32>,
@@ -288,6 +299,7 @@ fn parameter_types_with(
         view_memo: view_memo.clone(),
         cuts: Default::default(),
         cut_views: Default::default(),
+        attached,
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -377,6 +389,8 @@ struct Infer<'a> {
     /// The views whose reading saw a cut, for this statement's walk only, shared with every nested
     /// walk ([`Infer::view_columns`]).
     cut_views: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    /// The session's attached schemas ([`Attached`]).
+    attached: &'a Attached<'a>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -624,31 +638,58 @@ impl Infer<'_> {
 
     /// The main schema's name for the relation `schemaname.relname` names, as the engine resolves
     /// it: public's and pg_catalog's relations keep their names and information_schema's views are
-    /// information_schema_<view>; an unqualified name is read along the session's search path,
-    /// public's relation of the name if public comes before any other schema there, or the name as
-    /// is when no path schema has it. None for a relation of any other schema, and for an
-    /// unqualified name a schema other than public would be searched for first: that is an
-    /// attached schema, which this walk cannot read, so the relation is one it cannot open. Every
-    /// relation was read in public alone, so a parameter into s.t, or into t after `SET
-    /// search_path TO s, public`, was typed from public.t and stored as public's type (wire review
-    /// 14 item 3).
+    /// information_schema_<view>. An unqualified name is a catalog relation's first (PostgreSQL
+    /// searches pg_catalog before the path); then, with no path set, main's, else the attached
+    /// schemas' (the engine reads main, then each attached schema); with a path, each entry in turn,
+    /// public being main, an attached schema being passed over when it lacks the name, and any
+    /// other entry (`"$user"`, PostgreSQL's default, or a schema not attached) skipped, as the
+    /// engine skips it. None for a relation of an attached schema (which this walk cannot read: a
+    /// parameter compared with it or written into it is refused untyped, 42P18) and for a name the
+    /// engine resolves nowhere. Every relation was read in public alone (wire review 14 item 3);
+    /// then the walk stopped at the first path entry that was not public, so `"$user", public`
+    /// refused every parameter, and with no path took a name absent from main as main's, which
+    /// typed a parameter into an attached schema's table as text (wire review 17 item 3). A probe of
+    /// an attached schema counts as a cut: its answer can change with no new main snapshot, so a
+    /// view read through it is not kept for the snapshot ([`ViewCache`]).
     fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
         match schemaname.to_lowercase().as_str() {
             "public" | "pg_catalog" => Some(relname.to_string()),
             "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
             "" => {
+                let in_main = || {
+                    self.schema.get_table(relname).is_some()
+                        || self.schema.get_view(relname).is_some()
+                };
+                if crate::catalog::is_catalog_table_name(relname) {
+                    return Some(relname.to_string());
+                }
+                let attached_holds = |name: &String| {
+                    self.cuts.set(self.cuts.get() + 1);
+                    (self.attached.holds)(name, relname)
+                };
+                if self.search_path.is_empty() {
+                    if in_main() {
+                        return Some(relname.to_string());
+                    }
+                    return None;
+                }
                 for entry in &self.search_path {
                     if entry.eq_ignore_ascii_case("public") {
-                        if self.schema.get_table(relname).is_some()
-                            || self.schema.get_view(relname).is_some()
-                        {
+                        if in_main() {
                             return Some(relname.to_string());
                         }
-                    } else if !entry.eq_ignore_ascii_case("pg_catalog") {
-                        return None;
+                    } else if let Some(name) = self
+                        .attached
+                        .names
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(entry))
+                    {
+                        if attached_holds(name) {
+                            return None;
+                        }
                     }
                 }
-                Some(relname.to_string())
+                None
             }
             _ => None,
         }
@@ -773,6 +814,7 @@ impl Infer<'_> {
             view_memo: self.view_memo.clone(),
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
+            attached: self.attached,
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1540,6 +1582,7 @@ impl Infer<'_> {
             view_memo: self.view_memo.clone(),
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
+            attached: self.attached,
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();

@@ -564,11 +564,35 @@ fn prepare_statement_checked(
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
             let search_path = pg_conn.session_state.lock().unwrap().search_path.clone();
+            // Which attached schema holds a name, probed only when the walk resolves an
+            // unqualified name through one, once per (schema, name) per statement (wire review 17
+            // item 3).
+            let names = pg_conn.conn.attached_database_names();
+            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+            let holds = |schema: &str, name: &str| {
+                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+                if let Some(held) = probed.borrow().get(&key) {
+                    return *held;
+                }
+                let held = get_table_columns(
+                    &pg_conn.conn,
+                    &name.replace('\'', "''"),
+                    Some(&schema.replace('"', "\"\"")),
+                )
+                .is_ok_and(|columns| !columns.is_empty());
+                probed.borrow_mut().insert(key, held);
+                held
+            };
+            let attached = crate::result_types::Attached {
+                names: &names,
+                holds: &holds,
+            };
             (types.params, types.untyped) = crate::result_types::parameter_types(
                 &parse_result,
                 &schema,
                 &search_path,
                 &pg_conn.view_cache,
+                &attached,
             );
         }
         types.used = used;
