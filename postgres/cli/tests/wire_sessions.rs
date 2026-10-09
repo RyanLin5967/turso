@@ -4476,6 +4476,45 @@ fn an_empty_extended_statement_is_an_empty_query() {
     );
 }
 
+/// A named portal of an empty statement executed twice answers EmptyQueryResponse both times, and
+/// the pipeline it sits in commits at Sync, as PostgreSQL answers it (exec_execute_message's empty
+/// command, before any portal-state check). The first Execute marked the portal done, so the second
+/// was 55000 "portal cannot be run" and rolled the pipeline's INSERT back (wire review 15 item 1).
+#[test]
+fn an_empty_named_portal_runs_twice_as_an_empty_query() {
+    let dir = Scratch::new("emptyportal2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut out = Vec::new();
+    let mut put = |tag: u8, body: &[u8]| {
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+    };
+    put(b'P', b"\0INSERT INTO t VALUES (6, 'six')\0\0\0");
+    put(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+    put(b'E', &[0, 0, 0, 0, 0]);
+    put(b'P', b"s2\0\0\0\0");
+    put(b'B', b"p\0s2\0\0\0\0\0\0\0");
+    put(b'E', b"p\0\0\0\0\0");
+    put(b'E', b"p\0\0\0\0\0");
+    put(b'S', &[]);
+    a.s.write_all(&out).unwrap();
+    let (tags, errors, status) = read_raw_reply(&mut a);
+    assert!(errors.is_empty(), "errors: {errors:?}");
+    assert_eq!(
+        tags.iter().filter(|t| **t == b'I').count(),
+        2,
+        "an EmptyQueryResponse per Execute: {tags:?}"
+    );
+    assert_eq!(status, b'I');
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 6")
+            .single("the pipeline committed"),
+        "six"
+    );
+}
+
 /// A wrong-length result-format list is refused BEFORE a statement with a side effect runs: a branch
 /// create, switch or delete changes nothing, and an `INSERT ... RETURNING` writes no row; the
 /// refusals are worded as PostgreSQL words them. No test pinned the order: the earlier rows change
