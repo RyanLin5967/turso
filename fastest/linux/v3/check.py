@@ -1987,11 +1987,15 @@ def main(argv):
           # tenth review MED 2: a stray loop on n1, never mounted, is detached by the teardown, which leaves no loop on
           # the chain and nothing mounted
           and bool((rd(os.path.join(nm, "stray.dev")) or "").strip()) and rc_of(os.path.join(nm, "stray_teardown.rc")) == 0
+          # V3 review 12 item 13: the extra never-mounted loop on n1's own image was attached (only the final sweep can
+          # detach it; after_stray, below, then holds neither it nor the image)
+          and bool((rd(os.path.join(nm, "n1extra.dev")) or "").strip())
           and ast is not None and ast.strip() == "",
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
            "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
            "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
+           "n1extra": (rd(os.path.join(nm, "n1extra.dev")) or "").strip(),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
            "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
           "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
