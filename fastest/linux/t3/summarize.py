@@ -408,7 +408,7 @@ def self_test():
     N = v3l.N
     RULE = "1000:10:180"
 
-    def v3lj(verdict="VALID", lie=False):
+    def v3lj(verdict="VALID", lie=False, bins=(10000, 5)):
         """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
         over VOID arms (review L5)."""
         fs = N if verdict == "VALID" and not lie else N // 2
@@ -417,8 +417,8 @@ def self_test():
             return {"v1l": {"data_writes": N, "data_fsyncs": fsyncs, "other_fsyncs": 0, "failed": 0, "io_uring_setup": 0,
                             "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0},
                     "labelling_fio": {"writes": N, "syncs": syncs},
-                    "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": 10.0 if syncs else None,
-                              "fsync_bins_ns": {"10000": 5} if syncs else None, "flush_ios_delta": 2 * N}}
+                    "timed": {"writes": N, "syncs": syncs, "fsync_p50_us": bins[0] / 1e3 if syncs else None,
+                              "fsync_bins_ns": {str(bins[0]): bins[1]} if syncs else None, "flush_ios_delta": 2 * N}}
         r = {"verdict": "VALID" if lie else verdict, "void_reasons": [] if verdict == "VALID" or lie else ["planted"],
              "floor_kind": "x", "leaf": {"disk": "nvme0n1", "write_cache": "write back", "drive_reports": "write back",
                                          "layers": []},
@@ -453,7 +453,8 @@ def self_test():
              plants=True, plants_fired=True, plp="no", lie=False, cell="ok", void=None, drift="pass", a25_after=300.0,
              rule=RULE, ours_rule=RULE, ours_ops=(200, 200), comp_ops=200, adapter_rc=0, k=1, settle="quiet=yes",
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
-             ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1")):
+             ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
+             boundary_bins=None, garbage_v3l=None):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         system = {"ok": "ours", "na": "ours", "compfail": "dolt", "comp": "dolt"}[cell]
@@ -482,7 +483,8 @@ def self_test():
                                                           | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
             else:
-                verdict = "FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail" else "PASS F1\nVERDICT PASS\n"
+                verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail"
+                                           else "PASS F1\nVERDICT PASS\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
                 if info is not None:
@@ -527,17 +529,20 @@ def self_test():
             res, ok = blockgate.plants(sj, True, 0, plp, f"{f}/v3-before")
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
         bounds = [f"b{i}" for i in range(k + 1)]
-        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie))
+        bb = boundary_bins or [(10000, 5)] * (k + 1)
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0]))
         for i, b in enumerate(bounds[1:], 1):
             if i == 1 and after_v3l is None:
                 continue
-            w(f"{f}/v3l-{b}/v3l.json", v3lj(after_v3l if i == 1 else "VALID"))
+            w(f"{f}/v3l-{b}/v3l.json", v3lj(after_v3l if i == 1 else "VALID", bins=bb[i]))
         for b in bounds:  # what t3run's v3l() writes after each measurement
             if os.path.exists(f"{f}/v3l-{b}/v3l.json"):
                 res, ok = v3l.plants(json.load(open(f"{f}/v3l-{b}/v3l.json")))
                 w(f"{f}/v3l-{b}-plants.json", json.dumps({"plants": res, "all_fired": ok}, default=str))
         if drop:
             os.unlink(f"{f}/{drop}")
+        if garbage_v3l:  # an unreadable measurement, written after its plants record
+            w(f"{f}/{garbage_v3l}/v3l.json", "{not json")
         return out
 
     def first(s, key):
@@ -633,6 +638,27 @@ def self_test():
          lambda s: any("c4-create" in x for x in s["parity_refusals"])),
         ("LOW 24: a competitor run with no expected-cells.txt fails", {"cell": "comp", "expected": None}, False,
          lambda s: any("expected-cells.txt" in x for x in s["parity_refusals"])),
+        # fourth lane review LOW 21: the real driver's VERDICT FAIL arrives with adapter rc 1; its FAIL lines are kept
+        ("LOW 21: a competitor VERDICT FAIL at adapter rc 1 (the real shape) keeps its FAIL lines in failed_checks",
+         {"cell": "compfail", "adapter_rc": 1}, False,
+         lambda s: any("FAIL F1: something" in x for x in s["failed_checks"])),
+        # T3 runner review LOW 21: the verdict is the LAST VERDICT line, not 'VERDICT PASS' anywhere in the file
+        ("T3 runner LOW 21: a functional.txt whose last VERDICT line is FAIL fails, despite an earlier VERDICT PASS",
+         {"cell": "comp", "verdict_text": "VERDICT PASS\nFAIL F2: later\nVERDICT FAIL\n"}, False,
+         lambda s: any("FAIL F2: later" in x for x in s["failed_checks"])),
+        # fourth lane review LOW 22: distinct pooled p50s per block (bins hand-derived with the documented rule: the
+        # first bin where 2 x cumulative >= total): (10000x5, 15000x6) -> 15000; (15000x6, 25000x7) -> 25000;
+        # (25000x7, 40000x8) -> 40000
+        ("LOW 22: K=3 with distinct pooled p50s: each run carries exactly its own block's normaliser",
+         {"k": 3, "boundary_bins": [(10000, 5), (15000, 6), (25000, 7), (40000, 8)]}, True,
+         lambda s: [(r["block_k"], r["v3l_pooled_fsync_p50_us"]) for r in s["runs"]] == [(1, 15.0), (2, 25.0), (3, 40.0)]),
+        # fourth lane review LOW 23: summarize states its own verdict in summary.json, so the workflow reads one field
+        ("LOW 23: summary.json carries ok, equal to the exit verdict (good package)", {}, True, lambda s: s.get("ok") is True),
+        ("LOW 23: summary.json carries ok false on a failing package", {"before_rc": 2}, False,
+         lambda s: s.get("ok") is False),
+        # T3 runner review LOW 22: an unreadable v3l.json fails its block with a reason, it does not crash summarize
+        ("T3 runner LOW 22: an unreadable v3l.json fails the block instead of crashing", {"garbage_v3l": "v3l-b1"}, False,
+         lambda s: any("v3l-b1" in x for x in s["failed_blocks"])),
         ("LOW 11: K=3 blocks, all VALID: every run carries its own block's normaliser", {"k": 3}, True,
          lambda s: [r["block_k"] for r in s["runs"]] == [1, 2, 3] and all(r["v3l_pooled_fsync_p50_us"] == 10.0 for r in s["runs"])),
         ("LOW 11: K=3 with a VOID b1 fails blocks 1 and 2 and leaves their runs without a normaliser", {"k": 3, "after_v3l": "VOID"},
