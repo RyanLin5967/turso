@@ -106,6 +106,8 @@ SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
 # settle_dev and settle (the quiet gap before every run); a missing file is caught by NEEDS before anything runs
 [ -f "$L/t3/settle.sh" ] && source "$L/t3/settle.sh"
+# drift_ok, fslist_ok, registered_ok, plp_listed: checks only a real run reaches, tested by t3lib_test.sh
+[ -f "$L/t3/t3lib.sh" ] && source "$L/t3/t3lib.sh"
 SETTLE_DEV=""
 if [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
@@ -167,7 +169,7 @@ finish() {
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
-  t3/settle.sh t3/settle_test.sh
+  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -210,28 +212,17 @@ preflight() {
     [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
     # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
+    local dn fsl; dn=$(basename "$(readlink -f "$DEVICE")")
+    # --plp yes names a registered drive: model and firmware (NVMe firmware_rev, SCSI/SATA rev) in t3/PLP-DRIVES
     if [ "$PLP" = yes ]; then
-      local dn model fw; dn=$(basename "$(readlink -f "$DEVICE")")
-      # NVMe exposes device/firmware_rev, SCSI/SATA sd device/rev (third lane review LOW 9)
-      model=$(xargs < "/sys/block/$dn/device/model" 2>/dev/null)
-      fw=$(xargs < "/sys/block/$dn/device/firmware_rev" 2>/dev/null || xargs < "/sys/block/$dn/device/rev" 2>/dev/null)
-      grep -qxF "$(printf '%s\t%s' "$model" "$fw")" "$L/t3/PLP-DRIVES" ||
-        { echo "REFUSED: --plp yes but '$model' firmware '$fw' is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
+      plp_listed /sys "$dn" "$L/t3/PLP-DRIVES" ||
+        { echo "REFUSED: --plp yes but $dn ($(plp_drive_id /sys "$dn" 2>&1)) is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
     fi
-    # the registered values a bound batch in rental mode refuses without (A17; third lane review LOW 10), checked
-    # before deps, build and fire-checks are paid for: the frame arm, and on a write-back drive without PLP the D0
-    # threshold of every filesystem block (key d0_threshold/<fstype>/wb/bare; write-through and PLP need none, A14)
-    local reg=$L/v3/REGISTERED.tsv wc f fsl; wc=$(cat "/sys/block/$(basename "$(readlink -f "$DEVICE")")/queue/write_cache" 2>/dev/null)
-    awk -F '\t' '$1 == "frame_arm" && $2 != "" { ok = 1 } END { exit !ok }' "$reg" ||
-      { echo "REFUSED: $reg registers no frame_arm (PREREG section 4: fixed in the Registration annex)"; return 2; }
-    case $wc in "write back"|"write through") ;; *) echo "REFUSED: cannot read $DEVICE's queue/write_cache ('$wc')"; return 2 ;; esac
-    if [ "$wc" = "write back" ] && [ "$PLP" != yes ]; then
-      fsl=${FSLIST:-$(python3 -B "$L/t3/cells.py" fslist "$MAN")}
-      for f in $fsl; do
-        awk -F '\t' -v k="d0_threshold/$f/wb/bare" '$1 == k && $2 != "" { ok = 1 } END { exit !ok }' "$reg" ||
-          { echo "REFUSED: $reg registers no d0_threshold/$f/wb/bare (A17: rental mode refuses a provisional one)"; return 2; }
-      done
-    fi
+    # the A17 registration (frame arm; the D0 threshold of every block on a write-back drive without PLP), before
+    # deps, build and fire-checks are paid for (t3lib.sh registered_ok, tested by t3lib_test.sh)
+    fsl=$(python3 -B "$L/t3/cells.py" fslist "$MAN") && fslist_ok "$fsl" ||
+      { echo "REFUSED: the manifest names no filesystem block (cells.py fslist: '$fsl')"; return 2; }
+    registered_ok /sys "$L/v3/REGISTERED.tsv" "$dn" "$PLP" "$fsl" || return 2
     # P_nest3 must start on --device's own filesystem, which exists only per block (V3 ninth review HIGH)
     echo "REFUSED: a real run's V3 nest fixture cannot be placed on $DEVICE yet (needs mkfixtures.sh's per-block nest"
     echo "  and teardown modes from the V3 lane); on an md or LVM root the fire-check's P_nest3 would fail every block"
@@ -304,12 +295,24 @@ V3ENV=(V3_PLP="$PLP" V3_FX="$V3FX" V3_SHIM="$DIST/statfs_shim.so" V3_DYN="$DIST/
 # so with an existing OUT, reaching that refusal proves the environment passed, and any other exit-2 message names
 # the variable it lacks.
 fcenv_check() {
-  local o=$OUT/fcenv-check rc
+  local o=$OUT/fcenv-check rc x e
+  local -a sub
   mkdir -p "$o"
-  env "${V3ENV[@]}" bash "$L/v3/firecheck.sh" "$DIST/v3floor" ext4loop "$o/w" "$o" > "$o.txt" 2>&1
+  timeout 60 env "${V3ENV[@]}" bash "$L/v3/firecheck.sh" "$DIST/v3floor" ext4loop "$o/w" "$o" > "$o.txt" 2>&1
   rc=$?
-  [ $rc = 2 ] && grep -qx "firecheck: $o exists" "$o.txt" ||
+  [ $rc = 2 ] && grep -qxF "firecheck: $o exists" "$o.txt" ||
     { echo "fire-check environment refused (rc $rc): $(cat "$o.txt")"; return 1; }
+  # the negative control (fourth lane review LOW 9): each entry left out must be refused, naming its variable, or the
+  # positive check above proves nothing about this firecheck.sh
+  for e in "${V3ENV[@]%%=*}"; do
+    sub=()
+    for x in "${V3ENV[@]}"; do [ "${x%%=*}" = "$e" ] || sub+=("$x"); done
+    timeout 60 env -u "$e" "${sub[@]}" bash "$L/v3/firecheck.sh" "$DIST/v3floor" ext4loop "$o/w" "$o" \
+      > "$o-no-$e.txt" 2>&1
+    rc=$?
+    [ $rc = 2 ] && grep -qF "$e" "$o-no-$e.txt" && ! grep -qxF "firecheck: $o exists" "$o-no-$e.txt" ||
+      { echo "fire-check environment check: without $e it gave rc $rc: $(cat "$o-no-$e.txt")"; return 1; }
+  done
   rmdir "$o"
 }
 # The nest fixture (P_nest3) must start on the filesystem that holds the cell's leaf (V3 eighth review M5, ninth
@@ -336,7 +339,7 @@ v3fixtures() {
 # copies of its real record and its batch directory (blockgate.py plants): every one must be decided as planted.
 v3batch() { # v3batch before|after DIR
   local when=$1 dir=$2 o=$OUT/fs-$FS_NOW rc frame arms
-  local -a env=(V3_CELL="$V3CELL" "${V3ENV[0]}")  # V3ENV[0] is V3_PLP
+  local -a env=(V3_CELL="$V3CELL" "${V3ENV[@]}")  # the whole V3 environment (run.sh ignores the fire-check's names)
   # the registered V3 shape (PREREG section 4; V3 gate-6 MED 6; run.sh refuses a bound batch of any other):
   # N = 10000 and arms append25, fdatasync4k, nosync25 plus the registered frame arm, if one is registered
   frame=$(awk -F '\t' '$1 == "frame_arm" { v = $2 } END { print v }' "$L/v3/REGISTERED.tsv")
@@ -462,14 +465,14 @@ fs_block() {
   v3l "b$cur" "$mnt" || return 1
   v3batch after "$mnt/v3a" || return 1
   # The batches' start-to-end drift (batchgate.py drift; third lane review MED 2): PUBLISHED, not a gate on T3
-  # (PREREG :180 and departure 3 :553 make T3's drift descriptive; V3 review 2 item 6 keeps the T1 60 us void off
-  # T3), so a VOID (rc 3) is recorded and the block goes on. A REFUSED drift (rc 2: the two batches are not the same
-  # kind of batch, or one failed its own gate) fails the block.
+  # (PREREG :180 and departure 3 :553 make T3's drift descriptive; A20), so a VOID (rc 3) is recorded and the block
+  # goes on. Every other rc fails the block: 2 (the two batches are not the same kind of batch), and a traceback, a
+  # kill or a missing interpreter alike (t3lib.sh drift_ok, an allowlist; fourth lane review LOW 8).
   python3 -B "$L/v3/batchgate.py" drift "$o/v3-before" "$o/v3-after" > "$o/v3-drift.json" 2> "$o/v3-drift.err"
   local drc=$?
   echo "$drc" > "$o/v3-drift.rc"
   echo "V3 drift on $V3CELL: rc $drc $(cat "$o/v3-drift.json")"
-  [ $drc = 2 ] && { echo "V3 drift REFUSED on $V3CELL: the before and after batches cannot be compared"; return 1; }
+  drift_ok "$drc" || { echo "V3 drift on $V3CELL: rc $drc (only 0 or a published void, 3, lets the block go on)"; return 1; }
   return 0
 }
 
@@ -552,6 +555,7 @@ selftests() {
     python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
   done
   timeout 120 bash "$L/t3/settle_test.sh" > "$OUT/settle-selftest.txt" 2>&1 || { echo "self-test settle FAILED"; return 1; }
+  timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd want d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
     { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }
@@ -579,7 +583,10 @@ if [ $DRY = 1 ]; then
   sudo mount -o remount,barrier / && findmnt -n -o OPTIONS / | tee "$OUT/root-mount.txt"
 fi
 printf 'fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n' > "$OUT/cells.tsv"
-[ -z "$FSLIST" ] && FSLIST=$(python3 -B "$L/t3/cells.py" fslist "$MAN")
+if [ -z "$FSLIST" ]; then
+  FSLIST=$(python3 -B "$L/t3/cells.py" fslist "$MAN") || { echo "t3run: cells.py fslist failed"; finish 1; }
+fi
+fslist_ok "$FSLIST" || { echo "t3run: no filesystem block to run"; finish 1; }
 echo $FSLIST > "$OUT/fslist.txt"
 # Blocks (review H1): a failed block is recorded and torn down, and the next block runs; the run's rc is 1 at the end.
 BLOCKS_FAILED=0 BLOCKNO=0
