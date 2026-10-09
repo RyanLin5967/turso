@@ -2032,6 +2032,74 @@ fn a_busy_checkpoint_inside_a_block_says_it_was_skipped() {
     assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "4");
 }
 
+/// The branch store's checkpoints since the server started (turso_branch_stats' sixth column,
+/// `store_checkpoints`).
+fn store_checkpoints(a: &mut Wire) -> i64 {
+    let r = a.q("SELECT turso_branch_stats()").ok("stats");
+    assert_eq!(
+        r.oids.as_ref().map(Vec::len),
+        Some(6),
+        "turso_branch_stats has no store_checkpoints column: {:?}",
+        r.oids
+    );
+    r.rows[0][5]
+        .as_deref()
+        .expect("the store checkpoint count is never NULL")
+        .parse()
+        .unwrap()
+}
+
+/// A CHECKPOINT outside a block checkpoints the branch store after the trunk, and
+/// turso_branch_stats counts the store's checkpoints: PREREG section 5 M2 needs at least 3 store
+/// checkpoints in a timed window, or a forced one whose syncs and time are added, and over the
+/// wire there was neither, so per-create syncs and bytes left out the branch log's checkpoint I/O
+/// that PostgreSQL pays inline (wire review 14 item 13). Inside a block CHECKPOINT never waits, so
+/// it leaves the store alone. The branch log (`<db>-branch-log`) is cut by the store's checkpoint.
+#[test]
+fn a_checkpoint_checkpoints_the_branch_store() {
+    let dir = Scratch::new("storeckpt");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for i in 0..8 {
+        a.q(&format!("SELECT turso_branch_create('c{i}')"))
+            .ok("create");
+    }
+    let mut log = dir.db().into_os_string();
+    log.push("-branch-log");
+    let log = PathBuf::from(log);
+    let len = || {
+        std::fs::metadata(&log)
+            .map(|m| m.len())
+            .unwrap_or_else(|e| panic!("{}: {e}", log.display()))
+    };
+    let before = (len(), store_checkpoints(&mut a));
+    assert!(
+        before.0 > 40,
+        "premise: the creates are in the branch log, past its 40-byte header ({} bytes)",
+        before.0
+    );
+    a.q("BEGIN").ok("begin");
+    a.q("CHECKPOINT").ok("checkpoint in a block");
+    a.q("COMMIT").ok("commit");
+    assert_eq!(
+        store_checkpoints(&mut a),
+        before.1,
+        "a checkpoint inside a block checkpointed the store"
+    );
+    a.q("CHECKPOINT").ok("checkpoint");
+    let after = (len(), store_checkpoints(&mut a));
+    assert!(
+        after.1 > before.1,
+        "the store's checkpoint count did not move: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.0 < before.0,
+        "the branch log was not cut: {before:?} -> {after:?}"
+    );
+    a.q("SELECT turso_branch_switch('c7')")
+        .ok("a branch created before the checkpoint");
+}
+
 /// Engine errors carry PostgreSQL's SQLSTATE, so a driver raises the right exception class
 /// (psycopg's IntegrityError, not InternalError): at 472023b72 every one but Busy and
 /// BusySnapshot was XX000 (wire review 1 item 7). The codes are PostgreSQL's (errcodes.txt).
