@@ -5458,39 +5458,45 @@ mod format_tests {
     /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
     /// compaction, then replaced the log holding those acknowledged records with an unsynced file
     /// and no directory sync. Until that first rewrite lands, the store rewrites in the class the
-    /// records were made durable in. Mutant `inherited_floor_dropped`.
+    /// records were made durable in. Arms: a sharp cut (`rewrite_from`), a compaction, and a cut
+    /// prepared off the mutex (`cut_source`, `prepare_cut`, `finish_cut`), which syncs its file
+    /// and leaves its directory to the next flight that syncs (`dir_dirty`). File syncs are this
+    /// thread's syncs less its directory syncs (engine review 16 #17: the process-wide counts saw
+    /// other threads, and counted a directory sync as a file's). Mutant `inherited_floor_dropped`.
     #[cfg(unix)]
     #[test]
     fn a_d0_open_of_a_synced_log_rewrites_in_the_class_it_was_synced_in() {
         let dirs = || DIR_SYNCS.with(|c| c.get());
-        for compaction in [false, true] {
+        let file_syncs = || super::super::store::thread_syncs() - dirs();
+        for arm in ["cut", "compaction", "prepared cut"] {
             let dir = tempfile::TempDir::new().unwrap();
             let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
             flights(&files, 0, &[1, 1], SyncClass::Fsync);
             let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
-            assert!(!journal.raised.syncs(), "compaction={compaction}: premise: the D1 run never raised the header");
-            let (before, synced) = (dirs(), super::super::sync_counts());
-            if compaction {
-                journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
-            } else {
-                let end = journal.mark();
-                let generation = journal.generation;
-                journal.rewrite_from(end, generation).unwrap();
+            assert!(!journal.raised.syncs(), "arm={arm}: premise: the D1 run never raised the header");
+            let (before, synced) = (dirs(), file_syncs());
+            let end = journal.mark();
+            let generation = journal.generation;
+            match arm {
+                "cut" => journal.rewrite_from(end, generation).unwrap(),
+                "compaction" => journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap(),
+                _ => {
+                    let src = journal.cut_source(end).unwrap().expect("premise: the cut's records all lie in the file");
+                    let prep = Journal::prepare_cut(src, end, generation).unwrap();
+                    journal.finish_cut(prep, end, generation).unwrap();
+                }
             }
-            let after = super::super::sync_counts();
-            assert!(
-                after.fsync + after.full_fsync > synced.fsync + synced.full_fsync,
-                "compaction={compaction}: the first rewrite of acknowledged records synced no file"
-            );
-            assert!(
-                dirs() > before,
-                "compaction={compaction}: the first rewrite of acknowledged records synced no directory"
-            );
+            assert!(file_syncs() > synced, "arm={arm}: the first rewrite of acknowledged records synced no file");
+            if arm == "prepared cut" {
+                assert!(journal.dir_dirty, "arm={arm}: the first rewrite's rename was left to no syncing flight");
+            } else {
+                assert!(dirs() > before, "arm={arm}: the first rewrite of acknowledged records synced no directory");
+            }
             let before = dirs();
             let end = journal.mark();
             let generation = journal.generation;
             journal.rewrite_from(end, generation).unwrap();
-            assert_eq!(dirs(), before, "compaction={compaction}: the inherited floor outlived the rewrite that carried its records");
+            assert_eq!(dirs(), before, "arm={arm}: the inherited floor outlived the rewrite that carried its records");
         }
     }
 
