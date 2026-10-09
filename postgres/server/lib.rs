@@ -338,7 +338,10 @@ impl TursoPgServer {
         );
         // The budget harness refuses a --plant split-reply run whose server does not say this.
         #[cfg(feature = "budget-plant-split-reply")]
-        println!("PLANT split-reply: every simple-query reply goes out in two writes");
+        println!(
+            "PLANT split-reply: every simple-query reply goes out in two writes, and every \
+             extended round writes its BindComplete on its own"
+        );
 
         loop {
             tokio::select! {
@@ -2858,6 +2861,12 @@ impl ExtendedQueryHandler for Session {
         client
             .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
             .await?;
+        // The wire budget's extended fire-check plant (feature budget-plant-split-reply, never in a
+        // default build): BindComplete written on its own, a second reply write per extended round
+        // that `budget.py counts --protocol extended` must catch on net_out alone (wire review 13
+        // item 11).
+        #[cfg(feature = "budget-plant-split-reply")]
+        client.flush().await?;
         Ok(())
     }
 
