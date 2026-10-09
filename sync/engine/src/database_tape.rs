@@ -3409,4 +3409,78 @@ mod tests {
             "the swap must keep both rows"
         );
     }
+
+    /// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`), read as core's busy red reads it.
+    #[cfg(unix)]
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is plain old data that clock_gettime writes whole.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// Engine review 11 MED 4, the sync engine's half of the busy-timeout spin (DECISIONS
+    /// f8eb23bca): the tape loops (`exec_stmt`, `run_stmt_once`) answered a busy handler's
+    /// `StepResult::Sleep` by yielding IO to the operation's driver, whose answer is to step the IO
+    /// backend and resume; that step returns at once when nothing is in flight, so a tape statement
+    /// on a connection with a busy timeout spun a core for the whole wait. No connection the
+    /// engine opens today sets a busy handler, so this runs the loops over a connection that does.
+    /// Each loop, driven as the tests above drive an operation, waits out a 500 ms busy timeout
+    /// behind another connection's open write transaction, and the driving thread's CPU time over
+    /// the wait must be a small fraction of it.
+    #[cfg(unix)]
+    #[test]
+    pub fn a_tape_busy_wait_sleeps_rather_than_spins() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let holder = db.connect().unwrap();
+        for sql in ["CREATE TABLE t(x)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+            holder.execute(sql).unwrap();
+        }
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(500));
+        for name in ["exec_stmt", "run_stmt_once"] {
+            let mut stmt = waiter.prepare("INSERT INTO t VALUES (2)").unwrap();
+            let mut gen = genawaiter::sync::Gen::new(|coro| async move {
+                let coro: Coro<()> = coro.into();
+                if name == "exec_stmt" {
+                    crate::database_tape::exec_stmt(&coro, &mut stmt).await
+                } else {
+                    run_stmt_once(&coro, &mut stmt).await.map(|_| ())
+                }
+            });
+            let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+            let refused = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            let (waited, spent) = (wall.elapsed(), thread_cpu() - cpu);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(crate::errors::Error::DatabaseTapeError(message))
+                        if message == "database is busy"
+                ),
+                "{name}: premise: the second writer is refused busy, got {refused:?}"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(450),
+                "{name}: premise: the busy timeout was waited out (waited {waited:?})"
+            );
+            assert!(
+                spent < std::time::Duration::from_millis(100),
+                "{name}: the busy wait spent {spent:?} of CPU over {waited:?}: it spun"
+            );
+        }
+        holder.execute("COMMIT").unwrap();
+    }
 }
