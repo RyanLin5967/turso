@@ -1502,6 +1502,329 @@ fn a_commit_re_stepped_after_a_busy_decision_pass_commits_once() {
     }
 }
 
+/// Engine review 16 HIGH 1's fixture: a trunk with a live child, `BEGIN; UPDATE t SET v = 'new'
+/// WHERE id = 3`, and a COMMIT refused at the trunk's copy-decision pass (`Busy`, the premise).
+/// `held`: the COMMIT is a prepared statement kept for a re-step; otherwise it ran through
+/// `Connection::execute`, which drops its statement.
+#[cfg(feature = "conn_raw_api")]
+struct BusyCommit {
+    commit: Option<crate::Statement>,
+    _child: Branch,
+    a: Arc<Connection>,
+    db: Arc<Database>,
+    from_frame: u64,
+    checkpoint_seq: u32,
+    page_size: usize,
+    catalog: bool,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(feature = "conn_raw_api")]
+impl BusyCommit {
+    fn new(catalog: bool, held: bool) -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-commit.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        let page_size = a.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let before = a.wal_state().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        a.execute("BEGIN").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        let (commit, first) = if held {
+            let mut commit = a.prepare("COMMIT").unwrap();
+            let first = commit.run_ignore_rows();
+            (Some(commit), first)
+        } else {
+            (None, a.execute("COMMIT"))
+        };
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused: {first:?}"
+        );
+        Self {
+            commit,
+            _child: child,
+            a,
+            db,
+            from_frame: before.max_frame,
+            checkpoint_seq: before.checkpoint_seq_no,
+            page_size,
+            catalog,
+            _dir: dir,
+        }
+    }
+
+    /// Step the held COMMIT again.
+    fn restep(&mut self) -> crate::Result<()> {
+        self.commit.as_mut().expect("a held COMMIT").run_ignore_rows()
+    }
+
+    /// The WAL commit frames written since the fixture's first BEGIN.
+    fn commit_frames(&self) -> usize {
+        let now = self.a.wal_state().unwrap();
+        assert_eq!(
+            now.checkpoint_seq_no, self.checkpoint_seq,
+            "catalog={}: premise: no checkpoint restarted the WAL in between",
+            self.catalog
+        );
+        let mut frame = vec![0u8; 24 + self.page_size];
+        (self.from_frame + 1..=now.max_frame)
+            .filter(|&n| self.a.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+            .count()
+    }
+
+    /// Row `id`'s value as a fresh trunk connection reads it: what is committed.
+    fn committed(&self, id: i64) -> String {
+        read_wide(&self.db.connect().unwrap(), id)
+    }
+}
+
+/// Step `stmt` until it yields its first row (the premise of a statement left mid-way).
+#[cfg(feature = "conn_raw_api")]
+fn step_to_row(db: &Arc<Database>, stmt: &mut crate::Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => return,
+            crate::StepResult::IO | crate::StepResult::Yield => db.io.step().unwrap(),
+            other => panic!("premise: the statement yields a row, not {other:?}"),
+        }
+    }
+}
+
+/// Engine review 16 HIGH 1 (a): a sibling INSERT fails between a Busy COMMIT and its re-step.
+/// The re-stepped COMMIT must not report success for a transaction that is not durable.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_re_stepped_after_a_failed_sibling_insert_reports_only_a_durable_commit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let mut f = BusyCommit::new(catalog, true);
+        let sibling = f.a.execute("INSERT INTO t VALUES (3, 'dup')");
+        assert!(
+            matches!(sibling, Err(LimboError::Constraint(_))),
+            "catalog={catalog}: premise: the sibling INSERT fails: {sibling:?}"
+        );
+        let second = f.restep();
+        let committed = f.committed(3);
+        assert!(
+            second.is_err() || committed == "new",
+            "catalog={catalog}: CLAIM: the re-stepped COMMIT returned {second:?} while row 3 reads \
+             {committed:?}"
+        );
+    }
+}
+
+/// Engine review 16 HIGH 1 (b): the same with a sibling SELECT dropped mid-scan.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_re_stepped_after_a_dropped_sibling_scan_reports_only_a_durable_commit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let mut f = BusyCommit::new(catalog, true);
+        let mut scan = f.a.prepare("SELECT id FROM t").unwrap();
+        step_to_row(&f.db, &mut scan);
+        drop(scan);
+        let second = f.restep();
+        let committed = f.committed(3);
+        assert!(
+            second.is_err() || committed == "new",
+            "catalog={catalog}: CLAIM: the re-stepped COMMIT returned {second:?} while row 3 reads \
+             {committed:?}"
+        );
+    }
+}
+
+/// Engine review 16 HIGH 1 (c): `execute("COMMIT")` drops its statement on Busy; a second
+/// `execute("COMMIT")` must commit the transaction, exactly once.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_second_execute_commit_after_a_busy_one_commits_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let f = BusyCommit::new(catalog, false);
+        let second = f.a.execute("COMMIT");
+        assert!(
+            second.is_ok(),
+            "catalog={catalog}: CLAIM: a second execute(COMMIT) after a Busy one commits: {second:?}"
+        );
+        assert_eq!(f.commit_frames(), 1, "catalog={catalog}: the transaction committed exactly once");
+        assert_eq!(f.committed(3), "new", "catalog={catalog}: the write is committed");
+    }
+}
+
+/// Engine review 16 HIGH 1 (d): after a Busy COMMIT, ROLLBACK ends the transaction: it returns Ok,
+/// the write is gone, and another connection can take the write lock.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_rollback_after_a_busy_commit_rolls_the_transaction_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let f = BusyCommit::new(catalog, false);
+        let rollback = f.a.execute("ROLLBACK");
+        assert!(
+            rollback.is_ok(),
+            "catalog={catalog}: CLAIM: ROLLBACK after a Busy COMMIT rolls back: {rollback:?}"
+        );
+        assert_eq!(f.committed(3), "trunk-3", "catalog={catalog}: the write is gone");
+        let b = f.db.connect().unwrap();
+        let other = b.execute("UPDATE t SET v = 'other' WHERE id = 40");
+        assert!(other.is_ok(), "catalog={catalog}: another connection takes the write lock: {other:?}");
+        assert_eq!(f.commit_frames(), 1, "catalog={catalog}: only the other connection committed");
+    }
+}
+
+/// Engine review 16 HIGH 1 (e): while a Busy COMMIT waits for its re-step, its write transaction is
+/// still open, so the connection does not report autocommit.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_leaves_the_connection_out_of_autocommit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let mut f = BusyCommit::new(catalog, true);
+        assert!(
+            !f.a.get_auto_commit(),
+            "catalog={catalog}: CLAIM: autocommit reads true while the write transaction is open"
+        );
+        f.restep().unwrap();
+        assert_eq!(f.commit_frames(), 1, "catalog={catalog}: the re-step commits once");
+    }
+}
+
+/// Engine review 16 HIGH 1 (f): a BEGIN between a Busy COMMIT and its re-step is refused, because
+/// the write transaction is still open.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_begin_after_a_busy_commit_is_refused() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let f = BusyCommit::new(catalog, true);
+        let begin = f.a.execute("BEGIN");
+        assert!(
+            matches!(begin, Err(LimboError::TxError(_))),
+            "catalog={catalog}: CLAIM: BEGIN over the open write transaction gave {begin:?}"
+        );
+    }
+}
+
+/// Engine review 16 HIGH 1 (g): a sibling writer left mid-statement when the Busy COMMIT is
+/// re-stepped makes the COMMIT refuse (StatementsInProgress), and nothing is committed: neither the
+/// transaction's write nor the sibling's half-done one.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_re_stepped_over_a_paused_sibling_writer_is_refused() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let mut f = BusyCommit::new(catalog, true);
+        let mut sibling =
+            f.a.prepare("UPDATE t SET v = 'mid' WHERE id IN (40, 50) RETURNING id").unwrap();
+        step_to_row(&f.db, &mut sibling);
+        let second = f.restep();
+        assert!(
+            matches!(second, Err(LimboError::StatementsInProgress(_))),
+            "catalog={catalog}: CLAIM: the COMMIT re-stepped over a paused writer gave {second:?}"
+        );
+        assert_eq!(f.committed(3), "trunk-3", "catalog={catalog}: the transaction's write is not committed");
+        assert_eq!(f.committed(40), "trunk-40", "catalog={catalog}: the sibling's write is not committed");
+        assert_eq!(f.commit_frames(), 0, "catalog={catalog}: no commit frame");
+        drop(sibling);
+    }
+}
+
+/// Engine review 16 HIGH 1 (h): statement S1's COMMIT is Busy; BEGIN and COMMIT then run on another
+/// statement S2, which commits the transaction. Re-stepping S1 finds no transaction.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_re_stepped_after_another_statement_committed_finds_no_transaction() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let mut f = BusyCommit::new(catalog, true);
+        let _ = f.a.execute("BEGIN");
+        let s2 = f.a.execute("COMMIT");
+        assert!(s2.is_ok(), "catalog={catalog}: premise: S2's COMMIT commits: {s2:?}");
+        let s1 = f.restep();
+        assert!(
+            matches!(s1, Err(LimboError::TxError(_))),
+            "catalog={catalog}: CLAIM: S1 re-stepped after S2's COMMIT gave {s1:?}"
+        );
+        assert_eq!(f.commit_frames(), 1, "catalog={catalog}: one commit, S2's");
+        assert_eq!(f.committed(3), "new", "catalog={catalog}: S2 committed the write");
+    }
+}
+
+/// Engine review 16 HIGH 1 (i): an explicit transaction feeding a materialized view, whose view
+/// merge at COMMIT yields IO (`VIEW_MERGE_YIELDS`) before the trunk's decision pass refuses it, is
+/// committed once by the re-stepped COMMIT: one commit frame and the view counts each row once.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_whose_view_merge_yielded_commits_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("busy-view.db"),
+            opts(catalog, SyncClass::Fsync).with_views(true),
+        );
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        a.execute("CREATE TABLE counters(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)").unwrap();
+        a.execute(
+            "CREATE MATERIALIZED VIEW sums AS SELECT grp, SUM(val) AS total FROM counters GROUP BY grp",
+        )
+        .unwrap();
+        let child = a.fork_branch().unwrap();
+        let page_size = a.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let before = a.wal_state().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        a.execute("BEGIN").unwrap();
+        a.execute("INSERT INTO counters VALUES (1, 'a', 5), (2, 'a', 7)").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        crate::vdbe::VIEW_MERGE_YIELDS.with(|n| n.set(1));
+        let mut commit = a.prepare("COMMIT").unwrap();
+        let first = commit.run_ignore_rows();
+        let yielded = crate::vdbe::VIEW_MERGE_YIELDS.with(|n| n.replace(0)) == 0;
+        assert!(yielded, "catalog={catalog}: premise: the view merge yielded");
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused after the yield: {first:?}"
+        );
+        let second = commit.run_ignore_rows();
+        assert!(
+            second.is_ok(),
+            "catalog={catalog}: CLAIM: the re-stepped COMMIT commits: {second:?}"
+        );
+        drop(commit);
+        let after = a.wal_state().unwrap();
+        assert_eq!(after.checkpoint_seq_no, before.checkpoint_seq_no, "catalog={catalog}: premise");
+        let mut frame = vec![0u8; 24 + page_size];
+        let commit_frames = (before.max_frame + 1..=after.max_frame)
+            .filter(|&n| a.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+            .count();
+        assert_eq!(commit_frames, 1, "catalog={catalog}: the transaction committed exactly once");
+        let b = db.connect().unwrap();
+        let totals: Vec<(Option<String>, Option<i64>)> = b
+            .prepare("SELECT grp, CAST(total AS INTEGER) FROM sums")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row[0].to_text().map(str::to_string), row[1].as_int()))
+            .collect();
+        assert_eq!(
+            totals,
+            vec![(Some("a".to_string()), Some(12))],
+            "catalog={catalog}: the view counts each committed row once"
+        );
+        assert_eq!(read_wide(&b, 3), "new", "catalog={catalog}: the write is committed");
+        drop(child);
+    }
+}
+
 /// Review A-F1: a raw WAL session's commit (`wal_insert_end(true)`) closes the commit gate it opens,
 /// so the next trunk commit takes its own copy decisions and no fork waits on a gate nobody holds.
 #[cfg(feature = "conn_raw_api")]
