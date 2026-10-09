@@ -1257,6 +1257,23 @@ mod tests {
             assert_eq!(ints(&conn, "SELECT id FROM k ORDER BY id"), vec![3, 4, 5]);
             conn.close().unwrap();
         }
+        // Engine review 20 HIGH 1: ALTER TABLE DROP COLUMN stores the table again, and a reopen
+        // reparses it.
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("ALTER TABLE k DROP COLUMN w").unwrap();
+            let after_drop = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'after drop')");
+            assert!(not_null(&after_drop), "after ALTER TABLE DROP COLUMN: {after_drop:?}");
+            conn.close().unwrap();
+        }
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let reopened = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'reopened after drop')");
+            assert!(not_null(&reopened), "after DROP COLUMN and a reopen: {reopened:?}");
+            conn.close().unwrap();
+        }
 
         let db = open_db(&io, "sqlitekey.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
@@ -1270,5 +1287,54 @@ mod tests {
             "a SQLite table turns a NULL key into a new rowid"
         );
         conn.close().unwrap();
+    }
+
+    /// Engine review 20 HIGH 1, the branch arm: a branch forked after ALTER TABLE ADD COLUMN on a
+    /// frontend table refuses an explicit NULL key as the trunk does. A lock-free fork that sees a
+    /// trunk commit parses the stored schema at its first connect (678b18ba4; review 20 #19), which
+    /// lost the frontend's mark when ALTER stored the table without it. Red at base when that first
+    /// connect reparses; a guard otherwise. Both stores.
+    #[test]
+    fn a_branch_forked_after_alter_refuses_an_explicit_null_key() {
+        for catalog in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("pgkey-branch.db");
+            let sync = crate::branch::SyncClass::Off;
+            let durability = if catalog {
+                crate::branch::BranchDurability::Catalog { sync }
+            } else {
+                crate::branch::BranchDurability::Durable { sync }
+            };
+            let db = Database::open_file_with_flags(
+                Arc::new(crate::PlatformIO::new().unwrap()),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_branch_durability(durability),
+                None,
+                Arc::new(PgKeyTestDialect),
+            )
+            .unwrap();
+            let trunk = db.connect().unwrap();
+            trunk
+                .execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            trunk.execute("ALTER TABLE k ADD COLUMN w INTEGER").unwrap();
+            trunk.execute("INSERT INTO k (id, v) VALUES (1, 'one')").unwrap();
+            let on_trunk = trunk.execute("INSERT INTO k (id, v) VALUES (NULL, 'trunk')");
+            assert!(
+                matches!(&on_trunk, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+                "catalog={catalog}: premise: the trunk refuses an explicit NULL key after the ALTER: {on_trunk:?}"
+            );
+            let branch = trunk.fork_branch().unwrap();
+            let on_branch = branch
+                .connect()
+                .unwrap()
+                .execute("INSERT INTO k (id, v) VALUES (NULL, 'branch')");
+            assert!(
+                matches!(&on_branch, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+                "catalog={catalog}: CLAIM: a branch forked after the ALTER took a new rowid for a NULL key: {on_branch:?}"
+            );
+            drop(branch);
+        }
     }
 }
