@@ -9,7 +9,10 @@
   blockgate.py self-test [TESTDATA]          the decision on synthetic records and on the real records in TESTDATA
                                              (default: testdata/ beside this file); exit 0 iff every case passes
 
-BLOCK is loop, brd or device; PLP is yes or no (a real run's --plp; dry runs say no).
+BLOCK is loop, brd or device; PLP is yes or no (a real run's --plp; dry runs say no). A device block (a real run)
+also needs the batch bound to a passing fire-check verdict and of the registered shape, N=10000, whatever its class
+(fourth lane review LOW 17); every non-brd block needs the record's required_flushes to equal n x its flush-gated
+arms, re-derived as batchgate.post defines it (LOW 19).
 Records are judged in the shape the V3 probe writes from c225124ae on (timing_control, d0_control, plp, and
 batchgate.post's flush_gate.voids). Any other shape FAILs: the fields are an allowlist, not optional.
 Every class first:
@@ -37,7 +40,8 @@ A16 (annex row, 2026-10-08) makes A14's counter gate conditional on the cross-ch
   - brd (dry runs only): PASS when nothing above fails.
 The plants (every block, on copies of the real record; gate-6 reviews: each plant is ONE field changed on a record
 a positive arm shows passing, so a plant cannot fire without its defect):
-  control         the real record, judged as a device block                           must PASS (else NOT-RUN)
+  control         the real record, judged as a loop block (the class rules; not the
+                  device-only binding and shape)                                      must PASS (else NOT-RUN)
   b-missing       the kernel write_cache removed                                      must FAIL (b)
   b-mismatch      the drive's report flipped against the kernel's                     must FAIL (b)
   b-nodrive       the drive's report removed                                          must FAIL (b)
@@ -70,6 +74,7 @@ import tempfile
 
 
 F1B_REAL = ("F1b:real-all", "F1b:real-4k")
+DEVICE_N = 10000  # the registered V3 batch shape (PREREG section 4; run.sh refuses a bound batch of any other N)
 # the timing control a passing batch of each class carries (v3floor.c at c225124ae; annex A14): an allowlist
 TIMING = {"write back": "pass", "write back+plp": "not applicable: PLP",
           "write through": "not applicable: no volatile cache", "brd": "not applicable: brd"}
@@ -164,6 +169,14 @@ def decide(sj, raw, rc, block, plp):
         return fail("rc 3 with no void recorded in the summary")
     if not d0.startswith("pass"):
         return fail(f"the D0 control did not pass ({d0!r})")
+    if block == "device":
+        # a real run's block (fourth lane review LOW 17): a batch bound to its fire-check verdict, of the registered
+        # shape, whatever the class (a smoke batch, or N=200, is a dry run's)
+        ev = sj.get("_app_sync") or {}
+        if not (ev.get("bound") and ev.get("f1b_real")):
+            return fail(f"(device) the batch is not bound to a passing fire-check verdict ({ev.get('why')})")
+        if sj.get("n") != DEVICE_N:
+            return fail(f"(device) the batch ran N={sj.get('n')!r}, the registered shape is N={DEVICE_N}")
     if block == "brd":
         if not tc.startswith(TIMING["brd"]):
             return fail(f"brd: the probe's timing control reads {tc!r}, not {TIMING['brd']!r}")
@@ -179,6 +192,15 @@ def decide(sj, raw, rc, block, plp):
         return fail(f"(b) the kernel says {wc!r} and the drive reports {drive!r}: they must agree (A16)")
     need, got = g.get("required_flushes"), g.get("leaf_flushes_completed")
     d.update({"required_flushes": need, "leaf_flushes_completed": got})
+    # the sync count is re-derived as batchgate.post defines it, n x the flush-gated arms, never trusted as a field
+    # (fourth lane review LOW 19)
+    n = sj.get("n")
+    gated = [a for a, r in (sj.get("flush_control_arms") or {}).items() if isinstance(r, dict) and r.get("gated")]
+    derived = n * len(gated) if isinstance(n, int) and gated else None
+    d["required_flushes_derived"] = derived
+    if derived is None or need != derived:
+        return fail(f"(shape) the record's required_flushes {need!r} is not n x the flush-gated arms "
+                    f"({n!r} x {len(gated)} = {derived!r})")
     if not isinstance(got, int):
         return fail(f"the leaf's flush counter is not recorded ({got!r})")
     if wc == "write through":
@@ -237,11 +259,11 @@ def plants(sj, raw, rc, plp, outdir=None):
         if not (sj.get("_app_sync") or {}).get("f1b_real"):
             # an unbound (smoke) record: the base assumes the evidence, so wt-nosync is one field
             sj["_app_sync"] = {"bound": False, "f1b_real": True, "why": "ASSUMED for the plant base (unbound batch)"}
-    ctl = decide(copy.deepcopy(sj), raw, rc, "device", plp) if sj is not None else None
+    ctl = decide(copy.deepcopy(sj), raw, rc, "loop", plp) if sj is not None else None
     out.append({"plant": "control", "want": "PASS", "got": ctl, "fired": bool(ctl) and ctl["decision"] == "PASS"})
     if not out[0]["fired"]:
         out.append({"plant": "all", "want": "-", "got": None, "fired": False,
-                    "why": "NOT-RUN: the real record does not pass as a device block, so no plant can discriminate"})
+                    "why": "NOT-RUN: the real record does not pass as a loop block, so no plant can discriminate"})
         return out, False
     real = (sj.get("leaf") or {}).get("write_cache") or sj.get("leaf_write_cache")
 
@@ -249,7 +271,7 @@ def plants(sj, raw, rc, plp, outdir=None):
         s = copy.deepcopy(sj)
         base(s)
         mutate(s)
-        r = decide(s, raw, rc_, "device", plp_)
+        r = decide(s, raw, rc_, "loop", plp_)
         if want_prefix is None:
             out.append({"plant": name, "want": "PASS", "got": r, "fired": r["decision"] == "PASS"})
             return
@@ -321,7 +343,7 @@ def plants(sj, raw, rc, plp, outdir=None):
         s_ = copy.deepcopy(sj)
         wt(s_)
         s_["_app_sync"] = ev
-        r = decide(s_, raw, 0, "device", plp)
+        r = decide(s_, raw, 0, "loop", plp)
         # fired only by the sha256 binding itself: a verdict the copy could not find is not the defect planted
         fired = r["decision"] == "FAIL" and any(x.startswith("(write through)") and "sha256" in x for x in r["reasons"])
         out.append({"plant": "wt-tampered", "want": "FAIL (write through) ... sha256", "got": r, "fired": fired})
@@ -415,7 +437,8 @@ def self_test(data):
         base.update(k)
         return wt(**base)
 
-    def dec(sj, rc=0, block="device", plp="no", raw=True):
+    # the class rules are judged as a loop (dry) block; the device-only rules (LOW 17) have their own cases
+    def dec(sj, rc=0, block="loop", plp="no", raw=True):
         return decide(sj, raw, rc, block, plp)["decision"]
 
     foreign = "FAIL: run void (nosync25 p50 61.0 us >= 50 us: a foreign writer on the device)"

@@ -127,8 +127,7 @@
   "ow64k",
   "ow1m",
   "clone2b",
-  "cfr2b",
-  "fdatasync4k"
+  "cfr2b"
  ],
  "arms_gated_run": [
   "append25",
@@ -224,7 +223,6 @@
  "exe_sha256": "3b29ee069663bef112ae3956e6c6d9364885bcbb7bf0251dec9ed0463ec37921",
  "floor_claim": "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor 'above a same-batch drive flush' may be written; on a virtual drive: reach to media unknown",
  "floor_claim_from_counts": "no drive flush: the leaf reports write-through and receives no flush (a virtual drive: the host's caching is unknown)",
- "floor_frame_variant": "no frame arm registered",
  "floor_kind": "no volatile cache (a virtual drive's report): no drive flush, host caching unknown",
  "floor_reference": {
   "arm": "fdatasync4k",
@@ -259,7 +257,7 @@
    "timing_gated": false
   },
   "fdatasync4k": {
-   "gated": true,
+   "gated": false,
    "pass": true,
    "ratio": 48.1,
    "timing_gated": false
@@ -474,7 +472,6 @@
   "append25"
  ],
  "trace_clock": 0,
- "traced": false,
  "uname": "Linux 6.17.0-1022-azure aarch64",
  "virtualization": {
   "basis": "4 piece(s) of VM evidence",

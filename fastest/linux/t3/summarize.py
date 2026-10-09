@@ -438,7 +438,9 @@ def self_test():
             voids = ["fsync: append25's windows without an fsync or fdatasync by the probe: 3 of 10000"]
         return json.dumps({"frame_arm": "append64", "arms": {"append64": {"p50_us": 80.0}, "append25": {"p50_us": a25}},
                            "floor_kind": "x", "timing_control": tc, "flush_control": tc, "d0_control": d0, "plp": plp,
-                           "traced": False,
+                           "traced": False, "n": 200,  # 200 x the 7 flush-gated arms = required_flushes 1400 (LOW 19)
+                           "flush_control_arms": {x: {"gated": True} for x in ("append25", "append64", "ow4k", "ow64k",
+                                                                                "ow1m", "cfr2b", "fdatasync4k")},
                            "leaf": {"kind": "brd" if brd else "drive", "disk": "ram0" if brd else "nvme0n1",
                                     "write_cache": "write through" if brd else "write back",
                                     "drive_reports": "none (RAM)" if brd else "write back"},
