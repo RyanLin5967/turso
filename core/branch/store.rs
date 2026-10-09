@@ -6660,12 +6660,38 @@ impl BranchStore {
                 } else {
                     reader.name_hashes(|name| hasher.hash_one(name), &stop)
                 };
-                let mut inner = shared.lock();
+                // The set of the scanned names is built here, off the store mutex: its one table of
+                // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
+                // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
+                // byte). Under the mutex only the names applied while the scan ran join it, and it
+                // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
+                // scanned names are inserted under the mutex, as before.
+                let under = fe_mutant("name_filter_built_under_mutex");
+                let mut scanned = scanned.map(|hashes| {
+                    if under {
+                        (HashSet::default(), hashes)
+                    } else {
+                        (hashes.into_iter().collect::<HashSet<u64, BuildIdHasher>>(), Vec::new())
+                    }
+                });
+                // Room for the names applied meanwhile is made off the mutex too, so joining them
+                // never grows the table under it (a resize moves all N entries).
+                let mut inner = loop {
+                    let inner = shared.lock();
+                    let joining = inner.names.filter.pending.as_ref().map_or(0, HashSet::len);
+                    match scanned.as_mut() {
+                        Ok((built, _)) if !under && built.capacity() - built.len() < joining => {
+                            drop(inner);
+                            built.reserve(joining);
+                        }
+                        _ => break inner,
+                    }
+                };
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
-                    Ok(hashes) => {
-                        let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
+                    Ok((mut built, unbuilt)) => {
+                        built.extend(unbuilt);
                         built.extend(pending);
                         filter.built = Some(built);
                         filter.builds += 1;
