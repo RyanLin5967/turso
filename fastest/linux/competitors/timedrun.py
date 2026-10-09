@@ -374,9 +374,12 @@ CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # claim, so the record names that claim's time (warmup_end_ns, ns since t0), whether it ended capped, and the time of
 # the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
 # 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done. warmup_backsteps: the claims judged
-# with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are).
+# with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are);
+# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (each client's own intended
+# times, decided in lock order).
 RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
-       "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "max_window_s": 1800.0, "window_s": 5.0}
+       "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
+       "window_s": 5.0}
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
@@ -536,6 +539,18 @@ def selftest():
         ("A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)",
          dict(tracer=clean, timed_extra={"warmup_backsteps": 1}), False),
         ("A23: no warmup_backsteps in the record", dict(tracer=clean, timed_extra={"warmup_backsteps": None}), False),
+        # The lead's correction on 0138d2128: in OPEN loop each client keeps its own Poisson schedule, so claims reach
+        # the lock out of intended order and backsteps are expected, not a defect; only a closed-loop backstep is one.
+        # The run's loop mode is therefore part of the record.
+        ("A23: an open-loop record with backsteps is accepted (per-client intended times, decided in lock order)",
+         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), True),
+        ("A23: the same record in closed loop is refused",
+         dict(tracer=clean, timed_extra={"loop": "closed", "warmup_backsteps": 3}), False),
+        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's (a backstep at the "
+         "end): accepted", dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
+                                                           "warmup_last_claim_ns": 10_000_600_000}), True),
+        ("A23: no loop mode in the record", dict(tracer=clean, timed_extra={"loop": None}), False),
+        ("A23: a loop mode that is neither closed nor open", dict(tracer=clean, timed_extra={"loop": "b1"}), False),
         ("the labelling run's warm-up left early",
          dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
                                        "warmup_last_claim_ns": 999_000_000}), False),
@@ -603,7 +618,7 @@ def selftest():
     # rule's text (the same edges as the shared harness's cases), never from a driver.
     def wrec(ops, end_ns, capped, last_ns):
         return {"warmup_ops": ops, "warmup_s": end_ns / 1e9, "warmup_capped": capped, "warmup_end_ns": end_ns,
-                "warmup_last_claim_ns": last_ns, "warmup_backsteps": 0}
+                "warmup_last_claim_ns": last_ns, "warmup_backsteps": 0, "loop": "closed"}
     for rule_in, rec, want, what in (
             ("1000:1:0", wrec(0, 0, True, None), True, "MAX_S 0 ends at the first claim, capped (no 'no limit')"),
             ("1000:1:0", wrec(1000, 1_200_000_000, False, 1_190_000_000), False,
