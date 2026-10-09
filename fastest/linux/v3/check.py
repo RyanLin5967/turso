@@ -1415,6 +1415,13 @@ def real_selftest(chk):
             ls, c0 = f1b_lines(t)
             return "\n".join(ls[:c0] + [l for l in ls[c0:] if not re.match(r"^\d+\s+fsync\(\d+<[^>]*/cfr2b\.clones>\)", l)])
 
+        def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
+            # in-loop pwrite64, inside a timed window: a file that is no arm's own
+            ls, c0 = f1b_lines(t)
+            m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\((\d+)<([^>]*/cfr2b\.src)>\)", l) for l in ls[:c0]) if mm)
+            j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(", ls[k]))
+            return "\n".join(ls[:j + 1] + ["%s  fsync(%s<%s>) = 0" % m.groups()] + ls[j + 1:])
+
         cases = [
             ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
             ("flush_sent", both(lambda j: j.update(flush_sent_to_device=FLUSH_SENT["wb"][False] + " (planted)")),
@@ -1526,6 +1533,10 @@ def real_selftest(chk):
              ["sync_fds disagrees with F1b's strace"]),
             ("an F1b trace whose nosync25 window fsyncs nosync25's own file", {"f1b": f1b_nosync}, "F3:devflush",
              ["sync_fds disagrees with F1b's strace"]),
+            # V3 review 12 item 11: an in-window sync on a path that is no arm's file (<work>/cfr2b.src) was keyed
+            # "cfr2b.src" and never compared (the loop ran over rows only)
+            ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
         ]
         for name, muts, cid, want in cases:
             g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"),
