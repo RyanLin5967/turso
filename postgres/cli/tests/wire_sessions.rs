@@ -2685,6 +2685,85 @@ fn an_index_on_a_qualified_table_is_that_tables() {
     );
 }
 
+/// An unqualified relation is typed from the relation the engine resolves along the search path:
+/// an entry that names no attached schema (`"$user"`, PostgreSQL's default, or `nosuch`) is
+/// skipped, and an attached schema that does not hold the name is passed over, so under `"$user",
+/// public`, `nosuch, public` and `s, public` a Describe over public's orders types its `$1` int4
+/// (23), as PostgreSQL does; a named INSERT executed again after each such SET still runs, its $1
+/// typed int4 as at its first Execute;
+/// and with no path set, a table the engine finds only in attached s (u) is one the walk cannot
+/// read, so `$1` into it is refused 42P18, never typed text. The walk stopped at the first entry
+/// that was not public, so all three paths refused every parameter (42P18), and with no path it
+/// took a name absent from main as main's, typing nothing and falling to text (wire review 17 item
+/// 3). Schema s is made by the non-server CLI before the server starts.
+#[test]
+fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
+    let dir = Scratch::new("resolver");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"CREATE TABLE orders(id INT PRIMARY KEY);\n\
+              CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+              CREATE SCHEMA s;\n\
+              CREATE TABLE s.u(id INT PRIMARY KEY, n INT);\n",
+        )
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.describe_statement("UPDATE u SET n = $1");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P18"),
+        "u is s's, found by the engine after main: {:?}",
+        r.params
+    );
+    // s1 runs under the default path first (id 3), which fixes its $1 as int4 (id's type).
+    a.send(b'P', b"s1\0INSERT INTO t VALUES ($1, 7)\0\0\0");
+    a.send(b'B', b"\0s1\0\0\0\0\x01\0\0\0\x013\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(
+        r.error.is_none(),
+        "s1 under the default path: {:?}",
+        r.error
+    );
+    for path in ["\"$user\", public", "nosuch, public", "s, public"] {
+        a.q(&format!("SET search_path TO {path}")).ok(path);
+        let r = a.describe_statement("SELECT 1 FROM orders WHERE id = $1");
+        assert_eq!(r.params, Some(vec![23]), "{path}: {:?}", r.error);
+        let id = 10 + path.len();
+        let value = format!("{id}");
+        let mut bind = b"\0s1\0\0\0\0\x01".to_vec();
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value.as_bytes());
+        bind.extend_from_slice(&[0, 0]);
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        assert!(r.error.is_none(), "s1 under {path}: {:?}", r.error);
+    }
+    a.q("SET search_path TO public").ok("public alone");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE c = 7").single("rows"),
+        "4",
+        "s1 ran once per path and once before"
+    );
+}
+
 /// An explicit `public.` names public's relation whatever the search path, as in PostgreSQL. With
 /// public.t(c int) and s.t(c text) under `SET search_path TO s, public`, a literal INSERT, an UPDATE,
 /// a DELETE and an INSERT of an undeclared '007' (typed int4 from public.t, stored 7) all reach
