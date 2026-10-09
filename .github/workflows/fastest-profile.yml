@@ -215,15 +215,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: fastest/linux/profile
       - uses: actions/download-artifact@v4
         with:
           name: profile-raw-${{ matrix.runner }}
           path: raw
-      - name: The budget-syscalls rows of verdict.tsv
-        run: |
-          f=raw/analysis/verdict.tsv
-          [ -s "$f" ] || { echo "no verdict.tsv: the profile job produced no analysis"; exit 1; }
-          rows=$(awk -F'\t' '$1 ~ /^budget-syscalls\//' "$f")
-          echo "$rows"
-          echo "$rows" | awk -F'\t' '$4 == "PASS" || $4 == "FAIL"' | grep -q . || { echo "no budget-syscalls row was evaluated"; exit 1; }
-          ! echo "$rows" | awk -F'\t' '$4 == "FAIL"' | grep -q .
+      # T3 review 4bdb3a042..2d42982a0 item 28: this step used to go green on ANY arm's PASS, even with no
+      # budget-syscalls/full-snap-c1 row. analyze.py's budget_verdict() (self-tested) requires that row, evaluated,
+      # and no budget-syscalls FAIL; an unreadable or malformed verdict.tsv is refused.
+      - name: The budget-syscalls rows of verdict.tsv (budget-syscalls/full-snap-c1 required)
+        run: python3 -B fastest/linux/profile/analyze.py --budget-verdict raw/analysis/verdict.tsv

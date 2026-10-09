@@ -557,12 +557,78 @@ def regression_green(rows):
     return evaluated and not [r for r in rows if r[3] == "FAIL" and not r[0].startswith("budget-syscalls/")]
 
 
+VERDICT_FIELDS = 4  # gate, expected, got, verdict
+
+
+def write_verdict(path, rows):
+    """verdict.tsv, one row per line. A tab or newline inside a field would shift or split the row for every
+    reader, so such a row is refused (ValueError) rather than written."""
+    for r in rows:
+        if len(r) != VERDICT_FIELDS or any(not isinstance(f, str) or "\t" in f or "\n" in f for f in r):
+            raise ValueError(f"unwritable verdict row {r!r}")
+    with open(path, "w") as f:
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+
+
+def read_verdict(path):
+    """verdict.tsv back as tuples. A missing file raises OSError; an empty file, or a line without exactly
+    VERDICT_FIELDS fields, raises ValueError: a verdict that cannot be read is never read as a pass."""
+    with open(path) as f:
+        lines = f.read().splitlines()
+    rows = []
+    for n, line in enumerate(lines, 1):
+        fields = tuple(line.split("\t"))
+        if len(fields) != VERDICT_FIELDS:
+            raise ValueError(f"{path}:{n}: {len(fields)} fields, expected {VERDICT_FIELDS}: {line!r}")
+        rows.append(fields)
+    if not rows:
+        raise ValueError(f"{path}: no rows")
+    return rows
+
+
+def budget_verdict(rows):
+    """The absolute syscall budget job's verdict (T3 review item 28; the job used to go green on ANY arm's PASS).
+    The row of the arm the budget binds to, budget-syscalls/<BASELINE_ARM>, must be present exactly once and
+    evaluated (PASS or FAIL), and no budget-syscalls row may FAIL. Returns (ok, reasons)."""
+    need = f"budget-syscalls/{BASELINE_ARM}"
+    budget_rows = [r for r in rows if r[0].startswith("budget-syscalls/")]
+    mine = [r for r in budget_rows if r[0] == need]
+    reasons = []
+    if not mine:
+        reasons.append(f"no {need} row: the budget was not evaluated on the arm it binds to")
+    elif len(mine) > 1:
+        reasons.append(f"{len(mine)} {need} rows, expected one")
+    elif mine[0][3] not in ("PASS", "FAIL"):
+        reasons.append(f"{need} is {mine[0][3]}, not evaluated: {mine[0][2]}")
+    reasons += [f"{r[0]} FAIL: {r[2]}" for r in budget_rows if r[3] == "FAIL"]
+    return not reasons, reasons
+
+
 def main(argv):
     if argv[1:] == ["--self-test"]:
         return 0 if self_test() else 1
     if not self_test():
         print("analyze: self-test FAILED: the gates cannot be trusted", file=sys.stderr)
         return 1
+    if argv[1:2] == ["--budget-verdict"]:
+        # the "absolute syscall budget" job of fastest-profile.yml, on the profile job's verdict.tsv
+        if len(argv) != 3:
+            print("usage: analyze.py --budget-verdict <verdict.tsv>", file=sys.stderr)
+            return 2
+        try:
+            vrows = read_verdict(argv[2])
+        except (OSError, ValueError) as e:
+            print(f"analyze: budget verdict REFUSED: {e}", file=sys.stderr)
+            return 1
+        for r in vrows:
+            if r[0].startswith("budget-syscalls/"):
+                print("\t".join(r))
+        ok, reasons = budget_verdict(vrows)
+        for w in reasons:
+            print(f"analyze: budget: {w}")
+        print(f"analyze: absolute syscall budget {'PASS' if ok else 'FAIL'}")
+        return 0 if ok else 1
     raw, budget_path, out = argv[1], argv[2], argv[3]
     baseline = None
     if "--baseline" in argv:
@@ -583,9 +649,7 @@ def main(argv):
     rows = gates(sides["head"], sides.get("base"), budget, baseline, cpu=cpu)
     os.makedirs(out, exist_ok=True)
     json.dump(sides, open(os.path.join(out, "summary.json"), "w"), indent=1)
-    with open(os.path.join(out, "verdict.tsv"), "w") as f:
-        for r in rows:
-            f.write("\t".join(r) + "\n")
+    write_verdict(os.path.join(out, "verdict.tsv"), rows)
     h = sides["head"].get(BASELINE_ARM, {})
     json.dump({"sha": os.environ.get("GITHUB_SHA"), "ir_create": h.get("ir_per_op", {}).get("create"),
                "ir_per_op": h.get("ir_per_op"), "cpu": cpu,
