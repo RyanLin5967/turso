@@ -1263,9 +1263,18 @@ impl Infer<'_> {
                     if level.iter().any(|rel| matches!(rel, Rel::Unknown { .. })) {
                         return Some(None);
                     }
-                    let mut found = level.iter().filter_map(|rel| of(rel, column));
-                    if let Some(ty) = found.next() {
-                        return found.next().is_none().then_some(ty);
+                    // In two relations of the level: one column a join merged (USING, NATURAL)
+                    // when they agree on its type, which it then has; untyped when they do not. A
+                    // column no join merges is the engine's 42702 whichever is returned. It was
+                    // read as not found, which fell to text (wire review 14 item 9).
+                    let found: Vec<Option<u32>> =
+                        level.iter().filter_map(|rel| of(rel, column)).collect();
+                    if let [first, rest @ ..] = found.as_slice() {
+                        return Some(if rest.iter().all(|t| t == first) {
+                            *first
+                        } else {
+                            None
+                        });
                     }
                 }
                 None
