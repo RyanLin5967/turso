@@ -890,10 +890,8 @@ def self_test():
         sfp = os.path.join(rd_, "sync_fds.json")  # [tenth review HIGH 1] report() takes the probe's fd map
         with open(sfp, "w") as f:
             json.dump({"n": 2, "sync_fds": {"append25": {"3": 2}, "nosync25": {}}}, f)
-        try:
-            r = report(rec, None, wt, 99, sfp)
-        except TypeError as e:
-            r = {"syscalls": {"error": repr(e)}, "windows": {"arms": {"append25": {"devices": {"loop0": {"events": -1}}}}}}
+        # [V3 review 12 item 16: the red commit's `except TypeError` shims are gone from here on: an API break is a crash]
+        r = report(rec, None, wt, 99, sfp)
         sa = (r.get("syscalls") or {}).get("arms") or {}
         chk("report() end to end on a planted record: per-arm syncs by pid 99 (append25 synced in both windows), the "
             "block events by device, and the syscalls record", sa.get("append25", {}).get("windows_without_a_sync") == 0
@@ -924,12 +922,8 @@ def self_test():
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import check as _ck
         meta = json.load(open(os.path.join(tdd, "sync_fds.json")))
-        rr = {}
-        try:
-            rr = report(tdd, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
-            ra = (rr.get("syscalls") or {}).get("arms") or {}
-        except TypeError as e:
-            ra = {"error": repr(e)}
+        rr = report(tdd, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
+        ra = (rr.get("syscalls") or {}).get("arms") or {}
         # [V3 review 12 item 8, disclosed: "exactly its own" asserted only "at least its own"; windows_over 0 now
         # bounds it from above. Predicted: fc6ed8060's offline re-derivation found every arm's total exactly its defined
         # count (the rest 200, cfr2b/clone2b 400) with no window short, so none can be over]
@@ -983,11 +977,8 @@ def self_test():
                     for l in kept]
             with gzip.open(os.path.join(pl, "trace.txt.gz"), "wt") as f:
                 f.write("\n".join(kept))
-            try:
-                rp = report(pl, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
-                res_p = ((rp.get("syscalls") or {}).get("arms") or {}).get(plant[0])
-            except TypeError as e:
-                res_p = {"error": repr(e)}
+            rp = report(pl, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json"))
+            res_p = ((rp.get("syscalls") or {}).get("arms") or {}).get(plant[0])
         chk("real arm-xfs record with one gated window's own sync dropped, a neighbour's event overlapping that window -> "
             "the window shows (windows_without_a_sync 1)", plant is not None and isinstance(res_p, dict)
             and res_p.get("windows_without_a_sync") == 1, (plant, res_p))
@@ -1017,7 +1008,7 @@ def self_test():
                 sy7 = report(p7, None, os.path.join(tdd, "raw.tsv"), meta["pid"], os.path.join(tdd, "sync_fds.json")).get("syscalls") or {}
                 res7 = (((sy7.get("arms") or {}).get("nosync25") or {}).get("syncs_inside_any_fd"),
                         (sy7.get("unattributed") or {}).get("inside_foreign_fd"), ((sy7.get("arms") or {}).get("nosync25") or {}).get("syncs"))
-            except (TypeError, Refuse) as e:
+            except Refuse as e:  # the record's own refusal is the case's outcome, recorded; an API break is a crash
                 res7 = repr(e)
         chk("real arm-xfs record with an fsync on fd 99 planted wholly inside a nosync25 window -> nosync25 "
             "syncs_inside_any_fd 1, inside_foreign_fd 1, its own-fd syncs still 0", res7 == (1, 1, 0), (nw0, res7))

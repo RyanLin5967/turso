@@ -743,10 +743,11 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
     local l w1
     w1=$first1
     l=$(loop_list) || { echo "losetup --list failed: the loops cannot be listed"; return 0; }
-    [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, ""); p = $0
-      sub(/ \(deleted\)$/, "", p)
-      if (p == w1 || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }'
+    [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v w1b="${rbimg:-}" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, "")
+      p = $0; sub(/ \(deleted\)$/, "", p)
+      if (p == w1 || (w1b != "" && p == w1b) || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }'
   }
+  rbimg=""
   # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/ (as nbx's backing /mnt/v3fx/nb/x.img is), mounted,
   # must survive --teardown-nest untouched: same device, same backing file, still mounted
   pl=""
@@ -770,8 +771,14 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   # tenth review MED 2's plant: a loop attached to a file on n1 and never mounted; --teardown-nest must detach it and
   # leave no loop backed by the chain
   sudo truncate -s 64M "$FX/n1/stray.img" && sstray=$(sudo losetup --find --show "$FX/n1/stray.img") && echo "$sstray" > "$NM/stray.dev"
+  # V3 review 12 item 13: and an extra, never-mounted loop on n1's OWN (rebuilt) image: no level's pass detaches it,
+  # only teardown's final chain_loops sweep can, and only its outcome check (and the after_stray list below) can see
+  # it left; the teardown also deletes the image, which must then be gone
+  rbimg=$(cat "$NM/rebuilt_n1_backing.txt" 2>/dev/null)
+  if [ -n "$rbimg" ]; then x1=$(sudo losetup --find --show "$rbimg") && echo "$x1 $rbimg" > "$NM/n1extra.dev"; fi
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/stray_teardown.txt" 2>&1; echo $? > "$NM/stray_teardown.rc"
-  { chainloops | sed 's/^/loop still attached: /'; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done; } > "$NM/after_stray.txt"
+  { chainloops | sed 's/^/loop still attached: /'; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done
+    [ -n "$rbimg" ] && [ -e "$rbimg" ] && echo "n1 image still present: $rbimg"; } > "$NM/after_stray.txt"
 else
   echo "no proved nest chain to tear down (n1.ok absent or n1 not mounted)" > "$NM/na.txt"
 fi

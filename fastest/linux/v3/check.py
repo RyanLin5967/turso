@@ -563,10 +563,13 @@ def canon(a):
     return a
 
 
-def parse_trace(text):
+def parse_trace(text, sync_fd=None):
     """-> (calls, other, pids): every syscall line as (name, canonical text), the lines that are not syscalls, and the
     pids seen. strace 6.8 prints FICLONE as "BTRFS_IOC_CLONE or FICLONE" (one ioctl number) with its source fd as a
-    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned."""
+    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned.
+    sync_fd, when given a dict, receives {index in calls: the fd number} for every fsync and fdatasync (None when its
+    first argument is not fd<path>): the canonical text drops fd numbers, which f1b_window_syncs needs (V3 review 12
+    item 15: one strace parser, not two)."""
     calls, other, fds, pids = [], [], {}, set()
     for line in text.splitlines():
         m = LINE.match(line)
@@ -590,6 +593,9 @@ def parse_trace(text):
             t = "ioctl %s %s %s = %s" % (canon(args[0]), cmd, src, ret)
         else:
             t = name + " " + " ".join(canon(x) for x in args) + " = " + ret
+        if sync_fd is not None and name in ("fsync", "fdatasync"):
+            a0 = re.fullmatch(r"(\d+)<.*>", args[0].strip()) if args else None
+            sync_fd[len(calls)] = int(a0.group(1)) if a0 else None
         calls.append((name, t))
     return calls, other, pids
 
@@ -1328,7 +1334,10 @@ def real_selftest(chk):
             return
         t = rd(os.path.join(srcd, "F1b", "real-all.trace.gz"))
         with gzip.open(fb, "wt") as fh:
-            fh.write(f1b(t) if f1b else t)
+            fh.write(f1b(t) if callable(f1b) else t)
+        if f1b == "truncated":  # V3 review 12 item 12: a gzip cut in half (EOFError inside gzip, past OSError)
+            with open(fb, "r+b") as fh:
+                fh.truncate(os.path.getsize(fb) // 2)
 
     def run(name, probe=None, merged=None, report=None, files=None, kvmut=None, f1b=None):
         global CELL, KIND, W, OUT, results
@@ -1414,6 +1423,22 @@ def real_selftest(chk):
         def f1b_no_cfr_dirsync(t):
             ls, c0 = f1b_lines(t)
             return "\n".join(ls[:c0] + [l for l in ls[c0:] if not re.match(r"^\d+\s+fsync\(\d+<[^>]*/cfr2b\.clones>\)", l)])
+
+        def f1b_noclock(t):  # V3 review 12 item 12: one clock read deleted (the windows' parity breaks)
+            ls, c0 = f1b_lines(t)
+            return "\n".join(ls[:c0] + ls[c0 + 1:])
+
+        def f1b_nodecor(t):  # ... an in-window fsync with no -y decoration: "fsync(3) = 0"
+            ls, c0 = f1b_lines(t)
+            m = re.match(r"^(\d+)\s", ls[c0])
+            return "\n".join(ls[:c0 + 1] + ["%s  fsync(3) = 0" % m.group(1)] + ls[c0 + 1:])
+
+        def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
+            # in-loop pwrite64, inside a timed window: a file that is no arm's own
+            ls, c0 = f1b_lines(t)
+            m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\((\d+)<([^>]*/cfr2b\.src)>\)", l) for l in ls[:c0]) if mm)
+            j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(", ls[k]))
+            return "\n".join(ls[:j + 1] + ["%s  fsync(%s<%s>) = 0" % m.groups()] + ls[j + 1:])
 
         cases = [
             ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
@@ -1526,6 +1551,19 @@ def real_selftest(chk):
              ["sync_fds disagrees with F1b's strace"]),
             ("an F1b trace whose nosync25 window fsyncs nosync25's own file", {"f1b": f1b_nosync}, "F3:devflush",
              ["sync_fds disagrees with F1b's strace"]),
+            # V3 review 12 item 11: an in-window sync on a path that is no arm's file (<work>/cfr2b.src) was keyed
+            # "cfr2b.src" and never compared (the loop ran over rows only)
+            ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
+            # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
+            # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
+            # clock read and an undecorated in-window fsync make the windows unreadable
+            ("a truncated F1b gzip", {"f1b": "truncated"}, "F3:devflush",
+             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+            ("an F1b trace with one clock read deleted", {"f1b": f1b_noclock}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
+            ("an F1b trace with an in-window fsync without fd<path>", {"f1b": f1b_nodecor}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
         ]
         for name, muts, cid, want in cases:
             g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"),
@@ -1955,11 +1993,15 @@ def main(argv):
           # tenth review MED 2: a stray loop on n1, never mounted, is detached by the teardown, which leaves no loop on
           # the chain and nothing mounted
           and bool((rd(os.path.join(nm, "stray.dev")) or "").strip()) and rc_of(os.path.join(nm, "stray_teardown.rc")) == 0
+          # V3 review 12 item 13: the extra never-mounted loop on n1's own image was attached (only the final sweep can
+          # detach it; after_stray, below, then holds neither it nor the image)
+          and bool((rd(os.path.join(nm, "n1extra.dev")) or "").strip())
           and ast is not None and ast.strip() == "",
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
            "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
            "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
+           "n1extra": (rd(os.path.join(nm, "n1extra.dev")) or "").strip(),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
            "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
           "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
@@ -2504,37 +2546,41 @@ def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
 
 
 def f1b_window_syncs(text):
-    """eleventh review MED 2: ({arm: fds}, problems) for the fsync and fdatasync calls INSIDE the timed windows of an
-    F1b strace -f -y trace: between a window's opening and closing clock_gettime(CLOCK_MONOTONIC_RAW), the only clock
-    reads the loop makes (sequence_problems holds F1b:real-all to exactly 2 x n x arms of them). Setup and teardown
-    syncs are outside every window and not counted. A sync split by strace (<unfinished ...>) counts by its opening
-    half. The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>."""
-    seen, clocks, probs = {}, 0, []
-    for line in text.splitlines():
-        m = LINE.match(line)
-        if m and "<unfinished ...>" not in line and "resumed>" not in line:
-            name, args = m.group(2), m.group(3)
-        else:
-            u = re.match(r"^\d+\s+(fsync|fdatasync)\((.*?)\s*<unfinished \.\.\.>$", line)
-            if not u:
+    """eleventh review MED 2: the fsync and fdatasync calls INSIDE the timed windows of an F1b strace -f -y trace, read
+    through parse_trace and sliced as sequence_problems slices them (V3 review 12 item 15: this was a second strace
+    parser, whose split-line and parity branches no trace F1b:real-all accepts can reach): a window is the calls
+    between its opening and closing clock_gettime, the only clock reads the loop makes. Setup and teardown syncs are
+    outside every window. A split (<unfinished ...>) line is not a call (parse_trace keeps it in `other`, which
+    F1b:real-all refuses). The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>,
+    for an arm this probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd
+    (review 12 item 11). An odd number of clock reads, or an in-window sync whose first argument is not fd<path>, is a
+    problem. -> (seen {arm: fds}, problems, odd paths)"""
+    seen, probs, odd, fdmap = {}, [], [], {}
+    known = set(ALL.split(","))
+    calls, _other, _pids = parse_trace(text, fdmap)
+    clocks = [k for k, (name, _) in enumerate(calls) if name == "clock_gettime"]
+    if not clocks or len(clocks) % 2:
+        return {}, ["%d clock reads: the trace holds no whole timed windows" % len(clocks)], []
+    for w in range(len(clocks) // 2):
+        for k in range(clocks[2 * w] + 1, clocks[2 * w + 1]):
+            name, t = calls[k]
+            if name not in ("fsync", "fdatasync"):
                 continue
-            name, args = u.group(1), u.group(2)
-        if name == "clock_gettime":
-            clocks += 1
-            continue
-        if name not in ("fsync", "fdatasync") or clocks % 2 == 0:
-            continue
-        a = re.fullmatch(r"(\d+)<([^>]+)>", args.strip())
-        if not a:
-            probs.append("an in-window sync without fd<path>: " + line[:120])
-            continue
-        path, base = a.group(2), os.path.basename(a.group(2))
-        arm = (os.path.basename(os.path.dirname(path))[:-len(".clones")] if re.fullmatch(r"c\d+", base)
-               else base[:-len(".clones")] if base.endswith(".clones") else base)
-        seen.setdefault(arm, set()).add(int(a.group(1)))
-    if clocks == 0 or clocks % 2:
-        probs.append("%d clock reads: the trace holds no whole timed windows" % clocks)
-    return seen, probs
+            pm = re.match(r"^(?:fsync|fdatasync) <(.*)> = ", t)
+            if fdmap.get(k) is None or not pm:
+                probs.append("an in-window sync without fd<path>: " + t[:120])
+                continue
+            path, base = pm.group(1), os.path.basename(pm.group(1))
+            if re.fullmatch(r"c\d+", base):
+                par = os.path.basename(os.path.dirname(path))
+                arm = par[:-len(".clones")] if par.endswith(".clones") else None
+            else:
+                arm = base[:-len(".clones")] if base.endswith(".clones") else base
+            if arm not in known:
+                odd.append(path)
+                continue
+            seen.setdefault(arm, set()).add(fdmap[k])
+    return seen, probs, odd
 
 
 def sync_fds_def_problems(sj, rows, n):
@@ -2572,10 +2618,12 @@ def sync_fds_problems(sj, rows, n, f1b_trace):
     if f1b_trace is None:
         bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad
-    seen, probs = f1b_window_syncs(f1b_trace)
+    seen, probs, odd = f1b_window_syncs(f1b_trace)
     if probs:
         bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
         return bad
+    if odd:  # V3 review 12 item 11: an in-window sync on a path that is no arm's file is reported, never dropped
+        bad.append(("an F1b in-window sync on a file that is no arm's own", sorted(set(odd))[:5]))
     for a in rows:
         want = {int(k) for k in (sf.get(a) or {})}
         if want != seen.get(a, set()):
