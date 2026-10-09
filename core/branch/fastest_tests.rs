@@ -4354,8 +4354,13 @@ fn a_raised_d0_fuzzy_checkpoint_returns_held_frees_with_no_raised_op() {
 fn a_raised_d0_fuzzy_checkpoint_commit_makes_its_releases_durable() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
-    let (db, trunk, x, _slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("fuzzy-held-b.db"), true, false);
+    let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("fuzzy-held-b.db"), true, false);
     x.reap().unwrap();
+    // The premise the split from arm (a) dropped (engine review 17 LOW 7): the Release's frees are
+    // held, so its durability is what the checkpoint's commit must provide.
+    for &slot in &slots {
+        assert!(!db.branch_slot_is_free(slot), "(b) premise: slot {slot} is held for a sync");
+    }
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "(b) premise: a fuzzy checkpoint started");
     db.branch_checkpoint_wait();
     let led = db.branches.group_counters();
