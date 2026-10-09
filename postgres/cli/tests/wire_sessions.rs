@@ -2592,6 +2592,64 @@ fn schema_ddl_is_refused_in_server_mode() {
         .ok("a create in the session that asked");
 }
 
+/// An explicit `public.` names public's relation whatever the search path, as in PostgreSQL. With
+/// public.t(c int) and s.t(c text) under `SET search_path TO s, public`, a literal INSERT, an UPDATE,
+/// a DELETE and an INSERT of an undeclared '007' (typed int4 from public.t, stored 7) all reach
+/// public.t and leave s.t as it was, and DROP TABLE public.t drops public.t. The translator dropped
+/// the qualifier, so all of them followed the search path into s.t, the '007' stored there typed
+/// from public.t; DROP answered "no such database: public" (wire review 17 item 1). Schema s is made
+/// by the non-server CLI before the server starts.
+#[test]
+fn an_explicit_public_qualifier_names_public() {
+    let dir = Scratch::new("publicqual");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+              CREATE SCHEMA s;\n\
+              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
+              INSERT INTO s.t VALUES (1, 'one');\n",
+        )
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path TO s, public").ok("search path");
+    a.q("INSERT INTO public.t VALUES (4, 4)")
+        .ok("literal insert");
+    let r = a.xt("INSERT INTO public.t VALUES (5, $1)", &[(0, 0, b"007")]);
+    assert!(r.error.is_none(), "the '007' insert: {:?}", r.error);
+    a.q("UPDATE public.t SET c = c + 1 WHERE id = 4")
+        .ok("update");
+    a.q("DELETE FROM public.t WHERE id = 1").ok("delete");
+    assert_eq!(
+        a.q("SELECT count(*) || ',' || coalesce(max(c), '') FROM s.t")
+            .single("s.t"),
+        "1,one",
+        "a public.t statement reached s.t"
+    );
+    assert_eq!(
+        a.q("SELECT c FROM public.t WHERE id = 5").single("'007'"),
+        "7"
+    );
+    assert_eq!(a.q("SELECT c FROM public.t WHERE id = 4").single("4"), "5");
+    a.q("DROP TABLE public.t").ok("drop public.t");
+    let sql = "SELECT * FROM public.t";
+    assert_eq!(a.q(sql).err(sql).code, "42P01", "public.t still there");
+    assert_eq!(a.q("SELECT count(*) FROM s.t").single("s.t"), "1");
+}
+
 /// A parameter is typed from the relation the engine will write, through its schema and the
 /// session's search path: never from public's table of the same name. With public.t(c int) and
 /// s.t(c text), an undeclared '007' into s.t (INSERT, UPDATE SET, ON CONFLICT's excluded) or into
