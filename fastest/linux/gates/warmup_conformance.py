@@ -32,6 +32,9 @@ claim before the stop is a warm-up op, so warm_ops == stop_at.
         the harness on fake replayers: a correct one passes, and four wrong ones (> for >=, capped winning over
         done, the stop claim counted, rounding instead of truncating) each fail on a named case
 
+Every driver must also REFUSE each rule string in REFUSE (exit non-zero, no result line; review 5 MED 9): a driver
+that reads MAX_S 0 as "no limit" passes every decision case and fails only there.
+
 The expected values below are derived by hand from the rule's text, never from running a driver.
 """
 import hashlib
@@ -66,10 +69,24 @@ CASES = [
      [0, S, S + 1], (1, 1, 0)),
 ]
 LINE = re.compile(r"^stop_at=(\d+|none) warm_ops=(\d+) capped=(0|1|none)$")
+# rule strings every driver must refuse, exiting non-zero with no result line (review 5 MED 9): MAX_S 0 (never "no
+# limit", A23-AM2), a negative MAX_S, non-finite seconds, two fields, a negative OPS
+REFUSE = ["10:0:0", "10:0:-1", "1000:inf:inf", "1:2", "-1:0:5"]
 
 
 class Refused(Exception):
     pass
+
+
+def refuses(binary, rule):
+    """(ok, why): ok when BINARY --warmup-replay RULE exits non-zero and prints no result line (review 5 MED 9)"""
+    try:
+        r = subprocess.run([binary, "--warmup-replay", rule], input=f"0\n{S}\n", capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refused(f"{binary} --warmup-replay {rule}: {type(e).__name__}: {e}")
+    printed = any(LINE.match(ln.strip()) for ln in r.stdout.splitlines())
+    return r.returncode != 0 and not printed, f"rc {r.returncode}, stdout {r.stdout.strip()[-120:]!r}"
 
 
 def replay(binary, rule, trace):
@@ -136,6 +153,10 @@ def run(drivers, record=None):
                 ok = g == want
                 bad += not ok
                 out.append(f"warmup conformance {'PASS' if ok else 'FAIL'}: {name}: {case} ({rule}): got {g}, want {want}")
+            for rule in REFUSE:
+                ok, why = refuses(binary, rule)
+                bad += not ok
+                out.append(f"warmup conformance {'PASS' if ok else 'FAIL'}: {name}: must refuse {rule!r} ({why})")
     except Refused as e:
         return done(2, out + [f"warmup conformance: REFUSED: {e}"])
     names = sorted(drivers)
@@ -145,7 +166,8 @@ def run(drivers, record=None):
             out.append(f"warmup conformance: DISAGREE on {case!r}: {vals}")
     missing = [n for n in ("bbload", "clonebench", "fastest_profile") if n not in drivers]
     if bad:
-        out.append(f"warmup conformance: FAIL ({bad} mismatches over {len(drivers)} drivers x {len(CASES)} cases)")
+        out.append(f"warmup conformance: FAIL ({bad} mismatches over {len(drivers)} drivers x {len(CASES)} cases and "
+                   f"{len(REFUSE)} refusal rows)")
         return done(1, out)
     if missing:
         out.append(f"warmup conformance: PARTIAL: {len(drivers)} x {len(CASES)} match; not given: {missing}")
