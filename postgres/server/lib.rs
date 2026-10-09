@@ -1043,11 +1043,23 @@ impl Session {
     fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
         let with_notices = |r: Response| (std::mem::take(&mut self.state().notices), r);
         // A query that is one branch call goes straight to the engine: no split, no parse (L5).
+        // Inside an unsynced pipeline's implicit block it ends the block as any Query does: a
+        // refusal rolls it back and leaves the session idle, success commits it. The fast path
+        // left the block open, and a refusal left the session failed (wire review 16 item 6);
+        // with no block open it costs one look at the session's flag.
         if let Some(call) = branch_call(query) {
-            return vec![with_notices(
-                self.run(query, Some(call), None, &Format::UnifiedText)
-                    .unwrap_or_else(Response::Error),
-            )];
+            let result = self.run(query, Some(call), None, &Format::UnifiedText);
+            let open = self.state().implicit;
+            if open {
+                self.after_implicit(query, result.is_err());
+            }
+            let mut responses = vec![with_notices(result.unwrap_or_else(Response::Error))];
+            if open {
+                if let Err(e) = self.end_implicit() {
+                    responses.push(with_notices(Response::Error(e)));
+                }
+            }
+            return responses;
         }
         let statements = match split_statements(query) {
             Ok(s) => s,
@@ -1066,9 +1078,11 @@ impl Session {
                 Ok(())
             }
             .and_then(|()| self.run(sql, call, None, &Format::UnifiedText));
-            if multi {
-                self.after_implicit(sql, result.is_err());
-            }
+            // Every statement of a Query in an implicit block, a lone one inside an unsynced
+            // pipeline's included: a lone BEGIN there makes the pipeline's block the client's, as
+            // in PostgreSQL, where end_implicit committed it and answered idle (wire review 16
+            // item 6). With no block open after_implicit returns at once.
+            self.after_implicit(sql, result.is_err());
             match result {
                 Ok(r) => responses.push(with_notices(r)),
                 Err(e) => {
@@ -2716,7 +2730,13 @@ impl SimpleQueryHandler for Session {
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let responses = if is_blank(&query.query) {
-            vec![(Vec::new(), Response::EmptyQuery)]
+            // An empty Query ends an unsynced pipeline's implicit block as any Query does
+            // (committing it); it left the block open (wire review 16 item 6).
+            let mut responses = vec![(Vec::new(), Response::EmptyQuery)];
+            if let Err(e) = self.end_implicit() {
+                responses.push((Vec::new(), Response::Error(e)));
+            }
+            responses
         } else {
             self.simple_with_notices(&query.query)
         };
