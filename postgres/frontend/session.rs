@@ -481,6 +481,14 @@ fn prepare_statement_checked(
     // One parse serves both the special forms and the translation (it was two).
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
+    // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
+    // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
+    if parse_result.protobuf.stmts.len() > 1 {
+        return Err(LimboError::ParseError(
+            "cannot insert multiple commands into a prepared statement".to_string(),
+        ));
+    }
     // Every $n of the whole tree, before anything is sized by one: a number past
     // MAX_PARAMETER (Bind counts in 16 bits) or below 1 names no parameter (42P02, PostgreSQL's
     // "there is no parameter"); `SELECT 1 LIMIT $2147483647` sized a 16 GiB list (wire review 8
