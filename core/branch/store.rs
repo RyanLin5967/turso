@@ -4915,7 +4915,10 @@ impl BranchStore {
             .store(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Release);
     }
 
-    /// Fork a child of the trunk.
+    /// Fork a child of the trunk. `schema`: the one the caller's snapshot holds, or `None` when the
+    /// caller has none matching its snapshot's cookie (a DDL commit between publishing its pages and
+    /// its schema; engine 2b, review 16 MED 8): the child then reads its own at its first
+    /// connection, as after a commit decided since the snapshot (below).
     ///
     /// `seen: None`: the caller holds the trunk's WAL write lock, so no trunk write transaction is
     /// in flight, and its snapshot (the latest commit) gives the child its schema.
@@ -4938,7 +4941,7 @@ impl BranchStore {
     /// store-mutex hold.
     pub(crate) fn fork_trunk(
         &self,
-        schema: Arc<Schema>,
+        schema: Option<Arc<Schema>>,
         page_size: usize,
         seen: Option<u64>,
         name: Option<&str>,
@@ -4971,7 +4974,7 @@ impl BranchStore {
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
-        let mut schema = Some(schema);
+        let mut schema = schema;
         let mut after = None;
         // A fork under the WAL write lock moves the gate's count (lead review 1 item 10): a commit
         // made while the trunk had no child opened no gate, so a lock-free fork whose snapshot
@@ -5033,7 +5036,7 @@ impl BranchStore {
     /// store's model tests, which drive the store without a pager: it always registers.
     #[cfg(test)]
     pub(crate) fn fork_trunk_locked(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        match self.fork_trunk(schema, page_size, None, None)? {
+        match self.fork_trunk(Some(schema), page_size, None, None)? {
             TrunkFork::Forked { id, lsn, .. } => {
                 self.wait_durable(lsn, self.sync_class())?;
                 Ok(id)
