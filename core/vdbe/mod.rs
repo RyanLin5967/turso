@@ -855,6 +855,11 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
+    /// A part of this statement's COMMIT has committed: main's pager or MVCC transaction, or an
+    /// attached one (engine review 19 HIGH 2). A `Busy` after it is not a refusal of the whole
+    /// COMMIT, so its transition is never undone (`undo_commit_transition_after_busy`). Cleared at
+    /// reset.
+    commit_published: bool,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
     /// entry and drives it one step per opcode call, yielding
@@ -993,6 +998,7 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
+            commit_published: false,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
@@ -1081,6 +1087,16 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    /// A COMMIT's attached half failed once a part of the COMMIT had committed
+    /// (`commit_published`): it stays in `CommittingAttached`, so a re-step finishes the attached
+    /// half instead of judging the COMMIT anew (engine review 19 HIGH 2). Mutant
+    /// `attached_commit_from_ready` (test builds only): left as it was.
+    fn keep_committing_attached(&mut self) {
+        if self.commit_published && !crate::branch::store::fe_mutant("attached_commit_from_ready") {
+            self.commit_state = CommitState::CommittingAttached;
+        }
+    }
+
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
         self.pc = 0;
@@ -1144,6 +1160,7 @@ impl ProgramState {
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.commit_state = CommitState::Ready;
+        self.commit_published = false;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
         // (we handle that on every code path inside
@@ -2456,7 +2473,7 @@ impl Program {
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock() {
@@ -2478,7 +2495,11 @@ impl Program {
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    let attached = self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published);
+                    if attached.is_err() {
+                        program_state.keep_committing_attached();
+                    }
+                    match attached? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -2490,7 +2511,11 @@ impl Program {
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => {
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    let attached = self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published);
+                    if attached.is_err() {
+                        program_state.keep_committing_attached();
+                    }
+                    match attached? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -2560,6 +2585,9 @@ impl Program {
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
                     program_state.commit_state = CommitState::Ready;
+                    // Main's half is committed: a later Busy undoes no transition (engine review
+                    // 19 HIGH 2).
+                    program_state.commit_published |= !rollback;
                     // Fall through to attached phase
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2591,6 +2619,7 @@ impl Program {
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
+                    program_state.commit_published |= !rollback;
                     // Fall through to look for more
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2628,6 +2657,7 @@ impl Program {
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
+                    program_state.commit_published |= !rollback;
                     continue;
                 }
                 IOResult::IO(io) => {
@@ -2646,7 +2676,7 @@ impl Program {
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(&conn, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     self.end_attached_read_txns(&conn);
@@ -2656,7 +2686,11 @@ impl Program {
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        let attached = self.end_attached_write_txns(&conn, rollback, &mut program_state.commit_published);
+        if attached.is_err() {
+            program_state.keep_committing_attached();
+        }
+        match attached? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
@@ -2680,7 +2714,7 @@ impl Program {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
-            match self.end_attached_write_txns(connection, rollback)? {
+            match self.end_attached_write_txns(connection, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     *commit_state = CommitState::Ready;
                 }
@@ -2702,8 +2736,18 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
-                // Main pager commit done, now commit attached database pagers
-                match self.end_attached_write_txns(connection, rollback)? {
+                // Main pager commit done, now commit attached database pagers. Main's half is
+                // durable, so the COMMIT is marked past its point of no return before the attached
+                // pagers run: a Busy from one of them (its decision pass refused) leaves this
+                // state, and a re-step resumes the attached half instead of judging the COMMIT
+                // anew (engine review 19 HIGH 2). Blind spot: a main write transaction with no
+                // dirty page counts as committed too. Mutant `attached_commit_from_ready` (test
+                // builds only): from Ready, as before.
+                if !rollback && !crate::branch::store::fe_mutant("attached_commit_from_ready") {
+                    program_state.commit_published = true;
+                    *commit_state = CommitState::CommittingAttached;
+                }
+                match self.end_attached_write_txns(connection, rollback, &mut program_state.commit_published)? {
                     IOResult::Done(_) => {
                         *commit_state = CommitState::Ready;
                     }
@@ -2730,10 +2774,12 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
+    /// `published` is set once an attached pager's commit is done (engine review 19 HIGH 2).
     fn end_attached_write_txns(
         &self,
         connection: &Connection,
         rollback: bool,
+        published: &mut bool,
     ) -> Result<IOResult<()>> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
@@ -2763,6 +2809,7 @@ impl Program {
                         }
                         Err(e) => return Err(e),
                     }
+                    *published = true;
                     // WAL commit succeeded — publish the connection-local schema
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);

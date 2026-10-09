@@ -4815,15 +4815,26 @@ pub fn op_transaction_inner(
 }
 
 /// SQLite's OP_AutoCommit on SQLITE_BUSY (vdbe.c: `db->autoCommit = 1-desiredAutoCommit`): a COMMIT
-/// whose `commit_txn` returned Busy with `commit_state` still `Ready` (the trunk's copy-decision
-/// pass refused it before any frame) has committed nothing, so its transition is undone. The
+/// whose `commit_txn` returned Busy with `commit_state` still `Ready` and nothing of it committed
+/// (the trunk's copy-decision pass refused it before any frame) has committed nothing, so its
+/// transition is undone. The
 /// transaction is explicit again in the gap (siblings, BEGIN, ROLLBACK and `get_auto_commit` all
 /// see it open), and the re-stepped COMMIT makes the transition anew with every guard
 /// (StatementsInProgress, the poison mark, deferred FKs). Engine review 16 HIGH 1, which replaces
 /// 795295c09's commit-started flag. Mutant `busy_commit_keeps_autocommit` (test builds only): the
 /// transition stays, so the re-step reads "no transaction is active".
+///
+/// Never once a part of the COMMIT has committed (`ProgramState::commit_published`; engine review
+/// 19 HIGH 2): main's half is durable when an attached pager's decision pass refuses, and a
+/// reopened transaction would let ROLLBACK report a durable half as rolled back. On the WAL path
+/// such a COMMIT is in `CommittingAttached` already (its re-step finishes the attached half), so
+/// this check is reached only with `commit_state` `Ready` after a part committed: an attached MVCC
+/// commit refused after main's (`commit_txn_mvcc` phase 2), reachability unverified and no red.
 fn undo_commit_transition_after_busy(conn: &Connection, state: &mut ProgramState) {
     if crate::branch::store::fe_mutant("busy_commit_keeps_autocommit") {
+        return;
+    }
+    if state.commit_published {
         return;
     }
     conn.auto_commit.store(false, Ordering::SeqCst);
