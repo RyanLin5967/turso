@@ -1565,7 +1565,10 @@ fn fuzzy_checkpoints() -> bool {
 /// branch's `current` only when a writer of its row needs it (`DIRTY_NEW` or `DIRTY_CUR`), and its
 /// retained versions only for `DIRTY_NEW` or `DIRTY_RET`, as `checkpoint_write` uses them. A branch
 /// that is only `DIRTY_ROW` (a parent that forked) is then one row, not its whole page map. Off by
-/// default until the counter arm is scored: the lane's arm-switch pattern, like `R11_CKPT`.
+/// default until the counter arm is scored: the lane's arm-switch pattern, as `R11_CKPT` was on its
+/// base. On main `R11_CKPT` is a test-only switch (`fuzzy_checkpoints` is `#[cfg(test)]`; a database
+/// resolves its mode through `BranchCheckpoint::resolve`, which refuses unknown names), while this
+/// gate is read in every build and takes any value but `on` as off.
 fn capture_gate() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on"))
