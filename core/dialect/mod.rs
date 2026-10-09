@@ -103,6 +103,16 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
+    /// Produce stored SQL after `ALTER TABLE ... ADD COLUMN` or `DROP COLUMN` changed `table` in
+    /// place. The default stores the table's canonical SQLite text (`BTreeTable::to_sql`), as
+    /// before. A dialect whose `parse_table_sql` marks properties on its own tables (a PostgreSQL
+    /// frontend's NOT NULL rowid alias, `BTreeTable::rowid_alias_not_null`) overrides this, so the
+    /// stored text still carries them through a reparse: a reopen, a restart, a branch's first
+    /// connect (fastest-engine; engine review 20 HIGH 1).
+    fn format_altered_table_sql(&self, table: &crate::schema::BTreeTable) -> crate::Result<String> {
+        Ok(table.to_sql())
+    }
+
     /// Install the dialect's catalog tables into a freshly constructed
     /// schema.
     ///
@@ -1092,6 +1102,14 @@ mod tests {
 
     impl PgKeyTestDialect {
         const PREFIX: &'static str = "/* pgkey */ ";
+        /// The frontend's mark on its own table's canonical SQLite text after ALTER rewrote it
+        /// (`format_altered_table_sql`), as the PG frontend's second marker.
+        const ALTERED_PREFIX: &'static str = "/* pgkey sqlite */ ";
+
+        fn own(sql: &str) -> Option<&str> {
+            sql.strip_prefix(Self::PREFIX)
+                .or_else(|| sql.strip_prefix(Self::ALTERED_PREFIX))
+        }
     }
 
     impl Dialect for PgKeyTestDialect {
@@ -1104,7 +1122,7 @@ mod tests {
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            match sql.strip_prefix(Self::PREFIX) {
+            match Self::own(sql) {
                 Some(own) => {
                     let mut table = BTreeTable::from_sql(own, root_page)?;
                     table.rowid_alias_not_null = true;
@@ -1115,11 +1133,19 @@ mod tests {
         }
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-            sqlite::parse_table_sql_ast(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+            sqlite::parse_table_sql_ast(Self::own(sql).unwrap_or(sql))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            sqlite::table_sql_for_replay(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+            sqlite::table_sql_for_replay(Self::own(sql).unwrap_or(sql))
+        }
+
+        fn format_altered_table_sql(&self, table: &BTreeTable) -> crate::Result<String> {
+            if table.rowid_alias_not_null {
+                Ok(format!("{}{}", Self::ALTERED_PREFIX, table.to_sql()))
+            } else {
+                Ok(table.to_sql())
+            }
         }
 
         fn format_table_sql(
