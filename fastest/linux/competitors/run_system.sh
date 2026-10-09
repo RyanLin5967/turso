@@ -411,6 +411,32 @@ server_fixture() {
     ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" \
     --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null || fail "fixture.json"
 }
+# jf FILE KEY -> one key of a JSON file (empty when unreadable)
+jf() { python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null; }
+# cap_plants -- PG only, before the cells (lead review 62430d8bf..b49fb656a MED 5): the registered cap's code path on
+# the real binary, which CI otherwise never reaches. Three closed-loop runs ended by --max-window-s 1 (ops of about 0,
+# 5 and 20 ms) must each exit 0 with capped: true and verdict "capped", and timedrun.py must put them in the tiers
+# complete (>= 1000 ok), p50_only (100-999) and failed (< 100); and a --warmup 1000:1:0 run must leave its warm-up only
+# when BOTH 1000 ops and 1 s are reached (the OPS-and-S clause; MAX_S 0 = no limit).
+cap_plants() {
+  local sw spec want d rc
+  mkdir -p "$RAW/plants"
+  for sw in pg18-select1:complete pg18-sleep5:p50_only pg18-sleep20:failed; do
+    spec=${sw%%:*} want=${sw#*:} d="$RAW/plants/cap-$spec" rc=0
+    timeout 120 "$BB" --spec "$SPECS/$spec.spec" --out "$d" --clients 1 --max-ops 100000000 --set port="$PORT" \
+      --set rows="$ROWS" --stall-s 60 --max-window-s 1 >"$d.txt" 2>&1 || rc=$?
+    expect "cap plant $spec (closed loop ended by --max-window-s 1): rc|capped|verdict" \
+      "$rc|$(jf "$d/summary.json" capped)|$(jf "$d/summary.json" verdict)" "0|True|capped"
+    expect "cap plant $spec: tier at $(jf "$d/summary.json" measured_ok) ok ops" \
+      "$(python3 -B "$HERE/timedrun.py" tier "$d/summary.json")" "$want"
+  done
+  d="$RAW/plants/warmup-ops-and-s" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 100 --set port="$PORT" \
+    --set rows="$ROWS" --stall-s 60 --warmup 1000:1:0 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant --warmup 1000:1:0: rc|warmup_ops >= 1000|warmup_s >= 1" \
+    "$rc|$(python3 -B -c 'import json, sys; s = json.load(open(sys.argv[1])); print(s.get("warmup_ops", -1) >= 1000, s.get("warmup_s", -1) >= 1.0)' "$d/summary.json" 2>/dev/null | tr ' ' '|')" \
+    "0|True|True"
+}
 # designate SPEC -- after the cells: ONE op of SPEC (C=1, no warm-up) with its after-steps skipped, so its branch
 # stays for the functional checks to read (the isolation read, the clone proof); prints the branch name. Untraced,
 # untimed, outside every cell.
@@ -497,6 +523,7 @@ server_main() {
   if [ "$KIND" = pg ]; then
     expect "PGDG postgresql-18 package" "$(awk '$1 == "postgresql-18" {print $2}' "$RAW/version.txt")" \
       "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
+    cap_plants
   fi
   for spec in $SPECLIST; do
     for c in $CLIENTS; do
@@ -602,6 +629,15 @@ b1_main() {
   fi
   LIVE0=$(count_branches)
   expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"
+  # MED 5: clonebench's capped path on the real binary (a d0 closed loop ended by --max-window-s 1, every branch
+  # dropped): rc 0, capped: true, verdict "capped"; the tiers themselves are timedrun.py's (selftest; PG cap plants)
+  local cpd="$RAW/plants/cap-b1" rcp=0
+  mkdir -p "$RAW/plants" "$ROOT/branches/cap-plant"
+  timeout 120 "$CB" run --mode b1 --op m1c --sync d0 --parent "$ROOT/parent.db" --dir "$ROOT/branches/cap-plant" \
+    --clients 1 --max-ops 100000000 --rows "$ROWS" --max-window-s 1 --drop --out "$cpd" >"$cpd.txt" 2>&1 || rcp=$?
+  expect "cap plant b1 (clonebench d0 ended by --max-window-s 1): rc|capped|verdict" \
+    "$rcp|$(jf "$cpd/summary.json" capped)|$(jf "$cpd/summary.json" verdict)" "0|True|capped"
+  expect "cap plant b1: its branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \

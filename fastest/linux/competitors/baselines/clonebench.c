@@ -732,9 +732,9 @@ static int cmd_run(int argc, char **argv) {
     double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) / 1e6 +
                  (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
     int rc = (ok == 0 || bad) ? 3 : 0;
-    /* gate-6 review, t3run item 16: a run the registered cap (--max-window-s) ended is complete with reduced n only
-     * with >= 1000 ok ops; with fewer it is refused. */
-    if (!rc && CAPPED && ok < 1000) rc = 3;
+    /* gate-6 review, t3run item 16; lead review 62430d8bf..b49fb656a MED 5: a run the registered cap (--max-window-s)
+     * ended is reported, not judged: rc 0, verdict "capped", capped: true and its counts; timedrun.py alone applies
+     * PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed with cause 'cap'). */
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"clock\":\"%s\",\"b1_barrier\":\"%s\",", BB_CLOCK_NAME, SYNC_D0 ? "none" : B1_BARRIER); /* Linux port */
@@ -755,7 +755,7 @@ static int cmd_run(int argc, char **argv) {
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"
                "\"flights_in_window\":%llu,\"creates_per_flight_in_window\":%.3f,\"cpu_s\":%.3f,\"cpu_cores\":%.3f,"
                "\"v1_run\":\"%s\",\"v1_mark_base\":%llu,\"sqlite_version\":\"%s\",\"lat_us\":{\"p50\":%.1f,\"p99\":%.1f,\"max\":%.1f}}\n",
-            rc ? (ok == 0 ? "REFUSED: no measured operation succeeded" : bad ? "REFUSED: some operations failed" : "REFUSED: the window cap ended the run before 1000 ok ops") : "ok", rc,
+            rc ? (ok == 0 ? "REFUSED: no measured operation succeeded" : "REFUSED: some operations failed") : CAPPED ? "capped" : "ok", rc,
             MODE_B0 ? "b0" : "b1", OP_M1 ? "m1" : "m1c", SYNC_D0 ? "d0" : "d2", C, (unsigned long long)HOLD_US, MUTANT_EARLY,
             DROP, BRANCH_SHARED ? "shared" : "exclusive", PARENT, win, (unsigned long long)meas, (unsigned long long)ok, (unsigned long long)bad, total,
             win > 0 ? ok / win : 0, (unsigned long long)g_checkpoints, (unsigned long long)f_nflights,

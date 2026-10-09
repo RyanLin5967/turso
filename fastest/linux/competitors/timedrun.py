@@ -22,7 +22,9 @@ the load generator records its own TracerPid at the window's start and end (summ
   timedrun.py ops C N1 N4 [TOTAL]
                                 the run's ops total: TOTAL (FT_OPS_TOTAL) for every C when given, else N1 at C=1 and
                                 N4 otherwise (gate-6 review, t3run item 12). A run capped by the registered window
-                                with >= 1000 measured ok ops is complete with reduced n (item 16)
+                                is judged by tier() alone (MED 5): >= 1000 ok ops complete with reduced n, 100-999
+                                complete with p50 only (timed.json p50_only), fewer failed with cause 'cap'
+  timedrun.py tier SUMMARY.JSON the tier of one run summary (complete | p50_only | failed)
   timedrun.py rule CAP_S        PREREG :210's warm-up for a run capped at CAP_S seconds, as bbload/clonebench
                                 --warmup OPS:S:MAX_S: min(max(1000 ops, 10 s), 10% of the cap)
   timedrun.py real CAP_S WARMUP exit 0 only when a REAL run (run_system.sh FT_DRY=0, the T3 runner) may use this cap
@@ -127,13 +129,21 @@ def ops(c, n1, n4, total=""):
     return int(n1) if int(c) == 1 else int(n4)
 
 
-CAPPED_MIN = 1000  # PREREG: a run capped by the registered window with >= 1000 measured ops is complete, reduced n
+# PREREG FINAL-CANDIDATE :214, a run the registered window capped (lead review 62430d8bf..b49fb656a MED 5): the ONE
+# owner of these boundaries (bbload and clonebench only report capped, their counts, rc 0 and verdict "capped").
+CAP_COMPLETE = 1000  # >= this many ok ops: complete, reduced n
+CAP_P50 = 100        # >= this many: complete with p50 only; fewer: failed, cause 'cap'
 REGISTERED_CAP_S = 1800  # PREREG's per-run cap (30 min; t3run.sh RUN_CAP_S)
 
 
 def tier(sm):
-    """RED stub."""
-    return None
+    """'complete', 'p50_only' or None (failed: cause 'cap') for a run summary; an uncapped run is 'complete'."""
+    if (sm or {}).get("capped") is not True:
+        return "complete"
+    ok = (sm or {}).get("measured_ok")
+    if not isinstance(ok, int):
+        return None
+    return "complete" if ok >= CAP_COMPLETE else "p50_only" if ok >= CAP_P50 else None
 
 
 def real_problem(cap_s, warmup):
@@ -159,14 +169,14 @@ def check(celldir, n, warm_rule=None, live=None):
     why = []
     lab = load(os.path.join(celldir, "bb", "summary.json"))
 
-    def short(sm):  # measured fewer than N: complete only when the registered cap ended it with >= CAPPED_MIN ok ops
+    def short(sm):  # measured fewer than N: complete only when the registered cap ended it, in a tier (MED 5)
         got = (sm or {}).get("measured_ops")
+        if (sm or {}).get("capped") is True:
+            return None if tier(sm) else (f"capped with {(sm or {}).get('measured_ok')} ok ops (fewer than "
+                                          f"{CAP_P50}): failed, cause 'cap'")
         if got == n:
             return None
-        if (sm or {}).get("capped") is True and isinstance(got, int) and (sm or {}).get("measured_ok", 0) >= CAPPED_MIN:
-            return None
-        return f"measured {got} ops, not N={n}" + (" (capped with fewer than %d ok)" % CAPPED_MIN
-                                                   if (sm or {}).get("capped") else "")
+        return f"measured {got} ops, not N={n}"
     if not lab:
         why.append("no labelling run summary")
     elif short(lab):
@@ -175,8 +185,10 @@ def check(celldir, n, warm_rule=None, live=None):
     if t is None or not os.path.exists(os.path.join(celldir, "timed", "raw.tsv")):
         why.append("no timed run (timed/summary.json and timed/raw.tsv): only the traced labelling run's latency")
     else:
-        if t.get("verdict") != "ok" or t.get("rc") != 0:
-            why.append(f"timed run verdict {t.get('verdict')} rc {t.get('rc')}")
+        # "capped" only with capped: true (MED 5: the binaries' contract for a run the window ended)
+        want_v = "capped" if t.get("capped") is True else "ok"
+        if t.get("verdict") != want_v or t.get("rc") != 0:
+            why.append(f"timed run verdict {t.get('verdict')} rc {t.get('rc')} (want {want_v}, 0)")
         if short(t):
             why.append("timed run " + short(t))
     try:
@@ -215,7 +227,9 @@ def write_verdict(celldir, n, why):
     out = {"verdict": "ok" if not why else "REFUSED: " + "; ".join(why), "latency_file": "timed/raw.tsv",
            "labelling_dir": "bb", "ops_total": n,
            "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
-           "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)}}
+           "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)},
+           # MED 5: a capped timed run with 100-999 ok ops is complete with p50 only (PREREG FINAL-CANDIDATE :214)
+           "tier": tier(t) if t else None, "p50_only": tier(t) == "p50_only" if t else None}
     try:  # the live-branch counts around both runs, as run_system.sh read them (HIGH 1)
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
     except OSError:
@@ -413,6 +427,9 @@ if __name__ == "__main__":
         why = check(sys.argv[2], n, sys.argv[4], sys.argv[5])
         print(json.dumps(write_verdict(sys.argv[2], n, why)))
         sys.exit(0 if not why else 1)
+    if len(sys.argv) == 3 and sys.argv[1] == "tier":  # SUMMARY.JSON: run_system.sh's cap plants (MED 5)
+        print(tier(load(sys.argv[2])) or "failed")
+        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == "tracer-check":  # TRACER.TSV SUMMARY.JSON: the fire-check's F15
         why = tracer_problems(sys.argv[2], load(sys.argv[3]))
         print("ok" if not why else "REFUSED: " + "; ".join(why))

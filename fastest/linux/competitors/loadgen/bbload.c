@@ -10,7 +10,8 @@
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
  *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
  *                                                    with --max-ops it is the registered per-run cap: a run it ends
- *                                                    with >= 1000 ok ops is complete with reduced n (capped: true)
+ *                                                    exits 0 with verdict "capped" (capped: true) and its counts;
+ *                                                    timedrun.py applies PREREG's tiers (MED 5)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
  *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
  *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
@@ -157,7 +158,6 @@ static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
 static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
 static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
 static char WARM_RULE[64] = "";
-#define CAPPED_MIN 1000ULL /* PREREG: a capped run with >= 1000 measured ok ops is complete with reduced n */
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
 static char RUNTAG[64];
 static int NSET; static char *SETK[MAXLIST], *SETV[MAXLIST];
@@ -899,12 +899,12 @@ int main(int argc, char **argv) {
     int rc = 0;
     const char *verdict = "ok";
     if (meas_ok == 0) { rc = 3; verdict = "REFUSED: no measured operation succeeded"; }
-    /* gate-6 review, t3run item 16: with --max-ops, the window cap is the registered per-run cap; a run it ended with
-     * >= CAPPED_MIN ok ops is complete with a reduced n (summary.json capped=1), one with fewer is refused. */
+    /* gate-6 review, t3run item 16; lead review 62430d8bf..b49fb656a MED 5: with --max-ops, the window cap is the
+     * registered per-run cap, and a run it ended is reported, not judged: rc 0, verdict "capped", capped: true and its
+     * counts; timedrun.py alone applies PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed). */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
-    else if (short_window && MAX_OPS && meas_ok < CAPPED_MIN) { rc = 3; verdict = "REFUSED: the window cap ended the run before 1000 ok ops"; }
+    else if (short_window && MAX_OPS) verdict = "capped";
     else if (short_window && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
-    /* else: complete, or capped by the window with >= CAPPED_MIN ok ops (capped: true, reduced n) */
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"spec\":\"%s\",\"run_tag\":\"%s\",\"clients\":%d,\"mode\":\"%s\",\"rate\":%.3f,"
