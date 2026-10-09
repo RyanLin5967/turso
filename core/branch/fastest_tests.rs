@@ -4402,6 +4402,49 @@ fn the_held_free_upgrade_is_led_off_the_acknowledgement_path() {
     }
 }
 
+/// Engine review 16 MED 4: a D0 open of a log a syncing run wrote holds its frees in the class that
+/// run synced in (f9592ff20, engine review 13 MED 4), so past the bound an upgrade flight in that
+/// class is owed: in D2's case an F_FULLFSYNC, on whichever operation waited next, a create among
+/// them. It is led off the acknowledgement paths, here too: past the bound (forced to 1) a create
+/// on this thread syncs nothing, and the held slots come free once the background writer's
+/// upgrade lands. Mutant `upgrade_on_ack_path`.
+#[test]
+fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
+        let what = format!("catalog={catalog} written={written:?}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("synced-open-upgrade.db");
+        let (id, slots, incarnation) = {
+            let db = open_at(&path, opts(catalog, written));
+            let trunk = db.connect().unwrap();
+            seed_wide(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            write_v(&x.connect().unwrap(), 40, "x");
+            let slots = x.owned_slots();
+            assert!(slots.len() >= 2, "{what}: premise: x's writes took two slots, past the bound");
+            (x.into_id(), slots, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        let trunk = db.connect().unwrap();
+        // No premise that the slots are held here: the background writer may already have led the
+        // upgrade (a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite shows the hold).
+        db.branch(id).unwrap().reap().unwrap();
+        let syncs = super::store::thread_syncs();
+        let _y = trunk.fork_branch().unwrap().into_id();
+        assert_eq!(
+            super::store::thread_syncs() - syncs,
+            0,
+            "{what}: a create past the bound synced on its own thread: it led the upgrade flight"
+        );
+        eventually(&format!("{what}: the held slots never came free"), || {
+            slots.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+    }
+}
+
 /// Engine review 8 #8: three free paths skipped the hold: a lease's expiry (every fork's expiry
 /// pass), `reap_if_due`, and a close's collection of a branch released while a connection was
 /// open. They logged the Release with a write only, then freed at once. Here a lease runs out and
