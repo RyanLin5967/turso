@@ -64,9 +64,11 @@
 # name the same device and devguard.py allows it (an allowlist: a whole NVMe/SCSI/virtio disk, not the root disk or
 # on its controller, nothing mounted, held or claimed, no signature or partition table; review M4, devguard round-2
 # attack MED 2 and LOW 3), --plp is given, --fs is not (the manifest names the blocks; review M5), and every target
-# mounts with barriers. The device is resolved once at preflight (DEV_REAL); every block re-checks that --device
-# still resolves there and re-runs devguard on it immediately before its mkfs, and mkfs, mount and the cleanup's
-# wipefs act on DEV_REAL only (devguard round-2 attack LOW 4). So a block starts from a disk that passes devguard:
+# mounts with barriers. The device is resolved once at preflight (DEV_REAL) and the drive's identity recorded
+# (device-id.txt: wwid, MAJ:MIN, model, serial, firmware); every block re-checks, before its mkfs, its mount and the
+# cleanup's wipefs, that --device still resolves there to that same drive, still PLP-listed and registered, and
+# re-runs devguard before the mkfs; mkfs, mount and wipefs act on DEV_REAL only (devguard round-2 attack LOW 4,
+# review 5 MED 3). So a block starts from a disk that passes devguard:
 # block_cleanup wipes the filesystem its block made (after checking it is that one), and the operator wipes the
 # first by hand after reading what it holds.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
@@ -77,6 +79,7 @@
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
+DEV_NAME=""
 while [ $# -gt 0 ]; do
   case $1 in
     --sha) SHA=$2; shift ;;
@@ -183,7 +186,7 @@ finish() {
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
-  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh gates/warmup_conformance.py
+  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh t3/v3l_mutants.py gates/warmup_conformance.py
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -225,12 +228,20 @@ preflight() {
     DEV_REAL=$(readlink -f "$DEVICE")
     [ -b "$DEV_REAL" ] || { echo "REFUSED: $DEVICE resolves to '$DEV_REAL', not a block device"; return 2; }
     echo "$DEV_REAL" > "$OUT/device-real.txt"
+    # the drive itself, which every mkfs, mount and wipefs re-reads (t3lib.sh dev_unchanged; review 5 MED 3): the
+    # path alone is a tautology for a plain /dev/nvmeXnY, and the PLP and registration checks below hold for this drive
+    DEV_NAME=$(basename "$DEV_REAL")
+    dev_identity /sys "$DEV_NAME" > "$OUT/device-id.txt" 2> "$OUT/device-id.err" ||
+      { cat "$OUT/device-id.err"; echo "REFUSED: cannot record $DEV_NAME's identity"; return 2; }
+    # V3L's write rule reads the drive's sectors-written counter, which moves only with iostats on (review 5 MED 2)
+    [ "$(cat "/sys/block/$DEV_NAME/queue/iostats" 2>/dev/null)" = 1 ] ||
+      { echo "REFUSED: $DEV_NAME's queue/iostats is not 1: its sectors-written counter does not advance, so every V3L would VOID"; return 2; }
     # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
     local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
     [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
     # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
-    local dn fsl; dn=$(basename "$(readlink -f "$DEVICE")")
+    local dn=$DEV_NAME fsl
     # --plp yes names a registered drive: model and firmware (NVMe firmware_rev, SCSI/SATA rev) in t3/PLP-DRIVES
     if [ "$PLP" = yes ]; then
       plp_listed /sys "$dn" "$L/t3/PLP-DRIVES" ||
@@ -394,18 +405,19 @@ v3l() { # v3l bK MNT
   [ $DRY = 0 ] && env+=(V3L_REAL=1)
   [ "$PLANT_NOW:$when" = v3l-fsync-half:b0 ] && env+=(V3L_PLANT=fsync2)
   if [ "$PLANT_NOW:$when" = v3l-cache-lie:b0 ]; then
-    # the lie goes where the gate for this drive class can see it: a write-back drive behind a write-through loop
-    # (no fsync reaches the drive, so its flush counter gate fires). A write-through drive cannot be planted: the
-    # kernel refuses (6.8: EINVAL) or ignores (6.11) a write-back write to its queue, so that draw is NOT-RUN, not a
-    # failure (T3 runner review item 10); its cross-check is fired on copies by v3l.py's drive-mismatch plant.
+    # the lie is the LOOP's queue claiming write through, so no fsync reaches the backing file and its data stays in the
+    # page cache: behind a write-back drive the flush counter rule fires, behind a write-through drive (the runner's
+    # sda class) the sectors-written rule does ("did not reach the drive"; review 5 MED 4: the old NOT-RUN for a
+    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). Only a
+    # leaf that is not a loop has no knob, and that draw is NOT-RUN.
     local lo disk wc
     lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
     disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
     wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
     case $wc:$lo in
-      "write back:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
-      "write through:"*)
-        echo "plant v3l-cache-lie: NOT-RUN: $disk is write through; the kernel will not let its queue claim write back" |
+      "write back:loop"*|"write through:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
+      "write back:"*|"write through:"*)
+        echo "plant v3l-cache-lie: NOT-RUN: $lo is not a loop, so there is no loop queue to make lie" |
           tee "$o/plant.txt" "$OUT/plant-notrun.txt" ;;
       *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
     esac
@@ -438,7 +450,17 @@ v3l() { # v3l bK MNT
 
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
-FS_NOW="" V3CELL="" PLANT_NOW="" MADE_FS=""
+FS_NOW="" V3CELL="" PLANT_NOW="" MADE_FS="" MADE_UUID=""
+# the drive preflight recorded, unmoved and unchanged, still allowed by devguard, still listed for its --plp and still
+# registered for this block's filesystem (review 5 MED 3: those were read at preflight only); every mkfs and mount
+dev_recheck() { # dev_recheck OUTFILE
+  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" >> "$1" 2>&1 || return 1
+  if [ "$PLP" = yes ]; then
+    plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" >> "$1" 2>&1 ||
+      { echo "REFUSED: $DEV_NAME is no longer a listed PLP drive" >> "$1"; return 1; }
+  fi
+  registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$FS_NOW" >> "$1" 2>&1 || return 1
+}
 RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
@@ -456,7 +478,8 @@ fs_block() {
     device)
       # immediately before the mkfs: --device still names the node preflight checked, and devguard still allows it
       # (hours may have passed; devguard round-2 attack LOW 4). mkfs and mount act on that node, never on the name
-      dev_unmoved "$DEVICE" "$DEV_REAL" > "$o/devguard.txt" 2>&1 || { cat "$o/devguard.txt"; return 1; }
+      : > "$o/devguard.txt"
+      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: $DEV_REAL is not the drive preflight checked"; return 1; }
       sudo -n python3 -B "$L/t3/devguard.py" check "$DEV_REAL" >> "$o/devguard.txt" 2>&1 ||
         { cat "$o/devguard.txt"; echo "fs-$fs: devguard refuses $DEV_REAL before mkfs"; return 1; }
       case $fs in
@@ -465,8 +488,13 @@ fs_block() {
         ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEV_REAL" ;;
         *) echo "unknown fs $fs"; false ;;
       esac > "$o/mkfs.txt" 2>&1 || return 1
-      # from here block_cleanup must wipe what this block made, so the next block's devguard check passes
+      # from here block_cleanup must wipe what this block made, so the next block's devguard check passes; the UUID
+      # this mkfs gave it is what lets the wipe tell it from another drive's filesystem of the same type (MED 3)
       MADE_FS=$fs
+      MADE_UUID=$(t3_blkid UUID "$DEV_REAL" 2>> "$o/mkfs.txt")
+      echo "fs_uuid=$MADE_UUID" >> "$o/mkfs.txt"
+      [ -n "$MADE_UUID" ] || { echo "fs-$fs: blkid reads no UUID on the $fs just made on $DEV_REAL"; return 1; }
+      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: the drive changed before mount"; return 1; }
       # btrfs defaults to discard=async on SSDs, which discards freed extents 10-120 s later, inside a later run
       sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEV_REAL" "$mnt" &&
         sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
@@ -551,15 +579,17 @@ block_unmount() {
 }
 # Unmount (even when the block failed after its mkfs and before or after its mount), then on a device block wipe the
 # filesystem the block made, so the next block's devguard check before its mkfs sees a blank disk (devguard round-2
-# attack MED 2). It wipes only DEV_REAL, only while --device still resolves there, and only when blkid finds exactly
-# the filesystem this block made (t3lib.sh fs_is_ours); anything else stops the run with the device untouched.
+# attack MED 2). It wipes only DEV_REAL, only while --device still resolves there to the drive preflight recorded
+# (t3lib.sh dev_unchanged: wwid, MAJ:MIN, model, serial, firmware), and only when blkid finds exactly the filesystem
+# this block made, type and UUID (fs_is_ours; review 5 MED 3); anything else stops the run with the device untouched.
 block_cleanup() {
   local w=$OUT/fs-$FS_NOW/wipe.txt
   block_unmount || return 1
   [ "$BLOCK" = device ] && [ -n "$MADE_FS" ] || return 0
-  fs_is_ours "$DEVICE" "$DEV_REAL" "$MADE_FS" > "$w" 2>&1 && sudo -n wipefs -a "$DEV_REAL" >> "$w" 2>&1 ||
+  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" > "$w" 2>&1 &&
+    fs_is_ours "$DEVICE" "$DEV_REAL" "$MADE_FS" "$MADE_UUID" >> "$w" 2>&1 && sudo -n wipefs -a "$DEV_REAL" >> "$w" 2>&1 ||
     { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$w")"; return 1; }
-  MADE_FS=""
+  MADE_FS="" MADE_UUID=""
   return 0
 }
 
@@ -626,6 +656,11 @@ selftests() {
   timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
   timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
     { echo "self-test warmup_conformance FAILED"; return 1; }
+  # v3l.py's mutant table: its own guard, then every mutant, each of which must be KILLED (review 5 MED 5: nothing ran it)
+  timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test > "$OUT/v3l-mutants-selftest.txt" 2>&1 ||
+    { echo "self-test v3l_mutants FAILED"; return 1; }
+  timeout 1800 python3 -B "$L/t3/v3l_mutants.py" > "$OUT/v3l-mutants.txt" 2>&1 ||
+    { tail -3 "$OUT/v3l-mutants.txt"; echo "v3l mutants: not every mutant KILLED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd want d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
     { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }
@@ -652,6 +687,11 @@ selftests() {
         echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$want_text'; got exit $rc"; return 1
       fi
     done
+    # and nothing devguard could not read: on this box a "cannot read" line would refuse a rental's own spare as well
+    # (review 5 MED 1: an unreadable controller link refuses every device)
+    if grep -qF "cannot read" "$OUT/devguard-root-$d.txt"; then
+      cat "$OUT/devguard-root-$d.txt"; echo "selftests: devguard could not read something on /dev/$d"; return 1
+    fi
   done
 }
 stage preflight preflight
@@ -667,7 +707,8 @@ stage v3fixtures v3fixtures
 warmup_conformance() {
   local rc=0
   timeout 300 python3 -B "$L/gates/warmup_conformance.py" run --bbload "$DIST/bbload" --clonebench "$DIST/clonebench" \
-    --fastest-profile "$DIST/fastest_profile" > "$OUT/warmup-conformance.txt" 2>&1 || rc=$?
+    --fastest-profile "$DIST/fastest_profile" --record "$OUT/warmup-conformance.json" > "$OUT/warmup-conformance.txt" 2>&1 ||
+    rc=$?
   [ $rc = 0 ] || { tail -5 "$OUT/warmup-conformance.txt"; echo "envchecks: warm-up conformance rc $rc, want 0"; return 1; }
 }
 envchecks() { fcenv_check && warmup_conformance; }

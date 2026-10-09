@@ -68,16 +68,60 @@ check "an empty preflight path refuses (rc 2)" 'refuses2 dev_unmoved "$T/dev/by-
 ln -sfn "$T/dev/nvme2n1" "$T/dev/by-id-x"
 check "a device path that now resolves elsewhere refuses, naming where" \
   'refuses2 dev_unmoved "$T/dev/by-id-x" "$REAL1" && grep -q nvme2n1 "$T/out.txt"'
-# the wipe in block_cleanup: only the filesystem this block made, on the unmoved device
-printf '#!/bin/sh\necho xfs\n' > "$T/blkid-xfs"; printf '#!/bin/sh\nexit 2\n' > "$T/blkid-none"
-chmod +x "$T/blkid-xfs" "$T/blkid-none"
+# the wipe in block_cleanup: only the filesystem this block made (its type AND the UUID mkfs gave it, review 5 MED 3),
+# on the unmoved, unchanged drive. blkid is reached through t3lib.sh's t3_blkid function, redefined here; production
+# reads no override (review 5 LOW 22). Test edit, flagged: the four earlier cases used the T3_BLKID override, which
+# LOW 22 removes, and gain the UUID argument; their expectations are unchanged.
+t3_blkid() { case $1 in TYPE) echo "$FAKE_TYPE" ;; UUID) echo "$FAKE_UUID" ;; esac; }
+FAKE_TYPE=xfs FAKE_UUID=u-1
 ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
-check "the block's own filesystem on the unmoved device may be wiped" \
-  'T3_BLKID="$T/blkid-xfs" fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
-check "another filesystem refuses the wipe" 'T3_BLKID="$T/blkid-xfs" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" btrfs'
-check "no signature at all refuses the wipe" 'T3_BLKID="$T/blkid-none" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
+check "the block's own filesystem (type and UUID) on the unmoved device may be wiped" \
+  'fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-1'
+check "another filesystem refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" btrfs u-1'
+check "MED 3: the same type with another UUID (another drive under the name, re-made) refuses, naming the UUID" \
+  'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-2 && grep -q UUID "$T/out.txt"'
+check "MED 3: an empty recorded UUID refuses" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs "" && grep -q UUID "$T/out.txt"'
+FAKE_TYPE=""
+check "no signature at all refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-1'
+FAKE_TYPE=xfs
 ln -sfn "$T/dev/nvme2n1" "$T/dev/by-id-x"
-check "a moved device refuses the wipe" 'T3_BLKID="$T/blkid-xfs" refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs'
+check "a moved device refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-1'
+
+# review 5 MED 3: dev_unmoved compares path text, a tautology for a plain /dev/nvmeXnY, so the drive itself is what
+# preflight records (device-id.txt) and every mkfs, mount and wipefs re-reads: wwid, MAJ:MIN, model, serial, firmware
+ident() { # ident NAME WWID DEV MODEL SERIAL FW: a fake NVMe namespace (wwid on the block, the rest on its controller)
+  mkdir -p "$T/sys/block/$1/device"
+  echo "$2" > "$T/sys/block/$1/wwid"; echo "$3" > "$T/sys/block/$1/dev"; echo "$4" > "$T/sys/block/$1/device/model"
+  echo "$5" > "$T/sys/block/$1/device/serial"; echo "$6" > "$T/sys/block/$1/device/firmware_rev"; }
+NL=$'\n'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+check "MED 3: an NVMe namespace's identity is its wwid, MAJ:MIN, model, serial and firmware" \
+  '[ "$(dev_identity "$T/sys" nvme5n1)" = "wwid=eui.0001${NL}dev=259:5${NL}model=PM9A3${NL}serial=S1${NL}firmware=GDC5" ]'
+mkdir -p "$T/sys/block/sdc/device"; echo 8:32 > "$T/sys/block/sdc/dev"; echo "naa.5000c500" > "$T/sys/block/sdc/device/wwid"
+echo "ST4000NM" > "$T/sys/block/sdc/device/model"; echo "SN04" > "$T/sys/block/sdc/device/rev"
+printf '\000\200\000\010ZC10XYZ9' > "$T/sys/block/sdc/device/vpd_pg80"
+check "MED 3: a SCSI disk's identity takes the device wwid, the printable vpd_pg80 serial and rev" \
+  '[ "$(dev_identity "$T/sys" sdc)" = "wwid=naa.5000c500${NL}dev=8:32${NL}model=ST4000NM${NL}serial=ZC10XYZ9${NL}firmware=SN04" ]'
+ident nvme6n1 "" 259:6 PM9A3 S2 GDC5
+check "MED 3: an empty wwid refuses (rc 2)" 'refuses2 dev_identity "$T/sys" nvme6n1 && grep -q wwid "$T/out.txt"'
+ident nvme7n1 eui.0007 259:7 PM9A3 "" GDC5
+check "MED 3: an empty serial refuses (rc 2)" 'refuses2 dev_identity "$T/sys" nvme7n1 && grep -q serial "$T/out.txt"'
+dev_identity "$T/sys" nvme5n1 > "$T/id5.txt"
+: > "$T/dev/nvme5n1"; REAL5=$(readlink -f "$T/dev/nvme5n1")
+check "MED 3: the unmoved path to the unchanged drive passes" \
+  'dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt"'
+ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5
+check "MED 3: a plain node whose drive changed behind the same name (wwid, serial) refuses, naming wwid" \
+  'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" && grep -q wwid "$T/out.txt"'
+ident nvme5n1 eui.0001 259:9 PM9A3 S1 GDC5
+check "MED 3: a new MAJ:MIN behind the same name refuses" \
+  'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" && grep -q "dev=" "$T/out.txt"'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+: > "$T/id-empty.txt"
+check "MED 3: an empty identity record refuses" \
+  'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id-empty.txt"'
+check "MED 3: a moved path refuses before the identity is read" \
+  'refuses2 dev_unchanged "$T/dev/by-id-x" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt"'
 
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

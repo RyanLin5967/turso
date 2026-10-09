@@ -17,18 +17,23 @@ claimed >= OPS and el >= S x 1e9 (done), or when el >= MAX_S x 1e9 (capped); cap
 claim that meets both reads capped=0. Seconds become nanoseconds by truncation, as (uint64_t)(S * 1e9) does. Every
 claim before the stop is a warm-up op, so warm_ops == stop_at.
 
-  warmup_conformance.py run [--bbload BIN] [--clonebench BIN] [--fastest-profile BIN]
+  warmup_conformance.py run [--bbload BIN] [--clonebench BIN] [--fastest-profile BIN] [--record FILE]
         exit 0: all three given and every one matches every case; 3: every given one matches, but not all three
         were given (PARTIAL, never a conformance verdict); 1: a mismatch; 2: refused (none given, a driver missing,
-        timed out, or printing anything but one result line)
+        two roles naming one file or one sha256, timed out, or printing anything but one result line). Each
+        driver is reported by realpath and sha256; --record writes the verdict as JSON (rc, verdict, cases, and per
+        role path, realpath, sha256), which summarize binds to the binaries a package ran (review 5 MED 6, 7)
   warmup_conformance.py self-test
         the harness on fake replayers: a correct one passes, and four wrong ones (> for >=, capped winning over
         done, the stop claim counted, rounding instead of truncating) each fail on a named case
 
 The expected values below are derived by hand from the rule's text, never from running a driver.
 """
+import hashlib
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,11 +82,46 @@ def replay(binary, rule, trace):
     return (None if stop == "none" else int(stop), int(warm), None if capped == "none" else int(capped))
 
 
-def run(drivers):
-    """drivers: {name: binary}; returns (rc, report lines)"""
-    out, bad = [], 0
+def identity(binary):
+    """(realpath, sha256) of a driver binary; OSError when it cannot be read"""
+    rp = os.path.realpath(binary)
+    with open(rp, "rb") as f:
+        return rp, hashlib.sha256(f.read()).hexdigest()
+
+
+VERDICTS = {0: "PASS", 1: "FAIL", 2: "REFUSED", 3: "PARTIAL"}
+
+
+def run(drivers, record=None):
+    """drivers: {role: binary}; returns (rc, report lines). Each role's binary is named by realpath and sha256, and
+    two roles resolving to one file or to one sha256 are REFUSED (review 5 MED 7: the same binary under all three roles
+    gave rc 0). RECORD, when given, receives the verdict as JSON: rc, verdict, the case count, and per role its path,
+    realpath and sha256, so a package can bind the verdict to the binaries it ran (review 5 MED 6)."""
+    out, bad, ids = [], 0, {}
+
+    def done(rc, lines):
+        if record:
+            with open(record, "w") as f:
+                json.dump({"rc": rc, "verdict": VERDICTS[rc], "cases": len(CASES),
+                           "drivers": {r: {"path": drivers[r], "realpath": ids[r][0], "sha256": ids[r][1]}
+                                       for r in ids}, "report": lines[-1] if lines else ""}, f, indent=1)
+        return rc, lines
+
     if not drivers:
-        return 2, ["warmup conformance: REFUSED: no driver given"]
+        return done(2, ["warmup conformance: REFUSED: no driver given"])
+    try:
+        for role, binary in drivers.items():
+            ids[role] = identity(binary)
+    except OSError as e:
+        return done(2, [f"warmup conformance: REFUSED: a driver cannot be read: {e}"])
+    roles = sorted(ids)
+    for i, a in enumerate(roles):
+        for b in roles[i + 1:]:
+            if ids[a][0] == ids[b][0] or ids[a][1] == ids[b][1]:
+                return done(2, [f"warmup conformance: REFUSED: {a} and {b} are the same driver ({ids[a][0]}, sha256 "
+                                f"{ids[a][1][:12]}...): one verdict cannot stand for two drivers"])
+    for role in roles:
+        out.append(f"warmup conformance: driver {role}: {ids[role][0]} sha256 {ids[role][1]}")
     got = {}
     try:
         for name, binary in drivers.items():
@@ -92,7 +132,7 @@ def run(drivers):
                 bad += not ok
                 out.append(f"warmup conformance {'PASS' if ok else 'FAIL'}: {name}: {case} ({rule}): got {g}, want {want}")
     except Refused as e:
-        return 2, out + [f"warmup conformance: REFUSED: {e}"]
+        return done(2, out + [f"warmup conformance: REFUSED: {e}"])
     names = sorted(drivers)
     for case, _, _, _ in CASES:  # pairwise, so a report names who disagrees with whom even when both are wrong
         vals = {n: got[(n, case)] for n in names}
@@ -101,15 +141,16 @@ def run(drivers):
     missing = [n for n in ("bbload", "clonebench", "fastest_profile") if n not in drivers]
     if bad:
         out.append(f"warmup conformance: FAIL ({bad} mismatches over {len(drivers)} drivers x {len(CASES)} cases)")
-        return 1, out
+        return done(1, out)
     if missing:
         out.append(f"warmup conformance: PARTIAL: {len(drivers)} x {len(CASES)} match; not given: {missing}")
-        return 3, out
+        return done(3, out)
     out.append(f"warmup conformance: PASS: 3 drivers x {len(CASES)} cases match the rule")
-    return 0, out
+    return done(0, out)
 
 
 FAKE = r'''#!/usr/bin/env python3
+# fake replayer {name}
 import sys
 ops, s, m = sys.argv[2].split(":")
 ops, s_ns, m_ns = int(ops), {conv}(float(s) * 1e9), {conv}(float(m) * 1e9)
@@ -126,17 +167,35 @@ print(f"stop_at=none warm_ops={{claimed}} capped=none")
 '''
 
 
+def _safe(f):
+    try:
+        return bool(f())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def fake(d, name, conv="int", cmp=">=", extra=0, capped_expr="0 if done else 1"):
     p = os.path.join(d, name)
     with open(p, "w") as f:
-        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr))
+        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr, name=name))
     os.chmod(p, 0o755)
     return p
 
 
 def self_test():
     d = tempfile.mkdtemp(prefix="warmup-conformance-")
+    try:
+        return _self_test(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)  # review 5 LOW 13: the directory leaked
+
+
+def _self_test(d):
+    # TEST EDIT, flagged (review 5 MED 7): the cases below gave ONE file under several roles, which is the hole MED 7
+    # closes (the same binary under all three roles gave rc 0); each role now gets its own correct fake (the files
+    # differ by their name line), and every expectation is unchanged
     good = fake(d, "good")
+    good_b, good_c = fake(d, "good-bbload"), fake(d, "good-clonebench")
     wrong = {
         "strict time (> for >=)": (fake(d, "gt", cmp=">"), "edge: exactly OPS claimed and exactly S elapsed"),
         "capped wins over done": (fake(d, "capwins", capped_expr="1 if capped else 0"),
@@ -145,12 +204,31 @@ def self_test():
         "rounding, not truncation": (fake(d, "round", conv="round"), "truncation"),
     }
     cases = []
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good})
+    cases.append(("three correct fakes, one per role, pass (rc 0)", rc == 0, rep[-1]))
+    # review 5 MED 7: a verdict is about three binaries, so one file (or one byte-identical copy) under two roles refuses
     rc, rep = run({"bbload": good, "clonebench": good, "fastest_profile": good})
-    cases.append(("the correct fake, given as all three drivers, passes (rc 0)", rc == 0, rep[-1]))
+    cases.append(("MED 7: one file under all three roles is REFUSED (rc 2)", rc == 2 and "same" in rep[-1], rep[-1]))
+    twin = os.path.join(d, "twin")
+    shutil.copyfile(good, twin)
+    os.chmod(twin, 0o755)
+    rc, rep = run({"bbload": good_b, "clonebench": twin, "fastest_profile": good})
+    cases.append(("MED 7: a byte-identical copy under a second role is REFUSED (rc 2)", rc == 2 and "same" in rep[-1],
+                  rep[-1]))
+    rec = os.path.join(d, "record.json")
+
+    def rec_ok():
+        run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good}, record=rec)
+        r = json.load(open(rec))
+        return (r["rc"] == 0 and r["verdict"] == "PASS" and r["cases"] == len(CASES)
+                and all(r["drivers"][role]["sha256"] == hashlib.sha256(open(p, "rb").read()).hexdigest()
+                        and r["drivers"][role]["realpath"] == os.path.realpath(p)
+                        for role, p in (("bbload", good_b), ("clonebench", good_c), ("fastest_profile", good))))
+    cases.append(("MED 7: --record writes the rc, the verdict and each role's realpath and sha256", _safe(rec_ok), ""))
     rc, rep = run({"fastest_profile": good})
     cases.append(("one correct driver alone is PARTIAL (rc 3), never a pass", rc == 3, rep[-1]))
     for what, (p, case) in wrong.items():
-        rc, rep = run({"bbload": good, "clonebench": good, "fastest_profile": p})
+        rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": p})
         named = any(ln.startswith("warmup conformance FAIL: fastest_profile: " + case) for ln in rep)
         cases.append((f"a wrong fake ({what}) fails (rc 1) on its case {case!r}", rc == 1 and named, rep[-1]))
     rc, rep = run({"fastest_profile": os.path.join(d, "absent")})
@@ -174,13 +252,16 @@ def main(a):
         return self_test()
     if a[1:2] == ["run"]:
         flags = {"--bbload": "bbload", "--clonebench": "clonebench", "--fastest-profile": "fastest_profile"}
-        rest, drivers = a[2:], {}
-        if len(rest) % 2 or any(rest[i] not in flags for i in range(0, len(rest), 2)):
+        rest, drivers, record = a[2:], {}, None
+        if len(rest) % 2 or any(rest[i] not in flags and rest[i] != "--record" for i in range(0, len(rest), 2)):
             print(__doc__, file=sys.stderr)
             return 2
         for i in range(0, len(rest), 2):
-            drivers[flags[rest[i]]] = rest[i + 1]
-        rc, rep = run(drivers)
+            if rest[i] == "--record":
+                record = rest[i + 1]
+            else:
+                drivers[flags[rest[i]]] = rest[i + 1]
+        rc, rep = run(drivers, record)
         print("\n".join(rep))
         return rc
     print(__doc__, file=sys.stderr)

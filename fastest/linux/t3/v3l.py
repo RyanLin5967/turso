@@ -41,6 +41,8 @@ Gates (any failure makes the measurement VOID, and the block with it):
     flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, provisional until
     registered); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
     counter (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
+  - the leaf's queue/iostats reads 1 (recorded in leaf.iostats; measure() refuses otherwise, and gates() VOIDs a
+    record without it on its own text): the sectors-written counter moves only with iostats on (review 5 MED 2);
   - the drive's sectors-written counter rises by at least the fsynced data, N x 4 KiB = N x 8 sectors, across EACH
     fsync run, timed and labelling (T3 runner review item 10): over a write-through drive the flush counter reads 0
     whether or not an fsync reached the drive (a write-through loop above it sends no flush either, so its writes can
@@ -270,9 +272,24 @@ def gates(rec):
     else:
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
     if not str(rec["leaf"].get("disk") or "").startswith("ram"):
-        bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
+        # the write count only moves with queue/iostats 1; without it the write rule's verdict would name the wrong cause
+        ip = iostats_problem(rec["leaf"].get("iostats"))
+        if ip:
+            bad.append(f"drive {rec['leaf'].get('disk')}: {ip}")
+        else:
+            bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
         bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
     return bad
+
+
+def iostats_problem(v):
+    """Why the leaf's queue/iostats value V makes its sectors-written counter useless, or None when it is 1 (review 5
+    MED 2: flushes are counted whatever iostats says; sectors written are counted only with iostats on)"""
+    if v is None or str(v).strip() == "":
+        return "cannot read the leaf's queue/iostats: whether its sectors-written counter advances is unknown"
+    if str(v).strip() != "1":
+        return f"iostats off ({v!r}): the sectors-written counter does not advance"
+    return None
 
 
 def sync_gate(disk, sy):
@@ -396,6 +413,7 @@ def measure(d, out, leafrec=None):
            "n": N, "fio_version": sh("fio", "--version")[1].strip(),
            "strace_version": sv.splitlines()[0] if rc == 0 and sv else None,
            "leaf": {"chain": chain, "disk": disk, "write_cache": disk_attr(disk, "queue/write_cache"),
+                    "iostats": disk_attr(disk, "queue/iostats"),
                     "fua": disk_attr(disk, "queue/fua"), "rotational": disk_attr(disk, "queue/rotational"),
                     "model": disk_attr(disk, "device/model"), "drive_reports": drive_reports,
                     "drive_reports_from": leafrec,
@@ -404,6 +422,8 @@ def measure(d, out, leafrec=None):
            "virtualization": virt, "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
+    if not disk.startswith("ram") and iostats_problem(rec["leaf"]["iostats"]):
+        raise RuntimeError(f"{disk}: {iostats_problem(rec['leaf']['iostats'])} (review 5 MED 2; refused before any run)")
     os.makedirs(out)
     for arm, fs in (("fsync", True), ("control", False)):
         a = {}
@@ -640,6 +660,10 @@ def plants(rec):
         arm("wt-unwritten", "write through",
             lambda r: r["arms"]["fsync"]["timed"].__setitem__("sectors_written_delta", N * SECTORS_PER_WRITE // 2),
             (f"drive {disk}:", "did not reach the drive"))
+        # the labelling half of the same rule, on its own text (review 5 MED 4)
+        arm("wt-unwritten-lab", "write through",
+            lambda r: r["arms"]["fsync"]["timed"].__setitem__("lab_sectors_written_delta", N * SECTORS_PER_WRITE // 2),
+            (f"drive {disk}:", "in the labelling fsync run", "did not reach the drive"))
         # annex A24: the sync rule, forced to fire by a failed sync before the timed run
         arm("unsynced", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("timed", {"ran": True, "rc": 1}),
@@ -735,7 +759,7 @@ def self_test():
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
             timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
-            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0))):
+            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0)), iostats="1"):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -743,7 +767,7 @@ def self_test():
                     "timed": {"writes": fio_w, "syncs": tsyncs, "fsync_p50_us": 300.0, "fsync_bins_ns": {"300000": tsyncs}}}
         # fio's own sync count is whatever it reports (9,999 or 10,000 with end_fsync); only agreement is gated
         r = {"leaf": {"disk": disk, "write_cache": wc, "layers": layers or [],
-                      "drive_reports": wc if drive == "same" else drive},
+                      "drive_reports": wc if drive == "same" else drive, "iostats": iostats},
              "arms": {"fsync": arm(fsyncs, lab_syncs, timed_syncs),
                       "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
@@ -971,6 +995,17 @@ def self_test():
              _plant(plants(rec(delta=20003))[0], "wt-unwritten")))),
         ("item 10: plant wt-unwritten fires on a write-through record carrying labelling count 0",
          _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten").get("fired") is True)),
+        # review 5 MED 2: with queue/iostats 0 the sectors-written counter never moves (flushes are counted either
+        # way), so such a leaf VOIDs on its own text, not as data that "did not reach the drive"
+        ("MED 2: a leaf with iostats 0 VOIDs on the iostats text, not on 'did not reach the drive'",
+         _ok(lambda: (lambda g: _has(g, "drive nvme1n1:", "iostats") and not _has(g, "did not reach the drive"))(
+             gates(rec(iostats="0", sectors=0, lab_sectors=0))))),
+        ("MED 2: a leaf with no iostats recorded VOIDs", _has(gates(rec(iostats=None)), "drive nvme1n1:", "iostats")),
+        ("MED 2: a ram disk (brd) with no iostats recorded is VALID (exempt with the write rule)",
+         gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0", iostats=None)) == []),
+        ("MED 2: measure() refuses iostats 0 and an unreadable iostats, before any run; 1 passes",
+         _ok(lambda: iostats_problem("1") is None and "iostats off" in (iostats_problem("0") or "")
+             and "cannot read" in (iostats_problem(None) or ""))),
         # annex A24 (the lead's ruling): every run is preceded by a sync outside its window, and the record says it ran
         # and its rc; on a drive, an fsync-arm run without a sync record, or with a failed one, VOIDs
         ("A24: an fsync-arm record with no sync record VOIDs, on the sync rule's text",
@@ -986,6 +1021,13 @@ def self_test():
         ("A24: sync_record() on a sync that exits 1 refuses the measurement",
          _ok(lambda: _raises(lambda: sync_record(lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "boom")),
                              "sync before a V3L run failed"))),
+        # review 5 MED 4: the write rule's labelling half gets its own plant, matched on its own text
+        ("MED 4: plant wt-unwritten-lab fires on a write-back record, on the labelling half's text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:", "in the labelling fsync run",
+                                                                  "did not reach the drive"))(
+             _plant(plants(rec(delta=20003))[0], "wt-unwritten-lab")))),
+        ("MED 4: plant wt-unwritten-lab fires on a write-through record carrying labelling count 0",
+         _ok(lambda: _plant(plants(_lab(rec(wc="write through", delta=0), 0))[0], "wt-unwritten-lab").get("fired") is True)),
         ("item 10: plants() on a ram record runs no wt-unwritten plant and is still ok",
          _ok(lambda: (lambda res: res[1] is True and _plant(res[0], "wt-unwritten") == {})(
              plants(_lab(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0"), 0))))),
