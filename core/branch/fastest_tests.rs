@@ -1825,6 +1825,146 @@ fn a_busy_commit_whose_view_merge_yielded_commits_once() {
     }
 }
 
+/// The WAL commit frames `conn` reads past frame `from`, with no checkpoint since (`seq`).
+#[cfg(feature = "conn_raw_api")]
+fn commit_frames_since(conn: &Arc<Connection>, from: u64, seq: u32, page_size: usize) -> usize {
+    let now = conn.wal_state().unwrap();
+    assert_eq!(now.checkpoint_seq_no, seq, "premise: no checkpoint restarted the WAL in between");
+    let mut frame = vec![0u8; 24 + page_size];
+    (from + 1..=now.max_frame)
+        .filter(|&n| conn.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+        .count()
+}
+
+/// Engine review 19 HIGH 2's fixture: main and an attached `aux`, each a durable store with a live
+/// child (so each half takes copy decisions), `BEGIN`, a write to each, and a COMMIT whose main
+/// half commits while aux's decision pass is refused (`TrunkDecisionBusy` on aux's store only).
+/// Premises: the COMMIT is `Busy`, and main's commit frame is in its WAL. `held`: the COMMIT is a
+/// prepared statement kept for a re-step. Returns the databases, the main connection, a direct aux
+/// connection, the held COMMIT, both WALs' starting frames and checkpoint sequences, the page size,
+/// and the children (kept alive).
+#[cfg(feature = "conn_raw_api")]
+#[allow(clippy::type_complexity)]
+fn attached_busy_commit(
+    dir: &Path,
+    catalog: bool,
+    held: bool,
+) -> (
+    Arc<Database>,
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<Connection>,
+    Option<crate::Statement>,
+    [(u64, u32); 2],
+    usize,
+    [Branch; 2],
+) {
+    let aux_path = dir.join("aux.db");
+    let db = open_at(&dir.join("main.db"), opts(catalog, SyncClass::Fsync).with_attach(true));
+    let aux = open_at(&aux_path, opts(catalog, SyncClass::Fsync).with_attach(true));
+    let a = db.connect().unwrap();
+    seed_wide(&a);
+    let child = a.fork_branch().unwrap();
+    let x = aux.connect().unwrap();
+    seed_wide(&x);
+    let aux_child = x.fork_branch().unwrap();
+    a.execute(format!("ATTACH DATABASE '{}' AS aux", aux_path.display())).unwrap();
+    let page_size = a.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+        .as_int()
+        .unwrap() as usize;
+    let (main_before, aux_before) = (a.wal_state().unwrap(), x.wal_state().unwrap());
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+    a.execute("UPDATE aux.t SET v = 'aux-new' WHERE id = 3").unwrap();
+    aux.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+    let (commit, first) = if held {
+        let mut commit = a.prepare("COMMIT").unwrap();
+        let first = commit.run_ignore_rows();
+        (Some(commit), first)
+    } else {
+        (None, a.execute("COMMIT"))
+    };
+    assert!(
+        matches!(first, Err(LimboError::Busy)),
+        "catalog={catalog}: premise: aux's decision pass was refused: {first:?}"
+    );
+    assert_eq!(
+        commit_frames_since(&a, main_before.max_frame, main_before.checkpoint_seq_no, page_size),
+        1,
+        "catalog={catalog}: premise: main's half committed before aux's refusal"
+    );
+    (
+        db,
+        aux,
+        a,
+        x,
+        commit,
+        [
+            (main_before.max_frame, main_before.checkpoint_seq_no),
+            (aux_before.max_frame, aux_before.checkpoint_seq_no),
+        ],
+        page_size,
+        [child, aux_child],
+    )
+}
+
+/// Engine review 19 HIGH 2 (a): 19e2616f4 undid a Busy COMMIT's transition whenever `commit_state`
+/// was still `Ready`, inferring that nothing committed. With an attached database, main's
+/// `commit_tx` is done (frames published, locks released) before aux's decision pass is refused,
+/// with `commit_state` still `Ready`, so the restore reopened an explicit transaction over a durable
+/// main half: autocommit read false, and ROLLBACK returned Ok, undoing aux's half only. Neither may
+/// claim the transaction is still open.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_after_its_main_half_committed_is_not_reopened() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _aux, a, _x, _commit, _from, _page_size, _children) = attached_busy_commit(dir.path(), catalog, false);
+        assert!(
+            a.get_auto_commit(),
+            "catalog={catalog}: CLAIM: autocommit reads false after a COMMIT whose main half is durable"
+        );
+        let rollback = a.execute("ROLLBACK");
+        assert!(
+            rollback.is_err(),
+            "catalog={catalog}: CLAIM: ROLLBACK returned Ok over a durable main half"
+        );
+        assert_eq!(read_wide(&db.connect().unwrap(), 3), "new", "catalog={catalog}: main's half stays committed");
+    }
+}
+
+/// Engine review 19 HIGH 2 (b): the held COMMIT, re-stepped, commits aux's half exactly once and
+/// main's no second time.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_after_its_main_half_committed_re_steps_the_attached_half_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_db, aux, a, x, commit, from, page_size, _children) = attached_busy_commit(dir.path(), catalog, true);
+        let mut commit = commit.expect("a held COMMIT");
+        assert!(
+            a.get_auto_commit(),
+            "catalog={catalog}: CLAIM: autocommit reads false after a COMMIT whose main half is durable"
+        );
+        let second = commit.run_ignore_rows();
+        assert!(second.is_ok(), "catalog={catalog}: CLAIM: the re-stepped COMMIT commits aux's half: {second:?}");
+        drop(commit);
+        assert_eq!(
+            commit_frames_since(&a, from[0].0, from[0].1, page_size),
+            1,
+            "catalog={catalog}: main's half committed exactly once"
+        );
+        assert_eq!(
+            commit_frames_since(&x, from[1].0, from[1].1, page_size),
+            1,
+            "catalog={catalog}: aux's half committed exactly once"
+        );
+        assert_eq!(read_wide(&aux.connect().unwrap(), 3), "aux-new", "catalog={catalog}: aux's half is committed");
+    }
+}
+
 /// Review A-F1: a raw WAL session's commit (`wal_insert_end(true)`) closes the commit gate it opens,
 /// so the next trunk commit takes its own copy decisions and no fork waits on a gate nobody holds.
 #[cfg(feature = "conn_raw_api")]
