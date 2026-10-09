@@ -6,7 +6,9 @@ denylist, and a partition of the root disk or a symlink to /dev/ram0 passed it).
   devguard.py rootdisk         print the top-level disk(s) under "/", one per line, and exit 0; when it cannot tell,
                                exit 2 with the reason on stderr. t3run fires `check` on each disk it prints, and
                                requires exit 2 with the root rule's own text
-  devguard.py self-test        the rules on synthetic lsblk trees; exit 0 iff every case passes
+  devguard.py rootdisk-sysfs   the same answer from the kernel's sysfs links, with no lsblk: the independent second
+                               instrument t3run requires `rootdisk` to equal
+  devguard.py self-test       the rules on synthetic lsblk trees; exit 0 iff every case passes
 
 Rules (all must hold):
   - it is not a disk that holds "/", and it does not sit on one (T3 runner review MED 13). The walk starts at the one
@@ -25,8 +27,11 @@ Rules (all must hold):
     succeeds, so nothing in the kernel claims them (lane review MED 5; needs root, so t3run runs it under sudo -n);
   - it is not a native-multipath NVMe head (/sys/block/<name>/multipath non-empty): its flush counter may live on the
     path devices, which V3L does not read (stated blind spot, refused rather than guessed).
-Stated blind spot of the root rule: "/" is found only through lsblk's MOUNTPOINTS. A root that lsblk does not list
-(overlay, NFS, tmpfs) cannot be told apart, so every device is refused and none passes.
+Stated blind spots of the root rule. "/" is found only through lsblk's MOUNTPOINTS. A root that lsblk does not list
+(overlay, NFS, tmpfs) cannot be told apart, so every device is refused and none passes. A btrfs "/" spread over
+several disks shows "/" on one member only, so this rule does not refuse the other members. On a real box btrfs
+claims every member exclusively, so the O_EXCL rule refuses them instead. sysfs cannot name any btrfs root (its
+device number is anonymous), so t3run's fire refuses to run on such a box.
 """
 import json
 import os
@@ -74,18 +79,25 @@ def lsblk_graph(devices):
     parents, types, at_root = {}, {}, set()
 
     def walk(node, under):
-        if not isinstance(node, dict) or not node.get("kname") or "pkname" not in node:
+        if (not isinstance(node, dict) or not isinstance(node.get("kname"), str) or not node["kname"]
+                or "pkname" not in node or not (node["pkname"] is None or isinstance(node["pkname"], str))):
             raise CannotTell(f"lsblk node {node.get('name') if isinstance(node, dict) else node!r} lacks KNAME or PKNAME")
         k = node["kname"]
         if node["pkname"] != under:
             raise CannotTell(f"{k} has PKNAME {node['pkname']!r} but sits under {under!r}")
+        # shapes lsblk cannot print, refused rather than read (a string MOUNTPOINTS would match "/" as a substring)
+        mounts, children = node.get("mountpoints"), node.get("children")
+        if mounts is not None and not isinstance(mounts, list):
+            raise CannotTell(f"{k} has MOUNTPOINTS {mounts!r}, not a list")
+        if children is not None and not isinstance(children, list):
+            raise CannotTell(f"{k} has children {children!r}, not a list")
         parents.setdefault(k, set())
         if under:
             parents[k].add(under)
         types[k] = node.get("type")
-        if "/" in (node.get("mountpoints") or []):
+        if "/" in (mounts or []):
             at_root.add(k)
-        for c in node.get("children") or []:
+        for c in children or []:
             walk(c, k)
 
     for d in devices:
@@ -148,6 +160,53 @@ def rootdisk_report(text=None):
     except CannotTell as e:
         return 2, [f"cannot tell which disk holds /: {e}"]
     return 0, disks
+
+
+SYS_ROOT = "/sys"
+
+
+def sysfs_root_disks(sys_root=None, majmin=None):
+    """the top-level disk(s) under "/" from the kernel's sysfs links alone, with no lsblk. This is the second
+    instrument t3run compares `rootdisk` against, because a test's expected disks must not come from the walk under
+    test. "/"'s device number (st_dev) names /sys/dev/block/MAJ:MIN. A partition climbs to the disk directory it
+    sits in, and a device with slaves (md, dm) climbs every slave. Raises CannotTell when "/" has no block device:
+    btrfs, overlay, NFS and tmpfs report an anonymous device number. SYS_ROOT and MAJMIN are injectable for the
+    self-test."""
+    sys_root = sys_root or SYS_ROOT
+    if majmin is None:
+        st = os.stat("/").st_dev
+        majmin = f"{os.major(st)}:{os.minor(st)}"
+    start = os.path.join(sys_root, "dev", "block", majmin)
+    if not os.path.exists(start):
+        raise CannotTell(f"/ is on device {majmin}, which has no block device in sysfs ({start})")
+    disks, seen = set(), set()
+
+    def climb(p):
+        p = os.path.realpath(p)
+        if p in seen:
+            return
+        seen.add(p)
+        if os.path.isfile(os.path.join(p, "partition")):
+            return climb(os.path.dirname(p))
+        sl = os.path.join(p, "slaves")
+        slaves = sorted(os.listdir(sl)) if os.path.isdir(sl) else []
+        for s in slaves:
+            climb(os.path.join(sl, s))
+        if not slaves:
+            disks.add(os.path.basename(p))
+
+    try:
+        climb(start)
+    except OSError as e:
+        raise CannotTell(f"the sysfs walk from {start} failed: {e}")
+    return sorted(disks)
+
+
+def emit(rc, lines, cmd):
+    """a rootdisk-style subcommand's output: the disks on stdout at rc 0, else the reason on stderr"""
+    for line in lines:
+        print(line if rc == 0 else f"devguard: {cmd}: {line}", file=sys.stdout if rc == 0 else sys.stderr)
+    return rc
 
 
 def tree_mounts(node):
@@ -429,10 +488,12 @@ def main(a):
     if a[1:] == ["self-test"]:
         return self_test()
     if a[1:] == ["rootdisk"]:
-        rc, out = rootdisk_report()
-        for line in out:
-            print(line if rc == 0 else f"devguard: rootdisk: {line}", file=sys.stdout if rc == 0 else sys.stderr)
-        return rc
+        return emit(*rootdisk_report(), "rootdisk")
+    if a[1:] == ["rootdisk-sysfs"]:
+        try:
+            return emit(0, sysfs_root_disks(), "rootdisk-sysfs")
+        except CannotTell as e:
+            return emit(2, [f"cannot tell which disk holds / from sysfs: {e}"], "rootdisk-sysfs")
     if len(a) == 3 and a[1] == "check":
         name, bad = check(a[2])
         if bad:
