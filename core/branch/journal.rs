@@ -2309,6 +2309,7 @@ impl Journal {
                 dir: None,
                 nonce: self.nonce,
                 base_syncs: self.base_synced(),
+                names_slots: false,
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -2357,6 +2358,7 @@ impl Journal {
         self.note_class(class);
         let header = self.take_header_patch();
         let mut bytes = std::mem::take(&mut self.pending);
+        let names_slots = !self.pending_slots.is_empty();
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
         // The next flight is taken only once this one landed (one at a time), and a failed one
@@ -2385,6 +2387,7 @@ impl Journal {
             dir,
             nonce: self.nonce,
             base_syncs,
+            names_slots,
         })
     }
 
@@ -2842,6 +2845,9 @@ pub(crate) struct Flight {
     /// frame says whether it proves the flight before it synced, or is raised (`EndKind`; engine
     /// review 10 #2, review 16 MED 5).
     base_syncs: bool,
+    /// The flight's records name arena slots (engine review 17 MED 4): an ordered tag then needs
+    /// this flight's own arena barrier.
+    names_slots: bool,
 }
 
 impl Flight {
@@ -2889,9 +2895,15 @@ impl Flight {
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
             // An ordered flight says so (review 6 #7): recovery takes its slots as there whenever
-            // its records are. Mutant `ordered_tag_ignored` (test builds only): tagged as a synced
-            // flight, as before.
-            let kind = if self.ordered && self.class.syncs() && !super::store::fe_mutant("ordered_tag_ignored") {
+            // its records are. Only when this flight's own barrier covers every arena write its
+            // records name, or they name none (engine review 17 MED 4: a fuzzy checkpoint's
+            // settle_arena can take the dirty mark and only plain-fsync a slot this flight names,
+            // which on Apple orders nothing); otherwise it is tagged as a synced flight, its slots
+            // checked at open. Mutants (test builds only): `ordered_tag_ignored` (tagged as a
+            // synced flight, as before review 6 #7) and `ordered_tag_without_barrier` (tagged
+            // ordered whatever the arena, as before review 17 MED 4).
+            let barriered = self.arena.is_some() || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
+            let kind = if self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored") {
                 EndKind::ordered_by(self.base_syncs)
             } else {
                 EndKind::of_class(self.class, self.base_syncs)
