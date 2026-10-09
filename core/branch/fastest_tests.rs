@@ -6726,6 +6726,53 @@ fn a_trunk_fork_inside_a_ddl_commits_schema_window_succeeds() {
     }
 }
 
+/// Engine review 16 MED 8: a fork in a DDL commit's schema window re-read the whole schema
+/// (`reparse_schema`: every sqlite_schema row, the sequences, types and stats) into the forker's
+/// connection, on the first-child path in the lock-free pre-pass, and its cost grows with the
+/// schema. The child is registered with no schema instead, as any fork after a trunk commit is,
+/// and reads its own at its first connection: the create parses no schema row, under the WAL write
+/// lock or not, and leaves the forker's connection its schema. Counted on the forking thread
+/// (`budget_probe::sql_counts`). Mutant `fork_rereads_schema_window`.
+#[test]
+fn a_fork_inside_a_ddl_commits_schema_window_parses_no_schema() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for (catalog, first) in [(false, true), (false, false), (true, true), (true, false)] {
+        let what = format!("catalog={catalog} first={first}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("schema-window-cost.db"), opts(catalog, SyncClass::Fsync));
+        let ddl = db.connect().unwrap();
+        seed(&ddl);
+        let forker = db.connect().unwrap();
+        let _live = (!first).then(|| forker.fork_branch().unwrap().into_id());
+        let version = forker.schema.read().schema_version;
+        let _disarm = SchemaPublishDisarm;
+        super::store::SCHEMA_PUBLISH_HOLD.store(1, O::Release);
+        let alter = std::thread::spawn(move || {
+            ddl.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7").map(|_| ())
+        });
+        eventually(&format!("{what}: premise: the DDL commit never reached its schema publication"), || {
+            super::store::SCHEMA_PUBLISH_HOLD.load(O::Acquire) == 1 | super::store::HOLD_ARRIVED
+        });
+        let name = format!("window-cost-{catalog}-{first}");
+        let parsed = super::budget_probe::sql_counts().schema_rows;
+        let forked = forker.create_branch(&name);
+        let parsed = super::budget_probe::sql_counts().schema_rows - parsed;
+        let kept = forker.schema.read().schema_version;
+        super::store::SCHEMA_PUBLISH_HOLD.store(0, O::Release);
+        alter.join().unwrap().unwrap();
+        forked.unwrap_or_else(|e| panic!("{what}: premise: the fork inside the window succeeded: {e}"));
+        assert_eq!(parsed, 0, "{what}: the fork parsed {parsed} schema rows inside the window");
+        assert_eq!(kept, version, "{what}: the fork replaced its forker's schema");
+        let branch = db.connect_named(&name).unwrap();
+        let rows = branch
+            .prepare("SELECT c FROM t WHERE id = 1")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| panic!("{what}: the child's first connection did not read the schema its pages need: {e}"));
+        assert_eq!(rows[0][0].as_int(), Some(7), "{what}: the branch read the new column wrong");
+    }
+}
+
 // ---- review 6 #7: an ordered last flight is not checked like an unconfirmed one ----
 
 /// Review 6 #7: an ORDERED flight (a trunk commit's pre-image barriered ahead of the trunk WAL's
