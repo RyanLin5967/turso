@@ -300,6 +300,10 @@ pub(crate) struct BranchStore {
     /// Group commit with the flush outside the store mutex (fastest-engine M1 item 2); see
     /// [`Group`]. Shared with a fuzzy checkpoint's thread, whose install rewrites the log.
     group: Arc<Group>,
+    /// Failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`): a branch
+    /// catalog's own volatile store counts its catalog's, which the main store routes through its
+    /// at-risk decision (`truncate_catalog_wal`; engine review 17 MED 3).
+    sync_failures: AtomicU64,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
     /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
@@ -509,6 +513,42 @@ impl Group {
     fn fail(&self, _g: &mut GroupState) {
         self.failed.store(true, Ordering::Release);
         self.cv.notify_all();
+    }
+
+    /// A sync on the branch files' device failed; `drains`: it was a drain of the device (an
+    /// F_FULLFSYNC on Apple, any sync elsewhere). What that drain covered may be lost, and a later
+    /// successful flush would report it durable. So the store fail-stops, as after a failed
+    /// flight — every waiter, the riders the flush would have made durable among them, gets the
+    /// error — exactly when it holds records the drain could have lost: written and not yet
+    /// drained by a full flush (on Apple fsync(2) drains nothing, elsewhere it does) and counted
+    /// by `undrained_counts(drained)` (always, outside the store's mutants), an ordered flight, one
+    /// waiting for this very flush (`pending_full`), or a flight in the air, a fuzzy checkpoint's
+    /// arena sync included (engine review 9 #8). The trunk's WAL syncs and a branch catalog's own
+    /// (engine review 17 MED 3) both come here. Mutant `drain_failure_ignores_risk` (test builds
+    /// only): it always stops.
+    fn drain_failed(&self, drains: bool, undrained_counts: impl FnOnce(u64) -> bool) {
+        let mut g = self.lock();
+        let full = g.durable[class_index(SyncClass::FullFsync)];
+        let drained = if cfg!(target_vendor = "apple") {
+            full
+        } else {
+            g.durable[class_index(SyncClass::Fsync)].max(full)
+        };
+        // Any record written and not drained is at risk, whatever it is (engine review 15 HIGH 1):
+        // recovery replays the log as a prefix and stops at the first damaged frame, so a lost
+        // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
+        let at_risk = (g.durable[0] > drained && undrained_counts(drained))
+            || g.ordered > full
+            || g.pending_full.is_some()
+            || g.flushing
+            || g.arena_syncing;
+        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
+        if !stop {
+            return;
+        }
+        tracing::warn!("branch store fail-stopped: a sync on the branch files' device failed with branch records not yet drained");
+        g.pending_full = None;
+        self.fail(&mut g);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupState> {
@@ -2623,8 +2663,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
 /// PASSIVE backfill first, which waits for no reader, then a TRUNCATE attempt. The checkpoint is
-/// already durable, so a failure costs only WAL length: it is logged, not returned.
-fn truncate_catalog_wal(catalog: &mut Catalog) {
+/// already durable, so a busy or failed checkpoint costs only WAL length: it is logged, not
+/// returned. But its syncs are on the branch files' device: one that failed (counted by the
+/// catalog's own store, `Catalog::sync_failures`) is a failed drain when it drains the device (the
+/// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
+/// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
+/// (test builds only): logged only, as before.
+fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group) {
+    let failed_before = catalog.sync_failures();
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
@@ -2634,6 +2680,10 @@ fn truncate_catalog_wal(catalog: &mut Catalog) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
+    }
+    if catalog.sync_failures() > failed_before && !fe_mutant("catalog_sync_failure_logged") {
+        let drains = !cfg!(target_vendor = "apple") || catalog.commit_sync() == SyncClass::FullFsync;
+        group.drain_failed(drains, |_| true);
     }
 }
 
@@ -2791,7 +2841,7 @@ fn run_flight(
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                truncate_catalog_wal(&mut writer.lock())
+                truncate_catalog_wal(&mut writer.lock(), &group)
             }));
             truncating.store(false, Ordering::Release);
             if truncated.is_err() {
@@ -3151,6 +3201,7 @@ impl BranchStore {
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            sync_failures: AtomicU64::new(0),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3412,6 +3463,7 @@ impl BranchStore {
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            sync_failures: AtomicU64::new(0),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -5849,22 +5901,13 @@ impl BranchStore {
     /// `no_wal_fail_stop` (it never stops, as before review 6 #2) and `drain_failure_ignores_risk`
     /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
+        self.sync_failures.fetch_add(1, Ordering::AcqRel);
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
         // Mutant `drain_risk_ignores_held_frees` (test builds only) reads the newest fork's mark,
         // under the store mutex and so before the group's lock (the order `mature` takes them in).
         let fork = if fe_mutant("drain_risk_ignores_held_frees") { self.inner.lock().last_fork_lsn } else { 0 };
-        let mut g = self.group.lock();
-        let full = g.durable[class_index(SyncClass::FullFsync)];
-        let drained = if cfg!(target_vendor = "apple") {
-            full
-        } else {
-            g.durable[class_index(SyncClass::Fsync)].max(full)
-        };
-        // Any record written and not drained is at risk, whatever it is (engine review 15 HIGH 1):
-        // recovery replays the log as a prefix and stops at the first damaged frame, so a lost
-        // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
         // Mutants (test builds only): `drain_risk_by_store_class` (only in a store whose class
         // syncs, as before engine review 10 #6), `drain_risk_release_only` (or when the newest
         // Release is undrained, as before this), `drain_risk_barrier_floor_only` (or the newest
@@ -5873,29 +5916,24 @@ impl BranchStore {
         // free left out). Marks are not the rule: `durable[Off]` past the drain covers every kind.
         let release = self.last_release_lsn.load(Ordering::Acquire);
         let retain = self.retain_floor.load(Ordering::Acquire);
-        let undrained_counts = if fe_mutant("drain_risk_by_store_class") {
-            self.class.syncs()
-        } else if fe_mutant("drain_risk_release_only") {
-            self.class.syncs() || release > drained
-        } else if fe_mutant("drain_risk_barrier_floor_only") {
-            self.class.syncs() || release.max(retain) > drained
-        } else if fe_mutant("drain_risk_ignores_held_frees") {
-            self.class.syncs() || release.max(retain).max(fork) > drained
-        } else {
-            true
-        };
-        let at_risk = (g.durable[0] > drained && undrained_counts)
-            || g.ordered > full
-            || g.pending_full.is_some()
-            || g.flushing
-            || g.arena_syncing;
-        let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
-        if !stop {
-            return;
-        }
-        tracing::warn!("branch store fail-stopped: a trunk file's sync failed with branch records not yet drained");
-        g.pending_full = None;
-        self.group.fail(&mut g);
+        self.group.drain_failed(drains, |drained| {
+            if fe_mutant("drain_risk_by_store_class") {
+                self.class.syncs()
+            } else if fe_mutant("drain_risk_release_only") {
+                self.class.syncs() || release > drained
+            } else if fe_mutant("drain_risk_barrier_floor_only") {
+                self.class.syncs() || release.max(retain) > drained
+            } else if fe_mutant("drain_risk_ignores_held_frees") {
+                self.class.syncs() || release.max(retain).max(fork) > drained
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`).
+    pub(crate) fn sync_failures(&self) -> u64 {
+        self.sync_failures.load(Ordering::Acquire)
     }
 
     pub(crate) fn end_trunk_commit(&self) {
@@ -8227,7 +8265,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w);
+            truncate_catalog_wal(&mut w, &self.group);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {

@@ -996,6 +996,17 @@ impl Catalog {
         }
     }
 
+    /// The failed syncs of this catalog's own files: its pager reports them, acting at issue, to
+    /// its Database's own (volatile) branch store, which counts them (engine review 17 MED 3).
+    pub(crate) fn sync_failures(&self) -> u64 {
+        self._db.branches.sync_failures()
+    }
+
+    /// The class this handle's commits sync in (`set_commit_sync`).
+    pub(crate) fn commit_sync(&self) -> SyncClass {
+        self.sync
+    }
+
     /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block
     /// nobody (F-FZ phase 4, before the TRUNCATE attempt).
     pub(crate) fn wal_passive(&mut self) -> Result<()> {
