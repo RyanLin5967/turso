@@ -129,6 +129,55 @@ pub(super) fn emit_custom_type_operator(
     Ok(result_reg)
 }
 
+/// `emit_custom_type_operator` for operands already in registers: `lhs_reg` holds `e1` and
+/// `rhs_reg` holds `e2` of the pair `find_custom_type_operator` resolved, each as the operator
+/// takes it (a custom-type column decoded, the other operand as given). Used by an IN list, which
+/// translates its left side once and each element once (engine review 14 LOW 14). Returns the
+/// result's register.
+pub(super) fn emit_custom_type_operator_on_regs(
+    program: &mut ProgramBuilder,
+    lhs_reg: usize,
+    rhs_reg: usize,
+    resolved: &ResolvedOperator,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let func = resolver
+        .resolve_function(&resolved.func_name, 2)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
+        })?;
+    let (first, second) = if resolved.swap_args {
+        (rhs_reg, lhs_reg)
+    } else {
+        (lhs_reg, rhs_reg)
+    };
+    let args = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: first,
+        dst_reg: args,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: second,
+        dst_reg: args + 1,
+        extra_amount: 0,
+    });
+    let result_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args,
+        dest: result_reg,
+        func: FuncCtx { func, arg_count: 2 },
+    });
+    if resolved.negate {
+        program.emit_insn(Insn::Not {
+            reg: result_reg,
+            dest: result_reg,
+        });
+    }
+    Ok(result_reg)
+}
+
 /// Info about a column with a custom type, extracted from an expression.
 pub(super) struct ExprCustomTypeInfo {
     type_name: String,
