@@ -1506,7 +1506,15 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+            StepResult::Sleep { duration } => {
+                if async_io {
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    sync_wait_out_busy(stmt, duration)?;
+                    continue;
+                }
+            }
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1515,6 +1523,38 @@ fn step_inner(
                 }
             }
         };
+    }
+}
+
+/// The sync-mode answer to a busy handler's `StepResult::Sleep`: wait out its backoff
+/// (`Statement::wait_out_busy`), then step again. Stepping the IO backend instead returned at once
+/// when nothing was in flight (UnixIO always), so a sync caller with a busy timeout spun a core for
+/// the whole wait (engine review 11 MED 4). The busy statement has no IO of its own in flight then.
+/// Mutant `sdk_sync_sleep_spins` (test builds only): the IO step, as before.
+fn sync_wait_out_busy(stmt: &Statement, duration: Duration) -> Result<(), TursoError> {
+    if fe_mutant("sdk_sync_sleep_spins") {
+        stmt._io().step()?;
+        return Ok(());
+    }
+    stmt.wait_out_busy(duration)?;
+    Ok(())
+}
+
+/// sdk-kit's registered mutants (`FE_MUTANT`, the convention of turso_core's branch store): one
+/// names one deliberate defect, so each red can be shown to fail on its mutant from the same test
+/// binary. TEST BUILDS ONLY: a production binary has no mutant to switch on. Read once per process.
+fn fe_mutant(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("FE_MUTANT").ok())
+            .as_deref()
+            == Some(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
     }
 }
 

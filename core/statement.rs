@@ -1647,6 +1647,16 @@ impl Statement {
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
     }
+
+    /// The blocking answer to `StepResult::Sleep { duration }` for a caller outside this crate
+    /// that drives the statement itself (sdk-kit's sync step, the sync engine's tape loops): wait
+    /// out the busy handler's backoff on this statement's IO, then step again. Stepping the IO
+    /// backend instead returns at once when nothing is in flight, so the wait spins a core for the
+    /// whole busy timeout (engine review 11 MED 4). It is the one helper (`statement::wait_out_busy`,
+    /// mutant `busy_sleep_spins`) that this crate's own blocking helpers use.
+    pub fn wait_out_busy(&self, duration: Duration) -> Result<()> {
+        wait_out_busy(self._io(), duration)
+    }
 }
 
 /// Appends `value` to `out` as a SQL literal, the way SQLite renders bound
