@@ -215,9 +215,11 @@ pub use turso_pg_parser::MAX_PARAMETER;
 ///
 /// A parameter compared with an expression no context types (a function this walk does not know)
 /// is returned apart, in the second set: the server refuses it (42P18) rather than compare it as
-/// text, unless the client declared its type (fail closed; review 8 item 7, review 11 item 1). A
-/// parameter compared with a column the walk cannot resolve (a relation it does not model) is left
-/// untyped (text), as before.
+/// text, unless the client declared its type (fail closed; review 8 item 7, review 11 item 1). So
+/// is one compared with a column of a relation the walk cannot open (another schema's, a function
+/// in FROM it does not model, a circular view): the column is found with no type, never bound to
+/// an outer relation's column of the name (review 11 item 3, review 14 items 1 and 2). A column
+/// reference no relation in scope has is left untyped (text).
 pub fn parameter_types(
     parse: &ParseResult,
     schema: &Schema,
@@ -231,6 +233,7 @@ pub fn parameter_types(
         compared_untyped: std::collections::BTreeSet::new(),
         ctes: Vec::new(),
         views: Vec::new(),
+        subselects: Default::default(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -304,6 +307,11 @@ struct Infer<'a> {
     ctes: Vec<(String, Vec<(String, Option<u32>)>)>,
     /// The views being opened, outermost first ([`Infer::view_columns`]).
     views: Vec<String>,
+    /// Each scalar subquery's column type once typed, by its SelectStmt's address in this
+    /// statement's tree, shared with the walks [`Infer::subselect_type`] starts: each such walk
+    /// walks the subquery's FROM, which can hold scalar subqueries of its own, so unshared the
+    /// walks would double with each level of nesting.
+    subselects: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, Option<u32>>>>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -592,6 +600,7 @@ impl Infer<'_> {
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: Vec::new(),
             views,
+            subselects: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -635,8 +644,71 @@ impl Infer<'_> {
                 for item in &f.functions {
                     self.expr(item, scope);
                 }
+                // A function in FROM reads the items before it (PostgreSQL's functions in FROM are
+                // implicitly LATERAL).
+                let mut inner = scope.clone();
+                inner.push(level.clone());
+                level.push(self.range_function(f, &inner));
             }
             _ => {}
+        }
+    }
+
+    /// The relation a function in FROM brings into scope (wire review 14 item 2: it brought none, so
+    /// a parameter compared with its column bound to an outer column of the name, or fell to
+    /// text): generate_series over integers is a relation of one column, int4 (int8 if an argument
+    /// is bigint, numeric if one is numeric), named by the alias's column list, else the alias, else
+    /// the function, as PostgreSQL names it; any other function, and a form the walk does not model
+    /// (LATERAL, WITH ORDINALITY, ROWS FROM, an argument it cannot type), is a relation it cannot
+    /// open, so a parameter compared with a bare column there fails closed (42P18).
+    fn range_function(
+        &self,
+        f: &turso_pg_parser::pg_query::protobuf::RangeFunction,
+        scope: &Scope,
+    ) -> Rel {
+        let call = match f.functions.as_slice() {
+            [item] => match item.node.as_ref() {
+                Some(Node::List(l)) => l.items.first().and_then(|i| match i.node.as_ref() {
+                    Some(Node::FuncCall(c)) => Some(c),
+                    _ => None,
+                }),
+                Some(Node::FuncCall(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        let function = call.and_then(func_name);
+        let alias = f.alias.as_ref().filter(|a| !a.aliasname.is_empty());
+        let name = alias
+            .map(|a| a.aliasname.clone())
+            .or_else(|| function.clone())
+            .unwrap_or_default();
+        let (Some(call), Some("generate_series")) = (call, function.as_deref()) else {
+            return Rel::Unknown { name };
+        };
+        if f.lateral || f.ordinality || !(2..=3).contains(&call.args.len()) {
+            return Rel::Unknown { name };
+        }
+        let mut widest = INT4;
+        for arg in &call.args {
+            widest = match self.type_of(arg, scope) {
+                Some(INT2 | INT4) => widest,
+                Some(INT8) if widest != NUMERIC => INT8,
+                Some(INT8) => NUMERIC,
+                Some(NUMERIC) => NUMERIC,
+                _ => return Rel::Unknown { name },
+            };
+        }
+        let column = alias
+            .and_then(|a| a.colnames.first())
+            .and_then(|c| match c.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| name.clone());
+        Rel::Derived {
+            name,
+            columns: vec![(column, Some(widest))],
         }
     }
 
@@ -1199,8 +1271,11 @@ impl Infer<'_> {
         }
     }
 
-    /// The type of a scalar subquery's one result column, read in its own FROM (not walked:
-    /// [`Infer::expr`] walks it).
+    /// The type of a scalar subquery's one result column, read in its own FROM as the SELECT walk
+    /// reads a FROM ([`Infer::from_items`]: every kind of item), in a walk of its own whose
+    /// parameter types are dropped ([`Infer::expr`] types them when it walks the subquery). Only
+    /// its tables were read, so a derived table, a join or a function there added nothing, and the
+    /// column bound to an outer relation's column of the name (wire review 14 item 2).
     fn subselect_type(&self, s: &SelectStmt, scope: &Scope) -> Option<u32> {
         if s.larg.is_some() || s.with_clause.is_some() {
             return None;
@@ -1211,15 +1286,25 @@ impl Infer<'_> {
         let Some(Node::ResTarget(t)) = target.node.as_ref() else {
             return None;
         };
-        let mut level = Vec::new();
-        for item in &s.from_clause {
-            if let Some(Node::RangeVar(rv)) = item.node.as_ref() {
-                level.push(self.range_var(rv));
-            }
+        let val = t.val.as_deref()?;
+        let key = s as *const SelectStmt as usize;
+        if let Some(ty) = self.subselects.borrow().get(&key) {
+            return *ty;
         }
+        let mut walk = Infer {
+            schema: self.schema,
+            types: std::collections::BTreeMap::new(),
+            compared_untyped: std::collections::BTreeSet::new(),
+            ctes: self.ctes.clone(),
+            views: self.views.clone(),
+            subselects: self.subselects.clone(),
+        };
+        let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
         inner.push(level);
-        self.type_of(t.val.as_deref()?, &inner)
+        let ty = walk.type_of(val, &inner);
+        self.subselects.borrow_mut().insert(key, ty);
+        ty
     }
 }
 
