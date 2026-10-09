@@ -402,20 +402,31 @@ def per_arm(events, w):
     return arms, amb, outside
 
 
-NO_SYNC_ARMS = ("nosync25",)  # the one arm that issues no fsync or fdatasync of its own
+def syncs_per_op():
+    """arm -> the fsync/fdatasync calls each op issues, BY DEFINITION: check.py's OP table (the one spec F1 holds the
+    binary to under strace), never the probe's own say."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import check
+    return {a: spec.get("fsync", 0) + spec.get("fdatasync", 0) for a, spec in check.OP.items()}
 
 
-def sync_windows(sysev, w, pid):
+def sync_windows(sysev, w, pid, expect=None):
     """per arm: windows in which process pid entered no fsync or fdatasync (and the count it entered)."""
+    expect = syncs_per_op() if expect is None else expect
+    unknown = sorted({a for _, _, a, _ in w if a not in expect})
+    if unknown:
+        raise Refuse("arm(s) %s have no sync definition in check.OP" % unknown)
     mine = sorted((e for e in sysev if e[6] == pid), key=lambda e: e[0])
-    # the probe is single-threaded and enters its sync inside its op's window, so a sync event belongs to the window
-    # its +-500 ns interval overlaps (eighth review M4). Windows are 20-80 ns apart on real batches (ninth review M3),
-    # so a sync entering within 0.5 us of its window's start also overlaps the previous window's end. Such an event
-    # is the LATER window's when the earlier one needs no sync (nosync25) or already holds its own (events in time
-    # order): a window closes only after its sync returns, so a sync never enters within 0.5 us of its own window's
-    # end unless that call returned in under 0.5 us -- a clean fsync can -- and then the earlier window still lacks
-    # its own, and the event stays ambiguous: attributed to neither, so a missing sync can never be covered by a
-    # neighbour's (fail closed).
+    # The probe is single-threaded: its syncs and its windows are both in time order, and each window holds exactly
+    # its arm's defined syncs (F1 holds the binary to that count under strace). A sync event belongs to a window its
+    # +-500 ns interval overlaps. Windows are 20-80 ns apart on real batches (ninth review M3), so an interval can
+    # overlap two windows: a sync entering just after its window opened, or one returning just before its window
+    # closed (a clean fsync can return in < 0.5 us; clone2b's and cfr2b's second fsync ends their window). Such an
+    # event is given to the EARLIEST overlapped window that still lacks one of its defined syncs (run 37845193906: the
+    # later-window rule gave clone2b's second fsync to a following nosync25 window). So an event fills a later window
+    # only when every earlier overlapped window already holds its full count, and a window missing its own sync can
+    # never borrow a neighbour's, except a neighbour's sync beyond its defined count, which F1 refuses on the same
+    # binary (stated blind spot). An event no overlapped window has room for is ambiguous, attributed to none.
     starts = [x[0] for x in w]
     inside, amb = {}, []
     for e in mine:
@@ -427,11 +438,12 @@ def sync_windows(sysev, w, pid):
             poss.append(j)
             j -= 1
         poss.sort()
+        room = [j for j in poss if len(inside.get(j, [])) < expect[w[j][2]]]
         if len(poss) == 1:
-            inside.setdefault(poss[0], []).append(e)
-        elif len(poss) == 2 and poss[1] == poss[0] + 1 and (w[poss[0]][2] in NO_SYNC_ARMS or inside.get(poss[0])):
-            inside.setdefault(poss[1], []).append(e)
-            amb.append((e, poss))  # counted as ambiguous (informational), attributed to the later window
+            inside.setdefault(poss[0], []).append(e)  # wholly one window's: counted even beyond its definition
+        elif room:
+            inside.setdefault(room[0], []).append(e)
+            amb.append((e, poss))  # counted as ambiguous (informational), attributed as above
         elif poss:
             amb.append((e, poss))
     res = {}

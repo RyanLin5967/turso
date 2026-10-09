@@ -1728,6 +1728,10 @@ def main(argv):
         refusal(tag, want)
     rc = rc_of(os.path.join(OUT, "F4", "P_nest3.rc"))
     nj = rj(os.path.join(OUT, "F4", "P_nest3.out", "summary.json")) or {}
+    check("F4:P_nest3", rc in (0, 3) and nj.get("layers") == 4 and nj.get("loop_layers") == 3,
+          {"rc": rc, "layers": nj.get("layers"), "text": (rd(os.path.join(OUT, "F4", "P_nest3.txt")) or "")[-300:]},
+          "3 nested loops (4 layers) are followed to the leaf and accepted")
+    # P_nest_modes after P_nest3: the plan's order (run 37845193906 failed "plan" with it before)
     nm = os.path.join(OUT, "F4", "P_nest_modes")
     pj = rj(os.path.join(nm, "probe.out", "summary.json")) or {}
     at = rd(os.path.join(nm, "after_teardown.txt"))
@@ -1741,9 +1745,6 @@ def main(argv):
            "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
           "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
           "rebuilds all four on the same directory; the probe accepts the rebuilt n3 (4 layers)")
-    check("F4:P_nest3", rc in (0, 3) and nj.get("layers") == 4 and nj.get("loop_layers") == 3,
-          {"rc": rc, "layers": nj.get("layers"), "text": (rd(os.path.join(OUT, "F4", "P_nest3.txt")) or "")[-300:]},
-          "3 nested loops (4 layers) are followed to the leaf and accepted")
     if KIND == "ext4":
         rc = rc_of(os.path.join(OUT, "F4", "R_ficlone_accept.rc"))
         txt = rd(os.path.join(OUT, "F4", "R_ficlone_accept.txt")) or ""
