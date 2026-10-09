@@ -175,8 +175,15 @@ def selftest():
             "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
             "readback": dict(rb), "expected_readback": dict(rb)}
 
+    # MED 10: each system's maintenance line as its seed writes it (seed.txt "maintenance: ..."), aged or not
+    maint_of = {"pg18-d2": "CHECKPOINT; aged 0; VACUUM ANALYZE; CHECKPOINT",
+                "dolt": "DOLT_COMMIT seed; aged 0; DOLT_COMMIT age; DOLT_GC",
+                "doltgres": "dolt_commit seed; aged 0; dolt_commit age; dolt_gc",
+                "b1": "journal_mode=WAL; load; aged 0; wal_checkpoint(TRUNCATE)"}
+
     def v(**kw):
         d = dict(base)
+        d["maintenance"] = maint_of.get(kw.get("system", base["system"]), base["maintenance"])
         d.update(kw)
         return {k: x for k, x in d.items() if x is not KeyError}
 
@@ -209,6 +216,15 @@ def selftest():
          [v(), v(system="doltgres", stream_sha256=dict(streams, sql="cc" * 32))], False),
         ("no read-back", [v(), v(system="dolt", readback=KeyError)], False),
         ("no stream digest", [v(), v(system="dolt", stream_sha256=KeyError)], False),
+        # MED 10: every system runs its registered post-load maintenance whether or not it aged the parent
+        ("an unaged Dolt parent whose maintenance lacks DOLT_GC",
+         [v(), v(system="dolt", maintenance="DOLT_COMMIT seed")], False),
+        ("an unaged Doltgres parent without dolt_gc",
+         [v(), v(system="doltgres", maintenance="dolt_commit seed; aged 0; dolt_commit age")], False),
+        ("PG without its final CHECKPOINT", [v(maintenance="CHECKPOINT; aged 0; VACUUM ANALYZE")], False),
+        ("a system with no registered maintenance", [v(), v(system="mystery", maintenance="none")], False),
+        ("every system's registered maintenance, unaged",
+         [v(), v(system="dolt"), v(system="doltgres"), v(system="b1")], True),
     ]
     bad = 0
     for name, fx, want in cases:
