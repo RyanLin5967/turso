@@ -11,7 +11,7 @@ use turso_pg_parser::translator::{
     is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
     try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
     try_extract_drop_schema, try_extract_set, try_extract_show, PgAddConstraints, PgBranchArg,
-    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
+    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
     PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
@@ -677,8 +677,68 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
     stmt.run_ignore_rows()
 }
 
+/// Parameters SET accepts and this server need not act on, whatever their value: planner, resource
+/// and client settings that change no answer it gives (`enable_*` too).
+const NOOP_PARAMETERS: &[&str] = &[
+    "application_name",
+    "check_function_bodies",
+    "client_min_messages",
+    "cpu_index_tuple_cost",
+    "cpu_operator_cost",
+    "cpu_tuple_cost",
+    "default_statistics_target",
+    "effective_cache_size",
+    "effective_io_concurrency",
+    "from_collapse_limit",
+    "geqo",
+    "idle_in_transaction_session_timeout",
+    "jit",
+    "join_collapse_limit",
+    "lock_timeout",
+    "maintenance_work_mem",
+    "max_parallel_workers_per_gather",
+    "plan_cache_mode",
+    "random_page_cost",
+    "row_security",
+    "seq_page_cost",
+    "statement_timeout",
+    "synchronous_commit",
+    "temp_buffers",
+    "work_mem",
+];
+
+/// A boolean setting or input as PostgreSQL's parse_bool reads one: blanks around it, any case,
+/// `t`/`true`, `y`/`yes`, `f`/`false`, `n`/`no` or any prefix of those words, `on`, `off` (at least
+/// two letters, so `o` is ambiguous), `1` and `0`.
+pub fn pg_bool(text: &str) -> Option<bool> {
+    let s = text
+        .trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .to_ascii_lowercase();
+    let prefix_of = |word: &str| !s.is_empty() && word.starts_with(s.as_str());
+    match s.as_str() {
+        "1" | "on" => Some(true),
+        "0" | "of" | "off" => Some(false),
+        _ if prefix_of("true") || prefix_of("yes") => Some(true),
+        _ if prefix_of("false") || prefix_of("no") => Some(false),
+        _ => None,
+    }
+}
+
+/// SET of `set_stmt`'s parameter, from an allowlist (wire review 15 item 2): search_path; the
+/// engine's foreign_keys, exposed deliberately; a read-only transaction asked for through
+/// transaction_read_only or default_transaction_read_only is 0A000 (the engine has none, as BEGIN
+/// READ ONLY is refused), `off` changes nothing; client_encoding, standard_conforming_strings,
+/// bytea_output, DateStyle, IntervalStyle, TimeZone and extra_float_digits are accepted at the
+/// values this server answers by (UTF8, on, hex, ISO, postgres, UTC, 1 or more) and 0A000 at any
+/// other; NOOP_PARAMETERS and `enable_*` are accepted; a dotted (custom) name is 0A000; any other
+/// name is 42704 "unrecognized configuration parameter", as PostgreSQL answers a name it does not
+/// know (one it knows and this list omits gets 42704 too). Every SET became `PRAGMA name = value`,
+/// which the engine ignores for a name it does not know, so `transaction_read_only = on` answered
+/// SET and the writes after it committed, and one it does know (synchronous, journal_mode) changed
+/// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
-    if set_stmt.name == "search_path" {
+    let name = set_stmt.name.to_ascii_lowercase();
+    if name == "search_path" {
         let path = set_stmt
             .values
             .iter()
@@ -691,8 +751,62 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
-    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    if name == "foreign_keys" {
+        return pg_conn
+            .conn
+            .prepare(format!("PRAGMA foreign_keys = {}", value.to_sql_string()));
+    }
+    let text = match value {
+        PgSetValue::Identifier(v)
+        | PgSetValue::StringLiteral(v)
+        | PgSetValue::Number(v)
+        | PgSetValue::RawSql(v) => v.clone(),
+        PgSetValue::Bool(b) => b.to_string(),
+        PgSetValue::Null => String::new(),
+    };
+    let lower = text.to_ascii_lowercase();
+    let unsupported = |what: &str| {
+        Err(LimboError::ParseError(format!(
+            "SET {name} = {text} is not supported: {what}"
+        )))
+    };
+    let accepted = match name.as_str() {
+        "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
+            Some(false) => true,
+            _ => {
+                return Err(LimboError::ParseError(
+                    "READ ONLY transactions are not supported".to_string(),
+                ))
+            }
+        },
+        "client_encoding" => {
+            let clean: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+            clean == "utf8" || clean == "unicode"
+        }
+        "standard_conforming_strings" => pg_bool(&text) == Some(true),
+        "bytea_output" => lower == "hex",
+        "datestyle" => lower.split(',').any(|part| part.trim() == "iso"),
+        "intervalstyle" => lower == "postgres",
+        "timezone" => matches!(
+            lower.as_str(),
+            "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
+        ),
+        "extra_float_digits" => lower.parse::<i32>().is_ok_and(|d| d >= 1),
+        n if NOOP_PARAMETERS.contains(&n) || n.starts_with("enable_") => true,
+        n if n.contains('.') => {
+            return unsupported("custom configuration parameters are not supported")
+        }
+        _ => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized configuration parameter \"{name}\""
+            )))
+        }
+    };
+    if accepted {
+        noop_statement(&pg_conn.conn)
+    } else {
+        unsupported("this server answers only by its own setting of it")
+    }
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {

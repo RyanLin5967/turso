@@ -37,8 +37,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, element_of, split_statements, PgBranchArg, PgBranchCall,
-    PgConnection, StatementTypes,
+    attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
+    PgBranchCall, PgConnection, StatementTypes,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -1135,6 +1135,17 @@ impl Session {
             // an implicit block makes the block the client's, unwarned (after_implicit). The
             // warnings were missing (wire review 9 item 7).
             TxVerb::Begin if in_tx => {
+                // READ ONLY is refused here as the translator refuses it outside a block (0A000),
+                // and the block fails: answered with 25001's warning it was never read, and an
+                // implicit block, handed to the client, wrote and committed under it (wire review
+                // 15 item 3).
+                if begins_read_only(sql) {
+                    st.aborted = true;
+                    return Err(error(
+                        "0A000",
+                        "READ ONLY transactions are not supported".to_string(),
+                    ));
+                }
                 if !st.implicit {
                     st.notices.push(warning(
                         "25001",
@@ -2034,6 +2045,14 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
     Some(words)
 }
 
+/// Whether a BEGIN or START TRANSACTION ([`TxVerb::Begin`]) asks for READ ONLY among its modes.
+fn begins_read_only(sql: &str) -> bool {
+    tx_words(sql).is_some_and(|w| {
+        w.windows(2)
+            .any(|p| p[0].eq_ignore_ascii_case("READ") && p[1].eq_ignore_ascii_case("ONLY"))
+    })
+}
+
 /// Whether `w` is a list of transaction modes, as BEGIN and START TRANSACTION take them:
 /// `ISOLATION LEVEL {SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED}`,
 /// `READ WRITE`, `READ ONLY`, `[NOT] DEFERRABLE`, separated by commas or spaces.
@@ -2477,6 +2496,10 @@ fn sqlstate(e: &LimboError) -> &'static str {
             "42703"
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
+        // A SET of a parameter PostgreSQL does not know (wire review 15 item 2).
+        LimboError::ParseError(m) if m.starts_with("unrecognized configuration parameter") => {
+            "42704"
+        }
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
         // A savepoint name that names none (wire review 6 item 6).
         LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
@@ -3915,26 +3938,6 @@ fn pg_integer(text: &str) -> Option<Option<i64>> {
         magnitude as i64
     };
     Some(Some(value))
-}
-
-/// A boolean as PostgreSQL's boolin reads one (parse_bool_with_len): blanks around it, any case,
-/// `t`/`true`, `y`/`yes`, `f`/`false`, `n`/`no` or any prefix of those words, `on`, `off` (at least
-/// two letters, so `o` is ambiguous), `1` and `0`. It took six spellings, so `True`, ` t` and `of`
-/// were refused.
-fn pg_bool(text: &str) -> Option<bool> {
-    let s = text
-        .trim_matches(|c: char| c.is_ascii() && pg_space(c as u8))
-        .to_ascii_lowercase();
-    let prefix_of = |word: &str| !s.is_empty() && word.starts_with(s.as_str());
-    match s.as_str() {
-        "1" => Some(true),
-        "0" => Some(false),
-        "on" => Some(true),
-        "of" | "off" => Some(false),
-        _ if prefix_of("true") || prefix_of("yes") => Some(true),
-        _ if prefix_of("false") || prefix_of("no") => Some(false),
-        _ => None,
-    }
 }
 
 /// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
