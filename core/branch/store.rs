@@ -1466,6 +1466,12 @@ pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
 /// schema-publish stage.
 #[cfg(test)]
 pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic):
+/// `Database::connect_named` waits here, the name looked up, before it opens the branch (engine
+/// review 14 MED 9: a drop that lands in between).
+#[cfg(test)]
+pub(crate) const HOLD_CONNECT_LOOKED_UP: u8 = 12;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -5210,6 +5216,13 @@ impl BranchStore {
     pub(crate) fn pause_drop_looked_up(&self) {
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_DROP_LOOKED_UP);
+    }
+
+    /// `Database::connect_named` waits at `HOLD_CONNECT_LOOKED_UP` (test builds only; a no-op
+    /// otherwise), between its lookup and its open (engine review 14 MED 9).
+    pub(crate) fn pause_connect_looked_up(&self) {
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_CONNECT_LOOKED_UP);
     }
 
     /// Mutant `drop_check_separate_hold` only (`Database::drop_branch`): the open check in a
