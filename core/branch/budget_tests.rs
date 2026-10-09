@@ -55,7 +55,7 @@ const CKPT_ROUNDS: u64 = 240;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
-/// "Hold the confirmation word back": a quiet period no run reaches (about 31.7 years).
+/// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
 const CONFIRM_HELD_MS: u64 = 1 << 40;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
@@ -146,10 +146,11 @@ fn seed(conn: &Arc<Connection>, large: bool) {
     }
 }
 
-/// One fork, named `name` or unnamed (detached). A create that loses a race is retried: the
-/// population is not measured.
-fn fork_one(c: &Arc<Connection>, name: Option<&str>) {
-    loop {
+/// One fork, named `name` or unnamed (detached). A create refused Busy or SchemaUpdated is retried,
+/// at most `FORK_RETRY_CAP` times (review 2 L9: an unbounded loop turned a livelock into an 1800 s
+/// child timeout); the retries are returned, for the callers that count them.
+fn fork_one(c: &Arc<Connection>, name: Option<&str>) -> u64 {
+    for retries in 0..=FORK_RETRY_CAP {
         let made = match name {
             Some(name) => c.create_branch(name).map(|_| ()),
             None => c.fork_branch().map(|b| {
@@ -157,12 +158,16 @@ fn fork_one(c: &Arc<Connection>, name: Option<&str>) {
             }),
         };
         match made {
-            Ok(()) => return,
+            Ok(()) => return retries,
             Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => continue,
-            Err(e) => panic!("populating branch {name:?}: {e}"),
+            Err(e) => panic!("branch {name:?}: {e}"),
         }
     }
+    panic!("branch {name:?}: refused {FORK_RETRY_CAP} times in a row (a livelock)")
 }
+
+/// The most retries `fork_one` makes before it refuses.
+const FORK_RETRY_CAP: u64 = 1000;
 
 /// `n` live branches of the trunk, `<prefix>-<i>` when named, made by up to 32 threads (their
 /// flights shared). The trunk's first child is made first, alone: it takes the WAL write lock.
@@ -335,8 +340,9 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     let left = probe::threads() != base;
     let synced = absorb_confirm(&s0);
     let back = spin_settled(base, std::time::Duration::from_secs(30));
-    let s1 = probe::end();
+    // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
+    let s1 = probe::end();
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
     let confirms = delta(c0[0], c1[0]);
@@ -590,8 +596,8 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
         // and hides one convoyed acknowledgement); its store-mutex acquisitions; the creates
-        // refused Busy or SchemaUpdated and retried (the population's `fork_one` retries them
-        // silently); and its futile leads (`probe::futile_leads`: the store mutex and the group
+        // refused Busy or SchemaUpdated and retried (the count `fork_one` returns; the population
+        // discards it); and its futile leads (`probe::futile_leads`: the store mutex and the group
         // lock taken to lead, and no flight led; review 1 #9).
         let per: Vec<(u64, u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
             let mut clients = Vec::new();
@@ -599,10 +605,22 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             let writer = commits.then(|| {
                 s.spawn(move || {
                     let trunk = db.connect().unwrap();
-                    exec(&trunk, &format!("CREATE TABLE w{c}(x INTEGER)"));
+                    // The writer is load, not a subject: a statement refused Busy or SchemaUpdated
+                    // (a fork holding the trunk's write lock) is retried, not a crashed cell.
+                    let write = |sql: &str| {
+                        for _ in 0..=FORK_RETRY_CAP {
+                            match trunk.execute(sql) {
+                                Ok(_) => return,
+                                Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => continue,
+                                Err(e) => panic!("{cell}: trunk writer: {sql}: {e}"),
+                            }
+                        }
+                        panic!("{cell}: trunk writer: {sql}: refused {FORK_RETRY_CAP} times in a row");
+                    };
+                    write(&format!("CREATE TABLE w{c}(x INTEGER)"));
                     let mut i = 0u64;
                     while creating.load(std::sync::atomic::Ordering::Acquire) {
-                        exec(&trunk, &format!("UPDATE t SET v = 'c{i}' WHERE id = {}", 1 + i % 50));
+                        write(&format!("UPDATE t SET v = 'c{i}' WHERE id = {}", 1 + i % 50));
                         i += 1;
                     }
                 })
@@ -620,13 +638,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                     for i in 0..rounds {
                         let name = format!("{arm}-{t}-{i:04}");
                         let a0 = super::store::thread_waits();
-                        loop {
-                            match trunk.create_branch(&name) {
-                                Ok(_) => break,
-                                Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => retries += 1,
-                                Err(e) => panic!("{arm}: create {name}: {e}"),
-                            }
-                        }
+                        retries += fork_one(&trunk, Some(&name));
                         max_ack = max_ack.max(delta(a0, super::store::thread_waits()));
                         if cfw {
                             let b = db.connect_named(&name).unwrap();
@@ -654,8 +666,12 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
-            let per: Vec<(u64, u64, u64, u64, u64, u64)> = clients.into_iter().map(|h| h.join().unwrap()).collect();
+            // Every client is joined before the writer is told to stop, and only then is a client's
+            // panic raised: unwrapping as it joined left the writer looping, and the scope waiting on
+            // it, until the child's timeout.
+            let joined: Vec<_> = clients.into_iter().map(|h| h.join()).collect();
             creating.store(false, std::sync::atomic::Ordering::Release);
+            let per: Vec<(u64, u64, u64, u64, u64, u64)> = joined.into_iter().map(|j| j.unwrap()).collect();
             if let Some(w) = writer {
                 w.join().unwrap();
             }
@@ -1009,8 +1025,7 @@ fn sql_sample(a: &probe::SqlCounts, b: &probe::SqlCounts) -> Sample {
         ("wal_schema_rows", delta(a.wal_schema_rows, b.wal_schema_rows)),
         ("wal_allocs", delta(a.wal_allocs, b.wal_allocs)),
         ("wal_alloc_bytes", delta(a.wal_alloc_bytes, b.wal_alloc_bytes)),
-        ("allocs", delta(a.allocs, b.allocs)),
-        ("alloc_bytes", delta(a.alloc_bytes, b.alloc_bytes)),
+        ("held_prepares", delta(a.held_prepares, b.held_prepares)),
     ])
 }
 
@@ -1049,7 +1064,9 @@ impl Drop for SchemaHoldDisarm {
 /// `probe::schema_window_met`, a hook in `fork_trunk_registered`) is at least 1 in a window and 0 in
 /// a control; `wal_locks` is exactly 1 on the first-child path and 0 lock-free. The fork runs on its
 /// own thread, so one that waits for the parked commit is released after 30 s (`waited_for_ddl`);
-/// its store condition-variable waits are counted (`store_waits`). References: the schema's row
+/// its store condition-variable waits are counted (`store_waits`), and the bytes the create and the
+/// first connection allocate on their threads (`alloc_bytes`, `connect_alloc_bytes`, from
+/// `probe::thread_allocs`; review 2 L5). References: the schema's row
 /// count (`schema_table_rows`) and one plain `SELECT * FROM sqlite_schema` on a fresh connection
 /// (`ref_scan_page_reads`; it must prepare 1 statement and parse 0 schema rows).
 fn schema_window(cell: &str, tables: u64, out: &mut String) {
@@ -1114,14 +1131,15 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                 let fork = {
                     let forker = forker.clone();
                     std::thread::spawn(move || {
-                        let (c0, w0, m0, z0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps());
+                        let (c0, w0, m0, z0, a0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
                         let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
-                        let (c1, w1, m1, z1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps());
+                        let (c1, w1, m1, z1, a1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
                         let mut s = sql_sample(&c0, &c1);
+                        s.insert("alloc_bytes", delta(a0.1, a1.1));
                         s.insert("store_waits", delta(w0, w1));
                         s.insert("sleeps", delta(z0, z1));
                         s.insert("windows_met", delta(m0, m1));
-                        s.insert("held_after", u64::from(probe::wal_write_held()));
+                        s.insert("held_after", u64::from(probe::wal_lock_held()));
                         (made, s)
                     })
                 };
@@ -1137,14 +1155,15 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                 }
                 made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed: {e}"));
                 // The child's first connection: under MED 8 a window child parses its schema here.
-                let k0 = probe::sql_counts();
+                let (k0, b0) = (probe::sql_counts(), probe::thread_allocs());
                 let branch = db.connect_named("m-0000").unwrap();
-                let k1 = probe::sql_counts();
+                let (k1, b1) = (probe::sql_counts(), probe::thread_allocs());
                 for (key, v) in sql_sample(&k0, &k1) {
                     if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
                         s.insert(*k, v);
                     }
                 }
+                s.insert("connect_alloc_bytes", delta(b0.1, b1.1));
                 // The branch has the schema its pages need (the engine's own test's check).
                 assert_eq!(query_int(&branch, "SELECT c FROM t WHERE id = 1"), 7, "{cell}: {op}: the branch read the new column wrong");
                 s.insert("waited_for_ddl", u64::from(waited));
@@ -1457,11 +1476,36 @@ fn run_instruments(cell: &str) -> String {
     s.insert("schema_table_rows", query_int(&trunk, "SELECT count(*) FROM sqlite_schema") as u64);
     put("fc_sql_reparse", &s);
     let mut s = sql(&mut || exec(&trunk, "INSERT INTO t VALUES (1000, 'fc')"));
-    s.insert("held_after", u64::from(probe::wal_write_held()));
+    s.insert("held_after", u64::from(probe::wal_lock_held()));
     put("fc_sql_insert", &s);
     put("fc_sql_select_after", &sql(&mut || {
         std::hint::black_box(query_int(&trunk, "SELECT count(*) FROM t"));
     }));
+    // Review 2 L4: inside an open write transaction a prepare and a schema re-read count under the
+    // WAL write lock (wal_prepares and wal_schema_rows had never been seen non-zero), and a ROLLBACK
+    // lets the lock go (held_after had been checked only after a commit).
+    exec(&trunk, "BEGIN");
+    let mut s = sql(&mut || {
+        exec(&trunk, "INSERT INTO t VALUES (1001, 'fc-rollback')");
+        std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+        trunk.reparse_schema().unwrap();
+    });
+    s.insert("held_before_rollback", u64::from(probe::wal_lock_held()));
+    exec(&trunk, "ROLLBACK");
+    s.insert("held_after", u64::from(probe::wal_lock_held()));
+    s.insert("rolled_back", u64::from(query_int(&trunk, "SELECT count(*) FROM t WHERE id = 1001") == 0));
+    put("fc_sql_rollback", &s);
+    // Review 2 L6: a statement compiled while this thread holds a store mutex counts as held, one
+    // compiled outside does not (the guard taken through the probe's own hook pair).
+    put(
+        "fc_sql_held_prepare",
+        &sql(&mut || {
+            std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+            probe::store_locked();
+            std::hint::black_box(trunk.prepare("SELECT 2").unwrap());
+            probe::store_unlocked();
+        }),
+    );
     out
 }
 
@@ -1508,7 +1552,9 @@ fn budget_child() {
             }
         };
         let mut built = build(&spec, n, large, named);
-        probe::arm(true);
+        // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
+        // Mach traps per hold inside the measured mutex otherwise).
+        probe::arm(!spec.starts_with("shared_"));
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         if spec.starts_with("mem_") {
             memory(&spec, &mut built, &mut text);
@@ -1905,7 +1951,7 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "bg_hold_alloc_bytes"), 16, "the background maximum: the spawned thread's 16 B hold, not the foreground's 64 B");
     assert_eq!(get("fc_live_and_hold", "all_hold_alloc_bytes"), 64, "the all-threads maximum: the foreground's 64 B hold");
     assert_eq!(get("fc_live_and_hold", "hold_thread_left"), 1, "the hold arm's joined thread never left the thread count");
-    for k in ["prepares", "page_reads", "schema_rows", "wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs"] {
+    for k in ["prepares", "page_reads", "schema_rows", "wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs", "held_prepares"] {
         assert_eq!(get("fc_sql_nothing", k), 0, "an empty window moved {k}");
     }
     assert_eq!(get("fc_sql_prepare_3", "prepares"), 3, "three statements prepared");
@@ -1928,6 +1974,14 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_sql_insert", "held_after"), 0, "the WAL write lock still read as held after the commit");
     assert!(get("fc_sql_select_after", "page_reads") >= 1, "a SELECT read no page");
     assert_eq!(get("fc_sql_select_after", "wal_page_reads"), 0, "a SELECT after the commit read under the WAL write lock");
+    assert_eq!(get("fc_sql_rollback", "wal_locks"), 1, "a write transaction took the WAL write lock once");
+    assert!(get("fc_sql_rollback", "wal_prepares") >= 2, "a prepare and a re-read's scan under the WAL write lock not counted under it (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "wal_schema_rows"), rows, "a schema re-read under the WAL write lock: every sqlite_schema row once, under it (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "held_before_rollback"), 1, "an open write transaction's WAL write lock not read as held");
+    assert_eq!(get("fc_sql_rollback", "held_after"), 0, "the WAL write lock still read as held after a ROLLBACK (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "rolled_back"), 1, "premise: the ROLLBACK undid the INSERT");
+    assert_eq!(get("fc_sql_held_prepare", "prepares"), 2, "two statements prepared");
+    assert_eq!(get("fc_sql_held_prepare", "held_prepares"), 1, "one statement prepared under a store mutex, one outside (review 2 L6)");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {

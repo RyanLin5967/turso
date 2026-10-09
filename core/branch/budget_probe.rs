@@ -99,7 +99,7 @@ fn note_alloc(bytes: usize) {
         bump(&T_HELD_ALLOCS, 1);
         bump(&T_HELD_ALLOC_BYTES, bytes as u64);
     }
-    if wal_held() {
+    if wal_lock_held() {
         bump(&T_WAL_ALLOCS, 1);
         bump(&T_WAL_ALLOC_BYTES, bytes as u64);
     }
@@ -113,7 +113,8 @@ fn note_alloc(bytes: usize) {
 // which a reparse and the ParseSchema opcode both reach; review 2 M4),
 // and a WAL write lock (from `Pager::begin_write_tx` once `Wal::begin_write_tx` succeeded, to
 // `WalFile::end_write_tx`, which every release path calls: the commit's, a rollback's, a close's),
-// with what this thread did while it held one. Six `cfg(test)` hook lines in the engine's files.
+// with what this thread did while it held one; and the statements compiled while this thread held a
+// store mutex (`held_prepares`, review 2 L6). Six `cfg(test)` hook lines in the engine's files.
 // BLIND SPOTS: a page read without the pager's `read_page` (`read_page_no_cache`) is not counted;
 // the lock is ANY database's WAL write lock, the trunk's or the branch catalog's own (a separate
 // Turso database); a thread holding two at once reads as holding one until either is released.
@@ -121,6 +122,9 @@ thread_local! {
     static T_PREPARES: Cell<u64> = const { Cell::new(0) };
     static T_PAGE_READS: Cell<u64> = const { Cell::new(0) };
     static T_SCHEMA_ROWS: Cell<u64> = const { Cell::new(0) };
+    /// Statements compiled while this thread held a store mutex (review 2 L6: a first create's
+    /// catalog creation prepares 42 statements and runs 13 DDL commits under it).
+    static T_HELD_PREPARES: Cell<u64> = const { Cell::new(0) };
     static WAL_HELD: Cell<bool> = const { Cell::new(false) };
     static T_WAL_LOCKS: Cell<u64> = const { Cell::new(0) };
     static T_WAL_PREPARES: Cell<u64> = const { Cell::new(0) };
@@ -130,14 +134,19 @@ thread_local! {
     static T_WAL_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
-fn wal_held() -> bool {
+/// Whether this thread holds a WAL write lock now, any database's (review 2 L12: not only the
+/// trunk's; the branch catalog is a database of its own).
+pub(crate) fn wal_lock_held() -> bool {
     WAL_HELD.try_with(|h| h.get()).unwrap_or(false)
 }
 
 /// A statement was prepared on this thread.
 pub(crate) fn statement_prepared() {
     bump(&T_PREPARES, 1);
-    if wal_held() {
+    if DEPTH.try_with(|d| d.get()).unwrap_or(0) > 0 {
+        bump(&T_HELD_PREPARES, 1);
+    }
+    if wal_lock_held() {
         bump(&T_WAL_PREPARES, 1);
     }
 }
@@ -145,7 +154,7 @@ pub(crate) fn statement_prepared() {
 /// A page was read through the pager on this thread.
 pub(crate) fn page_read() {
     bump(&T_PAGE_READS, 1);
-    if wal_held() {
+    if wal_lock_held() {
         bump(&T_WAL_PAGE_READS, 1);
     }
 }
@@ -153,7 +162,7 @@ pub(crate) fn page_read() {
 /// A `sqlite_schema` row was parsed into a schema on this thread.
 pub(crate) fn schema_row_parsed() {
     bump(&T_SCHEMA_ROWS, 1);
-    if wal_held() {
+    if wal_lock_held() {
         bump(&T_WAL_SCHEMA_ROWS, 1);
     }
 }
@@ -181,8 +190,7 @@ pub(crate) struct SqlCounts {
     pub(crate) wal_schema_rows: u64,
     pub(crate) wal_allocs: u64,
     pub(crate) wal_alloc_bytes: u64,
-    pub(crate) allocs: u64,
-    pub(crate) alloc_bytes: u64,
+    pub(crate) held_prepares: u64,
 }
 
 pub(crate) fn sql_counts() -> SqlCounts {
@@ -197,8 +205,7 @@ pub(crate) fn sql_counts() -> SqlCounts {
         wal_schema_rows: get(&T_WAL_SCHEMA_ROWS),
         wal_allocs: get(&T_WAL_ALLOCS),
         wal_alloc_bytes: get(&T_WAL_ALLOC_BYTES),
-        allocs: get(&T_ALLOCS),
-        alloc_bytes: get(&T_ALLOC_BYTES),
+        held_prepares: get(&T_HELD_PREPARES),
     }
 }
 
@@ -251,11 +258,6 @@ pub(crate) fn schema_window_met() {
 /// This thread's count of `schema_window_met`.
 pub(crate) fn schema_windows_met() -> u64 {
     T_WINDOWS_MET.with(|c| c.get())
-}
-
-/// Whether this thread holds a trunk's WAL write lock now (the fire-check's).
-pub(crate) fn wal_write_held() -> bool {
-    wal_held()
 }
 
 // SAFETY: every call is forwarded unchanged to `System`; the counting touches only atomics and
@@ -338,10 +340,13 @@ pub(crate) fn store_unlocked() {
             MAX_BG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
             MAX_BG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
         }
-        if let (Some(since), Some(now)) = (HELD_SINCE.with(|s| s.take()), unix_syscalls()) {
-            let held = now.wrapping_sub(since) & u64::from(u32::MAX);
-            HELD_SYSCALLS.fetch_add(held, Relaxed);
-            bump(&T_HELD_SYSCALLS, held);
+        // Review 2 L7: the kernel count is read only when an armed hold sampled it at its lock.
+        if let Some(since) = HELD_SINCE.with(|s| s.take()) {
+            if let Some(now) = unix_syscalls() {
+                let held = now.wrapping_sub(since) & u64::from(u32::MAX);
+                HELD_SYSCALLS.fetch_add(held, Relaxed);
+                bump(&T_HELD_SYSCALLS, held);
+            }
         }
     }
 }
