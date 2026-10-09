@@ -1392,7 +1392,8 @@ impl Session {
 
     /// CHECKPOINT is the trunk's, as PostgreSQL's is the cluster's, so a session on a branch runs it
     /// on its trunk connection. Outside a block it is a TRUNCATE checkpoint that waits for writers
-    /// and readers within the lock timeout and fails with 55P03 after it. Inside a block the
+    /// and readers within the lock timeout and fails with 55P03 after it, then the branch store's
+    /// checkpoint (wire review 14 item 13). Inside a block the
     /// session's own transaction may hold the very locks a TRUNCATE waits for, so it is a PASSIVE
     /// checkpoint on a connection of its own, which never waits: it backfills what no reader pins.
     /// A busy answer there skips the checkpoint, and says so: a NOTICE, one more in
@@ -1431,6 +1432,14 @@ impl Session {
             })
         })
         .map_err(|e| engine_info(&e))?;
+        // Then the branch store's: its catalog checkpoint, which cuts the branch log, counted in
+        // turso_branch_stats' `store_checkpoints` (a no-op for volatile branches). PostgreSQL's
+        // CHECKPOINT carries all of the cluster's checkpoint I/O; over the wire this one carried
+        // none of the store's, so no client could force or count it (PREREG section 5 M2; wire
+        // review 14 item 13). It waits for a fuzzy checkpoint in flight, which is why a block's
+        // CHECKPOINT, which never waits, leaves the store alone.
+        self.waiting(|| self.shared.db.branch_compact_now())
+            .map_err(|e| engine_info(&e))?;
         Ok(Response::Execution(Tag::new("CHECKPOINT")))
     }
 
@@ -1703,7 +1712,7 @@ impl Session {
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
-            return stats_row(format);
+            return stats_row(format, &self.shared.db);
         }
         if !matches!(
             f,
@@ -2398,26 +2407,32 @@ fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
-const STATS_COLUMNS: [&str; 5] = [
+const STATS_COLUMNS: [&str; 6] = [
     "unix_syscalls",
     "mach_syscalls",
     "instructions",
     "cycles",
     "checkpoints_skipped",
+    "store_checkpoints",
 ];
 
 /// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
 /// the call runs, NULLs where the platform does not count them; then the server's own count of
-/// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]).
-fn stats_row(format: &Format) -> SqlResult<Response> {
+/// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]); then the branch store's checkpoints installed
+/// since the database opened (its own count, the first of `branch_checkpoint_counters`; 0 for a
+/// store that is not a catalog store), so a client can count the store checkpoints in a timed
+/// window (PREREG section 5 M2; wire review 14 item 13).
+fn stats_row(format: &Format, db: &Database) -> SqlResult<Response> {
     let header = Arc::new(stats_fields(format)?);
     let mut encoder = DataRowEncoder::new(header.clone());
     let values = counters::process_counters()
         .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
     let skipped = CHECKPOINTS_SKIPPED.load(Ordering::Relaxed) as i64;
+    let store_checkpoints = db.branch_checkpoint_counters()[0] as i64;
     let row = (0..4)
         .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
         .and_then(|()| encoder.encode_field(&skipped))
+        .and_then(|()| encoder.encode_field(&store_checkpoints))
         .and_then(|()| encoder.finish());
     Ok(Response::Query(QueryResponse::new(
         header,
