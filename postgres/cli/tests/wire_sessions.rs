@@ -7231,6 +7231,35 @@ fn a_foreign_key_the_catalog_refuses_is_refused_before_the_rebuild() {
     a.q("INSERT INTO c VALUES (6)").ok("c is unchanged");
 }
 
+/// A key the translator refuses (MATCH FULL over two columns, 0A000) is refused before an ALTER
+/// TABLE ADD FOREIGN KEY rebuilds the table, so while another session holds the trunk's write lock
+/// it is answered as it is, status I, not 55P03 after the lock wait, and the table is unchanged.
+/// The refusal came from translating the rebuild's own CREATE TABLE, after the BEGIN, the aside copy
+/// and the DROP, under the write lock (wire review 16 item 9). The server's lock wait is 300 ms so
+/// the base answers 55P03 at once rather than after a minute.
+#[test]
+fn a_key_the_translator_refuses_is_refused_before_the_rebuild() {
+    let dir = Scratch::new("fkmatchfull");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(a INT, b INT, PRIMARY KEY (a, b))")
+        .ok("p");
+    a.q("CREATE TABLE c(x INT, y INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5, 6)").ok("c row");
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9, 9)")
+        .ok("another session takes the write lock");
+    let sql = "ALTER TABLE c ADD FOREIGN KEY (x, y) REFERENCES p(a, b) MATCH FULL";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "0A000");
+    assert_eq!(r.status, b'I');
+    w.q("ROLLBACK").ok("end");
+    a.q("INSERT INTO c VALUES (7, 8)")
+        .ok("c is unchanged: no key was added");
+    assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "2");
+}
+
 /// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
 /// it. Its copy-back ran with foreign keys enforced, so it counted rows again: (i) a block's
 /// deferred orphan was cancelled by a valid child the copy re-inserted, and COMMIT kept the
