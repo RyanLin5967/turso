@@ -2597,6 +2597,9 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(m) if m.starts_with("NOT NULL constraint failed") => "23502",
         LimboError::Constraint(m) if m.starts_with("CHECK constraint failed") => "23514",
         LimboError::Constraint(m) if m.starts_with("invalid ") => "22P02",
+        // The engine's NUMERIC divide refuses a zero divisor as a constraint error in PostgreSQL's
+        // words, which is 22012, never an integrity violation (wire review 16 item 2).
+        LimboError::Constraint(m) if m == "division by zero" => "22012",
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
         LimboError::ParseError(m)
