@@ -1003,8 +1003,10 @@ impl Scanned {
                     if in_place {
                         set_file_len(&journal.file, whole as u64)?;
                         if class.syncs() {
+                            // The directory first, in Fsync: the log's full sync after it drains
+                            // the device, both writes included (engine review 16 LOW 11).
+                            fsync_dir_of(&files.log, open_dir_class(SyncClass::FullFsync))?;
                             fsync_file(&journal.file, SyncClass::FullFsync)?;
-                            fsync_dir_of(&files.log, SyncClass::FullFsync)?;
                             journal.prev_synced = true;
                         }
                     } else {
@@ -1018,11 +1020,13 @@ impl Scanned {
                     // later flight's frames will prove it was. So is its directory: that process
                     // may have died between a cut's rename and the flight that would have synced
                     // it, and `dir_dirty` died with it (engine review 10 #4). Mutant
-                    // `open_forgets_unsynced_rename` (test builds only): not synced, as before.
-                    fsync_file(&journal.file, class)?;
+                    // `open_forgets_unsynced_rename` (test builds only): not synced, as before. The
+                    // directory goes first, in Fsync, and the log's sync in `class` drains the
+                    // device after both (engine review 16 LOW 11: one flush, not two).
                     if !super::store::fe_mutant("open_forgets_unsynced_rename") {
-                        fsync_dir_of(&files.log, class)?;
+                        fsync_dir_of(&files.log, open_dir_class(class))?;
                     }
+                    fsync_file(&journal.file, class)?;
                     confirmable = proves_stable(class);
                     journal.prev_synced = true;
                 } else if !super::store::fe_mutant("open_forgets_unsynced_rename") {
@@ -3784,6 +3788,18 @@ thread_local! {
     /// Test builds: branch-file syncs this thread asked for, by class (`[Fsync, FullFsync]`),
     /// whatever the platform makes of them (engine review 16 MED 7: off Apple both are fsync(2)).
     pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
+}
+
+/// The class an open syncs the log's directory in, before the log itself (engine review 16 LOW
+/// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
+/// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
+/// class, as before (two device flushes per syncing open).
+fn open_dir_class(class: SyncClass) -> SyncClass {
+    if super::store::fe_mutant("open_dir_sync_in_class") {
+        class
+    } else {
+        SyncClass::Fsync
+    }
 }
 
 /// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
