@@ -10545,7 +10545,14 @@ pub fn op_function(
                                         "division by zero".to_string(),
                                     ));
                                 }
-                                a / b
+                                // PostgreSQL's result scale (lead ruling 2026-10-09 on
+                                // e52f01422). Mutant `div_scale_bigdecimal` (test builds
+                                // only): bigdecimal's own, as before.
+                                if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
+                                    a / b
+                                } else {
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                }
                             }
                             _ => unreachable!(),
                         };
