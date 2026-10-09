@@ -1479,6 +1479,13 @@ impl Database {
         self.branches.confirm_counts()
     }
 
+    /// Entries the catalog checkpoints' captures materialised under the store mutex so far: each
+    /// captured row's current pages and retained versions (PREREG A27; observing only).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_capture_entries(&self) -> u64 {
+        self.branches.checkpoint_capture_entries()
+    }
+
     /// Start a fuzzy catalog checkpoint now (F-FZ): its write runs on a thread of its own. `false`:
     /// nothing started (parked Commits remain after one bounded settle batch, one is in flight, or
     /// this is not a catalog store).

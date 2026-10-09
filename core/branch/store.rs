@@ -1348,6 +1348,9 @@ struct CkptCounters {
     settle_batches: u64,
     settle_loads: u64,
     settle_max_loads: u64,
+    /// Entries the capture materialised under the store mutex: each captured row's `current` and
+    /// retained versions (PREREG A27, the F-FZ residual; observing only, not in `as_array`).
+    capture_entries: u64,
 }
 
 impl CkptCounters {
@@ -1556,6 +1559,16 @@ fn fuzzy_checkpoints() -> bool {
         // The same exact names as `BranchCheckpoint::resolve` (review 4 #8).
         other => panic!("R11_CKPT={other:?}: the branch checkpoint mode is \"fuzzy\" or \"sharp\""),
     })
+}
+
+/// PREREG A27 (the F-FZ capture residual): with `R11_CAPTURE_GATE=on`, a checkpoint's capture copies a
+/// branch's `current` only when a writer of its row needs it (`DIRTY_NEW` or `DIRTY_CUR`), and its
+/// retained versions only for `DIRTY_NEW` or `DIRTY_RET`, as `checkpoint_write` uses them. A branch
+/// that is only `DIRTY_ROW` (a parent that forked) is then one row, not its whole page map. Off by
+/// default until the counter arm is scored: the lane's arm-switch pattern, like `R11_CKPT`.
+fn capture_gate() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on"))
 }
 
 impl CatState {
@@ -2363,26 +2376,37 @@ impl Lineage {
 /// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
 /// resident branch's row, current page map and retained versions, with what changed in it.
 fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+    // PREREG A27 (r11-restart-r3-capgate, opt-in): with the gate on, a row's lists are copied only
+    // for the flags under which `checkpoint_write` reads them (`put_branch` for DIRTY_NEW, `put_cur`
+    // for DIRTY_CUR, `put_ret` for DIRTY_RET; `update_row` and `rekey` read neither list).
+    let gate = capture_gate();
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
         .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
-        .map(|(&id, st, what)| (CatBranch {
-            id: id.0,
-            parent: st.parent.0,
-            fork_epoch: st.fork_epoch,
-            epoch: st.lineage.epoch,
-            released: st.handle == Handle::Released,
-            held_open: st.handle == Handle::Released && st.open,
-            lease: if st.handle == Handle::Released { None } else { st.lease },
-            n_children: st.lineage.n_children,
-            current: st
-                .current
-                .iter()
-                .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                .collect(),
-            retained: st.lineage.retained_list(),
-            name: None,
-        }, what))
+        .map(|(&id, st, what)| {
+            let need_current = !gate || what & (DIRTY_NEW | DIRTY_CUR) != 0;
+            let need_retained = !gate || what & (DIRTY_NEW | DIRTY_RET) != 0;
+            (CatBranch {
+                id: id.0,
+                parent: st.parent.0,
+                fork_epoch: st.fork_epoch,
+                epoch: st.lineage.epoch,
+                released: st.handle == Handle::Released,
+                held_open: st.handle == Handle::Released && st.open,
+                lease: if st.handle == Handle::Released { None } else { st.lease },
+                n_children: st.lineage.n_children,
+                current: if need_current {
+                    st.current
+                        .iter()
+                        .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                retained: if need_retained { st.lineage.retained_list() } else { Vec::new() },
+                name: None,
+            }, what)
+        })
         .collect();
     #[cfg(test)]
     CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
@@ -6854,6 +6878,12 @@ impl BranchStore {
         self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.fuzzy_refused_splice)
     }
 
+    /// Entries every capture so far materialised under the store mutex (PREREG A27; 0 for other
+    /// modes).
+    pub(crate) fn checkpoint_capture_entries(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.capture_entries)
+    }
+
     /// Start a fuzzy checkpoint now, whatever the log's length (F-FZ; tests and the harness), as
     /// `maybe_compact` would: while C-R has parked Commits, this settles one bounded batch and
     /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
@@ -8122,6 +8152,10 @@ impl StoreInner {
                 (dirty, rows)
             }
         };
+        // PREREG A27 instrument (observing only): the entries this capture materialised under the
+        // store mutex, each captured row's `current` and retained versions.
+        cat.ckpt.capture_entries +=
+            rows.iter().map(|(b, _)| (b.current.len() + b.retained.len()) as u64).sum::<u64>();
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
