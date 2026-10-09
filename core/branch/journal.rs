@@ -94,10 +94,12 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// the nonce. A 9 or 10 log ("written before the log nonce") is refused, never reinterpreted.
 ///
 /// 13 and 14 (fastest-engine, engine review 10 #2 and review 6 #7): the end frame says how its
-/// writer synced it, per flight: not at all, by a writer whose own class syncs (every flight
-/// before it was synced before it was written), raised by a writer whose class does not, or
-/// ORDERED ahead of a trunk commit's flush by either (`EndKind`). An 11 or 12 log tagged every
-/// synced or ordered flight alike, so it is refused, never reinterpreted.
+/// writer synced it, per flight: not at all, synced once every byte before it was synced (by a
+/// writer whose own class syncs, or after a synced or ordered flight), raised (synced, after a
+/// byte that may not have been), or ORDERED ahead of a trunk commit's flush either way
+/// (`EndKind`). An 11 or 12 log tagged every synced or ordered flight alike, so it is refused,
+/// never reinterpreted. A 13 or 14 log written before engine review 16 MED 5 tagged a raised
+/// flight after a synced one Raised, which only weakens its evidence: read as it is.
 const FORMAT_VERSION: u32 = 13;
 const SPLICE_FORMAT_VERSION: u32 = 14;
 
@@ -130,24 +132,27 @@ const END_ORDERED_RAISED_TAG: u8 = 0xE4;
 enum EndKind {
     /// Written in a class that does not sync: its slots may never have reached the device.
     Unsynced,
-    /// Synced by a writer whose own class syncs: it synced every flight before writing the next,
-    /// so this flight being written proves the one before it was synced.
+    /// Synced, and written once every byte before it was synced (`Journal::prev_synced`: the
+    /// writer's own class syncs, or the flight before it synced or was ordered, raised ones
+    /// included, since flights go one at a time; engine review 16 MED 5), so this flight being
+    /// written proves the one before it was synced.
     Synced,
-    /// Synced by a writer whose class does not (a raised D0 flight): durable itself, it proves
+    /// Synced, written when a byte before it may not have been (a raised D0 flight after an
+    /// unsynced one, or the first after an open that synced nothing): durable itself, it proves
     /// nothing about the flights before it.
     Raised,
-    /// ORDERED ahead of a trunk commit's F_FULLFSYNC (barriered, never confirmed), by a writer
-    /// whose class syncs (review 6 #7): its slots were barriered ahead of its records, so its
-    /// records on the device prove its slots are.
+    /// ORDERED ahead of a trunk commit's F_FULLFSYNC (barriered, never confirmed), written once
+    /// every byte before it was synced, as `Synced` (review 6 #7): its slots were barriered ahead
+    /// of its records, so its records on the device prove its slots are.
     Ordered,
-    /// `Ordered`, by a writer whose class does not sync: it proves nothing about the flights
-    /// before it.
+    /// `Ordered`, written when a byte before it may not have been synced: it proves nothing about
+    /// the flights before it.
     OrderedRaised,
 }
 
 impl EndKind {
-    /// The kind of a flight synced or not (`syncs`), ordered or not, by a writer whose class syncs
-    /// or not.
+    /// The kind of a flight synced or not (`syncs`), written once every byte before it was synced
+    /// or not (`base_syncs`).
     fn of(syncs: bool, base_syncs: bool) -> Self {
         match (syncs, base_syncs) {
             (false, _) => EndKind::Unsynced,
@@ -190,7 +195,7 @@ impl EndKind {
         self != EndKind::Unsynced
     }
 
-    /// Written by a writer that synced (or ordered) every flight before writing the next.
+    /// Written once every byte before it was synced (or ordered).
     fn by_syncing_writer(self) -> bool {
         matches!(self, EndKind::Synced | EndKind::Ordered)
     }
@@ -952,6 +957,7 @@ impl Scanned {
                         if class.syncs() {
                             fsync_file(&journal.file, SyncClass::FullFsync)?;
                             fsync_dir_of(&files.log, SyncClass::FullFsync)?;
+                            journal.prev_synced = true;
                         }
                     } else {
                         let snapshot_len = journal.snapshot_len;
@@ -970,6 +976,7 @@ impl Scanned {
                         fsync_dir_of(&files.log, class)?;
                     }
                     confirmable = proves_stable(class);
+                    journal.prev_synced = true;
                 } else if !super::store::fe_mutant("open_forgets_unsynced_rename") {
                     // Nothing here syncs: the next flight that does (a raised one) syncs the
                     // directory first, as after a cut in this process.
@@ -1129,6 +1136,12 @@ pub(crate) struct Journal {
     /// flight syncs the directory before its own log sync, so nothing is acknowledged before the
     /// rename is durable (review 2 #5: no directory sync under the store mutex).
     dir_dirty: bool,
+    /// Every byte the log holds was synced before the next flight is written (engine review 16
+    /// MED 5): set by a flight that syncs or is ordered (raised ones included: flights go one at a
+    /// time), a syncing open and a synced rewrite; cleared by a flight, an open or a rewrite that
+    /// syncs nothing. A flight written while it is set proves the one before it was synced, so its
+    /// end frame says so (`EndKind::Synced` / `Ordered`) whatever the writer's own class.
+    prev_synced: bool,
     /// After a failed checkpoint or compaction, no other is wanted until the log is past this
     /// length (review 2 #5: no retry storm, every operation starting one). 0 after a rewrite.
     compact_after: u64,
@@ -1170,6 +1183,9 @@ pub(crate) struct CutPrep {
     /// Every flight the prep kept is tagged synced (`reframe_tagged`): the install may confirm a
     /// delta's last flight only then (engine review 7 #1).
     all_synced: bool,
+    /// The temp log was synced (the prep's rewrite class syncs): with a synced delta, every byte
+    /// of the new log is (`Journal::prev_synced`).
+    synced: bool,
 }
 
 impl Journal {
@@ -1245,6 +1261,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            prev_synced: false,
             compact_after: 0,
         })
     }
@@ -1446,6 +1463,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            prev_synced: false,
             compact_after: 0,
         };
 
@@ -1834,6 +1852,7 @@ impl Journal {
         }
         // The records an earlier run made durable are carried in a synced rewrite now.
         self.inherited = SyncClass::Off;
+        self.prev_synced = class.syncs();
         Ok(())
     }
 
@@ -1897,6 +1916,7 @@ impl Journal {
                 old_nonce: src.nonce,
                 raised: src.raised,
                 all_synced,
+                synced: src.class.syncs(),
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&src.tmp);
@@ -1925,6 +1945,7 @@ impl Journal {
             return self.rewrite_from(from, generation);
         }
         let class = self.rewrite_class();
+        let mut synced = prep.synced;
         let mut len = LOG_HEADER_LEN as u64 + prep.written;
         // A raise since the prep (review 5 #11) reaches the new header; one always comes with a
         // flight's frames, so the delta's sync below covers it. Mutant `cut_drops_raise` (test
@@ -1942,6 +1963,7 @@ impl Journal {
                 if class.syncs() {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
+                synced &= class.syncs();
                 len += frames.len() as u64;
             }
         }
@@ -1968,6 +1990,7 @@ impl Journal {
         self.dir_dirty = class.syncs() || !super::store::fe_mutant("unsynced_rename_left_clean");
         // The records an earlier run made durable are carried in a synced rewrite now.
         self.inherited = SyncClass::Off;
+        self.prev_synced = synced;
         Ok(())
     }
 
@@ -2093,7 +2116,7 @@ impl Journal {
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
-        frames.extend_from_slice(&end_frame(self.nonce, EndKind::of(class.syncs(), self.sync.syncs()), &self.pending));
+        frames.extend_from_slice(&end_frame(self.nonce, EndKind::of(class.syncs(), self.base_synced()), &self.pending));
         let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -2107,6 +2130,7 @@ impl Journal {
                 self.pending.clear();
                 self.pending_slots.clear();
                 self.pending_class = SyncClass::Off;
+                self.prev_synced = class.syncs();
                 Ok(())
             }
             Err(e) => {
@@ -2227,7 +2251,7 @@ impl Journal {
                 ordered: false,
                 dir: None,
                 nonce: self.nonce,
-                base_syncs: self.sync.syncs(),
+                base_syncs: self.base_synced(),
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -2278,6 +2302,10 @@ impl Journal {
         let mut bytes = std::mem::take(&mut self.pending);
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
+        // The next flight is taken only once this one landed (one at a time), and a failed one
+        // fail-stops the store, so what this one syncs is what the next one's predecessor did.
+        let base_syncs = self.base_synced();
+        self.prev_synced = class.syncs();
         let at = self.len;
         // The flight's end frame goes in the same write, built by `Flight::write` with no lock held
         // (review 2 #8); its room is reserved here. An upgrade has no frames and no end.
@@ -2299,8 +2327,15 @@ impl Journal {
             ordered: false,
             dir,
             nonce: self.nonce,
-            base_syncs: self.sync.syncs(),
+            base_syncs,
         })
+    }
+
+    /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
+    /// the writer's own class syncs. Mutant `prev_synced_ignored` (test builds only): the writer's
+    /// class alone, as before engine review 16 MED 5.
+    fn base_synced(&self) -> bool {
+        self.sync.syncs() || (self.prev_synced && !super::store::fe_mutant("prev_synced_ignored"))
     }
 
     /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
@@ -2488,6 +2523,7 @@ impl Journal {
         // The records an earlier run made durable are carried in a synced rewrite now (a
         // compaction's snapshot, synced before this reset; a page-size restart's empty state).
         self.inherited = SyncClass::Off;
+        self.prev_synced = class.syncs();
         Ok(())
     }
 
@@ -2740,8 +2776,9 @@ pub(crate) struct Flight {
     dir: Option<File>,
     /// The log incarnation's nonce, for the end frame `write` builds.
     nonce: u32,
-    /// The writer's own class syncs (`Journal::sync`): its end frame says whether it was synced as
-    /// every flight of this writer is, or raised (`EndKind`; engine review 10 #2).
+    /// Every byte before this flight was synced when it was taken (`Journal::base_synced`): its end
+    /// frame says whether it proves the flight before it synced, or is raised (`EndKind`; engine
+    /// review 10 #2, review 16 MED 5).
     base_syncs: bool,
 }
 
@@ -2984,11 +3021,13 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
 ///
 /// The second form proves the damaged flight's sync returned only if the later flight's WRITER
 /// synced every flight before writing the next (engine review 7 #2), decided from the log's own
-/// evidence, not the opener's class: the later flight's own end frame says its writer's class
-/// synced (`EndKind::Synced`; engine review 10 #2: per flight, since a reopen in another class
-/// keeps the incarnation, so a whole-incarnation reading was wrong both ways), or the header
-/// confirms the later flight itself (`confirmed`: its sync returned, so every byte before it was
-/// durable). A raised flight (`EndKind::Raised`) proves nothing about the flights before it.
+/// evidence, not the opener's class: the later flight's own end frame says every byte before it
+/// was synced when it was written (`EndKind::Synced`; engine review 10 #2: per flight, since a
+/// reopen in another class keeps the incarnation, so a whole-incarnation reading was wrong both
+/// ways; review 16 MED 5: per predecessor, not per writer class, since a raised flight after a
+/// raised one proves it too), or the header confirms the later flight itself (`confirmed`: its
+/// sync returned, so every byte before it was durable). A raised flight (`EndKind::Raised`,
+/// written after a byte that may not have been synced) proves nothing about the flights before it.
 /// Mutants (test builds only): `writer_syncs_by_opener` (the writer taken to sync iff the opener's
 /// class does, `opener_syncs`, as before engine review 7 #2) and
 /// `writer_evidence_whole_incarnation` (no whole flight of the incarnation tagged unsynced, before
