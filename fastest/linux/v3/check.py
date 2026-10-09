@@ -1346,6 +1346,18 @@ def real_selftest(chk):
         g = run("control")
         chk("real: the banked write-back batch passes all five F3 checks unplanted",
             [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [], {i: tags(g.get(i, {})) for i in F3IDS})
+        # V3 review 12 item 3: both banked fixtures carry the sync-record shape THIS blkflush emits, present and 0, so a
+        # planted case fails on its plant, never on a missing key (the fd-7 case passed vacuously on the missing
+        # inside_no_fd). testdata/regen_f3.py regenerates them by script; until it runs (LOUD), this case and the
+        # control are red, a stated red
+        for fx in (BANKED_F3, BANKED_F3_WT):
+            sy0 = (rj(os.path.join(HERE, "testdata", fx, "F3", "blkflush", "report.json")) or {}).get("syscalls") or {}
+            ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
+            n00 = (sy0.get("arms") or {}).get("nosync25") or {}
+            chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
+                "no_fd, inside_foreign_fd, inside_no_fd present and 0)" % fx,
+                n00.get("syncs_inside_any_fd") == 0 and sorted(ua0) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
+                and all(v == 0 for v in ua0.values()), (n00, ua0))
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
             return {"probe": f, "merged": f}
