@@ -700,6 +700,13 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
+            // failed drain of the device, acted on before the row reports busy (engine review 17
+            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
+            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
+                pager.check_noted_syncs();
+            }
             pager.clear_checkpoint_state();
             state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
