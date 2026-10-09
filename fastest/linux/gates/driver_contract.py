@@ -72,8 +72,11 @@ def check(j, t, c, rule, by_client=None):
 
 
 def self_test():
-    def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=5010, by=None, per="auto", wpc=None,
+    # TEST EDIT, flagged (review 5 LOW 15): ot defaults to oa. It was 5010 beside oa 5000, and two cases gave 40 beside
+    # 12: a completion-counting driver's numbers, which A23's claim count cannot produce. No expectation changes.
+    def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=None, by=None, per="auto", wpc=None,
             capped=True):
+        ot = oa if ot is None else ot
         by = by if by is not None else split(t, c)
         return {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
                 "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
@@ -86,7 +89,7 @@ def self_test():
         ("the split is [9, 8, 8, 8]", split(33, 4) == [9, 8, 8, 8]),
         ("T=20 over 16 clients is four at 2", split(20, 16) == [2] * 4 + [1] * 12),
         ("an early stop on ops (10:0:30) keeps the contract",
-         check(rec(rule="10:0:30", st=0.04, oa=12, ot=40, capped=False), 33, 4, "10:0:30") == []),
+         check(rec(rule="10:0:30", st=0.04, oa=12, capped=False), 33, 4, "10:0:30") == []),
         ("mutant: OPS ignored (stops at S=0 with 0 of 10^6 ops)",
          check(rec(st=0.02, oa=3), 33, 4, "1000000:0:2") != []),
         ("mutant: S and MAX_S swapped (stops at 0 with MAX_S 2)", check(rec(st=0.0, oa=0), 33, 4, "1000000:0:2") != []),
@@ -108,7 +111,7 @@ def self_test():
         ("LOW 14: capped as a string fails", check(rec(capped="true"), 33, 4, "1000000:0:2") != []),
         ("LOW 14: a stop below OPS that says not capped fails", check(rec(capped=False), 33, 4, "1000000:0:2") != []),
         ("LOW 14: capped before MAX_S fails",
-         check(rec(rule="10:0:30", st=0.04, oa=12, ot=40, capped=True), 33, 4, "10:0:30") != []),
+         check(rec(rule="10:0:30", st=0.04, oa=12, capped=True), 33, 4, "10:0:30") != []),
         # review 5 LOW 15: under A23 the warm-up ops are the claims before the ending claim, read after every client
         # finished, so ops == ops_at_stop; capped both ways (not capped needs S reached; done wins over capped)
         ("LOW 15: ops above ops_at_stop fails (a claim counted after the end)",
@@ -119,6 +122,12 @@ def self_test():
          check(rec(rule="10:1:2", st=2.0, oa=12, ot=12, capped=True), 33, 4, "10:1:2") != []),
         ("LOW 15: a clean early stop with S > 0 keeps the contract",
          check(rec(rule="10:1:30", st=1.01, oa=12, ot=12, capped=False), 33, 4, "10:1:30") == []),
+        # the capped=(claimed < OPS) mutant differs from the rule only when MAX_S < S: at MAX_S with OPS met and S not
+        # reached, the rule says capped and the mutant says not (parse_rule accepts S > MAX_S)
+        ("LOW 15: MAX_S below S, OPS met, recorded not capped fails (the capped=(claimed<OPS) mutant)",
+         check(rec(rule="10:5:2", st=2.0, oa=12, capped=False), 33, 4, "10:5:2") != []),
+        ("LOW 15: MAX_S below S, OPS met, capped keeps the contract (done needs S too)",
+         check(rec(rule="10:5:2", st=2.0, oa=12, capped=True), 33, 4, "10:5:2") == []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
