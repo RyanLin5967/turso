@@ -3488,6 +3488,8 @@ impl Wal for WalFile {
                 .is_ok(),
             "end_write_tx called while write lock not held according to connection state"
         );
+        #[cfg(test)]
+        crate::branch::budget_probe::wal_write_unlocked();
         self.coordination.end_write_tx();
     }
 

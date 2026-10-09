@@ -13,8 +13,8 @@
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
 //!   [`store_unlocked`] (two `cfg(test)` hook lines in `store.rs`), per thread and process-wide.
 //! * **SQL-layer counts** (engine 2b's schema re-read), per thread: statements prepared, pages read
-//!   through the pager, schema rows parsed, and the trunk's WAL write lock with what was done while
-//!   it was held: five `cfg(test)` hook lines in `connection.rs`, `util.rs` and `pager.rs`
+//!   through the pager, schema rows parsed, and a WAL write lock with what was done while it was
+//!   held: five `cfg(test)` hook lines in `connection.rs`, `util.rs`, `pager.rs` and `wal.rs`
 //!   ([`sql_counts`]).
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
 //!   `TASK_EVENTS_INFO`, `syscalls_unix`: incremented at every BSD syscall entry by any thread of
@@ -103,13 +103,15 @@ fn note_alloc(bytes: usize) {
 }
 
 // The SQL layer's counters (engine 2b: a trunk fork's schema re-read), per thread only: statements
-// prepared (`Connection::prepare_with_origin`), pages read through the pager (`Pager::read_page`,
-// once per page per call, a cache hit or a miss alike), schema rows parsed
-// (`util::parse_schema_rows`), and the trunk's WAL write lock (`Pager::begin_write_tx` once
-// `Wal::begin_write_tx` succeeded, to `Pager::end_write_tx`), with what this thread did while it
-// held it. Five `cfg(test)` hook lines in the engine's files. BLIND SPOTS: a page read without the
-// pager's `read_page` (`read_page_no_cache`) is not counted; a thread holding two trunks' WAL
-// write locks at once (an attached database) reads as holding one, until either is released.
+// prepared (`Connection::prepare_with_origin`), pages read through the pager (`Pager::read_page`
+// calls that find no read of that page pending: a cache hit, or a miss's first call; a call
+// re-entered on a page still loading counts again), schema rows parsed (`util::parse_schema_rows`),
+// and a WAL write lock (from `Pager::begin_write_tx` once `Wal::begin_write_tx` succeeded, to
+// `WalFile::end_write_tx`, which every release path calls: the commit's, a rollback's, a close's),
+// with what this thread did while it held one. Five `cfg(test)` hook lines in the engine's files.
+// BLIND SPOTS: a page read without the pager's `read_page` (`read_page_no_cache`) is not counted;
+// the lock is ANY database's WAL write lock, the trunk's or the branch catalog's own (a separate
+// Turso database); a thread holding two at once reads as holding one until either is released.
 thread_local! {
     static T_PREPARES: Cell<u64> = const { Cell::new(0) };
     static T_PAGE_READS: Cell<u64> = const { Cell::new(0) };
@@ -151,13 +153,13 @@ pub(crate) fn schema_row_parsed() {
     }
 }
 
-/// This thread took a trunk's WAL write lock.
+/// This thread took a WAL write lock (`Pager::begin_write_tx`, once the WAL's own succeeded).
 pub(crate) fn wal_write_locked() {
     let _ = WAL_HELD.try_with(|h| h.set(true));
     bump(&T_WAL_LOCKS, 1);
 }
 
-/// This thread let a trunk's WAL write lock go (or ended a write transaction it never began).
+/// This thread let a WAL write lock go (`WalFile::end_write_tx`).
 pub(crate) fn wal_write_unlocked() {
     let _ = WAL_HELD.try_with(|h| h.set(false));
 }
