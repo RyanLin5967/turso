@@ -594,7 +594,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); no COPY sub-protocol, CancelRequest, or NotificationResponse |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Describe/Execute/Sync/Close/Flush) protocols; trust auth only; parameters in text format for every type, in binary for int2/int4/int8, float4/float8, bool, bytea, jsonb and the text types (any other binary parameter: 0A000); Execute row limits honoured (PortalSuspended). Bind is checked in PostgreSQL's order (parameter-format count 08P01, value count 08P01, failed block 25P02, each sent value's format code 22023); a statement holding a `$n` has its value count checked at Execute, after BindComplete (E5-QUEUE R2(a), placement only); a result format code other than 0 or 1 is refused (22023) when a row is formatted, as in PostgreSQL. No COPY sub-protocol, CancelRequest, or NotificationResponse |
 
 ## Platforms
 
