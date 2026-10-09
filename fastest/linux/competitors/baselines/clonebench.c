@@ -58,7 +58,9 @@
  *     truncated as (uint64_t)(S * 1e9); the ending claim is the first measured op. MAX_S is a bound, never "no limit":
  *     MAX_S 0 ends the warm-up at the first claim. --warmup-ops alone takes S 0 and MAX_S 0.1 x --max-window-s (as the
  *     macOS bbload takes 0.1 x its run cap), and is refused without a window bound. summary.json records warmup_ops,
- *     warmup_end_ns (the ending claim, ns since t0), warmup_capped and warmup_last_claim_ns (null with no warm-up op).
+ *     warmup_end_ns (the ending claim, ns since t0), warmup_capped, warmup_last_claim_ns (null with no warm-up op) and
+ *     warmup_backsteps (claims judged with an older time than the one before them: 0, each claim's time being read
+ *     under the claim lock).
  */
 #ifndef BB_HOOKS
 #ifdef __APPLE__
@@ -454,15 +456,23 @@ static int warmup_replay(const char *rule) {
     return 0;
 }
 
-/* claim_warm T -- the warm-up decision of one claim at time T (now), serialized under g_claim_mu as the macOS bbload's
- * claim_op serializes under g_claim (A23; this port used to decide on a 1 ms main-thread poll of the claimed count,
- * comparing seconds as doubles, with MAX_S 0 as no limit). Returns PH_WARM when this claim is a warm-up op, else the
- * phase now in force: the claim that ends the warm-up opens the window at T and is its first measured op. */
-static int claim_warm(uint64_t t) {
+/* claim_warm -- the warm-up decision of one claim, serialized under g_claim_mu as the macOS bbload's claim_op
+ * serializes under g_claim (A23; this port used to decide on a 1 ms main-thread poll of the claimed count, comparing
+ * seconds as doubles, with MAX_S 0 as no limit). The claim's time T is read UNDER the lock, as claim_op reads now_ns()
+ * after taking g_claim, so claims are judged in lock order with non-decreasing times (fastest-linux's LOW on
+ * f6c2dbb2f: it was read before the lock, so a slower claimant could be judged later with an older time). Returns
+ * PH_WARM when this claim is a warm-up op, else the phase now in force: the claim that ends the warm-up opens the
+ * window at T and is its first measured op. g_warm_backsteps counts claims judged with an older time than the one
+ * judged before them: 0 by construction here, recorded so timedrun.py can refuse a run where it is not. */
+static uint64_t g_claim_prev_el, g_warm_backsteps;
+static int claim_warm(void) {
     pthread_mutex_lock(&g_claim_mu);
     int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
     if (ph == PH_WARM) {
+        uint64_t t = now_ns();
         uint64_t el = t > g_t0 ? t - g_t0 : 0;
+        if (el < g_claim_prev_el) g_warm_backsteps++;
+        g_claim_prev_el = el;
         int end = warm_ends(g_warm, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
         if (end) {
             g_warm_capped = end == 2;
@@ -491,7 +501,7 @@ static void *client_main(void *arg) {
     while (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_INIT) { struct timespec ts = {0, 100000}; nanosleep(&ts, NULL); }
     for (uint32_t seq = 0;; seq++) {
         int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-        if (ph == PH_WARM) ph = claim_warm(now_ns()); /* A23: decided at this claim, under g_claim_mu */
+        if (ph == PH_WARM) ph = claim_warm(); /* A23: decided at this claim, its time read under g_claim_mu */
         if (ph >= PH_DRAIN) break;
         if (ph == PH_MEAS) {
             uint64_t k = __atomic_fetch_add(&g_meas, 1, __ATOMIC_RELAXED);
@@ -811,6 +821,7 @@ static int cmd_run(int argc, char **argv) {
     if (tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
     if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_backsteps\":%llu,", (unsigned long long)g_warm_backsteps);
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"

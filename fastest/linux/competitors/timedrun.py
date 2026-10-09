@@ -183,9 +183,10 @@ def warm_problems(nm, sm, warm_rule):
     (capped, and only when not done), in integer ns with seconds truncated as (uint64_t)(S * 1e9) -- Python's float
     product is the same IEEE double and int() truncates the same way. The binaries record warmup_ops (the claims before
     the ending one), warmup_end_ns (the ending claim), warmup_capped, and warmup_last_claim_ns (the last warm-up claim,
-    null with none). Exactly what the rule implies, nothing within a slack: the ending claim ends it as recorded, the
-    last warm-up claim did not (it came before MAX_S, and did not already meet OPS and S), and warmup_s is the ending
-    claim's time. (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
+    null with none) and warmup_backsteps (claims judged with an older time than the one before them). Exactly what the
+    rule implies, nothing within a slack: the ending claim ends it as recorded, the last warm-up claim did not (it came
+    before MAX_S, and did not already meet OPS and S), warmup_s is the ending claim's time, and every claim was judged
+    in time order (no backstep). (Before A23 this port decided on a 1 ms poll and allowed MAX_S + 0.05 s; MAX_S 0 meant no limit.)"""
     try:
         o_r, s_r, m_r = warm_rule.split(":")
         o_r, s_r, m_r = int(o_r), float(s_r), float(m_r)
@@ -219,6 +220,15 @@ def warm_problems(nm, sm, warm_rule):
                        f"{last} ns, met OPS and S of {warm_rule})")
     if abs(ws - end / 1e9) > 1e-6:
         why.append(f"{nm} run's warmup_s {ws} is not its ending claim's time {end / 1e9:.9f} s")
+    # The claims were judged in time order (fastest-linux's LOW on f6c2dbb2f): the binaries read a closed-loop claim's
+    # time under the claim lock, as claim_op does, and count every claim judged with an older time than the one judged
+    # before it. Without that order, an ending claim older than an already-counted warm-up claim passes the last-claim
+    # check above whenever that claim was not the last one judged.
+    bs = sm.get("warmup_backsteps")
+    if not _count(bs):
+        why.append(f"{nm} run has no warmup_backsteps record ({bs!r})")
+    elif bs:
+        why.append(f"{nm} run judged {bs} warm-up claim(s) with an older time than the claim judged before them")
     return why
 
 

@@ -31,7 +31,9 @@
  *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
  *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to); A23 gives 0:0:0 the same 0 warm-up ops.
  *   summary.json records the warm-up as decided: warmup_ops (the claims before the ending one), warmup_end_ns (the
- *   ending claim, ns since t0), warmup_capped, and warmup_last_claim_ns (the last warm-up claim; null with none).
+ *   ending claim, ns since t0), warmup_capped, warmup_last_claim_ns (the last warm-up claim; null with none), and
+ *   warmup_backsteps (claims judged with an older time than the one judged before them; 0 in closed loop, where each
+ *   claim's time is read under the claim lock).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
  * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
@@ -629,17 +631,25 @@ static int warmup_replay(const char *rule) {
     return 0;
 }
 
-/* claim_warm T -- the warm-up decision of one claim whose time is T (closed loop: now; open loop: the op's intended
- * time, as the macOS claim_op takes it), serialized under g_claim_mu as claim_op serializes under g_claim (A23; this
- * port used to decide on a 1 ms main-thread poll of the claimed count, comparing seconds as doubles, with MAX_S 0 as
- * no limit). Returns PH_WARM when this claim is a warm-up op, else the phase now in force: the claim that ends the
- * warm-up opens the window at T and is its first measured op. Open loop: claims are decided in the order they reach
- * the lock, each with its own intended time (every client keeps its own Poisson schedule). */
-static int claim_warm(uint64_t t) {
+/* claim_warm INTENDED -- the warm-up decision of one claim, serialized under g_claim_mu as the macOS claim_op
+ * serializes under g_claim (A23; this port used to decide on a 1 ms main-thread poll of the claimed count, comparing
+ * seconds as doubles, with MAX_S 0 as no limit). The claim's time T is read UNDER the lock in closed loop
+ * (INTENDED NULL), as claim_op reads now_ns() after taking g_claim, so claims are judged in lock order with
+ * non-decreasing times (fastest-linux's LOW on f6c2dbb2f: it was read before the lock, so a slower claimant could be
+ * judged later with an older time); open loop passes the op's intended time, as claim_op takes it. Returns PH_WARM
+ * when this claim is a warm-up op, else the phase now in force: the claim that ends the warm-up opens the window at T
+ * and is its first measured op. g_warm_backsteps counts claims judged with an older time than the one judged before:
+ * 0 in closed loop by construction; open loop decides in lock order, each claim with its own client's intended time
+ * (every client keeps its own Poisson schedule), so it can step back, and timedrun.py refuses any backstep. */
+static uint64_t g_claim_prev_el, g_warm_backsteps;
+static int claim_warm(const uint64_t *intended) {
     pthread_mutex_lock(&g_claim_mu);
     int ph = g_phase;
     if (ph == PH_WARM) {
+        uint64_t t = intended ? *intended : now_ns();
         uint64_t el = t > g_t0 ? t - g_t0 : 0;
+        if (el < g_claim_prev_el) g_warm_backsteps++;
+        g_claim_prev_el = el;
         int end = warm_ends(g_warm_claimed, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
         if (end) {
             g_warm_capped = end == 2;
@@ -698,12 +708,12 @@ static void *client_main(void *arg) {
              * is measured even when it is claimed after the window closed (AG9), so DRAIN reads as measured here. */
             int cur = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
             if (cur == PH_ABORT) goto done;
-            if (cur == PH_WARM) cur = claim_warm(intended);
+            if (cur == PH_WARM) cur = claim_warm(&intended);
             ph = cur == PH_WARM ? PH_WARM : PH_MEAS;
             if (ph == PH_MEAS) __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
         } else {
             ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-            if (ph == PH_WARM) ph = claim_warm(now_ns()); /* A23: decided at this claim, under g_claim_mu */
+            if (ph == PH_WARM) ph = claim_warm(NULL); /* A23: decided at this claim, its time read under g_claim_mu */
             if (ph >= PH_DRAIN) goto done;
             if (ph == PH_MEAS) {
                 uint64_t k = __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
@@ -1063,6 +1073,7 @@ int main(int argc, char **argv) {
     if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
     if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_backsteps\":%llu,", (unsigned long long)g_warm_backsteps);
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",
