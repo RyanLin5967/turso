@@ -230,6 +230,7 @@ pub fn parameter_types(
         types: std::collections::BTreeMap::new(),
         compared_untyped: std::collections::BTreeSet::new(),
         ctes: Vec::new(),
+        views: Vec::new(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -301,7 +302,13 @@ struct Infer<'a> {
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
     ctes: Vec<(String, Vec<(String, Option<u32>)>)>,
+    /// The views being opened, outermost first ([`Infer::view_columns`]).
+    views: Vec<String>,
 }
+
+/// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
+/// open.
+const MAX_VIEW_DEPTH: usize = 32;
 
 /// The parameter number of a bare `$n`.
 fn param(node: &PgNode) -> Option<u32> {
@@ -554,10 +561,19 @@ impl Infer<'_> {
 
     /// A view's columns, typed by walking its query (stored as SQL text) as a statement of its own:
     /// the query sees no enclosing scope and none of this statement's CTEs. None for no view of
-    /// that name, or one whose text does not parse as a view. A view was not opened at all, so a
-    /// parameter compared with its count(*) column fell to the text fallback, and rows went missing
-    /// (wire review 11 item 3).
+    /// that name, one whose text does not parse as a view, one already being opened (a circular
+    /// view) and one nested past MAX_VIEW_DEPTH: the relation is then one the walk cannot open, and
+    /// a parameter compared with its columns fails closed (42P18 unless declared). A view was not
+    /// opened at all, so a parameter compared with its count(*) column fell to the text fallback,
+    /// and rows went missing (wire review 11 item 3); then a circular view recursed until the
+    /// session thread's stack overflowed, which aborts the process, every session with it, before
+    /// the engine's own "circularly defined" refusal could run (wire review 14 item 1).
     fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
+        if self.views.len() >= MAX_VIEW_DEPTH
+            || self.views.iter().any(|v| v.eq_ignore_ascii_case(relname))
+        {
+            return None;
+        }
         let view = self.schema.get_view(relname)?;
         let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
         let parsed = turso_pg_parser::parse(sql).ok()?;
@@ -568,11 +584,14 @@ impl Infer<'_> {
         let Some(Node::SelectStmt(query)) = v.query.as_deref().and_then(|q| q.node.as_ref()) else {
             return None;
         };
+        let mut views = self.views.clone();
+        views.push(relname.to_string());
         let mut walk = Infer {
             schema: self.schema,
             types: std::collections::BTreeMap::new(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: Vec::new(),
+            views,
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
