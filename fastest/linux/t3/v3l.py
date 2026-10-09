@@ -233,8 +233,7 @@ def gates(rec):
     # A16 (1): the kernel's state and the drive's own report (the V3 batch's leaf record) must AGREE; an absent or
     # unknown report is not agreement (third lane review LOW 7). A ram disk (brd, dry runs only) has no report.
     dr = rec["leaf"].get("drive_reports")
-    want_dr = "none (RAM)" if str(rec["leaf"].get("disk", "")).startswith("ram") else rec["leaf"]["write_cache"]
-    if dr != want_dr:
+    if dr != drive_report_for(rec["leaf"].get("disk"), rec["leaf"]["write_cache"]):
         bad.append(f"drive {rec['leaf']['disk']}: the kernel's write_cache ({rec['leaf']['write_cache']}) disagrees with "
                    f"the drive's own report ({dr!r})")
     wc = rec["leaf"]["write_cache"]
@@ -244,6 +243,12 @@ def gates(rec):
     else:
         bad.append(f"drive {rec['leaf']['disk']}: queue/write_cache unreadable or unknown ({wc!r})")
     return bad
+
+
+def drive_report_for(disk, wc):
+    """The drive report that agrees with a kernel write_cache of `wc` on `disk`: the probe's 'none (RAM)' on a ram
+    disk (brd has no drive to ask), else the same state. gates() and the plant base both use it."""
+    return "none (RAM)" if str(disk or "").startswith("ram") else wc
 
 
 def counter_gate(what, wc, timed, lab):
@@ -479,7 +484,8 @@ def as_state(rec, wc):
 
     put(r["arms"]["fsync"]["timed"], rec["leaf"].get("write_cache"))
     r["leaf"]["write_cache"] = wc
-    r["leaf"]["drive_reports"] = wc
+    # the report the gate wants for this state: 'none (RAM)' on brd (fourth lane review HIGH 3)
+    r["leaf"]["drive_reports"] = drive_report_for(r["leaf"].get("disk"), wc)
     for lay in r["leaf"].get("layers") or []:
         put(lay, lay.get("write_cache"))
         lay["write_cache"] = wc
