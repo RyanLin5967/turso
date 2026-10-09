@@ -164,7 +164,7 @@ def real_problem(cap_s, warmup):
 LIVE_KEYS = ("label_before", "label_after", "timed_before", "timed_after")
 
 
-def check(celldir, n, warm_rule=None, live=None):
+def check(celldir, n, warm_rule=None, live=None, cap=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
     lab = load(os.path.join(celldir, "bb", "summary.json"))
@@ -261,8 +261,16 @@ def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100"):
     return "".join(out)
 
 
+CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
+# MED 6: what the binaries record about the warm-up and the window they actually ran (a warm-up that met OPS 1000 and
+# S 10 of the rule 1000:10:180; an uncapped 5 s window under the 1800 s cap)
+RUN = {"warmup_ops": 1500, "warmup_s": 10.2, "max_window_s": 1800.0, "window_s": 5.0}
+
+
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
-            lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3)):
+            lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3), lab=True, raw=True,
+            rc_file=None, lab_extra=None, timed_extra=None):
+    """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case)."""
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     if live == "held":
@@ -271,24 +279,30 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
         with open(os.path.join(d, "live.tsv"), "w") as f:
             f.write("".join(f"{k}\t{v}\n" for k, v in live.items()))
     lo = n if lab_ops is None else lab_ops
-    with open(os.path.join(d, "bb", "summary.json"), "w") as f:
-        json.dump({"verdict": "capped" if capped else "ok", "rc": 0, "measured_ops": lo, "measured_ok": lo,
-                   "warmup_rule": lab_rule, "capped": capped}, f)
+    run = dict(RUN, window_s=1800.0 if capped else RUN["window_s"])
+    if lab:
+        ls = dict(run, verdict="capped" if capped else "ok", rc=0, measured_ops=lo, measured_ok=lo,
+                  warmup_rule=lab_rule, capped=capped)
+        ls.update(lab_extra or {})
+        with open(os.path.join(d, "bb", "summary.json"), "w") as f:
+            json.dump(ls, f)
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         to = n if timed_ops is None else timed_ops
         # MED 5: a run the registered window capped exits 0 with verdict "capped"; timedrun.py alone judges its tier
-        sm = {"verdict": ("capped" if capped else "ok") if rc == 0 else "fail", "rc": rc, "measured_ops": to,
-              "measured_ok": to,
-              "warmup_rule": timed_rule, "capped": capped, "tm0_realtime_s": window[0], "tm1_realtime_s": window[1]}
+        sm = dict(run, verdict=("capped" if capped else "ok") if rc == 0 else "fail", rc=rc, measured_ops=to,
+                  measured_ok=to, warmup_rule=timed_rule, capped=capped, tm0_realtime_s=window[0],
+                  tm1_realtime_s=window[1])
         if self_tp is not None:  # the load generator's own TracerPid at tm0 and tm1 (MED 4)
             sm["tracerpid_tm0"], sm["tracerpid_tm1"] = self_tp
+        sm.update(timed_extra or {})
         with open(os.path.join(d, "timed", "summary.json"), "w") as f:
             json.dump(sm, f)
-        with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
-            f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
+        if raw:
+            with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
+                f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
         with open(os.path.join(d, "timed.rc"), "w") as f:
-            f.write(f"{rc}\n")
+            f.write(f"{rc if rc_file is None else rc_file}\n")
     if tracer is not None:
         with open(os.path.join(d, "timed.tracer.tsv"), "w") as f:
             f.write(tracer)
@@ -342,15 +356,47 @@ def selftest():
         # (the binaries report capped, rc 0, verdict "capped"): >= 1000 ok ops complete; 100-999 complete with p50
         # only; < 100 failed with cause 'cap'. (The case "a capped run with < 1000 ops" refused 800 ops; under the
         # registered tiers 800 is p50-only, so it is now an accepted case below.)
+        # (check_n: the N the cell asked for; LOW 27: it used to be chosen by a substring of the case's name)
         ("both runs capped with >= 1000 ops: complete, reduced n",
-         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1500), True),
-        ("capped at 1000 ok ops: complete", dict(tracer=clean, capped=True, lab_ops=1000, timed_ops=1000), True),
-        ("capped at 999 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=999), True),
-        ("capped at 800 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800), True),
-        ("capped at 100 ok ops: complete, p50 only", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=100), True),
-        ("capped at 99 ok ops: failed, cause cap", dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=99), False),
-        ("the labelling run capped at 99 ok ops", dict(tracer=clean, capped=True, lab_ops=99, timed_ops=1200), False),
-        ("an uncapped run short of N", dict(tracer=clean, lab_ops=1200, timed_ops=1500), False),
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1500, check_n=5000), True),
+        ("capped at 1000 ok ops: complete",
+         dict(tracer=clean, capped=True, lab_ops=1000, timed_ops=1000, check_n=5000), True),
+        ("capped at 999 ok ops: complete, p50 only",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=999, check_n=5000), True),
+        ("capped at 800 ok ops: complete, p50 only",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=800, check_n=5000), True),
+        ("capped at 100 ok ops: complete, p50 only",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=100, check_n=5000), True),
+        ("capped at 99 ok ops: failed, cause cap",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=99, check_n=5000), False),
+        ("the labelling run capped at 99 ok ops",
+         dict(tracer=clean, capped=True, lab_ops=99, timed_ops=1200, check_n=5000), False),
+        ("an uncapped run short of N", dict(tracer=clean, lab_ops=1200, timed_ops=1500, check_n=5000), False),
+        # MED 6: one defect per guard, each alone (a mutant that deletes or loosens one guard must turn one case red)
+        ("no labelling run summary", dict(tracer=clean, lab=False), False),
+        ("the labelling run measured another N", dict(tracer=clean, lab_ops=150), False),
+        ("the timed run's raw.tsv missing (summary present)", dict(tracer=clean, raw=False), False),
+        ("the timed summary says fail with rc 0", dict(tracer=clean, timed_extra={"verdict": "fail"}), False),
+        ("the timed summary says ok with rc 3", dict(tracer=clean, timed_extra={"rc": 3}), False),
+        ("the timed run's exit status file says 1", dict(tracer=clean, rc_file=1), False),
+        ("capped with 1200 ops but 50 ok (the tier counts ok ops)",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"measured_ok": 50},
+              check_n=5000), False),
+        ("a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)",
+         dict(tracer=clean, timed_extra={"warmup_s": 1.0}), False),
+        ("a warm-up that left before OPS and before MAX_S (500 ops, 12 s)",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 12.0}), False),
+        ("a warm-up ended by MAX_S (500 ops, 180.0 s)",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_s": 180.0}), True),
+        ("a warm-up past MAX_S plus the slack (181 s)",
+         dict(tracer=clean, timed_extra={"warmup_ops": 50000, "warmup_s": 181.0}), False),
+        ("the labelling run's warm-up left early", dict(tracer=clean, lab_extra={"warmup_s": 1.0}), False),
+        ("a window bound that is not the registered cap", dict(tracer=clean, timed_extra={"max_window_s": 20.0}),
+         False),
+        ("capped although the window was shorter than its bound",
+         dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"window_s": 300.0},
+              check_n=5000), False),
+        ("no warm-up record", dict(tracer=clean, timed_extra={"warmup_ops": None, "warmup_s": None}), False),
         # lead review 62430d8bf..b49fb656a HIGH 1: the live-branch count N is held fixed and recorded around both runs
         ("N held at 21 around both runs", dict(tracer=clean), True),
         ("the labelling run at N=20, the timed run at N=1020",
@@ -369,8 +415,10 @@ def selftest():
     bad = 0
     with tempfile.TemporaryDirectory() as root:
         for i, (name, kw, want) in enumerate(cases):
+            kw = dict(kw)
+            n_check = kw.pop("check_n", 200)
             d = fixture(root, f"c{i}", **kw)
-            why = check(d, 5000 if "capped" in name or "short of N" in name else 200, RULE, LIVE)
+            why = check(d, n_check, RULE, LIVE, CAP)
             got = not why
             print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
             bad += got != want
