@@ -4879,6 +4879,53 @@ mod tests {
         });
     }
 
+    /// Wire review 16 item 4: SHOW answers from an allowlist and never builds PRAGMA text from the
+    /// client's identifier. `SHOW "synchronous = off"` set the session's sync mode and `SHOW
+    /// "fullfsync = off"` turned F_FULLFSYNC into fsync on Apple, both while compiling (a Describe
+    /// too), and `SHOW wal_checkpoint` checkpointed: each is 42704 now, and the trunk connection's
+    /// settings read the same before and after.
+    #[test]
+    fn show_cannot_change_an_engine_setting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let pragma = |name: &str| {
+            let conn = s
+                .state()
+                .trunk
+                .as_ref()
+                .expect("premise: the trunk connection is open")
+                .inner()
+                .clone();
+            conn.prepare(format!("PRAGMA {name}"))
+                .ok()
+                .and_then(|mut stmt| stmt.run_collect_rows().ok())
+        };
+        let before = (pragma("synchronous"), pragma("fullfsync"));
+        assert!(before.0.is_some(), "premise: PRAGMA synchronous reads");
+        for sql in [
+            "SHOW \"synchronous = off\"",
+            "SHOW \"fullfsync = off\"",
+            "SHOW wal_checkpoint",
+            "SHOW synchronous",
+        ] {
+            let codes: Vec<String> = s
+                .simple(sql)
+                .into_iter()
+                .filter_map(|r| match r {
+                    Response::Error(e) => Some(e.code.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(codes, vec!["42704".to_string()], "{sql}");
+        }
+        assert_eq!(
+            (pragma("synchronous"), pragma("fullfsync")),
+            before,
+            "a SHOW changed an engine setting"
+        );
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {

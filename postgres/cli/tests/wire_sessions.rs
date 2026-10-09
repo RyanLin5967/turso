@@ -2104,6 +2104,43 @@ fn a_checkpoint_checkpoints_the_branch_store() {
         .ok("a branch created before the checkpoint");
 }
 
+/// SHOW answers the settings SET keeps, as PostgreSQL shows them: search_path from the session
+/// (`"$user", public` before any SET, `s, public` after one), the client settings at the values
+/// this server answers by, transaction_read_only off; a name PostgreSQL does not know either is
+/// 42704 and reaches nothing, and SHOW ALL is 0A000 (wire review 16 item 4). SHOW became `PRAGMA
+/// <name>`: a name the engine did not know answered no row, and one it knew ran.
+#[test]
+fn show_answers_from_the_settings_set_keeps() {
+    let dir = Scratch::new("show");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    assert_eq!(
+        a.q("SHOW search_path").single("the default path"),
+        "\"$user\", public"
+    );
+    a.q("SET search_path TO s, public").ok("set the path");
+    assert_eq!(a.q("SHOW search_path").single("the path"), "s, public");
+    for (name, want) in [
+        ("client_encoding", "UTF8"),
+        ("standard_conforming_strings", "on"),
+        ("DateStyle", "ISO, MDY"),
+        ("IntervalStyle", "postgres"),
+        ("TimeZone", "UTC"),
+        ("bytea_output", "hex"),
+        ("transaction_read_only", "off"),
+    ] {
+        assert_eq!(a.q(&format!("SHOW {name}")).single(name), want, "{name}");
+    }
+    for sql in [
+        "SHOW \"synchronous = off\"",
+        "SHOW wal_checkpoint",
+        "SHOW journal_mode",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "42704", "{sql}");
+    }
+    assert_eq!(a.q("SHOW ALL").err("SHOW ALL").code, "0A000");
+}
+
 /// The failure triggers the failure-path tests use do fail, each with its code, so a test that
 /// fails a statement or a block takes its failure path: a missing relation at prepare (42P01; in a
 /// block the block fails) and a duplicate key at execution (23505). `SELECT 1/0`, which they used,
