@@ -8,6 +8,20 @@ use crate::rsapi::TursoError;
 pub mod capi;
 pub mod rsapi;
 
+/// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`), read as core's busy red reads it: the
+/// instrument of this crate's busy-wait reds (engine review 11 MED 4).
+#[cfg(all(test, unix))]
+pub(crate) fn thread_cpu() -> std::time::Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is plain old data that clock_gettime writes whole.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 #[macro_export]
 macro_rules! assert_send {
     ($($ty:ty),+ $(,)?) => {

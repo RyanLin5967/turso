@@ -2948,19 +2948,6 @@ mod tests {
         assert_eq!(stmt.parameters_count(), 0);
     }
 
-    /// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`), read as core's busy red reads it.
-    #[cfg(unix)]
-    fn thread_cpu() -> std::time::Duration {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `ts` is plain old data that clock_gettime writes whole.
-        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
-        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
-    }
-
     /// Engine review 11 MED 4, the sdk-kit half of the busy-timeout spin (DECISIONS f8eb23bca):
     /// a sync-mode statement (`async_io: false`: the Python binding, and a C or Go caller with
     /// async_io=0) answered the busy handler's `StepResult::Sleep` by stepping the IO backend,
@@ -3004,9 +2991,9 @@ mod tests {
             ("step", &|| waiter.prepare_single(insert)?.step(None)),
         ];
         for (name, run) in calls {
-            let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+            let (wall, cpu) = (std::time::Instant::now(), crate::thread_cpu());
             let refused = run();
-            let (waited, spent) = (wall.elapsed(), thread_cpu() - cpu);
+            let (waited, spent) = (wall.elapsed(), crate::thread_cpu() - cpu);
             assert!(
                 matches!(refused, Err(TursoError::Busy(_))),
                 "{name}: premise: the second writer is refused busy, got {refused:?}"
