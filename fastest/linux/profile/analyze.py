@@ -6,11 +6,13 @@ runner's cpu, PROFILE_CPU).
 
 usage: analyze.py <raw-dir> <budget.json> <out-dir> [--baseline prev-baseline.json] [--rebaseline]
        analyze.py --self-test
+       analyze.py --budget-verdict <verdict.tsv>   (the absolute syscall budget job; exit 1 unless it passes)
 
 <raw-dir> holds head/ and, when a base was built, base/ (profile.sh's layout). Writes to <out-dir>:
   summary.json   every number, per side and arm
-  verdict.tsv    gate, expected, got, PASS|FAIL|INFO|NOT-RUN
-  baseline.json  this run's head numbers, the next run's baseline once this run is green
+  verdict.tsv    gate, expected, got, PASS|FAIL|INFO|NOT-RUN, regression|budget|info (the row's kind)
+  regression_green  1 when every regression-kind row PASSes, else 0
+  baseline.json  this run's head numbers, the next run's baseline once this run is regression-green
   summary.md     the same, for $GITHUB_STEP_SUMMARY
 Exit 1 if any gate FAILs, if no arm produced a count, or if the self-test (always run first) fails.
 
@@ -173,6 +175,33 @@ def analyze_arm(d, arm):
 
 
 BASELINE_ARM = "full-snap-c1"  # the arm baseline.json records; both regression premises bind to it
+VERDICTS = ("PASS", "FAIL", "INFO", "NOT-RUN")
+# T3 review item 29: every row carries a kind, and regression_green reads kinds, never gate ids.
+#   regression  the profile job's verdict: regression_green needs every such row to PASS (INFO and NOT-RUN block it)
+#   budget      the absolute syscall budget (budget-syscalls/*), the budget job's; red at 675adbfb3, never blocks
+#               the baseline
+#   info        recorded, never gates: INFO or NOT-RUN only (C>1 comparisons, an unavailable or unregistered class)
+KINDS = ("regression", "budget", "info")
+VERDICT_FIELDS = 5  # gate, expected, got, verdict, kind
+
+
+def row_problem(r):
+    """Why a verdict row is not representable, or None: the allowlist that gates(), write_verdict(), read_verdict()
+    and regression_green() all apply, so a row no reader can classify is refused where it is made or read."""
+    if len(r) != VERDICT_FIELDS:
+        return f"{len(r)} fields, expected {VERDICT_FIELDS}"
+    # read_verdict splits rows with str.splitlines(), so any character it breaks on (newline, carriage return,
+    # form feed, the file/group/record separators, the Unicode line and paragraph separators) inside a field
+    # would split the row; a tab would shift its fields
+    if any(not isinstance(f, str) or "\t" in f or (f != "" and f.splitlines() != [f]) for f in r):
+        return "a field that is not a string, or holds a tab or a line break"
+    if r[3] not in VERDICTS:
+        return f"verdict {r[3]!r} is not one of {VERDICTS}"
+    if r[4] not in KINDS:
+        return f"kind {r[4]!r} is not one of {KINDS}"
+    if r[4] == "info" and r[3] not in ("INFO", "NOT-RUN"):
+        return f"an info row cannot {r[3]}"
+    return None
 
 
 def artifact_refusal(baseline, cpu, field):
@@ -199,45 +228,53 @@ def gates(head, base, budget, baseline, cpu=None):
     the baseline arm against the artifact's own numbers, refused unless artifact_refusal() passes it."""
     rows = []
 
-    def row(g, exp, got, v):
-        rows.append((g, exp, str(got), v))
+    def row(g, exp, got, v, kind):
+        # `got` is instrument text (a driver's status line, strace refusals): a tab or newline in it is display, not
+        # structure, so it is flattened here; every other field is this function's own and row_problem() refuses it
+        r = (g, exp, " ".join(str(got).splitlines()).replace("\t", " "), v, kind)
+        why = row_problem(r)
+        if why:
+            raise ValueError(f"gates: row {g} is not representable: {why}")
+        rows.append(r)
 
     for arm, h in sorted(head.items()):
         cls = arm.split("-")[0]
         if "NOT AVAILABLE" in h.get("status", ""):
-            row(f"budget-flush/{arm}", "create flushes per op in budget", h["status"], "NOT-RUN")
+            row(f"budget-flush/{arm}", "create flushes per op in budget", h["status"], "NOT-RUN", "info")
             continue
         s = h.get("strace")
         if not s:
-            row(f"budget-flush/{arm}", "a strace count", "no strace data", "FAIL")
+            row(f"budget-flush/{arm}", "a strace count", "no strace data", "FAIL", "regression")
             continue
         if s["refusals"]:
-            row(f"budget-flush/{arm}", "no uncountable durability path", "; ".join(s["refusals"]), "FAIL")
+            row(f"budget-flush/{arm}", "no uncountable durability path", "; ".join(s["refusals"]), "FAIL", "regression")
             continue
         missing = [w for w in WINDOWS if s["windows"].get(w) is None]
         if missing:
-            row(f"windows/{arm}", "all four windows marked", f"missing {missing}", "FAIL")
+            row(f"windows/{arm}", "all four windows marked", f"missing {missing}", "FAIL", "regression")
             continue
         for w in WINDOWS:
             x = s["windows"][w]
             if x["engine_sync_counter"] is not None and x["engine_sync_counter"] != x["strace_fsync_like"]:
                 row(f"two-instruments/{arm}/{w}", "engine sync counter == strace fsync+fdatasync",
-                    f"engine {x['engine_sync_counter']} strace {x['strace_fsync_like']}", "FAIL")
+                    f"engine {x['engine_sync_counter']} strace {x['strace_fsync_like']}", "FAIL", "regression")
             else:
                 row(f"two-instruments/{arm}/{w}", "engine sync counter == strace fsync+fdatasync",
-                    f"{x['strace_fsync_like']}", "PASS")
+                    f"{x['strace_fsync_like']}", "PASS", "regression")
         spec = budget["classes"].get(cls)
         if spec is None:
-            row(f"budget-flush/{arm}", "a registered class", cls, "INFO")
+            row(f"budget-flush/{arm}", "a registered class", cls, "INFO", "info")
             continue
         c = h.get("clients", 1)
         lo, hi = lower_bound(spec["create_flushes_per_op_c1" if c == 1 else "create_flushes_per_op_cn"], c)
         x = s["windows"]["create"]
         f = x["flushes_per_op"]
-        row(f"budget-flush/{arm}", f"{lo:.4g} <= create flushes/op <= {hi:.4g}", f, "PASS" if lo <= f <= hi else "FAIL")
+        row(f"budget-flush/{arm}", f"{lo:.4g} <= create flushes/op <= {hi:.4g}", f, "PASS" if lo <= f <= hi else "FAIL",
+            "regression")
         allowed = spec["create_flush_files_allowed"]
         bad = {t: n for t, n in x["flush_targets"].items() if not any(t.endswith(a) for a in allowed)}
-        row(f"budget-flush-files/{arm}", f"create flushes only on {allowed or 'nothing'}", bad or "ok", "FAIL" if bad else "PASS")
+        row(f"budget-flush-files/{arm}", f"create flushes only on {allowed or 'nothing'}", bad or "ok",
+            "FAIL" if bad else "PASS", "regression")
         sb = budget.get("syscalls_per_create")
         if sb:
             # The ABSOLUTE budget (DECISIONS 2026-10-05T02:54:27Z): every syscall strace sees in the create window,
@@ -247,19 +284,27 @@ def gates(head, base, budget, baseline, cpu=None):
             top = ", ".join(f"{k} {v:g}" for k, v in sorted(x["syscalls_per_op"].items(), key=lambda kv: (-kv[1], kv[0]))[:8])
             v = ("PASS" if tot <= sb["max"] else "FAIL") if c == 1 else "INFO"
             row(f"budget-syscalls/{arm}", f"<= {sb['max']} syscalls per create" + ("" if c == 1 else " (C>1: INFO)"),
-                f"{tot:g}/op: {top}", v)
-        bx = src = None
+                f"{tot:g}/op: {top}", v, "budget")
+        bx = src = refused = None
         bw = (((base or {}).get(arm) or {}).get("strace") or {}).get("windows", {}).get("create")
         if bw:
             bx, src = bw["syscalls_per_op"], "base built in this job"
         elif arm == BASELINE_ARM and baseline is not None:
             # review 7b: without this, only an in-job base produced the row, so a base sha that would not build left
             # the premise unevaluated on every later push and the baseline never advanced.
-            why = artifact_refusal(baseline, cpu, "create_syscalls_per_op")
-            if why:
-                row(f"syscalls-vs-base/{arm}", "an in-job base, or the baseline artifact of this cpu", f"refused: {why}", "FAIL")
+            refused = artifact_refusal(baseline, cpu, "create_syscalls_per_op")
+            if refused:
+                row(f"syscalls-vs-base/{arm}", "an in-job base, or the baseline artifact of this cpu",
+                    f"refused: {refused}", "FAIL", "regression")
             else:
                 bx, src = baseline["create_syscalls_per_op"], f"baseline artifact of {baseline['sha']}"
+        if bx is None and not refused:
+            # review 29: the row exists even with nothing to compare against. On the baseline arm at C=1 it is the
+            # regression premise, so NOT-RUN blocks regression_green; elsewhere it is a record.
+            row(f"syscalls-vs-base/{arm}", "a base to compare the create window's syscalls against",
+                "no in-job base and no baseline artifact" if arm == BASELINE_ARM
+                else f"no in-job base for this arm (the baseline artifact records {BASELINE_ARM} only)",
+                "NOT-RUN", "regression" if arm == BASELINE_ARM and c == 1 else "info")
         if bx is not None:
             hx = x["syscalls_per_op"]
             sv = budget["syscalls_vs_base"]
@@ -270,10 +315,16 @@ def gates(head, base, budget, baseline, cpu=None):
             # engine on both sides and arm64 C=64 read getpid 3.21 -> 3.28 per create (a waiter's poll
             # loop runs as often as the flight takes). So the gate binds at C=1, where counts are exact
             # (getpid 4.005, run 37255309860), and C > 1 is recorded as INFO.
-            verdict = ("FAIL" if worse else "PASS") if h.get("clients", 1) == 1 else "INFO"
+            verdict = ("FAIL" if worse else "PASS") if c == 1 else "INFO"
             row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op vs {src}"
-                + ("" if h.get("clients", 1) == 1 else " (C>1: contention-dependent, INFO)"),
-                worse or "ok", verdict)
+                + ("" if c == 1 else " (C>1: contention-dependent, INFO)"),
+                worse or "ok", verdict, "regression" if c == 1 else "info")
+    if not any(r[0] == f"syscalls-vs-base/{BASELINE_ARM}" for r in rows):
+        # review 29: the premise row exists whatever cut the baseline arm short above (no strace, a refusal, a missing
+        # window, an unregistered class, NOT AVAILABLE, or no such arm), so regression_green never passes without it.
+        row(f"syscalls-vs-base/{BASELINE_ARM}", f"a create-window syscall comparison of {BASELINE_ARM}",
+            "never reached: " + ("no such head arm" if BASELINE_ARM not in head else "the arm was cut short (rows above)"),
+            "NOT-RUN", "regression")
     ins = budget["instructions"]
     arm = BASELINE_ARM
     h = head.get(arm, {}).get("ir_per_op", {}).get("create")
@@ -284,17 +335,19 @@ def gates(head, base, budget, baseline, cpu=None):
         why = artifact_refusal(baseline, cpu, "ir_create")
         if why is None:
             b, src = baseline["ir_create"], f"baseline artifact of {baseline['sha']}"
+    # instructions/create is always emitted and always regression-kind: INFO (first run) blocks regression_green too
     if h is None:
-        row("instructions/create", "a callgrind count", "none", "FAIL")
+        row("instructions/create", "a callgrind count", "none", "FAIL", "regression")
     elif why:
         row("instructions/create", f"growth <= {ins['create_growth_max']:.0%} vs an in-job base or the baseline artifact of this cpu",
-            f"refused: {why}", "FAIL")
+            f"refused: {why}", "FAIL", "regression")
     elif b is None:
-        row("instructions/create", f"<= base x {1 + ins['create_growth_max']}", f"head {h} Ir/op; no baseline (first run)", "INFO")
+        row("instructions/create", f"<= base x {1 + ins['create_growth_max']}", f"head {h} Ir/op; no baseline (first run)",
+            "INFO", "regression")
     else:
         g = h / b - 1
         row("instructions/create", f"growth <= {ins['create_growth_max']:.0%} vs {src}",
-            f"head {h} base {b} growth {g:+.2%}", "PASS" if g <= ins["create_growth_max"] else "FAIL")
+            f"head {h} base {b} growth {g:+.2%}", "PASS" if g <= ins["create_growth_max"] else "FAIL", "regression")
     return rows
 
 
@@ -622,40 +675,46 @@ def self_test():
 
 
 def regression_green(rows):
-    """Every gate but the absolute syscall budget passes, AND the two regression gates were actually evaluated
-    (gate-6 review L3: a run with every row INFO or a base that failed to build must not advance the baseline).
-    The absolute budget is red at 675adbfb3 (10 per create) and stays red until the engine meets it; if it blocked
-    the baseline, no run would ever be green, and the instruction and syscalls-vs-base regression gates would have
-    no base at all. So the baseline advances on regression-green runs while the budget job stays red (PROFILE.md)."""
-    v = {g: verdict for g, _, _, verdict in rows}
-    evaluated = v.get("instructions/create") == "PASS" and v.get("syscalls-vs-base/full-snap-c1") == "PASS"
-    return evaluated and not [r for r in rows if r[3] == "FAIL" and not r[0].startswith("budget-syscalls/")]
-
-
-VERDICT_FIELDS = 4  # gate, expected, got, verdict
+    """Every regression-kind row PASSes (T3 review item 29: by kind, never by gate id). gates() always emits
+    instructions/create and syscalls-vs-base/<BASELINE_ARM> as regression rows, INFO or NOT-RUN when they could not
+    be evaluated, so gate-6 review L3 (both regression gates evaluated: a run with every row INFO, or a base that
+    failed to build, must not advance the baseline) holds by construction. The absolute budget's rows are
+    budget-kind: it is red at 675adbfb3 (10 per create) and stays red until the engine meets it; if it blocked the
+    baseline, no run would ever be green, and the instruction and syscalls-vs-base regression gates would have no
+    base at all. So the baseline advances on regression-green runs while the budget job stays red (PROFILE.md)."""
+    for r in rows:
+        why = row_problem(r)
+        if why:
+            raise ValueError(f"regression_green: row {r[:1]} is not representable: {why}")
+    reg = [r for r in rows if r[4] == "regression"]
+    return bool(reg) and all(r[3] == "PASS" for r in reg)
 
 
 def write_verdict(path, rows):
-    """verdict.tsv, one row per line. A tab or newline inside a field would shift or split the row for every
-    reader, so such a row is refused (ValueError) rather than written."""
+    """verdict.tsv, one row per line, VERDICT_FIELDS fields. A row row_problem() rejects (a tab or newline inside
+    a field would shift or split it for every reader; an unknown verdict or kind) is refused (ValueError) rather
+    than written."""
     for r in rows:
-        if len(r) != VERDICT_FIELDS or any(not isinstance(f, str) or "\t" in f or "\n" in f for f in r):
-            raise ValueError(f"unwritable verdict row {r!r}")
+        why = row_problem(r)
+        if why:
+            raise ValueError(f"unwritable verdict row {r!r}: {why}")
     with open(path, "w") as f:
         for r in rows:
             f.write("\t".join(r) + "\n")
 
 
 def read_verdict(path):
-    """verdict.tsv back as tuples. A missing file raises OSError; an empty file, or a line without exactly
-    VERDICT_FIELDS fields, raises ValueError: a verdict that cannot be read is never read as a pass."""
+    """verdict.tsv back as tuples. A missing file raises OSError; an empty file, or a line row_problem() rejects
+    (not exactly VERDICT_FIELDS fields, an unknown verdict or kind, an info row that PASSes or FAILs), raises
+    ValueError: a verdict that cannot be read is never read as a pass."""
     with open(path) as f:
         lines = f.read().splitlines()
     rows = []
     for n, line in enumerate(lines, 1):
         fields = tuple(line.split("\t"))
-        if len(fields) != VERDICT_FIELDS:
-            raise ValueError(f"{path}:{n}: {len(fields)} fields, expected {VERDICT_FIELDS}: {line!r}")
+        why = row_problem(fields)
+        if why:
+            raise ValueError(f"{path}:{n}: {why}: {line!r}")
         rows.append(fields)
     if not rows:
         raise ValueError(f"{path}: no rows")
@@ -664,10 +723,11 @@ def read_verdict(path):
 
 def budget_verdict(rows):
     """The absolute syscall budget job's verdict (T3 review item 28; the job used to go green on ANY arm's PASS).
-    The row of the arm the budget binds to, budget-syscalls/<BASELINE_ARM>, must be present exactly once and
-    evaluated (PASS or FAIL), and no budget-syscalls row may FAIL. Returns (ok, reasons)."""
+    The budget-kind row of the arm the budget binds to, budget-syscalls/<BASELINE_ARM>, must be present exactly
+    once and evaluated (PASS or FAIL), and no budget-kind row may FAIL (item 29: by kind, not by id prefix).
+    Returns (ok, reasons)."""
     need = f"budget-syscalls/{BASELINE_ARM}"
-    budget_rows = [r for r in rows if r[0].startswith("budget-syscalls/")]
+    budget_rows = [r for r in rows if r[4] == "budget"]
     mine = [r for r in budget_rows if r[0] == need]
     reasons = []
     if not mine:
@@ -697,7 +757,7 @@ def main(argv):
             print(f"analyze: budget verdict REFUSED: {e}", file=sys.stderr)
             return 1
         for r in vrows:
-            if r[0].startswith("budget-syscalls/"):
+            if r[4] == "budget":
                 print("\t".join(r))
         ok, reasons = budget_verdict(vrows)
         for w in reasons:
@@ -731,9 +791,9 @@ def main(argv):
                "create_syscalls_per_op": ((h.get("strace") or {}).get("windows", {}).get("create") or {}).get("syscalls_per_op")},
               open(os.path.join(out, "baseline.json"), "w"), indent=1)
     with open(os.path.join(out, "summary.md"), "w") as f:
-        f.write("| gate | expected | got | verdict |\n|---|---|---|---|\n")
-        for g, e, got, v in rows:
-            f.write(f"| {g} | {e} | {got[:200]} | {v} |\n")
+        f.write("| gate | expected | got | verdict | kind |\n|---|---|---|---|---|\n")
+        for g, e, got, v, kind in rows:
+            f.write(f"| {g} | {e} | {got[:200]} | {v} | {kind} |\n")
         f.write("\n| side | arm | create p50/p99 us | flushes/op create | syscalls/op create | Ir/op create | busy retries/op create |\n|---|---|---|---|---|---|---|\n")
         for side, arms in sides.items():
             for a, r in arms.items():
@@ -746,7 +806,7 @@ def main(argv):
         print("\t".join(r))
     rg = regression_green(rows)
     open(os.path.join(out, "regression_green"), "w").write("1\n" if rg else "0\n")
-    print(f"analyze: regression_green={int(rg)} (every gate but budget-syscalls/*, and both regression gates evaluated)")
+    print(f"analyze: regression_green={int(rg)} (every regression-kind row PASS; budget-kind rows are the budget job's)")
     fails = [r for r in rows if r[3] == "FAIL"]
     counted = [r for r in rows if r[3] in ("PASS", "FAIL")]
     if not counted:

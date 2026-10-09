@@ -14,8 +14,10 @@ name: fastest-profile
 #     rebaseline dispatch restarts the chain (T3 review 4bdb3a042..2d42982a0 item 7b);
 #   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z), checked in its own job "absolute
 #     syscall budget" (red at 675adbfb3, 10 per create) so the profile job's own status is the regression verdict;
-#     the BASELINE advances on a regression-green run (every gate but this one passes, both regression gates
-#     evaluated), and the base is the newest run that uploaded a baseline, not the newest green one.
+#     the BASELINE advances on a regression-green run (every regression-kind row of verdict.tsv PASSes; the rows
+#     carry a kind, regression, budget or info, and the two regression gates on full-snap-c1 are always present as
+#     regression rows, so a run that could not evaluate them is not green; T3 review item 29), and the base is the
+#     newest run that uploaded a baseline, not the newest green one.
 # Smoke sizes; nothing here is a credited latency.
 
 on:
@@ -170,7 +172,7 @@ jobs:
           rc=$?
           cat "$RAW/analysis/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          # green for the BASELINE means regression-green: every gate but the absolute syscall budget passed
+          # green for the BASELINE means regression-green: every regression-kind row of verdict.tsv passed
           green=0
           [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] &&
             { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
@@ -198,10 +200,10 @@ jobs:
             r=$(cat "$RAW/$side.rc"); [ "$r" = 0 ] || { echo "profile.sh $side rc=$r (runs.tsv lists the failed instrument runs)"; bad=1; }
           done
           [ -f "$RAW/head.rc" ] || { echo "the head was never profiled"; bad=1; }
-          # The REGRESSION verdict (gate-6 review M9): every gate but the absolute syscall budget, both regression gates
-          # evaluated. The absolute budget is its own job below, so a regression shows as a red profile job and the
-          # known budget red as a red budget job; neither hides the other, and both block.
-          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; grep -v '^budget-syscalls/' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
+          # The REGRESSION verdict (gate-6 review M9): every regression-kind row PASSes (analyze.py regression_green).
+          # The absolute budget's rows are budget-kind and are its own job below, so a regression shows as a red
+          # profile job and the known budget red as a red budget job; neither hides the other, and both block.
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; awk -F'\t' '$5 != "budget"' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
           exit $bad
 
   budget:
@@ -224,6 +226,6 @@ jobs:
           path: raw
       # T3 review 4bdb3a042..2d42982a0 item 28: this step used to go green on ANY arm's PASS, even with no
       # budget-syscalls/full-snap-c1 row. analyze.py's budget_verdict() (self-tested) requires that row, evaluated,
-      # and no budget-syscalls FAIL; an unreadable or malformed verdict.tsv is refused.
+      # and no budget-kind FAIL (item 29: rows by kind); an unreadable or malformed verdict.tsv is refused.
       - name: The budget-syscalls rows of verdict.tsv (budget-syscalls/full-snap-c1 required)
         run: python3 -B fastest/linux/profile/analyze.py --budget-verdict raw/analysis/verdict.tsv
