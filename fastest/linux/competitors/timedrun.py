@@ -181,8 +181,23 @@ RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
 
 
+def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100"):
+    """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX" line per
+    sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every 0.05 s
+    to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]."""
+    if sweeps is None:
+        sweeps = ([("start", 100.0, 3, 0, 12, 0)] + [("mid", round(100.05 + 0.05 * k, 2), 3, 0, 12, 0) for k in range(8)]
+                  + [("end", 100.45, 0, 0, 12, 0)])
+    out = [f"roles {roles}\n"]
+    for ph, t, cn, cm, sn, sm in sweeps:
+        out.append(f"SWEEP {ph} {t:.6f} cmd={cn}:{cm} srv={sn}:{sm}\n")
+    for tr in traced:
+        out.append("TRACED " + " ".join(str(x) for x in tr) + "\n")
+    return "".join(out)
+
+
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
-            lab_ops=None, capped=False, live="held"):
+            lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3)):
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     if live == "held":
@@ -197,9 +212,12 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         to = n if timed_ops is None else timed_ops
+        sm = {"verdict": "ok" if rc == 0 else "fail", "rc": rc, "measured_ops": to, "measured_ok": to,
+              "warmup_rule": timed_rule, "capped": capped, "tm0_realtime_s": window[0], "tm1_realtime_s": window[1]}
+        if self_tp is not None:  # the load generator's own TracerPid at tm0 and tm1 (MED 4)
+            sm["tracerpid_tm0"], sm["tracerpid_tm1"] = self_tp
         with open(os.path.join(d, "timed", "summary.json"), "w") as f:
-            json.dump({"verdict": "ok" if rc == 0 else "fail", "rc": rc, "measured_ops": to, "measured_ok": to,
-                       "warmup_rule": timed_rule, "capped": capped}, f)
+            json.dump(sm, f)
         with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
             f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
         with open(os.path.join(d, "timed.rc"), "w") as f:
@@ -211,16 +229,41 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
 
 
 def selftest():
-    clean = "start 100 100 0\nstart 101 101 0\nend 100 100 0\nend 101 101 0\n"
+    # MED 4: the tracer record is trace.sh's tracer_sweep format (append-only sweeps every 0.05 s, whole process trees)
+    clean = trace_rec()
+    sw = [("start", 100.0, 3, 0, 12, 0)] + [("mid", round(100.05 + 0.05 * k, 2), 3, 0, 12, 0) for k in range(8)]
     cases = [  # (name, fixture kwargs, expect ok)
         ("untraced timed run", dict(tracer=clean), True),
-        ("a server task traced at the end of the timed run", dict(tracer=clean.replace("end 101 101 0", "end 101 101 4242")),
-         False),
-        ("a server task traced at its start", dict(tracer=clean.replace("start 100 100 0", "start 100 100 77")), False),
+        ("a server task traced at the end of the timed run",
+         dict(tracer=trace_rec(sw + [("end", 100.45, 0, 0, 12, 4242)], traced=[("end", "srv", 101, 101, 4242)])), False),
+        ("a server task traced at its start",
+         dict(tracer=trace_rec([("start", 100.0, 3, 0, 12, 77)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)],
+                               traced=[("start", "srv", 100, 100, 77)])), False),
         ("no timed run: only the traced labelling run's latency file", dict(timed=False, tracer=clean), False),
         ("no tracer samples", dict(tracer=""), False),
-        ("no sample at the end", dict(tracer="start 100 100 0\n"), False),
+        ("no sample at the end", dict(tracer=trace_rec(sw)), False),
         ("tracer record missing", dict(tracer=None), False),
+        ("a tracer attached mid-run and detached before the end (seen by a mid sweep)",
+         dict(tracer=trace_rec(sw[:4] + [("mid", 100.2, 3, 0, 12, 31337)] + sw[5:] + [("end", 100.45, 0, 0, 12, 0)],
+                               traced=[("mid", "srv", 104, 107, 31337)])), False),
+        ("a TRACED line whose sweep line says 0 (the line alone refuses)",
+         dict(tracer=trace_rec(traced=[("mid", "cmd", 500, 501, 9)])), False),
+        ("a blind second mid-run (a gap longer than the 0.25 s allowed)",
+         dict(tracer=trace_rec(sw[:3] + [("mid", 101.2, 3, 0, 12, 0)] + [("end", 101.25, 0, 0, 12, 0)]),
+              window=(100.1, 101.1)), False),
+        ("no sweep before the window opened",
+         dict(tracer=trace_rec([("start", 100.15, 3, 0, 12, 0)] + sw[4:] + [("end", 100.45, 0, 0, 12, 0)])), False),
+        ("no sweep after the window closed",
+         dict(tracer=trace_rec(sw[:6] + [("end", 100.28, 0, 0, 12, 0)])), False),
+        ("B1: no server role; the command's tree sampled throughout",
+         dict(tracer=trace_rec([(p, t, n, m, 0, 0) for p, t, n, m, _, _ in sw] + [("end", 100.45, 0, 0, 0, 0)],
+                               roles="cmd=500 srv=none")), True),
+        ("a server role whose start sweep found no task",
+         dict(tracer=trace_rec([("start", 100.0, 3, 0, 0, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
+        ("no roles header", dict(tracer="".join(ln for ln in clean.splitlines(True) if not ln.startswith("roles"))),
+         False),
+        ("the load generator itself traced at tm0 (its own record)", dict(tracer=clean, self_tp=(77, 0)), False),
+        ("no own tracer record in the timed summary", dict(tracer=clean, self_tp=None), False),
         ("timed run failed", dict(rc=3, tracer=clean), False),
         ("timed run measured another N", dict(timed_ops=150, tracer=clean), False),
         # gate-6 review, t3run item 3: one warm-up rule, PREREG :210's, for both runs
