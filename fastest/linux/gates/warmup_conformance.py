@@ -23,6 +23,11 @@ claim before the stop is a warm-up op, so warm_ops == stop_at.
         two roles naming one file or one sha256, timed out, or printing anything but one result line). Each
         driver is reported by realpath and sha256; --record writes the verdict as JSON (rc, verdict, cases, and per
         role path, realpath, sha256), which summarize binds to the binaries a package ran (review 5 MED 6, 7)
+  warmup_conformance.py live BIN RECORD
+        a run's LIVE decision (RECORD: {rule, claims_ns, stop_at, warm_ops, capped}, the claims it judged and what it
+        decided) replayed through the same BIN's --warmup-replay: 0 the same decision, 1 different, 2 refused (review
+        5 MED 8). The drivers' live records are owed: fastest_profile's with its ready/go barrier (Rust, held until it
+        builds), the Linux ports' by comp
   warmup_conformance.py self-test
         the harness on fake replayers: a correct one passes, and four wrong ones (> for >=, capped winning over
         done, the stop claim counted, rounding instead of truncating) each fail on a named case
@@ -149,6 +154,31 @@ def run(drivers, record=None):
     return done(0, out)
 
 
+def live_check(binary, path):
+    """A driver's LIVE warm-up decision against its own replay (review 5 MED 8: the gate above sees only the replay
+    loop). PATH is the run's live record {rule, claims_ns, stop_at, warm_ops, capped}: the claims it judged, in ns since
+    its warm-up began, in the order it judged them, and the decision it made. The claims are replayed through BINARY
+    --warmup-replay, so a driver whose live loop and replay loop disagree is caught here, and run() above ties the
+    replay loop to the rule. Returns (rc, lines): 0 same decision, 1 different, 2 refused (unreadable record, no claims,
+    claims going back in time, or a replay that refuses)."""
+    try:
+        r = json.load(open(path))
+        rule, claims, want = r["rule"], r["claims_ns"], (r["stop_at"], r["warm_ops"], r["capped"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return 2, [f"warmup live: REFUSED: {path}: {type(e).__name__}: {e}"]
+    if not isinstance(claims, list) or not claims or any(type(c) is not int or c < 0 for c in claims):
+        return 2, [f"warmup live: REFUSED: {path}: no claims, or a claim that is not a non-negative integer of ns"]
+    if any(b < a for a, b in zip(claims, claims[1:])):
+        return 2, [f"warmup live: REFUSED: {path}: claims go back in time (judged out of order)"]
+    try:
+        got = replay(binary, rule, claims)
+    except Refused as e:
+        return 2, [f"warmup live: REFUSED: {e}"]
+    if got != want:
+        return 1, [f"warmup live: FAIL: {path}: the run decided {want}, its own replay of the same claims {got}"]
+    return 0, [f"warmup live: PASS: {path}: the run's decision {want} is its replay's ({len(claims)} claims, {rule})"]
+
+
 FAKE = r'''#!/usr/bin/env python3
 # fake replayer {name}
 import sys
@@ -273,6 +303,10 @@ def _self_test(d):
 def main(a):
     if a[1:] == ["self-test"]:
         return self_test()
+    if a[1:2] == ["live"] and len(a) == 4:
+        rc, rep = live_check(a[2], a[3])
+        print("\n".join(rep))
+        return rc
     if a[1:2] == ["run"]:
         flags = {"--bbload": "bbload", "--clonebench": "clonebench", "--fastest-profile": "fastest_profile"}
         rest, drivers, record = a[2:], {}, None
