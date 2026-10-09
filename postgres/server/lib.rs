@@ -1982,33 +1982,6 @@ fn pg_space(c: u8) -> bool {
 /// and `ROLLBACK /* c */` could never end a failed block (wire review 9 item 7, review 11 item 7).
 fn tx_words(sql: &str) -> Option<Vec<&str>> {
     let b = sql.as_bytes();
-    // The length of the comment at the start of `b`: None if none starts there, Some(None) for
-    // one that never ends.
-    let comment = |b: &[u8]| -> Option<Option<usize>> {
-        if b.starts_with(b"--") {
-            let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
-            return Some(Some(end.map_or(b.len(), |p| p + 1)));
-        }
-        if !b.starts_with(b"/*") {
-            return None;
-        }
-        let (mut depth, mut i) = (0usize, 0usize);
-        while i < b.len() {
-            if b[i..].starts_with(b"/*") {
-                depth += 1;
-                i += 2;
-            } else if b[i..].starts_with(b"*/") {
-                depth -= 1;
-                i += 2;
-                if depth == 0 {
-                    return Some(Some(i));
-                }
-            } else {
-                i += 1;
-            }
-        }
-        Some(None)
-    };
     let mut i = 0;
     loop {
         while i < b.len() && pg_space(b[i]) {
@@ -2088,6 +2061,34 @@ fn tx_words(sql: &str) -> Option<Vec<&str>> {
         }
     }
     Some(words)
+}
+
+/// The length of the SQL comment at the start of `b`, as PostgreSQL's lexer reads one (`--` to the
+/// line's end, `/* */` nested): None if none starts there, Some(None) for one that never ends.
+fn comment(b: &[u8]) -> Option<Option<usize>> {
+    if b.starts_with(b"--") {
+        let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
+        return Some(Some(end.map_or(b.len(), |p| p + 1)));
+    }
+    if !b.starts_with(b"/*") {
+        return None;
+    }
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if b[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(Some(i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Some(None)
 }
 
 /// Whether a BEGIN or START TRANSACTION ([`TxVerb::Begin`]) asks for READ ONLY among its modes.
@@ -2461,11 +2462,26 @@ fn portal_not_found(name: &str) -> Box<ErrorInfo> {
     error("34000", format!("portal \"{name}\" does not exist"))
 }
 
-/// A statement with nothing in it (whitespace, or a lone `;`): PostgreSQL's empty query, answered
-/// with EmptyQueryResponse on both protocols.
+/// A statement with nothing in it: only PostgreSQL's whitespace, semicolons and comments, the text
+/// libpg_query parses to no statement. PostgreSQL's empty query, answered with
+/// EmptyQueryResponse on both protocols. Read by bytes, with no parse; an unterminated comment is
+/// not blank (the parser refuses it). Tested as whitespace or a lone `;`, `;;`, `-- c` and `/* c
+/// */` reached begin_implicit and the translator's "No statements found", which rolled a
+/// pipeline's earlier writes back (wire review 15 item 6).
 fn is_blank(sql: &str) -> bool {
-    let trimmed = turso_pg_parser::pg_trim(sql);
-    trimmed.is_empty() || trimmed == ";"
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if pg_space(b[i]) || b[i] == b';' {
+            i += 1;
+            continue;
+        }
+        match comment(&b[i..]) {
+            Some(Some(len)) => i += len,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.
