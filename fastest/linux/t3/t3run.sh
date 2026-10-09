@@ -10,17 +10,20 @@
 #
 # Stages (each timed into <out>/stages.tsv; the whole run's wall time is the last row):
 #   preflight  Ubuntu, passwordless sudo, free disk, the out dir new, the mode's refusals (below)
+#   selftests  the harness's own self-tests and the devguard root fire, before anything is paid for
 #   deps       apt (build tools, fio, strace, nvme-cli, smartmontools, fs tools, PGDG postgresql-18 without a
 #              cluster, MariaDB client), rustup with the repo's pinned toolchain
 #   build      the engine driver fastest_profile (release, debug symbols), bbload/clonebench/sqlite3
 #              (competitors/build.sh), Dolt + Doltgres release binaries (competitors/fetch_dolt.sh), v3floor and
 #              the fire-check's statfs shim
+#   envchecks  firecheck.sh's environment with t3run's V3ENV, positive and negative (needs the build)
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
-#              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, V3L BEFORE, every manifest cell for
-#              that fs in a seeded shuffle (each with the foreign-CPU sampler and its void decision made before
-#              any result of the cell is read; a void run is replaced once, at most twice per cell), V3L AFTER,
-#              a V3 batch AFTER, then the batches' drift (batchgate.py drift: published, not a gate on T3; a REFUSED
+#              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
+#              the plan's section-7 blocks K = 1..k with V3L at every block boundary (b0 before block 1, bK after
+#              block K, which is also before K+1; T3 runner review LOW 24), each run with the foreign-CPU sampler
+#              and its void decision made before any result of the run is read (a void run is replaced once, at
+#              most twice per cell), then a V3 batch AFTER, then the batches' drift (batchgate.py drift: published, not a gate on T3; a REFUSED
 #              drift fails). Each batch is judged by blockgate.py (review 2 item 5, rulings A14 and A16: every VOID
 #              fails), and the A16 plants run on copies of the BEFORE batch's real record; a batch blockgate fails, a
 #              plant that does not fire, or a V3L that is not VALID (v3l.py) fails the block's stage (items 5 and 6).
@@ -323,7 +326,7 @@ LOOPDIR=""
 v3fixtures() {
   local nest=""
   if [ "$BLOCK" = loop ]; then
-    LOOPDIR=$(df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')
+    LOOPDIR=$(bash "$L/fs/mkloop.sh" backing-dir)
     [ -d "$LOOPDIR" ] || { echo "v3fixtures: no backing directory for the loop blocks ('$LOOPDIR')"; return 1; }
     nest=$LOOPDIR
   fi
@@ -350,7 +353,10 @@ v3batch() { # v3batch before|after DIR
     [ $DRY = 0 ] && env+=(V3_REQUIRE_T3=1)
   fi
   echo "v3 $when: ${env[*]}"
-  env "${env[@]}" timeout 3600 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" 10000 --arms "$arms" \
+  # a bound batch runs the registered shape (N=10000, run.sh refuses any other); a brd batch is smoke (never bound,
+  # never credited), so it runs N=200 like the fire-check's F3, not 50x that (T3 runner review LOW 25)
+  local n=10000; [ "$BLOCK" = brd ] && n=200
+  env "${env[@]}" timeout 3600 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" "$n" --arms "$arms" \
     > "$o/v3-$when.txt" 2>&1
   rc=$?
   echo "$when rc=$rc" >> "$o/v3.rc"
@@ -575,12 +581,8 @@ run_cell() {
   done
 }
 
-stage preflight preflight
-stage deps deps
-export PATH="$HOME/.cargo/bin:$PATH"
-stage build build
-stage hwid hwid
-stage v3fixtures v3fixtures
+# The checks that need nothing built, BEFORE deps and build are paid for (T3 runner review LOW 17): the harness's own
+# self-tests and the devguard root fire on this box's real disks
 selftests() {
   local t
   for t in foreign_cpu v3l summarize blockgate devguard; do
@@ -607,9 +609,17 @@ selftests() {
       echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$d holds the root filesystem'; got exit $rc"; return 1
     fi
   done
-  fcenv_check
 }
+stage preflight preflight
 stage selftests selftests
+stage deps deps
+export PATH="$HOME/.cargo/bin:$PATH"
+stage build build
+stage hwid hwid
+stage v3fixtures v3fixtures
+# The checks that need the build (the V3 binaries): firecheck.sh's environment, positive and negative
+envchecks() { fcenv_check; }
+stage envchecks envchecks
 if [ $DRY = 1 ]; then
   echo "dry run: the runner image mounts / nobarrier; remount with barrier as a T3 box has it"
   sudo mount -o remount,barrier / && findmnt -n -o OPTIONS / | tee "$OUT/root-mount.txt"
