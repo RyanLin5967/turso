@@ -363,9 +363,10 @@ CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # S 10 of the rule 1000:10:180; an uncapped 5 s window under the 1800 s cap). PREREG annex A23: the warm-up ends at a
 # claim, so the record names that claim's time (warmup_end_ns, ns since t0), whether it ended capped, and the time of
 # the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
-# 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done.
+# 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done. warmup_backsteps: the claims judged
+# with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are).
 RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
-       "warmup_last_claim_ns": 9_999_800_000, "max_window_s": 1800.0, "window_s": 5.0}
+       "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "max_window_s": 1800.0, "window_s": 5.0}
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
@@ -518,6 +519,13 @@ def selftest():
          dict(tracer=clean, timed_extra={"warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}), False),
         ("A23: warm-up ops but no last claim time", dict(tracer=clean, timed_extra={"warmup_last_claim_ns": None}),
          False),
+        # fastest-linux's LOW on f6c2dbb2f: the closed-loop claim time was read BEFORE g_claim_mu, so a slower claimant
+        # could be judged later in lock order with an older time -- and an ending claim older than a warm-up claim
+        # already counted is invisible to the last-claim check whenever that claim was not the last one judged
+        # (e.g. warm 10.0003 s, warm 10.0001 s, end 10.0002 s). The binaries now count such backsteps under the lock.
+        ("A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)",
+         dict(tracer=clean, timed_extra={"warmup_backsteps": 1}), False),
+        ("A23: no warmup_backsteps in the record", dict(tracer=clean, timed_extra={"warmup_backsteps": None}), False),
         ("the labelling run's warm-up left early",
          dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
                                        "warmup_last_claim_ns": 999_000_000}), False),
@@ -585,7 +593,7 @@ def selftest():
     # rule's text (the same edges as the shared harness's cases), never from a driver.
     def wrec(ops, end_ns, capped, last_ns):
         return {"warmup_ops": ops, "warmup_s": end_ns / 1e9, "warmup_capped": capped, "warmup_end_ns": end_ns,
-                "warmup_last_claim_ns": last_ns}
+                "warmup_last_claim_ns": last_ns, "warmup_backsteps": 0}
     for rule_in, rec, want, what in (
             ("1000:1:0", wrec(0, 0, True, None), True, "MAX_S 0 ends at the first claim, capped (no 'no limit')"),
             ("1000:1:0", wrec(1000, 1_200_000_000, False, 1_190_000_000), False,
