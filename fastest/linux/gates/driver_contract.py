@@ -109,6 +109,16 @@ def self_test():
         ("LOW 14: a stop below OPS that says not capped fails", check(rec(capped=False), 33, 4, "1000000:0:2") != []),
         ("LOW 14: capped before MAX_S fails",
          check(rec(rule="10:0:30", st=0.04, oa=12, ot=40, capped=True), 33, 4, "10:0:30") != []),
+        # review 5 LOW 15: under A23 the warm-up ops are the claims before the ending claim, read after every client
+        # finished, so ops == ops_at_stop; capped both ways (not capped needs S reached; done wins over capped)
+        ("LOW 15: ops above ops_at_stop fails (a claim counted after the end)",
+         check(rec(rule="10:0:30", st=0.04, oa=12, ot=13, capped=False), 33, 4, "10:0:30") != []),
+        ("LOW 15: not capped before S fails (only MAX_S can end it before S)",
+         check(rec(rule="10:1:30", st=0.5, oa=12, ot=12, capped=False), 33, 4, "10:1:30") != []),
+        ("LOW 15: done (OPS and S met) but recorded capped fails (done wins)",
+         check(rec(rule="10:1:2", st=2.0, oa=12, ot=12, capped=True), 33, 4, "10:1:2") != []),
+        ("LOW 15: a clean early stop with S > 0 keeps the contract",
+         check(rec(rule="10:1:30", st=1.01, oa=12, ot=12, capped=False), 33, 4, "10:1:30") == []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
