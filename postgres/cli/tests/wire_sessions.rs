@@ -7470,6 +7470,57 @@ fn a_query_in_an_unsynced_pipeline_takes_part_in_its_block() {
     assert_eq!(a.read_reply().status, b'I');
 }
 
+/// A transaction verb followed by a run of `;` is its verb over the extended protocol too (wire
+/// review 16 item 7; pins of 216149918 (i) and 3067f87d8, which review 16 found unreddened): in an
+/// unsynced pipeline `COMMIT;;` ends the implicit block, committing its INSERT, and the flag goes
+/// with it, so a Query BEGIN then opens the client's block (T), never one committed at once (the
+/// stale-flag mutant answers I); and `ROLLBACK;;` ends a failed block with ROLLBACK, status I,
+/// where the verb reader read it as an ordinary statement and refused it 25P02.
+#[test]
+fn a_verb_before_empty_statements_is_its_verb_in_a_pipeline() {
+    let dir = Scratch::new("pipesemis");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    // Parse, Bind and Execute `sql` (no parameters, no Sync).
+    fn execute(w: &mut Wire, sql: &str) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        w.send(b'P', &parse);
+        w.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+    }
+    execute(&mut a, "INSERT INTO t VALUES (2, 'p')");
+    execute(&mut a, "COMMIT;;");
+    let r = a.q("BEGIN");
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        r.status, b'T',
+        "BEGIN after COMMIT;; opens the client's block"
+    );
+    a.q("ROLLBACK").ok("end");
+    a.send(b'S', &[]);
+    a.read_reply();
+    assert_eq!(
+        b.q("SELECT count(*) FROM t WHERE id = 2").single("kept"),
+        "1",
+        "COMMIT;; committed the pipeline's insert"
+    );
+    a.q("BEGIN").ok("begin");
+    assert_eq!(a.q("SELECT * FROM nosuch").status, b'E');
+    execute(&mut a, "ROLLBACK;;");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(
+        r.error.is_none(),
+        "ROLLBACK;; in a failed block: {:?}",
+        r.error
+    );
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+}
+
 /// An empty statement takes no value at Bind: one value is 08P01 before any BindComplete, as
 /// PostgreSQL counts it (its parameters are the ones Parse declared, none). It got BindComplete,
 /// then EmptyQueryResponse (wire review 16 item 5; a pin of 745585f27's Bind-time count).
