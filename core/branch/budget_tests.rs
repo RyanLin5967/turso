@@ -695,14 +695,16 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let _ = probe::take_hold_maxima();
     let foot0 = probe::phys_footprint();
     let before = probe::live_heap_bytes();
+    let held0 = probe::thread_allocs().3;
     let db = open_at(&built.path);
     assert_ne!(db.incarnation, built.incarnation, "{cell}: the registry returned the old Database: not a reopen");
     built.incarnation = db.incarnation;
     db.branch_wait_name_filter();
     let settled = quiesce(&db, base);
     let after = probe::live_heap_bytes();
-    let (bg_bytes, bg_rows) = probe::take_background_hold_maxima();
-    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let held1 = probe::thread_allocs().3;
+    let maxima = probe::take_hold_maxima();
+    let ((hold_bytes, hold_rows), (bg_bytes, bg_rows)) = (maxima.all, maxima.background);
     probe::mark_foreground(false);
     let foot1 = probe::phys_footprint();
     let mut s = Sample::new();
@@ -720,6 +722,10 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_hold_catalog_rows", hold_rows);
     s.insert("max_bg_hold_alloc_bytes", bg_bytes);
     s.insert("max_bg_hold_catalog_rows", bg_rows);
+    s.insert("max_fg_hold_alloc_bytes", maxima.foreground.0);
+    s.insert("max_fg_hold_catalog_rows", maxima.foreground.1);
+    // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
+    s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
 }
@@ -1249,7 +1255,7 @@ fn run_instruments(cell: &str) -> String {
     std::hint::black_box(Box::new(0u64));
     probe::store_unlocked();
     probe::store_unlocked();
-    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let (hold_bytes, hold_rows) = probe::take_hold_maxima().all;
     s.insert("max_hold_alloc_bytes", hold_bytes);
     s.insert("max_hold_catalog_rows", hold_rows);
     // A hold on a foreground-marked thread is not a background hold; one on another thread is.
@@ -1274,8 +1280,8 @@ fn run_instruments(cell: &str) -> String {
     }
     s.insert("hold_thread_left", u64::from(probe::threads() == threads_before));
     probe::mark_foreground(false);
-    let (bg_bytes, _) = probe::take_background_hold_maxima();
-    let (all_bytes, _) = probe::take_hold_maxima();
+    let maxima = probe::take_hold_maxima();
+    let ((bg_bytes, _), (all_bytes, _)) = (maxima.background, maxima.all);
     s.insert("bg_hold_alloc_bytes", bg_bytes);
     s.insert("all_hold_alloc_bytes", all_bytes);
     put("fc_live_and_hold", &s);
@@ -1388,7 +1394,7 @@ fn run_instruments(cell: &str) -> String {
     let base = probe::threads();
     let _ = probe::take_hold_maxima();
     let (_, mut s) = measure(&db, base, || db.branch_named("pop-7").unwrap());
-    s.insert("max_hold_catalog_rows", probe::take_hold_maxima().1);
+    s.insert("max_hold_catalog_rows", probe::take_hold_maxima().all.1);
     put("fc_lookup_cataloged", &s);
     let (_, s) = measure(&db, base, || db.branch_named("never-seen").unwrap());
     put("fc_lookup_unseen", &s);
@@ -2748,17 +2754,24 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
     );
 }
 
-/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): the largest
-/// single store-mutex hold made by the store's BACKGROUND threads during an open and its background
-/// work (the name filter's build; under L4, the name map's) does not grow with the live branches:
-/// from 10^4 to 10^5 its allocated bytes grow by at most a quarter plus 4 KiB, its catalog rows by
-/// at most a quarter plus 64. An O(N) hold grows tenfold. The opening thread's own holds are judged
-/// apart (the same bound on the all-threads maximum), because its fixed ~1 MiB hold (base10:
-/// 1,029,243 B in 9 holds at every N) masked the filter's O(N) install in the all-threads maximum
-/// at 10^4 (base13: 1,029,291 B at 10^4, 1,179,656 B at 10^5 = a 131,072-bucket set of u64 — read
-/// green). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no catalog
-/// row (the D0 recovery instruction test sees that one); a catalog statement that changes many rows
-/// counts one (`Stmt::exec`).
+/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): from 10^4 to 10^5
+/// live branches, an open and its background work (the name filter's build; under L4, the name
+/// map's) hold the store mutex for no more work. Judged ABSOLUTELY (review 2 M7: the x + x/4 term
+/// let an O(N) hold up to about 12.9 B per branch hide under the opener's fixed ~1 MiB hold):
+/// * the largest single hold by the store's BACKGROUND threads: bytes at most + 4 KiB, catalog rows
+///   at most + 64;
+/// * the largest single hold by the OPENING thread (marked foreground), the same;
+/// * the opening thread's held bytes summed over every hold of the open, at most + 4 KiB;
+/// * the all-threads maximum, the same as the per-kind ones.
+/// Both samples must be quiet (review 2 M7's LOW: a hold still open when the maxima are taken would
+/// be lost). The opening thread's held allocations are also held exactly equal between n10 and n1e4
+/// by recovery_of_named_branches_is_independent_of_live_branches_on_the_opening_thread (the
+/// backstop, red at base: +14 allocations). base14 (f5e9d5693): background 147,464 B at 10^4 ->
+/// 1,179,656 B at 10^5 (the filter set's table, built under the mutex; fixed by fastest-engine
+/// f315c960d, unrun). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no
+/// catalog row (the D0 recovery instruction test sees that one); a catalog statement that changes
+/// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
+/// `opener_filter_set`. WRITTEN NOT RUN in this form.
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -2766,19 +2779,23 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     }
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
+    assert!(sa["quiet"] == 1 && sb["quiet"] == 1, "premise: both memory samples quiet (10^4: {}, 10^5: {})", sa["quiet"], sb["quiet"]);
     let mut failures = String::new();
     for (k, slack) in [
         ("max_bg_hold_alloc_bytes", 4096u64),
         ("max_bg_hold_catalog_rows", 64),
+        ("max_fg_hold_alloc_bytes", 4096),
+        ("max_fg_hold_catalog_rows", 64),
+        ("fg_held_alloc_bytes_sum", 4096),
         ("max_hold_alloc_bytes", 4096),
         ("max_hold_catalog_rows", 64),
     ] {
         let (x, y) = (sa[k], sb[k]);
-        if y > x + x / 4 + slack {
-            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {x}/4 + {slack}");
+        if y > x + slack {
+            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {slack}");
         }
     }
-    assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");
+    assert!(failures.is_empty(), "an open's store-mutex holds grow with the live branches:\n{failures}");
 }
 
 /// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the

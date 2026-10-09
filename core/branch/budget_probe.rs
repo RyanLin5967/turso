@@ -57,6 +57,9 @@ static MAX_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 /// would otherwise mask in the all-threads maximum.
 static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
+// The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
+static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAX_FG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -328,7 +331,10 @@ pub(crate) fn store_unlocked() {
         let (bytes, rows) = (get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), get(&T_CAT_ROWS).wrapping_sub(rows0));
         MAX_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
         MAX_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
-        if !FOREGROUND.with(|f| f.get()) {
+        if FOREGROUND.with(|f| f.get()) {
+            MAX_FG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
+            MAX_FG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+        } else {
             MAX_BG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
             MAX_BG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
         }
@@ -363,16 +369,22 @@ pub(crate) fn live_heap_bytes() -> i64 {
 }
 
 /// `(bytes allocated, catalog rows touched)` in the largest single store-mutex hold since the last
-/// call, by any thread, and start again from zero.
-pub(crate) fn take_hold_maxima() -> (u64, u64) {
-    let _ = take_background_hold_maxima();
-    (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed))
+/// `take_hold_maxima`: by any thread, by threads not marked foreground, and by the foreground one.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HoldMaxima {
+    pub(crate) all: (u64, u64),
+    pub(crate) background: (u64, u64),
+    pub(crate) foreground: (u64, u64),
 }
 
-/// The same over holds by threads not marked foreground, and start again from zero. Reset by
-/// `take_hold_maxima` too.
-pub(crate) fn take_background_hold_maxima() -> (u64, u64) {
-    (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed))
+/// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
+/// order of two calls can zero one maximum before it is read).
+pub(crate) fn take_hold_maxima() -> HoldMaxima {
+    HoldMaxima {
+        all: (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed)),
+        background: (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed)),
+        foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
+    }
 }
 
 /// Mark the calling thread as the foreground (measuring) thread, or unmark it.
