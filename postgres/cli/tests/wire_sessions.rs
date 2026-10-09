@@ -2559,6 +2559,52 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
     );
 }
 
+/// A column alias list over a `*` the walk cannot expand (a relation of another schema) leaves the
+/// columns unknown, so a parameter compared with one is refused 42P18: a CTE's column list, a FROM
+/// alias's and a view's. The alias list renamed the `*` marker away, so the relation read as having
+/// the aliased columns, untyped, and $1 fell to text (wire review 14 item 8).
+#[test]
+fn an_alias_list_over_an_unknown_star_stays_unknown() {
+    let dir = Scratch::new("aliasstar");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(b"CREATE SCHEMA s;\nCREATE TABLE s.u(k INT, n INT);\n")
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE VIEW vu(k, n) AS SELECT * FROM s.u")
+        .ok("premise: a view with a column list over s.u");
+    let mut wrong = Vec::new();
+    for sql in [
+        "WITH w(k, n) AS (SELECT * FROM s.u) SELECT k FROM w WHERE n > $1",
+        "SELECT k FROM (SELECT * FROM s.u) AS d(k, n) WHERE n > $1",
+        "SELECT k FROM vu WHERE n > $1",
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
+            wrong.push(format!("{sql}: {:?} {:?}, want 42P18", r.params, r.error));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// ALTER TABLE ADD PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works in every transaction state a
 /// client can be in (autocommit; right after BEGIN; after BEGIN and a read; after BEGIN and a
 /// write): it commits with the block, keeps every row, takes effect, and leaves no aside table.
