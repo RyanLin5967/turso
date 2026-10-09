@@ -1381,6 +1381,18 @@ def real_selftest(chk):
             m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\(\d+<([^>]*/append25)>\)", l) for l in ls[:c0]) if mm)
             return "\n".join(ls[:c0] + ["%s  fsync(42<%s>) = 0" % m.groups()] + ls[c0:])
 
+        # V3 review 12 item 4: cfr2b's DIRECTORY fd, read from this fixture's own F1b strace (its in-window directory
+        # fsync), and an F1b plant that drops those in-window directory fsyncs: paired with a sync_fds that lacks the
+        # same fd, the F1b equality holds, so "one fd short" fails the arm-definitions rule alone (since e454c84bd's
+        # equality rule it also tripped "disagrees with F1b's strace")
+        _t4 = rd(os.path.join(src, "F1b", "real-all.trace.gz")) or ""
+        _m4 = re.search(r"fsync\((\d+)<[^>]*/cfr2b\.clones>\)", _t4[max(0, _t4.find("clock_gettime(CLOCK_MONOTONIC_RAW")):])
+        cfr_dir_fd = _m4.group(1) if _m4 else "no in-window cfr2b directory fsync in the fixture's F1b trace"
+
+        def f1b_no_cfr_dirsync(t):
+            ls, c0 = f1b_lines(t)
+            return "\n".join(ls[:c0] + [l for l in ls[c0:] if not re.match(r"^\d+\s+fsync\(\d+<[^>]*/cfr2b\.clones>\)", l)])
+
         cases = [
             ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
             ("flush_sent", both(lambda j: j.update(flush_sent_to_device=FLUSH_SENT["wb"][False] + " (planted)")),
@@ -1446,7 +1458,12 @@ def real_selftest(chk):
                                           "merged": lambda j: j["flush_gate"].update(required_flushes=1399)},
              "F3:gate", ["required_flushes"]),
             # tenth review HIGH 1: the fd record and the per-fd shortfall
-            ("cfr2b's sync_fds one fd short", both(lambda j: j["sync_fds"].update(cfr2b={k: v for k, v in list(j["sync_fds"]["cfr2b"].items())[:1]})),
+            # [amended at V3 review 12 item 4, disclosed: the plant now drops cfr2b's DIRECTORY fd (read from the
+            # fixture's trace, not by dict order) and pairs it with an F1b plant dropping the in-window directory
+            # fsyncs, so only the arm-definitions rule fires; the expectation is unchanged]
+            ("cfr2b's sync_fds one fd short", dict(both(lambda j: j["sync_fds"].update(cfr2b={k: v for k, v in j["sync_fds"]["cfr2b"].items()
+                                                                                               if k != cfr_dir_fd})),
+                                                   f1b=f1b_no_cfr_dirsync),
              "F3:devflush", ["sync_fds disagrees with the arm definitions"]),
             ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
              "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
