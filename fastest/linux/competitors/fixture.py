@@ -41,7 +41,8 @@ sys.path.insert(0, HERE)
 import gen_seed  # noqa: E402
 
 
-KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "stream_sha256", "readback")
+KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "schema_sha256", "stream_sha256",
+        "readback")
 
 
 # The registered post-load maintenance after the aging step (PREREG §7: PG VACUUM, CHECKPOINT; Dolt/Doltgres
@@ -144,6 +145,8 @@ def write(av):
     fx = {"system": o["--system"], "rows": rows, "age_updates": age, "prebranch": int(o["--prebranch"]),
           "live_branches": int(lv) if lv.isdigit() else None,
           "gen_seed_sha256": gen_seed.digest(rows, age, 1), "du_paths": o.get("--du", []),
+          # MED 11: the table's schema line, by itself (a schema change no longer hides inside the stream digest)
+          "schema_sha256": hashlib.sha256((next(gen_seed.sql_lines(1)) + "\n").encode()).hexdigest(),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,
           "extents": {p: extent_count(p) for p in o.get("--extents", [])},
@@ -199,7 +202,8 @@ def selftest():
     streams = {"sql": "aa" * 32, "age": "bb" * 32}
     rb = {"count": 10000, "sum": 0, "row_hash": 83937210371}
     base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "live_branches": 0,
-            "gen_seed_sha256": "ab" * 32, "du_bytes": 9000000, "engine_bytes": 8900000, "extents": {"t": 3},
+            "gen_seed_sha256": "ab" * 32, "schema_sha256": "5c" * 32, "du_bytes": 9000000, "engine_bytes": 8900000,
+            "extents": {"t": 3},
             "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
             "readback": dict(rb), "expected_readback": dict(rb)}
 
@@ -251,6 +255,8 @@ def selftest():
          [v(), v(system="doltgres", maintenance="dolt_commit seed; aged 0; dolt_commit age")], False),
         ("PG without its final CHECKPOINT", [v(maintenance="CHECKPOINT; aged 0; VACUUM ANALYZE")], False),
         ("a system with no registered maintenance", [v(), v(system="mystery", maintenance="none")], False),
+        # MED 11: the schema line is compared by itself
+        ("a system loaded another schema (INT PRIMARY KEY)", [v(), v(system="b1", schema_sha256="ee" * 32)], False),
         ("every system's registered maintenance, unaged",
          [v(), v(system="dolt"), v(system="doltgres"), v(system="b1")], True),
     ]

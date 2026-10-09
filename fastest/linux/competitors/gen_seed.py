@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """gen_seed.py -- the ONE parent fixture generator for every system (PG, Doltgres, Dolt, the SQLite B1 baseline, and
-ours: gate-6 review, t3run item 4). The table: t(id INT PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL), ids
+ours: gate-6 review, t3run item 4). The table: t(id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL), ids
 1..ROWS, v = 0, a deterministic 100-char pad. Plain SQL accepted by PostgreSQL, Doltgres, Dolt (MySQL dialect) and
 SQLite; INSERTs in batches of 1000 rows.
 
@@ -40,7 +40,10 @@ def xorshift32(x):
 
 def sql_lines(rows):
     """The parent: byte for byte what gen_seed.py ROWS has always printed (one pad stream across batches)."""
-    yield "CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+    # INTEGER PRIMARY KEY (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so
+    # B1's parent has no separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres
+    # read INTEGER as INT, so one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
+    yield "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
     x = 2463534242
     for start in range(1, rows + 1, 1000):
         vals = []
