@@ -114,8 +114,9 @@ jobs:
               ok = all(checks.values())
               print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
               sys.exit(0 if ok else 1)
-          sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or s.get("failed_blocks")
-                         or s.get("parity_refusals") or s.get("normaliser_missing") or not s["planned_runs"]) else 0)
+          # summarize's own verdict, not a hand copy of its terms (fourth lane review LOW 23)
+          print("summarize ok:", s.get("ok"), "fixture_refusals", s.get("fixture_refusals"))
+          sys.exit(0 if s.get("ok") is True else 1)
           PY
       - name: Upload the package
         if: always()

@@ -138,13 +138,19 @@ def block_record(out, fs, plp="no"):
             stored = json.load(open(os.path.join(fsdir, f"v3l-{when}-plants.json")))
         except (OSError, ValueError):
             stored = None
+        # loaded once; an unreadable measurement fails the block with its reason (T3 runner review LOW 22)
         try:
-            again, ok_again = v3l.plants(json.load(open(j)))
-        except (OSError, ValueError, KeyError, TypeError) as e:
+            meas = json.load(open(j))
+        except (OSError, ValueError) as e:
+            rec["why"].append(f"V3L {when}: v3l-{when}/v3l.json unreadable ({type(e).__name__})")
+            continue
+        try:
+            again, ok_again = v3l.plants(meas)
+        except (ValueError, KeyError, TypeError, AttributeError):
             again, ok_again = [], False
         rec.setdefault("v3l_plants", {})[when] = {p["plant"]: p["fired"] for p in again}
         if stored is None or not stored.get("all_fired") or not ok_again:
-            if json.load(open(j)).get("verdict") == "VALID":  # a VOID measurement already fails the block
+            if not isinstance(meas, dict) or meas.get("verdict") == "VALID":  # a VOID measurement already fails it
                 rec["why"].append(f"V3L {when} plants: stored {None if stored is None else stored.get('all_fired')}, "
                                   f"re-derived {rec['v3l_plants'][when]}")
     b, a = rec["v3"]["before"].get("frame_arm_p50_us"), rec["v3"]["after"].get("frame_arm_p50_us")
@@ -295,11 +301,11 @@ def summarize(out, sha, dry, manifest):
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
         d = os.path.join(out, f"fs-{fs}", "cells", cell, f"a{last['attempt']}") if last else None
-        result, why = False, "no attempt recorded"
+        result, why, not_available = False, "no attempt recorded", False
         if last:
             adapter = open(os.path.join(d, "adapter.txt"), errors="replace").read() if os.path.exists(os.path.join(d, "adapter.txt")) else ""
             if last["adapter_rc"] == 4 and any(l.startswith("NOT AVAILABLE") for l in adapter.splitlines()):
-                result, why = True, "NOT AVAILABLE (class absent at this sha)"
+                result, why, not_available = True, "NOT AVAILABLE (class absent at this sha)", True
             elif last["void"] != "VALID":
                 why = "last attempt VOID"
             elif system == "ours":
@@ -308,16 +314,26 @@ def summarize(out, sha, dry, manifest):
             else:
                 f = os.path.join(d, "result", "functional.txt")
                 text = open(f).read() if os.path.exists(f) else ""
-                result = "VERDICT" in text and last["adapter_rc"] == 0
-                why = (text.strip().splitlines() or ["no functional.txt"])[-1] if result else \
-                    f"no functional VERDICT (adapter rc {last['adapter_rc']})" if "VERDICT" not in text else \
-                    f"functional VERDICT written but the adapter exited {last['adapter_rc']}"
-                if result and "VERDICT PASS" not in text:
+                # the verdict is the LAST 'VERDICT ' line (T3 runner review LOW 21). run_system.sh exits 0 on PASS and
+                # 1 on FAIL, so a FAIL arrives at rc 1: complete raws of a failed check, its FAIL lines kept (fourth
+                # lane review LOW 21); any other rc (a kill, a refusal) is an incomplete run (LOW 12)
+                vl = [l.strip() for l in text.splitlines() if l.startswith("VERDICT ")]
+                verdict = vl[-1] if vl else None
+                rc_ = last["adapter_rc"]
+                if verdict == "VERDICT PASS":
+                    result = rc_ == 0
+                elif verdict is not None:
+                    result = rc_ in (0, 1)
+                else:
+                    result = False
+                why = verdict if result else f"no functional VERDICT (adapter rc {rc_})" if verdict is None else \
+                    f"functional {verdict} written but the adapter exited {rc_}"
+                if result and verdict != "VERDICT PASS":
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
         st = os.path.join(d, "settle.txt") if d else None
         settle = open(st).read().strip() if st and os.path.exists(st) else None
-        measured = result and why != "NOT AVAILABLE (class absent at this sha)"
+        measured = result and not not_available  # a flag, not the note's text (T3 runner review LOW 23)
         r = {"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
              "measured": measured, "settle": settle, "plan": prow.get((fs, cell))}
         if measured:
@@ -385,6 +401,7 @@ def summarize(out, sha, dry, manifest):
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
         and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet
+    summary["ok"] = ok  # the one verdict the workflow reads (fourth lane review LOW 23)
     return summary, ok
 
 
