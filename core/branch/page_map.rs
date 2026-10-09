@@ -83,6 +83,50 @@ impl PageMap {
         }
     }
 
+    /// Add every trie node of this map not already in `seen` (by address), for counting the nodes
+    /// all live maps hold between them. Observation only; a shared subtree is walked once.
+    pub(crate) fn count_nodes(&self, seen: &mut std::collections::HashSet<usize>) {
+        fn walk(node: &Arc<Node>, seen: &mut std::collections::HashSet<usize>) {
+            if !seen.insert(Arc::as_ptr(node) as usize) {
+                return;
+            }
+            if let Node::Inner(kids) = &**node {
+                for kid in kids.iter().flatten() {
+                    walk(kid, seen);
+                }
+            }
+        }
+        if let Some(root) = &self.root {
+            walk(root, seen);
+        }
+    }
+
+    /// Call `f` with every `(page, slot)` this map holds (the slot of each [`Mapped`]; its crc is
+    /// not passed). Observation only.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u32, Slot)) {
+        fn walk(node: &Node, prefix: u64, f: &mut dyn FnMut(u32, Slot)) {
+            match node {
+                Node::Inner(kids) => {
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            walk(kid, (prefix << BITS) | i as u64, f);
+                        }
+                    }
+                }
+                Node::Leaf(slots) => {
+                    for (i, &(slot, _crc)) in slots.iter().enumerate() {
+                        if slot != EMPTY {
+                            f(((prefix << BITS) | i as u64) as u32, slot);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(root) = &self.root {
+            walk(root, 0, &mut f);
+        }
+    }
+
     /// Map `page` to `mapped`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had.
     pub(crate) fn insert(&mut self, page: u32, mapped: Mapped) {

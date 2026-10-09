@@ -172,7 +172,15 @@
 //!   wall under concurrent writers; the benchmark this lane ships is single-threaded and says so.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it, so dropping a map never frees
-//!   a page and keeping one never pins a page.
+//!   a page and keeping one never pins a page. One exception, in the splice arm and harmless by
+//!   construction (the volatile store's F7 note, r11-ever fad7db24d): after a splice, a child's
+//!   `inherited` can still name a zombie slot that the splice freed because the child had its own
+//!   version of that page. Every reader consults the branch's `current` before its `inherited`
+//!   (`resolve`; `view_now` inserts the current versions born above `inherited_at` over it; a
+//!   snapshot or catalog load rebuilds a child's map over its parent's with `version_at`), so such
+//!   an entry is never read;
+//!   code that walks `inherited` alone must skip pages present in `current` (`merge_view` reads
+//!   only its page numbers).
 //! * Snapshot mode (`BranchDurability::Durable`) recovers eagerly: every branch map is materialised
 //!   at open, O(live branch state). Catalog mode reads state on demand (see `catalog.rs`).
 //! * A catalog written before the F7 durable port (children's epochs from 0), or in the other splice
@@ -221,8 +229,8 @@ use super::journal::{BranchFiles, Confirm, Flight, Journal, Record, SnapBranch, 
 use super::page_map::PageMap;
 use super::table::BranchTable;
 use super::{
-    BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
-    Reaped, SyncClass,
+    BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchResident, BranchStats,
+    BranchWork, Expired, Reaped, SyncClass,
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -1687,7 +1695,11 @@ impl LeaseClock {
 
 #[derive(Default)]
 struct Lineage {
-    /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
+    /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch. So it
+    /// is the epoch this node's next write is born in: one past its latest fork epoch, or, before a
+    /// branch has forked, one past the fork epoch it was created with (epoch inheritance; a splice
+    /// later lowers `fork_epoch` to its zombie parent's and leaves this alone; r11-ever F7'
+    /// d9be3f03a's wording).
     epoch: u64,
     /// How many live children this node has. The children themselves are indexed store-wide by
     /// (parent, fork epoch) in `StoreInner::children`, which a catalog store reads on demand.
@@ -6651,6 +6663,146 @@ impl BranchStore {
         })
     }
 
+    /// `(resident states, capacity)` of the branch table: capacity is the slots of its allocated
+    /// chunks (F8', [`super::table`]: it grows by a chunk and, unlike the volatile store's F8, falls
+    /// when a chunk empties). O(1); observation only (r11-ever's F8 instrument, 5d580203f).
+    pub(crate) fn table_shape(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.branches.len(), inner.branches.capacity())
+    }
+
+    /// Every resident structure's size, by a full scan under the lock: r11-ever's instrument
+    /// (11b61bf44, 3b22a96ef's waste breakdown, 5d580203f's visible slots), ported from the volatile
+    /// store. Observation only. As `stats` does, covered deferred frees are matured and parked
+    /// Commits applied first, so the arena counts are the ones the log describes.
+    ///
+    /// Exact for a volatile store, which is what `branch_ever` and `branch_peak` open. Elsewhere it
+    /// covers what is in memory: a catalog store's per-state sums cover its RESIDENT states (`states`
+    /// counts every state, as `BranchStats::live_branches` does), its children are the in-memory
+    /// child index's and its trunk versions those retained since the last checkpoint; and a durable
+    /// store's frees held until their record is durable (`pending_free`) are in `arena_in_use` and
+    /// in no waste field, so the waste parts then sum to less than `arena_in_use - visible_slots`.
+    pub(crate) fn resident(&self) -> Result<BranchResident> {
+        self.refuse_if_trunk_only("branch resident sizes")?;
+        let mut inner = self.inner.lock();
+        self.mature(&mut inner);
+        inner.settle()?;
+        let inner = &*inner;
+        let trunk = &inner.trunk;
+        let mut r = BranchResident {
+            states: inner.n_states as usize,
+            table_capacity: inner.branches.capacity(),
+            next_id: inner.next_id,
+            trunk_epoch: trunk.lineage.epoch,
+            trunk_children: trunk.lineage.n_children as usize,
+            trunk_retained_versions: trunk.lineage.by_born.len(),
+            trunk_retained_pages: trunk.lineage.retained.len(),
+            trunk_written_pages: trunk.written.len(),
+            ..Default::default()
+        };
+        let mut index_mismatch = trunk.lineage.by_died.len() != r.trunk_retained_versions
+            || trunk
+                .lineage
+                .retained
+                .values()
+                .map(|v| v.len())
+                .sum::<usize>()
+                != r.trunk_retained_versions;
+        let mut nodes = HashSet::new();
+        for (_, st) in inner.branches.iter() {
+            r.zombies += usize::from(st.handle.is_released());
+            r.open += usize::from(st.open);
+            r.branch_children += st.lineage.n_children as usize;
+            r.branch_retained_versions += st.lineage.by_born.len();
+            index_mismatch |= st.lineage.by_died.len() != st.lineage.by_born.len()
+                || st.lineage.retained.values().map(|v| v.len()).sum::<usize>()
+                    != st.lineage.by_born.len();
+            r.branch_current_pages += st.current.len();
+            index_mismatch |= st.current_by_born.len() != st.current.len();
+            st.inherited.count_nodes(&mut nodes);
+            if let Some(view) = &st.view {
+                r.views += 1;
+                view.count_nodes(&mut nodes);
+            }
+        }
+        r.page_map_nodes = nodes.len();
+        // Slots some reader (a branch not released, or one a connection holds) can read: its own
+        // current versions and the slots its open transaction reserved, what its `inherited` map
+        // names for pages it has not written, and the trunk's retained version at its `trunk_at`
+        // for pages neither holds.
+        let reader = |st: &BranchState| !st.handle.is_released() || st.open;
+        let mut visible = HashSet::new();
+        let mut unused = 0u64;
+        for (_, st) in inner.branches.iter().filter(|&(_, st)| reader(st)) {
+            visible.extend(st.current.values().map(|o| o.slot));
+            visible.extend(st.pending.values().copied());
+            st.inherited.for_each(|page, slot| {
+                if !st.current.contains_key(&page) {
+                    visible.insert(slot);
+                }
+            });
+            for &page in trunk.lineage.retained.keys() {
+                if st.current.contains_key(&page) || st.inherited.get(page).is_some() {
+                    continue;
+                }
+                if let Some((slot, _crc)) =
+                    trunk.lineage.retained_at(page, st.trunk_at, &mut unused)
+                {
+                    visible.insert(slot);
+                }
+            }
+        }
+        r.visible_slots = visible.len();
+        // Where the unreadable slots sit (observation only): a zombie's current versions born after
+        // its newest live child's fork (F4's `retire_current` frees these at the release, so 0
+        // unless a connection held it), its other current versions, retained versions of zombies
+        // and of live branches, and the trunk's retained versions.
+        for (&id, st) in inner.branches.iter() {
+            let zombie = !reader(st);
+            let newest = inner.children.below(None, id, u64::MAX).ok().flatten();
+            for o in st.current.values() {
+                if visible.contains(&o.slot) {
+                    continue;
+                }
+                if !zombie {
+                    r.waste_live_current += 1;
+                } else if newest.is_none_or(|f| o.born > f) {
+                    r.waste_zombie_current_after_last_fork += 1;
+                } else {
+                    r.waste_zombie_current_shadowed += 1;
+                }
+            }
+            for versions in st.lineage.retained.values() {
+                for v in versions.values() {
+                    if !visible.contains(&v.slot) {
+                        if zombie {
+                            r.waste_zombie_retained += 1;
+                        } else {
+                            r.waste_live_retained += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for versions in trunk.lineage.retained.values() {
+            r.waste_trunk_retained += versions
+                .values()
+                .filter(|v| !visible.contains(&v.slot))
+                .count();
+        }
+        r.index_mismatch = index_mismatch;
+        if let Some(arena) = &inner.arena {
+            let (high_water, free_capacity, free_bits_words, chunks) = arena.shape();
+            r.arena_high_water = high_water;
+            r.arena_in_use = arena.in_use();
+            r.arena_free_list_len = arena.free_count();
+            r.arena_free_list_capacity = free_capacity;
+            r.arena_free_bits_words = free_bits_words;
+            r.arena_chunks = chunks;
+        }
+        Ok(r)
+    }
+
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let mut inner = self.inner.lock();
         self.mature(&mut inner);
@@ -10056,6 +10208,97 @@ impl BranchStore {
             assert_eq!(st.current_by_born, by_born, "branch {}: current_by_born disagrees", id.0);
         }
     }
+
+    /// r11-ever's splice invariants and the bookkeeping behind them (the volatile store's
+    /// `check_invariants`, fad7db24d, ported), read under the lock between store calls of a
+    /// VOLATILE store: every index agrees with the map it indexes; every arena slot in use is owned
+    /// by exactly one current, reserved or retained version; every child is listed by the child
+    /// index under its own (parent, fork epoch) and counted by its parent; and, in the splice arm
+    /// (`splice`), no released state that no connection holds has fewer than two live children.
+    /// Volatile only: a durable store's frees wait for their record (`pending_free`), and a catalog
+    /// store's states and children are not all in memory.
+    fn check_invariants(&self, splice: bool, what: &str) {
+        let inner = self.inner.lock();
+        assert!(
+            inner.journal.is_none() && inner.cat.is_none(),
+            "{what}: these are a volatile store's invariants"
+        );
+        assert_eq!(
+            inner.n_states as usize,
+            inner.branches.len(),
+            "{what}: state count"
+        );
+        let mut owned: Vec<Slot> = Vec::new();
+        let lineage_slots = |l: &Lineage, owned: &mut Vec<Slot>| {
+            l.check_indexes(what);
+            for v in l.retained.values() {
+                owned.extend(v.values().map(|r| r.slot));
+            }
+        };
+        lineage_slots(&inner.trunk.lineage, &mut owned);
+        let mut counted: HashMap<u64, u64> = HashMap::new();
+        for (&(p, f), &child) in &inner.children.map {
+            let c = inner
+                .branches
+                .get(&child)
+                .unwrap_or_else(|| panic!("{what}: listed child {} is not kept", child.0));
+            assert!(
+                c.parent.0 == p && c.fork_epoch == f,
+                "{what}: child {} listed under ({p}, {f})",
+                child.0
+            );
+            *counted.entry(p).or_default() += 1;
+        }
+        assert_eq!(
+            counted.get(&BranchId::TRUNK.0).copied().unwrap_or(0),
+            inner.trunk.lineage.n_children,
+            "{what}: the trunk's live-child count"
+        );
+        for (&id, st) in inner.branches.iter() {
+            if splice && st.handle.is_released() && !st.open {
+                assert!(
+                    st.lineage.n_children >= 2,
+                    "{what}: released branch {} kept with {} live children",
+                    id.0,
+                    st.lineage.n_children
+                );
+            }
+            assert_eq!(
+                counted.get(&id.0).copied().unwrap_or(0),
+                st.lineage.n_children,
+                "{what}: branch {}'s live-child count",
+                id.0
+            );
+            assert_eq!(
+                inner.children.map.get(&(st.parent.0, st.fork_epoch)),
+                Some(&id),
+                "{what}: the child index does not list branch {} under its parent",
+                id.0
+            );
+            assert_eq!(
+                st.current.len(),
+                st.current_by_born.len(),
+                "{what}: branch {} current index",
+                id.0
+            );
+            for (&page, o) in &st.current {
+                assert!(
+                    st.current_by_born.contains(&(o.born, page)),
+                    "{what}: branch {} index entry",
+                    id.0
+                );
+                owned.push(o.slot);
+            }
+            owned.extend(st.pending.values().copied());
+            lineage_slots(&st.lineage, &mut owned);
+        }
+        let n = owned.len();
+        owned.sort_unstable();
+        owned.dedup();
+        assert_eq!(owned.len(), n, "{what}: an arena slot has two owners");
+        let in_use = inner.arena.as_ref().map_or(0, |a| a.in_use());
+        assert_eq!(in_use, n, "{what}: arena slots in use that no version owns");
+    }
 }
 
 /// Round 10's F1/F2 tests (turso `2d2653599`, `a3d79b98d`), ported to the durable store: the
@@ -10373,8 +10616,8 @@ mod sota_tree_tests {
     }
 
     /// A committed branch page holding `image(generation)`, as the pager hands it to
-    /// `commit_pages`.
-    fn page_with(page: u32, generation: u64) -> PageRef {
+    /// `commit_pages`. (Also `splice_churn_tests`'.)
+    pub(super) fn page_with(page: u32, generation: u64) -> PageRef {
         let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));
         let buffer = Arc::new(crate::Buffer::new_temporary(PAGE));
         buffer.as_mut_slice().copy_from_slice(&image(generation));
@@ -10502,6 +10745,16 @@ mod sota_tree_tests {
                 }
             };
             check(&store, "live");
+            // r11-ever's F7 (fad7db24d), ported: the store's own invariants after every step, in a
+            // volatile store (see `check_invariants`), the zombie rule in the splice arm only.
+            // FLAGGED TEST EDIT (resolve-vol-bushy-ever, merging r11-adv-x-f7fix): added checks,
+            // none weakened.
+            if mode == Mode::Volatile {
+                store.check_invariants(
+                    splice_arm(),
+                    &format!("{mode:?} seed {seed:#x} step {step}"),
+                );
+            }
             if durable && rng.below(20) == 0 {
                 // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
                 // (before or after its catalog commit), the crash image taken while it is held,
@@ -10554,6 +10807,19 @@ mod sota_tree_tests {
              after its first fork {wrote_after_fork}, crash images {images} ({fuzzy_images} with a fuzzy \
              checkpoint in flight)"
         );
+        // r11-ever's F7 (fad7db24d), ported: in the splice arm both merge directions of a splice
+        // must have run, or the splice half of this test proved nothing. FLAGGED TEST EDIT
+        // (resolve-vol-bushy-ever, merging r11-adv-x-f7fix): an added premise, none weakened. It
+        // held on the volatile lane store and is UNRUN on this one; volatile only, as the lane ran it.
+        if mode == Mode::Volatile && splice_arm() {
+            let work = store.stats().unwrap().work;
+            assert!(
+                work.splices > 0 && work.splice_commits > 0 && work.splice_commits < work.splices,
+                "{mode:?} seed {seed:#x}: splices {} of which commits {}: both merge directions must run",
+                work.splices,
+                work.splice_commits
+            );
+        }
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id).unwrap();
         }
@@ -10884,3 +11150,270 @@ mod fail_stop_tests {
     }
 }
 
+
+/// r11-ever's churn tests of the volatile store's F7 splice (fad7db24d, a85f41ab2; the held-zombie
+/// reads of bd698f924), ported to this store's splice arm (resolve-vol-bushy-ever, merging
+/// r11-adv-x-f7fix): a VOLATILE store opened IN the arm whatever `R11_SPLICE` says, since what they
+/// test is the splice. API ported (no pre-image at `first_write_branch`, commits as `PageRef`s,
+/// `open_conn`, `Result` returns); the one expectation that depends on the write path is re-derived
+/// and says so. The lane's chain test is not here: `durability_tests::
+/// a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages` is its port.
+#[cfg(test)]
+mod splice_churn_tests {
+    use super::sota_helpers::{image, Rng, PAGE};
+    use super::sota_tree_tests::page_with;
+    use super::*;
+
+    const PAGES: u32 = 6;
+
+    fn splice_store() -> BranchStore {
+        BranchStore::open_mode(BranchDurability::Volatile, None, true, ":memory:").unwrap()
+    }
+
+    fn read(store: &BranchStore, id: BranchId, page: u32) -> Option<u64> {
+        let mut buf = vec![0u8; PAGE];
+        store
+            .resolve_into(id, page, &mut buf)
+            .unwrap()
+            .then(|| u64::from_le_bytes(buf[..8].try_into().unwrap()))
+    }
+
+    /// The two agent shapes that made the store keep every branch it ever created (lane r11-ever),
+    /// against a model in which each branch is a plain copy of its parent's pages at its fork:
+    /// `newest` forks every branch from the newest live one and releases the oldest (without the
+    /// splice, nothing is ever freed); `random` forks from a random live branch, which then keeps
+    /// writing, and releases a random one. Every live branch must read what the model says for
+    /// every page after every step, the invariants must hold, the kept states must stay within
+    /// twice the live ones, and teardown must free everything.
+    #[test]
+    fn churned_branch_trees_keep_at_most_twice_their_live_branches() {
+        for seed in [
+            0x9E37_79B9_7F4A_7C15u64,
+            0xD1B5_4A32_D192_ED03,
+            0x2545_F491_4F6C_DD1D,
+        ] {
+            for newest in [true, false] {
+                run_churn(seed, newest);
+            }
+        }
+    }
+
+    fn run_churn(seed: u64, newest: bool) {
+        const LIVE: usize = 24;
+        let store = splice_store();
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        // (id, what it sees), oldest first.
+        let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+        let mut generation = 0u64;
+        let write = |store: &BranchStore,
+                     id: BranchId,
+                     sees: &mut HashMap<u32, u64>,
+                     rng: &mut Rng,
+                     generation: &mut u64| {
+            store.begin_write(id).unwrap();
+            let mut committed = Vec::new();
+            for _ in 0..=rng.below(2) {
+                let page = rng.below(u64::from(PAGES)) as u32;
+                if committed
+                    .iter()
+                    .any(|p: &PageRef| p.get().id == page as usize)
+                {
+                    continue;
+                }
+                store.first_write_branch(id, page).unwrap();
+                *generation += 1;
+                committed.push(page_with(page, *generation));
+                sees.insert(page, *generation);
+            }
+            store.commit_pages(id, &committed).unwrap();
+            store.end_write(id);
+        };
+        for step in 0..3000 {
+            let parent = match live.len() {
+                0 => None,
+                n if newest => Some(n - 1),
+                n => Some(rng.below(n as u64) as usize),
+            };
+            let (id, mut sees) = match parent {
+                None => (
+                    store
+                        .fork_trunk_locked(Arc::new(Schema::default()), PAGE)
+                        .unwrap(),
+                    trunk.clone(),
+                ),
+                Some(i) => (
+                    store.fork_branch_durable(live[i].0).unwrap(),
+                    live[i].1.clone(),
+                ),
+            };
+            write(&store, id, &mut sees, &mut rng, &mut generation);
+            if let Some(i) = parent.filter(|_| !newest || rng.below(2) == 0) {
+                // The parent keeps working after the fork.
+                let (pid, mut psees) = (live[i].0, std::mem::take(&mut live[i].1));
+                write(&store, pid, &mut psees, &mut rng, &mut generation);
+                live[i].1 = psees;
+            }
+            if rng.below(4) == 0 {
+                let page = rng.below(u64::from(PAGES)) as u32;
+                let required = if store.trunk_has_children() {
+                    store.first_write_trunk(page, &image(trunk[&page])).unwrap()
+                } else {
+                    store.barrier_floor()
+                };
+                store
+                    .durability_barrier_to(SyncClass::Off, required)
+                    .unwrap();
+                generation += 1;
+                trunk.insert(page, generation);
+            }
+            live.push((id, sees));
+            if live.len() > LIVE {
+                let at = if newest {
+                    0
+                } else {
+                    rng.below(live.len() as u64 - 1) as usize
+                };
+                let (victim, _) = live.remove(at);
+                store.release_handle(victim).unwrap();
+            }
+            let what = format!("seed {seed:#x} newest {newest} step {step}");
+            store.check_invariants(true, &what);
+            let states = store.stats().unwrap().live_branches;
+            assert!(
+                states < 2 * LIVE,
+                "{what}: {states} states kept for {} live",
+                live.len()
+            );
+            if newest {
+                assert_eq!(states, live.len(), "{what}: a chain kept a zombie");
+            }
+            for (id, sees) in &live {
+                for page in 0..PAGES {
+                    let got = read(&store, *id, page).unwrap_or(trunk[&page]);
+                    assert_eq!(got, sees[&page], "{what}: branch {} read page {page}", id.0);
+                }
+            }
+        }
+        let work = store.stats().unwrap().work;
+        assert!(
+            work.splices > 1000,
+            "seed {seed:#x} newest {newest}: {} splices",
+            work.splices
+        );
+        for (id, _) in live {
+            store.release_handle(id).unwrap();
+        }
+        assert_eq!(
+            store.stats().unwrap().live_branches,
+            0,
+            "seed {seed:#x}: branches leaked"
+        );
+        assert_eq!(
+            store.stats().unwrap().arena_slots_in_use,
+            0,
+            "seed {seed:#x}: slots leaked"
+        );
+    }
+
+    /// A zombie kept only by an open connection is spliced the moment the connection closes, while
+    /// its only child is in the middle of a write transaction; the child's in-flight reservation
+    /// survives the merge (its commit lands where it points), a page the zombie wrote and the child
+    /// had overwritten is freed, and a page the child reads through the zombie is kept for the
+    /// child's own later children. While the connection holds the zombie, the child reads through
+    /// it and the zombie reads its own page (r11-ever-refute coverage caveat iii, bd698f924).
+    #[test]
+    fn a_zombie_closed_while_its_child_is_mid_write_is_spliced_without_disturbing_the_write() {
+        let store = splice_store();
+        let z = store
+            .fork_trunk_locked(Arc::new(Schema::default()), PAGE)
+            .unwrap();
+        // z writes pages 0, 1 and 2.
+        store.begin_write(z).unwrap();
+        let mut committed = Vec::new();
+        for page in 0..3u32 {
+            store.first_write_branch(z, page).unwrap();
+            committed.push(page_with(page, 101 + u64::from(page)));
+        }
+        store.commit_pages(z, &committed).unwrap();
+        store.end_write(z);
+        let z_gen: Vec<u64> = (0..3).map(|p| 101 + p).collect();
+        let c = store.fork_branch_durable(z).unwrap();
+        // c overwrites page 1 and commits.
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 1).unwrap();
+        store.commit_pages(c, &[page_with(1, 201)]).unwrap();
+        store.end_write(c);
+        store.open_conn(z).unwrap();
+        let reaped = store.release_handle(z).unwrap();
+        assert!(
+            reaped.deferred && reaped.freed_pages == 0,
+            "an open zombie was freed: {reaped:?}"
+        );
+        assert_eq!(store.stats().unwrap().live_branches, 2);
+        assert_eq!(
+            read(&store, c, 0),
+            Some(z_gen[0]),
+            "c misread through the held zombie"
+        );
+        assert_eq!(
+            read(&store, z, 1),
+            Some(z_gen[1]),
+            "the held zombie lost its own page"
+        );
+        // c opens a transaction on page 2 and leaves it open across the splice.
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 2).unwrap();
+        let before = store.stats().unwrap();
+        store.close(z);
+        let after = store.stats().unwrap();
+        store.check_invariants(true, "after the splice");
+        assert_eq!(after.live_branches, 1, "the closed zombie was not spliced");
+        assert_eq!(after.work.splices, before.work.splices + 1);
+        // Re-derived for this store's write path (the lane's store copied the pre-image into c's
+        // `current` at the first write and freed 2 here): the copy decision only RESERVES a slot,
+        // so z's page 2 is what c reads until its commit and moves into c; the splice frees only
+        // z's page 1, which c overwrote and no child of c can read.
+        assert_eq!(
+            before.arena_slots_in_use - after.arena_slots_in_use,
+            1,
+            "z's version of page 1 is freed (c overwrote it, and c has no child to read it); z's \
+             page 2 moves into c, which reads it until its in-flight write commits"
+        );
+        store.commit_pages(c, &[page_with(2, 202)]).unwrap();
+        store.end_write(c);
+        assert_eq!(
+            after.arena_slots_in_use - store.stats().unwrap().arena_slots_in_use,
+            1,
+            "c's commit of page 2 frees the version of z it supersedes (no child of c can read it)"
+        );
+        assert_eq!(
+            read(&store, c, 0),
+            Some(z_gen[0]),
+            "c lost the page it read through z"
+        );
+        assert_eq!(read(&store, c, 1), Some(201));
+        assert_eq!(
+            read(&store, c, 2),
+            Some(202),
+            "the in-flight write did not land"
+        );
+        // A child of c forked now, then c rewrites page 0: the child keeps z's version.
+        let d = store.fork_branch_durable(c).unwrap();
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 0).unwrap();
+        store.commit_pages(c, &[page_with(0, 300)]).unwrap();
+        store.end_write(c);
+        store.check_invariants(true, "after c rewrote an absorbed page");
+        assert_eq!(
+            read(&store, d, 0),
+            Some(z_gen[0]),
+            "d lost z's version of page 0"
+        );
+        assert_eq!(read(&store, c, 0), Some(300));
+        store.release_handle(c).unwrap();
+        store.release_handle(d).unwrap();
+        assert_eq!(store.stats().unwrap().live_branches, 0);
+        assert_eq!(store.stats().unwrap().arena_slots_in_use, 0, "slots leaked");
+    }
+}

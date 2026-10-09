@@ -130,6 +130,8 @@ pub(crate) mod id_set;
 pub use id_set::id_set_census;
 pub(crate) mod journal;
 pub mod merge;
+#[doc(hidden)]
+pub mod bench;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
 pub(crate) mod store;
@@ -514,7 +516,11 @@ pub enum BranchFailpoint {
 /// The handle owns the branch. Dropping it — or calling [`Branch::reap`], which is the same thing
 /// with a report — releases the branch's pages at once, unless something still reads through them:
 /// an open connection on the branch, or a live child forked from it. Then the branch is kept until
-/// the last of those goes, and freed at that moment.
+/// the last of those goes, and freed at that moment. In the F7 splice arm
+/// (`DatabaseOpts::with_branch_splice`) the rule for children is narrower: with an open
+/// connection, or two or more live children, the branch is kept as above; with exactly one live
+/// child and no connection it is spliced out at once: the child takes its place and keeps the pages
+/// it reads through it, and the rest are freed (see `store`, "Splicing a zombie out").
 pub struct Branch {
     db: Arc<Database>,
     id: BranchId,
@@ -534,7 +540,8 @@ pub struct Expired {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// ancestor was retaining only for it. In the splice arm, a splice counts the pages it freed as
+    /// unreadable.
     pub freed_pages: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
     /// through it); its pages are freed when the last of those goes away. Also true when it was
@@ -812,6 +819,76 @@ pub struct BranchStats {
     pub arena_slots_free: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
+}
+
+/// The size of every structure the branch store keeps resident, for curves against the number of
+/// branches ever created at a fixed live count (r11-ever's instrument, ported from the volatile
+/// store). Observation only: [`Database::branch_resident`] takes it by a full scan under the store
+/// lock, so callers take it between timed operations. Exact for a volatile store; a durable or
+/// catalog store's counts cover what is in memory (see `BranchStore::resident`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchResident {
+    /// Branch states kept, including reaped ones kept for a live child (`BranchStats::live_branches`;
+    /// in a catalog store, resident or not, while the sums below cover the resident ones).
+    pub states: usize,
+    /// States released by their handle: kept only because a child or a connection still needs them.
+    pub zombies: usize,
+    /// States with an open connection.
+    pub open: usize,
+    /// Slots in the branch table's allocated chunks (F8', see `table`: it grows by whole chunks and
+    /// has no tombstones; unlike the volatile store's F8, it FALLS when a chunk's states are all
+    /// gone, since ids are never reused and a chunk holds a fixed id range).
+    pub table_capacity: usize,
+    /// The next branch id: ids are minted from 1 upward and never reused (F8' carries no
+    /// generational recycling), so it is one more than the number of branches ever created.
+    pub next_id: u64,
+    /// The trunk's fork epoch, advanced once per trunk fork.
+    pub trunk_epoch: u64,
+    /// Live children of the trunk.
+    pub trunk_children: usize,
+    /// Trunk pre-images retained for children (entries of each of the trunk's three indexes).
+    pub trunk_retained_versions: usize,
+    /// Pages with at least one retained trunk version.
+    pub trunk_retained_pages: usize,
+    /// Entries of the trunk's last-write-epoch map, which is never pruned.
+    pub trunk_written_pages: usize,
+    /// Child entries summed over every branch state's lineage.
+    pub branch_children: usize,
+    /// Retained versions summed over every branch state's lineage.
+    pub branch_retained_versions: usize,
+    /// Current pages summed over every branch state.
+    pub branch_current_pages: usize,
+    /// Branch states that carry a `view` page map (they have forked a child).
+    pub views: usize,
+    /// Distinct persistent page-map nodes reachable from every state's maps.
+    pub page_map_nodes: usize,
+    /// True if some lineage's three version indexes disagree in size (a bookkeeping defect).
+    pub index_mismatch: bool,
+    /// Distinct arena slots some reader (a branch with a handle or an open connection) can read:
+    /// the page-granular minimum the arena could hold. `arena_in_use - visible_slots` is what the
+    /// store keeps that no reader can reach (for children not yet forked, nothing: a zombie forks
+    /// nothing and a live branch's own versions count as visible).
+    pub visible_slots: usize,
+    /// Arena slots no reader can read, by owner: a zombie's current versions born after its newest
+    /// kept child's fork, its other current versions (every descendant has overwritten the page),
+    /// retained versions of zombies and of live branches (the child they are kept for overwrote the
+    /// page), the trunk's retained versions, and a live branch's current versions (always 0: a
+    /// branch reads its own). They sum to `arena_in_use - visible_slots`.
+    pub waste_zombie_current_after_last_fork: usize,
+    pub waste_zombie_current_shadowed: usize,
+    pub waste_zombie_retained: usize,
+    pub waste_live_retained: usize,
+    pub waste_trunk_retained: usize,
+    pub waste_live_current: usize,
+    /// Arena slots ever handed out (the arena never shrinks below this).
+    pub arena_high_water: usize,
+    pub arena_in_use: usize,
+    pub arena_free_list_len: usize,
+    pub arena_free_list_capacity: usize,
+    pub arena_free_bits_words: usize,
+    /// Arena chunks allocated (each `SLOTS_PER_CHUNK` pages; never freed). 0 for a file-backed
+    /// arena, whose slots are in the arena file.
+    pub arena_chunks: usize,
 }
 
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
@@ -1352,6 +1429,20 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {
         self.branches.trunk_retained_count()
+    }
+
+    /// Every resident structure of the branch store, by a full scan (see [`BranchResident`] for
+    /// what it covers outside a volatile store). Observation only; an error where `branch_stats`
+    /// would give one (a trunk-only store, parked Commits that cannot be applied).
+    #[doc(hidden)]
+    pub fn branch_resident(&self) -> Result<BranchResident> {
+        self.branches.resident()
+    }
+
+    /// `(states, capacity)` of the branch table, in O(1). Observation only.
+    #[doc(hidden)]
+    pub fn branch_table_shape(&self) -> (usize, usize) {
+        self.branches.table_shape()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
