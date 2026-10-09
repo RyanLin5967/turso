@@ -5778,6 +5778,9 @@ impl BranchStore {
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
+        // Mutant `drain_risk_ignores_held_frees` (test builds only) reads the newest fork's mark,
+        // under the store mutex and so before the group's lock (the order `mature` takes them in).
+        let fork = if fe_mutant("drain_risk_ignores_held_frees") { self.inner.lock().last_fork_lsn } else { 0 };
         let mut g = self.group.lock();
         let full = g.durable[class_index(SyncClass::FullFsync)];
         let drained = if cfg!(target_vendor = "apple") {
@@ -5790,8 +5793,10 @@ impl BranchStore {
         // fork, Commit, Lease, Clock or TrunkRetain is a hole every later record sits behind.
         // Mutants (test builds only): `drain_risk_by_store_class` (only in a store whose class
         // syncs, as before engine review 10 #6), `drain_risk_release_only` (or when the newest
-        // Release is undrained, as before this) and `drain_risk_barrier_floor_only` (or the newest
-        // Release or TrunkRetain).
+        // Release is undrained, as before this), `drain_risk_barrier_floor_only` (or the newest
+        // Release or TrunkRetain) and `drain_risk_ignores_held_frees` (or the newest Release,
+        // TrunkRetain or fork: every record kind with a mark of its own, a branch Commit holding a
+        // free left out). Marks are not the rule: `durable[Off]` past the drain covers every kind.
         let release = self.last_release_lsn.load(Ordering::Acquire);
         let retain = self.retain_floor.load(Ordering::Acquire);
         let undrained_counts = if fe_mutant("drain_risk_by_store_class") {
@@ -5800,6 +5805,8 @@ impl BranchStore {
             self.class.syncs() || release > drained
         } else if fe_mutant("drain_risk_barrier_floor_only") {
             self.class.syncs() || release.max(retain) > drained
+        } else if fe_mutant("drain_risk_ignores_held_frees") {
+            self.class.syncs() || release.max(retain).max(fork) > drained
         } else {
             true
         };
@@ -6572,6 +6579,25 @@ impl BranchStore {
         self.group.durable(class)
     }
 
+    /// Test builds: the log position that makes the newest Release durable (engine review 17
+    /// HIGH 2: a drain-failure route's premise that only its own record is undrained).
+    #[cfg(test)]
+    pub(crate) fn last_release_lsn_for_test(&self) -> u64 {
+        self.last_release_lsn.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the log position that makes the newest kept pre-image's TrunkRetain durable.
+    #[cfg(test)]
+    pub(crate) fn retain_floor_for_test(&self) -> u64 {
+        self.retain_floor.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the log position that makes the newest fork durable.
+    #[cfg(test)]
+    pub(crate) fn last_fork_lsn_for_test(&self) -> u64 {
+        self.inner.lock().last_fork_lsn
+    }
+
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
     #[cfg(test)]
     pub(crate) fn arena_dirty(&self) -> bool {
@@ -6638,12 +6664,38 @@ impl BranchStore {
                 } else {
                     reader.name_hashes(|name| hasher.hash_one(name), &stop)
                 };
-                let mut inner = shared.lock();
+                // The set of the scanned names is built here, off the store mutex: its one table of
+                // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
+                // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
+                // byte). Under the mutex only the names applied while the scan ran join it, and it
+                // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
+                // scanned names are inserted under the mutex, as before.
+                let under = fe_mutant("name_filter_built_under_mutex");
+                let mut scanned = scanned.map(|hashes| {
+                    if under {
+                        (HashSet::default(), hashes)
+                    } else {
+                        (hashes.into_iter().collect::<HashSet<u64, BuildIdHasher>>(), Vec::new())
+                    }
+                });
+                // Room for the names applied meanwhile is made off the mutex too, so joining them
+                // never grows the table under it (a resize moves all N entries).
+                let mut inner = loop {
+                    let inner = shared.lock();
+                    let joining = inner.names.filter.pending.as_ref().map_or(0, HashSet::len);
+                    match scanned.as_mut() {
+                        Ok((built, _)) if !under && built.capacity() - built.len() < joining => {
+                            drop(inner);
+                            built.reserve(joining);
+                        }
+                        _ => break inner,
+                    }
+                };
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
-                    Ok(hashes) => {
-                        let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
+                    Ok((mut built, unbuilt)) => {
+                        built.extend(unbuilt);
                         built.extend(pending);
                         filter.built = Some(built);
                         filter.builds += 1;
