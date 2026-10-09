@@ -58,9 +58,14 @@
 # A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
-# name the same device and devguard.py allows it (an allowlist: a whole NVMe/SCSI/virtio disk, not the root disk,
-# nothing mounted or held; review M4), --plp is given, --fs is not (the manifest names the blocks; review M5), and
-# every target mounts with barriers.
+# name the same device and devguard.py allows it (an allowlist: a whole NVMe/SCSI/virtio disk, not the root disk or
+# on its controller, nothing mounted, held or claimed, no signature or partition table; review M4, devguard round-2
+# attack MED 2 and LOW 3), --plp is given, --fs is not (the manifest names the blocks; review M5), and every target
+# mounts with barriers. The device is resolved once at preflight (DEV_REAL); every block re-checks that --device
+# still resolves there and re-runs devguard on it immediately before its mkfs, and mkfs, mount and the cleanup's
+# wipefs act on DEV_REAL only (devguard round-2 attack LOW 4). So a block starts from a disk that passes devguard:
+# block_cleanup wipes the filesystem its block made (after checking it is that one), and the operator wipes the
+# first by hand after reading what it holds.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
 # system (competitors/timedrun.py rule at the 1800 s cap, OPS:S:MAX_S) goes to fastest_profile and run_system.sh alike.
 # PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-v1-FINAL-CANDIDATE.md, the text the
@@ -68,7 +73,7 @@
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
-SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP=""
+SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
 while [ $# -gt 0 ]; do
   case $1 in
     --sha) SHA=$2; shift ;;
@@ -213,6 +218,10 @@ preflight() {
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
     sudo -n python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
+    # the node devguard just checked; every block's mkfs re-checks against it (devguard round-2 attack LOW 4)
+    DEV_REAL=$(readlink -f "$DEVICE")
+    [ -b "$DEV_REAL" ] || { echo "REFUSED: $DEVICE resolves to '$DEV_REAL', not a block device"; return 2; }
+    echo "$DEV_REAL" > "$OUT/device-real.txt"
     # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
     local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
     [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
@@ -426,7 +435,7 @@ v3l() { # v3l bK MNT
 
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
-FS_NOW="" V3CELL="" PLANT_NOW=""
+FS_NOW="" V3CELL="" PLANT_NOW="" MADE_FS=""
 RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
@@ -442,14 +451,21 @@ fs_block() {
     brd)
       bash "$L/v3/mkbrd.sh" "$fs" "$mnt" > "$o/mkfs.txt" 2>&1 || return 1 ;;
     device)
+      # immediately before the mkfs: --device still names the node preflight checked, and devguard still allows it
+      # (hours may have passed; devguard round-2 attack LOW 4). mkfs and mount act on that node, never on the name
+      dev_unmoved "$DEVICE" "$DEV_REAL" > "$o/devguard.txt" 2>&1 || { cat "$o/devguard.txt"; return 1; }
+      sudo -n python3 -B "$L/t3/devguard.py" check "$DEV_REAL" >> "$o/devguard.txt" 2>&1 ||
+        { cat "$o/devguard.txt"; echo "fs-$fs: devguard refuses $DEV_REAL before mkfs"; return 1; }
       case $fs in
-        xfs) sudo mkfs.xfs -f -m reflink=1 "$DEVICE" ;;
-        btrfs) sudo mkfs.btrfs -f "$DEVICE" ;;
-        ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEVICE" ;;
+        xfs) sudo mkfs.xfs -f -m reflink=1 "$DEV_REAL" ;;
+        btrfs) sudo mkfs.btrfs -f "$DEV_REAL" ;;
+        ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEV_REAL" ;;
         *) echo "unknown fs $fs"; false ;;
       esac > "$o/mkfs.txt" 2>&1 || return 1
+      # from here block_cleanup must wipe what this block made, so the next block's devguard check passes
+      MADE_FS=$fs
       # btrfs defaults to discard=async on SSDs, which discards freed extents 10-120 s later, inside a later run
-      sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEVICE" "$mnt" &&
+      sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEV_REAL" "$mnt" &&
         sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
   esac
   findmnt -n -o SOURCE,FSTYPE,OPTIONS -T "$mnt" | tee -a "$o/mkfs.txt"
@@ -501,7 +517,7 @@ fs_block() {
 }
 
 # After every block, passed or failed (review H1): unmount and detach, so the next block can make its filesystem.
-block_cleanup() {
+block_unmount() {
   local mnt=/mnt/t3-$FS_NOW dev back t0 k
   findmnt -n "$mnt" > /dev/null 2>&1 || return 0
   dev=$(findmnt -n -o SOURCE "$mnt")
@@ -528,6 +544,19 @@ block_cleanup() {
     back=$(losetup -n -O BACK-FILE "$dev" | xargs)
     sudo losetup -d "$dev" && sudo rm -f "$back" ;;
   esac
+  return 0
+}
+# Unmount (even when the block failed after its mkfs and before or after its mount), then on a device block wipe the
+# filesystem the block made, so the next block's devguard check before its mkfs sees a blank disk (devguard round-2
+# attack MED 2). It wipes only DEV_REAL, only while --device still resolves there, and only when blkid finds exactly
+# the filesystem this block made (t3lib.sh fs_is_ours); anything else stops the run with the device untouched.
+block_cleanup() {
+  local w=$OUT/fs-$FS_NOW/wipe.txt
+  block_unmount || return 1
+  [ "$BLOCK" = device ] && [ -n "$MADE_FS" ] || return 0
+  fs_is_ours "$DEVICE" "$DEV_REAL" "$MADE_FS" > "$w" 2>&1 && sudo -n wipefs -a "$DEV_REAL" >> "$w" 2>&1 ||
+    { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$w")"; return 1; }
+  MADE_FS=""
   return 0
 }
 
@@ -601,15 +630,23 @@ selftests() {
   want=$(python3 -B "$L/t3/devguard.py" rootdisk-sysfs 2> "$OUT/devguard-rootdisk-sysfs.txt") ||
     { cat "$OUT/devguard-rootdisk-sysfs.txt"; echo "selftests: sysfs cannot name the root disk, so rootdisk cannot be checked"; return 1; }
   [ "$rd" = "$want" ] || { echo "selftests: devguard rootdisk names '${rd//$'\n'/ }' but sysfs names '${want//$'\n'/ }'"; return 1; }
-  # every disk under / (an md root has several): exit 2 AND the root rule's own text for that disk. Any other exit (a
-  # sudo or Python crash), or another rule refusing alone, is not this rule firing (T3 runner review MED 13)
+  # every disk under / (an md root has several): exit 2 AND, for that disk, the root rule's own text, the O_EXCL rule's
+  # (the kernel claims a disk any of whose partitions is mounted or held) and the signature rule's (a root disk carries
+  # a partition table, a filesystem or a member signature). Those two rules are the ones that cover what the
+  # holder graph cannot see, so they too are fired on real input here, not only on fixtures (devguard round-2 attack
+  # MED 1 and MED 2). Any other exit (a sudo or Python crash), or another rule refusing alone, is not these rules
+  # firing (T3 runner review MED 13)
+  local want_text t
   for d in $rd; do
     sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$d" > "$OUT/devguard-root-$d.txt" 2>&1
     rc=$?
-    if [ $rc != 2 ] || ! grep -qF "REFUSED: $d holds the root filesystem" "$OUT/devguard-root-$d.txt"; then
-      cat "$OUT/devguard-root-$d.txt"
-      echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$d holds the root filesystem'; got exit $rc"; return 1
-    fi
+    for t in "holds the root filesystem" "cannot be opened exclusively" "carries a signature"; do
+      want_text="REFUSED: $d $t"
+      if [ $rc != 2 ] || ! grep -qF "$want_text" "$OUT/devguard-root-$d.txt"; then
+        cat "$OUT/devguard-root-$d.txt"
+        echo "selftests: devguard's root fire on /dev/$d needs exit 2 and '$want_text'; got exit $rc"; return 1
+      fi
+    done
   done
 }
 stage preflight preflight

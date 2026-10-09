@@ -35,6 +35,13 @@ run() { echo "\$ $*"; "$@" 2>&1; echo "[rc=$?]"; }
   done
   run findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS
   run losetup -l -O NAME,BACK-FILE,DIO
+  # the sysfs layout devguard's rules read, recorded so the next box settles what the fakes assume (devguard round-2
+  # attack LOW 2 and LOW 3): each block device's controller link, holders, slaves and multipath paths (the kernel
+  # release is uname -a's third field above)
+  run bash -c 'for b in /sys/block/*; do
+    printf "%s device=%s holders=[%s] slaves=[%s] multipath=[%s]\n" "${b##*/}" "$(readlink -f "$b/device" 2>/dev/null)" \
+      "$(ls "$b/holders" 2>/dev/null | xargs)" "$(ls "$b/slaves" 2>/dev/null | xargs)" "$(ls "$b/multipath" 2>/dev/null | xargs)"
+  done'
 } > "$out/hwid.txt" 2>&1
 
 python3 - "$out" "$@" <<'PY'

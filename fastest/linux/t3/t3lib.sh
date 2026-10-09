@@ -13,6 +13,13 @@
 #   plp_drive_id SYS DEV                "model<TAB>firmware" from SYS/block/DEV/device: firmware_rev (NVMe) or rev (SCSI,
 #                                       SATA); returns 2 when either field is missing or empty
 #   plp_listed SYS DEV FILE             DEV's identity is a whole line of FILE (t3/PLP-DRIVES)
+#   dev_unmoved PATH REAL               PATH still resolves to REAL, the device node preflight resolved and devguard
+#                                       checked (devguard round-2 attack LOW 4: a hotplug or controller reset can
+#                                       re-enumerate /dev/nvmeXnY between preflight and a block's mkfs hours later).
+#                                       Prints the reason and returns 2 on a refusal
+#   fs_is_ours PATH REAL FS             block_cleanup may wipe REAL: PATH is unmoved and blkid's low-level probe finds
+#                                       exactly the FS this block made on it (T3_BLKID overrides `sudo -n blkid -p`,
+#                                       for t3lib_test.sh only). Returns 2 on a refusal
 
 drift_ok() { case $1 in 0|3) return 0 ;; *) return 1 ;; esac; }
 
@@ -47,4 +54,19 @@ plp_listed() { # plp_listed SYS DEV FILE
   local id
   id=$(plp_drive_id "$1" "$2") || return 2
   grep -qxF "$id" "$3"
+}
+
+dev_unmoved() { # dev_unmoved PATH REAL
+  local now
+  now=$(readlink -f "$1")
+  [ -n "$2" ] && [ "$now" = "$2" ] ||
+    { echo "REFUSED: $1 resolved to '$2' at preflight and resolves to '$now' now: not the device devguard checked"; return 2; }
+}
+
+fs_is_ours() { # fs_is_ours PATH REAL FS
+  local t
+  dev_unmoved "$1" "$2" || return 2
+  t=$(${T3_BLKID:-sudo -n blkid -p} -o value -s TYPE "$2" 2>/dev/null)
+  [ -n "$3" ] && [ "$t" = "$3" ] ||
+    { echo "REFUSED: $2 carries '$t', not the '$3' this block made: not wiped"; return 2; }
 }

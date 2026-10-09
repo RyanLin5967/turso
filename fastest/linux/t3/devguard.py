@@ -5,9 +5,11 @@ denylist, and a partition of the root disk or a symlink to /dev/ram0 passed it).
   devguard.py check DEVICE     exit 0 and print the resolved disk when every rule holds; else exit 2 with every reason
   devguard.py rootdisk         print the top-level disk(s) under "/", one per line, and exit 0; when it cannot tell,
                                exit 2 with the reason on stderr. t3run fires `check` on each disk it prints, and
-                               requires exit 2 with the root rule's own text
-  devguard.py rootdisk-sysfs   the same answer from the kernel's sysfs links, with no lsblk: the independent second
-                               instrument t3run requires `rootdisk` to equal
+                               requires exit 2 with the root, O_EXCL and signature rules' own texts for that disk
+  devguard.py rootdisk-sysfs   the same answer from the kernel's sysfs links, with no lsblk: the second instrument
+                               t3run requires `rootdisk` to equal. It is independent in how it LOCATES "/" ("/"'s
+                               st_dev, not lsblk's mount table) and in its code, NOT in topology: lsblk builds its
+                               tree from the same holders/slaves links the climb reads (round-2 attack MED 2)
   devguard.py self-test       the rules on synthetic lsblk trees; exit 0 iff every case passes
 
 Rules (all must hold):
@@ -25,13 +27,28 @@ Rules (all must hold):
     bare partition (an LVM volume, md array, crypt or dm child refuses); the disk's AND each partition's
     /sys/block/<disk>/<part>/holders are empty; and an exclusive open (O_EXCL) of the disk and of each partition
     succeeds, so nothing in the kernel claims them (lane review MED 5; needs root, so t3run runs it under sudo -n);
+  - it shares no controller with a disk that holds "/": /sys/block/<name>/device resolves to a different NVMe
+    controller or SCSI device than every root disk's does, so a second namespace of the root drive is refused (its
+    queue and flush stream carry the root's writes; round-2 attack LOW 3). An unreadable link refuses;
+  - it carries no signature at all: `blkid -p` (libblkid probing the device itself, not udev's database, which can lag
+    a write) finds nothing on the disk or on any partition lsblk lists, so a partition table, a filesystem, an LVM
+    PV, an md member, a LUKS header, an external journal or log, a btrfs or zfs member, swap: any of them refuses.
+    This covers what neither the mount, holder nor O_EXCL rule sees: a PV of the root volume group holding no root
+    extents, a detached LUKS header, a filesystem in fstab not mounted now (round-2 attack MED 2). A partition table
+    alone refuses too, because a partition may hold raw data with no signature. A T3 disk must be blank: read what
+    it holds, then `wipefs -a` it by hand. A failed probe refuses;
   - it is not a native-multipath NVMe head (/sys/block/<name>/multipath non-empty): its flush counter may live on the
     path devices, which V3L does not read (stated blind spot, refused rather than guessed).
 Stated blind spots of the root rule. "/" is found only through lsblk's MOUNTPOINTS. A root that lsblk does not list
 (overlay, NFS, tmpfs) cannot be told apart, so every device is refused and none passes. A btrfs "/" spread over
 several disks shows "/" on one member only, so this rule does not refuse the other members. On a real box btrfs
 claims every member exclusively, so the O_EXCL rule refuses them instead. sysfs cannot name any btrfs root (its
-device number is anonymous), so t3run's fire refuses to run on such a box.
+device number is anonymous), so t3run's fire refuses to run on such a box. Neither instrument names a disk that
+carries part of "/" without a holder link: an XFS logdev= or rtdev=, an ext4 journal_dev, a DRBD backing disk, a
+detached LUKS header, a PV of the root volume group with no root extents (round-2 attack MED 2). The kernel claims
+the first three, so the O_EXCL rule refuses them; the signature rule refuses all five. A signature libblkid does not
+know (a raw partition with no metadata, a disk holding only ciphertext) is not seen, and the partition-table rule
+covers it only when the raw data sits in a partition.
 """
 import json
 import os
@@ -42,6 +59,8 @@ import sys
 import tempfile
 
 ALLOWED = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+)$")
+# an NVMe multipath path device nvme<subsystem>c<controller>n<namespace>; its head is nvme<subsystem>n<namespace>
+NVME_PATH = re.compile(r"^nvme(\d+)c\d+n(\d+)$")
 # KNAME and PKNAME carry the walk (PKNAME names the parent's KERNEL name: dm-0, not the mapper name)
 LSBLK = ["lsblk", "-J", "-o", "NAME,KNAME,PKNAME,TYPE,MOUNTPOINTS"]
 
@@ -168,8 +187,11 @@ SYS_ROOT = "/sys"
 def sysfs_root_disks(sys_root=None, majmin=None):
     """the top-level disk(s) under "/" from the kernel's sysfs links alone, with no lsblk. This is the second
     instrument t3run compares `rootdisk` against, because a test's expected disks must not come from the walk under
-    test. "/"'s device number (st_dev) names /sys/dev/block/MAJ:MIN. A partition climbs to the disk directory it
-    sits in, and a device with slaves (md, dm) climbs every slave. Raises CannotTell when "/" has no block device:
+    test. It is independent of the walk in locating "/" and in code, not in topology: both read the kernel's
+    holders/slaves graph, so a disk outside that graph is missed by both (see the module's blind spots). "/"'s
+    device number (st_dev) names /sys/dev/block/MAJ:MIN. A partition climbs to the disk directory it sits in, and a
+    device with slaves (md, dm) climbs every slave. An NVMe path device (nvmeXcYnZ) in a multipath head's slaves names
+    its head nvmeXnZ, the name lsblk prints (round-2 attack LOW 2). Raises CannotTell when "/" has no block device:
     btrfs, overlay, NFS and tmpfs report an anonymous device number. SYS_ROOT and MAJMIN are injectable for the
     self-test."""
     sys_root = sys_root or SYS_ROOT
@@ -193,7 +215,8 @@ def sysfs_root_disks(sys_root=None, majmin=None):
         for s in slaves:
             climb(os.path.join(sl, s))
         if not slaves:
-            disks.add(os.path.basename(p))
+            path = NVME_PATH.match(os.path.basename(p))
+            disks.add(f"nvme{path[1]}n{path[2]}" if path else os.path.basename(p))
 
     try:
         climb(start)
@@ -224,7 +247,10 @@ def descendants(node):
     return out
 
 
-def problems(name, devices, holders, multipath, part_holders=None, busy=None):
+def problems(name, devices, holders, multipath, part_holders=None, busy=None, ctrl=None, sigs=None):
+    """every reason NAME may not be destroyed. HOLDERS, MULTIPATH, PART_HOLDERS and BUSY are the sysfs and O_EXCL
+    readings; CTRL maps disk -> realpath of /sys/block/<disk>/device; SIGS maps disk or partition -> blkid -p's
+    (rc, stdout). check() always passes all of them; the self-test passes None to leave a rule out of a case"""
     # the root rule first, so the early return below cannot skip it (MED 13: a partition under an LVM root was
     # refused only as "not top-level", and the root rule never ran)
     bad = root_rule(name, devices)
@@ -249,9 +275,52 @@ def problems(name, devices, holders, multipath, part_holders=None, busy=None):
             bad.append(f"partition {part} of {name} is held by {h}")
     for dev, why in sorted((busy or {}).items()):
         bad.append(f"{dev} cannot be opened exclusively ({why}): the kernel claims it")
+    if ctrl is not None:
+        bad += controller_rule(name, devices, ctrl)
+    if sigs is not None:
+        for dev in [name] + [c.get("name") for c in descendants(node)]:
+            rc, out = sigs.get(dev, (None, "not probed"))
+            found = " ".join((out or "").split())
+            if rc == 0 and found:
+                bad.append(f"{dev} {SIG_TEXT} ({found}): a T3 disk must be blank; read what it holds, then wipefs -a it")
+            elif not (rc == 2 and not found):
+                bad.append(f"cannot probe {dev}'s signatures (blkid -p rc {rc}: {found or 'no output'}): refused")
     if multipath:
         bad.append(f"{name} is a multipath NVMe head ({multipath}): its flush counter may be on the path devices")
     return bad
+
+
+SIG_TEXT = "carries a signature"
+
+
+def controller_rule(name, devices, ctrl):
+    """NAME shares an NVMe controller or SCSI device with a disk that holds "/" (round-2 attack LOW 3); CTRL maps
+    disk -> realpath of /sys/block/<disk>/device. When the root disks cannot be told, the root rule already refuses"""
+    try:
+        roots, _, _ = root_disks(devices)
+    except CannotTell:
+        return []
+    bad = [f"cannot read {d}'s controller (/sys/block/{d}/device): refused rather than guessed"
+           for d in sorted({name, *roots}) if not ctrl.get(d)]
+    if ctrl.get(name):
+        bad += [f"{name} shares its controller ({ctrl[name]}) with {r}, which holds the root filesystem"
+                for r in roots if r != name and ctrl.get(r) == ctrl[name]]
+    return bad
+
+
+def blkid_probe(kname):
+    """blkid's low-level probe of /dev/KNAME, (rc, stdout): rc 2 with nothing printed is a blank device. A missing
+    node, or anything on stderr, is a failed probe (rc None): blkid also exits 2 when it cannot open the device"""
+    path = f"/dev/{kname}"
+    if not kname or not os.path.exists(path):
+        return None, f"no device node {path}"
+    try:
+        r = subprocess.run(["blkid", "-p", "-o", "export", path], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    if r.stderr.strip():
+        return None, r.stderr.strip()[:200]
+    return r.returncode, r.stdout
 
 
 def check(dev):
@@ -280,7 +349,19 @@ def check(dev):
             os.close(fd)
         except OSError as e:
             busy[dev] = e.strerror
-    return name, problems(name, devices, holders, multipath, part_holders, busy)
+    try:
+        roots, _, _ = root_disks(devices)
+    except CannotTell:
+        roots = []
+    ctrl = {}
+    for d in [name] + roots:
+        link = f"/sys/block/{d}/device"
+        if os.path.exists(link):
+            ctrl[d] = os.path.realpath(link)
+    # every descendant lsblk lists, partition or not, by its kernel name: the rule refuses any it could not probe
+    sigs = {name: blkid_probe(name)}
+    sigs.update({c.get("name"): blkid_probe(c.get("kname")) for c in descendants(node)})
+    return name, problems(name, devices, holders, multipath, part_holders, busy, ctrl, sigs)
 
 
 def _node(name, typ, pkname=None, mounts=None, children=None, kname=None):
