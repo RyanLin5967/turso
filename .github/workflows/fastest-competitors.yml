@@ -95,7 +95,14 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -q libpq-dev libmariadb-dev clang cmake pkg-config fio
+          # LOW 24: the PGDG archive too, so the pinned package stays installable after PGDG's main pool drops it,
+          # and libpq-dev pinned to the same registered package (read through pins.py, the one table's reader)
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt-archive.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg-archive main" |
+            sudo tee /etc/apt/sources.list.d/pgdg-archive.list
+          sudo apt-get update -q
+          pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
+          [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
+          sudo apt-get install -y -q "libpq-dev=$pgv" "libpq5=$pgv" libmariadb-dev clang cmake pkg-config fio
       - name: Hardware record
         run: bash fastest/linux/hw/record.sh "$RUNNER_TEMP/build-hw" "$RUNNER_TEMP/hw-target" 15
       - name: Build bbload, clonebench, sqlite3 (BB_HOOKS=0)
@@ -158,9 +165,16 @@ jobs:
           sudo apt-get install -y -q postgresql-common
           echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          # LOW 24: the PGDG archive as a second source, so the pinned package stays installable once PGDG's main
+          # pool moves past it (the build job adds the same line)
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt-archive.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg-archive main" |
+            sudo tee /etc/apt/sources.list.d/pgdg-archive.list
+          sudo apt-get update -q
           # PostgreSQL pinned to the registered package of versions.tsv (gate-6 review, t3run item 13); a PGDG
-          # repository without it fails here rather than installing another version.
-          pgv=$(awk -F'\t' '$1 == "postgresql" && $4 == "pgdg_package" {print $5}' fastest/linux/competitors/versions.tsv)
+          # repository without it fails here rather than installing another version. The pin is read through pins.py
+          # (LOW 24: this was a second, awk reader of the table), which exits non-zero on a missing row, and the
+          # step's bash -e stops on that.
+          pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
           [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
           sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
