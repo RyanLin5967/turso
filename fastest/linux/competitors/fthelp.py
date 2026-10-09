@@ -5,7 +5,9 @@
                                   total = rows (every op in the traced window, warm-up included),
                                   ok = rows with ok=1, created = rows whose create step K (default 1) succeeded
                                   (ok=1, or a step after K ran, or only the untimed after-step failed:
-                                  err >= 1000) -- the branches that must exist afterwards.
+                                  bbload err >= 1000, clonebench err 2, 3 or 4) -- the creates that happened,
+                                  whether or not their untimed delete then ran (the FICLONE = creates check).
+                                  Every value is a count, or the reader exits 1 (LOW 26).
   fthelp.py branch OUTDIR         the branch name of client 0's first ok op of a bbload run: b_<run_tag>_0_<seq>
   fthelp.py cloneproof A B        filefrag -v on A and B: extents, extents flagged shared, and how many of B's
                                   blocks sit on the same physical blocks as A's. Prints JSON; verdict "clone" if
@@ -14,13 +16,15 @@
   fthelp.py gcverdict RC GCOUT LOG
                                   the seed's DOLT_GC / dolt_gc verdict (MED 9): ok only for client rc 0, an output of
                                   exactly a GC_OK status, and no panic in the server log written since the CALL
-  fthelp.py selftest              known answers for gcverdict
+  fthelp.py selftest              known answers for gcverdict and ops
 """
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 
 
 def rows(d):
@@ -28,20 +32,35 @@ def rows(d):
         return list(csv.DictReader(f, delimiter="\t"))
 
 
-def ops(d, create_step=1):
+def ops_counts(d, create_step=1):
+    """(total, ok, created) of an out dir's raw.tsv; ValueError on a row whose ok or err is not what the binaries
+    write (LOW 26: a malformed row used to count as not ok and not created, silently)."""
     rs = rows(d)
-    ok = sum(1 for r in rs if r["ok"] == "1")
-    created = 0
-    for r in rs:
-        err = int(r.get("err") or -1)
+    ok = created = 0
+    for i, r in enumerate(rs):
+        if r.get("ok") not in ("0", "1") or not re.fullmatch(r"-?[0-9]+", r.get("err") or ""):
+            raise ValueError(f"raw.tsv row {i + 1}: ok [{r.get('ok')}] err [{r.get('err')}]")
+        err = int(r["err"])
+        ok += r["ok"] == "1"
         # bbload fills step<k>_ns for every step it attempted, so step K+1 attempted means step K succeeded; K is the
         # spec's create step (2 for amendment 14 variant (a), whose step 1 is the checkout of the parent).
         later = any((r.get(f"step{k}_ns") or "") != "" for k in range(create_step + 1, 9))
-        if "create_ns" in r:  # clonebench: err 1 = the create failed; 2 (open) and 3 (write) come after it
-            later = err in (2, 3)
+        if "create_ns" in r:
+            # clonebench: err 1 = the create failed; 2 (open) and 3 (write) come after it, and 4 (the --drop's
+            # fsync of the branch dir, set only when every step succeeded) after all of them -- 4 was missed when
+            # HIGH 1 added it, so a failed durable delete under-counted creates
+            later = err in (2, 3, 4)
         if r["ok"] == "1" or later or err >= 1000:
             created += 1
-    print(len(rs), ok, created)
+    return len(rs), ok, created
+
+
+def ops(d, create_step=1):
+    try:
+        total, ok, created = ops_counts(d, create_step)
+    except (OSError, KeyError, ValueError) as e:
+        sys.exit(f"fthelp ops: {d}: {e}")
+    print(total, ok, created)
 
 
 def branch(d):
@@ -128,13 +147,60 @@ def selftest():
         ("rc 0 with no output", "0", "", "", False),
         ("rc 0 with another status", "0", "1\n", "", False),
     ]
-    bad = 0
+    bad = n = 0
     for name, rc, out, log, want in cases:
         why = gc_verdict(rc, out, log)
         got = not why
         print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
         bad += got != want
-    print(f"fthelp selftest: {len(cases) - bad}/{len(cases)}")
+        n += 1
+
+    def ok(name, cond):
+        nonlocal bad, n
+        print(("PASS" if cond else "FAIL"), name)
+        bad += not cond
+        n += 1
+
+    # ops (LOW 26): raw.tsv in each binary's own header (clonebench.c and bbload.c's writers), one row per outcome
+    cb_head = ("client\tseq\tphase\tok\tstart_ns\tclone_done_ns\tend_ns\tlat_ns\tcreate_ns\topen_ns\twrite_ns\tafter_ns"
+               "\tticket\tflight\terr\n")
+    bb_head = "client\tseq\tphase\tok\tintended_ns\tstart_ns\tend_ns\tlat_ns\tstep1_ns\tstep2_ns\tstep3_ns\tafter_ns\terr\n"
+
+    def cb_row(seq, okv, err):
+        return f"0\t{seq}\t1\t{okv}\t10\t11\t12\t2\t1\t1\t1\t5\t0\t0\t{err}\n"
+
+    def bb_row(seq, okv, err, steps):
+        cells = [str(5) for _ in range(steps)] + [""] * (3 - steps)
+        return f"0\t{seq}\tmeasure\t{okv}\t1\t2\t3\t2\t" + "\t".join(cells) + f"\t4\t{err}\n"
+
+    with tempfile.TemporaryDirectory() as d:
+        def counts(name, text, k=1):
+            p = f"{d}/{name}"
+            os.makedirs(p)
+            with open(f"{p}/raw.tsv", "w") as f:
+                f.write(text)
+            try:
+                return ops_counts(p, k)
+            except ValueError as e:
+                return f"ValueError: {e}"
+        got = counts("cb", cb_head + cb_row(0, 1, -1) + cb_row(1, 0, 1) + cb_row(2, 0, 2) + cb_row(3, 0, 3)
+                     + cb_row(4, 0, 4))
+        ok(f"clonebench: ok, err 1 (create failed), 2, 3 and 4 (the --drop's dir fsync) -> 5 ops, 1 ok, 4 created "
+           f"(got {got})", got == (5, 1, 4))
+        got = counts("cb4", cb_head + cb_row(0, 0, 4) + cb_row(1, 0, 4))
+        ok(f"clonebench: two failed durable deletes are two creates (err 4 was missed; got {got})", got == (2, 0, 2))
+        got = counts("bb", bb_head + bb_row(0, 1, -1, 3) + bb_row(1, 0, 0, 1) + bb_row(2, 0, 1, 2) + bb_row(3, 0, 1003, 3))
+        ok(f"bbload K=1: ok, step 1 failed, step 2 failed, after-step failed -> 4 ops, 1 ok, 3 created (got {got})",
+           got == (4, 1, 3))
+        got = counts("bbk2", bb_head + bb_row(0, 0, 1, 2) + bb_row(1, 0, 2, 3), 2)
+        ok(f"bbload K=2 (variant (a)): step 2 failed is no create, step 3 failed is one (got {got})", got == (2, 0, 1))
+        got = counts("cbbad", cb_head + cb_row(0, 1, -1) + cb_row(1, 1, "").replace("\t\n", "\tx\n"))
+        ok(f"a row with a non-numeric err is refused, not counted (got {got})", isinstance(got, str))
+        got = counts("cbok", cb_head + cb_row(0, 2, -1))
+        ok(f"a row with ok not 0 or 1 is refused (got {got})", isinstance(got, str))
+        got = counts("empty", cb_head)
+        ok(f"control: a header-only raw.tsv is (0, 0, 0), which the cell then refuses (got {got})", got == (0, 0, 0))
+    print(f"fthelp selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
 

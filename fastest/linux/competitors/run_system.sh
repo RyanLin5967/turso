@@ -66,6 +66,9 @@ AGE=${FT_AGE:-0}
 PREBRANCH=${FT_PREBRANCH:-0}
 [[ $AGE =~ ^[0-9]+$ && $PREBRANCH =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_AGE [$AGE] / FT_PREBRANCH [$PREBRANCH] not counts" >&2; exit 2; }
 PSUM=$(python3 "$HERE/gen_seed.py" sum --rows "$ROWS" --updates "$AGE")  # the parent's sum(v) after the aging
+# LOW 26: a count, or nothing runs (a failed gen_seed left PSUM empty, so every isolation check compared against
+# "ROWS|" and "ROWS|1" and failed for the wrong reason, or, in shell arithmetic, read as 0)
+[[ $PSUM =~ ^[0-9]+$ ]] || { echo "REFUSED: the parent's sum(v) from gen_seed.py [$PSUM] is not a count" >&2; exit 2; }
 [[ $WARMUP =~ ^[0-9]+:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "REFUSED: warm-up [$WARMUP] is not OPS:S:MAX_S" >&2; exit 2; }
 # Real or smoke (lead ruling, artie DECISIONS 6b0bef481b): the CI smoke warm-up cap (FT_WARMUP=1000:10:2) is accepted
 # for SMOKE runs only, which say so with FT_DRY=1 and are never credited. Every other run is REAL (FT_DRY=0, also the
@@ -300,6 +303,13 @@ ops_of() {
   local k=1
   case $(basename "$2") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac  # variant (a): step 1 checks out the parent, step 2 creates
   if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
+  # LOW 26: the reader's line itself must be three counts, or the job FAILS (a short or empty line read as empty
+  # totals and reached stracecount's --ops)
+  ops_line_ok "$2/ops.txt" || { fail "ops reader on $1: [$(head -c 200 "$2/ops.txt")] is not three counts"; echo "0 0 0" >"$2/ops.txt"; }
+}
+# ops_line_ok FILE -- FILE is exactly one line of three counts, "<total> <ok> <created>"
+ops_line_ok() {
+  [ "$(wc -l <"$1" | tr -d ' ')" = 1 ] && grep -Eq '^[0-9]+ [0-9]+ [0-9]+$' "$1"
 }
 # timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
 # N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
@@ -307,8 +317,9 @@ timedrun_check() {
   local k=1
   case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
-  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>/dev/null; then :; else
-    fail "$3 timed run: ops reader"; echo "0 0 0" >"$1/timed.ops.txt"
+  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
+    ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
+    fail "$3 timed run: ops reader ($(tail -c 200 "$1/timed.ops.err" 2>/dev/null))"; echo "0 0 0" >"$1/timed.ops.txt"
   fi
 }
 # judge_cell CELLDIR -- the cell's verdict must be "ok"; anything else (REFUSED, INCOMPLETE, NOT CLEAN, a missing or

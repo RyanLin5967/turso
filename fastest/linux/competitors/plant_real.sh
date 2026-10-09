@@ -6,7 +6,8 @@
 #   a real run at a non-registered cap with the registered warm-up (the cap alone), and at 20 s with its own rule
 #   (rule(20) IS the smoke cap); a real run with another rule; a real run with FT_AGE, FT_PREBRANCH or the ops total
 #   left to the smoke defaults; an FT_DRY that is neither 0 nor 1; a non-numeric FT_CAP_S on any run; the dropped
-#   system pg18-defaults (gate-6 item 18); and a run whose drive class cannot be determined (MNT on tmpfs where
+#   system pg18-defaults (gate-6 item 18); a non-count ops total (LOW 13) or parent sum(v) (LOW 26: FT_ROWS=x makes
+#   gen_seed.py sum fail); and a run whose drive class cannot be determined (MNT on tmpfs where
 #   /dev/shm exists, else on a system with no /sys: drive.py must refuse; this case is handed a passing fire-check
 #   verdict so it reaches drive.py).
 # The controls -- smoke runs with the smoke cap and at a 20 s cap, real runs with the registered cap and rule (implicit
@@ -44,7 +45,7 @@ case_() {
   [ "$rc" = "$want_rc" ] || ok=0
   grep -qF -- "$want" <<<"$out" || ok=0
   # a control must not have met any of the planted refusals on its way to the fire-check
-  if [ "$want_rc" = 1 ] && grep -qE 'a real run|FT_DRY \[|FT_CAP_S \[|drive class' <<<"$out"; then ok=0; fi
+  if [ "$want_rc" = 1 ] && grep -qE 'a real run|FT_DRY \[|FT_CAP_S \[|drive class|sum\(v\) from gen_seed' <<<"$out"; then ok=0; fi
   if [ $ok = 1 ]; then
     echo "PASS $name: rc $rc, [$want]"
   else
@@ -75,6 +76,9 @@ case_ "pg18-defaults (dropped on Linux, item 18)" 2 "REFUSED: pg18-defaults is d
 # LOW 13: a non-count ops total refuses before the first cell (it used to cost each cell its conncheck and idle window)
 case_ "an ops total that is not a count (FT_OPS_TOTAL=x)" 2 "REFUSED: the ops total" FT_DRY=1 FT_OPS_TOTAL=x -- pg18-d2
 case_ "an N1 that is not a count (FT_N1=0x10)" 2 "REFUSED: the ops total" FT_DRY=1 FT_N1=0x10 -- b1
+# LOW 26: gen_seed.py sum fails on FT_ROWS=x (int('x')), which left PSUM empty; the guard on PSUM itself must refuse
+case_ "a parent sum(v) that is not a count (gen_seed.py sum fails on FT_ROWS=x)" 2 \
+  "REFUSED: the parent's sum(v) from gen_seed.py [] is not a count" FT_DRY=1 FT_ROWS=x -- doltgres
 if [ -d /dev/shm ]; then DMNT=/dev/shm/plant-real-$$; else DMNT=$S/mnt-drive; fi
 case_ "a drive class that cannot be determined (MNT $DMNT)" 2 "REFUSED: the drive class under" \
   FT_DRY=1 FT_FIRECHECK="$S/firecheck-pass.txt" -- b1 "$DMNT"
