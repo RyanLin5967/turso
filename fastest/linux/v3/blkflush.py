@@ -821,15 +821,18 @@ def self_test():
         (swf.get("_inside") or {}).get("nosync25") == 1 and (swf.get("_inside") or {}).get("append25") == 1
         and (swf.get("_unattributed") or {}).get("inside_foreign_fd") == 1
         and (swf.get("_unattributed") or {}).get("inside_no_fd") == 0 and (swf.get("nosync25") or {}).get("syncs") == 0, swf)
-    # (g) a sync whose fd does not parse ("fd: zz"), wholly inside an append25 window: no fd, inside a window
-    nw = [(1000000, 1100000, "append25", 0)]
-    ne, _ = parse_trace_all(HDR % (1, 1) + "%16s-%-7d [%03d] .....  %s: sys_fsync(fd: zz)" % ("v3floor", 99, 0, "0.001050")
-                            + "\n", devs)[1:], None
-    swg = swin(ne[0], nw, 99)
-    chk("sync windows (MED 1): a sync naming no fd wholly inside an append25 window -> inside_no_fd 1, append25 holds 1 "
-        "on any fd and still lacks its own", (swg.get("_unattributed") or {}).get("inside_no_fd") == 1
-        and (swg.get("_unattributed") or {}).get("no_fd") == 1 and (swg.get("_inside") or {}).get("append25") == 1
-        and (swg.get("append25") or {}).get("windows_without_a_sync") == 1, swg)
+    # (g) [AMENDED at V3 review 12 item 10, disclosed: a syscall line whose fd does not parse is a line that does not
+    #     parse, which refuses the record (the docstring's exit 2), never a sync counted as no_fd]
+    gp = parse_trace_all(HDR % (1, 1) + "%16s-%-7d [%03d] .....  %s: sys_fsync(fd: zz)" % ("v3floor", 99, 0, "0.001050")
+                         + "\n", devs)
+    chk("parse (review 12 item 10): a syscall line whose fd does not parse ('fd: zz') is a parse problem, not a sync",
+        gp[1] == [] and any("fd" in x and "parse" in x for x in gp[2]), (gp[1], gp[2]))
+    # the tracepoint prints the fd in HEX without 0x (measured on the banked traces: the shared clone fd 17 prints
+    # "fd: 11", clean's 14 "fd: e"); a 0x form parses as hex too (a guard)
+    hx = parse_trace_all(HDR % (2, 2) + "\n".join(["%16s-%-7d [%03d] .....  %s: sys_fsync(fd: %s)" % ("v3floor", 99, 0, "0.001050", f)
+                                                  for f in ("11", "0x00000011")]) + "\n", devs)
+    chk("parse (review 12 item 10): 'fd: 11' and 'fd: 0x00000011' are both fd 17 (the tracepoint's hex)",
+        [x[7] for x in hx[1]] == [17, 17] and hx[2] == [], (hx[1], hx[2]))
     # (c') case (c) again: cfr2b's directory fsync (fd 13) printed at cfr2b's end overlaps nosync25's start but is not
     #      wholly inside it, so nosync25 holds 0 on any fd too (a rule counting overlap, not containment, gives it 1);
     #      cfr2b holds 1 wholly inside (its clone fsync; the directory fsync straddles its end)
@@ -993,7 +996,8 @@ def self_test():
             proto = next(l for l in lines if SYSLINE.match(l) and int(SYSLINE.match(l).group("pid")) == meta["pid"])
             mm = SYSLINE.match(proto)
             planted_line = (proto[:mm.start("ts")] + "%d.%06d" % (tm // 10 ** 9, (tm % 10 ** 9) // 1000) + proto[mm.end("ts"):mm.start("args")]
-                            + "fd: 99" + proto[mm.end("args"):])
+                            + "fd: %x" % 99 + proto[mm.end("args"):])  # [review 12 item 10: in the
+            # tracepoint's own hex, so the fd planted is the 99 the guard checks; "fd: 99" was fd 153]
             kept7 = [re.sub(r"entries-in-buffer/entries-written: (\d+)/(\d+)",
                             lambda q: "entries-in-buffer/entries-written: %d/%d" % (int(q.group(1)) + 1, int(q.group(2)) + 1), l)
                      for l in lines] + [planted_line]
