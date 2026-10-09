@@ -495,6 +495,9 @@ fn prepare_statement_inner(
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(Some(stmt));
     }
+    // A CREATE TABLE's foreign keys: their parents checked now, every key resolved by the server
+    // once the table exists, in the CREATE's own transaction (wire review 13 item 2).
+    let new_table_keys = precheck_create_keys(&pg_conn.conn, &parse_result)?;
     if let Some(types) = types.as_deref_mut() {
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
@@ -514,6 +517,7 @@ fn prepare_statement_inner(
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
     if let Some(types) = types {
+        types.new_table_keys = new_table_keys;
         types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
         types.rolls_back = matches!(
             translated.cmd.stmt(),
@@ -958,16 +962,8 @@ fn handle_pg_add_constraints(
         for key in &keys {
             parent_keys.push(added_key_parent_columns(conn, &quoted, key)?);
         }
-        if let Some(first) = keys.first() {
-            conn.current_schema()
-                .resolved_fks_for_child(table)
-                .map_err(|_| {
-                    LimboError::ParseError(format!(
-                        "there is no unique constraint matching given keys for referenced table \
-                         \"{}\"",
-                        first.parent
-                    ))
-                })?;
+        if !keys.is_empty() {
+            check_table_keys(conn, table)?;
         }
         for (key, parent_columns) in keys.iter().zip(&parent_keys) {
             check_added_foreign_key(conn, &quoted, key, parent_columns)?;
@@ -1054,6 +1050,91 @@ fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option
         parent: c.pktable.as_ref()?.relname.clone(),
         parent_columns: names(&c.pk_attrs),
     })
+}
+
+/// Every foreign key of `table` resolves as the engine resolves it for a write, unique parent keys
+/// required (Schema::resolved_fks_for_child): one that does not is 42830 "there is no unique
+/// constraint matching given keys for referenced table", naming the parent the engine names. A key
+/// that did not resolve made every later INSERT into the table fail 'foreign key mismatch'. Shared
+/// by ALTER TABLE ADD FOREIGN KEY (wire review 11 item 5) and CREATE TABLE (review 13 item 2), so
+/// the two cannot drift.
+pub fn check_table_keys(conn: &Arc<Connection>, table: &str) -> Result<()> {
+    conn.current_schema()
+        .resolved_fks_for_child(table)
+        .map(|_| ())
+        .map_err(|e| {
+            let message = e.to_string();
+            // fk_mismatch_err: 'foreign key mismatch - "<child>" referencing "<parent>"'.
+            let parent = message
+                .rsplit_once("referencing \"")
+                .and_then(|(_, p)| p.strip_suffix('"'))
+                .unwrap_or(table)
+                .to_string();
+            LimboError::ParseError(format!(
+                "there is no unique constraint matching given keys for referenced table \"{parent}\""
+            ))
+        })
+}
+
+/// The foreign keys a CREATE TABLE declares, in its column constraints (the column the key's own)
+/// and its table constraints.
+fn create_foreign_keys(
+    create: &turso_pg_parser::pg_query::protobuf::CreateStmt,
+) -> Vec<AddedForeignKey> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let mut keys = Vec::new();
+    for elt in &create.table_elts {
+        match elt.node.as_ref() {
+            Some(Node::ColumnDef(col)) => {
+                for mut key in col.constraints.iter().filter_map(added_foreign_key) {
+                    if key.columns.is_empty() {
+                        key.columns = vec![col.colname.clone()];
+                    }
+                    keys.push(key);
+                }
+            }
+            Some(Node::Constraint(_)) => keys.extend(added_foreign_key(elt)),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// A CREATE TABLE's foreign keys, checked against their parents before the table is created, as
+/// PostgreSQL checks them (42P01 for a parent that does not exist, 42830 for one with no primary key
+/// to default to or a key of another column count); a key onto the table itself waits for the
+/// table. Returns the table's name when it declares a key, for the server to resolve every key
+/// once the table exists ([`check_table_keys`]). CREATE TABLE IF NOT EXISTS of a table that exists
+/// checks nothing, as in PostgreSQL, which creates nothing. CREATE TABLE checked no parent, so a
+/// key onto a missing parent or a non-unique column was accepted and every INSERT into the table
+/// then failed (wire review 13 item 2).
+fn precheck_create_keys(
+    conn: &Arc<Connection>,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<Option<String>> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Ok(None);
+    };
+    let Some(Node::CreateStmt(create)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(relation) = create.relation.as_ref() else {
+        return Ok(None);
+    };
+    let keys = create_foreign_keys(create);
+    if keys.is_empty()
+        || (create.if_not_exists && conn.current_schema().get_table(&relation.relname).is_some())
+    {
+        return Ok(None);
+    }
+    let quoted = format!("\"{}\"", relation.relname.replace('"', "\"\""));
+    for key in &keys {
+        if !key.parent.eq_ignore_ascii_case(&relation.relname) {
+            added_key_parent_columns(conn, &quoted, key)?;
+        }
+    }
+    Ok(Some(relation.relname.clone()))
 }
 
 /// The parent key of a foreign key an ALTER adds, as PostgreSQL resolves it: the columns named,

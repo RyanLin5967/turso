@@ -1464,7 +1464,9 @@ impl Session {
                 }
             }
         }
-        let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+        let r = if let Some(table) = types.new_table_keys.as_deref() {
+            create_with_keys(conn, &mut stmt, sql, table, backoff)
+        } else if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql, backoff)
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
@@ -2024,12 +2026,16 @@ fn tx_modes(mut w: &[&str]) -> bool {
     true
 }
 
-/// A transaction-control statement the client did not send: an implicit block's own.
+/// A transaction-control statement the client did not send: an implicit block's own, or the
+/// savepoint a statement runs under inside a block ([`create_with_keys`]).
 #[derive(Debug, Clone, Copy)]
 enum TxStmt {
     Begin,
     Commit,
     Rollback,
+    Savepoint(&'static str),
+    Release(&'static str),
+    RollbackTo(&'static str),
 }
 
 /// What a failed COMMIT tells the client, once the engine's transaction is settled: a COMMIT the
@@ -2065,26 +2071,45 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
 /// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
 /// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
 fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
-    use turso_parser::ast::Stmt;
+    use turso_parser::ast::{Name, Stmt};
     let (stmt, text) = match tx {
         TxStmt::Begin => (
             Stmt::Begin {
                 typ: None,
                 name: None,
             },
-            "BEGIN",
+            "BEGIN".to_string(),
         ),
-        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT"),
+        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT".to_string()),
         TxStmt::Rollback => (
             Stmt::Rollback {
                 tx_name: None,
                 savepoint_name: None,
             },
-            "ROLLBACK",
+            "ROLLBACK".to_string(),
+        ),
+        TxStmt::Savepoint(name) => (
+            Stmt::Savepoint {
+                name: Name::from_string(name),
+            },
+            format!("SAVEPOINT {name}"),
+        ),
+        TxStmt::Release(name) => (
+            Stmt::Release {
+                name: Name::from_string(name),
+            },
+            format!("RELEASE SAVEPOINT {name}"),
+        ),
+        TxStmt::RollbackTo(name) => (
+            Stmt::Rollback {
+                tx_name: None,
+                savepoint_name: Some(Name::from_string(name)),
+            },
+            format!("ROLLBACK TO SAVEPOINT {name}"),
         ),
     };
     conn.inner()
-        .prepare_translated_stmt(stmt, text)?
+        .prepare_translated_stmt(stmt, &text)?
         .run_ignore_rows()
 }
 
@@ -3109,6 +3134,61 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     } else {
         Type::TEXT_ARRAY
     }
+}
+
+/// A CREATE TABLE with foreign keys, run in a transaction of its own (a savepoint inside a block) so
+/// that every key is resolved once the table exists, as the engine resolves it for a write, and the
+/// table is undone if one does not resolve (42830, turso_pg::check_table_keys): the parents were
+/// checked at prepare, a key onto the table itself only now. It was created unchecked, and every
+/// INSERT into it then failed 'foreign key mismatch' (wire review 13 item 2). The transaction is
+/// the engine's (engine_tx), so no SQL text is parsed for it.
+fn create_with_keys(
+    conn: &PgConnection,
+    stmt: &mut turso_core::Statement,
+    sql: &str,
+    table: &str,
+    backoff: &mut Backoff,
+) -> PgWireResult<Response> {
+    const SAVEPOINT: &str = "__turso_create_keys";
+    let own = conn.inner().get_auto_commit();
+    engine_tx(
+        conn,
+        if own {
+            TxStmt::Begin
+        } else {
+            TxStmt::Savepoint(SAVEPOINT)
+        },
+    )
+    .map_err(engine_error)?;
+    let r = execute_non_query(stmt, sql, backoff).and_then(|response| {
+        turso_pg::check_table_keys(conn.inner(), table)
+            .map(|()| response)
+            .map_err(engine_error)
+    });
+    let end = match &r {
+        // The same rule as an implicit block's COMMIT (end_implicit): a block the engine still
+        // holds is rolled back, and a transaction it stranded breaks the connection.
+        Ok(_) if own => engine_tx(conn, TxStmt::Commit).map_err(|e| {
+            let info = commit_failed(conn, engine_info(&e));
+            if !conn.inner().get_auto_commit() {
+                let _ = engine_tx(conn, TxStmt::Rollback);
+            }
+            PgWireError::UserError(info)
+        }),
+        Ok(_) => engine_tx(conn, TxStmt::Release(SAVEPOINT)).map_err(engine_error),
+        Err(_) => {
+            if !conn.inner().get_auto_commit() {
+                let _ = if own {
+                    engine_tx(conn, TxStmt::Rollback)
+                } else {
+                    engine_tx(conn, TxStmt::RollbackTo(SAVEPOINT))
+                        .and_then(|()| engine_tx(conn, TxStmt::Release(SAVEPOINT)))
+                };
+            }
+            Ok(())
+        }
+    };
+    end.and(r)
 }
 
 /// Execute a query that returns rows and build a Query response. Each column has the type the
