@@ -891,6 +891,31 @@ mod tests {
         stmt.run_ignore_rows()
     }
 
+    /// Engine review 16 #21 (PLAUSIBLE, by reading; `blob_to_bigdecimal`'s validation unread): a
+    /// blob operand reaches numeric's operators as given, and they read a blob as the type's
+    /// internal encoding, so `x = X'00'` compared the column with a value no INSERT could have
+    /// stored. It must be refused as an INSERT of X'00' is, literal and bound. Red first: the fix
+    /// is written only once this runs red.
+    #[test]
+    fn a_blob_operand_of_numeric_is_refused_as_its_insert_is() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00)").unwrap();
+        let insert = conn.execute("INSERT INTO t VALUES (2, X'00')");
+        assert!(insert.is_err(), "premise: numeric refuses to store a blob it never encoded");
+        for (sql, param) in [
+            ("x = X'00'", None),
+            ("x = ?1", Some(Value::from_slice(&[0]).unwrap())),
+        ] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {sql}"), param);
+            assert!(
+                got.is_err(),
+                "CLAIM: {sql} with a blob operand gave {got:?}, where an INSERT of that blob is refused"
+            );
+        }
+    }
+
     /// Engine review 14 HIGH 1: 6b (a) encoded every bound operand of a custom type's operator
     /// with the COLUMN's parameters, so on numeric(10, 2) a parameter was truncated to two places
     /// and refused past ten digits, in arithmetic as well as comparisons: `x * ?1` with 1.075
