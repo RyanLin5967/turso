@@ -237,9 +237,15 @@ impl PostgreSQLTranslator {
         let mut qn = if range_var.schemaname.is_empty()
             || matches!(
                 range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "public" | "information_schema"
+                "pg_catalog" | "information_schema"
             ) {
             ast::QualifiedName::single(name)
+        } else if range_var.schemaname.eq_ignore_ascii_case("public") {
+            // An explicit public is the main database's relation whatever the search path: read as
+            // unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into s.t
+            // (wire review 17 item 1). pg_catalog's relations stay unqualified, as the engine
+            // finds its catalog tables.
+            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
         } else {
             let schema = ast::Name::from_string(range_var.schemaname.clone());
             ast::QualifiedName::fullname(schema, name)
@@ -1193,8 +1199,14 @@ impl PostgreSQLTranslator {
                 match names.len() {
                     0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
                     1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
+                    // public is the main database (as in qualified_name_from_range_var): DROP
+                    // TABLE public.t answered "no such database: public" (wire review 17 item 1).
                     _ => ast::QualifiedName::fullname(
-                        ast::Name::from_string(names[0].clone()),
+                        ast::Name::from_string(if names[0].eq_ignore_ascii_case("public") {
+                            "main".to_string()
+                        } else {
+                            names[0].clone()
+                        }),
                         ast::Name::from_string(names[1].clone()),
                     ),
                 }
