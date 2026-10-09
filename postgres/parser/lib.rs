@@ -194,10 +194,35 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
 /// Uses pg_query's scanner which correctly handles semicolons inside
 /// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The scanner emits a statement only where it saw a keyword, and skips every other stretch of the
+/// text: `COMMIT<NBSP>` (one identifier) between two statements was dropped, so `INSERT ..;
+/// COMMIT<NBSP>; INSERT ..` ran both INSERTs and nothing answered 42601. So every stretch before,
+/// between and after the statements must be blank (whitespace, comments, `;`), or the text is
+/// refused here: the caller then prepares it whole, and the parser refuses it, as PostgreSQL parses
+/// the whole string before it runs any of it (wire review 16 item 1).
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let b = sql.as_bytes();
+    let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
+    let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
+    let mut at = 0;
+    for part in &parts {
+        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`).
+        let start = (part.as_ptr() as usize)
+            .checked_sub(sql.as_ptr() as usize)
+            .filter(|start| *start >= at && *start + part.len() <= b.len())
+            .ok_or_else(stray)?;
+        if !blank(&b[at..start]) {
+            return Err(stray());
+        }
+        at = start + part.len();
+    }
+    if !blank(&b[at..]) {
+        return Err(stray());
+    }
     Ok(parts
         .into_iter()
         .map(|s| pg_trim(&s).to_string())
