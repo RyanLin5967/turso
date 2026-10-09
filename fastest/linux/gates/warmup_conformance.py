@@ -181,14 +181,22 @@ def live_check(binary, path):
 
 FAKE = r'''#!/usr/bin/env python3
 # fake replayer {name}
+import math
 import sys
-ops, s, m = sys.argv[2].split(":")
-ops, s_ns, m_ns = int(ops), {conv}(float(s) * 1e9), {conv}(float(m) * 1e9)
+try:
+    ops, s, m = sys.argv[2].split(":")
+    ok = ops.isdigit()
+    ops, s, m = int(ops) if ok else -1, float(s), float(m)
+except ValueError:
+    sys.exit(2)
+if not ok or not (math.isfinite(s) and math.isfinite(m)) or s < 0 or {maxcheck}:
+    sys.exit(2)
+s_ns, m_ns = {conv}(s * 1e9), {conv}(m * 1e9)
 claimed = 0
 for line in sys.stdin:
     el = int(line)
     done = claimed >= ops and el {cmp} s_ns
-    capped = el >= m_ns
+    capped = {capped_cond}
     if done or capped:
         print(f"stop_at={{claimed}} warm_ops={{claimed + {extra}}} capped={{{capped_expr}}}")
         sys.exit(0)
@@ -204,10 +212,12 @@ def _safe(f):
         return False
 
 
-def fake(d, name, conv="int", cmp=">=", extra=0, capped_expr="0 if done else 1"):
+def fake(d, name, conv="int", cmp=">=", extra=0, capped_expr="0 if done else 1", maxcheck="m <= 0",
+         capped_cond="el >= m_ns"):
     p = os.path.join(d, name)
     with open(p, "w") as f:
-        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr, name=name))
+        f.write(FAKE.format(conv=conv, cmp=cmp, extra=extra, capped_expr=capped_expr, name=name, maxcheck=maxcheck,
+                            capped_cond=capped_cond))
     os.chmod(p, 0o755)
     return p
 
@@ -270,6 +280,17 @@ def _self_test(d):
     rc, rep = run({"fastest_profile": noisy})
     cases.append(("a driver printing more than its result line is REFUSED (rc 2)", rc == 2, rep[-1]))
     cases.append(("no driver at all is REFUSED (rc 2)", run({})[0] == 2, ""))
+    # review 5 MED 9: rule strings every driver must refuse (non-zero exit, no result line); a fake that reads MAX_S 0
+    # as "no limit" (the ports' old reading, A23-AM1) passes every decision case and must fail here. TEST EDIT,
+    # flagged: the fakes now validate the rule as bbload's replay does (the good ones refuse every refusal row); no
+    # expectation changed
+    nolimit = fake(d, "nolimit", maxcheck="False", capped_cond="m_ns > 0 and el >= m_ns")
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": nolimit})
+    cases.append(("MED 9: a fake reading MAX_S 0 as no limit FAILS (rc 1) on the 10:0:0 refusal row",
+                  rc == 1 and any("must refuse '10:0:0'" in ln and "fastest_profile" in ln for ln in rep), rep[-1]))
+    lax = fake(d, "lax", maxcheck="m < 0")
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": lax})
+    cases.append(("MED 9: a fake accepting MAX_S 0 at all (it prints a result) FAILS (rc 1)", rc == 1, rep[-1]))
     # review 5 MED 8: the LIVE loop -- a driver's run records the claims it judged (ns since its warm-up began) and the
     # decision it made; live_check replays those claims through the same driver's --warmup-replay and compares
     live = os.path.join(d, "live.json")
