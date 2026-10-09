@@ -201,7 +201,7 @@ def run_parity(d, system):
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
     # the validated rule that also accepts a run ended by the registered cap with >= 1000 ok ops (PREREG :212,
     # "completed with reduced n"; fourth lane review MED 4); summarize compares the warm-up rule and N to the plan.
-    rules, ops, verdicts, reduced = [], [], [], {}
+    rules, ops, verdicts, reduced, seen = [], [], [], {}, set()
     for t in sorted(glob.glob(os.path.join(d, "result", "cells", "*", "timed", "summary.json"))):
         cell = os.path.basename(os.path.dirname(os.path.dirname(t)))
         try:
@@ -214,10 +214,53 @@ def run_parity(d, system):
             tj = None
         rules.append(j.get("warmup_rule"))
         ops.append((tj or {}).get("ops"))
+        seen.add(cell)
         verdicts.append((cell, "no timed.json" if tj is None else tj.get("verdict")))
         if j.get("capped") and isinstance(j.get("measured_ops"), int):
             reduced[cell] = j["measured_ops"]
-    return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None}
+    # every cell the run said it would produce has its timed run (fourth lane review LOW 24): run_system.sh writes
+    # result/expected-cells.txt before any cell runs, so a cell that returned early cannot drop out silently
+    try:
+        expected = [x for x in open(os.path.join(d, "result", "expected-cells.txt")).read().split() if x]
+        missing = [f"timed run {x}: missing (listed in expected-cells.txt)" for x in expected if x not in seen]
+        if not expected:
+            missing = ["expected-cells.txt lists no cell"]
+    except OSError:
+        missing = ["no expected-cells.txt: the cells this run had to produce are unknown"]
+    return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None,
+            "expected_missing": missing}
+
+
+def fixture_check(d, system, plan, dry):
+    """One parent fixture for every system (gate-6 t3run HIGH 4; comp's gen_seed parent aged by FT_AGE, with
+    FT_PREBRANCH live branches) and the package's mode (fourth lane review LOW 15): what the run itself recorded must
+    equal its plan row's age and live columns, and a competitor's dry= its package's. Returns the refusals."""
+    bad = []
+    if plan.get("age") is None or plan.get("live") is None:
+        return ["the plan row has no age/live columns"]
+    if system == "ours":
+        try:
+            fx = json.load(open(os.path.join(d, "result", "summary.json"))).get("fixture")
+        except (OSError, ValueError):
+            fx = None
+        if not isinstance(fx, dict):
+            return ["ours records no fixture record (fastest_profile does not yet build the plan's parent: gen_seed "
+                    "rows, the age's single-row UPDATEs, the live branches)"]
+        got = {"age": fx.get("age"), "live": fx.get("live")}
+    else:
+        try:
+            line = open(os.path.join(d, "result", "run-info.txt")).readline()
+        except OSError:
+            return ["no run-info.txt (the competitor's fixture and mode are unknown)"]
+        kv = dict(t.split("=", 1) for t in line.split() if "=" in t)
+        if kv.get("dry") != str(dry):
+            bad.append(f"run-info dry={kv.get('dry')!r}, the package's {dry!r}")
+        got = {"age": int(kv["age"]) if kv.get("age", "").isdigit() else kv.get("age"),
+               "live": int(kv["prebranch"]) if kv.get("prebranch", "").isdigit() else kv.get("prebranch")}
+    for k in ("age", "live"):
+        if got[k] != plan[k]:
+            bad.append(f"fixture {k} {got[k]!r}, planned {plan[k]!r}")
+    return bad
 
 
 def summarize(out, sha, dry, manifest):
@@ -241,12 +284,13 @@ def summarize(out, sha, dry, manifest):
             f = line.split("\t")
             cell, system = f[:2]
             planned.append((fs, cell, system))
-            prow[(fs, cell)] = {"clients": f[2] if len(f) > 2 else None, "ops": int(f[3]) if len(f) > 3 and f[3].isdigit()
-                                else None, "block_k": int(f[6]) if len(f) > 6 and f[6].isdigit() else None}
+            num = lambda k: int(f[k]) if len(f) > k and f[k].isdigit() else None  # noqa: E731
+            prow[(fs, cell)] = {"clients": f[2] if len(f) > 2 else None, "ops": num(3), "block_k": num(6),
+                                "age": num(7), "live": num(8)}
     wt = os.path.join(out, "warmup.txt")
     wtext = open(wt).read().split() if os.path.exists(wt) else []
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
-    runs, incomplete, failed_checks, parity = [], [], [], []
+    runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -292,6 +336,9 @@ def summarize(out, sha, dry, manifest):
                     parity.append(f"{fs}/{cell}: measured {x!r} ops, planned {want!r}")
             if system == "ours" and r.get("ops_total_asked") != want:
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
+            for x in r.get("expected_missing") or []:
+                parity.append(f"{fs}/{cell}: {x}")
+            fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
         runs.append(r)
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
@@ -331,12 +378,13 @@ def summarize(out, sha, dry, manifest):
                "wall_seconds": total, "stages": stages, "planned_runs": len(planned),
                "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
                "failed_checks": failed_checks, "failed_blocks": failed_blocks, "warmup_rule": rule,
-               "parity_refusals": parity, "normaliser_missing": normaliser, "unquiet_runs": unquiet,
+               "parity_refusals": parity, "fixture_refusals": fixture, "normaliser_missing": normaliser,
+               "unquiet_runs": unquiet,
                "failed_stages": failed, "blocks": blocks, "runs": runs}
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
-        and summary["measured_runs"] > 0 and not parity and not normaliser and not unquiet
+        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet
     return summary, ok
 
 
@@ -608,6 +656,9 @@ def self_test():
         a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
         w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
         w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300}))
+        # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
+        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300}))
+        w(f"{a1}/result/expected-cells.txt", "c1-create\n")
         s, ok = summarize(out, "sha", "1", "m")
         # TEST EDIT, flagged (fourth lane review HIGH 2): this case pinned the withdrawn cross-system rule (it
         # required a refusal); per-system n_run means ours at 200 beside a competitor at 300 is NOT a refusal
@@ -640,6 +691,7 @@ def self_test():
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
                                                                               "measured_ops": int(ops)}))
                     w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops)}))
+                    w(f"{a1}/result/expected-cells.txt", "c1\n")
         w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
         s, _ = summarize(out, "sha", "1", "m")
         cases.append(("HIGH 2: cells-smoke.tsv planned by cells.py gives no parity refusal (n_run is per system)",
