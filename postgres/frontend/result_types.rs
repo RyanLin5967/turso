@@ -287,6 +287,7 @@ fn parameter_types_with(
         search_path: search_path.to_vec(),
         view_memo: view_memo.clone(),
         cuts: Default::default(),
+        cut_views: Default::default(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -371,8 +372,11 @@ struct Infer<'a> {
     /// The views read so far for this snapshot ([`ViewCache`]), shared with every nested walk.
     view_memo: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     /// How many times a view was cut (a cycle, the depth bound), shared with every nested walk: a
-    /// view whose reading saw a cut is not memoised.
+    /// view whose reading saw a cut is not memoised for the snapshot.
     cuts: std::rc::Rc<std::cell::Cell<usize>>,
+    /// The views whose reading saw a cut, for this statement's walk only, shared with every nested
+    /// walk ([`Infer::view_columns`]).
+    cut_views: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -697,12 +701,26 @@ impl Infer<'_> {
         if let Some(columns) = self.view_memo.borrow().get(&key) {
             return columns.clone();
         }
+        // A view read with a cut is kept for this statement: a view sees a cut only inside a cycle
+        // through it, which any later reading of it meets too, or past the depth bound, where a
+        // shallower reading might not; either way its columns are fail-closed (whatever a cut
+        // relation held is unknown), so reusing them can only refuse more. Its reader counts the
+        // cut, so nothing read from it reaches the snapshot's memo. Not kept, every sibling FROM
+        // item read its view again: about e*(k-1)! parses for k views that each list all k (wire
+        // review 16 item 3).
+        if let Some(columns) = self.cut_views.borrow().get(&key) {
+            self.cuts.set(self.cuts.get() + 1);
+            return columns.clone();
+        }
         let view = self.schema.get_view(relname)?;
         let cuts = self.cuts.get();
         let columns = self.read_view(&view, relname);
-        if self.cuts.get() == cuts {
-            self.view_memo.borrow_mut().insert(key, columns.clone());
-        }
+        let memo = if self.cuts.get() == cuts {
+            &self.view_memo
+        } else {
+            &self.cut_views
+        };
+        memo.borrow_mut().insert(key, columns.clone());
         columns
     }
 
@@ -754,6 +772,7 @@ impl Infer<'_> {
             search_path: self.search_path.clone(),
             view_memo: self.view_memo.clone(),
             cuts: self.cuts.clone(),
+            cut_views: self.cut_views.clone(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1520,6 +1539,7 @@ impl Infer<'_> {
             search_path: self.search_path.clone(),
             view_memo: self.view_memo.clone(),
             cuts: self.cuts.clone(),
+            cut_views: self.cut_views.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
