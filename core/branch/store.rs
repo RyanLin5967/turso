@@ -1429,9 +1429,12 @@ pub(crate) enum TrunkFork {
 }
 
 /// F-FZ hook stages (`BranchStore::checkpoint_hold`): the writer has written the captured rows and
-/// not committed; or it has committed and the install has not run.
+/// not committed; or it has committed and the install has not run; or the install has run and
+/// phase 4 (the catalog WAL's PASSIVE and TRUNCATE checkpoints) has not (engine review 17 MED 3).
 pub(crate) const HOLD_BEFORE_COMMIT: u8 = 2;
 pub(crate) const HOLD_AFTER_COMMIT: u8 = 3;
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_WAL_TRUNCATE: u8 = 4;
 
 /// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
 pub(crate) const HOLD_ARRIVED: u8 = 0x80;
@@ -2784,6 +2787,8 @@ fn run_flight(
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
         Ok(()) => {
+            #[cfg(test)]
+            pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 truncate_catalog_wal(&mut writer.lock())
