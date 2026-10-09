@@ -39,8 +39,14 @@ Gates (any failure makes the measurement VOID, and the block with it):
     the histogram bins (review M1: no measurement, no normaliser, no VALID).
 Published, not gates (lines 180 and 553): both runs' drive flushes per fsync and every loop layer's, with the slack
 (item 18), the fsync p50, the fsync/control write p50 ratio, the before-to-after
-drift. On a write-through drive floor_kind says "no volatile cache: no drive flush": the block layer sends such a
-drive no flush, so the fsync latency is not a drive flush (GitHub-hosted runners' disks are such drives).
+drift. floor_kind names only what was checked, one text per state (T3 runner review item 19): a ram disk, "brd: no
+drive (dry runs only, never credited)"; a write-back drive, "write-back drive: flush requests completed by the
+driver (issued and acknowledged, not persistence)"; a write-through drive whose counter read 0, "no volatile cache:
+no flush request sent (counter 0 checked in both runs)", or, for a record without a labelling count, "no volatile
+cache: no flush request sent (counter 0 checked in the timed run; no labelling count)": the block layer sends such a
+drive no flush, so the fsync latency is not a drive flush (GitHub-hosted runners' disks are such drives); a
+write-through queue whose counter rose, "write-through queue with flushes counted (VOID)"; any other write_cache,
+"write cache unknown (VOID)". A virtualized leaf appends "; virtualized <kind>: reach to media unknown".
 The pooled p50 merges the two timed fsync runs' latency histograms (fio json+ bins, fio's own ~1.5% buckets).
 
 Blind spots, stated: the labelling and timed runs are separate executions of one command; the flush counter is the
@@ -346,12 +352,7 @@ def measure(d, out, leafrec=None):
         os.unlink(f)
         rec["arms"][arm] = a
     rec["published"] = publish(rec)
-    rec["floor_kind"] = ("brd: no drive (dry runs only, never credited)" if disk.startswith("ram")
-                         else "write-back drive: flush requests completed by the driver (issued and acknowledged, not "
-                              "persistence)" if rec["leaf"]["write_cache"] == "write back"
-                         else "no volatile cache: no flush request sent (counter 0 checked)")
-    if virt and virt.get("virtualized") is not False:
-        rec["floor_kind"] += f"; virtualized {virt.get('virtualized')!r}: reach to media unknown"
+    rec["floor_kind"] = floor_kind(rec)
     bad = gates(rec)
     rec["verdict"] = "VOID" if bad else "VALID"
     rec["void_reasons"] = bad
@@ -384,6 +385,29 @@ def publish(rec):
             "floor_slack": float(SLACK),
             "floor_rule": "write back: timed flushes per fsync >= labelling flushes per fsync x (1 - floor_slack); "
                           "the slack is provisional until registered"}
+
+
+def floor_kind(rec):
+    """What the record's floor is, naming only what was checked (T3 runner review item 19): one text per state, and an
+    unknown or VOID state never reads "counter 0 checked". The module docstring lists every text."""
+    leaf, t = rec["leaf"], rec["arms"]["fsync"]["timed"]
+    wc, timed, lab = leaf.get("write_cache"), t.get("flush_ios_delta"), t.get("lab_flush_ios_delta")
+    if str(leaf.get("disk", "")).startswith("ram"):
+        k = "brd: no drive (dry runs only, never credited)"
+    elif wc == "write back":
+        k = "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence)"
+    elif wc == "write through" and timed == 0 and lab == 0:
+        k = "no volatile cache: no flush request sent (counter 0 checked in both runs)"
+    elif wc == "write through" and timed == 0 and lab is None:
+        k = "no volatile cache: no flush request sent (counter 0 checked in the timed run; no labelling count)"
+    elif wc == "write through":
+        k = "write-through queue with flushes counted (VOID)"
+    else:
+        k = "write cache unknown (VOID)"
+    virt = rec.get("virtualization")
+    if virt and virt.get("virtualized") is not False:
+        k += f"; virtualized {virt.get('virtualized')!r}: reach to media unknown"
+    return k
 
 
 def pooled_p50_ns(bins_list):
