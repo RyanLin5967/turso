@@ -844,6 +844,19 @@ def selftest():
         r3 = count(tr, [], "/x", w, phases=p)
         ok("a split asked over a C>1 run is refused", r3.get("verdict", "").startswith("REFUSED")
            and "phase split" in r3.get("verdict", ""), r3.get("verdict"))
+        # LOW 16: a window's fields are read from their own lines, never from the launch command's text (cmd=)
+        good = open(w).read()
+        w2 = os.path.join(d, "c2.window")
+        open(w2, "w").write(good.replace("cmd=planted", "cmd=planted --tag strace_rc=0").replace("strace_rc=0\n",
+                                                                                                  "strace_rc=1\n"))
+        r4 = count(tr, [], "/x", w2)
+        ok("c2: strace_rc=0 in the cmd= line does not mask the window's strace_rc=1",
+           r4.get("verdict", "").startswith("REFUSED") and "strace_rc=1" in r4.get("verdict", ""), r4.get("verdict"))
+        w3 = os.path.join(d, "c3.window")
+        open(w3, "w").write(good.replace("cmd=planted", "cmd=planted t0=1700000000.000000000 t0_mono=1000.000000000"))
+        r5 = count(tr, [], "/x", w3)
+        ok("c3: clock-pair text in the cmd= line is not a stamp (the window stays ok)", r5.get("verdict") == "ok",
+           r5.get("verdict"))
     print(f"stracecount selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
