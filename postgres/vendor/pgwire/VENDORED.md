@@ -37,8 +37,11 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    - `tokio/server.rs` `process_message`: a `Malformed` message is discarded while awaiting Sync
      and otherwise answered with its ERROR.
 2. A malformed Sync is not an extended message (`is_extended_query` covers P, B, C, D, E, H):
-   PostgreSQL ends a skip at any Sync before it reads the body, so the server answers it (and a
-   malformed simple Query) itself, with ReadyForQuery (wire review 12 items 6 and 7).
+   PostgreSQL ends a skip at any Sync before it reads the body, so the server answers it itself,
+   ending the round as on_sync does, with ReadyForQuery (wire review 12 item 6, review 15 item 4).
+   A malformed simple Query is answered the same way outside a skip (wire review 12 item 7); during
+   one it is ignored, as PostgreSQL ignores every message but Sync there before reading its body
+   (wire review 15 item 5: answering it ended the skip).
 3. `read_cstring` decodes strictly: invalid UTF-8 is 22021 "invalid byte sequence for encoding
    \"UTF8\": 0x.." (it was read lossily), in one scan for the terminator. `MalformedMessage` and
    `PgWireFrontendMessage::Malformed` carry the SQLSTATE and the message (wire review 12 item 8).
