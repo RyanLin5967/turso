@@ -25,10 +25,11 @@ T3: PREREG :180 and departure 3), and its V3L pairs are VALID with the verdicts 
 (items 6, review L5; a VOID V3L voids the block, PREREG line 180). Each batch's rc, timing and D0 controls, voids,
 frame-arm p50, D0 ratio, flush_sent_to_device and floor_kind, append25's and the frame arm's drift, and V3L's
 pooled p50, ratio and drift are copied in (published, not gates). Every measured run carries its own block's pooled
-V3L p50 as its normaliser; a null one fails (third lane review LOW 11). Runs whose settle did not go quiet are listed
-(unquiet_runs; third lane review MED 5), not gated.
+V3L p50 as its normaliser; a null one fails (third lane review LOW 11). A measured run with no settle.txt, or whose
+settle (taken before it started) did not go quiet, fails (unquiet_runs; fourth lane review MED 5).
 Exit 1 if any planned run is not complete, any block is not OK or never ran (fslist.txt names every block), a
-stage failed, a parity check failed, or nothing was planned: a run that collected nothing has not passed.
+stage failed, a parity check failed, a run is unsettled, or nothing was planned: a run that collected nothing has
+not passed.
 """
 import glob
 import hashlib
@@ -311,7 +312,9 @@ def summarize(out, sha, dry, manifest):
         r["v3l_pooled_fsync_p50_us"] = pooled.get(r["fs"], {}).get(r["block_k"])
         if r["measured"] and r["v3l_pooled_fsync_p50_us"] is None:  # third lane review LOW 11
             normaliser.append(f"{r['fs']}/{r['cell']}: no pooled V3L p50 for its block {r['block_k']}")
-    unquiet = [f"{r['fs']}/{r['cell']}: {r['settle']}" for r in runs if r["settle"] and "quiet=yes" not in r["settle"].split()]
+    # every measured run settled before it started, and went quiet (fourth lane review MED 5; T3 runner review item 9)
+    unquiet = [f"{r['fs']}/{r['cell']}: " + (r["settle"] or "no settle.txt") for r in runs
+               if r["measured"] and (not r["settle"] or "quiet=yes" not in r["settle"].split())]
     failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
@@ -333,7 +336,7 @@ def summarize(out, sha, dry, manifest):
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
-        and summary["measured_runs"] > 0 and not parity and not normaliser
+        and summary["measured_runs"] > 0 and not parity and not normaliser and not unquiet
     return summary, ok
 
 
