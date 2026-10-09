@@ -24,8 +24,8 @@
 # B1 is embedded (no server): its load window runs clonebench under strace from exec, there is no idle control
 # (no process exists outside the op loop), and the per-path classes in cell.json split branch from parent flushes.
 #
-# Then the functional checks of tools/competitors/SMOKE.md: isolation (parent/main sum(v)=0; a branch written by
-# one M1 op reads sum(v)=1 over ROWS rows) and branch counts (every created branch exists), plus, where the system
+# Then the functional checks of tools/competitors/SMOKE.md: isolation (parent/main sum(v) = the aged parent's PSUM,
+# gen_seed.py sum; a branch written by one M1 op reads PSUM + 1 over ROWS rows) and branch counts (every created branch exists), plus, where the system
 # clones, the clone proof (filefrag: the branch file's blocks ARE the parent's blocks, flagged shared; strace: the
 # copy_file_range / FICLONE calls). RAW/functional.txt ends in a VERDICT line; exit 1 if any check failed.
 set -uo pipefail
@@ -128,6 +128,14 @@ case $SYSTEM in
   doltgres) KIND=doltgres PORT=55433 SPECLIST="doltgres-select1$(for v in $DOLT_V; do printf ' doltgres-%s' "$v"; done)" ;;
   b1) KIND=b1 SPECLIST="m1c-d2 m1-d2 m1c-d0 m1-d0" ;;
   *) echo "unknown system $SYSTEM" >&2; exit 2 ;;
+esac
+# The isolation checks' count and sum(v), the sum as an exact integer. Dolt's SUM over an INT column is a DOUBLE,
+# which the mariadb client prints as 8.996383e+07 once the aged parent's sum is large (run 37841577896 at b49fb656a:
+# all four dolt jobs failed isolation with got [10000|8.996383e+07] want [10000|89963830]); CAST makes it an integer,
+# exact while the sum stays below 2^53. PG's sum(int) is a bigint, and Doltgres printed exact integers in that run.
+case $KIND in
+  dolt) COUNTSUM="SELECT count(*), CAST(sum(v) AS SIGNED) FROM t" ;;
+  *) COUNTSUM="SELECT count(*), sum(v) FROM t" ;;
 esac
 for spec in $SPECLIST; do  # a missing spec file is a harness defect, found before anything runs
   [ "$KIND" = b1 ] || [ -f "$SPECS/$spec.spec" ] || { echo "REFUSED: no spec $SPECS/$spec.spec" >&2; exit 2; }
@@ -472,7 +480,7 @@ server_main() {
   fun "## functional checks ($SYSTEM on $(findmnt -n -o FSTYPE -T "$MNT"))"
   # The clone proof first: a later read of the template could dirty a page whose write-back un-shares its extent.
   if [ "$KIND" = pg ]; then pg_clone_proof; fi
-  expect "isolation: parent/main count|sum(v)" "$(sqlp "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
+  expect "isolation: parent/main count|sum(v)" "$(sqlp "$COUNTSUM")" "$ROWS|$PSUM"
   local want=0 m1 br
   [ -f "$RAW/prebranch.ops.txt" ] && want=$(cut -d' ' -f3 "$RAW/prebranch.ops.txt")  # the live branches made first
   for d in "$RAW"/cells/*; do
@@ -489,7 +497,7 @@ server_main() {
     nm1=$((nm1 + 1))
     br=$(python3 "$FH" branch "$d/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
     expect "isolation: $m1 branch $br count|sum(v) after one UPDATE" \
-      "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|$((PSUM + 1))"
+      "$(on_branch "$br" "$COUNTSUM" | tr '\t' '|')" "$ROWS|$((PSUM + 1))"
   done
   [ $nm1 -gt 0 ] || fail "isolation: no M1 cell to read a branch from"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
