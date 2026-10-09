@@ -4670,6 +4670,57 @@ mod tests {
         });
     }
 
+    /// Wire review 14 item 10: a view is parsed once per schema snapshot by the parameter-type
+    /// walk, however often the statements over it are prepared and however often it is reached:
+    /// v5 joins v4 twice, v4 joins v3 twice, and so on, so the walk opened 2^5 - 1 views (31
+    /// parses beside the statement's own) at every prepare. The first Describe of a statement over
+    /// v5 may parse each view once (6 calls with the statement's), the second only the statement.
+    #[test]
+    fn a_view_is_parsed_once_per_schema_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, n INT)");
+        ok(&s, "CREATE VIEW v1 AS SELECT id, n FROM t");
+        for k in 2..=5 {
+            ok(
+                &s,
+                &format!(
+                    "CREATE VIEW v{k} AS SELECT a.id, a.n FROM v{p} AS a JOIN v{p} AS b ON a.id = b.id",
+                    p = k - 1
+                ),
+            );
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            let sql = "SELECT n FROM v5 WHERE id = $1";
+            s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                .await
+                .unwrap();
+            let mut calls = Vec::new();
+            for _ in 0..2 {
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await
+                    .unwrap();
+                calls.push(turso_pg_parser::libpg_query_calls() - before);
+                for reply in c.replies.drain(..) {
+                    if let PgWireBackendMessage::ErrorResponse(e) = reply {
+                        panic!("Describe: {e:?}");
+                    }
+                }
+            }
+            assert!(
+                calls[0] <= 6,
+                "first Describe: {} libpg_query calls, want at most 6",
+                calls[0]
+            );
+            assert_eq!(calls[1], 1, "second Describe: the statement's parse only");
+        });
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {

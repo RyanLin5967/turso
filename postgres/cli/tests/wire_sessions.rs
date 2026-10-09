@@ -5362,6 +5362,51 @@ fn an_array_parameter_is_read_by_its_element_type() {
     }
 }
 
+/// A view whose stored text libpg_query cannot read (the engine stores a view as SQLite text, and
+/// `IS TRUE` becomes `IS 1`) is typed from the engine's own columns for the view: `id = $1` over
+/// it is int4, not refused 42P18 (wire review 14 item 10).
+#[test]
+fn a_view_libpg_query_cannot_reread_is_typed_from_the_engine() {
+    let dir = Scratch::new("viewisone");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vt(id INT PRIMARY KEY, flag BOOLEAN)")
+        .ok("vt");
+    a.q("INSERT INTO vt VALUES (1, true), (2, false)")
+        .ok("rows");
+    a.q("CREATE VIEW vtrue AS SELECT id FROM vt WHERE flag IS TRUE")
+        .ok("an IS TRUE view");
+    let sql = "SELECT id FROM vtrue WHERE id = $1";
+    let r = a.describe_statement(sql);
+    assert!(
+        r.error.is_none() && r.params == Some(vec![23]),
+        "{sql}: {:?} {:?}, want [23]",
+        r.params,
+        r.error
+    );
+    let r = a.xt(sql, &[(0, 0, b"1")]).ok(sql);
+    assert_eq!(r.rows, vec![vec![Some("1".to_string())]]);
+}
+
+/// KNOWN RED until the engine keeps a view's PostgreSQL text: `CREATE VIEW vb AS SELECT true AS
+/// flag` is stored as SQLite text (`SELECT 1 AS flag`), so `flag = $1` is typed int4 where
+/// PostgreSQL types bool (16). Storing the PostgreSQL text, as tables are stored, needs a view hook
+/// in the engine's Dialect (core/, not this lane's): E5-QUEUE V1 (wire review 14 item 10).
+#[test]
+fn a_bool_literal_view_types_its_parameter_bool() {
+    let dir = Scratch::new("viewbool");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE VIEW vb AS SELECT true AS flag").ok("vb");
+    let r = a.describe_statement("SELECT 1 FROM vb WHERE flag = $1");
+    assert!(
+        r.error.is_none() && r.params == Some(vec![16]),
+        "{:?} {:?}, want [16]",
+        r.params,
+        r.error
+    );
+}
+
 /// An undeclared parameter compared with a column of a relation the inference walk must open to
 /// type it is typed from that relation: a view's column (walked from the view's query), an
 /// alias-less subquery's, a `*` a CTE or derived table expands, and a column of the innermost
