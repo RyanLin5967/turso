@@ -16,7 +16,10 @@
 #   build      the engine driver fastest_profile (release, debug symbols), bbload/clonebench/sqlite3
 #              (competitors/build.sh), Dolt + Doltgres release binaries (competitors/fetch_dolt.sh), v3floor and
 #              the fire-check's statfs shim
-#   envchecks  firecheck.sh's environment with t3run's V3ENV, positive and negative (needs the build)
+#   envchecks  firecheck.sh's environment with t3run's V3ENV, positive and negative (needs the build), and the
+#              three drivers' warm-up decision against PREREG annex A23 (gates/warmup_conformance.py run on the
+#              built bbload, clonebench and fastest_profile: all three must match every case, rc 0; fourth lane
+#              review LOW 14: a run whose drivers disagree on the warm-up is not creditable for it)
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
@@ -180,7 +183,7 @@ finish() {
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
-  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh
+  t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh gates/warmup_conformance.py
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -621,6 +624,8 @@ selftests() {
   done
   timeout 120 bash "$L/t3/settle_test.sh" > "$OUT/settle-selftest.txt" 2>&1 || { echo "self-test settle FAILED"; return 1; }
   timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
+  timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
+    { echo "self-test warmup_conformance FAILED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
   local rd want d rc; rd=$(python3 -B "$L/t3/devguard.py" rootdisk 2> "$OUT/devguard-rootdisk.txt") ||
     { cat "$OUT/devguard-rootdisk.txt"; echo "selftests: devguard rootdisk cannot tell the root disk, so its root refusal cannot be fired"; return 1; }
@@ -657,7 +662,15 @@ stage build build
 stage hwid hwid
 stage v3fixtures v3fixtures
 # The checks that need the build (the V3 binaries): firecheck.sh's environment, positive and negative
-envchecks() { fcenv_check; }
+# the warm-up rule is one rule across the three drivers this run built (PREREG annex A23; fourth lane review LOW 14):
+# each replays its own live decision on the shared cases, and anything but rc 0 (all three, every case) fails the stage
+warmup_conformance() {
+  local rc=0
+  timeout 300 python3 -B "$L/gates/warmup_conformance.py" run --bbload "$DIST/bbload" --clonebench "$DIST/clonebench" \
+    --fastest-profile "$DIST/fastest_profile" > "$OUT/warmup-conformance.txt" 2>&1 || rc=$?
+  [ $rc = 0 ] || { tail -5 "$OUT/warmup-conformance.txt"; echo "envchecks: warm-up conformance rc $rc, want 0"; return 1; }
+}
+envchecks() { fcenv_check && warmup_conformance; }
 stage envchecks envchecks
 if [ $DRY = 1 ]; then
   echo "dry run: the runner image mounts / nobarrier; remount with barrier as a T3 box has it"
