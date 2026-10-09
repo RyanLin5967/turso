@@ -109,7 +109,12 @@ def selftest():
     # SQLite 3.53 on the Mac, 2026-10-08): count|sum = 2500|131727070. Not computed by the subject.
     ok("aged sum(v) = what SQLite read back after the same stream", aged_sum(2500, 300, 1) == 131727070)
     ok("a fresh parent sums to 0", aged_sum(2500, 0, 1) == 0)
-    print(f"gen_seed selftest: {14 - bad}/14")
+    # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
+    # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
+    # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
+    ok("aged sum(v) at the CI default = what three servers read back", aged_sum(10000, 200, 1) == 89963830)
+    n = 15
+    print(f"gen_seed selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
 

@@ -131,10 +131,11 @@ case $SYSTEM in
 esac
 # The isolation checks' count and sum(v), the sum as an exact integer. Dolt's SUM over an INT column is a DOUBLE,
 # which the mariadb client prints as 8.996383e+07 once the aged parent's sum is large (run 37841577896 at b49fb656a:
-# all four dolt jobs failed isolation with got [10000|8.996383e+07] want [10000|89963830]); CAST makes it an integer,
-# exact while the sum stays below 2^53. PG's sum(int) is a bigint, and Doltgres printed exact integers in that run.
+# all four dolt jobs failed isolation with got [10000|8.996383e+07] want [10000|89963830]); CAST(... AS DECIMAL(20,0))
+# prints it as an integer (measured by the lead's review on Dolt 2.4.1: 10000|89963830). PG's sum(int) is a bigint,
+# and Doltgres printed exact integers in that run (all 16 PG and Doltgres jobs: 10000|89963830, branches 89963831).
 case $KIND in
-  dolt) COUNTSUM="SELECT count(*), CAST(sum(v) AS SIGNED) FROM t" ;;
+  dolt) COUNTSUM="SELECT count(*), CAST(sum(v) AS DECIMAL(20,0)) FROM t" ;;
   *) COUNTSUM="SELECT count(*), sum(v) FROM t" ;;
 esac
 for spec in $SPECLIST; do  # a missing spec file is a harness defect, found before anything runs
