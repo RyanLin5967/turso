@@ -1194,6 +1194,9 @@ pub(crate) struct Journal {
     /// syncs nothing. A flight written while it is set proves the one before it was synced, so its
     /// end frame says so (`EndKind::Synced` / `Ordered`) whatever the writer's own class.
     prev_synced: bool,
+    /// The last flight with records named arena slots: an ordered zero-byte upgrade over it closes
+    /// with an empty ordered end frame (`take_ordered_flight`; engine review 17 MED 5).
+    last_names_slots: bool,
     /// After a failed checkpoint or compaction, no other is wanted until the log is past this
     /// length (review 2 #5: no retry storm, every operation starting one). 0 after a rewrite.
     compact_after: u64,
@@ -1314,6 +1317,7 @@ impl Journal {
             rewrites: 0,
             dir_dirty: false,
             prev_synced: false,
+            last_names_slots: false,
             compact_after: 0,
         })
     }
@@ -1516,6 +1520,7 @@ impl Journal {
             rewrites: 0,
             dir_dirty: false,
             prev_synced: false,
+            last_names_slots: false,
             compact_after: 0,
         };
 
@@ -2310,6 +2315,7 @@ impl Journal {
                 nonce: self.nonce,
                 base_syncs: self.base_synced(),
                 names_slots: false,
+                empty_end: false,
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -2371,6 +2377,7 @@ impl Journal {
         if !bytes.is_empty() {
             bytes.reserve_exact(END_FRAME_LEN);
             self.len += END_FRAME_LEN as u64;
+            self.last_names_slots = names_slots;
         }
         self.len += bytes.len() as u64;
         Ok(Flight {
@@ -2388,7 +2395,30 @@ impl Journal {
             nonce: self.nonce,
             base_syncs,
             names_slots,
+            empty_end: false,
         })
+    }
+
+    /// `take_flight` for a trunk commit's ORDERED flight (`BranchStore::order_for_trunk`). A
+    /// zero-byte upgrade over a last flight whose records name slots, carrying the arena (so its
+    /// barrier covers those slots), closes with an empty end frame tagged ordered: open then skips
+    /// that last flight's slot check, as for any ordered last flight, and a damaged slot is refused
+    /// when read rather than dropped with the flight whose records the upgrade made durable (engine
+    /// review 17 MED 5; its room is reserved here). One pwrite, no sync. Mutant
+    /// `ordered_upgrade_writes_no_end` (test builds only): no end frame, as before.
+    pub(crate) fn take_ordered_flight(&mut self, arena: &mut Arena, class: SyncClass, upgrade: bool) -> Result<Flight> {
+        let mut flight = self.take_flight(arena, class, upgrade)?;
+        if flight.bytes.is_empty()
+            && flight.log.is_some()
+            && flight.arena.is_some()
+            && self.last_names_slots
+            && !super::store::fe_mutant("ordered_upgrade_writes_no_end")
+        {
+            self.len += END_FRAME_LEN as u64;
+            self.last_names_slots = false;
+            flight.empty_end = true;
+        }
+        Ok(flight)
     }
 
     /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
@@ -2848,6 +2878,9 @@ pub(crate) struct Flight {
     /// The flight's records name arena slots (engine review 17 MED 4): an ordered tag then needs
     /// this flight's own arena barrier.
     names_slots: bool,
+    /// A zero-byte ordered upgrade closing with an empty ordered end frame, its room reserved
+    /// (`Journal::take_ordered_flight`; engine review 17 MED 5).
+    empty_end: bool,
 }
 
 impl Flight {
@@ -2911,6 +2944,10 @@ impl Flight {
             let end = end_frame(self.nonce, kind, &self.bytes);
             self.bytes.extend_from_slice(&end);
             write_at(&log, &self.bytes, self.at)?;
+        } else if self.empty_end {
+            // A zero-byte ordered upgrade's empty end frame (`Journal::take_ordered_flight`): its
+            // own arena barrier above covers the slots the last flight's records name.
+            write_at(&log, &end_frame(self.nonce, EndKind::ordered_by(self.base_syncs), &[]), self.at)?;
         }
         super::store::kill_point("flight.log_written");
         after_pwrite();

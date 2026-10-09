@@ -4030,6 +4030,15 @@ impl BranchStore {
         journal.take_flight(arena, class, upgrade).map(Some)
     }
 
+    /// `take_flight` for a trunk commit's ordered flight (`order_for_trunk`;
+    /// `Journal::take_ordered_flight`).
+    fn take_ordered_flight(inner: &mut StoreInner, class: SyncClass, upgrade: bool) -> Result<Option<Flight>> {
+        let (Some(journal), Some(arena)) = (inner.journal.as_mut(), inner.arena.as_mut()) else {
+            return Ok(None);
+        };
+        journal.take_ordered_flight(arena, class, upgrade).map(Some)
+    }
+
     /// Flush everything buffered, under the store mutex the caller holds, in at least `class`. A
     /// flight in the air goes first (its frames precede these in the log); its leader needs only
     /// the group's lock to land, never the store mutex, so waiting for it here cannot deadlock.
@@ -6226,7 +6235,7 @@ impl BranchStore {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
-                match Self::take_flight(&mut inner, SyncClass::FullFsync, upgrade) {
+                match Self::take_ordered_flight(&mut inner, SyncClass::FullFsync, upgrade) {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
