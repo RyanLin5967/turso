@@ -2212,7 +2212,13 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
-        let qualified_name = self.qualified_name_from_range_var(range_var);
+        // The FROM item's alias is the SelectTable's own; left on the name as well, it is written
+        // twice ("v1 AS a a") wherever the statement is turned back into SQL, as a view's stored
+        // definition is, and the view can never be loaded again.
+        let qualified_name = ast::QualifiedName {
+            alias: None,
+            ..self.qualified_name_from_range_var(range_var)
+        };
         let alias = range_var
             .alias
             .as_ref()
@@ -7872,6 +7878,20 @@ mod tests {
         } else {
             panic!("Expected CreateView, got: {translated:?}");
         }
+    }
+
+    #[test]
+    fn a_view_over_aliased_joins_is_stored_as_sql_that_parses_back() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE VIEW v2 AS SELECT a.id, a.n FROM v1 AS a JOIN v1 AS b ON a.id = b.id";
+        let translated = translator.translate(&crate::parse(sql).unwrap()).unwrap();
+        let stored = translated.to_string();
+        assert!(!stored.contains("AS a a") && !stored.contains("AS b b"), "an alias written twice: {stored}");
+        let mut parser = turso_parser::parser::Parser::new(stored.as_bytes());
+        assert!(
+            matches!(parser.next(), Some(Ok(ast::Cmd::Stmt(ast::Stmt::CreateView { .. })))),
+            "the stored definition does not parse back: {stored}"
+        );
     }
 
     #[test]
