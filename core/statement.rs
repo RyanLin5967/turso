@@ -884,6 +884,8 @@ impl Statement {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn reprepare(&mut self) -> Result<()> {
+        #[cfg(test)]
+        crate::branch::budget_probe::statement_prepared();
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
         let main_pager = conn.pager.load().clone();

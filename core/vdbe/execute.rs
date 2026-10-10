@@ -700,6 +700,13 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
+            // failed drain of the device, acted on before the row reports busy (engine review 17
+            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
+            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
+                pager.check_noted_syncs();
+            }
             pager.clear_checkpoint_state();
             state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
@@ -10600,7 +10607,14 @@ pub fn op_function(
                                         "division by zero".to_string(),
                                     ));
                                 }
-                                a / b
+                                // PostgreSQL's result scale (lead ruling 2026-10-09 on
+                                // e52f01422). Mutant `div_scale_bigdecimal` (test builds
+                                // only): bigdecimal's own, as before.
+                                if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
+                                    a / b
+                                } else {
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                }
                             }
                             _ => unreachable!(),
                         };
@@ -15781,6 +15795,33 @@ pub fn op_reset_once(
     let start = state.pc;
     let end = region_end.as_offset_int();
     state.once.retain(|pc| *pc <= start || *pc >= end);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchBegin] instruction: until [Insn::CatchEnd], a catchable value error
+/// jumps to `target_pc` (`Program::normal_step`).
+pub fn op_catch_begin(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(CatchBegin { target_pc }, insn);
+    assert!(target_pc.is_offset());
+    state.catch_target = Some(target_pc.as_offset_int());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchEnd] instruction: close the catch region.
+pub fn op_catch_end(
+    _program: &Program,
+    state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    state.catch_target = None;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

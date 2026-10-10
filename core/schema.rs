@@ -2112,6 +2112,8 @@ impl Schema {
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
         dialect: &dyn crate::dialect::Dialect,
     ) -> Result<()> {
+        #[cfg(test)]
+        crate::branch::budget_probe::schema_row_parsed();
         match ty {
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");

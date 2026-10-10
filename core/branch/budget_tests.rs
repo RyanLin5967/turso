@@ -55,7 +55,7 @@ const CKPT_ROUNDS: u64 = 240;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
-/// "Hold the confirmation word back": a quiet period no run reaches (about 31.7 years).
+/// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
 const CONFIRM_HELD_MS: u64 = 1 << 40;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
@@ -67,12 +67,26 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 /// D2, except in a `*_d0` cell (the instruction arm: no device flush, whose kernel work makes an
-/// operation's instruction count vary by ~15% from one process to the next).
+/// operation's instruction count vary by ~15% from one process to the next) and a `*_d1` cell (D1,
+/// plain fsync). A catalog store, except in the open-flush cells `open_d*` and their writer
+/// `open_writer_*`, which use the snapshot store (`Durable`): its open of a whole log takes the
+/// kept-log arm the open-flush budgets are about (see `open_flush`).
 fn opts() -> DatabaseOpts {
-    let d0 = std::env::var("FE_BUDGET_CHILD").is_ok_and(|s| s.ends_with("_d0"));
-    let sync = if d0 { SyncClass::Off } else { SyncClass::FullFsync };
+    let spec = std::env::var("FE_BUDGET_CHILD").unwrap_or_default();
+    let sync = if spec.ends_with("_d0") {
+        SyncClass::Off
+    } else if spec.ends_with("_d1") {
+        SyncClass::Fsync
+    } else {
+        SyncClass::FullFsync
+    };
+    let durability = if spec.starts_with("open_d") || spec.starts_with("open_writer") {
+        BranchDurability::Durable { sync }
+    } else {
+        BranchDurability::Catalog { sync }
+    };
     DatabaseOpts::new()
-        .with_branch_durability(BranchDurability::Catalog { sync })
+        .with_branch_durability(durability)
         .with_branch_checkpoint(BranchCheckpoint::Fuzzy)
 }
 
@@ -132,10 +146,11 @@ fn seed(conn: &Arc<Connection>, large: bool) {
     }
 }
 
-/// One fork, named `name` or unnamed (detached). A create that loses a race is retried: the
-/// population is not measured.
-fn fork_one(c: &Arc<Connection>, name: Option<&str>) {
-    loop {
+/// One fork, named `name` or unnamed (detached). A create refused Busy or SchemaUpdated is retried,
+/// at most `FORK_RETRY_CAP` times (review 2 L9: an unbounded loop turned a livelock into an 1800 s
+/// child timeout); the retries are returned, for the callers that count them.
+fn fork_one(c: &Arc<Connection>, name: Option<&str>) -> u64 {
+    for retries in 0..=FORK_RETRY_CAP {
         let made = match name {
             Some(name) => c.create_branch(name).map(|_| ()),
             None => c.fork_branch().map(|b| {
@@ -143,12 +158,16 @@ fn fork_one(c: &Arc<Connection>, name: Option<&str>) {
             }),
         };
         match made {
-            Ok(()) => return,
+            Ok(()) => return retries,
             Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => continue,
-            Err(e) => panic!("populating branch {name:?}: {e}"),
+            Err(e) => panic!("branch {name:?}: {e}"),
         }
     }
+    panic!("branch {name:?}: refused {FORK_RETRY_CAP} times in a row (a livelock)")
 }
+
+/// The most retries `fork_one` makes before it refuses.
+const FORK_RETRY_CAP: u64 = 1000;
 
 /// `n` live branches of the trunk, `<prefix>-<i>` when named, made by up to 32 threads (their
 /// flights shared). The trunk's first child is made first, alone: it takes the WAL write lock.
@@ -271,7 +290,12 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
 /// other thread is blocked, so what the work woke (the confirmation writer, at a flight's landing)
 /// has run and parked again. Mach traps and userspace only.
 fn settled(base: Option<u64>) -> bool {
-    probe::threads() == base && probe::others_blocked().unwrap_or(true)
+    // Review 2 M6: where the thread state cannot be read, a window cannot be shown to have closed;
+    // refuse, never fall through to "settled".
+    let threads = probe::threads().unwrap_or_else(|| panic!("budget window: the thread count cannot be read on this platform; refusing"));
+    let blocked = probe::others_blocked().unwrap_or_else(|| panic!("budget window: whether the other threads are blocked cannot be read on this platform; refusing"));
+    assert!(base.is_some(), "budget window: no base thread count; refusing");
+    Some(threads) == base && blocked
 }
 
 /// Spin, with no syscall, until `settled(base)` or the deadline; whether it settled.
@@ -316,16 +340,19 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     let left = probe::threads() != base;
     let synced = absorb_confirm(&s0);
     let back = spin_settled(base, std::time::Duration::from_secs(30));
-    let s1 = probe::end();
+    // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
+    let s1 = probe::end();
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
-    let confirms = c1[0] - c0[0];
+    let confirms = delta(c0[0], c1[0]);
     s.insert("confirms_written", confirms);
+    // Review 2 L10: a failed confirmation write is a fault, never a non-quiet sample to drop.
+    assert_eq!(c1[1], c0[1], "a confirmation word failed to write inside a measured window");
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && absorbed && c1[1] == c0[1] && (left || s["allocs_process"] == s["allocs"]);
+    let quiet = settled && back && absorbed && (left || s["allocs_process"] == s["allocs"]);
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
     (r, s)
@@ -338,9 +365,11 @@ static WORD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// confirmation thread write it after `confirm_quiet()` (5 ms) of idle, the default. Held, the writer
 /// is woken by the first landing only and then sleeps with the word pending, so no background
 /// thread runs in any later window and every count is the operation's own: each landing replaces
-/// the pending word and closes its descriptor on the landing thread, as under load, when a later
-/// flight lands inside the quiet period. That is every cell's regime but `confirm_n10`'s, which
-/// measures the idle tail's write against it.
+/// the pending word and closes its descriptor on the landing thread. That is NOT the engine under
+/// load (review 2 H1): with the shipped quiet period the writer also wakes on the group's condition
+/// variable at every landing while flights overlap, and those wake-ups never happen in a held cell.
+/// Held is every cell's regime but `confirm_n10`'s (the idle tail's write against it) and
+/// `confirm_load`'s (the writer under load, shipped quiet period).
 fn hold_word(held: bool) {
     use std::sync::atomic::Ordering::Release;
     super::store::CONFIRM_QUIET_MS.store(if held { CONFIRM_HELD_MS } else { 0 }, Release);
@@ -548,38 +577,105 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
 /// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation).
 fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     let rounds = shared_rounds(c);
-    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true)] {
+    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false)] {
         if cfw && c > 64 {
             continue;
         }
+        // Review 2 M5: creates beside a trunk writer (one DDL, then UPDATEs until the creates end),
+        // at C = 8 and 64 only.
+        let commits = arm == "shared_commits";
+        if commits && !(c == 8 || c == 64) {
+            continue;
+        }
+        let creating = std::sync::atomic::AtomicBool::new(true);
         // A start flag, not a Barrier: a thread that fails to start, or panics before the start,
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
         let s0 = sync_counts();
-        std::thread::scope(|s| {
-            let started = (0..c).try_for_each(|t| {
-                let go = &go;
-                std::thread::Builder::new()
-                    .stack_size(8 << 20)
-                    .spawn_scoped(s, move || {
-                        let trunk = db.connect();
-                        while !go.load(std::sync::atomic::Ordering::Acquire) {
-                            std::thread::yield_now();
-                        }
-                        let trunk = trunk.unwrap();
-                        for i in 0..rounds {
-                            let name = format!("{arm}-{t}-{i:04}");
-                            fork_one(&trunk, Some(&name));
-                            if cfw {
-                                let b = db.connect_named(&name).unwrap();
-                                exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+        // Per client, from its start to its last acknowledgement: the store's condition-variable
+        // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
+        // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
+        // and hides one convoyed acknowledgement); its store-mutex acquisitions; the creates
+        // refused Busy or SchemaUpdated and retried (the count `fork_one` returns; the population
+        // discards it); and its futile leads (`probe::futile_leads`: the store mutex and the group
+        // lock taken to lead, and no flight led; review 1 #9).
+        let per: Vec<(u64, u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
+            let mut clients = Vec::new();
+            let creating = &creating;
+            let writer = commits.then(|| {
+                s.spawn(move || {
+                    let trunk = db.connect().unwrap();
+                    // The writer is load, not a subject: a statement refused Busy or SchemaUpdated
+                    // (a fork holding the trunk's write lock) is retried, not a crashed cell.
+                    let write = |sql: &str| {
+                        for _ in 0..=FORK_RETRY_CAP {
+                            match trunk.execute(sql) {
+                                Ok(_) => return,
+                                Err(LimboError::Busy) | Err(LimboError::SchemaUpdated) => continue,
+                                Err(e) => panic!("{cell}: trunk writer: {sql}: {e}"),
                             }
                         }
-                    })
-                    .map(|_| ())
+                        panic!("{cell}: trunk writer: {sql}: refused {FORK_RETRY_CAP} times in a row");
+                    };
+                    write(&format!("CREATE TABLE w{c}(x INTEGER)"));
+                    let mut i = 0u64;
+                    while creating.load(std::sync::atomic::Ordering::Acquire) {
+                        write(&format!("UPDATE t SET v = 'c{i}' WHERE id = {}", 1 + i % 50));
+                        i += 1;
+                    }
+                })
             });
+            for t in 0..c {
+                let go = &go;
+                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                    let trunk = db.connect();
+                    while !go.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let trunk = trunk.unwrap();
+                    let (w0, l0, f0, g0) = (super::store::thread_waits(), probe::thread_locks(), probe::futile_leads(), probe::fork_registrations());
+                    let (mut retries, mut max_ack) = (0u64, 0u64);
+                    for i in 0..rounds {
+                        let name = format!("{arm}-{t}-{i:04}");
+                        let a0 = super::store::thread_waits();
+                        retries += fork_one(&trunk, Some(&name));
+                        max_ack = max_ack.max(delta(a0, super::store::thread_waits()));
+                        if cfw {
+                            let b = db.connect_named(&name).unwrap();
+                            let a1 = super::store::thread_waits();
+                            exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                            max_ack = max_ack.max(delta(a1, super::store::thread_waits()));
+                        }
+                    }
+                    (
+                        delta(w0, super::store::thread_waits()),
+                        delta(l0, probe::thread_locks()),
+                        retries,
+                        max_ack,
+                        delta(f0, probe::futile_leads()),
+                        delta(g0, probe::fork_registrations()),
+                    )
+                });
+                match spawned {
+                    Ok(h) => clients.push(h),
+                    Err(e) => {
+                        // The clients already started must not be left parked for ever.
+                        go.store(true, std::sync::atomic::Ordering::Release);
+                        panic!("{cell}: a thread of {c} did not start: {e}");
+                    }
+                }
+            }
             go.store(true, std::sync::atomic::Ordering::Release);
-            started.unwrap_or_else(|e| panic!("{cell}: a thread of {c} did not start: {e}"));
+            // Every client is joined before the writer is told to stop, and only then is a client's
+            // panic raised: unwrapping as it joined left the writer looping, and the scope waiting on
+            // it, until the child's timeout.
+            let joined: Vec<_> = clients.into_iter().map(|h| h.join()).collect();
+            creating.store(false, std::sync::atomic::Ordering::Release);
+            let per: Vec<(u64, u64, u64, u64, u64, u64)> = joined.into_iter().map(|j| j.unwrap()).collect();
+            if let Some(w) = writer {
+                w.join().unwrap();
+            }
+            per
         });
         let s1 = sync_counts();
         let mut m = Sample::new();
@@ -588,6 +684,13 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
         m.insert("barrier", s1.barrier - s0.barrier);
+        m.insert("store_waits", per.iter().map(|p| p.0).sum());
+        m.insert("store_waits_max_client", per.iter().map(|p| p.0).max().unwrap_or(0));
+        m.insert("store_waits_max_ack", per.iter().map(|p| p.3).max().unwrap_or(0));
+        m.insert("store_locks", per.iter().map(|p| p.1).sum());
+        m.insert("retries", per.iter().map(|p| p.2).sum());
+        m.insert("futile_leads", per.iter().map(|p| p.4).sum());
+        m.insert("registrations", per.iter().map(|p| p.5).sum());
         line(out, cell, arm, 0, &m);
     }
 }
@@ -608,14 +711,16 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let _ = probe::take_hold_maxima();
     let foot0 = probe::phys_footprint();
     let before = probe::live_heap_bytes();
+    let held0 = probe::thread_allocs().3;
     let db = open_at(&built.path);
     assert_ne!(db.incarnation, built.incarnation, "{cell}: the registry returned the old Database: not a reopen");
     built.incarnation = db.incarnation;
     db.branch_wait_name_filter();
     let settled = quiesce(&db, base);
     let after = probe::live_heap_bytes();
-    let (bg_bytes, bg_rows) = probe::take_background_hold_maxima();
-    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let held1 = probe::thread_allocs().3;
+    let maxima = probe::take_hold_maxima();
+    let ((hold_bytes, hold_rows), (bg_bytes, bg_rows)) = (maxima.all, maxima.background);
     probe::mark_foreground(false);
     let foot1 = probe::phys_footprint();
     let mut s = Sample::new();
@@ -633,14 +738,20 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_hold_catalog_rows", hold_rows);
     s.insert("max_bg_hold_alloc_bytes", bg_bytes);
     s.insert("max_bg_hold_catalog_rows", bg_rows);
+    s.insert("max_fg_hold_alloc_bytes", maxima.foreground.0);
+    s.insert("max_fg_hold_catalog_rows", maxima.foreground.1);
+    // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
+    s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
 }
 
 /// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
 /// writer): `k` rounds of a create whose window counts the word's write (`confirm_written`), then
-/// the same create with the word held back (`confirm_held`, the engine's test knob). The difference
-/// is the word's cost. A held window leaves the writer parked with the word pending and no deadline,
+/// the same create with the word held back (`confirm_held`, the engine's test knob), then a second
+/// held create (`confirm_reference`, review 2 H2), which lands on the first's pending word and so
+/// wakes no thread at its landing. Written minus reference is the word's cost with the landing's
+/// wake; held minus reference is the wake alone. A held window leaves the writer parked with the word pending and no deadline,
 /// and a landing wakes it only when nothing provable was pending, so each round first takes the
 /// pending word away with a checkpoint (`mark_durable`) and makes one unmeasured create (which pays
 /// the checkpoint's deferred directory sync and is written as usual).
@@ -654,13 +765,464 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
         let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
         hold_word(true);
         let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
+        // Review 2 H2: the reference. `h` landed with no proved word pending (w's was written), so its
+        // landing woke the parked writer (`confirm_cv.notify_one`, on the acknowledging thread); this
+        // second held create lands on h's pending word and wakes no one.
+        let (_, s_reference) = measure(db, base, || trunk.create_branch(&format!("r-{i:04}")).unwrap());
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
+            line(out, cell, "confirm_reference", i - WARMUP, &s_reference);
         }
     }
     hold_word(false);
 }
+
+/// The clients per burst of the confirmation writer's load arm (`confirm_load`).
+const CONFIRM_LOAD_CS: [u64; 3] = [1, 8, 64];
+
+/// Review 2 H1: the confirmation writer under load, with the shipped quiet period (the word NOT
+/// held). For each C in `CONFIRM_LOAD_CS`, C clients make back-to-back creates (`shared_rounds(C)`
+/// each, started together), then the cell waits out the idle tail: at most 1 s for the word the tail
+/// owes, and 20 ms more for a second one that must not come (wall time only to settle; nothing timed
+/// is measured). One line per C (`load_c{C}`): acknowledgements, flights (`group_counters()[0]`),
+/// words written during the burst (`confirms_burst`) and by the end of the tail
+/// (`confirms_total`), and the writer's wake-ups with a word pending
+/// (`confirm_wakeups_for_test`) during the burst.
+fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
+    hold_word(false);
+    let words = || db.branch_confirm_counts()[0];
+    let settle = |since: u64| {
+        let t = std::time::Instant::now();
+        while words() == since && t.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // The population's own tail word is written before the first burst starts.
+    settle(words());
+    for c in CONFIRM_LOAD_CS {
+        let rounds = shared_rounds(c);
+        let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
+        let go = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let mut clients = Vec::new();
+            for t in 0..c {
+                let go = &go;
+                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                    let trunk = db.connect();
+                    while !go.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let trunk = trunk.unwrap();
+                    for i in 0..rounds {
+                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                    }
+                });
+                match spawned {
+                    Ok(h) => clients.push(h),
+                    Err(e) => {
+                        go.store(true, std::sync::atomic::Ordering::Release);
+                        panic!("{cell}: a thread of {c} did not start: {e}");
+                    }
+                }
+            }
+            go.store(true, std::sync::atomic::Ordering::Release);
+            for h in clients {
+                h.join().unwrap();
+            }
+        });
+        let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
+        settle(w1);
+        let w2 = words();
+        let mut m = Sample::new();
+        m.insert("threads", c);
+        m.insert("acks", c * rounds);
+        m.insert("flights", delta(f0, f1));
+        m.insert("confirms_burst", delta(w0, w1));
+        m.insert("confirms_total", delta(w0, w2));
+        m.insert("wakeups_burst", delta(k0, k1));
+        line(out, cell, &format!("load_c{c}"), 0, &m);
+    }
+    hold_word(true);
+}
+
+/// The open-flush cells (lead order, DECISIONS 1334833a4d; review 16 LOW 11's a9ba5adb8): a store's
+/// open of a whole log it KEEPS (the kept-log arm of `Scanned::finish`), counted absolutely, because
+/// the recovery budgets compare cells and a regression hitting every open equally passes them, and
+/// because the recovery cells' opens take another arm (BUDGETS.md, fixture findings). Cells:
+/// * `open_d2_unconfirmed`: a snapshot store at D2 whose last flight carries no confirmation word: a
+///   writer grandchild (`open_writer_d2`) builds it and is SIGKILLed before it closes, so no close
+///   writes the word; one reopen measured per sample, 3 samples;
+/// * `open_d2_confirmed`, `open_cat_d2`, `open_d1`: built in this process and closed cleanly (the
+///   close writes the word where the class proves stable storage: D2 on Apple, never D1), then
+///   reopened 5 times, each reopen closed cleanly again.
+/// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
+/// by the class asked (`journal::CLASS_SYNCS`) and directory syncs (`journal::DIR_SYNCS`), and the
+/// premises: the log's inode and length unchanged across the open (it was kept: no rewrite, no
+/// cut, no reset) and whether its header's word confirms its last flight (`confirmed`). Each line
+/// of the confirmed D2 cells also carries this process's fcntl(F_FULLFSYNC) on a directory
+/// descriptor of the cell's own temp dir, outside every measured open (`dir_full_rc`,
+/// `dir_full_errno`; review of the confirmed budget's minimum: it rests on that call working).
+fn open_flush(cell: &str, out: &mut String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("open.db");
+    let (opens, unconfirmed) = if cell == "open_d2_unconfirmed" { (3, true) } else { (5, false) };
+    let probe_dir = dir_full_fsync(dir.path());
+    let mut log = None;
+    if !unconfirmed {
+        let db = open_at(&path);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, false);
+        for i in 0..4 {
+            trunk.create_branch(&format!("o-{i}")).unwrap();
+        }
+        log = db.branch_log_path();
+    }
+    for r in 0..opens {
+        if unconfirmed {
+            let sample = tempfile::TempDir::new_in(dir.path()).unwrap();
+            log = Some(open_writer_killed(cell, sample.path()));
+            let mut s = open_once(&sample.path().join("open.db"), log.as_ref().unwrap());
+            s.insert("dir_full_rc", probe_dir.0);
+            s.insert("dir_full_errno", probe_dir.1);
+            line(out, cell, "open", r, &s);
+        } else {
+            let mut s = open_once(&path, log.as_ref().expect("the built store's log"));
+            s.insert("dir_full_rc", probe_dir.0);
+            s.insert("dir_full_errno", probe_dir.1);
+            line(out, cell, "open", r, &s);
+        }
+    }
+}
+
+/// fcntl(F_FULLFSYNC) on a directory descriptor (Apple): `(rc, errno)`, `rc` 0 or 1 for -1; elsewhere
+/// `(2, 0)`, not applicable.
+fn dir_full_fsync(dir: &Path) -> (u64, u64) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let d = std::fs::File::open(dir).unwrap();
+        // SAFETY: the descriptor is owned by `d` and open for the duration of the call.
+        let rc = unsafe { libc::fcntl(d.as_raw_fd(), libc::F_FULLFSYNC) };
+        let errno = if rc == -1 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u64 } else { 0 };
+        (u64::from(rc == -1), errno)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = dir;
+        (2, 0)
+    }
+}
+
+/// The header word of `log` and the word that would confirm its last flight (`journal::confirm_word`
+/// of its last 4 bytes, the end frame's checksum, and its length), read before an open.
+fn log_confirmed(log: &Path) -> u64 {
+    let bytes = std::fs::read(log).unwrap();
+    // HEADER_CONFIRM_AT (journal.rs): the word sits at bytes 36..40 of the header.
+    let word = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+    u64::from(word != 0 && word == super::journal::confirm_word(crc, bytes.len() as u64))
+}
+
+/// One measured open of the store at `path`, whose log is `log`, then a clean close.
+fn open_once(path: &Path, log: &Path) -> Sample {
+    use std::os::unix::fs::MetadataExt;
+    let (m0, confirmed) = (std::fs::metadata(log).unwrap(), log_confirmed(log));
+    let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+    let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+    let (s0, c0, d0) = (sync_counts(), classes(), dirs());
+    let db = open_at(path);
+    let (s1, c1, d1) = (sync_counts(), classes(), dirs());
+    let m1 = std::fs::metadata(log).unwrap();
+    drop(db);
+    Sample::from([
+        ("full_fsync", s1.full_fsync - s0.full_fsync),
+        ("fsync", s1.fsync - s0.fsync),
+        ("barrier", s1.barrier - s0.barrier),
+        ("thread_plain", c1[0] - c0[0]),
+        ("thread_full", c1[1] - c0[1]),
+        ("dir_syncs", d1 - d0),
+        ("same_inode", u64::from(m0.ino() == m1.ino())),
+        ("same_len", u64::from(m0.len() == m1.len())),
+        ("confirmed", confirmed),
+    ])
+}
+
+/// Kills a writer grandchild when dropped, so no test failure leaves it running.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `open_d2_unconfirmed`'s writer: this binary again, as the child `open_writer_d2` building the
+/// store in `dir`; SIGKILLed once it reports ready, so it never closes the store. Returns its log.
+fn open_writer_killed(cell: &str, dir: &Path) -> PathBuf {
+    let ready = dir.join("ready");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::budget_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_BUDGET_CHILD", "open_writer_d2")
+        .env("FE_BUDGET_OUT", &ready)
+        .env("FE_BUDGET_DIR", dir)
+        .env_remove("FE_BUDGET_RAW_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = KillOnDrop(child);
+    let t = std::time::Instant::now();
+    let log = loop {
+        if let Ok(text) = std::fs::read_to_string(&ready) {
+            if let Some(log) = text.strip_prefix("ready ").map(|l| l.trim_end().to_string()) {
+                break PathBuf::from(log);
+            }
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(120), "{cell}: the writer never reported ready");
+        assert!(child.0.try_wait().unwrap().is_none(), "{cell}: the writer exited before it was killed");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // SIGKILL: no destructor, so no close writes the confirmation word.
+    child.0.kill().unwrap();
+    let _ = child.0.wait();
+    log
+}
+
+/// The writer child (`open_writer_d2`): builds a snapshot store at D2 with the word held (no idle
+/// writer), reports its log, and parks until it is killed; it exits by itself after 120 s, without
+/// running a destructor, so it can never orphan and never closes the store.
+fn open_writer(out: &str) -> ! {
+    let dir = PathBuf::from(std::env::var("FE_BUDGET_DIR").unwrap());
+    let db = open_at(&dir.join("open.db"));
+    let trunk = db.connect().unwrap();
+    seed(&trunk, false);
+    for i in 0..4 {
+        trunk.create_branch(&format!("o-{i}")).unwrap();
+    }
+    let log = db.branch_log_path().unwrap();
+    std::fs::write(out, format!("ready {}\n", log.display())).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
+    std::process::exit(0)
+}
+
+/// The schema-window cells' table counts/// The schema-window cells' table counts (`schema_t10`, `schema_t1e3`), and the samples per path and
+/// mode.
+const SCHEMA_TABLES: [(&str, u64); 2] = [("schema_t10", 10), ("schema_t1e3", 1000)];
+const SCHEMA_ROUNDS: u64 = 3;
+
+/// The calling thread's SQL-layer counters between two moments.
+fn sql_sample(a: &probe::SqlCounts, b: &probe::SqlCounts) -> Sample {
+    Sample::from([
+        ("prepares", delta(a.prepares, b.prepares)),
+        ("page_reads", delta(a.page_reads, b.page_reads)),
+        ("schema_rows", delta(a.schema_rows, b.schema_rows)),
+        ("wal_locks", delta(a.wal_locks, b.wal_locks)),
+        ("wal_prepares", delta(a.wal_prepares, b.wal_prepares)),
+        ("wal_page_reads", delta(a.wal_page_reads, b.wal_page_reads)),
+        ("wal_schema_rows", delta(a.wal_schema_rows, b.wal_schema_rows)),
+        ("wal_allocs", delta(a.wal_allocs, b.wal_allocs)),
+        ("wal_alloc_bytes", delta(a.wal_alloc_bytes, b.wal_alloc_bytes)),
+        ("held_prepares", delta(a.held_prepares, b.held_prepares)),
+    ])
+}
+
+/// Clears the store's own test hold (`BranchStore::trunk_commit_hold`, stage
+/// `store::HOLD_SCHEMA_PUBLISH`; engine review 16 #14) when dropped, so a failed sample releases its
+/// DDL commit.
+struct SchemaHoldDisarm(Arc<std::sync::atomic::AtomicU8>);
+
+impl Drop for SchemaHoldDisarm {
+    fn drop(&mut self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Engine 2b (fastest-engine 00340537c, red 4f9f83ece; its request of 2026-10-09), as engine review
+/// 16 MED 8 (678b18ba4) left it: a trunk fork whose snapshot's schema cookie matches neither its
+/// connection's schema nor the shared one — a DDL commit between publishing its pages and its
+/// schema, parked there by its store's own hold (`HOLD_SCHEMA_PUBLISH` on `trunk_commit_hold`) —
+/// registers the child with no schema, and the child parses its own at its first connection
+/// (`connect_branch`, `force_reparse_schema_without_publish`). This arm counts, with the SQL-layer
+/// counters (`probe::sql_counts`), the create on a thread of its own and the child's first
+/// `connect_named` on the cell's thread.
+///
+/// Every sample is a fresh database of `tables` tables (`t` with one row, then fillers, in one
+/// transaction; the WAL checkpointed), bootstrapped before anything is counted: one throwaway branch
+/// created and dropped, then the database closed and reopened, so the catalog exists and is opened by
+/// the open, not by the measured fork (review 2 H3: the first fork of a fresh store ran the catalog's
+/// 13 DDL statements and 42 prepares inside the window). Then it is forked once by a fresh connection
+/// (`m-0000`):
+/// * `first_*`: the trunk has no live child, so the fork takes the WAL write lock;
+///   `lockfree_*`: one live child first (`anchor`), so it registers without it;
+/// * `*_window`: the fork runs while an `ALTER TABLE t ADD COLUMN` commit is parked in the window;
+///   `*_control`: the same ALTER has finished first.
+///
+/// Premises per sample: `windows_met` (the fork found no schema in hand at its cookie,
+/// `probe::schema_window_met`, a hook in `fork_trunk_registered`) is at least 1 in a window and 0 in
+/// a control; `wal_locks` is exactly 1 on the first-child path and 0 lock-free. The fork runs on its
+/// own thread, so one that waits for the parked commit is released after 30 s (`waited_for_ddl`);
+/// its store condition-variable waits are counted (`store_waits`), and the bytes the create and the
+/// first connection allocate on their threads (`alloc_bytes`, `connect_alloc_bytes`, from
+/// `probe::thread_allocs`; review 2 L5). References: the schema's row
+/// count (`schema_table_rows`) and one plain `SELECT * FROM sqlite_schema` on a fresh connection
+/// (`ref_scan_page_reads`; it must prepare 1 statement and parse 0 schema rows).
+fn schema_window(cell: &str, tables: u64, out: &mut String) {
+    use std::sync::atomic::Ordering as O;
+    for i in 0..SCHEMA_ROUNDS {
+        for first in [true, false] {
+            for window in [false, true] {
+                let op = match (first, window) {
+                    (true, false) => "first_control",
+                    (true, true) => "first_window",
+                    (false, false) => "lockfree_control",
+                    (false, true) => "lockfree_window",
+                };
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("schema-window.db");
+                let built = {
+                    let db = open_at(&path);
+                    let ddl = db.connect().unwrap();
+                    exec(&ddl, "BEGIN");
+                    exec(&ddl, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+                    exec(&ddl, "INSERT INTO t VALUES (1, 'trunk-1')");
+                    for f in 1..tables {
+                        exec(&ddl, &format!("CREATE TABLE f{f}(id INTEGER PRIMARY KEY, v TEXT)"));
+                    }
+                    exec(&ddl, "COMMIT");
+                    let _ = ddl
+                        .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .and_then(|mut s| s.run_collect_rows())
+                        .unwrap();
+                    // The bootstrap (review 2 H3): the store's catalog is created by its first fork.
+                    ddl.create_branch("boot").unwrap();
+                    db.drop_branch("boot").unwrap();
+                    db.incarnation
+                };
+                let db = open_at(&path);
+                assert_ne!(db.incarnation, built, "{cell}: {op}: premise: the registry returned the old Database, not a reopen");
+                let ddl = db.connect().unwrap();
+                let forker = db.connect().unwrap();
+                if !first {
+                    forker.create_branch("anchor").unwrap();
+                }
+                let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7";
+                let hold = db.branches.trunk_commit_hold.clone();
+                let _disarm = SchemaHoldDisarm(hold.clone());
+                let parked = if window {
+                    hold.store(super::store::HOLD_SCHEMA_PUBLISH, O::Release);
+                    let ddl = ddl.clone();
+                    let commit = std::thread::spawn(move || ddl.execute(alter).map(|_| ()).map_err(|e| e.to_string()));
+                    let t = std::time::Instant::now();
+                    while hold.load(O::Acquire) != (super::store::HOLD_SCHEMA_PUBLISH | super::store::HOLD_ARRIVED) {
+                        assert!(
+                            t.elapsed() < std::time::Duration::from_secs(10),
+                            "{cell}: {op}: premise: the DDL commit never reached its schema publication"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Some(commit)
+                } else {
+                    exec(&ddl, alter);
+                    None
+                };
+                let fork = {
+                    let forker = forker.clone();
+                    std::thread::spawn(move || {
+                        let (c0, w0, m0, z0, a0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
+                        let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
+                        let (c1, w1, m1, z1, a1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
+                        let mut s = sql_sample(&c0, &c1);
+                        s.insert("alloc_bytes", delta(a0.1, a1.1));
+                        s.insert("store_waits", delta(w0, w1));
+                        s.insert("sleeps", delta(z0, z1));
+                        s.insert("windows_met", delta(m0, m1));
+                        s.insert("held_after", u64::from(probe::wal_lock_held()));
+                        (made, s)
+                    })
+                };
+                let t = std::time::Instant::now();
+                while !fork.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let waited = !fork.is_finished();
+                hold.store(0, O::Release);
+                let (made, mut s) = fork.join().unwrap();
+                if let Some(commit) = parked {
+                    commit.join().unwrap().unwrap_or_else(|e| panic!("{cell}: {op}: the parked ALTER failed: {e}"));
+                }
+                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed: {e}"));
+                // The child's first connection: under MED 8 a window child parses its schema here.
+                let (k0, b0) = (probe::sql_counts(), probe::thread_allocs());
+                let branch = db.connect_named("m-0000").unwrap();
+                let (k1, b1) = (probe::sql_counts(), probe::thread_allocs());
+                for (key, v) in sql_sample(&k0, &k1) {
+                    if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
+                        s.insert(*k, v);
+                    }
+                }
+                s.insert("connect_alloc_bytes", delta(b0.1, b1.1));
+                // The branch has the schema its pages need (the engine's own test's check).
+                assert_eq!(query_int(&branch, "SELECT c FROM t WHERE id = 1"), 7, "{cell}: {op}: the branch read the new column wrong");
+                s.insert("waited_for_ddl", u64::from(waited));
+                s.insert("schema_table_rows", query_int(&ddl, "SELECT count(*) FROM sqlite_schema") as u64);
+                let fresh = db.connect().unwrap();
+                let r0 = probe::sql_counts();
+                fresh.prepare("SELECT * FROM sqlite_schema").and_then(|mut s| s.run_collect_rows()).unwrap();
+                let r1 = probe::sql_counts();
+                assert_eq!(delta(r0.prepares, r1.prepares), 1, "{cell}: {op}: premise: the reference scan is one statement");
+                assert_eq!(delta(r0.schema_rows, r1.schema_rows), 0, "{cell}: {op}: premise: the reference scan parses no schema");
+                s.insert("ref_scan_page_reads", delta(r0.page_reads, r1.page_reads));
+                line(out, cell, op, i, &s);
+            }
+        }
+    }
+}
+
+/// Review 2 L6's cell (`first_create`): per round, a fresh small database forked once
+/// (`first_fresh`: this create creates the store's catalog) and, as the reference, one whose catalog
+/// a throwaway branch created before a reopen (`first_reopened`, the schema-window bootstrap: the same
+/// first-child path, no catalog to make). Per create, on the creating thread: the SQL-layer counters
+/// (`wal_locks` counts every write transaction, the trunk's and the catalog's; `held_prepares` the
+/// statements compiled under a store mutex), and the process's flushes (reported).
+fn first_create(cell: &str, out: &mut String) {
+    for i in 0..SCHEMA_ROUNDS {
+        for op in ["first_fresh", "first_reopened"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("first-create.db");
+            let db = if op == "first_reopened" {
+                let built = {
+                    let db = open_at(&path);
+                    let trunk = db.connect().unwrap();
+                    seed(&trunk, false);
+                    trunk.create_branch("boot").unwrap();
+                    db.drop_branch("boot").unwrap();
+                    db.incarnation
+                };
+                let db = open_at(&path);
+                assert_ne!(db.incarnation, built, "{cell}: {op}: premise: the registry returned the old Database, not a reopen");
+                db
+            } else {
+                let db = open_at(&path);
+                seed(&db.connect().unwrap(), false);
+                db
+            };
+            let trunk = db.connect().unwrap();
+            let (c0, f0) = (probe::sql_counts(), sync_counts());
+            trunk.create_branch("m-0000").unwrap();
+            let (c1, f1) = (probe::sql_counts(), sync_counts());
+            let mut s = sql_sample(&c0, &c1);
+            s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
+            s.insert("fsync", f1.fsync - f0.fsync);
+            line(out, cell, op, i, &s);
+        }
+    }
+}
+
+/// The first-connect keys of a schema-window sample (`sql_sample`'s, prefixed).
+const CONNECT_KEYS: [&str; 4] = ["connect_prepares", "connect_page_reads", "connect_schema_rows", "connect_wal_locks"];
 
 /// A named create on `db`, so a checkpoint has a dirty branch to write.
 fn trunk_for_fc(db: &Arc<Database>) {
@@ -752,7 +1314,7 @@ fn run_instruments(cell: &str) -> String {
     std::hint::black_box(Box::new(0u64));
     probe::store_unlocked();
     probe::store_unlocked();
-    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let (hold_bytes, hold_rows) = probe::take_hold_maxima().all;
     s.insert("max_hold_alloc_bytes", hold_bytes);
     s.insert("max_hold_catalog_rows", hold_rows);
     // A hold on a foreground-marked thread is not a background hold; one on another thread is.
@@ -760,6 +1322,7 @@ fn run_instruments(cell: &str) -> String {
     probe::store_locked();
     std::hint::black_box(Box::new([0u64; 8]));
     probe::store_unlocked();
+    let threads_before = probe::threads();
     std::thread::spawn(|| {
         probe::store_locked();
         std::hint::black_box(Box::new([0u64; 2]));
@@ -767,9 +1330,17 @@ fn run_instruments(cell: &str) -> String {
     })
     .join()
     .unwrap();
+    // A joined thread can still be exiting. The thread-count arm below reads its base next, so
+    // this arm leaves only once its thread has left the count (base14 read base 3, after 2, when
+    // it did not wait).
+    let t = std::time::Instant::now();
+    while probe::threads() != threads_before && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    s.insert("hold_thread_left", u64::from(probe::threads() == threads_before));
     probe::mark_foreground(false);
-    let (bg_bytes, _) = probe::take_background_hold_maxima();
-    let (all_bytes, _) = probe::take_hold_maxima();
+    let maxima = probe::take_hold_maxima();
+    let ((bg_bytes, _), (all_bytes, _)) = (maxima.background, maxima.all);
     s.insert("bg_hold_alloc_bytes", bg_bytes);
     s.insert("all_hold_alloc_bytes", all_bytes);
     put("fc_live_and_hold", &s);
@@ -790,13 +1361,15 @@ fn run_instruments(cell: &str) -> String {
     s.insert("base", base.unwrap_or(0));
     s.insert("with", with.unwrap_or(0));
     s.insert("after", after.unwrap_or(0));
-    // A parked thread named as a persistent store thread is not counted, and a parked thread is
-    // blocked; a spinning one is not.
+    // A parked thread the engine reported as a persistent store thread (`probe::persistent_started`,
+    // as `start_confirm_writer` does; review 2 M6) is not counted, and a parked thread is blocked; a
+    // spinning one is not.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let named = std::thread::Builder::new()
-        .name(probe::PERSISTENT_THREADS[0].to_string())
-        .spawn(move || rx.recv())
-        .unwrap();
+    probe::persistent_started();
+    let named = std::thread::spawn(move || {
+        let _ = rx.recv();
+        probe::persistent_ended();
+    });
     let t = std::time::Instant::now();
     while probe::others_blocked() != Some(true) && t.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -820,6 +1393,28 @@ fn run_instruments(cell: &str) -> String {
     s.insert("spinning_seen_running", u64::from(seen_running));
     stop.store(true, std::sync::atomic::Ordering::Release);
     let _ = spinning.join();
+    // Review 2 H1: a RUNNING persistent store thread (the confirmation writer at work) is not
+    // blocked: the persistent count exempts such a thread from the thread count, never from the
+    // blocked check.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    probe::persistent_started();
+    let spinning_named = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            probe::persistent_ended();
+        })
+    };
+    let t = std::time::Instant::now();
+    let mut seen_running = false;
+    while t.elapsed() < std::time::Duration::from_millis(500) && !seen_running {
+        seen_running = probe::others_blocked() == Some(false);
+    }
+    s.insert("persistent_spinning_seen_running", u64::from(seen_running));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = spinning_named.join();
     tx.send(()).unwrap();
     let _ = named.join();
     put("fc_thread_count", &s);
@@ -858,7 +1453,7 @@ fn run_instruments(cell: &str) -> String {
     let base = probe::threads();
     let _ = probe::take_hold_maxima();
     let (_, mut s) = measure(&db, base, || db.branch_named("pop-7").unwrap());
-    s.insert("max_hold_catalog_rows", probe::take_hold_maxima().1);
+    s.insert("max_hold_catalog_rows", probe::take_hold_maxima().all.1);
     put("fc_lookup_cataloged", &s);
     let (_, s) = measure(&db, base, || db.branch_named("never-seen").unwrap());
     put("fc_lookup_unseen", &s);
@@ -871,6 +1466,86 @@ fn run_instruments(cell: &str) -> String {
     let trunk = db.connect().unwrap();
     let (_, s) = measure(&db, base, || trunk.create_branch("fc-new").unwrap());
     put("fc_create_logs", &s);
+    // The SQL-layer counters (engine 2b), on this thread: three statements prepared count three;
+    // a scan of `t` reads its page through the pager, and an empty window reads nothing; a schema
+    // re-read under a read transaction (the 2b fix's own sequence) parses every `sqlite_schema` row
+    // once; an autocommit INSERT takes the trunk's WAL write lock once and reads and allocates under
+    // it, and lets it go; a SELECT after it reads pages, none of them under the lock.
+    let sql = |f: &mut dyn FnMut()| {
+        let a = probe::sql_counts();
+        f();
+        let b = probe::sql_counts();
+        sql_sample(&a, &b)
+    };
+    put("fc_sql_nothing", &sql(&mut || {}));
+    // Review 2 M4: execute and query reach the compiler too; review 2 M3: the sleep counter counts
+    // crate::thread::sleep and (its blind spot, shown) not std's.
+    put("fc_sql_execute", &sql(&mut || exec(&trunk, "SELECT 1")));
+    put(
+        "fc_sql_query",
+        &sql(&mut || {
+            std::hint::black_box(trunk.query("SELECT 1").unwrap());
+        }),
+    );
+    let z0 = probe::sleeps();
+    crate::thread::sleep(std::time::Duration::from_millis(1));
+    let z1 = probe::sleeps();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let z2 = probe::sleeps();
+    put("fc_sleeps", &Sample::from([("crate_sleep", delta(z0, z1)), ("std_sleep", delta(z1, z2))]));
+    put(
+        "fc_sql_prepare_3",
+        &sql(&mut || {
+            for _ in 0..3 {
+                std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+            }
+        }),
+    );
+    put("fc_sql_scan", &sql(&mut || {
+        std::hint::black_box(query_int(&trunk, "SELECT count(*) FROM t"));
+    }));
+    let mut s = sql(&mut || {
+        let pager = trunk.pager.load();
+        pager.begin_read_tx().unwrap();
+        trunk.set_tx_state(TransactionState::Read);
+        let reread = trunk.reparse_schema();
+        trunk.set_tx_state(TransactionState::None);
+        pager.end_read_tx();
+        reread.unwrap();
+    });
+    s.insert("schema_table_rows", query_int(&trunk, "SELECT count(*) FROM sqlite_schema") as u64);
+    put("fc_sql_reparse", &s);
+    let mut s = sql(&mut || exec(&trunk, "INSERT INTO t VALUES (1000, 'fc')"));
+    s.insert("held_after", u64::from(probe::wal_lock_held()));
+    put("fc_sql_insert", &s);
+    put("fc_sql_select_after", &sql(&mut || {
+        std::hint::black_box(query_int(&trunk, "SELECT count(*) FROM t"));
+    }));
+    // Review 2 L4: inside an open write transaction a prepare and a schema re-read count under the
+    // WAL write lock (wal_prepares and wal_schema_rows had never been seen non-zero), and a ROLLBACK
+    // lets the lock go (held_after had been checked only after a commit).
+    exec(&trunk, "BEGIN");
+    let mut s = sql(&mut || {
+        exec(&trunk, "INSERT INTO t VALUES (1001, 'fc-rollback')");
+        std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+        trunk.reparse_schema().unwrap();
+    });
+    s.insert("held_before_rollback", u64::from(probe::wal_lock_held()));
+    exec(&trunk, "ROLLBACK");
+    s.insert("held_after", u64::from(probe::wal_lock_held()));
+    s.insert("rolled_back", u64::from(query_int(&trunk, "SELECT count(*) FROM t WHERE id = 1001") == 0));
+    put("fc_sql_rollback", &s);
+    // Review 2 L6: a statement compiled while this thread holds a store mutex counts as held, one
+    // compiled outside does not (the guard taken through the probe's own hook pair).
+    put(
+        "fc_sql_held_prepare",
+        &sql(&mut || {
+            std::hint::black_box(trunk.prepare("SELECT 1").unwrap());
+            probe::store_locked();
+            std::hint::black_box(trunk.prepare("SELECT 2").unwrap());
+            probe::store_unlocked();
+        }),
+    );
     out
 }
 
@@ -886,14 +1561,23 @@ fn budget_child() {
     // (`hold_word`). base12 counted it where it was written instead, and the writer's wake and wait
     // then landed inside the operation's own store-mutex holds as the timing made (first write's
     // syscalls 17..19, held syscalls 4..6, in one cell).
-    hold_word(spec != "confirm_n10");
+    hold_word(spec != "confirm_n10" && spec != "confirm_load");
     let mut text = String::new();
+    if spec == "open_writer_d2" {
+        open_writer(&out);
+    }
     if spec == "instruments" {
         text = run_instruments(&spec);
+    } else if spec.starts_with("open_d") || spec.starts_with("open_cat") {
+        open_flush(&spec, &mut text);
+    } else if let Some(&(_, tables)) = SCHEMA_TABLES.iter().find(|(c, _)| *c == spec) {
+        schema_window(&spec, tables, &mut text);
+    } else if spec == "first_create" {
+        first_create(&spec, &mut text);
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "confirm_n10" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
@@ -910,7 +1594,9 @@ fn budget_child() {
             }
         };
         let mut built = build(&spec, n, large, named);
-        probe::arm(true);
+        // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
+        // Mach traps per hold inside the measured mutex otherwise).
+        probe::arm(!spec.starts_with("shared_"));
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         if spec.starts_with("mem_") {
             memory(&spec, &mut built, &mut text);
@@ -919,7 +1605,9 @@ fn budget_child() {
             return;
         }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if spec == "confirm_n10" {
+        if spec == "confirm_load" {
+            confirm_load(&spec, &db, &mut text);
+        } else if spec == "confirm_n10" {
             confirm(&spec, &db, base, k, &mut text);
         } else if let Some(c) = spec.strip_prefix("shared_c") {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
@@ -1304,12 +1992,45 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
     assert_eq!(get("fc_live_and_hold", "bg_hold_alloc_bytes"), 16, "the background maximum: the spawned thread's 16 B hold, not the foreground's 64 B");
     assert_eq!(get("fc_live_and_hold", "all_hold_alloc_bytes"), 64, "the all-threads maximum: the foreground's 64 B hold");
+    assert_eq!(get("fc_live_and_hold", "hold_thread_left"), 1, "the hold arm's joined thread never left the thread count");
+    for k in ["prepares", "page_reads", "schema_rows", "wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs", "held_prepares"] {
+        assert_eq!(get("fc_sql_nothing", k), 0, "an empty window moved {k}");
+    }
+    assert_eq!(get("fc_sql_prepare_3", "prepares"), 3, "three statements prepared");
+    assert_eq!(get("fc_sql_execute", "prepares"), 1, "an execute compiled no statement (review 2 M4)");
+    assert_eq!(get("fc_sql_query", "prepares"), 1, "a query compiled no statement (review 2 M4)");
+    assert_eq!(get("fc_sleeps", "crate_sleep"), 1, "crate::thread::sleep not counted (review 2 M3)");
+    assert_eq!(get("fc_sleeps", "std_sleep"), 0, "std::thread::sleep counted: the blind spot the docs state is gone");
+    assert_eq!(get("fc_sql_prepare_3", "wal_locks"), 0, "preparing took the WAL write lock");
+    assert_eq!(get("fc_sql_scan", "prepares"), 1, "one query, one statement");
+    assert!(get("fc_sql_scan", "page_reads") >= 1, "a scan of t read no page through the pager");
+    assert_eq!(get("fc_sql_scan", "schema_rows"), 0, "a scan of t parsed schema rows");
+    let rows = get("fc_sql_reparse", "schema_table_rows");
+    assert!(rows >= 2, "premise: sqlite_schema has rows ({rows})");
+    assert_eq!(get("fc_sql_reparse", "schema_rows"), rows, "a schema re-read parses every sqlite_schema row once");
+    assert_eq!(get("fc_sql_reparse", "prepares"), 1, "a schema re-read prepares its one sqlite_schema scan");
+    assert_eq!(get("fc_sql_reparse", "wal_locks"), 0, "a schema re-read under a read transaction took the WAL write lock");
+    assert_eq!(get("fc_sql_insert", "wal_locks"), 1, "an autocommit INSERT took the WAL write lock once");
+    assert!(get("fc_sql_insert", "wal_page_reads") >= 1, "an INSERT read no page under the WAL write lock");
+    assert!(get("fc_sql_insert", "wal_allocs") >= 1, "an INSERT allocated nothing under the WAL write lock");
+    assert_eq!(get("fc_sql_insert", "held_after"), 0, "the WAL write lock still read as held after the commit");
+    assert!(get("fc_sql_select_after", "page_reads") >= 1, "a SELECT read no page");
+    assert_eq!(get("fc_sql_select_after", "wal_page_reads"), 0, "a SELECT after the commit read under the WAL write lock");
+    assert_eq!(get("fc_sql_rollback", "wal_locks"), 1, "a write transaction took the WAL write lock once");
+    assert!(get("fc_sql_rollback", "wal_prepares") >= 2, "a prepare and a re-read's scan under the WAL write lock not counted under it (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "wal_schema_rows"), rows, "a schema re-read under the WAL write lock: every sqlite_schema row once, under it (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "held_before_rollback"), 1, "an open write transaction's WAL write lock not read as held");
+    assert_eq!(get("fc_sql_rollback", "held_after"), 0, "the WAL write lock still read as held after a ROLLBACK (review 2 L4)");
+    assert_eq!(get("fc_sql_rollback", "rolled_back"), 1, "premise: the ROLLBACK undid the INSERT");
+    assert_eq!(get("fc_sql_held_prepare", "prepares"), 2, "two statements prepared");
+    assert_eq!(get("fc_sql_held_prepare", "held_prepares"), 1, "one statement prepared under a store mutex, one outside (review 2 L6)");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
         assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
         assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
         assert_eq!(get("fc_thread_count", "spinning_seen_running"), 1, "a spinning thread read as blocked");
+        assert_eq!(get("fc_thread_count", "persistent_spinning_seen_running"), 1, "a running persistent store thread read as blocked");
     }
     #[cfg(target_vendor = "apple")]
     {
@@ -2129,17 +2850,24 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
     );
 }
 
-/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): the largest
-/// single store-mutex hold made by the store's BACKGROUND threads during an open and its background
-/// work (the name filter's build; under L4, the name map's) does not grow with the live branches:
-/// from 10^4 to 10^5 its allocated bytes grow by at most a quarter plus 4 KiB, its catalog rows by
-/// at most a quarter plus 64. An O(N) hold grows tenfold. The opening thread's own holds are judged
-/// apart (the same bound on the all-threads maximum), because its fixed ~1 MiB hold (base10:
-/// 1,029,243 B in 9 holds at every N) masked the filter's O(N) install in the all-threads maximum
-/// at 10^4 (base13: 1,029,291 B at 10^4, 1,179,656 B at 10^5 = a 131,072-bucket set of u64 — read
-/// green). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no catalog
-/// row (the D0 recovery instruction test sees that one); a catalog statement that changes many rows
-/// counts one (`Stmt::exec`).
+/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): from 10^4 to 10^5
+/// live branches, an open and its background work (the name filter's build; under L4, the name
+/// map's) hold the store mutex for no more work. Judged ABSOLUTELY (review 2 M7: the x + x/4 term
+/// let an O(N) hold up to about 12.9 B per branch hide under the opener's fixed ~1 MiB hold):
+/// * the largest single hold by the store's BACKGROUND threads: bytes at most + 4 KiB, catalog rows
+///   at most + 64;
+/// * the largest single hold by the OPENING thread (marked foreground), the same;
+/// * the opening thread's held bytes summed over every hold of the open, at most + 4 KiB;
+/// * the all-threads maximum, the same as the per-kind ones.
+/// Both samples must be quiet (review 2 M7's LOW: a hold still open when the maxima are taken would
+/// be lost). The opening thread's held allocations are also held exactly equal between n10 and n1e4
+/// by recovery_of_named_branches_is_independent_of_live_branches_on_the_opening_thread (the
+/// backstop, red at base: +14 allocations). base14 (f5e9d5693): background 147,464 B at 10^4 ->
+/// 1,179,656 B at 10^5 (the filter set's table, built under the mutex; fixed by fastest-engine
+/// f315c960d, unrun). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no
+/// catalog row (the D0 recovery instruction test sees that one); a catalog statement that changes
+/// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
+/// `opener_filter_set`. WRITTEN NOT RUN in this form.
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -2147,29 +2875,55 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     }
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
+    assert!(sa["quiet"] == 1 && sb["quiet"] == 1, "premise: both memory samples quiet (10^4: {}, 10^5: {})", sa["quiet"], sb["quiet"]);
     let mut failures = String::new();
     for (k, slack) in [
         ("max_bg_hold_alloc_bytes", 4096u64),
         ("max_bg_hold_catalog_rows", 64),
+        ("max_fg_hold_alloc_bytes", 4096),
+        ("max_fg_hold_catalog_rows", 64),
+        ("fg_held_alloc_bytes_sum", 4096),
         ("max_hold_alloc_bytes", 4096),
         ("max_hold_catalog_rows", 64),
     ] {
         let (x, y) = (sa[k], sb[k]);
-        if y > x + x / 4 + slack {
-            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {x}/4 + {slack}");
+        if y > x + slack {
+            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + {slack}");
         }
     }
-    assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");
+    assert!(failures.is_empty(), "an open's store-mutex holds grow with the live branches:\n{failures}");
+}
+
+/// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the
+/// rounds are paired by index and the LARGEST difference is budgeted; comparing two minimums hid a
+/// cost paid in all but one round). Samples are kept in the order they were measured, one of each op
+/// per round, so the j-th of each op is the j-th round. Refused when fewer than half the pairs are
+/// quiet, as `quiet` refuses.
+fn confirm_pairs<'a>(c: &'a CellData, op: &str) -> Vec<(&'a Map, &'a Map)> {
+    let (a, r) = (&c.ops[op], &c.ops["confirm_reference"]);
+    assert_eq!(a.len(), r.len(), "{}: {op} and confirm_reference rounds differ", c.name);
+    let q = |s: &Map| s.get("quiet").copied().unwrap_or(1) == 1;
+    let pairs: Vec<(&Map, &Map)> = a.iter().zip(r).filter(|(x, y)| q(x) && q(y)).collect();
+    assert!(!pairs.is_empty() && 2 * pairs.len() >= a.len(), "{}: {op}: {} of {} round pairs quiet", c.name, pairs.len(), a.len());
+    pairs
+}
+
+/// The largest `x[k] - y[k]` over the pairs, as a signed number.
+fn worst_diff(pairs: &[(&Map, &Map)], k: &str) -> i64 {
+    pairs.iter().map(|(x, y)| x[k] as i64 - y[k] as i64).max().unwrap()
 }
 
 /// Review 6 #1's ruling: the flight's confirmation word leaves the create path for a background
 /// writer, which writes it with ONE unsynced pwrite once the group is idle, under no store mutex.
-/// An idle-tail create whose word is written costs, beyond the same create with the word held, at
-/// most two syscalls (the pwrite, and the writer's one wait to park again) and no sync, no
-/// store-mutex acquisition and no syscall under it, on any thread. A word that owns a duplicated
-/// descriptor adds its close (and std's debug-build F_GETFD at that close): base13 read +4, and an
-/// lldb trace of the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`;
-/// review 1 #14 / review 2 #6 (one shared descriptor, no dup per flight) remove the close.
+/// An idle-tail create whose word is written costs, beyond the reference create that lands on a
+/// pending word (review 2 H2), at most three syscalls — the landing's wake of the parked writer
+/// (`confirm_cv.notify_one`), the pwrite, and the writer's one wait to park again — and no sync, no
+/// store-mutex acquisition and no syscall under it, on any thread; in EVERY quiet round, paired by
+/// index (review 2 H6). A word that owns a duplicated descriptor adds its close (and std's
+/// debug-build F_GETFD at that close): base13 read +4 against the held create, and an lldb trace of
+/// the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`; review 1 #14 /
+/// review 2 #6 (one shared descriptor, no dup per flight) remove the close. Mutant
+/// `confirm_sync_alternate` (a device flush on every other word). WRITTEN NOT RUN in this form.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
@@ -2177,20 +2931,627 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
         return;
     }
     let c = cell("confirm_n10");
-    let (held, written) = (quiet(&c, "confirm_held"), quiet(&c, "confirm_written"));
-    assert!(written.iter().all(|s| s["confirms_written"] == 1), "premise: every written window wrote one word");
-    assert!(held.iter().all(|s| s["confirms_written"] == 0), "premise: no held window wrote a word");
-    let min = |v: &[&Map], k: &str| values(&c, "confirm", v, k).into_iter().min().unwrap();
+    let pairs = confirm_pairs(&c, "confirm_written");
+    assert!(pairs.iter().all(|(w, _)| w["confirms_written"] == 1), "premise: every written window wrote one word");
+    assert!(pairs.iter().all(|(_, r)| r["confirms_written"] == 0), "premise: no reference window wrote a word");
     let mut failures = String::new();
-    for (k, extra) in [("full_fsync", 0u64), ("fsync", 0), ("barrier", 0), ("locks_process", 0), ("held_syscalls", 0)] {
-        let (h, w) = (min(&held, k), min(&written, k));
-        if w != h + extra {
-            let _ = writeln!(failures, "  {k}: held {h}, written {w}; budget held + {extra}");
+    for k in ["full_fsync", "fsync", "barrier", "locks_process", "held_syscalls"] {
+        let d = worst_diff(&pairs, k);
+        if d > 0 {
+            let _ = writeln!(failures, "  {k}: written - reference reached {d} in a round; budget 0");
         }
     }
-    let (h, w) = (min(&held, "syscalls"), min(&written, "syscalls"));
-    if w > h + 2 {
-        let _ = writeln!(failures, "  syscalls: held {h}, written {w}; budget held + 2 (one pwrite, one wait)");
+    let d = worst_diff(&pairs, "syscalls");
+    if d > 3 {
+        let _ = writeln!(failures, "  syscalls: written - reference reached {d} in a round; budget <= 3 (the landing's wake, one pwrite, one wait)");
     }
-    assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
+    // Review 2 L14: the held per-op cells leave the word out, so the figure to quote for one idle-tail
+    // create against PostgreSQL 18 is the written window's own total, word included.
+    let total = |k: &str| {
+        let v: Vec<u64> = pairs.iter().map(|(w, _)| w[k]).collect();
+        (*v.iter().min().unwrap(), *v.iter().max().unwrap())
+    };
+    let ((s0, s1), (f0, f1), (p0, p1)) = (total("syscalls"), total("full_fsync"), total("fsync"));
+    let quote = format!("an idle-tail create, word included: {s0}..{s1} syscalls, {f0}..{f1} F_FULLFSYNC, {p0}..{p1} fsync over {} quiet rounds", pairs.len());
+    println!("{quote}");
+    assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}({quote})");
+}
+
+/// Review 2 H2 (an engine SHAVE, filed by the lead): an idle-tail create whose flight lands with no
+/// proved word pending wakes the parked confirmation writer on its own acknowledging thread
+/// (`confirm_cv.notify_one` under the group lock, before the create returns): one BSD syscall that
+/// no held per-op cell sees, since a word is always pending there. Budget: the acknowledgement wakes
+/// no thread — held minus reference is 0 syscalls in every quiet round. Expected RED today (+1, the
+/// notify); the SHAVE moves the wake off the acknowledgement path. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_idle_tail_create_wakes_no_thread_on_its_acknowledgement() {
+    if in_child() {
+        return;
+    }
+    let c = cell("confirm_n10");
+    let pairs = confirm_pairs(&c, "confirm_held");
+    assert!(pairs.iter().all(|(h, r)| h["confirms_written"] == 0 && r["confirms_written"] == 0), "premise: no held or reference window wrote a word");
+    let d = worst_diff(&pairs, "syscalls");
+    assert!(d <= 0, "an idle-tail create's acknowledgement paid {d} syscalls more than a create landing on a pending word (the writer's wake on the ack path) [review 2 H2, engine SHAVE]; budget 0");
+}
+
+// ---- engine 2b: a trunk fork inside a DDL commit's schema window (00340537c, then MED 8 678b18ba4) ----
+
+/// `op`'s schema-window samples in `c`, refused when there are none (review 2 L13: `quiet` keeps every
+/// one of them, these samples carry no quiet flag).
+fn schema_samples<'a>(c: &'a CellData, op: &str) -> Vec<&'a Map> {
+    let v: Vec<&Map> = c.ops.get(op).map(|v| v.iter().collect()).unwrap_or_default();
+    assert!(!v.is_empty(), "{}: no {op} sample", c.name);
+    v
+}
+
+/// The smallest value of `key` over `op`'s samples (the SQL-layer counters are the forking or
+/// connecting thread's own, so no other thread's work enters them).
+fn schema_min(c: &CellData, op: &str, key: &str) -> u64 {
+    values(c, op, &schema_samples(c, op), key).into_iter().min().unwrap()
+}
+
+/// The premises of every schema-window sample, one failure line each:
+/// * its path: a `first_*` fork took a WAL write lock exactly once (the trunk's first child forks
+///   under it), a `lockfree_*` one none (exact, review 2 H3: the lock flag is a bool that any release
+///   clears, so ">= 1" would hide a second lock);
+/// * its mode: a `*_window` fork found no schema in hand at least once (`windows_met`; the first-child
+///   path asks twice, its lock-free attempt and its locked one), a `*_control` fork never (review 2 M2:
+///   the premise is a flag, not a budget's equality);
+/// * the fork thread let every WAL write lock go (`held_after == 0`, review 2 L4).
+fn schema_premises(c: &CellData, op: &str, failures: &mut String) {
+    let lock = u64::from(op.starts_with("first"));
+    let window = op.ends_with("_window");
+    for (i, s) in schema_samples(c, op).into_iter().enumerate() {
+        if s["wal_locks"] != lock {
+            let _ = writeln!(failures, "  {}: {op} #{i}: wal_locks {}; premise: exactly {lock} (the path the op names)", c.name, s["wal_locks"]);
+        }
+        if (s["windows_met"] >= 1) != window {
+            let _ = writeln!(failures, "  {}: {op} #{i}: windows_met {}; premise: {} (the mode the op names)", c.name, s["windows_met"], if window { ">= 1" } else { "0" });
+        }
+        if s["held_after"] != 0 {
+            let _ = writeln!(failures, "  {}: {op} #{i}: the fork thread still read a WAL write lock as held after the create", c.name);
+        }
+    }
+}
+
+/// Engine 2b (00340537c: "0 otherwise"; MED 8 678b18ba4: a fork outside the window is registered with
+/// the schema in hand): a fork that meets no DDL commit's schema window parses nothing, neither at
+/// its create (no statement, no schema row) nor at its child's first connection (no schema row), on
+/// the first-child path and the lock-free one, at 10 and at 10^3 tables; both paths prepare the same
+/// (review 2 H3: the bootstrap is outside the window); and the create's page reads do not grow with
+/// the tables. Mutant `schema_reread_always`. WRITTEN NOT RUN.
+#[test]
+fn a_fork_outside_a_schema_window_rereads_nothing() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut pages = Vec::new();
+    for (spec, _) in SCHEMA_TABLES {
+        let c = cell(spec);
+        for op in ["first_control", "lockfree_control"] {
+            schema_premises(&c, op, &mut failures);
+            for k in ["prepares", "schema_rows", "connect_schema_rows"] {
+                let v = values(&c, op, &schema_samples(&c, op), k);
+                if v.iter().any(|&x| x != 0) {
+                    let _ = writeln!(failures, "  {spec}: {op}.{k} = {v:?}; budget 0");
+                }
+            }
+            let v = values(&c, op, &schema_samples(&c, op), "page_reads");
+            pages.push((spec, op, *v.iter().min().unwrap(), *v.iter().max().unwrap()));
+        }
+        let (f, l) = (schema_min(&c, "first_control", "prepares"), schema_min(&c, "lockfree_control", "prepares"));
+        if f != l {
+            let _ = writeln!(failures, "  {spec}: first_control prepares {f}, lockfree_control {l}; budget equal (no bootstrap in the window)");
+        }
+    }
+    for op in ["first_control", "lockfree_control"] {
+        let at: Vec<_> = pages.iter().filter(|p| p.1 == op).collect();
+        if let [a, b] = &at[..] {
+            if (a.2, a.3) != (b.2, b.3) {
+                let _ = writeln!(failures, "  {op}.page_reads: {}..{} at {}, {}..{} at {}; budget equal", a.2, a.3, a.0, b.2, b.3, b.0);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "a fork outside a schema window parsed something [engine 2b]:\n{failures}");
+}
+
+/// Engine 2b as MED 8 left it (678b18ba4: "create in the window 0 schema rows parsed;
+/// create-then-first-connect pays the one reparse"; 00340537c: "no wait or retry bound is needed"),
+/// against the same path's control:
+/// * the create in the window parses no more than the control's create (MED 8's claim, held as a
+///   ratchet: prepares and schema rows equal);
+/// * the create and the child's first connection together re-read the schema at most once: at most
+///   +1 statement, at most + every `sqlite_schema` row once, page reads at most + one plain scan + 1
+///   (bounds, not requirements: an engine that publishes the schema with the pages may read less,
+///   review 2 M2);
+/// * the fork does not wait for the parked commit: not released at 30 s, and no more store waits and
+///   no more sleeps (`crate::thread::sleep`, review 2 M3) than the control's. BLIND SPOT: a direct
+///   `std::thread::sleep`, or a wait on a condition variable outside `Group::wait`, is not counted;
+///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet.
+/// On both paths, at 10 and at 10^3 tables. Mutants `schema_reread_twice`,
+/// `schema_window_waits_for_publish`, env `fork_rereads_schema_window`. WRITTEN NOT RUN.
+#[test]
+fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for path in ["first", "lockfree"] {
+        let (op, control) = (format!("{path}_window"), format!("{path}_control"));
+        for (spec, _) in SCHEMA_TABLES {
+            let c = cell(spec);
+            schema_premises(&c, &op, &mut failures);
+            schema_premises(&c, &control, &mut failures);
+            let base = |k: &str| schema_min(&c, &control, k);
+            let control_waits = values(&c, &control, &schema_samples(&c, &control), "store_waits").into_iter().max().unwrap();
+            let control_sleeps = values(&c, &control, &schema_samples(&c, &control), "sleeps").into_iter().max().unwrap();
+            for (i, s) in schema_samples(&c, &op).into_iter().enumerate() {
+                let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
+                for k in ["prepares", "schema_rows"] {
+                    if s[k] != base(k) {
+                        let _ = writeln!(failures, "  {spec}: {op} #{i}: the create's {k} {} against the control's {}; budget equal (MED 8: the create parses nothing)", s[k], base(k));
+                    }
+                }
+                let both = |k: &str| s[k] + s[&format!("connect_{k}")];
+                let base_both = |k: &str| base(k) + base(&format!("connect_{k}"));
+                if both("prepares") > base_both("prepares") + 1 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: create + first connect prepared {} against the control's {}; budget <= control + 1", both("prepares"), base_both("prepares"));
+                }
+                if both("schema_rows") > base_both("schema_rows") + rows {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: create + first connect parsed {} schema rows against the control's {}; budget <= control + {rows} (each row once)", both("schema_rows"), base_both("schema_rows"));
+                }
+                if both("page_reads") > base_both("page_reads") + scan + 1 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: create + first connect read {} pages against the control's {}; budget <= control + one scan ({scan}) + 1", both("page_reads"), base_both("page_reads"));
+                }
+                if s["waited_for_ddl"] != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the fork waited for the parked DDL commit (released after 30 s)");
+                }
+                if s["store_waits"] > control_waits {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {} store waits against the control's at most {control_waits}; budget no more", s["store_waits"]);
+                }
+                if s["sleeps"] > control_sleeps {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {} sleeps against the control's at most {control_sleeps}; budget no more (review 2 M3: a bounded wait for the publication)", s["sleeps"]);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "a fork inside a schema window parsed more than the schema once [engine 2b]:\n{failures}");
+}
+
+/// Engine 2b ("the re-read ... could run under the WAL write lock", MED 8): on the first-child path
+/// the fork holds the trunk's WAL write lock, and a window adds NOTHING under it — the statements,
+/// schema rows and page reads it makes under the lock equal the control's (review 2 M1: a bound of
+/// "control + the re-read" was implied by the other two budgets, and an O(tables) scan moved under
+/// the lock passed it). The lock-free path takes no WAL write lock at all, and the control's work
+/// under the lock does not grow with the tables. Mutants `lockfree_fork_takes_wal_lock`,
+/// `schema_reread_under_lock`, env `fork_rereads_schema_window`. WRITTEN NOT RUN.
+#[test]
+fn a_schema_window_adds_nothing_under_the_wal_write_lock() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut control_under_lock = Vec::new();
+    for (spec, _) in SCHEMA_TABLES {
+        let c = cell(spec);
+        for op in ["first_control", "first_window", "lockfree_control", "lockfree_window"] {
+            schema_premises(&c, op, &mut failures);
+        }
+        for op in ["lockfree_control", "lockfree_window"] {
+            for k in ["wal_locks", "wal_prepares", "wal_page_reads", "wal_schema_rows", "wal_allocs"] {
+                let v = values(&c, op, &schema_samples(&c, op), k);
+                if v.iter().any(|&x| x != 0) {
+                    let _ = writeln!(failures, "  {spec}: {op}.{k} = {v:?}; budget 0 (the lock-free fork takes no WAL write lock)");
+                }
+            }
+        }
+        let base = |k: &str| schema_min(&c, "first_control", k);
+        for (i, s) in schema_samples(&c, "first_window").into_iter().enumerate() {
+            for k in ["wal_prepares", "wal_schema_rows", "wal_page_reads"] {
+                if s[k] != base(k) {
+                    let _ = writeln!(failures, "  {spec}: first_window #{i}: {k} {} under the WAL write lock against the control's {}; budget equal (nothing added under the lock)", s[k], base(k));
+                }
+            }
+        }
+        control_under_lock.push((spec, base("wal_page_reads"), base("wal_prepares"), base("wal_schema_rows")));
+    }
+    let (a, b) = (control_under_lock[0], control_under_lock[1]);
+    if (a.1, a.2, a.3) != (b.1, b.2, b.3) {
+        let _ = writeln!(failures, "  first_control under the WAL write lock (page reads, prepares, schema rows): {:?} at {}, {:?} at {}; budget equal", (a.1, a.2, a.3), a.0, (b.1, b.2, b.3), b.0);
+    }
+    assert!(failures.is_empty(), "the schema window under the WAL write lock [engine 2b]:\n{failures}");
+}
+
+/// Review 2 L5: the schema re-read's allocations, budgeted by their slope in tables. On each path the
+/// window's extra bytes over its control (the create's and the child's first connection's, each on
+/// its own thread) per table at 10^3 tables may exceed the per-table extra at 10 tables by at most
+/// 64 B. A cost linear in tables with a fixed part meets this (the fixed part only raises the
+/// 10-table figure); one that grows faster than the tables does not (a schema copied once per parsed
+/// row costs about tables/2 copies per table). Read generously: the 10^3 cell's smallest extra (its
+/// window's least minus its control's most) against the 10 cell's largest. Mutant
+/// `schema_parse_quadratic`. WRITTEN NOT RUN.
+#[test]
+fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let [(small, n_small), (large, n_large)] = SCHEMA_TABLES;
+    let (cs, cl) = (cell(small), cell(large));
+    let (cs, cl) = (&*cs, &*cl);
+    let bytes = |c: &CellData, op: &str| -> Vec<u64> {
+        schema_samples(c, op).into_iter().map(|s| s["alloc_bytes"] + s["connect_alloc_bytes"]).collect()
+    };
+    for path in ["first", "lockfree"] {
+        let (op, control) = (format!("{path}_window"), format!("{path}_control"));
+        for c in [cs, cl] {
+            schema_premises(c, &op, &mut failures);
+            schema_premises(c, &control, &mut failures);
+        }
+        let hi_small = bytes(cs, op.as_str()).into_iter().max().unwrap().saturating_sub(bytes(cs, control.as_str()).into_iter().min().unwrap());
+        let lo_large = bytes(cl, op.as_str()).into_iter().min().unwrap().saturating_sub(bytes(cl, control.as_str()).into_iter().max().unwrap());
+        // Per table, in integers: lo_large / n_large <= hi_small / n_small + 64.
+        if lo_large * n_small > (hi_small + 64 * n_small) * n_large {
+            let _ = writeln!(
+                failures,
+                "  {path}: the window's extra bytes per table: at least {} at {n_large} tables against at most {} at {n_small}; budget <= the {n_small}-table figure + 64 B",
+                lo_large / n_large,
+                hi_small / n_small
+            );
+        }
+    }
+    assert!(failures.is_empty(), "the schema re-read's allocations grow faster than the tables [engine 2b, review 2 L5]:\n{failures}");
+}
+
+/// Review 2 L6 (an engine FIX, one-time per database): a store's first create creates its catalog,
+/// under the store mutex: `Catalog::open` runs 13 `CREATE ... IF NOT EXISTS` statements, each its
+/// own commit, sets 2 pragmas and prepares 42 statements, then the meta row commits in a transaction
+/// of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
+/// first child, so both take the trunk's WAL write lock once):
+/// * the catalog is created in ONE commit: the fresh create's write transactions exceed the
+///   reference's by at most 1 (the schema and the meta row together; today 13 + 1);
+/// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
+///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
+///   prepared before the mutex is taken, or at the open).
+/// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
+/// RED today. The review's split-transaction mutant is today's code, so this red at base is its
+/// kill; once the FIX lands, mutant `catalog_schema_split` splits the transaction again (registered
+/// against the fixed code). WRITTEN NOT RUN.
+#[test]
+fn a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex() {
+    if in_child() {
+        return;
+    }
+    let c = cell("first_create");
+    let mut failures = String::new();
+    let fresh = schema_samples(&c, "first_fresh");
+    let reference = schema_samples(&c, "first_reopened");
+    for (i, s) in reference.iter().enumerate() {
+        if s["wal_locks"] != 1 {
+            let _ = writeln!(failures, "  first_reopened #{i}: wal_locks {}; premise: exactly 1 (the trunk's first child, no catalog write)", s["wal_locks"]);
+        }
+    }
+    let most = |v: &[&Map], k: &str| v.iter().map(|s| s[k]).max().unwrap();
+    let least = |v: &[&Map], k: &str| v.iter().map(|s| s[k]).min().unwrap();
+    let commits = least(&fresh[..], "wal_locks").saturating_sub(most(&reference[..], "wal_locks"));
+    if commits > 1 {
+        let _ = writeln!(failures, "  the catalog's creation committed {commits} times (fresh {}..{} write transactions, reference {}..{}); budget <= 1", least(&fresh[..], "wal_locks"), most(&fresh[..], "wal_locks"), least(&reference[..], "wal_locks"), most(&reference[..], "wal_locks"));
+    }
+    let held = least(&fresh[..], "held_prepares").saturating_sub(most(&reference[..], "held_prepares"));
+    if held > 0 {
+        let _ = writeln!(failures, "  the catalog's creation compiled {held} statements under the store mutex; budget 0");
+    }
+    println!(
+        "first create: fresh {}..{} F_FULLFSYNC, {}..{} fsync; reopened {}..{} F_FULLFSYNC, {}..{} fsync",
+        least(&fresh[..], "full_fsync"),
+        most(&fresh[..], "full_fsync"),
+        least(&fresh[..], "fsync"),
+        most(&fresh[..], "fsync"),
+        least(&reference[..], "full_fsync"),
+        most(&reference[..], "full_fsync"),
+        least(&reference[..], "fsync"),
+        most(&reference[..], "fsync")
+    );
+    assert!(failures.is_empty(), "a first create's catalog [review 2 L6, engine FIX]:\n{failures}");
+}
+
+// ---- contention: C clients creating at once (the shared-flight cells, `SHARED_CS`) ----
+
+/// Every shared-flight line: `(cell, C, arm, sample)`; the create-then-first-write arm runs only up
+/// to C = 64. Refuses a cell that lacks an arm it must have.
+fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
+    let mut lines = Vec::new();
+    for c in SHARED_CS {
+        let spec = format!("shared_c{c}");
+        let data = cell(&spec);
+        for arm in ["shared_create", "shared_cfw", "shared_commits"] {
+            match data.ops.get(arm).and_then(|v| v.first()) {
+                Some(s) => lines.push((spec.clone(), c, arm, s.clone())),
+                None => assert!(
+                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)),
+                    "{spec}: no {arm} line"
+                ),
+            }
+        }
+    }
+    lines
+}
+
+/// Refusals a caller sees under contention (review 2 M5 narrowed this budget's citation): at every C
+/// from 1 to 1,024, no create is refused Busy or SchemaUpdated and retried by its caller. The fork's
+/// own contract (`BranchStore::fork_trunk`: "The fork itself waits for no trunk commit and never
+/// retries"). BLIND SPOTS: the shared arm makes no trunk commit and no DDL, so it reaches no refusal
+/// path the engine has today, and retries inside the engine (begin_read_tx's loop,
+/// fork_trunk_locked's BusySnapshot retries, wait_durable's `continue`) are not counted here: the
+/// futile-lead budget below counts the last; engine review 4's re-capture storm inside creates that
+/// succeed is not counted at all. Mutant `lockfree_fork_refuses_every_other`. WRITTEN NOT RUN.
+#[test]
+fn contention_no_create_is_refused_and_retried_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        if s["retries"] != 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} creates refused and retried by {c} clients; budget 0", s["retries"]);
+        }
+    }
+    assert!(failures.is_empty(), "creates refused under contention:\n{failures}");
+}
+
+/// Group commit's shape (DESIGN §3; PREREG M2): one flight in the air at a time, and it takes
+/// everything buffered, so an acknowledgement waits for at most two flights — the one in progress,
+/// then its own. At every C from 1 to 1,024 no single acknowledgement (a create, or a first write)
+/// makes more than 2 store waits (`store::thread_waits`, one per condition-variable wait call, so a
+/// waiter woken and waiting again counts again). This holds by construction today (review 2 H5): it
+/// guards the shape, against a waiter that polls on timed waits or a flight that takes part of the
+/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A line at C >= 8 with
+/// no store wait at all is refused: some waiter must sleep, and a wait outside `Group::wait` (a
+/// sleep-and-relock poll, or creates serialised on the store mutex) would read as none. Reported per
+/// line: the mean per acknowledgement, the worst acknowledgement, and the worst client's waits per
+/// its own acknowledgements (the lead's condition, DECISIONS 2026-10-09). Mutants
+/// `group_wait_polls`, `poll_outside_group_wait`, `flush_under_mutex`. WRITTEN NOT RUN.
+#[test]
+fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        // Beside trunk commits a create may also wait for a commit's publication (a different wait,
+        // `wait_trunk_commit_published`): that arm is judged by the retries, registrations and
+        // futile-lead budgets, not this one.
+        if arm == "shared_commits" {
+            continue;
+        }
+        let (acks, waits, locks) = (s["acks"], s["store_waits"], s["store_locks"]);
+        let per_client_acks = acks / c;
+        let _ = write!(
+            seen,
+            " C={c}/{arm}: {:.2} waits per ack (worst ack {}, worst client {:.2} per its ack), {:.2} locks per ack;",
+            waits as f64 / acks as f64,
+            s["store_waits_max_ack"],
+            s["store_waits_max_client"] as f64 / per_client_acks as f64,
+            locks as f64 / acks as f64,
+        );
+        if s["store_waits_max_ack"] > 2 {
+            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2", s["store_waits_max_ack"]);
+        }
+        if c >= 8 && waits == 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere (refused)");
+        }
+    }
+    assert!(failures.is_empty(), "acknowledgements under contention (all:{seen}):\n{failures}");
+}
+
+/// Review 1 #9 (no leader flag, one condition variable: every landing wakes every waiter, and an
+/// uncovered one takes the store mutex and the group lock only to find a flight in the air, or a
+/// covered one only to return): at every C from 1 to 1,024, no flight waiter takes the store mutex to
+/// lead and leads no flight (`probe::futile_leads`, two `cfg(test)` hook lines in
+/// `BranchStore::wait_durable_on`, review 2 H5). Expected RED at base: #9 is live. Its engine fix (a
+/// leader flag, or waiters woken only when their flight lands) turns it green; mutant
+/// `herd_relead` scores only after that fix. WRITTEN NOT RUN.
+#[test]
+fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        if s["futile_leads"] != 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} futile leads over {} acknowledgements by {c} clients; budget 0", s["futile_leads"], s["acks"]);
+        }
+    }
+    assert!(failures.is_empty(), "flight waiters took the store mutex to lead and led nothing [review 1 #9]:\n{failures}");
+}
+
+// ---- the confirmation writer under load (review 2 H1; the `confirm_load` cell) ----
+
+/// Review 2 H1 and DECISIONS (review 6 #1's ruling: "under load, no confirmation word at all"): with
+/// the shipped 5 ms quiet period and C clients making back-to-back creates,
+/// * while flights overlap (C >= 8) the writer writes no word during the burst;
+/// * the idle tail after a burst gets at most one word, at every C;
+/// * the writer wakes, with a word pending, at most twice per flight during the burst: once at the
+///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
+///   between two flights (a stated constant: a poll wakes many times per flight).
+/// At C = 1 the burst's words are reported and not budgeted: one client's creates do not overlap,
+/// and a gap of 5 ms between two of them is a legitimate idle tail. Mutants `confirm_quiet_zero`,
+/// env `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
+#[test]
+fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for c in CONFIRM_LOAD_CS {
+        let op = format!("load_c{c}");
+        let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
+        let (flights, burst, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_total"], s["wakeups_burst"]);
+        assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
+        let _ = write!(seen, " C={c}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
+        if c >= 8 && burst != 0 {
+            let _ = writeln!(failures, "  C={c}: {burst} confirmation words written while flights overlapped; budget 0");
+        }
+        if total - burst > 1 {
+            let _ = writeln!(failures, "  C={c}: {} words in the idle tail after the burst; budget <= 1", total - burst);
+        }
+        if wakes > 2 * flights {
+            let _ = writeln!(failures, "  C={c}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
+        }
+    }
+    assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
+}
+
+// ---- the open's flushes, absolutely (lead order 2026-10-09, DECISIONS 1334833a4d; the open_* cells) ----
+
+/// The premises of an open-flush cell's samples (the log kept: same inode and length; and the tail's
+/// confirmation state the cell is built for), each failure one line. `None`: any.
+fn open_premises(c: &CellData, confirmed: Option<u64>, failures: &mut String) -> Vec<Map> {
+    let v: Vec<Map> = c.ops.get("open").cloned().unwrap_or_default();
+    assert!(!v.is_empty(), "{}: no open sample", c.name);
+    for (i, s) in v.iter().enumerate() {
+        if s["same_inode"] != 1 || s["same_len"] != 1 {
+            let _ = writeln!(failures, "  {}: open #{i}: the log was not kept (same inode {}, same length {}); premise", c.name, s["same_inode"], s["same_len"]);
+        }
+        if let Some(want) = confirmed {
+            if s["confirmed"] != want {
+                let _ = writeln!(failures, "  {}: open #{i}: confirmed {}; premise {want}", c.name, s["confirmed"]);
+            }
+        }
+    }
+    v
+}
+
+/// Every open sample's flushes against the budget `(full_fsync, fsync, thread_full, thread_plain,
+/// dir_syncs)`, exact both ways.
+fn open_exact(c: &CellData, v: &[Map], want: [u64; 5], why: &str, failures: &mut String) {
+    let keys = ["full_fsync", "fsync", "thread_full", "thread_plain", "dir_syncs"];
+    for (i, s) in v.iter().enumerate() {
+        let got: Vec<u64> = keys.iter().map(|k| s[*k]).collect();
+        if got[..] != want[..] {
+            let _ = writeln!(failures, "  {}: open #{i}: (full_fsync, fsync, thread_full, thread_plain, dir_syncs) = {got:?}; budget {want:?} [{why}]", c.name);
+        }
+    }
+}
+
+/// Engine review 16 LOW 11 (a9ba5adb8: "a syncing open makes one device flush, not two"): a D2 open of
+/// a whole log whose last flight is UNCONFIRMED (the writer was killed before its close, so no word
+/// proves the flight's sync returned) makes exactly 1 F_FULLFSYNC — the log's, which drains the
+/// device after both writes — and exactly 1 plain fsync, the directory's, made first; on the opening
+/// thread 1 FullFsync-class sync, 1 Fsync-class sync, 1 directory sync. That is the minimum: the open
+/// must make durable the log's bytes (the dead writer may never have synced its last flight) and the
+/// log's name (a rename it may not have synced), and on Apple only F_FULLFSYNC drains the device.
+/// Mutants env `open_dir_sync_in_class` (the second device flush back) and
+/// `open_forgets_unsynced_rename` (no directory sync). WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_open_of_an_unconfirmed_log_makes_one_device_flush_and_one_directory_sync() {
+    if in_child() {
+        return;
+    }
+    let c = cell("open_d2_unconfirmed");
+    let mut failures = String::new();
+    let v = open_premises(&c, Some(0), &mut failures);
+    open_exact(&c, &v, [1, 1, 1, 1, 1], "a9ba5adb8: the directory in Fsync, then the log in FullFsync", &mut failures);
+    assert!(failures.is_empty(), "a D2 open of an unconfirmed log:\n{failures}");
+}
+
+/// The confirmed case (lead, DECISIONS 1334833a4d): a D2 open of a whole log whose header's word
+/// confirms its last flight (its sync returned in FullFsync: the word proves it) owes the log's bytes
+/// nothing; only the log's name (a rename the closing process may not have synced) remains, so the
+/// principled minimum is the directory's sync alone, in a class that drains the device. Which number
+/// that is depends on one fact this process records outside every measured open (`dir_full_rc`):
+/// * fcntl(F_FULLFSYNC) on a directory descriptor succeeds: exactly 1 F_FULLFSYNC, 0 plain fsync, 1
+///   directory sync (on the opening thread 1 FullFsync-class, 0 Fsync-class). RED today: the open
+///   re-syncs the log (1 F_FULLFSYNC + 1 fsync), the restart-path engine SHAVE the lead filed;
+/// * it fails: a directory cannot be drained directly, so its entry reaches the device only through
+///   a device flush after its plain fsync, and today's 1 F_FULLFSYNC + 1 fsync is the minimum.
+/// No default: a line without `dir_full_rc` refuses. `open_cat_d2` (a catalog store) is the same case
+/// and is held to the same budget when its premises hold; when they do not (its open rewrites the
+/// log), its numbers stand in the raw as an observation and the test does not fail on it. Mutant env
+/// `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["open_d2_confirmed", "open_cat_d2"] {
+        let c = cell(spec);
+        let mut premise = String::new();
+        let v = open_premises(&c, Some(1), &mut premise);
+        if !premise.is_empty() {
+            if spec == "open_cat_d2" {
+                continue;
+            }
+            failures.push_str(&premise);
+            continue;
+        }
+        let rc = v.iter().map(|s| *s.get("dir_full_rc").unwrap_or_else(|| panic!("{spec}: no dir_full_rc recorded (no default)"))).collect::<Vec<_>>();
+        assert!(rc.iter().all(|&x| x == rc[0]), "{spec}: dir_full_rc changed between opens: {rc:?}");
+        let want = match rc[0] {
+            0 => [1, 0, 1, 0, 1],
+            1 => [1, 1, 1, 1, 1],
+            other => panic!("{spec}: dir_full_rc {other}: not applicable on this platform"),
+        };
+        let why = if rc[0] == 0 {
+            "the directory alone, drained by F_FULLFSYNC on its descriptor (which this Mac accepts)"
+        } else {
+            "F_FULLFSYNC on a directory is refused here, so the log's device flush after the directory's fsync is the minimum"
+        };
+        open_exact(&c, &v, want, why, &mut failures);
+    }
+    assert!(failures.is_empty(), "a D2 open of a confirmed log [the confirmed-tail SHAVE when F_FULLFSYNC on a directory works]:\n{failures}");
+}
+
+/// A D1 open of a whole log makes exactly 2 plain fsyncs and no F_FULLFSYNC: the directory's, then
+/// the log's; on the opening thread 2 Fsync-class syncs, 1 of them a directory sync. Derivation (lead,
+/// accepted): an open that keeps a log it cannot prove durable exposes its records and appends after
+/// them, so it must first make durable (a) the log's bytes, whose last flight the previous process may
+/// never have synced, and (b) the log's name, whose rename it may never have synced. POSIX:
+/// fsync(file) does not make the file's directory entry durable, and fsync(dir) does not make the
+/// file's data durable, so these are two syncs. At D1 on Apple nothing proves (a): the confirmation
+/// word is written only for a class that proves stable storage (`journal::proves_stable`: only
+/// FullFsync on Apple), so a D1 log's tail is never confirmed. Minimum 2; the engine issues 2.
+/// Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d1_open_makes_two_plain_fsyncs() {
+    if in_child() {
+        return;
+    }
+    let c = cell("open_d1");
+    let mut failures = String::new();
+    let v = open_premises(&c, Some(0), &mut failures);
+    open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
+    assert!(failures.is_empty(), "a D1 open:\n{failures}");
+}
+
+/// Review 2 M5: an internal retry (a refusal the caller never sees, retried inside the engine) shows
+/// as more trunk-fork registration attempts than creates (`probe::fork_registrations`, a `cfg(test)`
+/// hook line at `Connection::fork_trunk_registered`'s entry). At every C, each create registers
+/// exactly once: these clients fork a trunk that already has live children, so no create takes the
+/// first-child path (which registers twice by design, its lock-free attempt and its locked one).
+/// Includes the arm beside trunk commits and a DDL. Mutant `internal_retry_in_fork_trunk`. WRITTEN
+/// NOT RUN.
+#[test]
+fn contention_each_create_registers_once_at_any_client_count() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for (spec, c, arm, s) in shared_lines() {
+        let creates = if arm == "shared_cfw" { s["acks"] / 2 } else { s["acks"] };
+        if s["registrations"] != creates {
+            let _ = writeln!(failures, "  {spec}: {arm}: {} fork registrations for {creates} creates by {c} clients; budget equal", s["registrations"]);
+        }
+    }
+    assert!(failures.is_empty(), "creates registered more than once under contention (an internal retry):\n{failures}");
 }

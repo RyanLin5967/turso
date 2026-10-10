@@ -82,6 +82,52 @@ pub(super) fn translate_in_list(
         let rhs_reg = program.alloc_registers(lhs_arity);
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
+        // A custom type's '=' decides the element as `lhs = expr` would (engine review 14 LOW
+        // 14): the IN is the OR of its elements' '=', true on the first true one, NULL when none
+        // is true and one is NULL. Mutant `in_list_skips_type_operator` (test builds only): the
+        // plain comparison, as before.
+        let type_eq = if lhs_arity != 1
+            || crate::branch::store::fe_mutant("in_list_skips_type_operator")
+        {
+            None
+        } else {
+            find_custom_type_operator(
+                lhs,
+                expr,
+                &ast::Operator::Equals,
+                referenced_tables,
+                resolver,
+            )
+        };
+        if let Some(resolved) = type_eq {
+            let result_reg =
+                emit_custom_type_operator_on_regs(program, lhs_reg, rhs_reg, &resolved, resolver)?;
+            if check_null_reg != 0 {
+                program.emit_insn(Insn::BitAnd {
+                    lhs: check_null_reg,
+                    rhs: result_reg,
+                    dest: check_null_reg,
+                });
+            }
+            if !last_condition
+                || condition_metadata.jump_target_when_false
+                    != condition_metadata.jump_target_when_null
+            {
+                program.emit_insn(Insn::If {
+                    reg: result_reg,
+                    target_pc: label_ok,
+                    jump_if_null: false,
+                });
+            } else {
+                program.emit_insn(Insn::IfNot {
+                    reg: result_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                    jump_if_null: true,
+                });
+            }
+            continue;
+        }
+
         if check_null_reg != 0 && expr.can_be_null() {
             program.emit_insn(Insn::BitAnd {
                 lhs: check_null_reg,
