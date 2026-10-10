@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# fetch_dolt.sh BIN_DIR OUT_TXT -- Dolt 2.3.5 and Doltgres 1.3.3 release binaries (the Mac smoke's versions) for
-# this machine's arch, into BIN_DIR/dolt and BIN_DIR/doltgres.
+# fetch_dolt.sh BIN_DIR OUT_TXT -- the REGISTERED Dolt and Doltgres release binaries (PREREG §6(6): Dolt 2.4.1,
+# Doltgres 1.4.0; gate-6 review, t3run item 13) for this machine's arch, into BIN_DIR/dolt and BIN_DIR/doltgres.
 #
-# Each tarball is checked against the sha256 GitHub reports for that release asset (`gh release view --json assets`,
-# field digest, read 2026-10-04); a mismatch or an unknown arch refuses (exit 2). OUT_TXT records the URL, the
-# tarball sha256, each binary's sha256 and its own version output. The version commands run with a throwaway
-# DOLT_ROOT_PATH whose global config disables metrics and the version check (common.sh's dolt_quiet_root), and with
-# DOLT_DISABLE_EVENT_FLUSH=1, so nothing is reported to eventsapi.dolthub.com from here either.
+# Versions and tarball sha256s come from versions.tsv (pins.py; GitHub's release-asset digests), the one table the
+# driver checks against too; a mismatch, a missing row or an unknown arch refuses (exit 2). OUT_TXT records the URL,
+# the tarball sha256, each binary's sha256 and its own version output, which must name the registered version. The
+# version commands run with a throwaway DOLT_ROOT_PATH whose global config disables metrics and the version check
+# (common.sh's dolt_quiet_root), and with DOLT_DISABLE_EVENT_FLUSH=1, so nothing is reported to
+# eventsapi.dolthub.com from here either.
 set -euo pipefail
 BIN=${1:?usage: fetch_dolt.sh BIN_DIR OUT_TXT}
 OUT=${2:?usage: fetch_dolt.sh BIN_DIR OUT_TXT}
-source "$(cd "$(dirname "$0")" && pwd)/common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/common.sh"
+PINS="$HERE/pins.py"
 case "$(uname -m)" in
-  x86_64) arch=amd64
-    dolt_sha=c49d4c3e004cf1581ba0d4a00c5023a26f84eb2ec15d5fe876eed36d5343f463
-    dg_sha=4873959e06190ac43c5da20561034cb8598885d0ca4bcc7a2bb8f7210965f8c0 ;;
-  aarch64) arch=arm64
-    dolt_sha=9ce70fc81e50139e97758ef7f4dc57e9583e4e5ef05ad75d7535c30caa161387
-    dg_sha=97dfbf2436413fa8bc25554eb9cf2361cdf5b71f53c856505d511fcda20f58f9 ;;
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
   *) die "REFUSED: no pinned Dolt/Doltgres digest for arch $(uname -m)" ;;
 esac
+dolt_v=$(python3 -B "$PINS" version dolt) || die "REFUSED: no Dolt version in versions.tsv"
+dg_v=$(python3 -B "$PINS" version doltgres) || die "REFUSED: no Doltgres version in versions.tsv"
+dolt_sha=$(python3 -B "$PINS" get dolt "$arch" tarball_sha256) || die "REFUSED: no Dolt $arch digest in versions.tsv"
+dg_sha=$(python3 -B "$PINS" get doltgres "$arch" tarball_sha256) || die "REFUSED: no Doltgres $arch digest in versions.tsv"
 mkdir -p "$BIN"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -39,12 +42,19 @@ fetch() { # fetch NAME URL SHA256 BINNAME
 }
 
 : >"$OUT"
-fetch dolt "https://github.com/dolthub/dolt/releases/download/v2.3.5/dolt-linux-$arch.tar.gz" "$dolt_sha" dolt
-fetch doltgres "https://github.com/dolthub/doltgresql/releases/download/v1.3.3/doltgresql-linux-$arch.tar.gz" "$dg_sha" doltgres
+fetch dolt "https://github.com/dolthub/dolt/releases/download/v$dolt_v/dolt-linux-$arch.tar.gz" "$dolt_sha" dolt
+fetch doltgres "https://github.com/dolthub/doltgresql/releases/download/v$dg_v/doltgresql-linux-$arch.tar.gz" "$dg_sha" doltgres
 dolt_quiet_root "$work/root"
-{ echo "dolt version: $("$BIN/dolt" version 2>&1 | head -3 | tr '\n' ' ')";
-  echo "doltgres version: $(cd "$work" && "$BIN/doltgres" -version 2>&1 | head -3 | tr '\n' ' ')";
+# Each version command's own output, unprefixed, is what check-version reads: since LOW 19 it takes the version from
+# the FIRST line in the command's own form ("dolt version X", "Doltgres version X"). This used to grep the prefixed,
+# space-joined OUT lines ("dolt version: dolt version 2.4.1 ..."), which that first-line rule refuses, and its
+# `grep -v doltgres` never removed anything (LOW 27). The rc is recorded; the output is what is judged.
+dv_rc=0 dgv_rc=0
+"$BIN/dolt" version >"$work/dv" 2>&1 || dv_rc=$?
+(cd "$work" && "$BIN/doltgres" -version) >"$work/dgv" 2>&1 || dgv_rc=$?
+{ echo "dolt version (rc=$dv_rc): $(head -3 "$work/dv" | tr '\n' ' ')";
+  echo "doltgres version (rc=$dgv_rc): $(head -3 "$work/dgv" | tr '\n' ' ')";
   echo "telemetry: DOLT_ROOT_PATH config $(cat "$work/root/.dolt/config_global.json") DOLT_DISABLE_EVENT_FLUSH=$DOLT_DISABLE_EVENT_FLUSH"; } >>"$OUT"
-grep -q 'dolt version: .*2\.3\.5' "$OUT" || die "REFUSED: dolt does not report 2.3.5: $(grep 'dolt version' "$OUT")"
-grep -q 'doltgres version: .*1\.3\.3' "$OUT" || die "REFUSED: doltgres does not report 1.3.3: $(grep 'doltgres version' "$OUT")"
+python3 -B "$PINS" check-version dolt "$work/dv" || die "REFUSED: dolt does not report $dolt_v: $(head -3 "$work/dv")"
+python3 -B "$PINS" check-version doltgres "$work/dgv" || die "REFUSED: doltgres does not report $dg_v: $(head -3 "$work/dgv")"
 cat "$OUT"

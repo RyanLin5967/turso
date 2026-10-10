@@ -21,8 +21,8 @@
 #   strace_run OUT CMD...      run CMD under the same strace from its first instruction.
 # Each window writes OUT.strace (per-call lines stamped -ttt, then the -c table), OUT.strace.err and OUT.window (the
 # window's CLOCK_REALTIME bounds: t0 attach-complete to t1 detach-request, and strace's rc; an attach window's stamps
-# are clock pairs, tseize before strace starts and tend after it exits, see clock_pair; a launch window's are from
-# `date +%s.%N`).
+# are clock pairs, tseize before strace starts and tend after it exits, see clock_pair; a launch window's t0 and t1
+# are clock pairs too, t0 before strace starts and t1 after it exits (SMOKE.md erratum E4; they were `date` stamps).
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
 TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
 TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
@@ -171,6 +171,74 @@ task_check() {
     return
   fi
   if is_dead_state "$s"; then echo dead; elif [ "$tp" = "$2" ]; then echo traced; else echo untraced; fi
+}
+
+# ---- the untraced TIMED run and its tracer record (lead review 62430d8bf..b49fb656a MED 4; gate-6 review, item 2)
+# proc_tree PID -> appends PID and every live descendant to the array TREE, builtins only: each task's
+# /proc/PID/task/TID/children (no ps, no fork), so it can run every 0.05 s beside a timed run.
+proc_tree() {
+  local p=$1 t c
+  local -a kids
+  [ -d "/proc/$p" ] || return 0
+  TREE+=("$p")
+  for t in /proc/"$p"/task/*; do
+    kids=()
+    { read -r -a kids <"$t/children"; } 2>/dev/null || true
+    for c in ${kids[@]+"${kids[@]}"}; do proc_tree "$c"; done
+  done
+}
+# tracer_sweep PHASE CMDPID SRVPID -> one "TRACED PHASE ROLE pid tid tracerpid" line per traced task of the command's
+# tree (role cmd) and the server's (role srv; empty: none), then "SWEEP PHASE <EPOCHREALTIME> cmd=N:MAX srv=N:MAX"
+# (tasks read, largest TracerPid). Builtins only.
+tracer_sweep() {
+  local ph=$1 role pid p t k v n m out=""
+  for role in cmd srv; do
+    if [ "$role" = cmd ]; then pid=$2; else pid=$3; fi
+    n=0 m=0
+    TREE=()
+    [ -n "$pid" ] && proc_tree "$pid"
+    for p in ${TREE[@]+"${TREE[@]}"}; do
+      for t in /proc/"$p"/task/*; do
+        [ -e "$t" ] || continue
+        v=""
+        while read -r k v _; do [ "$k" = TracerPid: ] && break; v=""; done 2>/dev/null <"$t/status"
+        [ -n "$v" ] || continue  # the task exited between the listing and the read
+        n=$((n + 1))
+        if [ "$v" != 0 ]; then
+          echo "TRACED $ph $role $p ${t##*/} $v"
+          if [[ $v =~ ^[0-9]+$ ]]; then [ "$v" -gt "$m" ] && m=$v; else m=1; fi  # non-numeric still marks it
+        fi
+      done
+    done
+    out+=" $role=$n:$m"
+  done
+  echo "SWEEP $ph $EPOCHREALTIME$out"
+}
+# timed_run OUT SERVERPID -- CMD...: the UNTRACED timed run (PREREG :173). CMD runs with no strace anywhere; its whole
+# process tree and the server's (SERVERPID; empty for the embedded B1) are swept for TracerPid at the start, every
+# 0.05 s while CMD lives (a FIFO read with a timeout sleeps without a fork), and at the end, APPENDED to OUT.tracer.tsv
+# under a "roles" header (no sample ever replaces another); CMD's output goes to OUT.txt, its exit status to OUT.rc.
+# timedrun.py check refuses the cell on any TracerPid, a gap over 0.25 s, no sweep before the measured window or after
+# it, a role swept empty, or a kernel without /proc/*/task/*/children (tree=none: the trees could not be walked).
+timed_run() {
+  local out=$1 spid=$2 rc=0 pid slp="" tree=children
+  shift 3
+  [ -r "/proc/$BASHPID/task/$BASHPID/children" ] || tree=none
+  "$@" >"$out.txt" 2>&1 &
+  pid=$!
+  sleep 0.2  # let CMD's own process (under its `timeout` wrapper) start, so the start sweep sees it
+  if mkfifo "$out.slp" 2>/dev/null; then exec {slp}<>"$out.slp"; rm -f "$out.slp"; fi
+  { echo "roles cmd=$pid srv=${spid:-none} tree=$tree"; tracer_sweep start "$pid" "$spid"; } >"$out.tracer.tsv"
+  while kill -0 "$pid" 2>/dev/null; do
+    tracer_sweep mid "$pid" "$spid" >>"$out.tracer.tsv"
+    if [ -n "$slp" ]; then read -r -t 0.05 -u "$slp" _ 2>/dev/null || true; else sleep 0.05; fi
+  done
+  wait "$pid" || rc=$?
+  tracer_sweep end "" "$spid" >>"$out.tracer.tsv"
+  [ -n "$slp" ] && exec {slp}>&-
+  echo "$rc" >"$out.rc"
+  cat "$out.txt"
+  return $rc
 }
 
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
@@ -365,12 +433,14 @@ strace_detach() {
 strace_run() {
   local out=$1 rc=0
   shift
-  echo "cmd=$* t0=$(date +%s.%N)" >"$out.window"
+  # t0 and t1 are clock pairs, as in an attach window, so stracecount's clock-step checks cover launch windows too
+  # (SMOKE.md erratum E4: they were `date` stamps with no pair).
+  { echo "cmd=$*"; clock_pair t0; } >"$out.window"
   # The traced command's own stderr goes to OUT.cmd.err (an sh that redirects fd 2 and execs it, traced from the
   # start), so OUT.strace.err holds strace's messages only: a Python DeprecationWarning from the fire-check's F1
   # probe sat in strace.err in 2 of 20 jobs of run 37244177784 and would now refuse the window (third review, 3).
   strace "${STRACE_OPTS[@]}" -o "$out.strace" /bin/sh -c 'exec "$@" 2>"$0"' "$out.cmd.err" "$@" 2>"$out.strace.err" || rc=$?
-  { echo "t1=$(date +%s.%N)"; echo "strace_rc=$rc"; } >>"$out.window"
+  { clock_pair t1; echo "strace_rc=$rc"; } >>"$out.window"
   return $rc
 }
 
