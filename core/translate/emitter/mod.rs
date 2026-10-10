@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -178,6 +178,8 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    #[cfg(feature = "simulator")]
+    subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
@@ -220,26 +222,16 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|c| c.affinity_with_strict(table.is_strict))
-                    .collect(),
-            ),
+            SelfTableContext::ForDML { table, .. } => {
+                Some(table.columns().iter().map(|c| c.affinity()).collect())
+            }
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| {
-                    btree
-                        .columns()
-                        .iter()
-                        .map(|c| c.affinity_with_strict(btree.is_strict))
-                        .collect()
-                }),
+                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
         };
 
         Self {
@@ -318,6 +310,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
             trigger_context: None,
             has_temp_schema,
@@ -329,6 +323,16 @@ impl<'a> Resolver<'a> {
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn set_subquery_unnesting_mode(&mut self, mode: crate::SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode = mode;
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> crate::SubqueryUnnestingMode {
+        self.subquery_unnesting_mode
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -352,6 +356,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -378,6 +384,8 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            #[cfg(feature = "simulator")]
+            subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
@@ -431,6 +439,25 @@ impl<'a> Resolver<'a> {
             .and_then(|scope| scope.affinity(column))
     }
 
+    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
+        let scope = self.self_table_scope.borrow();
+        let context = &scope.as_ref()?.context;
+        let table = match context {
+            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)?
+                .1
+                .btree()?,
+        };
+        match column {
+            Some(column) => table.columns().get(column)?.collation_opt(),
+            None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
         self.self_table_scope
             .borrow()
@@ -469,18 +496,19 @@ impl<'a> Resolver<'a> {
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    Arc::new(
+                    let mut schema =
                         Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed"),
-                    )
+                            .expect("built-in type definitions are malformed");
+                    schema.copy_table_valued_functions(self.schema);
+                    Arc::new(schema)
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
+                let entry = attached_dbs
                     .index_to_data
                     .get(&database_id)
                     .expect("Database ID should be valid after resolve_database_id");
-                let schema = db.schema.lock().clone();
+                let schema = entry.db.schema.lock().clone();
                 schema
             }
         };
@@ -914,6 +942,12 @@ pub struct MaterializedBuildInput {
     pub prefix_tables: TableMask,
 }
 
+impl MaterializedBuildInput {
+    pub(crate) fn requires_build_table(&self) -> bool {
+        matches!(self.mode, MaterializedBuildInputMode::RowidOnly)
+    }
+}
+
 impl LimitCtx {
     pub fn new(program: &mut ProgramBuilder) -> Self {
         Self {
@@ -943,6 +977,8 @@ pub(crate) struct HashLabels {
     pub check_outer: Option<BranchOffset>,
     /// Entry label for the inner-loop subroutine.
     pub inner_loop_gosub: Option<BranchOffset>,
+    /// Return label for the inner-loop subroutine.
+    pub inner_loop_return: Option<BranchOffset>,
     /// Label that skips past the subroutine body (resolved after Return).
     pub inner_loop_skip: Option<BranchOffset>,
     /// Label for the grace loop's own HashNext (resolved during grace loop emission).
@@ -956,6 +992,7 @@ impl HashLabels {
             next,
             check_outer: None,
             inner_loop_gosub: None,
+            inner_loop_return: None,
             inner_loop_skip: None,
             grace_hash_next: None,
         }
@@ -975,8 +1012,7 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Build table cursor (for NullRow in outer joins).
-    pub build_cursor_id: Option<CursorID>,
+    pub build_table_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
     /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
     /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
@@ -1018,9 +1054,13 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
-    /// mapping between table loop index and associated metadata (for left joins only)
-    /// this metadata exists for the right table in a given left join
+    /// Match state for each JOIN that keeps unmatched left rows.
+    ///
+    /// Left-row and right-row match state are separate because a FULL JOIN needs both.
+    /// This matches SQLite's `WhereLevel.iLeftJoin` and `WhereLevel.pRJ` fields.
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// Match state for each JOIN that keeps unmatched right rows.
+    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
     /// mapping between table loop index and associated metadata (for semi/anti joins)
     pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
     pub resolver: Resolver<'a>,
@@ -1045,6 +1085,7 @@ pub struct TranslateCtx<'a> {
     /// Only populated when GROUP BY uses a sorter, enabling deferred expression
     /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
     /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
+    /// An expression that the selected index stores is kept whole.
     pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
@@ -1080,6 +1121,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_right_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
@@ -1214,11 +1256,10 @@ pub fn emit_cdc_patch_record(
             extra_amount: 0,
         });
         let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
-        let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
         let affinity_str = columns
             .iter()
             .filter(|col| !col.is_virtual_generated())
-            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+            .map(|col| col.affinity().aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -1239,7 +1280,6 @@ pub(super) fn emit_make_record<'a>(
     cols: impl IntoIterator<Item = &'a Column>,
     start_reg: usize,
     dest_reg: usize,
-    is_strict: bool,
 ) {
     let storable_cols: Vec<&Column> = cols
         .into_iter()
@@ -1249,7 +1289,7 @@ pub(super) fn emit_make_record<'a>(
 
     let affinity_str: String = storable_cols
         .iter()
-        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
+        .map(|c| c.affinity().aff_mask())
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
@@ -1266,7 +1306,6 @@ pub fn emit_cdc_full_record(
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-    is_strict: bool,
 ) -> usize {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
@@ -1289,7 +1328,7 @@ pub fn emit_cdc_full_record(
     let affinity_str = columns
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {

@@ -1162,7 +1162,15 @@ impl CompiledRecipe {
             match insn.to_function()(&self.program, &mut self.state, insn, pager)? {
                 InsnFunctionStepResult::Step => {}
                 InsnFunctionStepResult::Done => break,
-                InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row => {
+                InsnFunctionStepResult::IO => {
+                    // The instruction parked its completion in the state; a recipe never waits
+                    // on it, so it is dropped before the refusal.
+                    drop(self.state.take_suspended_io());
+                    return Err(LimboError::InternalError(
+                        "recipe sub-program yielded".to_string(),
+                    ));
+                }
+                InsnFunctionStepResult::Row => {
                     return Err(LimboError::InternalError(
                         "recipe sub-program yielded".to_string(),
                     ))

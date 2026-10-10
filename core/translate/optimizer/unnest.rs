@@ -98,22 +98,25 @@
 //!   `count` returns 0 and `sum` returns NULL. An extension aggregate may return
 //!   something else, and this code does not know which value to use.
 //!
-//! The code only moves direct `=` checks between an inner and outer column. Other
-//! forms stay as subqueries. `NOT IN` also stays as a subquery because NULL values
-//! can change its result. A one-value subquery stays as it is unless its result for
-//! an empty input is known.
+//! The `EXISTS`, `NOT EXISTS`, and direct positive `IN` rewrites can move
+//! comparisons between inner and outer expressions.
+//! They keep an inner `WHERE` expression in the subquery if it can fail.
+//! A join can skip a row that the subquery tests and hide an error.
+//! Aggregate rewrites only move direct `=` checks between inner and outer columns.
+//! `NOT IN` stays as a subquery because NULL values can change its result.
+//! A one-value subquery stays as it is unless its result for an empty input is known.
 //!
 //! References:
-//! - SQLite subquery results: https://sqlite.org/lang_expr.html#subquery_expressions
-//! - PostgreSQL subquery results: https://www.postgresql.org/docs/current/functions-subquery.html
-//! - MySQL semi-joins: https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html
-//! - MySQL scalar decorrelation: https://dev.mysql.com/doc/refman/8.4/en/correlated-subqueries.html
-//! - MySQL optimizer switches: https://dev.mysql.com/doc/refman/8.0/en/switchable-optimizations.html
-//! - MariaDB semi-joins: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/semi-join-subquery-optimizations
-//! - MariaDB materialization: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/optimization-strategies/semi-join-materialization-strategy
-//! - MariaDB subquery cache: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/subquery-cache
-//! - Neumann and Kemper, Unnesting Arbitrary Queries: https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf
-//! - Neumann, A Formalization of Top-Down Unnesting: https://arxiv.org/abs/2412.04294
+//! - SQLite subquery results: <https://sqlite.org/lang_expr.html#subquery_expressions>
+//! - PostgreSQL subquery results: <https://www.postgresql.org/docs/current/functions-subquery.html>
+//! - MySQL semi-joins: <https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html>
+//! - MySQL scalar decorrelation: <https://dev.mysql.com/doc/refman/8.4/en/correlated-subqueries.html>
+//! - MySQL optimizer switches: <https://dev.mysql.com/doc/refman/8.0/en/switchable-optimizations.html>
+//! - MariaDB semi-joins: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/semi-join-subquery-optimizations>
+//! - MariaDB materialization: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/optimization-strategies/semi-join-materialization-strategy>
+//! - MariaDB subquery cache: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/subquery-cache>
+//! - Neumann and Kemper, Unnesting Arbitrary Queries: <https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf>
+//! - Neumann, A Formalization of Top-Down Unnesting: <https://arxiv.org/abs/2412.04294>
 
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -131,11 +134,13 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
+        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
+        walk_expr_mut, WalkControl,
     },
     plan::{
-        plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinType, JoinedTable,
+        plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
         QueryDestination, ResultSetColumn, SelectPlan, SubqueryState, TableReferences, WhereTerm,
+        WhereTermOrigin,
     },
 };
 use crate::util::exprs_are_equivalent;
@@ -146,12 +151,11 @@ pub fn rewrite_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
+    if plan.table_references.has_right_or_full_join() {
+        // SQLite keeps correlated subqueries inside the shared join body. A
+        // later semi-join cannot take part in the unmatched-right scan.
+        return Ok(false);
+    }
     let mut changed = false;
     let mut subquery_index = 0;
     while subquery_index < plan.non_from_clause_subqueries.len() {
@@ -186,7 +190,7 @@ pub fn rewrite_correlated_subqueries(
                     continue;
                 }
             }
-            ast::SubqueryType::RowValue { num_regs: 1, .. } if !has_full_join => {
+            ast::SubqueryType::RowValue { num_regs: 1, .. } => {
                 if let Some(replacement) = same_query
                     .and_then(|same_query| aggregate_replacements.get(&same_query))
                     .cloned()
@@ -305,17 +309,13 @@ fn try_rewrite_in(
     if inner_plan.result_columns.len() != 1
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
-        || inner_plan
-            .where_clause
-            .iter()
-            .any(|term| expression_can_fail_on_input(&term.expr))
     {
         return Ok(false);
     }
 
     let extra_term = WhereTerm {
         expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
-        from_outer_join: None,
+        origin: WhereTermOrigin::Where,
         consumed: false,
     };
     rewrite_as_semi_or_anti_join(
@@ -478,7 +478,6 @@ struct ColumnPair {
 }
 
 /// Where the aggregate result is stored after a rewrite.
-#[expect(clippy::large_enum_variant)]
 enum AggregateRewrite {
     /// The result is a column in a grouped table. Another reference to the same
     /// subquery can read that column instead of building another grouped table.
@@ -513,7 +512,7 @@ fn try_rewrite_single_value_aggregate(
     // A value used by an outer join condition must be ready before that join
     // decides whether to fill its right side with NULL values.
     if plan.where_clause.iter().any(|term| {
-        term.from_outer_join.is_some() && expr_references_subquery_id(&term.expr, subquery_id)
+        term.origin.is_outer_join() && expr_references_subquery_id(&term.expr, subquery_id)
     }) {
         return Ok(None);
     }
@@ -567,7 +566,7 @@ fn try_rewrite_single_value_aggregate(
             inner_where.push(term);
             continue;
         }
-        if term.from_outer_join.is_some() {
+        if term.origin.is_outer_join() {
             return Ok(None);
         }
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
@@ -678,7 +677,7 @@ fn try_rewrite_single_value_aggregate(
         };
         plan.where_clause.push(WhereTerm {
             expr: Expr::Binary(Box::new(left), ast::Operator::Equals, Box::new(right)),
-            from_outer_join: Some(subquery_id),
+            origin: WhereTermOrigin::Join(JoinOrigin::Outer(subquery_id)),
             consumed: false,
         });
     }
@@ -781,7 +780,14 @@ fn rewrite_aggregate_as_join_then_group(
     plan.table_references.add_joined_table(inner_table);
 
     for mut term in inner_plan.where_clause {
-        term.from_outer_join = Some(inner_table_id);
+        term.origin = match term.origin {
+            WhereTermOrigin::TableFunction(_) => {
+                WhereTermOrigin::TableFunction(JoinOrigin::Outer(inner_table_id))
+            }
+            WhereTermOrigin::Where | WhereTermOrigin::Join(_) => {
+                WhereTermOrigin::Join(JoinOrigin::Outer(inner_table_id))
+            }
+        };
         term.consumed = false;
         plan.where_clause.push(term);
     }
@@ -864,7 +870,7 @@ fn find_direct_aggregate_comparison(
             }
             continue;
         }
-        if found.is_some() || term.from_outer_join.is_some() {
+        if found.is_some() || term.origin.is_outer_join() {
             return Ok(None);
         }
         let Expr::Binary(left, operator, right) = &term.expr else {
@@ -1017,53 +1023,6 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
     !aggregate_expressions
         .chain(filter_expressions)
         .any(expression_can_fail_on_input)
-}
-
-/// Return whether evaluating this expression can return an error.
-///
-/// For example, `json_extract(value, '$')` fails when `value` contains invalid
-/// JSON. This check uses these simple, strict rules:
-///
-/// - Every function call counts because an extension function can return an
-///   error, and there is no list of functions proved to be safe.
-/// - `LIKE` counts because it can call a user-defined `like` function.
-/// - `RAISE` counts because its purpose is to return an error.
-/// - JSON and array operators count because they can reject invalid input.
-///
-/// Callers use this check in two cases:
-///
-/// - An `IN` semi-join stops after its first match. It must not hide an error in
-///   a later inner row.
-/// - A grouped table computes keys that no outer row uses. It must not create
-///   an error that the original correlated subquery never created.
-fn expression_can_fail_on_input(expr: &Expr) -> bool {
-    let mut can_fail = false;
-    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if matches!(
-            expr,
-            Expr::FunctionCall { .. }
-                | Expr::FunctionCallStar { .. }
-                | Expr::Like { .. }
-                | Expr::Raise(_, _)
-                | Expr::Binary(
-                    _,
-                    ast::Operator::ArrowRight
-                        | ast::Operator::ArrowRightShift
-                        | ast::Operator::ArrayContains
-                        | ast::Operator::ArrayOverlap,
-                    _
-                )
-        ) {
-            can_fail = true;
-        }
-        Ok(if can_fail {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        })
-    })
-    .expect("walking an expression cannot fail");
-    can_fail
 }
 
 /// Return the result for no input rows, if it is known.
@@ -1341,7 +1300,9 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
     }
 
     for term in &plan.where_clause {
-        if expr_contains_nondeterministic_scalar_function(&term.expr, resolver)? {
+        if expression_can_fail_on_input(&term.expr)
+            || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
             return Ok(false);
         }
     }
@@ -1366,7 +1327,7 @@ fn find_exists_in_where(
     for (index, term) in where_clause.iter().enumerate() {
         // An EXISTS inside an outer join condition must still allow the outer
         // row through when it is false.
-        if term.from_outer_join.is_some() {
+        if term.origin.is_outer_join() {
             continue;
         }
         if let Expr::SubqueryResult {
@@ -1404,7 +1365,7 @@ fn find_exists_in_where(
 /// Find a direct IN term. IN under OR and NOT IN stay as subqueries.
 fn find_in_term(where_clause: &[WhereTerm], subquery_id: TableInternalId) -> Option<(usize, Expr)> {
     where_clause.iter().enumerate().find_map(|(index, term)| {
-        if term.from_outer_join.is_some() {
+        if term.origin.is_outer_join() {
             return None;
         }
         let Expr::SubqueryResult {
@@ -1441,40 +1402,43 @@ fn can_move_join_term(
         return true;
     }
 
-    is_inner_outer_equal_check(expr, outer_table_ids, inner_table_ids)
+    is_inner_outer_comparison(expr, outer_table_ids, inner_table_ids)
 }
 
-/// One side of an `=` check may use inner tables and the other may use outer tables.
-fn is_inner_outer_equal_check(
+/// One side of a comparison may use inner tables and the other may use outer tables.
+fn is_inner_outer_comparison(
     expr: &Expr,
     outer_table_ids: &[TableInternalId],
     inner_table_ids: &[TableInternalId],
 ) -> bool {
-    if let Expr::Binary(left, ast::Operator::Equals, right) = expr {
-        let left_tables = collect_table_refs(left);
-        let right_tables = collect_table_refs(right);
-
-        let left_is_outer = left_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let left_is_inner = left_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let right_is_outer = right_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !right_tables.is_empty();
-        let right_is_inner = right_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !right_tables.is_empty();
-
-        (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
-    } else {
-        false
+    let Expr::Binary(left, operator, right) = expr else {
+        return false;
+    };
+    if !operator.is_comparison() {
+        return false;
     }
+
+    let left_tables = collect_table_refs(left);
+    let right_tables = collect_table_refs(right);
+
+    let left_is_outer = left_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let left_is_inner = left_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let right_is_outer = right_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !right_tables.is_empty();
+    let right_is_inner = right_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !right_tables.is_empty();
+
+    (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
 }
 
 /// Return each table used by an expression.

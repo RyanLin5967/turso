@@ -994,9 +994,7 @@ impl Merger {
             .map(|(cc, pc)| {
                 let same = match (child.get_column(cc), parent.get_column(pc)) {
                     (Some((_, c)), Some((_, p))) => {
-                        c.affinity_with_strict(child.is_strict)
-                            == p.affinity_with_strict(parent.is_strict)
-                            && c.collation() == p.collation()
+                        c.affinity() == p.affinity() && c.collation() == p.collation()
                     }
                     _ => false,
                 };

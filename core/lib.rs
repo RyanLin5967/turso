@@ -32,6 +32,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod recipe;
@@ -121,15 +122,17 @@ pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
 };
+#[cfg(feature = "simulator")]
+pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    sidecar_mvcc_log_path, sidecar_wal_path, Database, DatabaseOpts, EncryptionOpts,
-    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    sidecar_mvcc_log_path, sidecar_wal_path, ConnectAsyncState, Database, DatabaseAllocators,
+    DatabaseOpts, EncryptionOpts, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};

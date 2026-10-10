@@ -334,7 +334,9 @@ impl TursoPgServer {
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {}, at most {} sessions)",
-            self.address, self.shared.db_file, self.shared.max_connections
+            listener.local_addr()?,
+            self.shared.db_file,
+            self.shared.max_connections
         );
         // The budget harness refuses a --plant split-reply run whose server does not say this.
         #[cfg(feature = "budget-plant-split-reply")]

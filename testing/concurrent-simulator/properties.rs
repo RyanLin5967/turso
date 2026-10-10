@@ -305,6 +305,60 @@ impl Property for IntegrityCheckProperty {
     }
 }
 
+/// Compare how often each row ID appears in FTS results and in a table scan.
+/// Both reads run in one statement, so they see the same database view.
+/// Require the FTS index to exist, because without it `fts_match` also scans the table.
+pub struct FtsResultComparisonProperty;
+
+impl Property for FtsResultComparisonProperty {
+    fn finish_op(
+        &mut self,
+        step: usize,
+        fiber_id: usize,
+        _txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let Operation::CompareFtsResults { word } = op else {
+            return Ok(());
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            // This valid SQL must not fail with a parse or argument error.
+            // Otherwise, the driver keeps retrying a broken query.
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => {
+                bail!("step {step} fiber {fiber_id}: the FTS comparison query was rejected: {err}")
+            }
+            // The driver handles failed operations. There are no rows to compare.
+            Err(_) => return Ok(()),
+        };
+        let Some(row) = rows.first() else {
+            bail!("step {step} fiber {fiber_id}: the FTS comparison returned no row");
+        };
+        let row_count_difference = row.first().and_then(Value::as_int);
+        let index_count = row.get(1).and_then(Value::as_int);
+        if index_count != Some(1) {
+            bail!(
+                "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
+                 (count {index_count:?}). Without an index, fts_match also scans the table",
+                crate::workloads::FTS_SIM_INDEX
+            );
+        }
+        if row_count_difference != Some(0) {
+            bail!(
+                "step {step} fiber {fiber_id}: fts_match and the table scan disagree \
+                 for word {word:?}: row count difference {row_count_difference:?} \
+                 (FTS has extra matches: {:?}, table scan has extra matches: {:?})",
+                row.get(2),
+                row.get(3)
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Check if an integrity_check result is informational (not actual corruption).
 /// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
 fn is_integrity_check_informational(text: &str) -> bool {
@@ -2076,12 +2130,92 @@ impl Property for SequenceCorrectnessProperty {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fts_comparison_accepts_matching_row_counts() {
+        let mut property = FtsResultComparisonProperty;
+        let op = Operation::CompareFtsResults {
+            word: "alpha".to_string(),
+        };
+        let result = Ok(vec![vec![
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::Null,
+            Value::Null,
+        ]]);
+
+        property.finish_op(4, 2, None, 8, 9, &op, &result).unwrap();
+    }
+
+    #[test]
+    fn fts_comparison_rejects_duplicate_match_rows() {
+        let mut property = FtsResultComparisonProperty;
+        let op = Operation::CompareFtsResults {
+            word: "alpha".to_string(),
+        };
+        let result = Ok(vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::build_text("7:2/1"),
+            Value::Null,
+        ]]);
+
+        let error = property
+            .finish_op(4, 2, None, 8, 9, &op, &result)
+            .unwrap_err();
+        assert!(error.to_string().contains("row count difference Some(1)"));
+        assert!(error.to_string().contains("7:2/1"));
+    }
+
     fn test_output_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "turso-whopper-{label}-{}-{}.edn",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ))
+    }
+
+    #[test]
+    fn cycle_wrap_accepts_post_wrap_values_when_watermark_is_in_last_slot() {
+        // start=1, increment=3, min=1, max=19 emits 1,4,...,19 then wraps
+        // to 1. An in-flight tx can consume the wrap value (1) without
+        // advancing the shared watermark, so an autocommit emission then
+        // sees 4 (or 7, with two in-flight txs) against watermark=19.
+        let params = SequenceParams {
+            start: 1,
+            increment: 3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        // Exact landing on min_value is a wrap from anywhere past it.
+        assert!(is_cycle_wrap(&params, 1, 19));
+        assert!(is_cycle_wrap(&params, 1, 10));
+        // Watermark in the last pre-wrap slot: the whole post-wrap grid
+        // is a legitimate wrap observation.
+        assert!(is_cycle_wrap(&params, 4, 19));
+        assert!(is_cycle_wrap(&params, 7, 19));
+        // Watermark mid-range: a backward step is a real bug.
+        assert!(!is_cycle_wrap(&params, 4, 10));
+        // Off-grid value is never a wrap.
+        assert!(!is_cycle_wrap(&params, 5, 19));
+        // Non-cycling sequences never wrap.
+        let no_cycle = SequenceParams {
+            cycle: false,
+            ..params
+        };
+        assert!(!is_cycle_wrap(&no_cycle, 1, 19));
+
+        // Descending mirror: 19,16,...,1 then wraps to 19.
+        let desc = SequenceParams {
+            start: 19,
+            increment: -3,
+            min_value: 1,
+            max_value: 19,
+            cycle: true,
+        };
+        assert!(is_cycle_wrap(&desc, 19, 1));
+        assert!(is_cycle_wrap(&desc, 16, 1));
+        assert!(!is_cycle_wrap(&desc, 16, 10));
     }
 
     #[test]
@@ -2241,14 +2375,34 @@ fn parse_comma_separated_ints(s: &str) -> Option<Vec<i64>> {
 /// emission set on wrap and treat a backward step as a wrap only when
 /// it actually lands on MIN/MAX — every other backward step still
 /// fires the wrong-direction bail.
+///
+/// In-tx emissions defer their watermark update until commit, so
+/// in-flight transactions can consume the wrap value (and more values
+/// past it) while the shared watermark still sits in the last
+/// pre-wrap slot. A later autocommit emission then observes
+/// `min_value + k*increment` against the stale pre-wrap watermark,
+/// so the wrap value itself never shows up here. Accept the whole
+/// post-wrap grid when the watermark is in the last pre-wrap slot —
+/// the next emission after it MUST wrap. A backward step with the
+/// watermark anywhere else in the range still fires the bail.
 fn is_cycle_wrap(params: &SequenceParams, value: i64, prev_watermark: i64) -> bool {
     if !params.cycle {
         return false;
     }
     if params.increment > 0 {
-        value == params.min_value && prev_watermark > params.min_value
+        if value == params.min_value && prev_watermark > params.min_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) > params.max_value
+            && value >= params.min_value
+            && (value - params.min_value) % params.increment == 0
     } else {
-        value == params.max_value && prev_watermark < params.max_value
+        if value == params.max_value && prev_watermark < params.max_value {
+            return true;
+        }
+        prev_watermark.saturating_add(params.increment) < params.min_value
+            && value <= params.max_value
+            && (value - params.max_value) % params.increment == 0
     }
 }
 

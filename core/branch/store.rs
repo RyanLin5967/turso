@@ -6122,7 +6122,7 @@ impl BranchStore {
             let arena = arena.as_mut().expect("a branch exists, so the arena does");
             let mut entries = Vec::with_capacity(pages.len());
             for page in pages {
-                let no = page.get().id as u32;
+                let no = page.get().id() as u32;
                 let slot = st.pending.remove(&no).ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "branch {} committed page {no} with no copy decision behind it",
@@ -10378,7 +10378,7 @@ mod sota_tree_tests {
         let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));
         let buffer = Arc::new(crate::Buffer::new_temporary(PAGE));
         buffer.as_mut_slice().copy_from_slice(&image(generation));
-        p.get().buffer = Some(buffer);
+        p.get().set_buffer(buffer);
         p
     }
 
@@ -10461,7 +10461,7 @@ mod sota_tree_tests {
                     let mut committed = Vec::new();
                     for _ in 0..=rng.below(2) {
                         let page = rng.below(u64::from(PAGES)) as u32;
-                        if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                        if committed.iter().any(|p: &PageRef| p.get().id() == page as usize) {
                             continue;
                         }
                         store.first_write_branch(id, page).unwrap();
@@ -10678,7 +10678,7 @@ mod sota_tree_tests {
                     let mut sees = nodes[v].sees.clone();
                     for _ in 0..=rng.below(2) {
                         let page = rng.below(u64::from(PAGES)) as u32;
-                        if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                        if committed.iter().any(|p: &PageRef| p.get().id() == page as usize) {
                             continue;
                         }
                         store.first_write_branch(id, page).unwrap();

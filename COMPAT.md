@@ -287,7 +287,7 @@ avoid this window.
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
 | PRAGMA vdbe_trace                | ✅ Yes        |                                              |
-| PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
+| PRAGMA wal_autocheckpoint        | ✅ Yes        |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
 
@@ -672,7 +672,7 @@ Modifiers:
 | sqlite3_changes        | ✅ Yes     |         |
 | sqlite3_changes64      | ✅ Yes     |         |
 | sqlite3_total_changes  | ✅ Yes     |         |
-| sqlite3_total_changes64| ❌ No      |         |
+| sqlite3_total_changes64| ✅ Yes     |         |
 | sqlite3_last_insert_rowid | ✅ Yes  |         |
 | sqlite3_set_last_insert_rowid | ❌ No |       |
 
@@ -750,8 +750,8 @@ Modifiers:
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
 | sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
-| sqlite3_strnicmp            | ❌ No      |         |
+| sqlite3_stricmp             | ✅ Yes     |         |
+| sqlite3_strnicmp            | ✅ Yes     |         |
 
 ### Backup API
 
@@ -940,6 +940,7 @@ Modifiers:
 | Integer        | ✅ Yes    |         |
 | IntegrityCk    | ✅ Yes    |         |
 | IsNull         | ✅ Yes    |         |
+| IsType         | ✅ Yes    |         |
 | IsUnique       | ❌ No     |         |
 | JournalMode    | ✅ Yes    |         |
 | Jump           | ✅ Yes    |         |

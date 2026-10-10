@@ -6,10 +6,11 @@ use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResultOr;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -190,14 +191,23 @@ pub struct ReparseSchemaInner {
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
     fresh: Schema,
-    /// Built-in table-valued functions captured from the old schema; rehydrated
-    /// after the sqlite_schema scan since they don't survive re-parsing.
-    tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
     preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
     phase: ReparsePhase,
+}
+
+/// Test-only control over correlated-subquery rewrites.
+#[cfg(feature = "simulator")]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryUnnestingMode {
+    /// Let the cost model choose between the correlated and rewritten plans.
+    Auto = 0,
+    /// Keep the original correlated plan.
+    Disabled = 1,
+    /// Use the rewritten plan whenever the rewrite applies.
+    Forced = 2,
 }
 
 enum ReparsePhase {
@@ -391,9 +401,6 @@ pub struct Connection {
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
-    /// page size used for an uninitialized database or the next vacuum command.
-    /// it's not always equal to the current page size of the database
-    pub(super) page_size: AtomicU16,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -402,6 +409,7 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    pub(super) wal_autocheckpoint: AtomicU32,
     /// Whether MVCC commits should include portable logical-change metadata in
     /// the logical log.
     ///
@@ -421,6 +429,10 @@ pub struct Connection {
     pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
+    /// Set before the first temp or attached database is installed and
+    /// never cleared, so the statement paths that visit the non-main pagers
+    /// can skip the catalog locks while no such pager can exist.
+    pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
     /// Recipe backfill (lane k1-recipe-build, see `crate::recipe`): eligible bulk UPDATEs on this
     /// connection become recipes instead of table rewrites. Reads honour recipes either way.
@@ -431,6 +443,10 @@ pub struct Connection {
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
     /// one row with the number of rows it changed.
     pub(super) count_changes: AtomicBool,
+    /// PRAGMA fts_merge_threshold: number of visible FTS index segments a
+    /// statement flush may leave behind before the write path merges them.
+    /// 0 disables write-path merging.
+    pub(super) fts_merge_threshold: AtomicI64,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
@@ -438,6 +454,9 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Simulator-only planner control used by the differential fuzzer.
+    #[cfg(feature = "simulator")]
+    pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -646,6 +665,7 @@ impl Connection {
         )
         .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
 
@@ -766,14 +786,20 @@ impl Connection {
         })
     }
 
+    /// Returns true once the per-connection temp database has been created.
+    pub(crate) fn has_temp_database(&self) -> bool {
+        self.temp.database.read().is_some()
+    }
+
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
-        if self.temp.database.read().is_some() {
+        if self.has_temp_database() {
             return Ok(());
         }
 
         let temp_db = self.create_temp_database()?;
         let mut guard = self.temp.database.write();
         if guard.is_none() {
+            self.has_non_main_pagers.store(true, Ordering::Release);
             *guard = Some(temp_db);
         }
         Ok(())
@@ -873,6 +899,18 @@ impl Connection {
     #[inline]
     pub(crate) fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
+    }
+
+    /// Choose how correlated subqueries are planned in newly prepared statements.
+    #[cfg(feature = "simulator")]
+    pub fn set_subquery_unnesting_mode(&self, mode: SubqueryUnnestingMode) {
+        self.subquery_unnesting_mode.set(mode);
+        self.bump_prepare_context_generation();
+    }
+
+    #[cfg(feature = "simulator")]
+    pub(crate) fn subquery_unnesting_mode(&self) -> SubqueryUnnestingMode {
+        self.subquery_unnesting_mode.get()
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
@@ -1405,7 +1443,7 @@ impl Connection {
     pub(crate) fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if matches!(state, ReparseSchemaState::Start) {
             // read cookie before consuming statement program - otherwise we can
@@ -1437,23 +1475,7 @@ impl Connection {
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
-        // Capture built-in table-valued functions (e.g. generate_series, json_each)
-        // before dropping the old schema. These are registered programmatically and
-        // don't survive re-parsing from sqlite_schema alone.
-        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        fresh.copy_table_valued_functions(&self.schema.read());
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1476,7 +1498,6 @@ impl Connection {
         Ok(ReparseSchemaInner {
             _guard: guard,
             fresh,
-            tvfs,
             preserved_sequences,
             phase: ReparsePhase::ParseSchema {
                 parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
@@ -1489,7 +1510,7 @@ impl Connection {
     fn drive_reparse_building(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             let ReparseSchemaState::Building(inner) = state else {
@@ -1512,14 +1533,6 @@ impl Connection {
                         &attached_resolver,
                         self.db.dialect().as_ref(),
                     ));
-
-                    // Rehydrate built-in table-valued functions captured at init.
-                    for vtab in &inner.tvfs {
-                        let normalized = crate::util::normalize_ident(&vtab.name);
-                        inner.fresh.tables.entry(normalized).or_insert_with(|| {
-                            Arc::new(crate::schema::Table::Virtual(vtab.clone()))
-                        });
-                    }
 
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::PopulateSequences {
@@ -1652,7 +1665,7 @@ impl Connection {
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
                     // Type loading is best-effort: log and continue on error.
-                    let scan = (|| -> Result<IOResult<()>> {
+                    let scan = (|| -> IOResultOr<()> {
                         crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
                             type_rows.push(row.get::<&str>(1)?.to_string());
                             Ok(())
@@ -1718,9 +1731,7 @@ impl Connection {
     /// Non-blocking variant of [`Self::read_current_schema_cookie`]. The MVCC
     /// path reads an in-memory header (never yields); the pager path may yield
     /// while reading page 1. Idempotent across re-entry.
-    pub(crate) fn read_current_schema_cookie_nonblock(
-        &self,
-    ) -> Result<crate::types::IOResult<u32>> {
+    pub(crate) fn read_current_schema_cookie_nonblock(&self) -> crate::types::IOResultOr<u32> {
         use crate::types::IOResult;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
@@ -2031,16 +2042,22 @@ impl Connection {
         if self.branch_id().is_some() {
             return;
         }
+        // Inside a transaction the schema cannot change under the
+        // connection, so there is nothing to adopt. This runs on every step
+        // of every statement in MVCC mode, and the check below takes the
+        // database's shared schema lock, which every connection contends
+        // for: decide without it whenever possible.
+        if !self.has_no_open_transaction_state() {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         // MVCC checkpoint can publish physical btree roots into the shared
         // schema without changing SQLite's schema cookie. If this connection
         // still has the older schema snapshot, prepared statements must be
         // invalidated and recompiled with the published roots.
-        if self.has_no_open_transaction_state()
-            && (current_schema.schema_version != schema.schema_version
-                || self
-                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
+        if current_schema.schema_version != schema.schema_version
+            || self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
         {
             let mut adopted = schema.clone();
             // Resolve placeholder (negative) roots to the real pages a checkpoint has
@@ -2224,16 +2241,17 @@ impl Connection {
         frame_watermark: Option<u64>,
     ) -> Result<Option<(Arc<Page>, Completion)>> {
         let pager = self.pager.load();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
-            Ok(result) => result,
-            // on windows, zero read will trigger UnexpectedEof
-            #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        let (page_ref, c) =
+            match pager.read_page_no_cache(page_idx as i64, frame_watermark, true, None) {
+                Ok(result) => result,
+                // on windows, zero read will trigger UnexpectedEof
+                #[cfg(target_os = "windows")]
+                Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
+                    std::io::ErrorKind::UnexpectedEof,
+                    _,
+                ))) => return Ok(None),
+                Err(err) => return Err(err),
+            };
 
         Ok(Some((page_ref, c)))
     }
@@ -2246,7 +2264,7 @@ impl Connection {
     ) -> Result<bool> {
         let content = page_ref.get_contents();
         // empty read - attempt to read absent page
-        if content.buffer.as_ref().is_none_or(|b| b.is_empty()) {
+        if content.buffer().is_none_or(|b| b.is_empty()) {
             return Ok(false);
         }
         page.copy_from_slice(content.as_slice());
@@ -2340,6 +2358,7 @@ impl Connection {
                     .block(|| {
                         return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
+                            self.get_wal_autocheckpoint(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -2514,6 +2533,15 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn get_wal_autocheckpoint(&self) -> u32 {
+        self.wal_autocheckpoint.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_wal_autocheckpoint(&self, frames: u32) {
+        self.wal_autocheckpoint.store(frames, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     /// Publish the connection's current schema snapshot to the shared database
@@ -2765,8 +2793,7 @@ impl Connection {
         self.cdc_transaction_id.store(id, Ordering::SeqCst);
     }
     pub fn get_page_size(&self) -> PageSize {
-        let value = self.page_size.load(Ordering::SeqCst);
-        PageSize::new_from_header_u16(value).unwrap_or_default()
+        self.pager.load().get_page_size_unchecked()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2805,23 +2832,23 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
-    pub fn reset_page_size(&self, size: u32) -> Result<()> {
-        if self.db.initialized() {
+    pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
-        self.pager.load().set_initial_page_size(size)?;
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        pager.set_initial_page_size(size)?;
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
         // pager will write to disk; otherwise paths like op_open_ephemeral allocate buffers
         // sized to the connection's page_size but compute usable_space from the stale 4 KiB
         // global header, tripping the btree_init_page assertion.
-        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+        if let Some(mv_store) = self.mv_store_for_db(database_id).as_ref() {
             mv_store.set_global_page_size(size);
         }
         self.bump_prepare_context_generation();
@@ -3228,11 +3255,11 @@ impl Connection {
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
                     let attached_dbs = self.attached_databases.read();
-                    let (db, _pager) = attached_dbs
+                    let entry = attached_dbs
                         .index_to_data
                         .get(&database_id)
                         .expect("Database ID should be valid");
-                    let schema = db.schema.lock().clone();
+                    let schema = entry.db.schema.lock().clone();
                     schema
                 });
                 let schema = Schema::try_make_mut(schema_arc)?;
@@ -3263,7 +3290,15 @@ impl Connection {
                     .map(|temp_db| temp_db.pager.clone())
                     .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
+            _ => self
+                .attached_databases
+                .read()
+                .get_pager_by_index(index)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {index} is missing from the attached catalog"
+                    ))
+                }),
         }
     }
 
@@ -3468,7 +3503,7 @@ impl Connection {
         _path: &str,
         _alias: &str,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         Err(LimboError::InvalidArgument(
             "attach not available in this build (no-fs)".to_string(),
         ))
@@ -3481,7 +3516,7 @@ impl Connection {
         _alias: &str,
         _reserved_space: Option<u8>,
         _state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
         self.attach_database(_path, _alias, _state)
@@ -3494,7 +3529,7 @@ impl Connection {
         path: &str,
         alias: &str,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         self.attach_database_with_config(path, alias, None, state)
     }
 
@@ -3507,12 +3542,14 @@ impl Connection {
         alias: &str,
         reserved_space: Option<u8>,
         state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         loop {
             match state {
                 AttachDatabaseState::Start => {
                     if self.is_closed() {
-                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                        return Err(
+                            LimboError::InternalError("Connection closed".to_string()).into()
+                        );
                     }
                     // fastest-engine E2 scope rule (PREREG v1 amendments 10-11): an attached file
                     // is not branched, so a branch that attached one would share its writes with
@@ -3528,19 +3565,22 @@ impl Connection {
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
                             "database {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
 
                     if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
                         return Err(LimboError::InvalidArgument(format!(
                             "reserved name {alias} is already in use"
-                        )));
+                        ))
+                        .into());
                     }
                     if self.pager.load().has_external_page_codec() {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is unsupported for connections using an external page codec"
                                 .to_string(),
-                        ));
+                        )
+                        .into());
                     }
 
                     let db_opts = DatabaseOpts::new()
@@ -3624,7 +3664,7 @@ impl Connection {
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,
-                            init.db.mv_store_allocator.clone(),
+                            init.db.allocators.mv_store.clone(),
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
@@ -3670,7 +3710,8 @@ impl Connection {
                     let Some(mv_store) = mv_store_guard.as_ref() else {
                         return Err(LimboError::InternalError(
                             "fresh MVCC attach missing MV store".to_string(),
-                        ));
+                        )
+                        .into());
                     };
                     crate::return_if_io!(mv_store.bootstrap_nonblock(
                         bootstrap
@@ -3687,9 +3728,12 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
-                    self.attached_databases
-                        .write()
-                        .insert(alias.as_str(), (db.clone(), pager.clone()));
+                    self.has_non_main_pagers.store(true, Ordering::Release);
+                    self.attached_databases.write().insert(
+                        alias.as_str(),
+                        db.clone(),
+                        pager.clone(),
+                    );
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -3697,7 +3741,8 @@ impl Connection {
                 AttachDatabaseState::Done => {
                     return Err(LimboError::InternalError(
                         "attach_database called after completion".to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -3785,21 +3830,34 @@ impl Connection {
     /// (temp + attached).The internal locks are released before `f` runs, which also
     /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
     /// which re-reads the attached-database catalog).
+    #[inline(always)]
     pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
     {
-        let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
-        }
+        return if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            f(&[])
+        } else {
+            attach_all_pagers_cold(self, f)
+        };
+
+        #[inline(never)]
+        fn attach_all_pagers_cold<F, R>(conn: &Connection, f: F) -> R
+        where
+            F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
         {
-            let catalog = self.attached_databases.read();
-            for (&idx, (_db, pager)) in catalog.index_to_data.iter() {
-                pagers.push((idx, pager.clone()));
+            let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
+            if let Some(temp_db) = conn.temp.database.read().as_ref() {
+                pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
             }
+            {
+                let catalog = conn.attached_databases.read();
+                for (&idx, entry) in catalog.index_to_data.iter() {
+                    pagers.push((idx, entry.pager.clone()));
+                }
+            }
+            f(&pagers)
         }
-        f(&pagers)
     }
 
     pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
@@ -3825,11 +3883,11 @@ impl Connection {
         }
 
         let attached_dbs = self.attached_databases.read();
-        let (db, _pager) = attached_dbs
+        let entry = attached_dbs
             .index_to_data
             .get(&database_id)
             .expect("Database ID should be valid after resolve_database_id");
-        let schema = db.schema.lock().clone();
+        let schema = entry.db.schema.lock().clone();
         schema
     }
 
@@ -3847,8 +3905,8 @@ impl Connection {
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
             let attached_dbs = self.attached_databases.read();
-            if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
-                *db.schema.lock() = local_schema;
+            if let Some(entry) = attached_dbs.index_to_data.get(&database_id) {
+                *entry.db.schema.lock() = local_schema;
             }
             self.bump_prepare_context_generation();
         }
@@ -3872,25 +3930,19 @@ impl Connection {
         }
     }
 
-    /// Clone the *shared* schema of `database_id` (main or attached), bypassing
-    /// the per-connection schema cache. Falls back to the main DB's shared
-    /// schema when `database_id` does not name an attached database — callers
-    /// in error paths get something usable instead of a panic.
+    /// Clone the shared schema for `database_id`, bypassing the connection-local cache.
     ///
-    /// MVCC checkpoint specifically must call this rather than [`Self::with_schema`]:
-    /// it writes from the mv store to the pager, so the schema it uses must
-    /// match the pager being checkpointed and cannot be a stale per-connection
-    /// copy.
+    /// Panics if `database_id` is neither main nor an attached database.
     pub(crate) fn clone_shared_schema(&self, database_id: usize) -> Arc<Schema> {
         if database_id == crate::MAIN_DB_ID {
             self.db.clone_schema()
         } else {
-            self.attached_databases
-                .read()
+            let attached_databases = self.attached_databases.read();
+            let entry = attached_databases
                 .index_to_data
                 .get(&database_id)
-                .map(|(db, _)| db.schema.lock().clone())
-                .unwrap_or_else(|| self.db.clone_schema())
+                .expect("shared schema requested for unknown attached database");
+            entry.db.clone_schema()
         }
     }
 
@@ -3927,9 +3979,8 @@ impl Connection {
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
-            let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
-            {
-                Self::get_canonical_path_for_database(db)
+            let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
+                Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
@@ -3974,6 +4025,14 @@ impl Connection {
 
     pub fn get_dml_require_where(&self) -> bool {
         self.dml_require_where.load(Ordering::SeqCst)
+    }
+
+    pub fn get_fts_merge_threshold(&self) -> i64 {
+        self.fts_merge_threshold.load(Ordering::SeqCst)
+    }
+
+    pub fn set_fts_merge_threshold(&self, value: i64) {
+        self.fts_merge_threshold.store(value, Ordering::SeqCst);
     }
 
     pub fn set_dml_require_where(&self, value: bool) {
@@ -4022,6 +4081,50 @@ impl Connection {
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.sync_mode.set(mode);
         self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn get_sync_mode_for_database(&self, database_id: usize) -> Result<SyncMode> {
+        match database_id {
+            MAIN_DB_ID => Ok(self.get_sync_mode()),
+            TEMP_DB_ID => Ok(SyncMode::Off),
+            _ => self
+                .attached_databases
+                .read()
+                .index_to_data
+                .get(&database_id)
+                .map(|entry| entry.sync_mode)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "database index {database_id} is missing from the attached catalog"
+                    ))
+                }),
+        }
+    }
+
+    pub(crate) fn set_sync_mode_for_database(
+        &self,
+        database_id: usize,
+        mode: SyncMode,
+    ) -> Result<()> {
+        match database_id {
+            MAIN_DB_ID => self.sync_mode.set(mode),
+            // SQLite fixes temp databases at synchronous=OFF.
+            TEMP_DB_ID => return Ok(()),
+            _ => {
+                let mut attached_databases = self.attached_databases.write();
+                let entry = attached_databases
+                    .index_to_data
+                    .get_mut(&database_id)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "database index {database_id} is missing from the attached catalog"
+                        ))
+                    })?;
+                entry.sync_mode = mode;
+            }
+        }
+        self.bump_prepare_context_generation();
+        Ok(())
     }
 
     pub fn get_temp_store(&self) -> crate::TempStore {
@@ -4111,7 +4214,7 @@ impl Connection {
     pub(crate) fn load_sequence_descriptors_via_sql_nonblock(
         self: &Arc<Connection>,
         state: &mut LoadSequenceDescriptorsState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         loop {
             match state {
@@ -4221,7 +4324,7 @@ impl Connection {
         seq_name: &str,
         stmt: &mut Option<Box<Statement>>,
         meta: &mut Option<(i64, i64, i64, i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4254,7 +4357,8 @@ impl Connection {
             Err(err) => Err(LimboError::Corrupt(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\": descriptor row read failed: {err}"
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4298,7 +4402,7 @@ impl Connection {
         seq: &crate::schema::Sequence,
         stmt: &mut Option<Box<Statement>>,
         row: &mut Option<(i64, bool)>,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
@@ -4329,7 +4433,8 @@ impl Connection {
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{}\": watermark row read failed: {err}",
                 seq.name
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -4382,7 +4487,7 @@ impl Connection {
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
-    ) -> Result<crate::types::IOResult<()>> {
+    ) -> crate::types::IOResultOr<()> {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
@@ -4565,14 +4670,10 @@ impl Connection {
             .values()
             .map(|f| {
                 let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc,
-                    function::ExtFunc::Scalar { argc, .. } => *argc,
-                };
                 (
                     f.name.clone(),
                     is_agg,
-                    argc,
+                    f.func.arg_count(),
                     function::Deterministic::is_deterministic(f.as_ref()),
                 )
             })
@@ -4796,8 +4897,8 @@ impl Connection {
     }
 
     /// Get the query timeout duration.
-    pub fn get_query_timeout(&self) -> Duration {
-        Duration::from_millis(self.query_timeout_ms.load(Ordering::SeqCst))
+    pub fn get_query_timeout_ms(&self) -> u64 {
+        self.query_timeout_ms.load(Ordering::SeqCst)
     }
 
     /// Get a reference to the busy handler.
@@ -4811,9 +4912,15 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
-    /// Returns true when the step-based progress handler requests interruption.
-    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
-        self.progress_handler.should_interrupt(vm_steps)
+    /// Configured progress-handler interval in VM steps; 0 when disabled.
+    pub fn progress_ops(&self) -> u64 {
+        self.progress_handler.ops()
+    }
+
+    /// Returns true when the step-based progress handler requests interruption
+    /// for the VM steps executed in `(prev_steps, vm_steps]`.
+    pub fn should_interrupt_for_progress(&self, prev_steps: u64, vm_steps: u64) -> bool {
+        self.progress_handler.should_interrupt(prev_steps, vm_steps)
     }
 
     /// Request interruption of currently running root statements on this connection.
@@ -4884,6 +4991,24 @@ impl Connection {
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
+    }
+
+    /// Finish a commit of this connection's own MVCC transaction that was
+    /// abandoned before it completed. The dropped `CommitStateMachine` rolls
+    /// back the MVCC transaction itself; this releases the read lock and
+    /// transaction state the connection holds for it, which the state machine
+    /// does not own. Nested transactions, such as the one `nextval()` opens
+    /// inside a user transaction, must not call this.
+    pub(crate) fn end_abandoned_mvcc_commit(&self, db_id: usize) {
+        self.get_pager_from_database_index(&db_id)
+            .expect("the database of an abandoned MVCC commit must still have its pager")
+            .end_read_tx();
+        // `transaction_state` tracks only the main database. An attached database
+        // records its transaction in `attached_mv_txs` and in its pager locks, and
+        // the dropped state machine has already cleared that slot.
+        if db_id == MAIN_DB_ID {
+            self.set_tx_state(TransactionState::None);
+        }
     }
 
     /// Returns true if the connection is currently in a write transaction.
@@ -5276,7 +5401,7 @@ impl Connection {
                 catalog
                     .index_to_data
                     .get(&db)
-                    .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+                    .and_then(|entry| entry.db.get_mv_store().as_ref().cloned())
             }
         }
     }
@@ -5313,6 +5438,24 @@ impl Connection {
     pub(crate) fn mvcc_gc_threshold(&self) -> Result<i64> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.gc_threshold()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn set_mvcc_group_commit(&self, enabled: bool) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_group_commit_enabled(enabled);
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_group_commit(&self) -> Result<bool> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.group_commit_enabled()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
@@ -5489,7 +5632,8 @@ mod tests {
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
         let index = *catalog.name_to_index.get(alias).unwrap();
-        catalog.index_to_data.get(&index).unwrap().clone()
+        let entry = catalog.index_to_data.get(&index).unwrap();
+        (entry.db.clone(), entry.pager.clone())
     }
 
     #[test]

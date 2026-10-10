@@ -378,6 +378,18 @@ PRAGMA wal_checkpoint;
 
 A checkpoint writes pages from the WAL file back to the database file.
 
+### wal_autocheckpoint
+
+Returns or sets how many pages the WAL can hold before a commit on this connection runs a checkpoint. The default is 1000 pages. Zero or a negative value turns automatic checkpoints off.
+
+```sql
+PRAGMA wal_autocheckpoint;
+PRAGMA wal_autocheckpoint = 1000;
+PRAGMA wal_autocheckpoint = 0;    -- turn automatic checkpoints off
+```
+
+The setting applies only to the connection that sets it. Closing the last connection to the database still checkpoints the WAL. In MVCC mode the setting has no effect; use `mvcc_checkpoint_threshold` instead.
+
 ## MVCC Tuning
 
 <Info>
@@ -398,6 +410,19 @@ Sets the threshold that controls how aggressively Turso garbage-collects obsolet
 
 ```sql
 PRAGMA mvcc_gc_threshold = 1000;
+```
+
+### mvcc_group_commit
+
+Lets concurrent MVCC commits batch their logical-log writes so one of them appends
+every waiting transaction's record and the whole batch shares a single fsync.
+Off by default.
+Exclusive transactions started with `BEGIN IMMEDIATE` or `BEGIN EXCLUSIVE` commit
+on the solo path and do not join the queue. The setting applies to every
+connection on the store.
+
+```sql
+PRAGMA mvcc_group_commit = on;
 ```
 
 ## Change Data Capture
