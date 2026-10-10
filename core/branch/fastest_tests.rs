@@ -5863,6 +5863,7 @@ fn a_yielded_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way
     let (db, armed) = open_failing_wal(&dir.path().join("walyield.db"), opts(catalog, SyncClass::Off));
     let trunk = db.connect().unwrap();
     seed(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("PRAGMA fullfsync = ON").unwrap();
     trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
     // Frames in the WAL, then a D0 fork: written, not drained.
