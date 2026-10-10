@@ -21,10 +21,14 @@
 //!   system; third lane review MED 3: ceil(T / C) per client ran up to C - 1 extra).
 //! * `--warmup OPS:S:MAX_S`: the warm-up rule in bbload's and clonebench's own form, so one value is passed to every
 //!   system (gate-6 review 3; PREREG :210's min(max(1,000 ops, 10 s), 10% of the cap) is 1000:10:180 at the 1800 s
-//!   cap, from competitors/timedrun.py rule): cycles run until OPS warm-up ops across all clients AND S seconds have
-//!   passed, or until MAX_S, whichever comes first. Recorded verbatim as `warmup_rule`, with the stop (when the main
-//!   thread told the clients to stop) and the drain (until every client finished its cycle in flight) apart, and the
-//!   ops over the whole warm-up (third lane review MED 4). `--warmup W` (default 20) is W cycles per client.
+//!   cap, from competitors/timedrun.py rule), decided as bbload decides it (its claim_op; the lead's ruling on fourth
+//!   lane review LOW 14, PREREG annex A23): at each claim of a cycle, with `claimed` warm-up cycles claimed before it,
+//!   the warm-up ends there when claimed >= OPS and S seconds have passed, or when MAX_S has passed (capped), and that
+//!   claim is not a warm-up cycle. Recorded verbatim as `warmup_rule`, with the claim that ended it (its time, the
+//!   cycles claimed, capped) and the drain (until every client finished its cycle in flight) apart (third lane review
+//!   MED 4). `--warmup W` (default 20) is W cycles per client. `--warmup-replay OPS:S:MAX_S < TRACE` replays the same
+//!   decision on claim times (ns since the start, one per line) and prints where it ends, for the shared conformance
+//!   test against bbload and clonebench (fastest/linux/gates/warmup_conformance.py).
 //! * `--phases K` (phases mode, 1-4, default 4): only the first K phases, so an instruction counter can
 //!   take a phase's cost as the difference between runs (callgrind's per-function inclusive cost is not
 //!   trustworthy where it reports false recursion: arm64, run 37255309860). With K < 4 the branches are
@@ -54,8 +58,8 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use turso_core::branch::{sync_counts, BranchDurability, SyncClass};
@@ -93,6 +97,25 @@ struct Args {
     phases: usize,
 }
 
+/// `--warmup OPS:S:MAX_S` that does not parse (a function, not a closure: one closure has one return type, so
+/// reusing it across the usize and f64 parses did not compile, E0308; fourth lane review HIGH 1).
+fn bad_warmup(v: &str) -> ! {
+    not_a_result(&format!("--warmup OPS:S:MAX_S: {v} (OPS an integer, S and MAX_S finite seconds, MAX_S > 0)"))
+}
+
+/// `OPS:S:MAX_S`, as `--warmup` and `--warmup-replay` take it: (ops, seconds, max seconds, the text as given).
+fn parse_rule(v: &str) -> (usize, f64, f64, String) {
+    let f: Vec<&str> = v.split(':').collect();
+    let [o, s, m] = f.as_slice() else { bad_warmup(v) };
+    let o: usize = o.parse().unwrap_or_else(|_| bad_warmup(v));
+    let s: f64 = s.parse().unwrap_or_else(|_| bad_warmup(v));
+    let m: f64 = m.parse().unwrap_or_else(|_| bad_warmup(v));
+    if !(s.is_finite() && m.is_finite() && s >= 0.0 && m > 0.0) {
+        bad_warmup(v);
+    }
+    (o, s, m, v.to_string())
+}
+
 fn not_a_result(msg: &str) -> ! {
     println!("NOT A RESULT: {msg}");
     std::process::exit(1)
@@ -120,6 +143,7 @@ fn parse_args() -> Args {
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
+    let mut ops_given = false;
     let val = |i: &mut usize| -> String {
         *i += 1;
         argv.get(*i).cloned().unwrap_or_else(|| not_a_result(&format!("{} needs a value", argv[*i - 1])))
@@ -148,24 +172,18 @@ fn parse_args() -> Args {
             }
             "--catalog" => a.catalog = true,
             "--clients" => a.clients = num(val(&mut i), "--clients"),
-            "--ops" => a.ops = num(val(&mut i), "--ops"),
+            "--ops" => {
+                a.ops = num(val(&mut i), "--ops");
+                ops_given = true;
+            }
             "--ops-total" => a.ops_total = Some(num(val(&mut i), "--ops-total")),
             "--warmup" => {
                 let v = val(&mut i);
-                let f: Vec<&str> = v.split(':').collect();
-                match f.as_slice() {
-                    [o, s, m] => {
-                        let bad = || not_a_result(&format!("--warmup OPS:S:MAX_S: {v}"));
-                        let o: usize = o.parse().unwrap_or_else(|_| bad());
-                        let s: f64 = s.parse().unwrap_or_else(|_| bad());
-                        let m: f64 = m.parse().unwrap_or_else(|_| bad());
-                        if !(s >= 0.0 && m > 0.0) {
-                            bad();
-                        }
-                        a.warm_rule = Some((o, s, m, v.clone()));
-                    }
-                    [_] => a.warmup = num(v.clone(), "--warmup"),
-                    _ => not_a_result(&format!("--warmup W or OPS:S:MAX_S: {v}")),
+                // a ':' makes it the rule (two or four fields are refused by parse_rule); none, W cycles per client
+                if v.contains(':') {
+                    a.warm_rule = Some(parse_rule(&v));
+                } else {
+                    a.warmup = num(v.clone(), "--warmup");
                 }
             }
             "--rows" => a.rows = num(val(&mut i), "--rows") as i64,
@@ -204,6 +222,9 @@ fn parse_args() -> Args {
     if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
         not_a_result("--phases is 1-4, and below 4 only in phases mode");
     }
+    if ops_given && a.ops_total.is_some() {
+        not_a_result("--ops (per client) and --ops-total (the run's total) are exclusive");
+    }
     if a.clients == 0 || a.ops == 0 || a.rows < 1 || a.ops_total == Some(0) {
         not_a_result("--clients, --ops, --ops-total and --rows must be at least 1");
     }
@@ -213,6 +234,13 @@ fn parse_args() -> Args {
     };
     if a.ops_of.contains(&0) {
         not_a_result("--ops-total below --clients leaves a client with no op");
+    }
+    if let Some(t) = a.ops_total {
+        // the split is exactly T (fourth lane review MED 6: a wrong split would otherwise only show downstream)
+        let got: usize = a.ops_of.iter().sum();
+        if got != t {
+            not_a_result(&format!("--ops-total {t} split into {got} ops"));
+        }
     }
     a
 }
@@ -305,14 +333,86 @@ impl Rng {
     }
 }
 
+/// The warm-up under `--warmup OPS:S:MAX_S`: its start, the cycles claimed, and, once a claim has ended it,
+/// (capped, the cycles claimed before that claim, ns from the start to it). Claims take this lock one at a time, as
+/// bbload's claims take its claim lock.
+struct Warm {
+    t0: Option<Instant>,
+    claimed: usize,
+    end: Option<(bool, usize, u64)>,
+}
+static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None });
+
+/// bbload's warm-up decision, the definition (artie frontier/fastest/tools/loadgen/bbload.c claim_op at ec9bba5552,
+/// factored there as warm_ends; the lead's ruling on fourth lane review LOW 14, PREREG annex A23), made at a claim:
+/// with `claimed` warm-up ops claimed before it and `el_ns` since the start, the warm-up ends at this claim when
+/// claimed >= ops and el_ns >= s_ns (done), or when el_ns >= max_ns (capped, reported only when not done).
+/// None: go on, this claim is a warm-up op. Some(capped): this claim ends the warm-up and is not one.
+fn warm_ends(claimed: usize, el_ns: u64, ops: usize, s_ns: u64, max_ns: u64) -> Option<bool> {
+    let done = claimed >= ops && el_ns >= s_ns;
+    if done || el_ns >= max_ns {
+        Some(!done)
+    } else {
+        None
+    }
+}
+
+/// Seconds as bbload turns them into nanoseconds, `(uint64_t)(S * 1e9)`: truncated.
+fn secs_ns(s: f64) -> u64 {
+    (s * 1e9) as u64
+}
+
+/// One client's claim of a warm-up cycle under the rule: true to run it (it is counted), false once the warm-up has
+/// ended, at this claim or an earlier one.
+fn warm_claim(rule: &(usize, f64, f64, String)) -> bool {
+    let mut w = WARM.lock().unwrap_or_else(|e| e.into_inner());
+    if w.end.is_some() {
+        return false;
+    }
+    let el = w
+        .t0
+        .map(|t| t.elapsed().as_nanos() as u64)
+        .unwrap_or_else(|| not_a_result("a warm-up claim before its start"));
+    match warm_ends(w.claimed, el, rule.0, secs_ns(rule.1), secs_ns(rule.2)) {
+        None => {
+            w.claimed += 1;
+            true
+        }
+        Some(capped) => {
+            w.end = Some((capped, w.claimed, el));
+            false
+        }
+    }
+}
+
+/// `--warmup-replay OPS:S:MAX_S`: warm_ends replayed on claim times read from stdin (integer ns since the start, one
+/// per line, non-decreasing), printing `stop_at=I warm_ops=N capped=0|1`, or `stop_at=none warm_ops=N capped=none`
+/// when the trace ends first. Every claim before the stop is a warm-up op, so warm_ops is the stop's index.
+fn warmup_replay(rule: &str) -> ! {
+    let (ops, s, m, _) = parse_rule(rule);
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text).unwrap_or_else(|e| not_a_result(&format!("stdin: {e}")));
+    let (mut claimed, mut prev) = (0usize, 0u64);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let el: u64 = line.parse().unwrap_or_else(|_| not_a_result(&format!("trace line {line:?}: not integer ns")));
+        if el < prev {
+            not_a_result(&format!("trace line {line:?}: earlier than the claim before it ({prev})"));
+        }
+        prev = el;
+        if let Some(capped) = warm_ends(claimed, el, ops, secs_ns(s), secs_ns(m)) {
+            println!("stop_at={claimed} warm_ops={claimed} capped={}", u8::from(capped));
+            std::process::exit(0)
+        }
+        claimed += 1;
+    }
+    println!("stop_at=none warm_ops={claimed} capped=none");
+    std::process::exit(0)
+}
+
 /// Busy/SchemaUpdated retries per phase, over the whole run (warm-up included; the windows'
 /// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
 /// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
 /// operation's latency), and gives up at 30 s (PREREG: a failed operation).
-/// The warm-up rule (`--warmup OPS:S:MAX_S`): cycles done by every client, and the main thread's stop.
-static WARM_OPS: AtomicUsize = AtomicUsize::new(0);
-static WARM_STOP: AtomicBool = AtomicBool::new(false);
-
 static RETRIES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
@@ -434,11 +534,10 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
     };
     let n = a.ops_of[id];
     gate.wait(); // ready
-    if a.warm_rule.is_some() {
+    if let Some(rule) = &a.warm_rule {
         let mut k = 0usize;
-        while !WARM_STOP.load(Ordering::Acquire) {
+        while warm_claim(rule) {
             cycles(&format!("warm{k}"), 1, None);
-            WARM_OPS.fetch_add(1, Ordering::AcqRel);
             k += 1;
         }
     } else {
@@ -527,6 +626,13 @@ fn pct(sorted: &[u64], q: f64) -> u64 {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--warmup-replay") {
+        match argv.get(2) {
+            Some(rule) if argv.len() == 3 => warmup_replay(rule),
+            _ => not_a_result("--warmup-replay OPS:S:MAX_S < TRACE"),
+        }
+    }
     let a = parse_args();
     std::fs::create_dir_all(&a.dir).unwrap_or_else(|e| not_a_result(&format!("mkdir: {e}")));
     let db = open_db(&a.dir.join("profile.db"), &a);
@@ -542,8 +648,8 @@ fn main() {
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
-    // the warm-up's record: (ops when told to stop, seconds to the stop, seconds to every client done)
-    let mut warm_times = (0usize, 0.0f64, 0.0f64);
+    // seconds from the warm-up's start to every client done (under a rule, the claim that ended it is in WARM)
+    let mut warm_secs = 0.0f64;
     // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
     let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
@@ -554,23 +660,14 @@ fn main() {
                 s.spawn(move || client(id, db, a, gate))
             })
             .collect();
+        // the warm-up's clock starts before the clients are let go, so no claim precedes it; the clients decide its
+        // end at their claims (warm_claim), as bbload's do
+        let t = Instant::now();
+        WARM.lock().unwrap_or_else(|e| e.into_inner()).t0 = Some(t);
         gate.wait(); // ready
         fence.marker("FASTEST_PHASE warmup begin");
-        let t = Instant::now();
-        if let Some((ops, min_s, max_s, _)) = &a.warm_rule {
-            // min(max(OPS ops, S s), MAX_S): both minimums, unless MAX_S ends it first
-            loop {
-                let secs = t.elapsed().as_secs_f64();
-                if (WARM_OPS.load(Ordering::Acquire) >= *ops && secs >= *min_s) || secs >= *max_s {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            WARM_STOP.store(true, Ordering::Release);
-            warm_times = (WARM_OPS.load(Ordering::Acquire), t.elapsed().as_secs_f64(), 0.0);
-        }
         gate.wait(); // warm-up done
-        warm_times.2 = t.elapsed().as_secs_f64();
+        warm_secs = t.elapsed().as_secs_f64();
         fence.marker("FASTEST_PHASE warmup end");
         for w in &windows_wanted {
             let s0 = engine_syncs();
@@ -611,25 +708,29 @@ fn main() {
 
     let ops_total: usize = a.ops_of.iter().sum();
     let (rule_text, warm_rule) = match &a.warm_rule {
-        // ops over the whole warm-up (read after every client finished), the stop and the drain apart
-        Some((_, _, _, text)) => (
-            text.clone(),
-            format!(
-                "{{\"rule\":\"{text}\",\"ops_at_stop\":{},\"ops\":{},\"stop_secs\":{:.3},\"drain_secs\":{:.3},\"secs\":{:.3}}}",
-                warm_times.0,
-                WARM_OPS.load(Ordering::Acquire),
-                warm_times.1,
-                warm_times.2 - warm_times.1,
-                warm_times.2
-            ),
-        ),
+        // the claim that ended it (its cycles claimed, its time, capped), the cycles over the whole warm-up (read after
+        // every client finished: the same count, as no claim after the end is counted), and the drain apart
+        Some((_, _, _, text)) => {
+            let w = WARM.lock().unwrap_or_else(|e| e.into_inner());
+            let (capped, at_stop, stop_ns) = w.end.unwrap_or_else(|| not_a_result("the warm-up never ended"));
+            let stop = stop_ns as f64 / 1e9;
+            (
+                text.clone(),
+                format!(
+                    "{{\"rule\":\"{text}\",\"ops_at_stop\":{at_stop},\"ops\":{},\"stop_secs\":{stop:.3},\"drain_secs\":{:.3},\"secs\":{:.3},\"capped\":{capped}}}",
+                    w.claimed,
+                    warm_secs - stop,
+                    warm_secs
+                ),
+            )
+        }
         None => (
             format!("cycles_per_client:{}", a.warmup),
             format!(
                 "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3}}}",
                 a.warmup,
                 a.clients * a.warmup,
-                warm_times.2
+                warm_secs
             ),
         ),
     };

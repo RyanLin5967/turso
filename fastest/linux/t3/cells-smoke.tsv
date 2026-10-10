@@ -1,19 +1,18 @@
 # FASTEST T3 cell manifest: SMOKE, for the GitHub Actions dry run only. Never credited; a real T3 run
 # refuses any manifest whose sha256 is not in REGISTERED-MANIFESTS (empty until the T3 registration).
-cell	system	fs	clients	ops	runs	class
-ours-full-c1	ours	xfs	1	200	2	full
-ours-full-c16	ours	xfs	16	20	1	full
-ours-async-c1	ours	xfs	1	200	1	async
-pg18-d2-c1	pg18-d2	xfs	1	30	1	-
-pg18-defaults-c1	pg18-defaults	xfs	1	30	1	-
-dolt-c1	dolt	xfs	1	30	1	-
-doltgres-c1	doltgres	xfs	1	30	1	-
-b1-c1	b1	xfs	1	30	1	-
-ours-full-c1	ours	btrfs	1	200	2	full
-ours-full-c16	ours	btrfs	16	20	1	full
-ours-async-c1	ours	btrfs	1	200	1	async
-pg18-d2-c1	pg18-d2	btrfs	1	30	1	-
-pg18-defaults-c1	pg18-defaults	btrfs	1	30	1	-
-dolt-c1	dolt	btrfs	1	30	1	-
-doltgres-c1	doltgres	btrfs	1	30	1	-
-b1-c1	b1	btrfs	1	30	1	-
+# age 200 and live 20: the competitors' CI smoke fixture (FT_AGE=200 FT_PREBRANCH=20); PREREG section 7 ages with 1e5
+cell	system	fs	clients	ops	runs	class	age	live
+ours-full-c1	ours	xfs	1	200	2	full	200	20
+ours-full-c16	ours	xfs	16	20	1	full	200	20
+ours-async-c1	ours	xfs	1	200	1	async	200	20
+pg18-d2-c1	pg18-d2	xfs	1	30	1	-	200	20
+dolt-c1	dolt	xfs	1	30	1	-	200	20
+doltgres-c1	doltgres	xfs	1	30	1	-	200	20
+b1-c1	b1	xfs	1	30	1	-	200	20
+ours-full-c1	ours	btrfs	1	200	2	full	200	20
+ours-full-c16	ours	btrfs	16	20	1	full	200	20
+ours-async-c1	ours	btrfs	1	200	1	async	200	20
+pg18-d2-c1	pg18-d2	btrfs	1	30	1	-	200	20
+dolt-c1	dolt	btrfs	1	30	1	-	200	20
+doltgres-c1	doltgres	btrfs	1	30	1	-	200	20
+b1-c1	b1	btrfs	1	30	1	-	200	20

@@ -16,6 +16,10 @@
 #   - reflink (cp --reflink=always) succeeds on xfs and btrfs and is refused on ext4/ext4loop;
 #   - the mountpoint is writable by the calling user.
 set -euo pipefail
+# mkloop.sh backing-dir: print the directory a loop's backing file goes to (/ or /mnt, whichever has more free
+# space), the one rule t3run also needs (fourth lane review LOW 26)
+backing_dir() { df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}'; }
+if [ "${1:-}" = backing-dir ]; then backing_dir; exit 0; fi
 fs=${1:?usage: mkloop.sh <ext4|ext4loop|xfs|btrfs> <mountpoint> [size]}
 mnt=${2:?usage: mkloop.sh <fs> <mountpoint> [size]}
 size=${3:-12G}
@@ -27,7 +31,7 @@ case $fs in
     sudo chown "$me" "$mnt"
     want=ext4 ;;
   ext4loop|xfs|btrfs)
-    best=${LOOP_BACKING_DIR:-$(df --output=avail,target -B1 / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')}
+    best=${LOOP_BACKING_DIR:-$(backing_dir)}
     [ -d "$best" ] || { echo "mkloop: backing directory '$best' does not exist" >&2; exit 2; }
     back="${best%/}/fastest-loop-$fs.img"
     sudo rm -f "$back"
@@ -39,7 +43,9 @@ case $fs in
       btrfs) sudo mkfs.btrfs -f -q "$dev"; want=btrfs ;;
     esac
     sudo mkdir -p "$mnt"
-    sudo mount "$dev" "$mnt"
+    # btrfs defaults to discard=async on a device that supports discard (a loop does): freed extents would be
+    # discarded 10-120 s later, inside a later measured run (fourth lane review MED 5); t3run fstrims between runs
+    if [ "$fs" = btrfs ]; then sudo mount -o nodiscard "$dev" "$mnt"; else sudo mount "$dev" "$mnt"; fi
     sudo chown "$me" "$mnt"
     echo "loop: dev=$dev backing=$back backing_fs=$(findmnt -n -o FSTYPE -T "$best")"
     losetup -l -O NAME,BACK-FILE,DIO,LOG-SEC "$dev"

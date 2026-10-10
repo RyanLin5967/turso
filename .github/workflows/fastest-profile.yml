@@ -5,13 +5,21 @@ name: fastest-profile
 # record flame graph of the create window, callgrind instructions. Gates (budget.json):
 #   - D2: create flushes per op in [1, 1.01] at C=1, in [1/C, 1.01] at C>1, all on the branch log;
 #   - async: 0 flushes on the create path (NOT-RUN while the engine has no async class);
-#   - instructions per create (callgrind) <= 1.05 x the previous green run's sha, rebuilt and run on
-#     the same runner in the same job (its stored baseline artifact is the fallback);
-#   - no create-window syscall above the base's + 0.05 per op;
+#   - instructions per create (callgrind) <= 1.05 x the base's, and no create-window syscall above the base's + 0.05
+#     per op. The base is the sha of the newest baseline artifact for this runner, rebuilt with the head's driver and
+#     run on the same runner in this job. When that base cannot be built, or its profile run fails (its rc is passed
+#     as --base-rc and the base is dropped: review 5 MED 11), every C=1 arm the artifact holds is compared against
+#     the artifact's own numbers for that arm (review 5 MED 10), labelled with its sha, and FAILs as refused when the
+#     artifact names no sha or cpu, ran on another cpu model (PROFILE_CPU), or records another identity: driver
+#     source, profile script, sizes, runner image or valgrind (review 5 MED 12); an artifact arm the head no longer
+#     runs FAILs. With no artifact at all nothing is compared, the run cannot be regression-green, and only a
+#     rebaseline dispatch restarts the chain (T3 review 4bdb3a042..2d42982a0 item 7b);
 #   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z), checked in its own job "absolute
 #     syscall budget" (red at 675adbfb3, 10 per create) so the profile job's own status is the regression verdict;
-#     the BASELINE advances on a regression-green run (every gate but this one passes, both regression gates
-#     evaluated), and the base is the newest run that uploaded a baseline, not the newest green one.
+#     the BASELINE advances on a regression-green run (every regression-kind row of verdict.tsv PASSes; the rows
+#     carry a kind, regression, budget or info, and the two regression gates on full-snap-c1 are always present as
+#     regression rows, so a run that could not evaluate them is not green; T3 review item 29), and the base is the
+#     newest run that uploaded a baseline, not the newest green one.
 # Smoke sizes; nothing here is a credited latency.
 
 on:
@@ -134,7 +142,7 @@ jobs:
             cp target-base/release/examples/fastest_profile dist/base/
             sha256sum dist/base/fastest_profile | tee -a "$RAW/run-info.txt"
           else
-            echo "base build FAILED (analysis falls back to the stored baseline artifact)" | tee -a "$RAW/base.txt"
+            echo "base build FAILED (both regression gates fall back to the baseline artifact's full-snap-c1 numbers, refused unless it ran on this cpu)" | tee -a "$RAW/base.txt"
             tail -30 dist/base/build.stderr | tee -a "$RAW/base.txt"
           fi
       - name: Filesystem and hardware record
@@ -160,16 +168,22 @@ jobs:
         id: gate
         run: |
           export PROFILE_CPU="$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+          # the identity a baseline artifact must match to stand in for a base (review 5 MED 12)
+          export PROFILE_DRIVER_SHA="$(git hash-object core/examples/fastest_profile/main.rs)"
+          export PROFILE_SH_SHA="$(git hash-object fastest/linux/profile/profile.sh)"
+          export PROFILE_VALGRIND="$(valgrind --version)"
           set +e
           python3 -B fastest/linux/profile/analyze.py "$RAW" fastest/linux/profile/budget.json "$RAW/analysis" \
-            --baseline prev/baseline.json
+            --baseline prev/baseline.json $( [ -f "$RAW/base.rc" ] && echo --base-rc "$(cat "$RAW/base.rc")" )
           rc=$?
           cat "$RAW/analysis/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          # green for the BASELINE means regression-green: every gate but the absolute syscall budget passed
+          # green for the BASELINE means regression-green: every regression-kind row of verdict.tsv passed, on a head
+          # that profiled cleanly. A failed base run no longer blocks it (review 5 MED 11): analyze.py dropped that base
+          # and compared against the artifact, and said so in an info row
           green=0
           [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] &&
-            { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
+            green=1
           echo "green=$green" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Upload raw
@@ -189,15 +203,15 @@ jobs:
       - name: Verdict
         run: |
           bad=0
-          for side in head base; do
-            [ -f "$RAW/$side.rc" ] || continue
-            r=$(cat "$RAW/$side.rc"); [ "$r" = 0 ] || { echo "profile.sh $side rc=$r (runs.tsv lists the failed instrument runs)"; bad=1; }
-          done
+          # the head's rc and regression_green decide (review 5 MED 11); a failed base run is reported, not a failure:
+          # analyze.py dropped it and compared against the baseline artifact
           [ -f "$RAW/head.rc" ] || { echo "the head was never profiled"; bad=1; }
-          # The REGRESSION verdict (gate-6 review M9): every gate but the absolute syscall budget, both regression gates
-          # evaluated. The absolute budget is its own job below, so a regression shows as a red profile job and the
-          # known budget red as a red budget job; neither hides the other, and both block.
-          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; grep -v '^budget-syscalls/' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
+          r=$(cat "$RAW/head.rc" 2>/dev/null); [ "${r:-x}" = 0 ] || { echo "profile.sh head rc=${r:-none} (runs.tsv lists the failed instrument runs)"; bad=1; }
+          [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ] || echo "note: profile.sh base rc=$(cat "$RAW/base.rc"): the base was dropped (see the base/run row)"
+          # The REGRESSION verdict (gate-6 review M9): every regression-kind row PASSes (analyze.py regression_green).
+          # The absolute budget's rows are budget-kind and are its own job below, so a regression shows as a red
+          # profile job and the known budget red as a red budget job; neither hides the other, and both block.
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] || { echo "profile REGRESSION gates FAILED (or not evaluated): see verdict.tsv"; awk -F'\t' '$5 != "budget"' "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
           exit $bad
 
   budget:
@@ -211,15 +225,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: fastest/linux/profile
       - uses: actions/download-artifact@v4
         with:
           name: profile-raw-${{ matrix.runner }}
           path: raw
-      - name: The budget-syscalls rows of verdict.tsv
-        run: |
-          f=raw/analysis/verdict.tsv
-          [ -s "$f" ] || { echo "no verdict.tsv: the profile job produced no analysis"; exit 1; }
-          rows=$(awk -F'\t' '$1 ~ /^budget-syscalls\//' "$f")
-          echo "$rows"
-          echo "$rows" | awk -F'\t' '$4 == "PASS" || $4 == "FAIL"' | grep -q . || { echo "no budget-syscalls row was evaluated"; exit 1; }
-          ! echo "$rows" | awk -F'\t' '$4 == "FAIL"' | grep -q .
+      # T3 review 4bdb3a042..2d42982a0 item 28: this step used to go green on ANY arm's PASS, even with no
+      # budget-syscalls/full-snap-c1 row. analyze.py's budget_verdict() (self-tested) requires that row, evaluated,
+      # and no budget-kind FAIL (item 29: rows by kind); an unreadable or malformed verdict.tsv is refused.
+      - name: The budget-syscalls rows of verdict.tsv (budget-syscalls/full-snap-c1 required)
+        run: python3 -B fastest/linux/profile/analyze.py --budget-verdict raw/analysis/verdict.tsv
