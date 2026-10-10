@@ -5049,7 +5049,7 @@ impl BranchStore {
             // The class the cut rewrites the log in, read before the cut clears the inherited
             // floor (engine review 16 LOW 12).
             let cut_class = inner.journal.as_ref().map(rewritten_class);
-            let checkpointed = inner.checkpoint_catalog(fail_after_rename);
+            let checkpointed = inner.checkpoint_catalog(fail_after_rename, &self.group);
             if let Some((lsn, class)) = covered {
                 let committed = inner.cat.as_ref().map(|c| c.generation) != generation;
                 if committed && !fe_mutant("cut_failure_unacknowledges") {
@@ -5184,7 +5184,7 @@ impl BranchStore {
             drop(self.group.quiesce());
         }
         let restart_class = inner.journal.as_ref().map(rewritten_class);
-        inner.ensure_backing(page_size)?;
+        inner.ensure_backing(page_size, &self.group)?;
         if restart {
             // It did (it refuses otherwise): the empty state supersedes everything buffered, in
             // the class read before its rewrite cleared the inherited floor (review 16 LOW 12).
@@ -8148,7 +8148,7 @@ impl StoreInner {
 
     /// Create the arena (and, for a durable store, its files) at the first fork, when the page size
     /// is known.
-    fn ensure_backing(&mut self, page_size: usize) -> Result<()> {
+    fn ensure_backing(&mut self, page_size: usize, group: &Group) -> Result<()> {
         if let Some(current) = self.arena.as_ref().map(Arena::page_size) {
             if current == page_size {
                 return Ok(());
@@ -8173,7 +8173,7 @@ impl StoreInner {
                 && self.trunk.lineage.retained.is_empty()
                 && !fe_mutant("restart_guard_counts_reaped")
             {
-                self.checkpoint_catalog(false)?;
+                self.checkpoint_catalog(false, group)?;
                 catalog_retains = match self.catalog() {
                     Some(cat) => cat.any_retained()?,
                     None => false,
@@ -8184,7 +8184,7 @@ impl StoreInner {
                     "branch arena holds {current}-byte pages but the database now uses {page_size}"
                 )));
             }
-            return self.restart_empty(page_size);
+            return self.restart_empty(page_size, group);
         }
         match &self.files {
             None => self.arena = Some(Arena::new(page_size)),
@@ -8271,7 +8271,7 @@ impl StoreInner {
     /// truncated. Nothing references a slot before or after, so a crash anywhere in between
     /// recovers an empty store; an arena file left at the old size only yields free slots, since
     /// `Arena::open_file` counts whole slots of the recovered page size.
-    fn restart_empty(&mut self, page_size: usize) -> Result<()> {
+    fn restart_empty(&mut self, page_size: usize, group: &Group) -> Result<()> {
         let Some(files) = self.files.clone() else {
             self.restarted_arena(Arena::new(page_size));
             return Ok(());
@@ -8284,7 +8284,7 @@ impl StoreInner {
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
-            if let Err(e) = self.checkpoint_catalog_as(false, true) {
+            if let Err(e) = self.checkpoint_catalog_as(false, true, group) {
                 // Once the catalog committed the new page size, the store cannot go back to the old
                 // one: it fail-stops, and the next open rewrites the log at the new size (engine
                 // review 9 #4). Before the commit, nothing changed on disk, and the old size stays.
@@ -8378,8 +8378,8 @@ impl StoreInner {
     /// purpose): capture, write and install back to back under the store mutex. `maybe_compact`
     /// runs the same three steps as a fuzzy checkpoint instead, with the write on its own thread
     /// and no store mutex held across it (F-FZ).
-    fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
-        self.checkpoint_catalog_as(fail_after_commit, false)
+    fn checkpoint_catalog(&mut self, fail_after_commit: bool, group: &Group) -> Result<()> {
+        self.checkpoint_catalog_as(fail_after_commit, false, group)
     }
 
     /// `checkpoint_catalog`; with `fresh_arena`, for an empty store's page-size restart, whose arena
@@ -8388,7 +8388,12 @@ impl StoreInner {
     /// row deleted, none written) and a high-water mark and in-use count of 0 — exact, since an
     /// empty store references no slot. Mutant `restart_keeps_free_table` (test builds only): the
     /// old arena's free slots and high-water mark, as before.
-    fn checkpoint_catalog_as(&mut self, fail_after_commit: bool, fresh_arena: bool) -> Result<()> {
+    fn checkpoint_catalog_as(
+        &mut self,
+        fail_after_commit: bool,
+        fresh_arena: bool,
+        group: &Group,
+    ) -> Result<()> {
         // The catalog must hold the state the log describes: parked Commits first (C-R).
         self.settle()?;
         if self.journal.is_none() || self.arena.is_none() {
@@ -8426,7 +8431,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w, &self.group);
+            truncate_catalog_wal(&mut w, group);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {
@@ -9923,7 +9928,7 @@ mod tests {
         let durable = BranchDurability::Durable { sync: crate::branch::SyncClass::Off };
         {
             let first = BranchStore::open(durable, None, path).unwrap();
-            first.inner.lock().ensure_backing(512).unwrap();
+            first.inner.lock().ensure_backing(512, &first.group).unwrap();
         }
         let ro = BranchStore::open_with_flags(BranchDurability::Volatile, None, false, path, true)
             .expect("a read-only open over branch files must open trunk-only");
@@ -9944,14 +9949,14 @@ mod tests {
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
-        store.inner.lock().ensure_backing(512).unwrap();
+        store.inner.lock().ensure_backing(512, &store.group).unwrap();
         let files = BranchFiles::for_db(path);
         // The open arena's file is replaced by a directory: the restart's reopen fails.
         std::fs::remove_file(&files.arena).unwrap();
         std::fs::create_dir(&files.arena).unwrap();
-        assert!(store.inner.lock().ensure_backing(1024).is_err(), "the arena reopened over a directory");
+        assert!(store.inner.lock().ensure_backing(1024, &store.group).is_err(), "the arena reopened over a directory");
         std::fs::remove_dir(&files.arena).unwrap();
-        let _ = store.inner.lock().ensure_backing(512);
+        let _ = store.inner.lock().ensure_backing(512, &store.group);
         let mut inner = store.inner.lock();
         assert!(
             store.log(&mut inner, Record::Release { branch: 9 }).is_err(),
@@ -9970,11 +9975,11 @@ mod tests {
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
-        store.inner.lock().ensure_backing(512).unwrap();
+        store.inner.lock().ensure_backing(512, &store.group).unwrap();
         store
             .inner
             .lock()
-            .ensure_backing(1024)
+            .ensure_backing(1024, &store.group)
             .expect("an empty store refused the database's new page size");
         {
             let mut inner = store.inner.lock();
@@ -9999,10 +10004,10 @@ mod tests {
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         let mut inner = store.inner.lock();
-        inner.ensure_backing(512).unwrap();
+        inner.ensure_backing(512, &store.group).unwrap();
         let far = inner.journal.as_ref().unwrap().lsn() + 1;
         inner.pending_free.push_back((far, vec![1, 2]));
-        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        inner.ensure_backing(1024, &store.group).expect("an empty store refused the database's new page size");
         store.group.mark_durable(far, SyncClass::Off);
         store.mature(&mut inner);
         let arena = inner.arena.as_mut().unwrap();
@@ -10025,7 +10030,7 @@ mod tests {
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
         let mut inner = store.inner.lock();
-        inner.ensure_backing(512).unwrap();
+        inner.ensure_backing(512, &store.group).unwrap();
         // Slots 0..4 freed and checkpointed: they are in the catalog's free table. Slots 4..6 freed
         // since: they are on the in-memory list.
         for n in [4, 2] {
@@ -10035,10 +10040,10 @@ mod tests {
                 arena.release(slot);
             }
             if n == 4 {
-                inner.checkpoint_catalog(false).unwrap();
+                inner.checkpoint_catalog(false, &store.group).unwrap();
             }
         }
-        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        inner.ensure_backing(1024, &store.group).expect("an empty store refused the database's new page size");
         let mut seen = HashSet::new();
         for n in 0..8 {
             let slot = inner.alloc_slot().unwrap();
@@ -10063,7 +10068,7 @@ mod tests {
         {
             let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
             let mut inner = store.inner.lock();
-            inner.ensure_backing(512).unwrap();
+            inner.ensure_backing(512, &store.group).unwrap();
             // As above: slots 0..4 in the catalog's free table, 4..6 on the in-memory list.
             for n in [4, 2] {
                 let arena = inner.arena.as_mut().unwrap();
@@ -10072,10 +10077,10 @@ mod tests {
                     arena.release(slot);
                 }
                 if n == 4 {
-                    inner.checkpoint_catalog(false).unwrap();
+                    inner.checkpoint_catalog(false, &store.group).unwrap();
                 }
             }
-            inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+            inner.ensure_backing(1024, &store.group).expect("an empty store refused the database's new page size");
             let catalog = inner.catalog().unwrap();
             assert_eq!(
                 catalog.free_all().unwrap(),
@@ -10095,7 +10100,7 @@ mod tests {
             for &slot in &held {
                 inner.arena.as_mut().unwrap().write_slot(slot, &[0u8; 1024]).unwrap();
             }
-            inner.checkpoint_catalog(false).unwrap();
+            inner.checkpoint_catalog(false, &store.group).unwrap();
             let mut seen: HashSet<Slot> = held.iter().copied().collect();
             for _ in 0..8 {
                 let slot = inner.alloc_slot().unwrap();
@@ -10111,7 +10116,7 @@ mod tests {
         // stale row lists them free.
         let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
         let mut inner = store.inner.lock();
-        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        inner.ensure_backing(1024, &store.group).expect("the reopened store is not at the new page size");
         let free = inner.catalog().unwrap().free_all().unwrap();
         assert!(free.iter().all(|&s| s >= 2), "after a reopen the free table lists a held slot: {free:?}");
     }
@@ -10130,10 +10135,10 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
-            store.inner.lock().ensure_backing(512).unwrap();
+            store.inner.lock().ensure_backing(512, &store.group).unwrap();
             store.set_failpoint(Some(BranchFailpoint::ReplacementSyncFails));
             let mut inner = store.inner.lock();
-            assert!(inner.ensure_backing(1024).is_err(), "premise: the restart's log rewrite failed");
+            assert!(inner.ensure_backing(1024, &store.group).is_err(), "premise: the restart's log rewrite failed");
             assert!(inner.poisoned(), "a restart whose catalog commit landed went on");
             assert_eq!(
                 inner.journal.as_ref().map(Journal::page_size),
@@ -10144,7 +10149,7 @@ mod tests {
         let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path)
             .expect("the files a restart cut short after its catalog commit left behind were refused at open");
         let mut inner = store.inner.lock();
-        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        inner.ensure_backing(1024, &store.group).expect("the reopened store is not at the new page size");
         assert_eq!(inner.journal.as_ref().map(Journal::page_size), Some(1024));
         assert_eq!(inner.alloc_slot().unwrap(), 0, "the reopened arena does not start empty");
     }
@@ -10160,7 +10165,7 @@ mod tests {
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
-        store.inner.lock().ensure_backing(512).unwrap();
+        store.inner.lock().ensure_backing(512, &store.group).unwrap();
         let b = store.fork_trunk_locked(Arc::new(Schema::default()), 512).unwrap();
         // A trunk write while b lives keeps its pre-image for b, in the catalog after a checkpoint.
         store.first_write_trunk(1, &[7u8; 512]).unwrap();
@@ -10176,7 +10181,7 @@ mod tests {
         );
         let mut inner = store.inner.lock();
         inner
-            .ensure_backing(1024)
+            .ensure_backing(1024, &store.group)
             .expect("a store with no branch refused a new page size over rows its next checkpoint deletes");
         assert_eq!(inner.alloc_slot().unwrap(), 0, "the restarted arena does not start empty");
     }
@@ -10190,11 +10195,11 @@ mod tests {
         let path = path.to_str().unwrap();
         let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         let mut inner = store.inner.lock();
-        inner.ensure_backing(512).unwrap();
+        inner.ensure_backing(512, &store.group).unwrap();
         inner
             .apply_fork(BranchId::TRUNK, BranchId(1), None, Handle::Detached, None)
             .unwrap();
-        assert!(inner.ensure_backing(1024).is_err(), "a store holding a branch changed page size");
+        assert!(inner.ensure_backing(1024, &store.group).is_err(), "a store holding a branch changed page size");
     }
 
     /// Review 5 #13: the one-device guard (ruling 85a032f01: the arena is synced by a plain fsync,
@@ -10238,21 +10243,21 @@ mod tests {
                     "create" => {
                         let store = BranchStore::open(mode, None, path).unwrap();
                         let _s = shift();
-                        let got = store.inner.lock().ensure_backing(512);
+                        let got = store.inner.lock().ensure_backing(512, &store.group);
                         got.is_err()
                     }
                     "restart" => {
                         let store = BranchStore::open(mode, None, path).unwrap();
-                        store.inner.lock().ensure_backing(512).unwrap();
+                        store.inner.lock().ensure_backing(512, &store.group).unwrap();
                         let _s = shift();
-                        let got = store.inner.lock().ensure_backing(1024);
+                        let got = store.inner.lock().ensure_backing(1024, &store.group);
                         got.is_err()
                     }
                     _ => {
                         {
                             let store = BranchStore::open(mode, None, path).unwrap();
                             let mut inner = store.inner.lock();
-                            inner.ensure_backing(512).unwrap();
+                            inner.ensure_backing(512, &store.group).unwrap();
                             store.log(&mut inner, Record::Clock { now_ms: 7 }).unwrap();
                         }
                         let _s = shift();
@@ -10285,7 +10290,7 @@ mod tests {
                 {
                     let store = BranchStore::open(mode, None, path).unwrap();
                     let mut inner = store.inner.lock();
-                    inner.ensure_backing(512).unwrap();
+                    inner.ensure_backing(512, &store.group).unwrap();
                     store.log(&mut inner, Record::Clock { now_ms: 7 }).unwrap();
                 }
                 let files = BranchFiles::for_db(path);
@@ -10320,9 +10325,9 @@ mod tests {
         let files = BranchFiles::for_db(path);
         // A directory where the arena file goes: the first attempt's arena open fails.
         std::fs::create_dir(&files.arena).unwrap();
-        assert!(store.inner.lock().ensure_backing(512).is_err(), "the arena opened over a directory");
+        assert!(store.inner.lock().ensure_backing(512, &store.group).is_err(), "the arena opened over a directory");
         std::fs::remove_dir(&files.arena).unwrap();
-        store.inner.lock().ensure_backing(1024).unwrap();
+        store.inner.lock().ensure_backing(1024, &store.group).unwrap();
         {
             let mut inner = store.inner.lock();
             store.log(&mut inner, Record::Release { branch: 9 }).unwrap();
@@ -10347,16 +10352,16 @@ mod tests {
         {
             let first = BranchStore::open(durable, None, path).unwrap();
             let mut inner = first.inner.lock();
-            inner.ensure_backing(512).unwrap();
+            inner.ensure_backing(512, &first.group).unwrap();
             first.log(&mut inner, Record::Release { branch: 7 }).unwrap();
             drop(inner);
             assert!(
-                late.inner.lock().ensure_backing(512).is_err(),
+                late.inner.lock().ensure_backing(512, &late.group).is_err(),
                 "a second store created its files over a live store's"
             );
         }
         assert!(
-            late.inner.lock().ensure_backing(512).is_err(),
+            late.inner.lock().ensure_backing(512, &late.group).is_err(),
             "a store started over files another store had written since it opened"
         );
         let files = BranchFiles::for_db(path);
