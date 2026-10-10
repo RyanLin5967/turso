@@ -218,11 +218,13 @@ def gates(rec):
     for lay in rec["leaf"].get("layers") or []:
         bad += counter_gate(f"loop layer {lay.get('name')}", lay.get("write_cache"), lay.get("flush_ios_delta"),
                             lay.get("lab_flush_ios_delta"))
+    # A16 (1): the kernel's state and the drive's own report (the V3 batch's leaf record) must AGREE; an absent or
+    # unknown report is not agreement (third lane review LOW 7). A ram disk (brd, dry runs only) has no report.
     dr = rec["leaf"].get("drive_reports")
-    if dr in ("write back", "write through") and rec["leaf"]["write_cache"] in ("write back", "write through") \
-            and dr != rec["leaf"]["write_cache"]:
+    want_dr = "none (RAM)" if str(rec["leaf"].get("disk", "")).startswith("ram") else rec["leaf"]["write_cache"]
+    if dr != want_dr:
         bad.append(f"drive {rec['leaf']['disk']}: the kernel's write_cache ({rec['leaf']['write_cache']}) disagrees with "
-                   f"the drive's own report ({dr})")
+                   f"the drive's own report ({dr!r})")
     wc = rec["leaf"]["write_cache"]
     if wc in ("write back", "write through"):
         bad += counter_gate(f"drive {rec['leaf']['disk']}", wc, rec["arms"]["fsync"]["timed"].get("flush_ios_delta"),
@@ -498,14 +500,15 @@ def self_test():
                   c2["failed"] == 2 and c2["data_fsyncs"] == 2 and c2["io_uring_setup"] == 1))
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
-            timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive=None, lab_syncs=N - 1):
+            timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1"):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
             return {"v1l": v, "labelling_fio": {"writes": fio_w, "syncs": syncs},
                     "timed": {"writes": fio_w, "syncs": tsyncs, "fsync_p50_us": 300.0, "fsync_bins_ns": {"300000": tsyncs}}}
         # fio's own sync count is whatever it reports (9,999 or 10,000 with end_fsync); only agreement is gated
-        r = {"leaf": {"disk": "nvme1n1", "write_cache": wc, "layers": layers or [], "drive_reports": drive},
+        r = {"leaf": {"disk": disk, "write_cache": wc, "layers": layers or [],
+                      "drive_reports": wc if drive == "same" else drive},
              "arms": {"fsync": arm(fsyncs, lab_syncs, timed_syncs),
                       "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
@@ -538,6 +541,12 @@ def self_test():
         ("M6: kernel write through over a drive reporting write back VOIDs",
          gates(rec(wc="write through", delta=0, drive="write back")) != []),
         ("M6: kernel and drive agreeing on write back is VALID", gates(rec(drive="write back")) == []),
+        ("LOW 7: a write-through drive with no drive report VOIDs", gates(rec(wc="write through", delta=0, drive=None)) != []),
+        ("LOW 7: a write-back drive with an 'unknown' drive report VOIDs", gates(rec(drive="unknown")) != []),
+        ("LOW 7: a ram disk (brd) with the probe's 'none (RAM)' is VALID",
+         gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0")) == []),
+        ("LOW 7: a ram disk claiming a drive report VOIDs",
+         gates(rec(wc="write through", delta=0, drive="write through", disk="ram0")) != []),
         ("A16: write-through drive with a non-zero counter VOIDs", gates(rec(wc="write through", delta=1)) != []),
         ("A16: write-through loop layer with a non-zero counter VOIDs",
          gates(rec(layers=[{"name": "loop3", "write_cache": "write through", "flush_ios_delta": 3}])) != []),
