@@ -543,8 +543,19 @@ impl Catalog {
     /// fuzzy checkpoint (F-FZ), which runs without the store mutex while the store's own
     /// connection keeps serving on-demand reads from a pinned snapshot.
     pub(crate) fn writer(&self, sync: SyncClass) -> Result<Catalog> {
-        let conn = self._db.connect()?;
-        Self::prepared(self._db.clone(), conn, sync)
+        Self::reader_on(self._db.clone(), sync)
+    }
+
+    /// The catalog database, for a handle opened without the store mutex (`reader_on`).
+    pub(crate) fn database(&self) -> Arc<Database> {
+        self._db.clone()
+    }
+
+    /// A handle on the catalog database `db` over a connection of its own (the name filter's
+    /// builder, which opens it off the store mutex).
+    pub(crate) fn reader_on(db: Arc<Database>, sync: SyncClass) -> Result<Catalog> {
+        let conn = db.connect()?;
+        Self::prepared(db, conn, sync)
     }
 
     /// Set a connection's pragmas and prepare every statement on it.
