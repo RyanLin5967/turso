@@ -337,6 +337,10 @@ pub(crate) struct BranchStore {
     /// rolled back) is not decided again by the retry — the page's written epoch already is the
     /// commit's own — yet the commit overwrites what it kept (review 3 #1).
     retain_floor: AtomicU64,
+    /// Time the phases of every release (r11-ever amendment 34, instrument I; merged from
+    /// r11-ever-pk5-A). Read before the store mutex, so the wait for it is one of the phases. Off
+    /// unless a harness turns it on.
+    reap_phases: AtomicBool,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -1126,6 +1130,58 @@ struct StoreInner {
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
     last_fork_lsn: u64,
+    /// Observation only; see [`ReapProbe`].
+    probe: ReapProbe,
+}
+
+/// r11-ever amendment 34's instrument I and its arms (merged from r11-ever-pk5-A 7831b51a7 and its
+/// fixes, written for the volatile store F7'+F8). Observation only: nothing here changes what a
+/// release frees or what any reader sees; arm G changes only WHEN a removed state's memory goes
+/// (never, while it is on).
+#[derive(Default)]
+struct ReapProbe {
+    /// ns of the last release's phases while [`BranchStore::reap_phases`] is on: lock (the wait for
+    /// the store mutex), remove (everything from the lock to the state's removal from the table:
+    /// on the composed store that includes the release's record and bookkeeping), release (the
+    /// slots it frees, gathered and then handed to the arena; a store whose Release must become
+    /// durable first holds them instead, and that hold is all this phase then times), child_gone
+    /// (the parent's lineage and the child index), drop (the removed state's destructor, i.e. the
+    /// allocator's frees). Zeroed at each release's start and summed over the states one release
+    /// frees in cascade; a release that retires or splices its branch is not split: that time is
+    /// in none of the phases.
+    last: [u64; 5],
+    /// Arm G: a removed state is parked here instead of dropped, so no free reaches the allocator.
+    /// Never emptied while the arm is on: the harness leaks it.
+    graveyard: Option<Vec<BranchState>>,
+    /// The fire-check's planted stall: sleep this long inside the drop phase.
+    planted_drop_sleep_us: u64,
+}
+
+/// Adds the time since `mark` to `acc` and restarts `mark`; a no-op while the phase timers are off.
+fn lap(mark: &mut Option<Instant>, acc: &mut u64) {
+    if let Some(m) = mark {
+        let now = Instant::now();
+        *acc += now.duration_since(*m).as_nanos() as u64;
+        *m = now;
+    }
+}
+
+/// Restarts `mark` without charging any phase (instrument I: a retire or a splice is in none).
+fn unlapped(mark: &mut Option<Instant>) {
+    if let Some(m) = mark {
+        *m = Instant::now();
+    }
+}
+
+/// The drop phase of a release: park the state in arm G's graveyard, or drop it.
+fn dispose(st: BranchState, probe: &mut ReapProbe) {
+    if probe.planted_drop_sleep_us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(probe.planted_drop_sleep_us));
+    }
+    match probe.graveyard.as_mut() {
+        Some(g) => g.push(st),
+        None => drop(st),
+    }
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -3133,6 +3189,7 @@ impl BranchStore {
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             fuzzy: false,
+            reap_phases: AtomicBool::new(false),
         }
     }
 
@@ -3394,6 +3451,7 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
+            reap_phases: AtomicBool::new(false),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -7150,6 +7208,7 @@ impl StoreInner {
             fail_stop: Arc::new(AtomicBool::new(false)),
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
+            probe: ReapProbe::default(),
         }
     }
 
