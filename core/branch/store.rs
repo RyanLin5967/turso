@@ -749,6 +749,10 @@ impl BranchStore {
             let deferred = st.open || !st.lineage.children.is_empty();
             let start = inner.doomed_end();
             self.collect(&mut inner, id, &mut dead);
+            // MUTANT M1: the unlink hold reclaims the whole queue before it releases the mutex.
+            while !inner.doomed.is_empty() {
+                inner.reclaim(usize::MAX);
+            }
             crate::turso_assert!(
                 deferred || !inner.branches.contains_key(&id),
                 "a branch nothing reads through was kept"
