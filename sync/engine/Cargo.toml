@@ -39,3 +39,5 @@ uuid = "1.17.0"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 futures = { workspace = true }
+# The busy-wait red reads the thread's CPU time (clock_gettime), as core's busy red does.
+libc = { version = "0.2.172" }

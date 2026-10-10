@@ -17,3 +17,5 @@ hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The busy-wait red reads the thread's CPU time (clock_gettime), as core's busy red does.
+libc = { version = "0.2.172" }

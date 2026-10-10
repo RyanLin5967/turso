@@ -66,3 +66,5 @@ rand_chacha = { workspace = true }
 anyhow.workspace = true
 reqwest = { version = "0.13.2", features = ["json"] }
 serde_json.workspace = true
+# The busy-wait red reads the thread's CPU time (clock_gettime), as core's busy red does.
+libc = { version = "0.2.172" }

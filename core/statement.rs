@@ -601,10 +601,11 @@ impl Statement {
             let now = self.pager.io.current_time_monotonic();
             if now < busy_state.timeout() {
                 // The timeout has not been reached yet: ask the caller to wait
-                // out the remaining delay before stepping again.
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                // out the remaining delay before stepping again. A Sleep does
+                // not wake `waker`: its caller owns the wait (a sleep, or a timer
+                // that wakes the task), since a wake now polls the task again at
+                // once and spins for the whole busy timeout (engine review 11
+                // MED 4).
                 return Ok(StepResult::Sleep {
                     duration: busy_state.get_delay(now),
                 });
@@ -680,10 +681,8 @@ impl Statement {
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
                 // Handler says retry: ask the caller to wait out the backoff
-                // delay before stepping again.
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                // delay before stepping again. As above, a Sleep does not wake
+                // `waker`: the caller owns the wait.
                 res = Ok(StepResult::Sleep {
                     duration: busy_state.get_delay(now),
                 });
@@ -729,6 +728,9 @@ impl Statement {
         self._step(None)
     }
 
+    /// [`Self::step`], registering `waker` with the IO the step waits on. A
+    /// `StepResult::Sleep` (a busy handler's backoff) does not wake it: the caller
+    /// must step again once the duration has passed, by a timer that wakes its task.
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
@@ -1648,6 +1650,16 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+
+    /// The blocking answer to `StepResult::Sleep { duration }` for a caller outside this crate
+    /// that drives the statement itself (sdk-kit's sync step, the sync engine's tape loops): wait
+    /// out the busy handler's backoff on this statement's IO, then step again. Stepping the IO
+    /// backend instead returns at once when nothing is in flight, so the wait spins a core for the
+    /// whole busy timeout (engine review 11 MED 4). It is the one helper (`statement::wait_out_busy`,
+    /// mutant `busy_sleep_spins`) that this crate's own blocking helpers use.
+    pub fn wait_out_busy(&self, duration: Duration) -> Result<()> {
+        wait_out_busy(self._io(), duration)
     }
 }
 
