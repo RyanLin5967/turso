@@ -40,9 +40,17 @@ pub(crate) fn get_cstring(buf: &mut BytesMut) -> Option<String> {
 /// read here was unchecked against the whole read buffer).
 pub(crate) const INSUFFICIENT_DATA: &str = "insufficient data left in message";
 
+/// A protocol fault (08P01) in PostgreSQL's words.
+pub(crate) fn malformed(message: &str) -> PgWireError {
+    PgWireError::MalformedMessage {
+        code: "08P01",
+        message: message.to_owned(),
+    }
+}
+
 fn take<const N: usize>(buf: &mut BytesMut) -> PgWireResult<[u8; N]> {
     if buf.remaining() < N {
-        return Err(PgWireError::MalformedMessage(INSUFFICIENT_DATA));
+        return Err(malformed(INSUFFICIENT_DATA));
     }
     let mut bytes = [0u8; N];
     buf.copy_to_slice(&mut bytes);
@@ -50,7 +58,7 @@ fn take<const N: usize>(buf: &mut BytesMut) -> PgWireResult<[u8; N]> {
 }
 
 /// Checked reads of a frontend message body (vendored change): each refuses a body that ends
-/// first with [`PgWireError::MalformedMessage`].
+/// first with [`PgWireError::MalformedMessage`] (08P01).
 pub(crate) fn read_u8(buf: &mut BytesMut) -> PgWireResult<u8> {
     take::<1>(buf).map(|b| b[0])
 }
@@ -70,25 +78,48 @@ pub(crate) fn read_i32(buf: &mut BytesMut) -> PgWireResult<i32> {
 /// The next `len` bytes of the body.
 pub(crate) fn read_bytes(buf: &mut BytesMut, len: usize) -> PgWireResult<BytesMut> {
     if buf.remaining() < len {
-        return Err(PgWireError::MalformedMessage(INSUFFICIENT_DATA));
+        return Err(malformed(INSUFFICIENT_DATA));
     }
     Ok(buf.split_to(len))
 }
 
 /// [`get_cstring`], refusing a string the body does not terminate (PostgreSQL's "invalid string
-/// in message").
+/// in message", 08P01) and one that is not valid UTF-8 (its "invalid byte sequence for encoding",
+/// 22021): read lossily, the names '\xff' and '\xfe' were one name (wire review 12 item 8).
 pub(crate) fn read_cstring(buf: &mut BytesMut) -> PgWireResult<Option<String>> {
-    if !buf.contains(&b'\0') {
-        return Err(PgWireError::MalformedMessage("invalid string in message"));
+    let Some(end) = buf.iter().position(|&c| c == b'\0') else {
+        return Err(malformed("invalid string in message"));
+    };
+    let bytes = buf.split_to(end + 1);
+    let text = &bytes[..end];
+    if text.is_empty() {
+        return Ok(None);
     }
-    Ok(get_cstring(buf))
+    match str::from_utf8(text) {
+        Ok(s) => Ok(Some(s.to_owned())),
+        Err(e) => {
+            let at = e.valid_up_to();
+            let len = e.error_len().unwrap_or(text.len() - at).clamp(1, 4);
+            let sequence: Vec<String> = text[at..(at + len).min(text.len())]
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect();
+            Err(PgWireError::MalformedMessage {
+                code: "22021",
+                message: format!(
+                    "invalid byte sequence for encoding \"UTF8\": {}",
+                    sequence.join(" ")
+                ),
+            })
+        }
+    }
 }
 
 /// The body has been read to its end: bytes left over are PostgreSQL's "invalid message format"
 /// (pq_getmsgend).
 pub(crate) fn read_end(buf: &BytesMut) -> PgWireResult<()> {
     if buf.has_remaining() {
-        return Err(PgWireError::MalformedMessage("invalid message format"));
+        return Err(malformed("invalid message format"));
     }
     Ok(())
 }

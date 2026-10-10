@@ -1991,6 +1991,7 @@ impl Schema {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                rowid_alias_not_null: false,
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
@@ -2111,6 +2112,8 @@ impl Schema {
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
         dialect: &dyn crate::dialect::Dialect,
     ) -> Result<()> {
+        #[cfg(test)]
+        crate::branch::budget_probe::schema_row_parsed();
         match ty {
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
@@ -2730,6 +2733,7 @@ impl TryClone for BTreeTable {
             foreign_keys: self.foreign_keys.try_clone()?,
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
+            rowid_alias_not_null: self.rowid_alias_not_null,
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
@@ -3331,6 +3335,14 @@ pub struct BTreeTable {
     /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
     pub rowid_alias_conflict_clause: Option<ResolveType>,
+    /// The table's rowid alias (its INTEGER PRIMARY KEY) is NOT NULL, as every primary key of the
+    /// frontend that created it is (PostgreSQL's): an explicit NULL into it, a literal or a bound
+    /// parameter, raises the NOT NULL constraint instead of taking a new rowid. An omitted key
+    /// still takes one, and the key stays the rowid alias with no index of its own. Set by a
+    /// dialect's `parse_table_sql` for the tables it created (the PG frontend's marked tables);
+    /// false for SQLite tables, whose INTEGER PRIMARY KEY turns a NULL into a new rowid
+    /// (fastest-engine 4c).
+    pub rowid_alias_not_null: bool,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
@@ -3398,6 +3410,7 @@ impl BTreeTable {
             foreign_keys,
             check_constraints,
             rowid_alias_conflict_clause,
+            rowid_alias_not_null: false,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
@@ -3407,6 +3420,13 @@ impl BTreeTable {
 
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// Whether an explicit NULL into this table's rowid alias raises the NOT NULL constraint
+    /// instead of taking a new rowid (`rowid_alias_not_null`, fastest-engine 4c). Mutant
+    /// `null_key_takes_rowid` (test builds only): never, as before.
+    pub fn rowid_alias_refuses_null(&self) -> bool {
+        self.rowid_alias_not_null && !crate::branch::store::fe_mutant("null_key_takes_rowid")
     }
 
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
@@ -5049,6 +5069,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
+        rowid_alias_not_null: false,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
@@ -5641,6 +5662,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
+        rowid_alias_not_null: false,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
@@ -6597,6 +6619,7 @@ mod tests {
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            rowid_alias_not_null: false,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),

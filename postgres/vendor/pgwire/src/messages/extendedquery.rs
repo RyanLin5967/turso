@@ -277,7 +277,7 @@ impl Message for Bind {
             match data_len {
                 -1 => parameters.push(None),
                 n if n < 0 => {
-                    return Err(PgWireError::MalformedMessage(codec::INSUFFICIENT_DATA));
+                    return Err(codec::malformed(codec::INSUFFICIENT_DATA));
                 }
                 n => parameters.push(Some(codec::read_bytes(buf, n as usize)?.freeze())),
             }

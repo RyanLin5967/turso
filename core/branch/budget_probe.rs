@@ -11,7 +11,11 @@
 //! * **Live heap bytes** (requested sizes of every live allocation), and the largest allocation
 //!   and catalog-row count inside one store-mutex hold (`take_hold_maxima`).
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
-//!   [`store_unlocked`] (the only two edits to the engine's files), per thread and process-wide.
+//!   [`store_unlocked`] (two `cfg(test)` hook lines in `store.rs`), per thread and process-wide.
+//! * **SQL-layer counts** (engine 2b's schema re-read), per thread: statements prepared, pages read
+//!   through the pager, schema rows parsed, and a WAL write lock with what was done while it was
+//!   held: six `cfg(test)` hook lines in `connection.rs`, `statement.rs`, `schema.rs`, `pager.rs` and
+//!   `wal.rs` ([`sql_counts`]).
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
 //!   `TASK_EVENTS_INFO`, `syscalls_unix`: incremented at every BSD syscall entry by any thread of
 //!   the process, so nothing the engine does can bypass it). Reading it is a Mach trap, which that
@@ -53,6 +57,9 @@ static MAX_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 /// would otherwise mask in the all-threads maximum.
 static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
+// The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
+static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAX_FG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -92,6 +99,165 @@ fn note_alloc(bytes: usize) {
         bump(&T_HELD_ALLOCS, 1);
         bump(&T_HELD_ALLOC_BYTES, bytes as u64);
     }
+    if wal_lock_held() {
+        bump(&T_WAL_ALLOCS, 1);
+        bump(&T_WAL_ALLOC_BYTES, bytes as u64);
+    }
+}
+
+// The SQL layer's counters (engine 2b: a trunk fork's schema re-read), per thread only: statements
+// compiled (`Connection::compile_cmd`, which prepare, execute, query and batches all reach, and
+// `Statement::reprepare`; review 2 M4), pages read through the pager (`Pager::read_page`
+// calls that find no read of that page pending: a cache hit, or a miss's first call; a call
+// re-entered on a page still loading counts again), schema rows parsed (`Schema::handle_schema_row`,
+// which a reparse and the ParseSchema opcode both reach; review 2 M4),
+// and a WAL write lock (from `Pager::begin_write_tx` once `Wal::begin_write_tx` succeeded, to
+// `WalFile::end_write_tx`, which every release path calls: the commit's, a rollback's, a close's),
+// with what this thread did while it held one; and the statements compiled while this thread held a
+// store mutex (`held_prepares`, review 2 L6). Six `cfg(test)` hook lines in the engine's files.
+// BLIND SPOTS: a page read without the pager's `read_page` (`read_page_no_cache`) is not counted;
+// the lock is ANY database's WAL write lock, the trunk's or the branch catalog's own (a separate
+// Turso database); a thread holding two at once reads as holding one until either is released.
+thread_local! {
+    static T_PREPARES: Cell<u64> = const { Cell::new(0) };
+    static T_PAGE_READS: Cell<u64> = const { Cell::new(0) };
+    static T_SCHEMA_ROWS: Cell<u64> = const { Cell::new(0) };
+    /// Statements compiled while this thread held a store mutex (review 2 L6: a first create's
+    /// catalog creation prepares 42 statements and runs 13 DDL commits under it).
+    static T_HELD_PREPARES: Cell<u64> = const { Cell::new(0) };
+    static WAL_HELD: Cell<bool> = const { Cell::new(false) };
+    static T_WAL_LOCKS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_PREPARES: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_PAGE_READS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_SCHEMA_ROWS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static T_WAL_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Whether this thread holds a WAL write lock now, any database's (review 2 L12: not only the
+/// trunk's; the branch catalog is a database of its own).
+pub(crate) fn wal_lock_held() -> bool {
+    WAL_HELD.try_with(|h| h.get()).unwrap_or(false)
+}
+
+/// A statement was prepared on this thread.
+pub(crate) fn statement_prepared() {
+    bump(&T_PREPARES, 1);
+    if DEPTH.try_with(|d| d.get()).unwrap_or(0) > 0 {
+        bump(&T_HELD_PREPARES, 1);
+    }
+    if wal_lock_held() {
+        bump(&T_WAL_PREPARES, 1);
+    }
+}
+
+/// A page was read through the pager on this thread.
+pub(crate) fn page_read() {
+    bump(&T_PAGE_READS, 1);
+    if wal_lock_held() {
+        bump(&T_WAL_PAGE_READS, 1);
+    }
+}
+
+/// A `sqlite_schema` row was parsed into a schema on this thread.
+pub(crate) fn schema_row_parsed() {
+    bump(&T_SCHEMA_ROWS, 1);
+    if wal_lock_held() {
+        bump(&T_WAL_SCHEMA_ROWS, 1);
+    }
+}
+
+/// This thread took a WAL write lock (`Pager::begin_write_tx`, once the WAL's own succeeded).
+pub(crate) fn wal_write_locked() {
+    let _ = WAL_HELD.try_with(|h| h.set(true));
+    bump(&T_WAL_LOCKS, 1);
+}
+
+/// This thread let a WAL write lock go (`WalFile::end_write_tx`).
+pub(crate) fn wal_write_unlocked() {
+    let _ = WAL_HELD.try_with(|h| h.set(false));
+}
+
+/// The SQL-layer counters of the calling thread at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SqlCounts {
+    pub(crate) prepares: u64,
+    pub(crate) page_reads: u64,
+    pub(crate) schema_rows: u64,
+    pub(crate) wal_locks: u64,
+    pub(crate) wal_prepares: u64,
+    pub(crate) wal_page_reads: u64,
+    pub(crate) wal_schema_rows: u64,
+    pub(crate) wal_allocs: u64,
+    pub(crate) wal_alloc_bytes: u64,
+    pub(crate) held_prepares: u64,
+}
+
+pub(crate) fn sql_counts() -> SqlCounts {
+    let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+    SqlCounts {
+        prepares: get(&T_PREPARES),
+        page_reads: get(&T_PAGE_READS),
+        schema_rows: get(&T_SCHEMA_ROWS),
+        wal_locks: get(&T_WAL_LOCKS),
+        wal_prepares: get(&T_WAL_PREPARES),
+        wal_page_reads: get(&T_WAL_PAGE_READS),
+        wal_schema_rows: get(&T_WAL_SCHEMA_ROWS),
+        wal_allocs: get(&T_WAL_ALLOCS),
+        wal_alloc_bytes: get(&T_WAL_ALLOC_BYTES),
+        held_prepares: get(&T_HELD_PREPARES),
+    }
+}
+
+thread_local! {
+    static T_WINDOWS_MET: Cell<u64> = const { Cell::new(0) };
+    static T_FUTILE_LEADS: Cell<u64> = const { Cell::new(0) };
+    static T_SLEEPS: Cell<u64> = const { Cell::new(0) };
+    static T_REGISTRATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A trunk fork registration attempt on this thread (`Connection::fork_trunk_registered`; review 2
+/// M5: an internal retry shows as more attempts than acknowledged creates).
+pub(crate) fn fork_registration() {
+    bump(&T_REGISTRATIONS, 1);
+}
+
+/// This thread's count of `fork_registration`.
+pub(crate) fn fork_registrations() -> u64 {
+    T_REGISTRATIONS.with(|c| c.get())
+}
+
+/// This thread slept through `crate::thread::sleep` (test builds' wrapper, review 2 M3).
+pub(crate) fn slept() {
+    bump(&T_SLEEPS, 1);
+}
+
+/// This thread's count of `slept`.
+pub(crate) fn sleeps() -> u64 {
+    T_SLEEPS.with(|c| c.get())
+}
+
+/// A flight waiter on this thread took the store mutex and the group lock to lead, and led no flight:
+/// it was covered meanwhile, or another flight was already in the air (review 1 #9's herd; review 2
+/// H5). Two `cfg(test)` hook lines in `BranchStore::wait_durable_on`.
+pub(crate) fn futile_lead() {
+    bump(&T_FUTILE_LEADS, 1);
+}
+
+/// This thread's count of `futile_lead`.
+pub(crate) fn futile_leads() -> u64 {
+    T_FUTILE_LEADS.with(|c| c.get())
+}
+
+/// A trunk fork on this thread found no schema in hand at its snapshot's cookie (engine 2b's DDL
+/// window; a `cfg(test)` hook line in `Connection::fork_trunk_registered`, review 2 M2's premise).
+pub(crate) fn schema_window_met() {
+    bump(&T_WINDOWS_MET, 1);
+}
+
+/// This thread's count of `schema_window_met`.
+pub(crate) fn schema_windows_met() -> u64 {
+    T_WINDOWS_MET.with(|c| c.get())
 }
 
 // SAFETY: every call is forwarded unchanged to `System`; the counting touches only atomics and
@@ -167,14 +333,20 @@ pub(crate) fn store_unlocked() {
         let (bytes, rows) = (get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), get(&T_CAT_ROWS).wrapping_sub(rows0));
         MAX_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
         MAX_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
-        if !FOREGROUND.with(|f| f.get()) {
+        if FOREGROUND.with(|f| f.get()) {
+            MAX_FG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
+            MAX_FG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+        } else {
             MAX_BG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
             MAX_BG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
         }
-        if let (Some(since), Some(now)) = (HELD_SINCE.with(|s| s.take()), unix_syscalls()) {
-            let held = now.wrapping_sub(since) & u64::from(u32::MAX);
-            HELD_SYSCALLS.fetch_add(held, Relaxed);
-            bump(&T_HELD_SYSCALLS, held);
+        // Review 2 L7: the kernel count is read only when an armed hold sampled it at its lock.
+        if let Some(since) = HELD_SINCE.with(|s| s.take()) {
+            if let Some(now) = unix_syscalls() {
+                let held = now.wrapping_sub(since) & u64::from(u32::MAX);
+                HELD_SYSCALLS.fetch_add(held, Relaxed);
+                bump(&T_HELD_SYSCALLS, held);
+            }
         }
     }
 }
@@ -202,16 +374,22 @@ pub(crate) fn live_heap_bytes() -> i64 {
 }
 
 /// `(bytes allocated, catalog rows touched)` in the largest single store-mutex hold since the last
-/// call, by any thread, and start again from zero.
-pub(crate) fn take_hold_maxima() -> (u64, u64) {
-    let _ = take_background_hold_maxima();
-    (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed))
+/// `take_hold_maxima`: by any thread, by threads not marked foreground, and by the foreground one.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HoldMaxima {
+    pub(crate) all: (u64, u64),
+    pub(crate) background: (u64, u64),
+    pub(crate) foreground: (u64, u64),
 }
 
-/// The same over holds by threads not marked foreground, and start again from zero. Reset by
-/// `take_hold_maxima` too.
-pub(crate) fn take_background_hold_maxima() -> (u64, u64) {
-    (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed))
+/// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
+/// order of two calls can zero one maximum before it is read).
+pub(crate) fn take_hold_maxima() -> HoldMaxima {
+    HoldMaxima {
+        all: (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed)),
+        background: (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed)),
+        foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
+    }
 }
 
 /// Mark the calling thread as the foreground (measuring) thread, or unmark it.
@@ -276,6 +454,11 @@ pub(crate) fn end() -> Snapshot {
     s.syscalls = syscalls;
     s.instructions = instructions();
     s
+}
+
+/// This thread's store-mutex acquisitions so far (exact per thread however many others run).
+pub(crate) fn thread_locks() -> u64 {
+    T_LOCKS.with(|c| c.get())
 }
 
 /// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
@@ -412,19 +595,28 @@ pub(crate) fn phys_footprint() -> Option<u64> {
     }
 }
 
-/// Threads a branch store keeps for its whole life, by name: not counted by [`threads`], since a
-/// window cannot wait for them to exit. An allowlist on purpose: an unknown long-lived thread is
-/// counted, so the windows never settle and the cell refuses, rather than its work being ignored.
-pub(crate) const PERSISTENT_THREADS: &[&str] = &["branch-confirm"];
+/// The store threads that live as long as their store (the confirmation writer, review 6 #1) and
+/// park between bursts of work: counted live by the engine itself (`persistent_started` before the
+/// spawn, `persistent_ended` as the thread's last act; three `cfg(test)` lines in
+/// `BranchStore::start_confirm_writer`), and left out of [`threads`] on every platform (review 2 M6;
+/// it replaced a name allowlist read with pthread calls inside the measured window, review 2 L1).
+static PERSISTENT_LIVE: AtomicI64 = AtomicI64::new(0);
 
-/// The threads of this process, each as `(is_self, blocked, persistent)`, given to `each`;
-/// `None` when they cannot be listed (off Apple). Mach traps and userspace only (the port list is
-/// given back with `mach_port_deallocate` and `vm_deallocate`; a thread's name is read from its
-/// pthread), so it can run inside a measured window without moving the syscall count. `blocked` is
-/// `TH_STATE_WAITING`: a thread in a blocking wait or syscall. A thread woken (by a notify) is
-/// runnable at once, before it runs, so a woken thread never reads blocked.
-#[allow(deprecated)]
-fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
+/// A persistent store thread is about to start.
+pub(crate) fn persistent_started() {
+    PERSISTENT_LIVE.fetch_add(1, Relaxed);
+}
+
+/// A persistent store thread is ending (or never started).
+pub(crate) fn persistent_ended() {
+    PERSISTENT_LIVE.fetch_sub(1, Relaxed);
+}
+
+/// The threads of this process, each as `(is_self, blocked)`, given to `each`; `None` when they cannot
+/// be listed (off Apple). Mach traps and userspace only (the port list is given back with
+/// `mach_port_deallocate` and `vm_deallocate`), so it can run inside a measured window without moving
+/// the syscall count. `blocked` is the kernel's `TH_STATE_WAITING` for the thread.
+fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
     #[cfg(target_vendor = "apple")]
     {
         extern "C" {
@@ -456,18 +648,7 @@ fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
                     &mut n,
                 )
             };
-            let blocked = kr == 0 && info.run_state == libc::TH_STATE_WAITING;
-            let mut name = [0 as libc::c_char; 64];
-            // SAFETY: a thread port of this task; a thread that has exited gives a null pthread.
-            let pt = unsafe { libc::pthread_from_mach_thread_np(port) };
-            let persistent = pt != 0
-                // SAFETY: a live pthread of this process and a buffer of the length given.
-                && unsafe { libc::pthread_getname_np(pt, name.as_mut_ptr(), name.len()) } == 0
-                // SAFETY: NUL-terminated by pthread_getname_np.
-                && unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-                    .to_str()
-                    .is_ok_and(|n| PERSISTENT_THREADS.contains(&n));
-            each(port == me, blocked, persistent);
+            each(port == me, kr == 0 && info.run_state == libc::TH_STATE_WAITING);
             // SAFETY: `list` holds `count` send rights, each released once.
             unsafe { mach_port_deallocate(task, port) };
         }
@@ -488,22 +669,21 @@ fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
     }
 }
 
-/// The threads this process has now, persistent ones (`PERSISTENT_THREADS`) left out: through
-/// [`each_thread`] on Apple (so it can be read inside a measured window), `/proc/self/stat` on Linux
-/// (persistent ones included there); `None` elsewhere.
+/// The threads this process has now, the live persistent store threads (`PERSISTENT_LIVE`) left out:
+/// through [`each_thread`] on Apple (so it can be read inside a measured window), `/proc/self/stat`
+/// on Linux; `None` elsewhere.
 pub(crate) fn threads() -> Option<u64> {
     let mut n = 0u64;
-    if each_thread(|_, _, persistent| n += u64::from(!persistent)).is_some() {
-        return Some(n);
-    }
-    linux_threads()
+    let raw = if each_thread(|_, _| n += 1).is_some() { Some(n) } else { linux_threads() }?;
+    u64::try_from(raw as i64 - PERSISTENT_LIVE.load(Relaxed)).ok()
 }
 
 /// Whether every thread but the caller is blocked (see [`each_thread`]): the work a notify woke has
-/// run and parked again. `None` off Apple.
+/// run and parked again. `None` off Apple: a window that needs it must refuse there, never assume it
+/// (review 2 M6).
 pub(crate) fn others_blocked() -> Option<bool> {
     let mut all = true;
-    each_thread(|me, blocked, _| all &= me || blocked)?;
+    each_thread(|me, blocked| all &= me || blocked)?;
     Some(all)
 }
 

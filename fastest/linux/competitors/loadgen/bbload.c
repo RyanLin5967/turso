@@ -2,19 +2,47 @@
  *
  *   bbload --spec FILE --out DIR --clients C
  *          [--mode closed|open] [--rate R]          open loop: Poisson arrivals, R ops/s in total
- *          [--warmup-s S] [--warmup-ops N]           warm-up ends when both are reached (default 0, 0)
+ *          [--warmup OPS:S:MAX_S]                    the warm-up rule (PREREG annex A23, the macOS bbload's claim_op):
+ *                                                    decided AT EACH CLAIM of an op by warm_ends, the warm-up ends at
+ *                                                    the first claim with OPS warm-up ops claimed before it and S
+ *                                                    seconds since t0 (done), or with MAX_S seconds since t0 (capped);
+ *                                                    the ending claim is the first measured op. Integer ns, seconds
+ *                                                    truncated as (uint64_t)(S * 1e9). MAX_S is a bound, never "no
+ *                                                    limit" (A23-AM1): MAX_S 0 ends the warm-up at the first claim.
+ *                                                    PREREG :210 is min(max(1000 ops, 10 s), 10% of the cap), e.g.
+ *                                                    1000:10:180 at an 1800 s cap. summary.json warmup_rule is
+ *                                                    formatted from the effective values (%llu:%g:%g); mixing it with
+ *                                                    --warmup-ops or --warmup-s is refused (rc 2; MED 7)
+ *          [--warmup-s S] [--warmup-ops N]           the legacy form: OPS and S, with MAX_S 0.1 x --max-window-s (as the
+ *                                                    macOS bbload takes 0.1 x its run cap; refused without a window
+ *                                                    bound)
+ *   bbload --warmup-replay OPS:S:MAX_S < TRACE       warm_ends replayed on claim times (integer ns since t0, one per
+ *                                                    line, non-decreasing): one line, "stop_at=I warm_ops=N capped=0|1"
+ *                                                    or "stop_at=none warm_ops=N capped=none" (the shared cross-driver
+ *                                                    test fastest/linux/gates/warmup_conformance.py; A23)
  *          [--duration-s S] [--min-ops N]            the measured window ends when both are reached
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
- *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600)
+ *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
+ *                                                    with --max-ops it is the registered per-run cap: a run it ends
+ *                                                    exits 0 with verdict "capped" (capped: true) and its counts;
+ *                                                    timedrun.py applies PREREG's tiers (MED 5)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
- *          [--stall-s S] [--allow-errors]
+ *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
+ *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
+ *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to); A23 gives 0:0:0 the same 0 warm-up ops.
+ *   summary.json records the warm-up as decided: warmup_ops (the claims before the ending one), warmup_end_ns (the
+ *   ending claim, ns since t0), warmup_capped, warmup_last_claim_ns (the last warm-up claim; null with none), and
+ *   warmup_backsteps (claims judged with an older time than the one judged before them; 0 in both loop modes: each
+ *   claim's time is fixed under the claim lock, see claim_warm and claim_open), and loop (closed | open).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
  * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
  *
  * Latency is measured from the INTENDED send time. Closed loop: intended = actual send, think time 0. Open loop:
- * each client follows its own Poisson schedule at R/C; a late op still counts from its intended time, and every op
- * intended inside the window is run even after the window closes, so queueing is never hidden (AG9).
+ * ONE Poisson arrival stream at R for the whole run, seeded by --seed alone and starting at t0 (the macOS bbload's,
+ * artie 4010ff3b06; PREREG annex A23): a free client claims the next arrival under the claim lock and waits for it;
+ * a late op still counts from its intended time, and every op intended inside the window is run even after the window
+ * closes, so queueing is never hidden (AG9). (Before A23 each client followed its own Poisson schedule at R/C.)
  * An operation is the spec's steps run in order; no step is sent before the previous one is acknowledged.
  *
  * Spec file (one directive per line, '#' comments; templates: {c} client, {i} op number of that client,
@@ -29,6 +57,8 @@
  *   step connect <overrides>      timed; open a new connection (home conninfo + overrides) that becomes current
  *   step close                    timed; close the current non-home connection
  *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns
+ *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
+ *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -105,7 +135,7 @@ enum { P_PG = 0, P_MYSQL = 1 };
 enum { K_SQL, K_WRITE, K_CONNECT, K_CLOSE };
 enum { PH_INIT = 0, PH_WARM = 1, PH_MEAS = 2, PH_DRAIN = 3, PH_ABORT = 4 };
 
-typedef struct { int k; char *t; } step_t;
+typedef struct { int k; char *t; int serial; } step_t;
 typedef struct {
     int proto;
     char *connect;
@@ -145,7 +175,9 @@ typedef struct {
 
 static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
-static double RATE = 0, WARM_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
+static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static char WARM_RULE[64] = "";
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
 static char RUNTAG[64];
 static int NSET; static char *SETK[MAXLIST], *SETV[MAXLIST];
@@ -157,8 +189,16 @@ static int HAVE_C1B;
 static volatile int g_phase = PH_INIT;
 static volatile uint64_t g_t0, g_tm0, g_tm1; /* run start, window start, window end (0 = not yet) */
 static volatile uint64_t g_warm_claimed, g_meas_claimed, g_completed;
+/* PREREG annex A23: the warm-up is decided at each claim under g_claim_mu (claim_warm), as the macOS claim_op decides
+ * under g_claim. WARM_S_NS and WARM_MAX_NS are the rule's seconds truncated to ns once, as (uint64_t)(S * 1e9). */
+static pthread_mutex_t g_claim_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t WARM_S_NS, WARM_MAX_NS;
+static int g_warm_capped, g_warm_any; /* g_warm_any: a warm-up op was claimed, so g_warm_last_ns is set */
+static uint64_t g_warm_end_ns, g_warm_last_ns;
+static struct rusage g_ru0; /* the process's usage at the window's start (the ending claim, or t0 with no warm-up) */
 static int g_nready, g_nfailed;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_serial_mu = PTHREAD_MUTEX_INITIALIZER; /* one sql-serial statement at a time, all clients */
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static char *g_errs[MAXERR];
 static uint64_t g_errn[MAXERR];
@@ -194,6 +234,23 @@ static void sleep_until(uint64_t t_ns) {
     while (clock_nanosleep(BB_CLOCK, TIMER_ABSTIME, &ts, NULL) == EINTR) { }
 }
 #endif
+/* The load generator's own TracerPid (lead review 62430d8bf..b49fb656a MED 4), read at the measured window's start and
+ * end into summary.json tracerpid_tm0/tm1: -1 when it cannot be read (no /proc: not Linux), which timedrun.py refuses. */
+static int self_tracerpid(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char ln[256];
+    int tp = -1;
+    while (fgets(ln, sizeof ln, f))
+        if (sscanf(ln, "TracerPid: %d", &tp) == 1) break;
+    fclose(f);
+    return tp;
+#else
+    return -1;
+#endif
+}
+static int g_tp_tm0 = -2, g_tp_tm1 = -2; /* -2: the window never opened / closed */
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 static double unif(uint64_t *s) { return ((xs(s) >> 11) + 0.5) / 9007199254740992.0; }
 
@@ -219,7 +276,9 @@ static int parse_step(char *rest, step_t *st, char *why) {
     while (*arg && *arg != ' ' && *arg != '\t') arg++;
     if (*arg) *arg++ = 0;
     arg = trim(arg);
+    st->serial = 0;
     if (!strcmp(kw, "sql")) st->k = K_SQL;
+    else if (!strcmp(kw, "sql-serial")) { st->k = K_SQL; st->serial = 1; }
     else if (!strcmp(kw, "write")) st->k = K_WRITE;
     else if (!strcmp(kw, "connect")) st->k = K_CONNECT;
     else if (!strcmp(kw, "close")) st->k = K_CLOSE;
@@ -494,7 +553,13 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
         return 0;
     }
     conn_t *target = *have_branch ? cur : &c->home;
-    return conn_exec(target, text, st->k == K_WRITE, why, wsz);
+    if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
+    /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
+     * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    pthread_mutex_lock(&g_serial_mu);
+    int rc = conn_exec(target, text, 0, why, wsz);
+    pthread_mutex_unlock(&g_serial_mu);
+    return rc;
 }
 
 static void record(client_t *c, const oprec *r) {
@@ -521,6 +586,115 @@ static void reconnect_home(client_t *c) {
     __atomic_fetch_add(&g_reconnects, 1, __ATOMIC_RELAXED);
 }
 
+/* The warm-up rule, the definition every load driver matches (the lead's ruling on fastest-linux's fourth lane review
+ * LOW 14; PREREG annex A23): at a claim, with CLAIMED warm-up ops claimed before it and EL ns since t0, the warm-up
+ * ends at this claim when CLAIMED >= OPS and EL >= S_NS (done) or EL >= MAX_NS (capped). 0: go on, this claim is a
+ * warm-up op; 1: it ends done; 2: it ends capped. Verbatim from the macOS bbload (artie 4010ff3b06), whose claim_op
+ * is the validated implementation (A23-AM1); claim_warm decides with it, and --warmup-replay replays it. */
+static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
+    int done = claimed >= ops && el >= s_ns;
+    return done ? 1 : el >= max_ns ? 2 : 0;
+}
+
+/* --warmup-replay OPS:S:MAX_S < TRACE: warm_ends on claim times read from stdin (integer ns since t0, one per line,
+ * non-decreasing). Prints "stop_at=I warm_ops=N capped=0|1", or "stop_at=none warm_ops=N capped=none" when the trace
+ * ends first; seconds become ns as claim_warm makes them, (uint64_t)(S * 1e9). Verbatim from the macOS bbload (artie
+ * 4010ff3b06), so the shared harness (fastest/linux/gates/warmup_conformance.py) feeds every driver the same claims. */
+static int warmup_replay(const char *rule) {
+    unsigned long long ops;
+    double s, m;
+    char tail;
+    if (rule[0] < '0' || rule[0] > '9' || sscanf(rule, "%llu:%lf:%lf%c", &ops, &s, &m, &tail) != 3 || !isfinite(s) ||
+        !isfinite(m) || !(s >= 0) || !(m > 0)) {
+        fprintf(stderr, "bbload: --warmup-replay OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds, MAX_S > 0): %s\n", rule);
+        return 2;
+    }
+    uint64_t claimed = 0, prev = 0;
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        if (line[0] == '\n') continue;
+        char *e;
+        errno = 0;
+        unsigned long long el = strtoull(line, &e, 10);
+        if (line[0] < '0' || line[0] > '9' || (*e != '\n' && *e != '\0') || errno || el < prev) {
+            fprintf(stderr, "bbload: --warmup-replay: bad trace line: %s", line);
+            return 2;
+        }
+        prev = el;
+        int end = warm_ends(claimed, el, ops, (uint64_t)(s * 1e9), (uint64_t)(m * 1e9));
+        if (end) {
+            printf("stop_at=%llu warm_ops=%llu capped=%d\n", (unsigned long long)claimed, (unsigned long long)claimed,
+                   end == 2);
+            return 0;
+        }
+        claimed++;
+    }
+    printf("stop_at=none warm_ops=%llu capped=none\n", (unsigned long long)claimed);
+    return 0;
+}
+
+/* The claims, serialized under g_claim_mu as the macOS claim_op serializes under g_claim (A23; this port used to
+ * decide the warm-up on a 1 ms main-thread poll of the claimed count, comparing seconds as doubles, with MAX_S 0 as no
+ * limit). Each claim's time T is fixed INSIDE the lock, so claims are judged in lock order with non-decreasing times:
+ *   closed loop (claim_warm): T = now_ns(), read after taking the lock, as claim_op reads it after taking g_claim
+ *     (fastest-linux's LOW on f6c2dbb2f: it was read before the lock, so a slower claimant could be judged later with
+ *     an older time);
+ *   open loop (claim_open): the macOS claim_op's open-loop arrivals at artie 4010ff3b06, verbatim: every claim takes
+ *     the NEXT arrival of ONE Poisson arrival stream for the whole run, T = g_arr_t, then g_arr_t +=
+ *     -log(unif(&g_arr_rng)) * 1e9 / RATE, the stream seeded by --seed alone (g_arr_rng in main) and starting at
+ *     g_arr_t = g_t0; the warm-up is decided at T in the same critical section, and the client then waits until T.
+ *     The Linux and macOS open-loop arrivals now match (the lead's reversal of its correction on 0138d2128: this port
+ *     drew one schedule per client, whose claims reached the lock out of intended order). The macOS claim_op also
+ *     numbers each arrival (k.arrival = g_arr_idx++) for its per-op records; this port's raw.tsv carries no arrival
+ *     column, so it keeps no index.
+ * warm_decide_locked T (g_claim_mu held, phase PH_WARM) returns PH_WARM when this claim is a warm-up op, else PH_MEAS:
+ * the claim that ends the warm-up opens the window at T and is its first measured op. g_warm_backsteps counts claims
+ * judged with an older time than the one judged before them: 0 in both loop modes by construction, recorded so
+ * timedrun.py can refuse a run where it is not. */
+static uint64_t g_claim_prev_el, g_warm_backsteps;
+static uint64_t g_arr_t, g_arr_rng; /* the open-loop arrival stream (claim_open) */
+static int warm_decide_locked(uint64_t t) {
+    uint64_t el = t > g_t0 ? t - g_t0 : 0;
+    if (el < g_claim_prev_el) g_warm_backsteps++;
+    g_claim_prev_el = el;
+    int end = warm_ends(g_warm_claimed, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
+    if (end) {
+        g_warm_capped = end == 2;
+        g_warm_end_ns = el;
+        getrusage(RUSAGE_SELF, &g_ru0);
+        __atomic_store_n(&g_tm0, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
+        if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
+        g_tp_tm0 = self_tracerpid();
+        return PH_MEAS;
+    }
+    g_warm_last_ns = el;
+    g_warm_any = 1;
+    g_warm_claimed++;
+    return PH_WARM;
+}
+
+/* claim_warm -- a closed-loop claim in the warm-up: its time read under the lock, the warm-up decided at it */
+static int claim_warm(void) {
+    pthread_mutex_lock(&g_claim_mu);
+    int ph = g_phase;
+    if (ph == PH_WARM) ph = warm_decide_locked(now_ns());
+    pthread_mutex_unlock(&g_claim_mu);
+    return ph;
+}
+
+/* claim_open T -- an open-loop claim, in every phase: the next arrival of the run's one stream into *T and, during
+ * the warm-up, the decision at it, in one critical section (the macOS claim_op, 4010ff3b06). Returns the phase. */
+static int claim_open(uint64_t *t) {
+    pthread_mutex_lock(&g_claim_mu);
+    *t = g_arr_t;
+    g_arr_t += (uint64_t)(-log(unif(&g_arr_rng)) * 1e9 / RATE);
+    int ph = g_phase;
+    if (ph == PH_WARM) ph = warm_decide_locked(*t);
+    pthread_mutex_unlock(&g_claim_mu);
+    return ph;
+}
+
 static void *client_main(void *arg) {
     client_t *c = arg;
     if (S.proto == P_MYSQL) mysql_thread_init();
@@ -540,14 +714,17 @@ static void *client_main(void *arg) {
     pthread_mutex_unlock(&g_mu);
     if (fail || g_phase == PH_ABORT) return NULL;
 
-    double mean_gap_ns = OPEN_LOOP ? 1e9 * C / RATE : 0;
     uint64_t intended = g_t0;
     for (uint32_t seq = 0;; seq++) {
         oprec r;
         memset(&r, 0, sizeof r);
         int ph;
         if (OPEN_LOOP) {
-            intended += (uint64_t)(-log(unif(&c->rng)) * mean_gap_ns);
+            /* A23: the next arrival of the run's one stream, and the warm-up decided at it, under the claim lock (the
+             * macOS claim_op); then wait for it. An op intended before the window's end is measured even when it is
+             * claimed after the window closed (AG9), so DRAIN reads as measured here. */
+            int cur = claim_open(&intended);
+            if (cur == PH_ABORT) goto done;
             for (;;) { /* wait for the intended time in slices, so the window end is noticed */
                 uint64_t tm1 = __atomic_load_n(&g_tm1, __ATOMIC_ACQUIRE);
                 if ((tm1 && intended >= tm1) || g_phase == PH_ABORT) goto done;
@@ -555,17 +732,16 @@ static void *client_main(void *arg) {
                 if (n >= intended) break;
                 sleep_until(intended - n > 10000000 ? n + 10000000 : intended);
             }
-            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
-            ph = (!tm0 || intended < tm0) ? PH_WARM : PH_MEAS;
-            if (ph == PH_WARM) __atomic_fetch_add(&g_warm_claimed, 1, __ATOMIC_RELAXED);
-            else __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
+            ph = cur == PH_WARM ? PH_WARM : PH_MEAS;
+            if (ph == PH_MEAS) __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
         } else {
             ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+            if (ph == PH_WARM) ph = claim_warm(); /* A23: decided at this claim, its time read under g_claim_mu */
             if (ph >= PH_DRAIN) goto done;
             if (ph == PH_MEAS) {
                 uint64_t k = __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
                 if (MAX_OPS && k >= MAX_OPS) goto done;
-            } else __atomic_fetch_add(&g_warm_claimed, 1, __ATOMIC_RELAXED);
+            }
         }
         ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar};
         char vbuf[MAXLIST][1024];
@@ -602,7 +778,7 @@ static void *client_main(void *arg) {
         }
         r.end = now_ns();
         if (V1 && C == 1) v1_set_mark(V1, V1_MARK_IDLE | (MARKB + seq + 1));
-        for (int k = 0; k < S.nafter; k++)
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; k++)
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
@@ -639,7 +815,9 @@ static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) 
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--warmup-replay")) return warmup_replay(argv[2]); /* PREREG annex A23 */
     const char *specp = NULL, *out = NULL, *v1run = NULL;
+    int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops/--warmup-s may not be mixed */
 #ifdef __APPLE__
     mach_timebase_info(&TB);
 #endif
@@ -651,8 +829,22 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
         else if (!strcmp(a, "--mode") && v) { OPEN_LOOP = !strcmp(v, "open"); if (strcmp(v, "open") && strcmp(v, "closed")) { fprintf(stderr, "bbload: --mode closed|open\n"); return 2; } i++; }
         else if (!strcmp(a, "--rate") && v) RATE = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-s") && v) WARM_S = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-ops") && v) WARM_OPS = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warmup-s") && v) { WARM_S = atof(argv[++i]); warm_legacy = 1; }
+        else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
+        else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S; PREREG annex A23 */
+            unsigned long long wo; double ws, wm; char extra;
+            /* S and MAX_S finite (A23-AM1: MAX_S is a bound, 0 ends the warm-up at the first claim) and at most 1e7 s,
+             * so (uint64_t)(x * 1e9) is defined; OPS starts with a digit (%llu would wrap "-1") */
+            if (v[0] < '0' || v[0] > '9' || sscanf(v, "%llu:%lf:%lf%c", &wo, &ws, &wm, &extra) != 3 || !isfinite(ws) ||
+                !isfinite(wm) || !(ws >= 0) || !(wm >= 0) || ws > 1e7 || wm > 1e7) {
+                fprintf(stderr, "bbload: --warmup OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds in [0, 1e7]) "
+                                "(got %s)\n", v);
+                return 2;
+            }
+            WARM_OPS = wo; WARM_S = ws; WARM_MAX_S = wm;
+            warm_rule_flag = 1;
+            i++;
+        }
         else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
         else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--max-ops") && v) MAX_OPS = strtoull(argv[++i], NULL, 10);
@@ -679,6 +871,7 @@ int main(int argc, char **argv) {
 #endif
         }
         else if (!strcmp(a, "--allow-errors")) ALLOW_ERR = 1;
+        else if (!strcmp(a, "--skip-after")) SKIP_AFTER = 1;
         else if (!strcmp(a, "--set") && v) {
             char *eq = strchr(argv[++i], '=');
             if (!eq || NSET >= MAXLIST) { fprintf(stderr, "bbload: --set k=v\n"); return 2; }
@@ -688,6 +881,23 @@ int main(int argc, char **argv) {
         } else { fprintf(stderr, "bbload: bad argument %s (see the header of bbload.c)\n", a); return 2; }
     }
     if (!specp || !out || C < 1) { fprintf(stderr, "usage: bbload --spec FILE --out DIR --clients C ...\n"); return 2; }
+    if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
+        fprintf(stderr, "bbload: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops/--warmup-s (the effective "
+                        "warm-up and the recorded rule would differ)\n");
+        return 2;
+    }
+    if (warm_legacy) {
+        /* PREREG annex A23-AM1: MAX_S is a bound, never "no limit" (a rule with MAX_S 0 ends at the first claim). The
+         * legacy flags therefore take MAX_S = 0.1 x the window bound, as the macOS bbload takes 0.1 x its run cap. */
+        if (!isfinite(WARM_S) || !(WARM_S >= 0) || WARM_S > 1e7 || !isfinite(MAXWIN_S) || !(MAXWIN_S > 0) || MAXWIN_S > 1e8) {
+            fprintf(stderr, "bbload: REFUSED: --warmup-s/--warmup-ops need S in [0, 1e7] s and a window bound "
+                            "(--max-window-s > 0), whose tenth is their MAX_S (A23-AM1)\n");
+            return 2;
+        }
+        WARM_MAX_S = 0.1 * MAXWIN_S;
+    }
+    WARM_S_NS = (uint64_t)(WARM_S * 1e9);
+    WARM_MAX_NS = (uint64_t)(WARM_MAX_S * 1e9);
     if (OPEN_LOOP && RATE <= 0) { fprintf(stderr, "bbload: open loop needs --rate > 0\n"); return 2; }
     if (OPEN_LOOP && MAX_OPS) { fprintf(stderr, "bbload: --max-ops is closed-loop only\n"); return 2; }
     if (DUR_S <= 0 && MIN_OPS == 0 && MAX_OPS == 0) { fprintf(stderr, "bbload: set --duration-s, --min-ops or --max-ops\n"); return 2; }
@@ -709,6 +919,9 @@ int main(int argc, char **argv) {
     /* The connector must be initialised once before any thread calls mysql_init. */
     if (S.proto == P_MYSQL && mysql_library_init(0, NULL, NULL)) { fprintf(stderr, "bbload: mysql_library_init failed\n"); return 2; }
     CL = calloc((size_t)C, sizeof *CL);
+    /* The open-loop arrival stream, verbatim from the macOS bbload at artie 4010ff3b06 (claim_open draws it) */
+    g_arr_rng = (SEED * 0xA24BAED4963EE407ULL) ^ 0x9FB21C651E98DF25ULL; /* the arrival stream: --seed alone (#25) */
+    if (!g_arr_rng) g_arr_rng = 1;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 512 * 1024);
@@ -721,8 +934,14 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&g_mu);
     while (g_nready + g_nfailed < C) pthread_cond_wait(&g_cv, &g_mu);
     int failed = g_nfailed;
+    /* No warm-up asked for (all of OPS, S and MAX_S zero): the run starts in the measured phase, so --max-ops N makes
+     * exactly N ops. With a warm phase the first 1 ms tick let every client claim a warm op first, so an untimed
+     * N-op run (the prebranch) made about N + C (lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1). */
+    int nowarm = WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0;
     g_t0 = now_ns();
-    __atomic_store_n(&g_phase, failed ? PH_ABORT : PH_WARM, __ATOMIC_RELEASE);
+    g_arr_t = g_t0; /* the arrival stream starts at t0 (macOS bbload, 4010ff3b06), set under g_mu before any claim */
+    if (nowarm && !failed) __atomic_store_n(&g_tm0, g_t0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_phase, failed ? PH_ABORT : (nowarm ? PH_MEAS : PH_WARM), __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     if (failed) {
@@ -731,25 +950,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bbload: %d of %d clients failed to connect or set up\n", failed, C);
         return 2;
     }
-    if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_WARM);
-    struct rusage ru0, ru1;
-    memset(&ru0, 0, sizeof ru0);
+    if (V1 && C > 1) v1_set_mark(V1, MARKB + (nowarm ? PH_MEAS : PH_WARM));
+    struct rusage ru1;
+    if (nowarm) { getrusage(RUSAGE_SELF, &g_ru0); g_tp_tm0 = self_tracerpid(); }
     uint64_t last_done = 0, last_progress = now_ns();
     int stalled = 0, short_window = 0;
     for (;;) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
+        /* The phase first, then the clock: a claim that ended the warm-up stored g_tm0 before PH_MEAS (release), so a
+         * clock read after this acquire is not before it (the guard below keeps a cross-CPU read from going negative). */
+        int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
         uint64_t n = now_ns(), done = __atomic_load_n(&g_completed, __ATOMIC_ACQUIRE);
         if (done != last_done) { last_done = done; last_progress = n; }
         else if ((n - last_progress) / 1e9 > STALL_S) { stalled = 1; break; }
-        int ph = g_phase;
-        if (ph == PH_WARM && g_warm_claimed >= WARM_OPS && (n - g_t0) / 1e9 >= WARM_S) {
-            getrusage(RUSAGE_SELF, &ru0);
-            __atomic_store_n(&g_tm0, n, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
-            if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
-        } else if (ph == PH_MEAS) {
-            double el = (n - g_tm0) / 1e9;
+        /* the warm-up is no longer decided here: claim_warm decides it at each claim (PREREG annex A23) */
+        if (ph == PH_MEAS) {
+            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
+            double el = n > tm0 ? (n - tm0) / 1e9 : 0;
             /* The duration/min-ops clause applies only when one of them was asked for: with --max-ops alone,
              * "el >= 0 && claimed >= 0" held at once and closed the window before any op was measured. */
             int timed = DUR_S > 0 || MIN_OPS > 0;
@@ -760,6 +978,7 @@ int main(int argc, char **argv) {
                 __atomic_store_n(&g_tm1, n, __ATOMIC_RELEASE);
                 __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
                 if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_DRAIN);
+                g_tp_tm1 = self_tracerpid();
                 break;
             }
         }
@@ -837,13 +1056,17 @@ int main(int argc, char **argv) {
     hdr_out(ht, out, "hdr_total.txt");
     for (int s = 0; s < S.nstep; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_step%d.txt", s + 1); hdr_out(hs[s], out, nm); }
     double win = (g_tm1 - g_tm0) / 1e9;
-    double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) / 1e6 +
-                 (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
+    double cpu = (ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
+                 (ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = 0;
     const char *verdict = "ok";
     if (meas_ok == 0) { rc = 3; verdict = "REFUSED: no measured operation succeeded"; }
-    else if (short_window) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
+    /* gate-6 review, t3run item 16; lead review 62430d8bf..b49fb656a MED 5: with --max-ops, the window cap is the
+     * registered per-run cap, and a run it ended is reported, not judged: rc 0, verdict "capped", capped: true and its
+     * counts; timedrun.py alone applies PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed). */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
+    else if (short_window && MAX_OPS) verdict = "capped";
+    else if (short_window && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"spec\":\"%s\",\"run_tag\":\"%s\",\"clients\":%d,\"mode\":\"%s\",\"rate\":%.3f,"
@@ -857,6 +1080,28 @@ int main(int argc, char **argv) {
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
+    fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
+    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
+    {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
+         * and the load generator's own TracerPid at its start and end */
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        double off = (double)rt.tv_sec + rt.tv_nsec / 1e9 - now_ns() / 1e9;
+        fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
+                g_tm0 / 1e9 + off, g_tm1 / 1e9 + off, g_tp_tm0, g_tp_tm1);
+    }
+    /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
+    snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
+    fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
+    /* PREREG annex A23: the warm-up as claim_warm decided it -- the ending claim (ns since t0; 0 with no warm-up),
+     * whether it ended capped, and the last warm-up claim (null when none was claimed) -- so timedrun.py can check
+     * the decision exactly instead of within a poll's slack */
+    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm_capped ? "true" : "false");
+    if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_last_claim_ns\":");
+    if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"%s\",", (unsigned long long)g_warm_backsteps,
+            OPEN_LOOP ? "open" : "closed"); /* loop: the run's loop mode (timedrun.py applies the order checks to both) */
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",

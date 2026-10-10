@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dolt.sh -- Dolt 2.3.5 sql-server (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
+# dolt.sh -- Dolt sql-server (the version versions.tsv registers) (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
 # LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/dolt.sh @648ce2929):
 # unchanged except that the binaries and python come from common.sh (FT_DOLT = the dolt-linux-<arch> release
 # tarball, sha256-checked by fetch_dolt.sh; FT_MARIADB = Ubuntu's mariadb client).
@@ -9,7 +9,7 @@
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
 #   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
 #                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS         bench.t(ROWS rows) through the MariaDB client, then DOLT_COMMIT on main
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
@@ -46,8 +46,32 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
-  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | my bench
+  AGE=${4:-0}
+  # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
+  # Aged parent (gate-6 review, t3run item 4; amendment 52): AGE single-row UPDATEs, each its own autocommitted
+  # statement (AGE=0 pipes an empty stream, whose digest is recorded too), then Dolt's documented maintenance:
+  # dolt_commit, then dolt_gc.
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | my bench
+  # The maintenance runs whether or not the parent was aged (lead review 62430d8bf..b49fb656a MED 10: an unaged Dolt
+  # parent used to be measured un-GC'd, unlike PG and SQLite): the age commit (--allow-empty: nothing changed at AGE=0),
+  # then DOLT_GC. The server's GC settings are recorded beside it.
+  my -N bench -e "CALL DOLT_COMMIT('-am', 'age', '--allow-empty')" >/dev/null
+  my -N bench -e "SHOW VARIABLES LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 || echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
+  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
+  # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
+  # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
+  gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
+  gc_log0=$(stat -c %s "$LOG")
+  gcrc=0
+  my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
+  tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcverdict "$gcrc" "$DATA.gc.txt" "$DATA.gc.log" >"$DATA.gc.verdict" ||
+    die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
+  echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
+  echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)

@@ -130,6 +130,77 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     Ok(BigDecimal::new(bigint, scale))
 }
 
+/// PostgreSQL's division-scale constants (numeric.c): the significant digits a quotient keeps at
+/// least, the largest display scale, and the decimal digits in one base-10000 digit.
+const PG_MIN_SIG_DIGITS: i64 = 16;
+const PG_MAX_DISPLAY_SCALE: i64 = 1000;
+const PG_DEC_DIGITS: i64 = 4;
+
+/// `a / b` as PostgreSQL computes it (numeric.c `select_div_scale`, then `div_var` rounding at
+/// that scale): the result scale keeps at least 16 significant digits and is never below either
+/// operand's display scale, and the quotient is rounded half away from zero (lead ruling
+/// 2026-10-09 on e52f01422). `b` must not be zero.
+pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> BigDecimal {
+    let rscale = pg_div_scale(a, b);
+    let (ai, sa) = a.as_bigint_and_exponent();
+    let (bi, sb) = b.as_bigint_and_exponent();
+    // a / b = (ai / bi) * 10^(sb - sa); the result's integer at `rscale` is that times 10^rscale.
+    let shift = rscale + sb - sa;
+    let pow10 = |k: i64| BigInt::from(10).pow(u32::try_from(k).unwrap_or(u32::MAX));
+    let (num, den) = if shift >= 0 {
+        (ai * pow10(shift), bi)
+    } else {
+        (ai, bi * pow10(-shift))
+    };
+    // Truncated toward zero, then rounded half away from zero on the remainder.
+    let mut q = &num / &den;
+    let r = &num - &q * &den;
+    let twice = r.magnitude() + r.magnitude();
+    if &twice >= den.magnitude() {
+        if (num.sign() == Sign::Minus) != (den.sign() == Sign::Minus) {
+            q -= BigInt::from(1);
+        } else {
+            q += BigInt::from(1);
+        }
+    }
+    BigDecimal::new(q, rscale)
+}
+
+/// numeric.c `select_div_scale`: the quotient's estimated weight from the two operands' weights
+/// and first base-10000 digits (equal first digits are taken as `a` < `b`), then 16 significant
+/// digits' worth of scale, bounded by the operands' display scales and PostgreSQL's display range.
+fn pg_div_scale(a: &BigDecimal, b: &BigDecimal) -> i64 {
+    let (weight1, first1) = pg_weight_and_first_digit(a);
+    let (weight2, first2) = pg_weight_and_first_digit(b);
+    let mut qweight = weight1 - weight2;
+    if first1 <= first2 {
+        qweight -= 1;
+    }
+    let display = |v: &BigDecimal| v.as_bigint_and_exponent().1.max(0);
+    (PG_MIN_SIG_DIGITS - qweight * PG_DEC_DIGITS)
+        .max(display(a))
+        .max(display(b))
+        .max(0)
+        .min(PG_MAX_DISPLAY_SCALE)
+}
+
+/// numeric.c's normalized weight of `v` (the base-10000 position of its first nonzero digit) and
+/// that digit's value; `(0, 0)` for zero, as `select_div_scale` takes it.
+fn pg_weight_and_first_digit(v: &BigDecimal) -> (i64, u32) {
+    let (int, scale) = v.as_bigint_and_exponent();
+    let digits = int.magnitude().to_string();
+    if digits == "0" {
+        return (0, 0);
+    }
+    // The decimal exponent of the most significant digit, and the base-10000 digit holding it,
+    // which spans decimal exponents 4 * weight + 3 down to 4 * weight.
+    let e10 = digits.len() as i64 - 1 - scale;
+    let weight = e10.div_euclid(PG_DEC_DIGITS);
+    let lead = usize::try_from(e10 - weight * PG_DEC_DIGITS + 1).unwrap_or(1);
+    let first: String = digits.chars().chain(std::iter::repeat('0')).take(lead).collect();
+    (weight, first.parse().unwrap_or(0))
+}
+
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
 /// BigDecimal::to_string() may drop trailing zeros, but we want "1.10" to
 /// remain "1.10" and "0.00" to remain "0.00" for a value stored with scale=2.

@@ -880,4 +880,96 @@ mod tests {
 
         Ok(())
     }
+
+    /// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`), read as core's busy red reads it.
+    #[cfg(unix)]
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is plain old data that clock_gettime writes whole.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// Engine review 11 MED 4, this crate's half of the busy-timeout spin (DECISIONS f8eb23bca):
+    /// `Statement::step` answers TursoStatusCode::Io with run_io and Poll::Pending, so a busy
+    /// handler's backoff either polled the task again at once (core woke it with the Sleep) and
+    /// spun for the whole busy timeout, or, with run_io waiting the backoff out, held the executor
+    /// thread inside each poll. Here `Connection::execute` waits out a 500 ms busy timeout behind
+    /// another connection's open write transaction on a current-thread runtime: the thread's CPU
+    /// time over the wait must be a small fraction of it, and no single poll of the waiting future
+    /// may last as long as a backoff step (the longest is 100 ms, so a poll that sleeps one lasts
+    /// at least that).
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_wait_neither_spins_nor_holds_the_executor() {
+        /// Polls the future it wraps, recording the longest single poll and the number of polls.
+        struct Timed<F> {
+            inner: std::pin::Pin<Box<F>>,
+            longest: std::time::Duration,
+            polls: usize,
+        }
+        impl<F: std::future::Future> std::future::Future for Timed<F> {
+            type Output = (F::Output, std::time::Duration, usize);
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                let start = std::time::Instant::now();
+                let polled = std::future::Future::poll(self.inner.as_mut(), cx);
+                self.longest = self.longest.max(start.elapsed());
+                self.polls += 1;
+                polled.map(|output| (output, self.longest, self.polls))
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("busy.db");
+            let db = Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let holder = db.connect().unwrap();
+            for sql in ["CREATE TABLE t(x)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+                holder.execute(sql, ()).await.unwrap();
+            }
+            let waiter = db.connect().unwrap();
+            waiter
+                .busy_timeout(std::time::Duration::from_millis(500))
+                .unwrap();
+            let insert = Timed {
+                inner: Box::pin(waiter.execute("INSERT INTO t VALUES (2)", ())),
+                longest: std::time::Duration::ZERO,
+                polls: 0,
+            };
+            let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+            let (refused, longest, polls) = insert.await;
+            let (waited, spent) = (wall.elapsed(), thread_cpu() - cpu);
+            assert!(
+                matches!(refused, Err(Error::Busy(_))),
+                "premise: the second writer is refused busy, got {refused:?}"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(450),
+                "premise: the busy timeout was waited out (waited {waited:?})"
+            );
+            assert!(
+                spent < std::time::Duration::from_millis(100),
+                "the busy wait spent {spent:?} of CPU over {waited:?} in {polls} polls: it spun"
+            );
+            assert!(
+                longest < std::time::Duration::from_millis(50),
+                "one poll of the busy wait lasted {longest:?} (of {waited:?}, {polls} polls): \
+                 it slept a backoff step inside the poll, holding the executor thread"
+            );
+            holder.execute("COMMIT", ()).await.unwrap();
+        });
+    }
 }

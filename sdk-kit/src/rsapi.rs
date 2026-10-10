@@ -1313,6 +1313,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            pending_sleep: Mutex::new(None),
         }))
     }
 
@@ -1341,6 +1342,7 @@ impl TursoConnection {
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
+                    pending_sleep: Mutex::new(None),
                 }));
             }
         }
@@ -1371,6 +1373,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            pending_sleep: Mutex::new(None),
         }))
     }
 
@@ -1400,6 +1403,7 @@ impl TursoConnection {
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
+                        pending_sleep: Mutex::new(None),
                     }),
                     position,
                 )))
@@ -1487,6 +1491,39 @@ type StmtRegistry = Arc<Mutex<HashMap<usize, Weak<Mutex<Option<Statement>>>>>>;
 
 const FINALIZED_ERR: &str = "statement has been finalized";
 
+/// A busy handler's backoff that an async-mode step without a waker reported as
+/// [`TursoStatusCode::Io`]: the caller's answer to that Io, [`TursoStatement::run_io`], waits it
+/// out instead of stepping the IO backend (engine review 11 MED 4). It stands only for the Io that
+/// announced it: every step clears it first, and so does a reset.
+struct PendingSleep {
+    duration: Duration,
+}
+
+/// The async-mode answer to a busy handler's `StepResult::Sleep`, which the step reports as Io.
+/// A step with a task's waker (the Rust `turso` crate) hands the waker to the busy timer, which
+/// wakes it once the backoff is over. Core does not wake it with the Sleep, so the task is neither
+/// polled again at once (a spin for the whole busy timeout) nor held inside a poll by a `run_io`
+/// that waits the backoff out; its `run_io` steps the IO backend, which has nothing in flight. A
+/// step without one (the C API) leaves a [`PendingSleep`] for its caller's `run_io` to wait out.
+/// Mutant `sdk_waker_sleep_blocks` (test builds only): the waker is woken at once and `run_io`
+/// waits the backoff out, as before.
+fn async_answer_busy(
+    duration: Duration,
+    waker: Option<&Waker>,
+    pending_sleep: &Mutex<Option<PendingSleep>>,
+) {
+    match waker {
+        Some(waker) if !fe_mutant("sdk_waker_sleep_blocks") => {
+            crate::busy_timer::wake_after(duration, waker.clone());
+        }
+        Some(waker) => {
+            waker.wake_by_ref();
+            *pending_sleep.lock().unwrap() = Some(PendingSleep { duration });
+        }
+        None => *pending_sleep.lock().unwrap() = Some(PendingSleep { duration }),
+    }
+}
+
 /// Advance one step of a statement's execution.
 /// Factored out of `TursoStatement` so it can be called while holding
 /// the `StatementHandle` lock without re-entrancy issues.
@@ -1494,7 +1531,9 @@ fn step_inner(
     stmt: &mut Statement,
     async_io: bool,
     waker: Option<&Waker>,
+    pending_sleep: &Mutex<Option<PendingSleep>>,
 ) -> Result<TursoStatusCode, TursoError> {
+    *pending_sleep.lock().unwrap() = None;
     loop {
         let result = if let Some(waker) = waker {
             stmt.step_with_waker(waker)
@@ -1506,7 +1545,16 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+            StepResult::Sleep { duration } => {
+                if async_io {
+                    async_answer_busy(duration, waker, pending_sleep);
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    sync_wait_out_busy(stmt, duration)?;
+                    continue;
+                }
+            }
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1518,6 +1566,38 @@ fn step_inner(
     }
 }
 
+/// The sync-mode answer to a busy handler's `StepResult::Sleep`: wait out its backoff
+/// (`Statement::wait_out_busy`), then step again. Stepping the IO backend instead returned at once
+/// when nothing was in flight (UnixIO always), so a sync caller with a busy timeout spun a core for
+/// the whole wait (engine review 11 MED 4). The busy statement has no IO of its own in flight then.
+/// Mutant `sdk_sync_sleep_spins` (test builds only): the IO step, as before.
+fn sync_wait_out_busy(stmt: &Statement, duration: Duration) -> Result<(), TursoError> {
+    if fe_mutant("sdk_sync_sleep_spins") {
+        stmt._io().step()?;
+        return Ok(());
+    }
+    stmt.wait_out_busy(duration)?;
+    Ok(())
+}
+
+/// sdk-kit's registered mutants (`FE_MUTANT`, the convention of turso_core's branch store): one
+/// names one deliberate defect, so each red can be shown to fail on its mutant from the same test
+/// binary. TEST BUILDS ONLY: a production binary has no mutant to switch on. Read once per process.
+fn fe_mutant(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("FE_MUTANT").ok())
+            .as_deref()
+            == Some(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
@@ -1525,6 +1605,8 @@ pub struct TursoStatement {
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
+    /// Set when the last async-mode step's Io was a busy handler's backoff (see [`PendingSleep`]).
+    pending_sleep: Mutex<Option<PendingSleep>>,
 }
 
 impl Drop for TursoStatement {
@@ -1632,7 +1714,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        step_inner(stmt, self.async_io, waker)
+        step_inner(stmt, self.async_io, waker, &self.pending_sleep)
             .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
@@ -1651,7 +1733,7 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)
+            let status = step_inner(stmt, self.async_io, waker, &self.pending_sleep)
                 .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
@@ -1671,13 +1753,24 @@ impl TursoStatement {
             )));
         }
     }
-    /// run iteration of the IO backend
+    /// run iteration of the IO backend, the caller's answer to [TursoStatusCode::Io]
+    ///
+    /// When that Io stood for a busy handler's backoff (of a step without a waker; a step with one
+    /// has the busy timer wake its task instead), this waits the backoff out
+    /// (`Statement::wait_out_busy`): the busy statement has no IO in flight, so stepping the
+    /// backend would return at once, and a step / run_io loop would spin a core for the whole busy
+    /// timeout (engine review 11 MED 4). Mutant `sdk_run_io_spins` (test builds only): the IO
+    /// step, as before.
     pub fn run_io(&self) -> Result<(), TursoError> {
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        stmt._io().step()?;
+        let pending_sleep = self.pending_sleep.lock().unwrap().take();
+        match pending_sleep {
+            Some(sleep) if !fe_mutant("sdk_run_io_spins") => stmt.wait_out_busy(sleep.duration)?,
+            _ => stmt._io().step()?,
+        }
         Ok(())
     }
     /// get row value as an owned Value
@@ -1758,7 +1851,7 @@ impl TursoStatement {
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
             while stmt.execution_state().is_running() {
-                let status = step_inner(stmt, self.async_io, waker)?;
+                let status = step_inner(stmt, self.async_io, waker, &self.pending_sleep)?;
                 if status == TursoStatusCode::Io {
                     return Ok(status);
                 }
@@ -1774,6 +1867,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        *self.pending_sleep.lock().unwrap() = None;
         stmt.reset()?;
         stmt.clear_bindings();
         Ok(())
@@ -2906,5 +3000,163 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    /// Engine review 11 MED 4, the sdk-kit half of the busy-timeout spin (DECISIONS f8eb23bca):
+    /// a sync-mode statement (`async_io: false`: the Python binding, and a C or Go caller with
+    /// async_io=0) answered the busy handler's `StepResult::Sleep` by stepping the IO backend,
+    /// which returns at once when nothing is in flight (UnixIO always), so the wait spun a core
+    /// for the whole busy timeout. Here `execute` and `step` each wait out a 500 ms busy timeout
+    /// behind another connection's open write transaction, and the waiting thread's CPU time
+    /// over the wait must be a small fraction of it, as in core's
+    /// `a_busy_timeout_wait_sleeps_rather_than_spins`.
+    #[cfg(unix)]
+    #[test]
+    fn a_sync_busy_wait_sleeps_rather_than_spins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("busy.db");
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let holder = db.connect().unwrap();
+        for sql in ["CREATE TABLE t(x)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+            let mut stmt = holder.prepare_single(sql).unwrap();
+            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+        }
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(500));
+        let insert = "INSERT INTO t VALUES (2)";
+        let calls: [(&str, &dyn Fn() -> Result<TursoStatusCode, TursoError>); 2] = [
+            ("execute", &|| {
+                waiter
+                    .prepare_single(insert)?
+                    .execute(None)
+                    .map(|done| done.status)
+            }),
+            ("step", &|| waiter.prepare_single(insert)?.step(None)),
+        ];
+        for (name, run) in calls {
+            let (wall, cpu) = (std::time::Instant::now(), crate::thread_cpu());
+            let refused = run();
+            let (waited, spent) = (wall.elapsed(), crate::thread_cpu() - cpu);
+            assert!(
+                matches!(refused, Err(TursoError::Busy(_))),
+                "{name}: premise: the second writer is refused busy, got {refused:?}"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(450),
+                "{name}: premise: the busy timeout was waited out (waited {waited:?})"
+            );
+            assert!(
+                spent < std::time::Duration::from_millis(100),
+                "{name}: the busy wait spent {spent:?} of CPU over {waited:?}: it spun"
+            );
+        }
+        let mut commit = holder.prepare_single("COMMIT").unwrap();
+        assert_eq!(commit.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    /// Engine review 11 MED 4, the waker half of the busy-timeout spin: the Rust `turso` crate
+    /// steps an async-mode statement with its task's waker, answers TursoStatusCode::Io with
+    /// run_io, and returns Poll::Pending. A busy handler's backoff comes back as that Io with the
+    /// waker already woken (core wakes it with the Sleep), so the task is polled again at once:
+    /// it spun for the whole busy timeout, and with run_io waiting the backoff out it holds the
+    /// executor thread inside each poll instead. Here that poll loop, on a thread that parks
+    /// between polls until its waker unparks it, waits out a 500 ms busy timeout behind another
+    /// connection's open write transaction: the thread's CPU time over the wait must be a small
+    /// fraction of it, and no single poll may last as long as a backoff step (the longest is
+    /// 100 ms, so a poll that sleeps one lasts at least that).
+    #[cfg(unix)]
+    #[test]
+    fn a_waker_busy_wait_neither_spins_nor_sleeps_in_a_poll() {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        fn execute_to_end(stmt: &mut super::TursoStatement) -> TursoStatusCode {
+            loop {
+                let status = stmt.execute(None).unwrap().status;
+                if status != TursoStatusCode::Io {
+                    return status;
+                }
+                stmt.run_io().unwrap();
+            }
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("busy.db");
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: true,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        // An async open is driven by opening again; the syscall backend completes each read
+        // inside the call that issues it.
+        while db.open().unwrap().is_io() {}
+        let holder = db.connect().unwrap();
+        for sql in ["CREATE TABLE t(x)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+            let mut stmt = holder.prepare_single(sql).unwrap();
+            assert_eq!(execute_to_end(&mut stmt), TursoStatusCode::Done);
+        }
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(500));
+        let mut insert = waiter.prepare_single("INSERT INTO t VALUES (2)").unwrap();
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let (mut longest, mut polls) = (std::time::Duration::ZERO, 0usize);
+        let (wall, cpu) = (std::time::Instant::now(), crate::thread_cpu());
+        let refused = loop {
+            // One poll, as the turso crate's Statement::step makes it: step with the waker, and
+            // on Io run the IO and return Pending.
+            let poll = std::time::Instant::now();
+            let outcome = insert.execute(Some(&waker)).and_then(|done| {
+                if done.status == TursoStatusCode::Io {
+                    insert.run_io().map(|()| None)
+                } else {
+                    Ok(Some(done.status))
+                }
+            });
+            longest = longest.max(poll.elapsed());
+            polls += 1;
+            match outcome {
+                Ok(None) => std::thread::park(),
+                ready => break ready,
+            }
+        };
+        let (waited, spent) = (wall.elapsed(), crate::thread_cpu() - cpu);
+        assert!(
+            matches!(refused, Err(TursoError::Busy(_))),
+            "premise: the second writer is refused busy, got {refused:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(450),
+            "premise: the busy timeout was waited out (waited {waited:?})"
+        );
+        assert!(
+            spent < std::time::Duration::from_millis(100),
+            "the busy wait spent {spent:?} of CPU over {waited:?} in {polls} polls: it spun"
+        );
+        assert!(
+            longest < std::time::Duration::from_millis(50),
+            "one poll of the busy wait lasted {longest:?} (of {waited:?}, {polls} polls): \
+             it slept a backoff step inside the poll, holding the executor thread"
+        );
+        let mut commit = holder.prepare_single("COMMIT").unwrap();
+        assert_eq!(execute_to_end(&mut commit), TursoStatusCode::Done);
     }
 }

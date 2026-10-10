@@ -41,7 +41,7 @@ use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use turso_core::branch::{Branch, BranchDurability, BranchId};
+use turso_core::branch::{Branch, BranchDurability, BranchId, SyncClass};
 use turso_core::recipe::{counter, recipe_io};
 use turso_core::{
     Connection, Database, DatabaseOpts, Numeric, OpenFlags, PlatformIO, SqliteDialect, Statement,
@@ -55,7 +55,7 @@ fn branch_mode() -> bool {
 fn open_db(path: &Path) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let durability = if branch_mode() {
-        BranchDurability::Durable { sync: false }
+        BranchDurability::Durable { sync: SyncClass::Off }
     } else {
         BranchDurability::Volatile
     };

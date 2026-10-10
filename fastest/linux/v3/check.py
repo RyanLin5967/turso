@@ -8,9 +8,9 @@ CELL is explicit (v3cell.py: ext4|xfs|btrfs on a block device, ext4loop|xfsloop|
                                byte rules on planted records; exit 0 iff all fire as written
   check.py --bind OUT CELL     after run.sh was bound to OUT/verdict.json (firecheck.sh's last step): write
                                OUT/verdict.bind.json (the binding record run.sh requires) and remove the pending one
-  check.py --plan CELL ARCH LEAF VIRT FLIP   print the check ids a verdict for that cell, arch, leaf class (wb|wt|brd)
-                               and box (VIRT vm|bare from systemd-detect-virt; FLIP yes|no: can the leaf disk's
-                               write cache be made to disagree with the drive) must hold
+  check.py --plan CELL ARCH LEAF VIRT FLIP PLP   print the check ids a verdict for that cell, arch, leaf class
+                               (wb|wt|brd) and box (VIRT vm|bare from systemd-detect-virt; FLIP yes|no: can the leaf
+                               disk's write cache be made to disagree with the drive; PLP yes|no, V3_PLP) must hold
   check.py --box OUT           print the box firecheck.sh recorded in OUT/info.txt, as check.py reads it
 
 Every expectation below comes from the arm definitions (v3floor.c's header, PREREG section 11 M0 exit 1), written
@@ -19,7 +19,7 @@ from raw.tsv. The sequence checker is itself fire-checked first: planted breache
 be rejected. The checks a verdict holds are fixed in advance by plan(cell, arch, leaf class): a verdict whose ids
 differ from its plan fails, and run.sh refuses to bind one. Exit 0 all pass, 1 any fail, 2 usage.
 """
-import gzip, hashlib, json, os, re, sys
+import gzip, hashlib, json, os, re, sys, zlib
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,7 +54,10 @@ APPEND_BASE = 4096  # the append arms' files start one 4 KiB block long (setup),
 REC = {"ow4k": 4096, "ow64k": 65536, "ow1m": 1 << 20, "fdatasync4k": 4096}
 CAP = {"ow4k": 16 << 20, "ow64k": 16 << 20, "ow1m": 128 << 20, "fdatasync4k": 16 << 20}
 FLUSHED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "fdatasync4k", "clone1b", "clone2b", "cfr2b"]
-GATED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b"]  # the flush control gates these (rc 3)
+# flush-gated: every op must issue a device flush and its own sync (post's gates); fdatasync4k since it is an A18
+# floor candidate (eighth review M1; measured: it issues a flush-carrying request in 200/200 windows on the three
+# write-back cells of run 37812355435). The TIMING control gates append25 only (A17).
+GATED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b", "fdatasync4k"]
 CLONES = ["clone1b", "clone2b"]  # FICLONE: refused on ext4
 COPIES = ["clone1b", "clone2b", "cfr2b"]
 FLUSH_FAMILY = ["fsync", "fdatasync", "sync", "syncfs", "sync_file_range", "msync"]
@@ -111,6 +114,18 @@ REFUSALS = {
     "R_datajournal": "effective option 'data=journal'",
     # fourth review M2: a scsi_debug leaf outside the fire-check
     "R_sdbg_noenv": "is a scsi_debug disk",
+    # ninth review L13, M6, M7, L9: the probe's own registration and rental refusals, each on a planted --registered
+    "R_rental_noreg": "--require-registered without --registered",
+    "R_rental_noframe": "rental mode: no registered frame arm",
+    "R_rental_novariant": "has no fdatasync variant arm",
+    "R_reg_frame25": "other than append25",
+    "R_reg_nonascii": "breaks the one strict rule",
+    "R_reg_longline": "breaks the one strict rule",
+    # V3 review 12 item 2: each broken registry rule refuses with its own text, naming the key (the frame-arm allowlist
+    # inside reg_lookup had made R_reg_frame25 refuse with the generic byte/length text); the probe-side duplicate-key
+    # and unknown-key rules had no plant
+    "R_reg_dupkey": "is given twice",
+    "R_reg_unknownkey": "is not frame_arm or a d0_threshold",
 }
 # run.sh refusals: tag -> the refusing rule's own reason PREFIX (rc 2, no out dir, no probe run). Every planted
 # verdict also carries "planted", so a bare word ("plan", "cell", "arch") would match whatever rule fired (fresh
@@ -132,6 +147,8 @@ RUNSH = {
     "R_runsh_pending": "bind: pending",
     # annex A14: the operator's PLP declaration is required
     "R_runsh_noplp": "V3_PLP='' is not yes or no",
+    # ninth review L13: a cell name of the other layout (block vs loop) refuses before the probe runs
+    "R_runsh_celllayout": "cell layout:",
 }
 # the probe ran; run.sh refused after it (rc 2): tag -> reasons that must all appear
 RUNSH_POST = {"R_runsh_post": ["exe_sha256: the probe that ran", "mutant_nosync=1"],
@@ -161,15 +178,46 @@ HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3c
            "../../../.github/workflows/fastest-v3.yml"]
 
 
-def registered(here=HERE):
-    """REGISTERED.tsv: key -> (value, registration ref) (annex A17; gate-6 review MED 5)."""
+REGISTRY_FILE = "REGISTERED.tsv"  # the self-test points this at a fixed snapshot (eighth review M7)
+
+
+REG_LINE_MAX, REG_KEY_MAX, REG_VAL_MAX, REG_REF_MAX = 512, 120, 60, 200  # v3floor.c's caps (ninth review M7)
+FRAME_ARMS_ALLOWED = ["append64", "ow4k", "ow64k", "ow1m"]  # M0 append/overwrite arms; not append25 (ninth review L9)
+
+
+def registered(here=HERE, path="REGISTERED.tsv"):
+    """REGISTERED.tsv: key -> (value, registration ref) (annex A17; gate-6 review MED 5). The probe's one strict rule
+    (reg_lookup; eighth review L5, ninth review M7): printable ASCII and TAB only (no CR, NUL or byte >= 0x7f, which the
+    probe would write as one \\u00XX per byte), every line at most 512 bytes, comments included; data lines exactly
+    three non-empty fields, key <= 120, value <= 60, ref <= 200 bytes; a d0 threshold a plain decimal above 1; a frame
+    arm one of append64, ow4k, ow64k, ow1m."""
     out = {}
-    for line in (rd(os.path.join(here, "REGISTERED.tsv")) or "").splitlines():
-        if not line.strip() or line.startswith("#"):
+    # bytes, so that every byte is seen (text mode would translate a CR away); an unreadable registry raises (OSError),
+    # never reads as an empty one (tenth review LOW 4)
+    raw = open(os.path.join(here, path), "rb").read()
+    lines = raw.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines = lines[:-1]
+    for b in lines:
+        if len(b) > REG_LINE_MAX or any(not (c == 9 or 0x20 <= c <= 0x7e) for c in b):
+            raise ValueError("REGISTERED.tsv: a line over %d bytes or with a byte outside printable ASCII and TAB: %r"
+                             % (REG_LINE_MAX, b[:80]))
+        line = b.decode("ascii")
+        if not line or line.startswith("#"):
             continue
         f = line.split("\t")
-        if len(f) >= 3:
-            out[f[0]] = (f[1], f[2])
+        if len(f) != 3 or not all(f) or len(f[0]) > REG_KEY_MAX or len(f[1]) > REG_VAL_MAX or len(f[2]) > REG_REF_MAX:
+            raise ValueError("REGISTERED.tsv: a line that is not key<TAB>value<TAB>ref within the caps: %r" % line[:80])
+        # tenth review LOW 2: the keys are an allowlist, and a key twice is refused (no last-wins), as in the probe
+        if f[0] != "frame_arm" and not re.fullmatch(r"d0_threshold/(ext4|xfs|btrfs)/(wb|wt|brd)/(vm|bare|nr)", f[0]):
+            raise ValueError("REGISTERED.tsv: key %r is neither frame_arm nor d0_threshold/<fs>/<wb|wt|brd>/<vm|bare|nr>" % f[0])
+        if f[0] in out:
+            raise ValueError("REGISTERED.tsv: key %s twice" % f[0])
+        if f[0].startswith("d0_threshold/") and not (re.fullmatch(r"[0-9]+(\.[0-9]*)?", f[1]) and float(f[1]) > 1.0):
+            raise ValueError("REGISTERED.tsv: %s = %r is not a plain decimal above 1" % (f[0], f[1]))
+        if f[0] == "frame_arm" and f[1] not in FRAME_ARMS_ALLOWED:
+            raise ValueError("REGISTERED.tsv: frame_arm %r is not one of %s" % (f[1], FRAME_ARMS_ALLOWED))
+        out[f[0]] = (f[1], f[2])
     return out
 
 
@@ -177,7 +225,7 @@ def timing_expect(sj, p50):
     """The timing control and the D0 control the probe must record, recomputed from raw p50s and the leaf, written
     by hand from the rulings: A14 (not applicable on no volatile cache, declared PLP, brd), A17 (append25 only, the
     registered threshold or a provisional 10), PREREG section 4 (nosync25 p50 >= 50 us voids). -> (expect, voids)."""
-    reg = registered()
+    reg = registered(path=REGISTRY_FILE)
     lf = sj.get("leaf") or {}
     lc = "brd" if lf.get("kind") == "brd" else "wb" if sj.get("leaf_write_cache") == "write back" else "wt"
     vz = (sj.get("virtualization") or {}).get("virtualized")
@@ -200,9 +248,12 @@ def timing_expect(sj, p50):
             voids.append("timing")
     dc = None
     if d0 is not None:
-        dc = "FAIL: run void (nosync25 p50" if d0 / 1e3 >= 50 else "pass (nosync25 p50"
-        if d0 / 1e3 >= 50:
-            voids.append("d0")
+        if sj.get("traced") is True:  # a tracer's stops, not a foreign writer (eighth review H2)
+            dc = "not applicable: traced"
+        else:
+            dc = "FAIL: run void (nosync25 p50" if d0 / 1e3 >= 50 else "pass (nosync25 p50"
+            if d0 / 1e3 >= 50:
+                voids.append("d0")
     return {"key": key, "threshold": t, "ref": reg[key][1] if key in reg else None, "timing": tc, "d0": dc}, voids
 
 
@@ -269,7 +320,7 @@ def plan(cell, arch, leaf, box):
     for a in FLUSHED:
         if not all_flushed_refused([a, "nosync25"], k):
             ids.append("F2c:" + a)
-    ids += ["F2b", "F3:complete", "F3:devflush", "F3:merge", "F3:gate", "F3:record"]
+    ids += ["F2b", "T:untraced", "F3:complete", "F3:devflush", "F3:merge", "F3:gate", "F3:record"]
     if leaf == "wb" and box.get("plp") == "no":
         ids.append("F2b:discriminates")
     ids.append("frame:append")
@@ -279,6 +330,7 @@ def plan(cell, arch, leaf, box):
     for t in REFUSALS:
         ids.append("F4:" + t)
     ids.append("F4:P_nest3")
+    ids.append("F4:P_nest_modes")
     ids.append("F4:R_ficlone_accept" if k == "ext4" else "F4:X_allclones")
     ids.append("F4:R_leftover")
     if box.get("flip") == "yes":
@@ -314,13 +366,15 @@ def check(cid, ok, detail, desc=""):
 
 
 def rd(p):
+    """The file's text, or None when it is missing or cannot be read whole (eleventh review MED 2: a truncated or
+    corrupt gzip raised EOFError or zlib.error past the old OSError catch; a caller treats None as missing)."""
     try:
         if p.endswith(".gz"):
             with gzip.open(p, "rt") as f:
                 return f.read()
         with open(p) as f:
             return f.read()
-    except OSError:
+    except (OSError, EOFError, zlib.error, UnicodeDecodeError):
         return None
 
 
@@ -450,6 +504,8 @@ def counted_set(stage, s, mutant):
             probs.append(("raw rows", n, {a: len(v) for a, v in rows.items()}))
         if int(sj.get("mutant_nosync", -1)) != int(mutant) or int(sj.get("trace_clock", -1)) != 0:
             probs.append(("flags", n, sj.get("mutant_nosync"), sj.get("trace_clock")))
+        if sj.get("traced") is not True:  # ninth review M4: under strace -f -c the probe must see its tracer
+            probs.append(("traced", n, sj.get("traced")))
         counts[n] = c
     return counts, probs
 
@@ -507,10 +563,13 @@ def canon(a):
     return a
 
 
-def parse_trace(text):
+def parse_trace(text, sync_fd=None):
     """-> (calls, other, pids): every syscall line as (name, canonical text), the lines that are not syscalls, and the
     pids seen. strace 6.8 prints FICLONE as "BTRFS_IOC_CLONE or FICLONE" (one ioctl number) with its source fd as a
-    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned."""
+    bare integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned.
+    sync_fd, when given a dict, receives {index in calls: the fd number} for every fsync and fdatasync (None when its
+    first argument is not fd<path>): the canonical text drops fd numbers, which f1b_window_syncs needs (V3 review 12
+    item 15: one strace parser, not two)."""
     calls, other, fds, pids = [], [], {}, set()
     for line in text.splitlines():
         m = LINE.match(line)
@@ -534,6 +593,9 @@ def parse_trace(text):
             t = "ioctl %s %s %s = %s" % (canon(args[0]), cmd, src, ret)
         else:
             t = name + " " + " ".join(canon(x) for x in args) + " = " + ret
+        if sync_fd is not None and name in ("fsync", "fdatasync"):
+            a0 = re.fullmatch(r"(\d+)<.*>", args[0].strip()) if args else None
+            sync_fd[len(calls)] = int(a0.group(1)) if a0 else None
         calls.append((name, t))
     return calls, other, pids
 
@@ -1038,6 +1100,115 @@ def self_test():
     chk("harness: no start record", harness_moved(None, dict(a)) != [])
     w1 = hexs.replace("WCE=0", "WCE=1").replace("08 0a 00", "08 0a 04")
     chk("MODE SENSE bytes: WCE=0 and WCE=1 read back", wce_from_hex(hexs)[0] == 0 and wce_from_hex(w1)[0] == 1)
+    # eighth review L5: REGISTERED.tsv has one strict rule (three non-empty fields, a plain decimal threshold)
+    import tempfile as _tf
+    rd_ = _tf.mkdtemp(prefix="check-reg-")
+    for name, text, ok in (("a good line", "d0_threshold/ext4/wb/bare\t9.5\tDECISIONS x\n", True),
+                           ("two fields", "d0_threshold/ext4/wb/bare\t9.5\n", False),
+                           ("a CR", "d0_threshold/ext4/wb/bare\t9.5\tref\r\n", False),
+                           ("an exponent", "d0_threshold/ext4/wb/bare\t1e1\tref\n", False),
+                           ("inf", "d0_threshold/ext4/wb/bare\tinf\tref\n", False),
+                           # ninth review M7: what C's jstr and check.py's UTF-8 decode would read differently, and
+                           # what C's buffers would split or truncate
+                           ("a non-ASCII ref", "d0_threshold/ext4/wb/bare\t9.5\tDECISIONS \u2026 (PREREG \u00a74)\n", False),
+                           ("a ref of 201 bytes", "d0_threshold/ext4/wb/bare\t9.5\t" + "r" * 201 + "\n", False),
+                           ("a ref of 200 bytes", "d0_threshold/ext4/wb/bare\t9.5\t" + "r" * 200 + "\n", True),
+                           ("a comment line of 1100 bytes", "#" + "c" * 1099 + "\nd0_threshold/ext4/wb/bare\t9.5\tref\n", False),
+                           ("a value of 61 bytes", "frame_arm\t" + "o" * 61 + "\tref\n", False),
+                           ("a NUL byte", "d0_threshold/ext4/wb/bare\t9.5\tref\x00x\n", False),
+                           # ninth review L9: append25 is already in the bound shape; a frame arm append25 names it twice
+                           ("frame_arm append25", "frame_arm\tappend25\tref\n", False),
+                           ("frame_arm ow64k", "frame_arm\tow64k\tref\n", True),
+                           ("frame_arm clean (not an M0 append or overwrite arm)", "frame_arm\tclean\tref\n", False),
+                           # tenth review LOW 2: every line under the one rule; a key twice is refused, not last-wins
+                           ("frame_arm twice", "frame_arm\tow4k\tref\nframe_arm\tow64k\tref\n", False),
+                           ("a threshold twice", "d0_threshold/ext4/wb/bare\t9.5\tr\nd0_threshold/ext4/wb/bare\t9.6\tr\n", False),
+                           ("an unknown key", "frame_arms\tow4k\tref\n", False)):
+        open(os.path.join(rd_, "r.tsv"), "w").write("# comment\n" + text)
+        try:
+            registered(rd_, "r.tsv")
+            got = True
+        except ValueError:
+            got = False
+        chk("REGISTERED.tsv rule: %s -> %s" % (name, "read" if ok else "refused"), got is ok)
+    try:  # tenth review LOW 4: an unreadable registry refuses, never reads as an empty one
+        registered(rd_, "no-such-registry.tsv")
+        unread = "read as %r" % (registered(rd_, "no-such-registry.tsv"),)
+    except (ValueError, OSError) as e:
+        unread = "refused: %r" % e
+    chk("REGISTERED.tsv rule: an unreadable registry -> refused", unread.startswith("refused"), unread)
+    import shutil as _sh
+    _sh.rmtree(rd_)
+    # tenth review HIGH 2: main() on an empty OUT, for every cell, arch, leaf class and box, evaluates exactly plan()'s
+    # ids in plan()'s order (run 37845193906 failed "plan" on 12/12 cells on the order alone)
+    import contextlib as _cl, io as _io, itertools as _it, tempfile as _tf2
+    global CELL, KIND, W, OUT, results
+    saved_g = (CELL, KIND, W, OUT, results)
+    orig_flc, orig_box = find_leaf_class, box_of
+    pbad, pruns = [], 0
+    try:
+        for cell, arch, lc, virt, flip, plp in _it.product(sorted(v3cell.CELLS), ("x86_64", "aarch64"), ("wb", "wt", "brd"),
+                                                           ("vm", "bare"), ("yes", "no"), ("yes", "no")):
+            tdp = _tf2.mkdtemp(prefix="check-plan-")
+            open(os.path.join(tdp, "info.txt"), "w").write("arch=%s\n" % arch)
+            bx = {"virt": virt, "flip": flip, "plp": plp}
+            globals()["find_leaf_class"] = lambda lc=lc: (lc, "planted")
+            globals()["box_of"] = lambda kv, bx=bx: dict(bx, leafdisk=None)
+            results = []
+            try:
+                with _cl.redirect_stdout(_io.StringIO()), _cl.redirect_stderr(_io.StringIO()):
+                    main([tdp, cell])
+                ids = [r["id"] for r in results]
+                pruns += 1
+                if ids != plan(cell, arch, lc, bx):
+                    pbad.append((cell, arch, lc, virt, flip, plp))
+            except Exception as e:  # noqa: BLE001
+                pbad.append((cell, arch, lc, virt, flip, plp, repr(e)[:120]))
+            finally:
+                _sh.rmtree(tdp, ignore_errors=True)
+    finally:
+        globals()["find_leaf_class"], globals()["box_of"] = orig_flc, orig_box
+        CELL, KIND, W, OUT, results = saved_g
+    chk("plan order: main() on an empty OUT evaluates exactly plan()'s ids in order, for all %d cell/arch/leaf/box "
+        "combinations" % pruns, pruns == 288 and not pbad, pbad[:4])
+    # ninth review H1, L10, M6: the A18 floor reference as the probe picks it -- among append25 (fsync) and
+    # fdatasync4k only (the frame arm runs with fsync and is not a candidate, even when registered), on raw nanosecond
+    # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
+
+    def frp(sj, p50ns):
+        try:
+            return floor_reference_problems(sj, p50ns)
+        except TypeError as e:  # the base takes no raw p50s
+            return [("the floor rule reads no raw p50s", repr(e))]
+
+    def fsj(p50us, fr, frame="ow4k", variant="fdatasync4k (ow4k + fdatasync)"):
+        return {"arms": {a: {"p50_us": v} for a, v in p50us.items()}, "frame_arm": frame, "floor_frame_variant": variant,
+                "floor_reference": fr}
+    cheap_ow4k = {"append25": 875.1, "fdatasync4k": 900.0, "ow4k": 800.3}
+    cheap_ns = {"append25": 875100, "fdatasync4k": 900000, "ow4k": 800300}
+    for name, sj, ns, ok in (
+            ("frame_arm ow4k registered and cheapest, the reference append25 (the probe's pick)",
+             fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}), cheap_ns, True),
+            ("frame_arm ow4k registered and cheapest, the reference ow4k (fsync, not a candidate)",
+             fsj(cheap_ow4k, {"arm": "ow4k", "barrier": "fsync", "p50_us": 800.3}), cheap_ns, False),
+            ("a near tie: fdatasync4k 181151 ns, append25 181249 ns (both 181.2 us), the reference fdatasync4k",
+             fsj({"append25": 181.2, "fdatasync4k": 181.2}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 181.2},
+                 None, "no frame arm registered"), {"append25": 181249, "fdatasync4k": 181151}, True),
+            ("the same near tie, the reference append25 (not the raw minimum)",
+             fsj({"append25": 181.2, "fdatasync4k": 181.2}, {"arm": "append25", "barrier": "fsync", "p50_us": 181.2},
+                 None, "no frame arm registered"), {"append25": 181249, "fdatasync4k": 181151}, False),
+            ("frame_arm ow64k registered: its variant recorded missing",
+             fsj({"append25": 400.0, "fdatasync4k": 200.0, "ow64k": 500.0}, {"arm": "fdatasync4k", "barrier": "fdatasync",
+                 "p50_us": 200.0}, "ow64k", "none in this probe: the registered frame arm has no fdatasync variant arm "
+                 "(A18 needs one)"), {"append25": 400000, "fdatasync4k": 200000, "ow64k": 500000}, True),
+            ("frame_arm ow4k registered, the variant label saying none registered",
+             fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}, "ow4k", "no frame arm registered"),
+             cheap_ns, False),
+            ("no frame arm registered, the variant label missing",
+             fsj({"append25": 400.0, "fdatasync4k": 200.0}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 200.0},
+                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False)):
+        got = frp(sj, ns)
+        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), (got == []) is ok, got)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
     # sixth review H1: the box and the plan it selects
@@ -1074,6 +1245,62 @@ def self_test():
                 (vm is False or [t[0] for t in label_problems(unq, lc, vm)] == ["flush_sent_to_device"]),
                 (label_problems(good, lc, vm), label_problems(swapped, lc, vm)))
     chk("labels: virtualized 1 is not an answer", label_problems({}, "wb", 1) != [])
+    # ninth review L12: stamp.py end compares the write cache of the flush path's devices only, and an unreadable one
+    # is a problem of its own, never "a change"
+    import importlib.util as _ilu
+    _sp = _ilu.spec_from_file_location("v3stamp", os.path.join(HERE, "stamp.py"))
+    _st = _ilu.module_from_spec(_sp)
+    _sp.loader.exec_module(_st)
+    wcp = getattr(_st, "write_cache_problems", None)
+    a0 = {"nvme0n1": {"write_cache": "write back"}, "loop0": {"write_cache": "write back"}, "sdb": {"write_cache": "write back"}}
+    for name, b1, devs, want in (
+            ("the leaf flipped write back -> write through", dict(a0, nvme0n1={"write_cache": "write through"}),
+             ["loop0", "nvme0n1"], "changed"),
+            ("a device off the flush path flipped", dict(a0, sdb={"write_cache": "write through"}), ["loop0", "nvme0n1"], None),
+            ("the leaf unreadable at the end", dict(a0, nvme0n1={"write_cache": ""}), ["loop0", "nvme0n1"], "unreadable"),
+            ("the leaf gone at the end", {k: v for k, v in a0.items() if k != "nvme0n1"}, ["loop0", "nvme0n1"], "unreadable"),
+            ("no flush-path devices named", a0, [], "no flush-path devices"),
+            ("nothing changed", a0, ["loop0", "nvme0n1"], None)):
+        got = wcp(a0, b1, devs) if wcp else ["(no write_cache_problems in stamp.py)"]
+        ok = (got == []) if want is None else (bool(got) and all(want in x for x in got))
+        chk("stamp write cache (ninth review L12): %s -> %s" % (name, "no problem" if want is None else want), ok, got)
+    # V3 review 12 item 5: P_nest_modes' n1 image against the CELL's own directory, which firecheck derives from the
+    # work dir's mount (a /dev/loop source: its backing file's directory; otherwise the mount target), both sides
+    # canonical: a loop cell's '/' must give /v3fx-n1.img (the raw '//v3fx-n1.img' compare was a false red on 6/6
+    # loop cells), and an f_nest that ignores V3_NEST_DIR must fail on a block cell (the old check read the dir back
+    # from the n1 it judged, so it could not)
+    nnp = globals().get("nest_n1_problems")
+    for name, cdir, first, rebuilt, ok in (
+            ("a loop cell, dir '/': n1 /v3fx-n1.img both builds", "/", "/v3fx-n1.img", "/v3fx-n1.img", True),
+            ("a block cell: n1 on the cell's filesystem both builds", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
+            ("a cell dir with a trailing slash and a '..'", "/mnt/a/../fastest-v3-xfs/", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
+            ("a block cell whose f_nest ignored V3_NEST_DIR (n1 at /)", "/mnt/fastest-v3-xfs", "/v3fx-n1.img", "/v3fx-n1.img",
+             False),
+            ("a block cell whose rebuild ignored V3_NEST_DIR", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
+             "/v3fx-n1.img", False),
+            ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
+            ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
+        got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
+        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
+    # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
+    # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
+    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are) and a losetup that fails (which must
+    # never read as "nothing attached"); and neither script may keep a copy of the old prefix matcher
+    import subprocess as _sp12
+    nl = os.path.join(HERE, "nestloops.sh")
+    r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
+    chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
+        "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
+        and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
+    copies = []
+    for nm12 in ("mkfixtures.sh", "firecheck.sh"):
+        t12 = rd(os.path.join(HERE, nm12))
+        if t12 is None or 'awk -v b="$base/n"' in t12 or 'awk -v b="$FX/n"' in t12 or '/nestloops.sh"' not in t12:
+            copies.append(nm12)
+    chk("one matcher: mkfixtures.sh and firecheck.sh source nestloops.sh and keep no copy of the old prefix matcher",
+        not copies, copies)
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
@@ -1082,21 +1309,39 @@ def self_test():
     return 0 if ok else 1
 
 
-BANKED_F3 = "f3-37528595878-x86-ext4loop"   # write-back NVMe (upgraded: its README)
-BANKED_F3_WT = "f3-37811638228-arm-ext4loop"  # write-through Hyper-V sd, a real batch of the current record format
+BANKED_F3 = "f3-37812355435-x86-ext4loop"     # write-back MSFT NVMe, real (four format fields: its README)
+BANKED_F3_WT = "f3-37812355435-arm-ext4loop"  # write-through Hyper-V sd, real (the same four fields)
 
 
 def real_selftest(chk):
     import contextlib, io, shutil, tempfile
-    global CELL, KIND, W, OUT, results
+    global CELL, KIND, W, OUT, results, REGISTRY_FILE
+    REGISTRY_FILE = os.path.join("testdata", "REGISTERED.selftest.tsv")
     src = os.path.join(HERE, "testdata", BANKED_F3)
     info = rd(os.path.join(src, "info.txt")) or ""
     kv = dict(l.split("=", 1) for l in info.splitlines() if "=" in l and not l.startswith(("loop ", "block ")))
     saved = (CELL, KIND, W, OUT, results)
     td = tempfile.mkdtemp(prefix="check-selftest-")
 
-    def run(name, probe=None, merged=None, report=None, files=None, kvmut=None):
+    def put_f1b(out, srcd, f1b):
+        """eleventh review MED 2: OUT/F1b/real-all.trace.gz as a real verdict's OUT holds it: the same cell and run's
+        F1b strace (testdata/<cell>/F1b, copied unchanged from artie), planted by f1b(text), or removed ("absent")."""
+        fb = os.path.join(out, "F1b", "real-all.trace.gz")
+        os.makedirs(os.path.dirname(fb), exist_ok=True)
+        if os.path.exists(fb):
+            os.remove(fb)
+        if f1b == "absent":
+            return
+        t = rd(os.path.join(srcd, "F1b", "real-all.trace.gz"))
+        with gzip.open(fb, "wt") as fh:
+            fh.write(f1b(t) if callable(f1b) else t)
+        if f1b == "truncated":  # V3 review 12 item 12: a gzip cut in half (EOFError inside gzip, past OSError)
+            with open(fb, "r+b") as fh:
+                fh.truncate(os.path.getsize(fb) // 2)
+
+    def run(name, probe=None, merged=None, report=None, files=None, kvmut=None, f1b=None):
         global CELL, KIND, W, OUT, results
+        put_f1b(td, src, f1b)
         d = os.path.join(td, name)
         shutil.copytree(os.path.join(src, "F3"), d)
         muts = [("summary.probe.json", probe), ("summary.json", merged), (os.path.join("blkflush", "report.json"), report)]
@@ -1130,9 +1375,70 @@ def real_selftest(chk):
         g = run("control")
         chk("real: the banked write-back batch passes all five F3 checks unplanted",
             [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [], {i: tags(g.get(i, {})) for i in F3IDS})
+        # V3 review 12 item 3: both banked fixtures carry the sync-record shape THIS blkflush emits, present and 0, so a
+        # planted case fails on its plant, never on a missing key (the fd-7 case passed vacuously on the missing
+        # inside_no_fd). testdata/regen_f3.py regenerates them by script; until it runs (LOUD), this case and the
+        # control are red, a stated red
+        for fx in (BANKED_F3, BANKED_F3_WT):
+            sy0 = (rj(os.path.join(HERE, "testdata", fx, "F3", "blkflush", "report.json")) or {}).get("syscalls") or {}
+            ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
+            n00 = (sy0.get("arms") or {}).get("nosync25") or {}
+            chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
+                "no_fd, inside_foreign_fd, inside_no_fd present and 0; every arm's windows_over 0, review 12 item 8)" % fx,
+                n00.get("syncs_inside_any_fd") == 0 and sorted(ua0) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
+                and all(v == 0 for v in ua0.values()) and bool(sy0.get("arms"))
+                and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in (sy0.get("arms") or {}).values()),
+                (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
             return {"probe": f, "merged": f}
+
+        # eleventh review MED 2's F1b plants, on the banked strace text (expectations by hand)
+        def f1b_fd99(t):  # the first in-loop cfr2b clone fsync names fd 99 (the other 299 keep the real fd)
+            return re.sub(r"fsync\(\d+<([^>]*/cfr2b\.clones/c\d+)>\)", r"fsync(99<\1>)", t, count=1)
+
+        def f1b_lines(t):
+            ls = t.split("\n")
+            return ls, next(k for k, l in enumerate(ls) if "clock_gettime(CLOCK_MONOTONIC_RAW" in l)
+
+        def f1b_nosync(t):  # an fsync of nosync25's own file right after its first in-loop pwrite64 (inside its window)
+            ls, c0 = f1b_lines(t)
+            j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(\d+<[^>]*/nosync25>", ls[k]))
+            m = re.match(r"^(\d+)\s+pwrite64\((\d+)<([^>]*)>", ls[j])
+            return "\n".join(ls[:j + 1] + ["%s  fsync(%s<%s>) = 0" % m.groups()] + ls[j + 1:])
+
+        def f1b_setup(t):  # an fsync on fd 42 of append25's file BEFORE the first timed window (setup)
+            ls, c0 = f1b_lines(t)
+            m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\(\d+<([^>]*/append25)>\)", l) for l in ls[:c0]) if mm)
+            return "\n".join(ls[:c0] + ["%s  fsync(42<%s>) = 0" % m.groups()] + ls[c0:])
+
+        # V3 review 12 item 4: cfr2b's DIRECTORY fd, read from this fixture's own F1b strace (its in-window directory
+        # fsync), and an F1b plant that drops those in-window directory fsyncs: paired with a sync_fds that lacks the
+        # same fd, the F1b equality holds, so "one fd short" fails the arm-definitions rule alone (since e454c84bd's
+        # equality rule it also tripped "disagrees with F1b's strace")
+        _t4 = rd(os.path.join(src, "F1b", "real-all.trace.gz")) or ""
+        _m4 = re.search(r"fsync\((\d+)<[^>]*/cfr2b\.clones>\)", _t4[max(0, _t4.find("clock_gettime(CLOCK_MONOTONIC_RAW")):])
+        cfr_dir_fd = _m4.group(1) if _m4 else "no in-window cfr2b directory fsync in the fixture's F1b trace"
+
+        def f1b_no_cfr_dirsync(t):
+            ls, c0 = f1b_lines(t)
+            return "\n".join(ls[:c0] + [l for l in ls[c0:] if not re.match(r"^\d+\s+fsync\(\d+<[^>]*/cfr2b\.clones>\)", l)])
+
+        def f1b_noclock(t):  # V3 review 12 item 12: one clock read deleted (the windows' parity breaks)
+            ls, c0 = f1b_lines(t)
+            return "\n".join(ls[:c0] + ls[c0 + 1:])
+
+        def f1b_nodecor(t):  # ... an in-window fsync with no -y decoration: "fsync(3) = 0"
+            ls, c0 = f1b_lines(t)
+            m = re.match(r"^(\d+)\s", ls[c0])
+            return "\n".join(ls[:c0 + 1] + ["%s  fsync(3) = 0" % m.group(1)] + ls[c0 + 1:])
+
+        def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
+            # in-loop pwrite64, inside a timed window: a file that is no arm's own
+            ls, c0 = f1b_lines(t)
+            m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\((\d+)<([^>]*/cfr2b\.src)>\)", l) for l in ls[:c0]) if mm)
+            j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(", ls[k]))
+            return "\n".join(ls[:j + 1] + ["%s  fsync(%s<%s>) = 0" % m.groups()] + ls[j + 1:])
 
         cases = [
             ("floor_kind", both(lambda j: j.update(floor_kind=VIRT_KIND["wb"][False])), "F3:record", ["floor_kind"]),
@@ -1177,13 +1483,101 @@ def real_selftest(chk):
             ("a window without the probe's fsync", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_without_a_sync=1)},
              "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
             ("PLP declared yes to the fire-check", {"kvmut": lambda k: k.update(plp="yes")}, "F3:record", ["plp"]),
+            # amended at the ninth review (M4): the plant now also trips F3's own untraced rule, beside the D0 rule
+            ("traced, the D0 control still judged", both(lambda j: j.update(traced=True)), "F3:complete",
+             ["d0_control disagrees with raw", "F3 ran traced or did not record it"]),
+            # ninth review M4: F3 runs untraced, and says so
+            ("traced not recorded", both(lambda j: j.pop("traced")), "F3:complete", ["F3 ran traced or did not record it"]),
+            # ninth review M5: F3:gate derives the gated set, the requirement and the blkflush gate's arms by hand
+            ("the gate without fdatasync4k (the old post)", {
+                "files": {"gate.json": lambda j: j["flush_gate"].update(
+                    gated_arms_run=[a for a in j["flush_gate"]["gated_arms_run"] if a != "fdatasync4k"],
+                    required_flushes=j["flush_gate"]["n"] * (len(j["flush_gate"]["gated_arms_run"]) - 1),
+                    blkflush_leaf_gate=dict(j["flush_gate"]["blkflush_leaf_gate"], arms={
+                        a: v for a, v in j["flush_gate"]["blkflush_leaf_gate"]["arms"].items() if a != "fdatasync4k"}))},
+                "merged": lambda j: j["flush_gate"].update(
+                    gated_arms_run=[a for a in j["flush_gate"]["gated_arms_run"] if a != "fdatasync4k"],
+                    required_flushes=j["flush_gate"]["n"] * (len(j["flush_gate"]["gated_arms_run"]) - 1),
+                    blkflush_leaf_gate=dict(j["flush_gate"]["blkflush_leaf_gate"], arms={
+                        a: v for a, v in j["flush_gate"]["blkflush_leaf_gate"]["arms"].items() if a != "fdatasync4k"}))},
+             "F3:gate", ["gated_arms_run", "required_flushes", "blkflush gate arms"]),
+            ("a miscounted requirement", {"files": {"gate.json": lambda j: j["flush_gate"].update(required_flushes=1399)},
+                                          "merged": lambda j: j["flush_gate"].update(required_flushes=1399)},
+             "F3:gate", ["required_flushes"]),
+            # tenth review HIGH 1: the fd record and the per-fd shortfall
+            # [amended at V3 review 12 item 4, disclosed: the plant now drops cfr2b's DIRECTORY fd (read from the
+            # fixture's trace, not by dict order) and pairs it with an F1b plant dropping the in-window directory
+            # fsyncs, so only the arm-definitions rule fires; the expectation is unchanged]
+            ("cfr2b's sync_fds one fd short", dict(both(lambda j: j["sync_fds"].update(cfr2b={k: v for k, v in j["sync_fds"]["cfr2b"].items()
+                                                                                               if k != cfr_dir_fd})),
+                                                   f1b=f1b_no_cfr_dirsync),
+             "F3:devflush", ["sync_fds disagrees with the arm definitions"]),
+            ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
+             "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
+            # V3 review 12 item 8: an extra own-fd sync in a floor-reference arm's window (append25)
+            ("an append25 window over its own syncs", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_over=1)},
+             "F3:devflush", ["a flush-gated op's window holds more than its own syncs"]),
+            # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate
+            ("fdatasync4k: a window without a flush-carrying request",
+             {"report": lambda j: j["windows"]["arms"]["fdatasync4k"]["devices"]["nvme0n1"].update(flush_carrying_zero_windows=1)},
+             "F3:devflush", ["a gated op's window holds no flush-carrying request to a write-back layer"]),
+            ("fdatasync4k: a window without the probe's fdatasync",
+             {"report": lambda j: j["syscalls"]["arms"]["fdatasync4k"].update(windows_without_a_sync=1)},
+             "F3:devflush", ["a flush-gated op's window holds no fsync by the probe"]),
+            # eleventh review MED 1: the pid's syncs lying wholly inside a window, counted on ANY fd: nosync25's must be
+            # 0, and none may lie wholly inside a window on an fd that window's arm does not own (the review's plant: an
+            # fsync on fd 7 inside a nosync25 window, which the fd rule alone gives to no window)
+            # [amended at V3 review 12 item 6, disclosed: such a sync is counted in foreign_fd too (a wholly-inside
+            # event on an fd its window's arm does not own has no owning candidate), so the plant is made consistent
+            # (foreign_fd 1) and the one gate is foreign_fd/no_fd == 0; the "wholly inside" counts are descriptive]
+            ("an fsync on fd 7 wholly inside a nosync25 window",
+             {"report": lambda j: (j["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1),
+                                   j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1, inside_foreign_fd=1))},
+             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            # V3 review 12 item 6: a sync on an fd no arm owns at a nosync25 window's EDGE (t0 + 200 ns: its +-500 ns
+            # interval is not wholly inside, so every "inside" count stays 0 and only foreign_fd sees it), a sync
+            # naming no fd, and a report without foreign_fd (a missing count is not a zero)
+            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            ("a sync naming no fd (no_fd 1)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(no_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            ("a report whose unattributed lacks foreign_fd",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            # eleventh review MED 2: the F1b cross-check refuses without its trace, and compares the probe's sync_fds
+            # with the fds strace saw synced INSIDE each arm's timed windows, as sets (setup syncs excluded)
+            ("no F1b real-all trace", {"f1b": "absent"}, "F3:devflush",
+             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+            ("an F1b trace whose first cfr2b clone fsync names fd 99", {"f1b": f1b_fd99}, "F3:devflush",
+             ["sync_fds disagrees with F1b's strace"]),
+            ("an F1b trace whose nosync25 window fsyncs nosync25's own file", {"f1b": f1b_nosync}, "F3:devflush",
+             ["sync_fds disagrees with F1b's strace"]),
+            # V3 review 12 item 11: an in-window sync on a path that is no arm's file (<work>/cfr2b.src) was keyed
+            # "cfr2b.src" and never compared (the loop ran over rows only)
+            ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
+            # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
+            # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
+            # clock read and an undecorated in-window fsync make the windows unreadable
+            ("a truncated F1b gzip", {"f1b": "truncated"}, "F3:devflush",
+             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+            ("an F1b trace with one clock read deleted", {"f1b": f1b_noclock}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
+            ("an F1b trace with an in-window fsync without fd<path>", {"f1b": f1b_nodecor}, "F3:devflush",
+             ["the F1b trace's timed windows cannot be read"]),
         ]
         for name, muts, cid, want in cases:
-            g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"))
+            g = run(name, muts.get("probe"), muts.get("merged"), muts.get("report"), muts.get("files"), muts.get("kvmut"),
+                    muts.get("f1b"))
             t = tags(g.get(cid, {}))
             others = [i for i in F3IDS if i != cid and g.get(i, {}).get("pass") is not True]
             chk("real: planted %s -> %s fails with %s only, the other F3 checks pass" % (name, cid, want),
                 g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
+        # eleventh review MED 2: a sync outside every timed window (setup) on another fd is not the arm's (the old
+        # whole-trace rule counted setup syncs); all five F3 checks pass
+        g = run("f1b-setup-fsync", f1b=f1b_setup)
+        chk("real (MED 2): an F1b fsync of append25's file on fd 42 before the first timed window is not counted -> all "
+            "five F3 checks pass", [i for i in F3IDS if g.get(i, {}).get("pass") is not True] == [],
+            {i: tags(g.get(i, {})) for i in F3IDS})
         m = both(lambda j: j["virtualization"].update(virtualized=False, evidence=[]))
         g = run("virtualized", m["probe"], m["merged"])
         want_v = sorted(["virtualization", "floor_kind", "flush_sent_to_device", "floor_claim qualified on bare metal",
@@ -1206,7 +1600,10 @@ def real_selftest(chk):
                     mut(j)
                     with open(os.path.join(d, f), "w") as fh:
                         json.dump(j, fh)
-            CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv_wt.get("work", ""), td, []
+            # eleventh review MED 2: this cell's own F1b strace, under an OUT of its own
+            wto = os.path.join(td, "wtout")
+            put_f1b(wto, src_wt, None)
+            CELL, KIND, W, OUT, results = "ext4loop", "ext4", kv_wt.get("work", ""), wto, []
             with contextlib.redirect_stdout(io.StringIO()):
                 check_real(d, 0, kv_wt, "wt")
             return {r["id"]: r for r in results}
@@ -1233,7 +1630,7 @@ def real_selftest(chk):
                 g.get(cid, {}).get("pass") is False and sorted(set(t)) == sorted(want) and not others, (t, others))
         # cell:leaf through its own function
         f3 = rj(os.path.join(src, "F3", "summary.probe.json"))
-        sdl = rj(os.path.join(src, "sd_leaf.json"))
+        sdl = (rj(os.path.join(src_wt, "F3", "summary.probe.json")) or {}).get("leaf")  # the real Hyper-V sd leaf
         for name, lf, ok in (("the banked NVMe leaf", f3["leaf"], True), ("the banked Hyper-V sd leaf", sdl, True),
                              ("NVMe over tcp", dict(f3["leaf"], nvme_transport=["tcp"]), False),
                              ("a scsi_debug kind", dict(sdl, kind="scsi_debug", creditable=False), False),
@@ -1277,6 +1674,7 @@ def real_selftest(chk):
             chk("real: cell:box with %s -> %s" % (name, "pass" if ok else "fail"), results[0]["pass"] is ok, results[0]["detail"])
     finally:
         CELL, KIND, W, OUT, results = saved
+        REGISTRY_FILE = "REGISTERED.tsv"
         shutil.rmtree(td)
 
 
@@ -1284,10 +1682,11 @@ def main(argv):
     global OUT, CELL, KIND, W
     if argv == ["--self-test"]:
         return self_test()
-    if len(argv) == 6 and argv[0] == "--plan":
-        if argv[1] not in v3cell.CELLS or argv[4] not in ("vm", "bare") or argv[5] not in ("yes", "no"):
+    if len(argv) == 7 and argv[0] == "--plan":
+        if argv[1] not in v3cell.CELLS or argv[4] not in ("vm", "bare") or argv[5] not in ("yes", "no") or \
+                argv[6] not in ("yes", "no"):
             return 2
-        print("\n".join(plan(argv[1], argv[2], argv[3], {"virt": argv[4], "flip": argv[5]})))
+        print("\n".join(plan(argv[1], argv[2], argv[3], {"virt": argv[4], "flip": argv[5], "plp": argv[6]})))
         return 0
     if len(argv) == 2 and argv[0] == "--box":
         info = rd(os.path.join(argv[1], "info.txt")) or ""
@@ -1361,6 +1760,8 @@ def main(argv):
         bad = sequence_problems(calls, arms, n, mutant, other, pids, rc)
         if int(sj.get("trace_clock", 0)) != 1 or int(sj.get("mutant_nosync", -1)) != int(mutant):
             bad.append(("flags", sj.get("trace_clock"), sj.get("mutant_nosync")))
+        if sj.get("traced") is not True:  # ninth review M4
+            bad.append(("traced", sj.get("traced")))
         check(cid, not bad, {"bad": bad[:8]},
               "strace -f -y --trace-clock [%s] n=%d: every timed window holds exactly its arm's syscalls on its own files, "
               "sizes and offsets; nothing between ops; each arm once per round (%d distinct round orders); the only other "
@@ -1429,12 +1830,17 @@ def main(argv):
     f2bv = summary_vs_raw(s2, r2, 200)[2] if r2 and "nosync25" in r2 else ["missing raw"]
     check("F2b", want2 is not None and str(s2.get("timing_control", "")).startswith(want2) and s2.get("plp") == box["plp"]
           and f2b == (3 if f2bv else 0) and (want2 != "FAIL" or f2b == 3) and mut_ratios.get("append25") is not None
-          and mut_ratios["append25"] <= thr2 and not bad2,
+          and mut_ratios["append25"] <= thr2 and not bad2 and s2.get("traced") is False,
           {"rc": f2b, "timing_control": s2.get("timing_control"), "want": want2, "plp": s2.get("plp"),
-           "ratios_from_raw": mut_ratios, "bad": bad2[:6]},
+           "ratios_from_raw": mut_ratios, "bad": bad2[:6], "traced": s2.get("traced")},
           "--mutant-nosync n=200: append25/nosync25 <= the threshold from raw, summary == raw; on a write-back leaf "
           "without PLP the timing control voids it (rc 3), on a write-through, brd or declared-PLP leaf it records "
-          "'not applicable' (A14)")
+          "'not applicable' (A14); untraced, and the probe says so (ninth review M4)")
+    # T: the untraced twin of F3 (stage T) must say it ran untraced (ninth review M4)
+    tsj = rj(os.path.join(OUT, "T.out", "summary.json")) or {}
+    trc = rc_of(os.path.join(OUT, "T.rc"))
+    check("T:untraced", trc in (0, 3) and tsj.get("traced") is False, {"rc": trc, "traced": tsj.get("traced")},
+          "stage T ran the probe alone (rc 0 or 3) and its summary records traced: false")
 
     # F3: the real run, n=200, through run.sh (stamps, blkflush, the batch gate)
     f3rec = check_real(os.path.join(OUT, "F3"), rc_of(os.path.join(OUT, "F3.rc")), kv, leaf)
@@ -1450,17 +1856,21 @@ def main(argv):
                   "append25). The registered threshold for a class (REGISTERED.tsv) is taken from such candidates "
                   "before any rental; the other arms are descriptive and left to the flush gate",
           "registered_key": (rj(os.path.join(OUT, "F3", "summary.probe.json")) or {}).get("d0_threshold_key"),
-          "max_mutant_gated": max(gm) if gm else None, "min_real_gated": min(gr) if gr else None, "per_arm": {}}
+          "max_mutant_gated": max(gm) if gm else None, "min_real_gated": min(gr) if gr else None, "per_arm": {},
+          "pooled_over_flush_gated_arms_descriptive": True}
     for a in GATED:
         if a in mut_ratios and a in real_r:
             mu, re_ = mut_ratios[a], real_r[a]
             d0["per_arm"][a] = {"mutant": mu, "real": re_, "separates": mu < re_,
                                 "candidate": round((mu * re_) ** 0.5, 2) if mu < re_ and mu > 0 else None,
                                 "threshold_10_separates": mu < 10 < re_}
-    if gm and gr:
-        d0["separates"] = max(gm) < min(gr)
-        d0["candidate"] = round((max(gm) * min(gr)) ** 0.5, 2) if d0["separates"] else None
-        d0["threshold_10_separates"] = max(gm) < 10 < min(gr)
+    # the registered candidate is append25's alone (A17; eighth review M3): the pooled max/min above are descriptive
+    a25 = d0["per_arm"].get("append25")
+    if a25:
+        d0["separates"] = a25["separates"]
+        d0["candidate"] = a25["candidate"]
+        d0["threshold_10_separates"] = a25["threshold_10_separates"]
+        d0["candidate_arm"] = "append25"
 
     # frame arm (item 11; gate-6 review MED 5): the registered one, else none with the rule's candidate; append64 (an
     # append of >= the ~60 B flight and < 4 KiB) runs in F3, descriptive until registered
@@ -1558,6 +1968,44 @@ def main(argv):
     check("F4:P_nest3", rc in (0, 3) and nj.get("layers") == 4 and nj.get("loop_layers") == 3,
           {"rc": rc, "layers": nj.get("layers"), "text": (rd(os.path.join(OUT, "F4", "P_nest3.txt")) or "")[-300:]},
           "3 nested loops (4 layers) are followed to the leaf and accepted")
+    # P_nest_modes after P_nest3: the plan's order (run 37845193906 failed "plan" with it before)
+    nm = os.path.join(OUT, "F4", "P_nest_modes")
+    pj = rj(os.path.join(nm, "probe.out", "summary.json")) or {}
+    at = rd(os.path.join(nm, "after_teardown.txt"))
+    ar = rd(os.path.join(nm, "after_rebuild.txt"))
+    rb1 = (rd(os.path.join(nm, "rebuilt_n1_backing.txt")) or "").strip()
+    # V3 review 12 item 5: both builds' n1 image against the cell's own directory (firecheck derives it from the work
+    # dir's mount, independently of the n1 it judges)
+    n1p = nest_n1_problems((rd(os.path.join(nm, "cell_nest_dir.txt")) or "").strip(),
+                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1)
+    ast = rd(os.path.join(nm, "after_stray.txt"))
+    # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
+    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
+    pb = (rd(os.path.join(nm, "plant_before.txt")) or "").strip()
+    pa = (rd(os.path.join(nm, "plant_after.txt")) or "").strip()
+    plant_ok = bool(pb) and pa == pb and (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip() == "yes"
+    check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
+          and plant_ok
+          and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
+          and sorted(ar.split("\n")[:-1]) == ["n%d mounted ok" % k for k in (1, 2, 3, 4)]
+          and not n1p  # tenth review MED 1, review 12 item 5: n1 on the cell's own filesystem, both builds
+          and rc_of(os.path.join(nm, "probe.rc")) in (0, 3) and pj.get("layers") == 4 and pj.get("loop_layers") == 3
+          # tenth review MED 2: a stray loop on n1, never mounted, is detached by the teardown, which leaves no loop on
+          # the chain and nothing mounted
+          and bool((rd(os.path.join(nm, "stray.dev")) or "").strip()) and rc_of(os.path.join(nm, "stray_teardown.rc")) == 0
+          # V3 review 12 item 13: the extra never-mounted loop on n1's own image was attached (only the final sweep can
+          # detach it; after_stray, below, then holds neither it nor the image)
+          and bool((rd(os.path.join(nm, "n1extra.dev")) or "").strip())
+          and ast is not None and ast.strip() == "",
+          {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
+           "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
+           "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
+           "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
+           "n1extra": (rd(os.path.join(nm, "n1extra.dev")) or "").strip(),
+           "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
+           "na": rd(os.path.join(nm, "na.txt")), "teardown": (rd(os.path.join(nm, "teardown.txt")) or "")[-300:]},
+          "mkfixtures.sh --teardown-nest leaves nothing of n1..n4 (no mount, no .ok, no n1 image); V3_FIXTURES=nest "
+          "rebuilds all four on the same directory; the probe accepts the rebuilt n3 (4 layers)")
     if KIND == "ext4":
         rc = rc_of(os.path.join(OUT, "F4", "R_ficlone_accept.rc"))
         txt = rd(os.path.join(OUT, "F4", "R_ficlone_accept.txt")) or ""
@@ -1832,6 +2280,10 @@ def unplanted(arch, leaf, box):
         u.append("the kernel's write_cache disagreeing with the drive: the leaf disk reads write-through and is not sd, "
                  "so neither direction can be planted (the kernel refuses 'write back' on a queue without a volatile "
                  "cache: recalled, unverified)")
+    u.append("run.sh's rental-mode loop-cell refusal (on a runner without the performance governor t3pre refuses first; "
+             "post's rental rules are self-tested: batchgate self-test), and the probe's rental no-threshold refusal, "
+             "which needs a write-back leaf without PLP (its other --require-registered refusals are planted: "
+             "R_rental_noreg, R_rental_noframe, R_rental_novariant)")
     if leaf != "wt":
         u.append("A16's write-through refusals on this cell's own batch (its leaf is not write-through; the post plants "
                  "R_post_wtflush and R_post_wtmismatch make a copy of it write-through)")
@@ -1901,6 +2353,8 @@ def check_real(o3, rc, kv, leaf):
         bad.append(("probe rc vs the control recomputed from raw", probe_rc, fail))
     if int(sj.get("mutant_nosync", -1)) != 0 or int(sj.get("trace_clock", -1)) != 0:
         bad.append(("flags", sj.get("mutant_nosync"), sj.get("trace_clock")))
+    if sj.get("traced") is not False:  # ninth review M4: F3 runs untraced (run.sh), and the probe must say so
+        bad.append(("F3 ran traced or did not record it", sj.get("traced")))
     lp = v3cell.layout_problems(CELL, sj.get("fstype"), sj.get("mount_source"), sj.get("flush_path"))
     if lp:
         bad.append(("layout", lp))
@@ -1990,8 +2444,26 @@ def check_real(o3, rc, kv, leaf):
                 if a in rows and ((sy["arms"].get(a) or {}).get("windows_without_a_sync") != 0 or
                                   (sy["arms"].get(a) or {}).get("ops") != n):
                     dbad.append(("a flush-gated op's window holds no fsync by the probe", a, sy["arms"].get(a)))
+                # tenth review HIGH 1: syncs are attributed by fd, so each window must hold ALL its own (clone2b and
+                # cfr2b sync the clone and the directory)
+                if a in rows and (sy["arms"].get(a) or {}).get("windows_short") != 0:
+                    dbad.append(("a flush-gated op's window lacks one of its own syncs", a, sy["arms"].get(a)))
+                # V3 review 12 item 8: ... and no more than its own (an extra own-fd sync on a floor-reference arm,
+                # append25 or fdatasync4k, would otherwise pass); a missing count is not a zero
+                if a in rows and (sy["arms"].get(a) or {}).get("windows_over") != 0:
+                    dbad.append(("a flush-gated op's window holds more than its own syncs", a, sy["arms"].get(a)))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
+            # eleventh review MED 1, V3 review 12 item 6: nosync25 owns no fd, so the fd rule can never give it a sync;
+            # every sync of the probe's that no overlapping window's arm owns (foreign_fd: a nosync25 window's
+            # included, wholly inside or at its edge) or that names no fd (no_fd) must be 0 (a missing count is not a
+            # zero). The "wholly inside" counts (syncs_inside_any_fd, inside_*) are strictly weaker and stay
+            # descriptive: an edge or sub-us-window sync shows only in foreign_fd
+            ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
+            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
+                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns, or on none",
+                             sy.get("unattributed")))
+        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
         rec["shared_devices"] = shared
@@ -2026,10 +2498,19 @@ def check_real(o3, rc, kv, leaf):
         gb.append(("flush gate", fg, want))
     if (merged or {}).get("flush_gate") != fg:
         gb.append("summary.json's flush_gate differs from gate.json's")
+    # ninth review M5: the gate's inputs derived here by hand, never trusted from the gate's own record
+    ran_g = sorted(a for a in GATED if a in (sj.get("arms") or {}))
+    if sorted(fg.get("gated_arms_run") or []) != ran_g:
+        gb.append(("gated_arms_run", fg.get("gated_arms_run"), ran_g))
+    if not isinstance(sj.get("n"), int) or fg.get("required_flushes") != sj["n"] * len(ran_g):
+        gb.append(("required_flushes", fg.get("required_flushes"), sj.get("n"), len(ran_g)))
+    bk = fg.get("blkflush_leaf_gate") or {}
+    if not str(bk.get("outcome", "")).startswith("not applicable") and sorted(bk.get("arms") or {}) != ran_g:
+        gb.append(("blkflush gate arms", sorted(bk.get("arms") or {}), ran_g))
     check("F3:gate", not gb, {"bad": gb, "gate": g},
           "run.sh's gate: no post-run refusal; the diskstats leaf flush gate passes on a write-back leaf (>= n x gated "
           "arms) and labels a write-through or brd leaf, never passes it")
-    rb = record_problems(sj, merged, rep, st0, kv, leaf)
+    rb = record_problems(sj, merged, rep, st0, kv, leaf, p50)
     check("F3:record", not rb, {"bad": rb},
           "the batch records the clocksource (allowlisted, in summary and stamp), cpufreq/cpuidle, the binary's own sha256 "
           "(static, nothing else mapped), per-layer write_cache/fua and ext4 data=/commit=/async commit, virtualization "
@@ -2040,21 +2521,143 @@ def check_real(o3, rc, kv, leaf):
     return rec
 
 
-def floor_reference_problems(sj):
-    """A18: the floor reference is the min p50 over append25, fdatasync4k and the registered frame arm that ran."""
+FRAME_VARIANT = {None: "no frame arm registered", "ow4k": "fdatasync4k (ow4k + fdatasync)"}
+FRAME_VARIANT_NONE = "none in this probe: the registered frame arm has no fdatasync variant arm (A18 needs one)"
+
+
+def canon_path(p):
+    """A path made canonical lexically, as `readlink -m` makes one that does not exist: runs of '/' collapsed (POSIX
+    normpath keeps a leading '//'), '.' and '..' resolved; '' stays ''."""
+    p = re.sub(r"/+", "/", (p or "").strip())
+    return os.path.normpath(p) if p else ""
+
+
+def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
+    """V3 review 12 item 5: P_nest_modes' n1 image, first built and rebuilt, against the CELL's own directory, which
+    firecheck derives from the work dir's mount (a /dev/loop source: its backing file's directory; else the mount
+    target), never from the n1 under test (the old check read the directory back from it, so an f_nest that ignored
+    V3_NEST_DIR passed, and a loop cell's '//v3fx-n1.img' was a false red). [] when both are cell_dir/v3fx-n1.img."""
+    cd = canon_path(cell_dir)
+    if not cd.startswith("/"):
+        return ["no cell directory was derived (%r)" % (cell_dir,)]
+    want = canon_path(cd + "/v3fx-n1.img")
+    return ["the %s n1 image is %r, not the cell's %s" % (what, got, want)
+            for what, got in (("first-built", first_n1), ("rebuilt", rebuilt_n1)) if canon_path(got) != want]
+
+
+def f1b_window_syncs(text):
+    """eleventh review MED 2: the fsync and fdatasync calls INSIDE the timed windows of an F1b strace -f -y trace, read
+    through parse_trace and sliced as sequence_problems slices them (V3 review 12 item 15: this was a second strace
+    parser, whose split-line and parity branches no trace F1b:real-all accepts can reach): a window is the calls
+    between its opening and closing clock_gettime, the only clock reads the loop makes. Setup and teardown syncs are
+    outside every window. A split (<unfinished ...>) line is not a call (parse_trace keeps it in `other`, which
+    F1b:real-all refuses). The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>,
+    for an arm this probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd
+    (review 12 item 11). An odd number of clock reads, or an in-window sync whose first argument is not fd<path>, is a
+    problem. -> (seen {arm: fds}, problems, odd paths)"""
+    seen, probs, odd, fdmap = {}, [], [], {}
+    known = set(ALL.split(","))
+    calls, _other, _pids = parse_trace(text, fdmap)
+    clocks = [k for k, (name, _) in enumerate(calls) if name == "clock_gettime"]
+    if not clocks or len(clocks) % 2:
+        return {}, ["%d clock reads: the trace holds no whole timed windows" % len(clocks)], []
+    for w in range(len(clocks) // 2):
+        for k in range(clocks[2 * w] + 1, clocks[2 * w + 1]):
+            name, t = calls[k]
+            if name not in ("fsync", "fdatasync"):
+                continue
+            pm = re.match(r"^(?:fsync|fdatasync) <(.*)> = ", t)
+            if fdmap.get(k) is None or not pm:
+                probs.append("an in-window sync without fd<path>: " + t[:120])
+                continue
+            path, base = pm.group(1), os.path.basename(pm.group(1))
+            if re.fullmatch(r"c\d+", base):
+                par = os.path.basename(os.path.dirname(path))
+                arm = par[:-len(".clones")] if par.endswith(".clones") else None
+            else:
+                arm = base[:-len(".clones")] if base.endswith(".clones") else base
+            if arm not in known:
+                odd.append(path)
+                continue
+            seen.setdefault(arm, set()).add(fdmap[k])
+    return seen, probs, odd
+
+
+def sync_fds_def_problems(sj, rows, n):
+    """The arm-definitions half of sync_fds_problems, on its own so batchgate's post runs it too (V3 review 11 LOW 2,
+    review 12 item 7: post trusted the probe's sync_fds): per arm in rows, one fd per synced file (the clone and the
+    directory for clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25), each
+    synced n times; a missing or overflowed record is one problem. -> [(tag, arm, recorded, fds, syncs)]."""
+    sf = sj.get("sync_fds")
+    if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
+        return [("sync_fds disagrees with the arm definitions", "missing or overflowed", sj.get("sync_fds_overflow"))]
+    bad = []
+    for a in rows:
+        spec = OP.get(a, {})
+        per_op = spec.get("fsync", 0) + spec.get("fdatasync", 0)
+        nfd = 2 if a in ("clone2b", "cfr2b") else (1 if per_op else 0)
+        got = sf.get(a)
+        if not isinstance(got, dict) or len(got) != nfd or sum(got.values()) != n * per_op or \
+                any(v != n for v in got.values()):
+            bad.append(("sync_fds disagrees with the arm definitions", a, got, nfd, n * per_op))
+    return bad
+
+
+def sync_fds_problems(sj, rows, n, f1b_trace):
+    """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
+    match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
+    clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
+    the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
+    fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
+    (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
+    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
+    bad = sync_fds_def_problems(sj, rows, n)
+    if bad and bad[0][1] == "missing or overflowed":
+        return bad
+    sf = sj.get("sync_fds")
+    if f1b_trace is None:
+        bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
+        return bad
+    seen, probs, odd = f1b_window_syncs(f1b_trace)
+    if probs:
+        bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
+        return bad
+    if odd:  # V3 review 12 item 11: an in-window sync on a path that is no arm's file is reported, never dropped
+        bad.append(("an F1b in-window sync on a file that is no arm's own", sorted(set(odd))[:5]))
+    for a in rows:
+        want = {int(k) for k in (sf.get(a) or {})}
+        if want != seen.get(a, set()):
+            bad.append(("sync_fds disagrees with F1b's strace", a, sorted(want), sorted(seen.get(a, set()))))
+    return bad
+
+
+def floor_reference_problems(sj, p50ns):
+    """A18 as the probe applies it (ninth review H1, L10, M6): the floor reference is the arm with the least raw p50
+    (nanoseconds, from raw.tsv: two arms within 0.1 us must not split on rounding) among append25 (fsync) and
+    fdatasync4k (ow4k + fdatasync: the frame arm's fdatasync variant when the frame arm is ow4k) that ran. The frame
+    arm itself runs with fsync and is never a candidate, registered or not. floor_frame_variant names the variant for
+    the registered frame arm, or records that this probe has none."""
+    bad = []
     arms = sj.get("arms") or {}
-    cands = [a for a in ("append25", "fdatasync4k", sj.get("frame_arm")) if a and a in arms]
     fr = sj.get("floor_reference")
+    want_v = FRAME_VARIANT.get(sj.get("frame_arm"), FRAME_VARIANT_NONE)
+    if sj.get("floor_frame_variant") != want_v:
+        bad.append(("floor_frame_variant", sj.get("floor_frame_variant"), want_v))
+    cands = [a for a in ("append25", "fdatasync4k") if a in arms]
     if not cands:
-        return [] if fr is None else [("floor_reference without a candidate arm", fr)]
-    best = min(cands, key=lambda a: arms[a].get("p50_us", 1e18))
-    if not isinstance(fr, dict) or fr.get("arm") != best or abs((fr.get("p50_us") or -1) - arms[best].get("p50_us", -2)) > 0.051 \
-            or fr.get("barrier") != ("fdatasync" if best == "fdatasync4k" else "fsync"):
-        return [("floor_reference", fr, best, arms[best].get("p50_us"))]
-    return []
+        return bad + ([] if fr is None else [("floor_reference without a candidate arm", fr)])
+    if not isinstance(p50ns, dict) or any(not isinstance(p50ns.get(a), (int, float)) for a in cands):
+        return bad + [("floor_reference: no raw p50 for the candidates", cands)]
+    least = min(p50ns[a] for a in cands)
+    best = [a for a in cands if p50ns[a] == least]  # an exact tie in nanoseconds: either is the minimum
+    if not isinstance(fr, dict) or fr.get("arm") not in best or \
+            abs((fr.get("p50_us") or -1) - p50ns[fr.get("arm")] / 1e3) > 0.051 or \
+            fr.get("barrier") != ("fdatasync" if fr.get("arm") == "fdatasync4k" else "fsync"):
+        bad.append(("floor_reference", fr, best, round(least / 1e3, 3)))
+    return bad
 
 
-def record_problems(sj, merged, rep, st0, kv, leaf):
+def record_problems(sj, merged, rep, st0, kv, leaf, p50=None):
     """F3:record's rules on the batch's own records (check_real calls it; the self-test drives check_real itself on
     planted copies of a banked batch, so the call is covered too: sixth review M3)."""
     rep = rep or {}
@@ -2089,7 +2692,7 @@ def record_problems(sj, merged, rep, st0, kv, leaf):
         rb.append(("plp", sj.get("plp"), kv.get("plp")))
     if not isinstance(sj.get("pid"), int):
         rb.append(("pid", sj.get("pid")))
-    rb += floor_reference_problems(sj)
+    rb += floor_reference_problems(sj, p50)
     # the claim the batch may make, re-derived here from the device flush record's clean windows (fresh reviews
     # P-H1, B-H2; fourth review L1, L2, L9)
     fpl = sj.get("flush_path") or []
@@ -2157,13 +2760,14 @@ def bind(out, cell):
                                                                            "claim": claim, "claim_want": want},
                     "check": "run.sh binds a batch to this cell's real passing verdict, records its sha256 and run id, "
                              "and the batch's claim says its clean arm did not run"})
-        rc = rc_of(os.path.join(out, "F4", "R_runsh_boundshape.rc"))
-        txt = rd(os.path.join(out, "F4", "R_runsh_boundshape.txt")) or ""
-        res.append({"id": "bind:R_runsh_boundshape", "pass": rc == 2 and "bound shape: a bound batch runs N=10000" in txt
-                    and not os.path.exists(os.path.join(out, "F4", "R_runsh_boundshape.out")),
-                    "detail": {"rc": rc, "text": txt[-300:]},
-                    "check": "the same verdict, bound, but N=5: run.sh refuses before the probe runs (the registered V3 "
-                             "shape: gate-6 review MED 6)"})
+        for tag, what in (("R_runsh_boundshape", "N=5"), ("R_runsh_boundarms", "N=10000 without fdatasync4k")):
+            rc = rc_of(os.path.join(out, "F4", tag + ".rc"))
+            txt = rd(os.path.join(out, "F4", tag + ".txt")) or ""
+            res.append({"id": "bind:" + tag, "pass": rc == 2 and "bound shape: a bound batch runs N=10000" in txt
+                        and not os.path.exists(os.path.join(out, "F4", tag + ".out")),
+                        "detail": {"rc": rc, "text": txt[-300:]},
+                        "check": "the same verdict, bound, but %s: run.sh refuses before the probe runs (the registered "
+                                 "V3 shape: gate-6 review MED 6, eighth review L4)" % what})
     vsha = hashlib.sha256(open(os.path.join(out, "verdict.json"), "rb").read()).hexdigest() \
         if os.path.exists(os.path.join(out, "verdict.json")) else None
     b = {"cell": cell, "verdict_sha256": vsha, "verdict_all_pass": v.get("all_pass"), "checks": res,

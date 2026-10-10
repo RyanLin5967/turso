@@ -1825,6 +1825,17 @@ pub enum Insn {
     ResetOnce {
         region_end: BranchOffset,
     },
+    /// Open a catch region: until the next [Insn::CatchEnd], a value error an instruction raises
+    /// (a function's refusal, a conversion; `LimboError::is_catchable_value_error`) jumps to
+    /// `target_pc` instead of failing the statement. Brackets an expression that may refuse a
+    /// value with no effect but its registers, such as a seek key's ENCODE (engine review 16
+    /// HIGH 2). A RAISE translated inside such a region jumps to `target_pc` itself
+    /// (`ProgramBuilder::catch_raise_target`).
+    CatchBegin {
+        target_pc: BranchOffset,
+    },
+    /// Close the catch region [Insn::CatchBegin] opened.
+    CatchEnd,
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
     /// Otherwise, continue to the next instruction.
@@ -2323,6 +2334,8 @@ impl InsnVariants {
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
             InsnVariants::ResetOnce => execute::op_reset_once,
+            InsnVariants::CatchBegin => execute::op_catch_begin,
+            InsnVariants::CatchEnd => execute::op_catch_end,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,

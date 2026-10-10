@@ -227,6 +227,23 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     }
 }
 
+/// An argument of numeric's operator functions as a decimal (engine review 16 #21, review 20
+/// HIGH 2). Their operands reach them as user-facing values (a numeric column read decoded, as
+/// text; the other operand as given: `emit_custom_type_operator`), so a blob can only be an operand
+/// given as one, which numeric's INSERT refuses (`numeric_encode`). It is refused here with that
+/// same error rather than read as the type's internal encoding, which made `x = <blob>` match a
+/// value no INSERT could have stored. The sort comparator still reads stored encodings
+/// (`value_to_bigdecimal`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
+/// encoding, as before.
+fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
+    if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
+        return Err(LimboError::Constraint(format!(
+            "invalid input for type numeric: \"{val}\""
+        )));
+    }
+    value_to_bigdecimal(val)
+}
+
 /// Create a sort comparator closure from a SortComparatorType enum.
 fn make_sort_comparator(
     cmp_type: &SortComparatorType,
@@ -700,6 +717,13 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
+            // failed drain of the device, acted on before the row reports busy (engine review 17
+            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
+            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
+                pager.check_noted_syncs();
+            }
             pager.clear_checkpoint_state();
             state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
@@ -4859,6 +4883,33 @@ pub fn op_transaction_inner(
     }
 }
 
+/// SQLite's OP_AutoCommit on SQLITE_BUSY (vdbe.c: `db->autoCommit = 1-desiredAutoCommit`): a COMMIT
+/// whose `commit_txn` returned Busy with `commit_state` still `Ready` and nothing of it committed
+/// (the trunk's copy-decision pass refused it before any frame) has committed nothing, so its
+/// transition is undone. The
+/// transaction is explicit again in the gap (siblings, BEGIN, ROLLBACK and `get_auto_commit` all
+/// see it open), and the re-stepped COMMIT makes the transition anew with every guard
+/// (StatementsInProgress, the poison mark, deferred FKs). Engine review 16 HIGH 1, which replaces
+/// 795295c09's commit-started flag. Mutant `busy_commit_keeps_autocommit` (test builds only): the
+/// transition stays, so the re-step reads "no transaction is active".
+///
+/// Never once a part of the COMMIT has committed (`ProgramState::commit_published`; engine review
+/// 19 HIGH 2): main's half is durable when an attached pager's decision pass refuses, and a
+/// reopened transaction would let ROLLBACK report a durable half as rolled back. On the WAL path
+/// such a COMMIT is in `CommittingAttached` already (its re-step finishes the attached half), so
+/// this check is reached only with `commit_state` `Ready` after a part committed: an attached MVCC
+/// commit refused after main's (`commit_txn_mvcc` phase 2), reachability unverified and no red.
+fn undo_commit_transition_after_busy(conn: &Connection, state: &mut ProgramState) {
+    if crate::branch::store::fe_mutant("busy_commit_keeps_autocommit") {
+        return;
+    }
+    if state.commit_published {
+        return;
+    }
+    conn.auto_commit.store(false, Ordering::SeqCst);
+    state.auto_txn_cleanup = TxnCleanup::None;
+}
+
 pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
@@ -4889,12 +4940,12 @@ pub fn op_auto_commit(
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
-        // The commit finished, or failed for good: a later step is not its re-entry.
-        if !matches!(
-            res,
-            Ok(InsnFunctionStepResult::IO(_)) | Err(LimboError::Busy)
-        ) {
-            state.commit_started = false;
+        // A resumed commit (after a view merge's yield) refused before its pager commit began.
+        if matches!(res, Err(LimboError::Busy))
+            && !*rollback
+            && matches!(state.commit_state, CommitState::Ready)
+        {
+            undo_commit_transition_after_busy(&conn, state);
         }
         // Only clear after a final, successful non-rollback COMMIT.
         if fk_on
@@ -4941,17 +4992,6 @@ pub fn op_auto_commit(
             ));
         }
     };
-
-    // A COMMIT stepped again after its `commit_txn` returned Busy before recording any
-    // `commit_state` (a trunk commit's refused copy-decision pass) made its transition on the
-    // first step: `auto_commit` is still true from it, so it only drives `commit_txn` again (wire
-    // review 7 HIGH 3). Had a BEGIN on this connection cleared `auto_commit` in between, the
-    // COMMIT is an ordinary one again and makes the transition anew. Mutant
-    // `commit_restarts_after_busy` (test builds only): the re-entry is judged as a new COMMIT, as
-    // before, and reads "no transaction is active".
-    let resuming_commit = state.commit_started
-        && had_autocommit
-        && !crate::branch::store::fe_mutant("commit_restarts_after_busy");
 
     // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
     // or COMMIT/ROLLBACK without one) is invalid.
@@ -5005,7 +5045,6 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                state.commit_started = true;
             }
             TxOp::Begin => {
                 turso_assert!(
@@ -5016,7 +5055,7 @@ pub fn op_auto_commit(
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
-    } else if !resuming_commit {
+    } else {
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
@@ -5039,26 +5078,27 @@ pub fn op_auto_commit(
     // Index-method staging is a per-statement Halt responsibility (each
     // statement stages its writes at its own halt and hands its cursors to
     // the connection), so the COMMIT program has nothing to stage here. A
-    // yield point at this spot would also be unsafe: `conn.auto_commit` was
-    // already flipped above, and re-entering this opcode from the top after
-    // an IO yield would then fail `valid_transition` with a torn-down
-    // transaction.
+    // yield point here, between the transition above and `commit_txn`, would
+    // be unsafe: it records no `commit_state`, so the re-entry would judge
+    // the COMMIT anew while `conn.auto_commit` is already flipped and fail
+    // `valid_transition`.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
         .map(Into::<InsnFunctionStepResult>::into)
     {
         Ok(res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step)) => res,
-        // An IO yield records its `commit_state`, whose re-entry is driven above.
+        // Every IO yield inside `commit_txn` records its `commit_state` (a view merge's as
+        // `ApplyingViewDeltas`), so the re-entry is driven by the block at the top.
         Ok(res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row)) => return Ok(res),
-        // Retried at this pc: a COMMIT keeps `commit_started` and resumes.
-        Err(LimboError::Busy) => return Err(LimboError::Busy),
-        Err(err) => {
-            state.commit_started = false;
-            return Err(err);
+        Err(LimboError::Busy) => {
+            if !*rollback && matches!(state.commit_state, CommitState::Ready) {
+                undo_commit_transition_after_busy(&conn, state);
+            }
+            return Err(LimboError::Busy);
         }
+        Err(err) => return Err(err),
     };
-    state.commit_started = false;
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;
@@ -10582,8 +10622,8 @@ pub fn op_function(
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -10595,7 +10635,14 @@ pub fn op_function(
                                         "division by zero".to_string(),
                                     ));
                                 }
-                                a / b
+                                // PostgreSQL's result scale (lead ruling 2026-10-09 on
+                                // e52f01422). Mutant `div_scale_bigdecimal` (test builds
+                                // only): bigdecimal's own, as before.
+                                if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
+                                    a / b
+                                } else {
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                }
                             }
                             _ => unreachable!(),
                         };
@@ -10611,8 +10658,8 @@ pub fn op_function(
                 match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
@@ -15776,6 +15823,33 @@ pub fn op_reset_once(
     let start = state.pc;
     let end = region_end.as_offset_int();
     state.once.retain(|pc| *pc <= start || *pc >= end);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchBegin] instruction: until [Insn::CatchEnd], a catchable value error
+/// jumps to `target_pc` (`Program::normal_step`).
+pub fn op_catch_begin(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(CatchBegin { target_pc }, insn);
+    assert!(target_pc.is_offset());
+    state.catch_target = Some(target_pc.as_offset_int());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchEnd] instruction: close the catch region.
+pub fn op_catch_end(
+    _program: &Program,
+    state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    state.catch_target = None;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

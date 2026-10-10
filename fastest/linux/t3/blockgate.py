@@ -9,7 +9,10 @@
   blockgate.py self-test [TESTDATA]          the decision on synthetic records and on the real records in TESTDATA
                                              (default: testdata/ beside this file); exit 0 iff every case passes
 
-BLOCK is loop, brd or device; PLP is yes or no (a real run's --plp; dry runs say no).
+BLOCK is loop, brd or device; PLP is yes or no (a real run's --plp; dry runs say no). A device block (a real run)
+also needs the batch bound to a passing fire-check verdict and of the registered shape, N=10000, whatever its class
+(fourth lane review LOW 17); every non-brd block needs the record's required_flushes to equal n x its flush-gated
+arms, re-derived as batchgate.post defines it (LOW 19).
 Records are judged in the shape the V3 probe writes from c225124ae on (timing_control, d0_control, plp, and
 batchgate.post's flush_gate.voids). Any other shape FAILs: the fields are an allowlist, not optional.
 Every class first:
@@ -18,8 +21,10 @@ Every class first:
     control FAILed (a foreign writer: nosync25 p50 >= 50 us), or batchgate.post recorded a void in
     flush_gate.voids (the flush gate, a write-back layer's window with no flush-carrying request, a gated window
     with no fsync by the probe). rc 3 with no void recorded FAILs; so does rc 0 with one. The D0 control must read
-    "pass". (Fail closed: PREREG :177 gives the D0 void to T1 and V3 review 2 item 6 kept it off T3, but the probe
-    now evaluates it on every batch, and a foreign writer on the leaf also inflates the flush counter below.)
+    "pass". Annex A20 (the lead's ruling): on T3 a D0 foreign-writer void FAILS the block, because a foreign writer
+    on the leaf also inflates the flush counter A16 relies on. A11's "brd VOID recorded" is narrowed by the same
+    change: the probe has not voided brd on timing since c225124ae, so every brd void is a real one (annex row for
+    A11 owed by the lead; fourth lane review LOW 18).
   - the probe's timing control must read what A14 gives the class: "pass" (write back, no PLP), "not applicable:
     PLP" (write back, --plp yes), "not applicable: no volatile cache" (write through), "not applicable: brd".
 A16 (annex row, 2026-10-08) makes A14's counter gate conditional on the cross-checked write-cache state:
@@ -37,7 +42,8 @@ A16 (annex row, 2026-10-08) makes A14's counter gate conditional on the cross-ch
   - brd (dry runs only): PASS when nothing above fails.
 The plants (every block, on copies of the real record; gate-6 reviews: each plant is ONE field changed on a record
 a positive arm shows passing, so a plant cannot fire without its defect):
-  control         the real record, judged as a device block                           must PASS (else NOT-RUN)
+  control         the real record, judged as a loop block (the class rules; not the
+                  device-only binding and shape)                                      must PASS (else NOT-RUN)
   b-missing       the kernel write_cache removed                                      must FAIL (b)
   b-mismatch      the drive's report flipped against the kernel's                     must FAIL (b)
   b-nodrive       the drive's report removed                                          must FAIL (b)
@@ -59,17 +65,21 @@ On an unbound (smoke, brd) batch the plant base assumes the app-sync evidence, s
 a brd record the base is first made a drive (write through, drive agreeing, its timing control as for that class).
 The branch the real drive is not on is reached by setting both kernel and drive to that state (and the timing
 control to that class's); the counts stay the record's own except the one planted field.
+PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-v1-FINAL-CANDIDATE.md, the text the
+rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 """
 import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 
 
 F1B_REAL = ("F1b:real-all", "F1b:real-4k")
+DEVICE_N = 10000  # the registered V3 batch shape (PREREG section 4; run.sh refuses a bound batch of any other N)
 # the timing control a passing batch of each class carries (v3floor.c at c225124ae; annex A14): an allowlist
 TIMING = {"write back": "pass", "write back+plp": "not applicable: PLP",
           "write through": "not applicable: no volatile cache", "brd": "not applicable: brd"}
@@ -103,9 +113,13 @@ def app_sync_evidence(outdir):
             return ev
         v = json.loads(raw)
         got = {c["id"]: c.get("pass") for c in v.get("checks") or []}
-        ev["f1b_real"] = all(got.get(k) is True for k in F1B_REAL) and v.get("v3floor_sha256") == kv.get("v3floor_sha256")
+        # the binary's sha must BE a sha256 and the verdict's must equal it: two absent fields, or two equal non-sha
+        # strings, are no binding (T3 runner review item 15)
+        exe = kv.get("v3floor_sha256")
+        exe_ok = isinstance(exe, str) and re.fullmatch(r"[0-9a-f]{64}", exe) is not None and v.get("v3floor_sha256") == exe
+        ev["f1b_real"] = all(got.get(k) is True for k in F1B_REAL) and exe_ok
         if not ev["f1b_real"]:
-            ev["why"] = f"F1b real checks {[got.get(k) for k in F1B_REAL]}, verdict sha matches {v.get('v3floor_sha256') == kv.get('v3floor_sha256')}"
+            ev["why"] = f"F1b real checks {[got.get(k) for k in F1B_REAL]}, binary sha {exe!r} bound and matching: {exe_ok}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         ev["f1b_real"], ev["why"] = False, f"verdict unreadable: {type(e).__name__}"
     return ev
@@ -164,6 +178,14 @@ def decide(sj, raw, rc, block, plp):
         return fail("rc 3 with no void recorded in the summary")
     if not d0.startswith("pass"):
         return fail(f"the D0 control did not pass ({d0!r})")
+    if block == "device":
+        # a real run's block (fourth lane review LOW 17): a batch bound to its fire-check verdict, of the registered
+        # shape, whatever the class (a smoke batch, or N=200, is a dry run's)
+        ev = sj.get("_app_sync") or {}
+        if not (ev.get("bound") and ev.get("f1b_real")):
+            return fail(f"(device) the batch is not bound to a passing fire-check verdict ({ev.get('why')})")
+        if sj.get("n") != DEVICE_N:
+            return fail(f"(device) the batch ran N={sj.get('n')!r}, the registered shape is N={DEVICE_N}")
     if block == "brd":
         if not tc.startswith(TIMING["brd"]):
             return fail(f"brd: the probe's timing control reads {tc!r}, not {TIMING['brd']!r}")
@@ -179,6 +201,15 @@ def decide(sj, raw, rc, block, plp):
         return fail(f"(b) the kernel says {wc!r} and the drive reports {drive!r}: they must agree (A16)")
     need, got = g.get("required_flushes"), g.get("leaf_flushes_completed")
     d.update({"required_flushes": need, "leaf_flushes_completed": got})
+    # the sync count is re-derived as batchgate.post defines it, n x the flush-gated arms, never trusted as a field
+    # (fourth lane review LOW 19)
+    n = sj.get("n")
+    gated = [a for a, r in (sj.get("flush_control_arms") or {}).items() if isinstance(r, dict) and r.get("gated")]
+    derived = n * len(gated) if isinstance(n, int) and gated else None
+    d["required_flushes_derived"] = derived
+    if derived is None or need != derived:
+        return fail(f"(shape) the record's required_flushes {need!r} is not n x the flush-gated arms "
+                    f"({n!r} x {len(gated)} = {derived!r})")
     if not isinstance(got, int):
         return fail(f"the leaf's flush counter is not recorded ({got!r})")
     if wc == "write through":
@@ -226,6 +257,9 @@ def plants(sj, raw, rc, plp, outdir=None):
     outdir (the real batch's run.sh OUT) enables wt-tampered."""
     out = []
     bound = bool(sj) and bool((sj.get("_app_sync") or {}).get("bound"))
+    # where the real batch's verdict was actually read (on the runner: the bound path; off it: beside the batch), so
+    # the tampered copy differs from the real binding in verdict_sha256 ONLY (fourth lane review MED 7)
+    read_at = ((sj or {}).get("_app_sync") or {}).get("verdict_read_at") or ((sj or {}).get("_app_sync") or {}).get("verdict")
     if sj is not None:
         sj = copy.deepcopy(sj)
         if (sj.get("leaf") or {}).get("kind") == "brd":
@@ -234,11 +268,11 @@ def plants(sj, raw, rc, plp, outdir=None):
         if not (sj.get("_app_sync") or {}).get("f1b_real"):
             # an unbound (smoke) record: the base assumes the evidence, so wt-nosync is one field
             sj["_app_sync"] = {"bound": False, "f1b_real": True, "why": "ASSUMED for the plant base (unbound batch)"}
-    ctl = decide(copy.deepcopy(sj), raw, rc, "device", plp) if sj is not None else None
+    ctl = decide(copy.deepcopy(sj), raw, rc, "loop", plp) if sj is not None else None
     out.append({"plant": "control", "want": "PASS", "got": ctl, "fired": bool(ctl) and ctl["decision"] == "PASS"})
     if not out[0]["fired"]:
         out.append({"plant": "all", "want": "-", "got": None, "fired": False,
-                    "why": "NOT-RUN: the real record does not pass as a device block, so no plant can discriminate"})
+                    "why": "NOT-RUN: the real record does not pass as a loop block, so no plant can discriminate"})
         return out, False
     real = (sj.get("leaf") or {}).get("write_cache") or sj.get("leaf_write_cache")
 
@@ -246,7 +280,7 @@ def plants(sj, raw, rc, plp, outdir=None):
         s = copy.deepcopy(sj)
         base(s)
         mutate(s)
-        r = decide(s, raw, rc_, "device", plp_)
+        r = decide(s, raw, rc_, "loop", plp_)
         if want_prefix is None:
             out.append({"plant": name, "want": "PASS", "got": r, "fired": r["decision"] == "PASS"})
             return
@@ -308,12 +342,20 @@ def plants(sj, raw, rc, plp, outdir=None):
             sub = os.path.join(tmp, os.path.basename(os.path.normpath(outdir)))
             os.makedirs(sub)
             lines = open(os.path.join(outdir, "binary.txt")).read().splitlines()
-            lines = [("verdict_sha256=" + "0" * 64) if l.startswith("verdict_sha256=") else l for l in lines]
+            lines = [("verdict_sha256=" + "0" * 64) if l.startswith("verdict_sha256=")
+                     else ("bound=fire-checked: " + os.path.abspath(read_at)) if l.startswith("bound=") and read_at
+                     else l for l in lines]
             open(os.path.join(sub, "binary.txt"), "w").write("\n".join(lines) + "\n")
             ev = app_sync_evidence(sub)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        arm("wt-tampered", wt, lambda s: s.update(_app_sync=ev), "(write through)")
+        s_ = copy.deepcopy(sj)
+        wt(s_)
+        s_["_app_sync"] = ev
+        r = decide(s_, raw, 0, "loop", plp)
+        # fired only by the sha256 binding itself: a verdict the copy could not find is not the defect planted
+        fired = r["decision"] == "FAIL" and any(x.startswith("(write through)") and "sha256" in x for x in r["reasons"])
+        out.append({"plant": "wt-tampered", "want": "FAIL (write through) ... sha256", "got": r, "fired": fired})
     else:
         out.append({"plant": "wt-tampered", "want": "-", "got": None, "fired": None, "counted": False,
                     "why": "not applicable: " + ("an unbound batch has no binding to tamper" if not bound
@@ -337,7 +379,7 @@ def evidence_cases(tmp):
                                                                {"id": "F1b:real-4k", "pass": f1b[1]},
                                                                {"id": "F3:complete", "pass": True}]})
 
-    def batch(name, vtext, bound="fire-checked: {v}", sha=None, write_verdict=True, where="abs"):
+    def batch(name, vtext, bound="fire-checked: {v}", sha=None, write_verdict=True, where="abs", exe_line=None):
         fs = os.path.join(tmp, name)
         out = os.path.join(fs, "v3-before")
         vpath = os.path.join(fs, "v3-firecheck", "verdict.json")
@@ -346,7 +388,8 @@ def evidence_cases(tmp):
         named = vpath if where == "abs" else os.path.join("/nonexistent-runner-path", "fs-x", "v3-firecheck",
                                                          "verdict.json")
         s = sha if sha is not None else hashlib.sha256(vtext.encode()).hexdigest()
-        _write(os.path.join(out, "binary.txt"), f"v3floor_sha256={exe}\nbound={bound.format(v=named)}\n"
+        xl = f"v3floor_sha256={exe}\n" if exe_line is None else exe_line
+        _write(os.path.join(out, "binary.txt"), f"{xl}bound={bound.format(v=named)}\n"
                                                 f"verdict_sha256={s}\nplp=no\n")
         return app_sync_evidence(out)
 
@@ -361,6 +404,9 @@ def evidence_cases(tmp):
         "smoke": batch("smoke", good, bound="smoke: V3_SMOKE=1, not bound to a fire-check, never credited"),
         "missing-verdict": batch("missing", good, write_verdict=False),
         "garbage-verdict": batch("garbage", "[1, 2"),
+        # T3 runner review item 15: two absent shas, or two equal non-sha strings, compared equal and passed
+        "no-exe-sha": batch("noexe", json.dumps({"checks": json.loads(good)["checks"]}), exe_line=""),
+        "non-hex-sha": batch("nonhex", verdict(exe_="x"), exe_line="v3floor_sha256=x\n"),
     }
     os.makedirs(os.path.join(tmp, "nobin", "v3-before"))
     e["no-binary"] = app_sync_evidence(os.path.join(tmp, "nobin", "v3-before"))
@@ -376,6 +422,10 @@ def evidence_cases(tmp):
         ("app_sync_evidence: a missing verdict file is not evidence", e["missing-verdict"]["f1b_real"] is False),
         ("app_sync_evidence: an unparseable verdict is not evidence", e["garbage-verdict"]["f1b_real"] is False),
         ("app_sync_evidence: no binary.txt is unbound", e["no-binary"]["bound"] is False and not e["no-binary"]["f1b_real"]),
+        ("item 15: a binary.txt and a verdict that both lack v3floor_sha256 are not evidence (None is not a sha)",
+         e["no-exe-sha"]["f1b_real"] is False),
+        ("item 15: a binary.txt and a verdict that both carry the same non-sha string are not evidence",
+         e["non-hex-sha"]["f1b_real"] is False),
     ], os.path.join(tmp, "good", "v3-before")
 
 
@@ -385,7 +435,9 @@ def self_test(data):
         if tc is None:
             tc = TIMING.get("brd" if kind == "brd" else "write back+plp" if wc == "write back" and plp == "yes" else wc,
                             "pass")
-        return {"timing_control": tc, "flush_control": tc, "d0_control": d0, "plp": plp, "traced": False,
+        gated = ["append25", "append64", "ow4k", "ow64k", "ow1m", "cfr2b", "fdatasync4k"]  # 7 x n=200 = need 1400
+        return {"timing_control": tc, "flush_control": tc, "d0_control": d0, "plp": plp, "traced": False, "n": 200,
+                "flush_control_arms": {a: {"gated": True} for a in gated} | {"nosync25": {"gated": False}},
                 "leaf": {"write_cache": wc, "drive_reports": drive, "kind": kind}, "leaf_write_cache": wc,
                 "flush_gate": {"outcome": gate, "required_flushes": need, "leaf_flushes_completed": got,
                                "blkflush_leaf_gate": {"outcome": bk}, "voids": list(voids)},
@@ -402,7 +454,8 @@ def self_test(data):
         base.update(k)
         return wt(**base)
 
-    def dec(sj, rc=0, block="device", plp="no", raw=True):
+    # the class rules are judged as a loop (dry) block; the device-only rules (LOW 17) have their own cases
+    def dec(sj, rc=0, block="loop", plp="no", raw=True):
         return decide(sj, raw, rc, block, plp)["decision"]
 
     foreign = "FAIL: run void (nosync25 p50 61.0 us >= 50 us: a foreign writer on the device)"
@@ -445,6 +498,20 @@ def self_test(data):
         ("brd rc 0 PASS", dec(brd(), 0, "brd") == "PASS"),
         ("brd D0 foreign writer rc 3 FAILs (no RECORDED any more)", dec(brd(d0=foreign), 3, "brd") == "FAIL"),
         ("brd with an applied timing control FAILs", dec(brd(tc="pass"), 0, "brd") == "FAIL"),
+        # fourth lane review LOW 16: red at 2d42982a0, whose brd branch RECORDED a timing-only void
+        ("LOW 16: brd rc 3 whose only void is the timing control FAILs (no RECORDED)",
+         dec(brd(tc="FAIL: run void (append25 ratio 3.1 <= threshold 10.00)"), 3, "brd") == "FAIL"),
+        # fourth lane review LOW 19: the sync count is re-derived, n x the flush-gated arms, never trusted
+        ("LOW 19: required_flushes that is not n x the gated arms FAILs",
+         dec(dict(rec(), n=200, flush_control_arms={"append25": {"gated": True}, "ow4k": {"gated": True}})) == "FAIL"),
+        ("LOW 19: required_flushes equal to n x the gated arms passes",
+         dec(dict(rec(need=400), n=200, flush_control_arms={"append25": {"gated": True}, "ow4k": {"gated": True}})) == "PASS"),
+        # fourth lane review LOW 17: a real run's device block needs a bound batch of the registered shape, any class
+        ("LOW 17: an unbound (smoke) write-back batch FAILs a device block", dec(rec(sync=False), 0, "device") == "FAIL"),
+        ("LOW 17: the same batch passes a loop (dry-run) block", dec(rec(sync=False), 0, "loop") == "PASS"),
+        ("LOW 17: a bound batch of N=200 FAILs a device block", dec(dict(rec(), n=200), 0, "device") == "FAIL"),
+        ("LOW 17: a bound batch of N=10000 passes a device block",
+         dec(dict(rec(need=70000, got=140000), n=10000), 0, "device") == "PASS"),
     ]
     want_order = ["control", "b-missing", "b-mismatch", "b-nodrive", "void-d0", "void-nosync", "wb-pass", "wb-short",
                   "wb-gatefail", "plp-pass", "plp-d0", "plp-nosync", "wt-pass", "wt-nonzero", "wt-nosync", "wt-tampered"]
@@ -474,16 +541,31 @@ def self_test(data):
         t = [x for x in p if x["plant"] == "wt-tampered"]
         cases.append(("an unbound batch's wt-tampered is recorded not applicable and not counted",
                       ok and t[0]["fired"] is None and t[0]["counted"] is False))
+        # fourth lane review MED 7: off the runner (the bound path absent, the verdict beside the batch) the plant must
+        # still reach the sha256 check, not fire on a verdict it could not find
+        moved = os.path.join(tmp, "relocated", "v3-before")
+        sj = wt()
+        sj["_app_sync"] = app_sync_evidence(moved)
+        p, ok = plants(sj, True, 0, "no", moved)
+        t = [x for x in p if x["plant"] == "wt-tampered"]
+        cases.append(("MED 7: off the runner, wt-tampered fires on the sha256 check, not on a missing verdict",
+                      ok and len(t) == 1 and t[0]["fired"] is True
+                      and any("sha256" in r for r in t[0]["got"]["reasons"])
+                      and not any("FileNotFoundError" in r for r in t[0]["got"]["reasons"])))
     # the real records (testdata/README.md): run 37812355435's batches in the c225124ae format
     for name, want in (("v3-37812355435-x86-ext4loop", "PASS"), ("v3-37812355435-arm-ext4loop", "FAIL")):
         d = os.path.join(data, name)
         sj, raw = load(d)
-        r = decide(sj, True, 0, "loop", "no") if sj is not None else {"decision": None, "reasons": ["no record"]}
+        rc = int(open(os.path.join(d, "rc")).read().split("rc=")[-1].split()[0])  # run.sh's own rc (LOW 19)
+        r = decide(sj, raw, rc, "loop", "no") if sj is not None else {"decision": None, "reasons": ["no record"]}
         why = "write back, counter met" if want == "PASS" else "write through, unbound smoke: no A16 (3) evidence"
         cases.append((f"real {name}: {want} ({why})", r["decision"] == want
                       and (want == "PASS" or any(x.startswith("(write through) no strace") for x in r["reasons"]))))
-        p, ok = plants(sj, True, 0, "no", d)
+        p, ok = plants(sj, raw, rc, "no", d)
         cases.append((f"real {name}: plants all fire on copies of it", ok and [x["plant"] for x in p] == want_order))
+        if want == "PASS":
+            cases.append((f"LOW 17: real {name} (smoke, N=200) FAILs as a device block",
+                          decide(sj, raw, rc, "device", "no")["decision"] == "FAIL"))
     bad = [n for n, good in cases if not good]
     for n, good in cases:
         print(f"BLOCKGATE self-test {'PASS' if good else 'FAIL'}: {n}")

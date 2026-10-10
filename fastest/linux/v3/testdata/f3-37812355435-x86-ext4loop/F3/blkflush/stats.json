@@ -1,0 +1,42 @@
+{
+ "cpu0": {
+  "entries": 1779,
+  "overrun": 0,
+  "commit overrun": 0,
+  "bytes": 80112,
+  "oldest event ts": "108.534730",
+  "now ts": "111.216890",
+  "dropped events": 0,
+  "read events": 0
+ },
+ "cpu1": {
+  "entries": 2018,
+  "overrun": 0,
+  "commit overrun": 0,
+  "bytes": 137736,
+  "oldest event ts": "108.534273",
+  "now ts": "111.222131",
+  "dropped events": 0,
+  "read events": 0
+ },
+ "cpu2": {
+  "entries": 2125,
+  "overrun": 0,
+  "commit overrun": 0,
+  "bytes": 132064,
+  "oldest event ts": "108.534113",
+  "now ts": "111.227265",
+  "dropped events": 0,
+  "read events": 0
+ },
+ "cpu3": {
+  "entries": 1515,
+  "overrun": 0,
+  "commit overrun": 0,
+  "bytes": 110376,
+  "oldest event ts": "108.534604",
+  "now ts": "111.232417",
+  "dropped events": 0,
+  "read events": 0
+ }
+}

@@ -31,7 +31,6 @@ on:
     branches: [fastest-branching]
     paths:
       - "core/**"
-      - "!core/examples/fastest_profile/**"
       - "Cargo.lock"
       - "fastest/linux/gates/**"
       - "fastest/linux/hw/**"
@@ -149,6 +148,41 @@ jobs:
           rc=0; dist/fastest_profile --dir "$d/async" --class async > dist/smoke-async.txt || rc=$?
           cat dist/smoke-async.txt
           [ $rc -eq 4 ] && grep -q '^NOT AVAILABLE' dist/smoke-async.txt || { echo "async class: rc=$rc, expected the rc 4 refusal"; exit 1; }
+      - name: The driver's own contract (exact --ops-total split, the warm-up rule kept; fourth lane review MED 6, LOW 14)
+        # results, not exit codes: driver_contract.py checks each summary.json against the asked T, C and rule, with
+        # rules whose outcome is forced (1000000:0:2 must run to MAX_S; 10:0:30 must stop on its ops), so a driver
+        # that ignores OPS, swaps S and MAX_S, stops at once or splits T into T+1 fails here
+        run: |
+          set -o pipefail
+          d=$(mktemp -d) C=fastest/linux/gates/driver_contract.py
+          python3 -B $C self-test | tail -1
+          dist/fastest_profile --dir "$d/k1" --class full --clients 4 --ops-total 33 --warmup 1000000:0:2 --out dist/contract-k1 | tail -1
+          python3 -B $C check dist/contract-k1/summary.json 33 4 1000000:0:2 9,8,8,8
+          dist/fastest_profile --dir "$d/k2" --class full --clients 16 --ops-total 20 --warmup 10:0:30 --mode cycle --out dist/contract-k2 | tail -1
+          python3 -B $C check dist/contract-k2/summary.json 20 16 10:0:30 2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1
+          # S > 0 (review 5 LOW 15): it must stop at a claim at or after 1 s with 10 ops claimed, not capped
+          dist/fastest_profile --dir "$d/k3" --class full --clients 4 --ops-total 33 --warmup 10:1:30 --out dist/contract-k3 | tail -1
+          python3 -B $C check dist/contract-k3/summary.json 33 4 10:1:30 9,8,8,8
+          # refusals: each must exit 1 with NOT A RESULT, before any op
+          refuse() { local rc=0; dist/fastest_profile --dir "$d/r$1" "${@:2}" > "dist/contract-refuse-$1.txt" 2>&1 || rc=$?
+            [ $rc -eq 1 ] && grep -q '^NOT A RESULT' "dist/contract-refuse-$1.txt" || { echo "refusal $1 (${*:2}): rc=$rc"; cat "dist/contract-refuse-$1.txt"; exit 1; }; }
+          refuse t-below-c --class full --clients 4 --ops-total 3
+          refuse both-ops --class full --ops 5 --ops-total 5
+          refuse prereg-form --class full --warmup prereg:1800
+          refuse two-fields --class full --warmup 1:2
+          refuse inf --class full --warmup 1000:inf:inf
+          refuse zero-max --class full --warmup 10:0:0
+          echo "driver contract: 3 records kept, 6 refusals refused"
+          # one warm-up rule for every driver (fourth lane review LOW 14): the driver replays bbload's OPS:S:MAX_S rule
+          # on the shared cases. This job builds fastest_profile only, so here the verdict can only be PARTIAL (rc 3:
+          # every case matches, not all three drivers given). The three-driver verdict (rc 0) is the T3 runner's
+          # envchecks stage on the integration branch, over the Linux ports of bbload and clonebench it builds there
+          # (PREREG annex A23-AM1; review 5 MED 7), bound by sha256 to the binaries the package ran (MED 6)
+          W=fastest/linux/gates/warmup_conformance.py
+          python3 -B $W self-test | tail -1
+          rc=0; python3 -B $W run --fastest-profile dist/fastest_profile > dist/warmup-conformance.txt || rc=$?
+          cat dist/warmup-conformance.txt
+          [ $rc -eq 3 ] || { echo "warm-up conformance: rc $rc, want 3 (PARTIAL, every case matching)"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: engine-release-${{ matrix.runner }}

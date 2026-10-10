@@ -25,6 +25,8 @@ opsn=${PROFILE_OPS_CN:-20}
 cgops=${PROFILE_CG_OPS:-100}
 flame=${FLAMEGRAPH_DIR:-}
 mkdir -p "$raw" "$work" || exit 1
+# the sizes this side ran, part of the identity a baseline artifact must match (analyze.py, review 5 MED 12)
+echo "$ops1:$opsn:$cgops" > "$raw/sizes.txt"
 runs="$raw/runs.tsv"
 : > "$runs"
 k=0

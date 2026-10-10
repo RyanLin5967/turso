@@ -963,6 +963,8 @@ impl Connection {
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        #[cfg(test)]
+        crate::branch::budget_probe::statement_prepared();
         self.maybe_update_schema();
 
         let syms = self.syms.read();
