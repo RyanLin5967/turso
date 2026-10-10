@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turso_core::branch::{Branch, BranchDurability};
+use turso_core::branch::{Branch, BranchDurability, SyncClass};
 use turso_core::recipe::{counter, recipe_io};
 use turso_core::{
     Connection, Database, DatabaseOpts, Numeric, OpenFlags, PlatformIO, SqliteDialect, Value,
@@ -1322,7 +1322,7 @@ fn bench_main(args: &Args) {
     for suffix in ["", "-wal", "-branch-log", "-branch-snap", "-branch-arena", "-branch-cat", "-branch-cat-wal"] {
         let _ = std::fs::remove_file(format!("{base}{suffix}"));
     }
-    let db = open_db(&args.db, BranchDurability::Durable { sync: false });
+    let db = open_db(&args.db, BranchDurability::Durable { sync: SyncClass::Off });
     let trunk = db.connect().unwrap();
     let sync = rows(&trunk, "PRAGMA synchronous").unwrap();
     let mut rng = Rng(args.seed);
@@ -1878,7 +1878,7 @@ fn crash_recover(
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: true }),
+        DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: SyncClass::Fsync }),
         None,
         Arc::new(SqliteDialect),
     )
@@ -1917,7 +1917,7 @@ fn crash_recover(
 
 fn crash_child(args: &Args) {
     let ops = crash_ops(args.seed, args.n, args.ops as usize);
-    let db = open_db(&args.dir.join("c.db"), BranchDurability::Durable { sync: true });
+    let db = open_db(&args.dir.join("c.db"), BranchDurability::Durable { sync: SyncClass::Fsync });
     let mut cdb = CrashDb::new(db, true);
     let mut log = std::fs::OpenOptions::new()
         .create(true)

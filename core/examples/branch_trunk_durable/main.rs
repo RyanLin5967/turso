@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use turso_core::branch::{Branch, BranchDurability};
+use turso_core::branch::{Branch, BranchDurability, SyncClass};
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
 };
@@ -78,8 +78,8 @@ fn parse_args() -> Args {
             "--durability" => {
                 args.durability = match val().as_str() {
                     "volatile" => BranchDurability::Volatile,
-                    "durable" => BranchDurability::Durable { sync: true },
-                    "durable-nosync" => BranchDurability::Durable { sync: false },
+                    "durable" => BranchDurability::Durable { sync: SyncClass::Fsync },
+                    "durable-nosync" => BranchDurability::Durable { sync: SyncClass::Off },
                     other => die(&format!("unknown --durability {other}")),
                 }
             }

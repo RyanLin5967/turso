@@ -891,7 +891,7 @@ impl Infer<'_> {
             },
             _ => None,
         };
-        let function = call.and_then(func_name);
+        let function = call.and_then(|c| func_name(c));
         let alias = f.alias.as_ref().filter(|a| !a.aliasname.is_empty());
         let name = alias
             .map(|a| a.aliasname.clone())
