@@ -201,6 +201,10 @@ pub enum StepResult {
 ///   primarily to the WAL, but also possibly checkpointing the WAL to the database file.
 enum CommitState {
     Ready,
+    /// `commit_txn`'s materialized-view merge yielded IO before the pager commit began, so a
+    /// re-entry resumes the merge (`view_delta_state`) instead of starting a new commit (engine
+    /// review 16 HIGH 1). Back to `Ready` once the deltas are applied.
+    ApplyingViewDeltas,
     Committing,
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
@@ -224,7 +228,10 @@ impl CommitState {
             CommitState::CommittingAttachedMvcc { state_machine, .. } => {
                 state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
             }
-            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+            CommitState::Ready
+            | CommitState::ApplyingViewDeltas
+            | CommitState::Committing
+            | CommitState::CommittingAttached => {}
         }
     }
 
@@ -452,6 +459,37 @@ impl Register {
 pub struct Row {
     values: *const Register,
     count: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test instrument (engine review 16 HIGH 1, red (i)): the next N materialized-view merges a
+    /// commit on this thread makes yield IO first, as a `merge_delta` that meets an uncached page
+    /// would. Thread-local, so a parallel test is never affected.
+    pub(crate) static VIEW_MERGE_YIELDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `err` ends an explicit transaction even when the failing statement wrote nothing. The
+/// engine's own state may be damaged after these: an I/O error, out of memory, a full database or
+/// page cache (SQLite's sqlite3VdbeHalt rolls a read-only statement's transaction back for
+/// SQLITE_IOERR, SQLITE_NOMEM and SQLITE_FULL only), corruption or an internal error, and an MVCC
+/// transaction the store has already ended. Every other error (a SQL evaluation error such as an
+/// integer overflow, a constraint, an interrupt) ends only a statement that wrote nothing
+/// (fastest-engine 4b).
+fn error_ends_the_transaction(err: &LimboError) -> bool {
+    matches!(
+        err,
+        LimboError::CompletionError(_)
+            | LimboError::OutOfMemory
+            | LimboError::DatabaseFull(_)
+            | LimboError::CacheError(_)
+            | LimboError::Corrupt(_)
+            | LimboError::NotADB
+            | LimboError::InternalError(_)
+            | LimboError::TxTerminated
+            | LimboError::CommitDependencyAborted
+            | LimboError::NoSuchTransactionID(_)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -817,13 +855,6 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
-    /// An explicit COMMIT has made its transition (`auto_commit` set, deferred FKs checked) and
-    /// called `commit_txn`, which has not finished. A `commit_txn` that returns `Busy` before it
-    /// records any `commit_state` (a trunk commit's refused copy-decision pass) leaves the state
-    /// `Ready`, so this flag is what tells the re-stepped `AutoCommit` to drive `commit_txn` again
-    /// rather than read `auto_commit` as "no transaction is active" (wire review 7 HIGH 3).
-    /// Cleared when the commit finishes or fails for good, and on reset.
-    pub(crate) commit_started: bool,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
     /// entry and drives it one step per opcode call, yielding
@@ -962,7 +993,6 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
-            commit_started: false,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
@@ -1114,7 +1144,6 @@ impl ProgramState {
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.commit_state = CommitState::Ready;
-        self.commit_started = false;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
         // (we handle that on every code path inside
@@ -2264,6 +2293,18 @@ impl Program {
                             delta_set.insert(table_name, delta);
                         }
 
+                        // Test instrument (engine review 16 HIGH 1, red (i)): yield here, as a
+                        // merge_delta that meets an uncached page would, leaving this index.
+                        #[cfg(test)]
+                        if VIEW_MERGE_YIELDS.with(|n| {
+                            let left = n.get();
+                            n.set(left.saturating_sub(1));
+                            left > 0
+                        }) {
+                            return Ok(IOResult::IO(crate::types::IOCompletions(
+                                crate::io::Completion::new_yield(),
+                            )));
+                        }
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(_) => {
@@ -2305,10 +2346,21 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
+        // Apply view deltas with I/O handling. A yield is recorded in `commit_state`, so the
+        // statement's re-entry resumes this commit rather than judging it a new one (an explicit
+        // COMMIT has already made its transition; engine review 16 HIGH 1).
         match self.apply_view_deltas(program_state, rollback, &pager)? {
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            IOResult::Done(_) => {}
+            IOResult::IO(io) => {
+                if matches!(program_state.commit_state, CommitState::Ready) {
+                    program_state.commit_state = CommitState::ApplyingViewDeltas;
+                }
+                return Ok(IOResult::IO(io));
+            }
+            IOResult::Done(_) => {
+                if matches!(program_state.commit_state, CommitState::ApplyingViewDeltas) {
+                    program_state.commit_state = CommitState::Ready;
+                }
+            }
         }
 
         // Reset state for next use
@@ -3148,8 +3200,22 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
+                        // Inside an explicit transaction a statement with no statement
+                        // savepoint cannot be undone alone, so its error rolls back the
+                        // transaction, unless the statement never began writing (a read, or a
+                        // writer refused before its first write): it changed nothing, so its
+                        // error ends only itself, as PostgreSQL's statement does and SQLite's
+                        // read-only one does (fastest-engine 4b). Errors that may have damaged
+                        // the engine's own state still roll back
+                        // (`error_ends_the_transaction`). Mutant `read_error_rolls_back_txn`
+                        // (test builds only): every error rolls back, as before.
+                        let ends_only_the_statement = !unfinished_writer
+                            && err.is_some_and(|err| !error_ends_the_transaction(err))
+                            && !crate::branch::store::fe_mutant("read_error_rolls_back_txn");
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (!self.connection.get_auto_commit()
+                                && err.is_some()
+                                && !ends_only_the_statement)
                         {
                             self.rollback_current_txn(pager);
                         }

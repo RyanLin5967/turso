@@ -64,7 +64,13 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
+                let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
+                // Every PostgreSQL primary key is NOT NULL: an explicit NULL (a literal or a bound
+                // parameter) into an integer key, which is the table's rowid alias, raises 23502
+                // instead of taking a new rowid. An omitted key still takes one (serial's
+                // DEFAULT path), and the key stays the rowid alias (fastest-engine 4c).
+                table.rowid_alias_not_null = true;
+                Ok(table)
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
