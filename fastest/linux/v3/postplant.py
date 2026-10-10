@@ -148,7 +148,10 @@ def main(a):
     env = dict(os.environ)
     env.pop("V3_REQUIRE_T3", None)
     if plant == "unregistered":
-        env["V3_REQUIRE_T3"] = "1"
+        env["V3_REQUIRE_T3"] = "1"  # its premise, nothing registered, made true in the copy (eighth review H5)
+        sj.update(d0_threshold_ref=None, frame_arm=None, frame_arm_ref=None)
+        with open(os.path.join(out, "summary.json"), "w") as f:
+            json.dump(sj, f)
     r = subprocess.run([sys.executable, "-B", gate, "post", out, c, sha, "bound", vp], timeout=300, env=env)
     return r.returncode
 

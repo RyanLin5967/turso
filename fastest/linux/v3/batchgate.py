@@ -366,13 +366,22 @@ def post(out, cell, sha, mode, verdict_path):
                         "mismatch refuses)" % (lfr.get("drive_reports"), lfr.get("write_cache")))
     if sj.get("plp") not in ("yes", "no"):
         refusals.append("plp: the batch declares %r, not yes or no (run.sh passes V3_PLP)" % (sj.get("plp"),))
+    if sj.get("traced") is not False:  # a tracer's stops change every timing (eighth review H2)
+        refusals.append("traced: the probe ran under a tracer (or did not record whether it did): %r" % (sj.get("traced"),))
     if os.environ.get("V3_REQUIRE_T3") == "1":  # rental mode: the registered values must exist (A17, MED 5)
+        # ... and a real run is on a drive: no loop layer, no brd leaf (A16; eighth review M6)
+        if v3cell.is_loop(cell) or len(sj.get("flush_path") or []) != 1 or lc == "brd":
+            refusals.append("rental: a real run is on a drive: cell %s, %d layer(s), leaf class %r (A16: ram and loop "
+                            "devices are dry-run only)" % (cell, len(sj.get("flush_path") or []), lc))
         tc = str(sj.get("timing_control", ""))
         if not tc.startswith("not applicable") and not sj.get("d0_threshold_ref"):
             refusals.append("registration: no registered d0 threshold for %s (A17: rental mode refuses a provisional "
                             "one)" % sj.get("d0_threshold_key"))
         if not sj.get("frame_arm"):
             refusals.append("registration: no registered frame arm (PREREG section 4: fixed in the Registration annex)")
+        elif sj.get("frame_arm") != "ow4k":  # A18 needs the frame arm's fdatasync variant; only ow4k has one (M6)
+            refusals.append("registration: the registered frame arm %s has no fdatasync variant arm in this probe (A18 "
+                            "needs one; only ow4k has one, fdatasync4k)" % sj.get("frame_arm"))
     if mode == "bound":
         v = {}
         try:
@@ -486,6 +495,35 @@ def post(out, cell, sha, mode, verdict_path):
                 if r.get("ops") != (arms.get(a) or {}).get("ops") or r.get("windows_without_a_sync") != 0:
                     voids.append("fsync: %s's windows without an fsync or fdatasync by the probe: %r of %r" %
                                  (a, r.get("windows_without_a_sync"), r.get("ops")))
+                elif r.get("windows_short") != 0:  # attributed by fd: each window holds all its own (tenth review H1)
+                    voids.append("fsync: %s's windows short of their own syncs (by fd): %r of %r" %
+                                 (a, r.get("windows_short"), r.get("ops")))
+                if r.get("windows_over") != 0:  # ... and no more than its own (V3 review 12 item 8)
+                    voids.append("fsync: %s's windows over their own syncs (by fd): %r of %r" %
+                                 (a, r.get("windows_over"), r.get("ops")))
+            # eleventh review MED 1, V3 review 12 item 6: every sync of the probe's that no overlapping window's arm
+            # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) or that names no fd (no_fd) VOIDs
+            # the batch; a missing count is not a zero. (The nosync25-only lookup that stood here VOIDed any smoke
+            # batch without nosync25 as "None sync(s)"; the "wholly inside" counts stay descriptive.)
+            # V3 review 12 item 7: check.py's nosync25 rule, here too: nosync25 syncs nothing by definition, so its
+            # windows hold no sync attributed to it (a nosync25 that owns an fd and syncs on it shows here only: every
+            # unattributed count is then 0)
+            n0 = sarms.get("nosync25")
+            if isinstance(n0, dict) and n0.get("syncs") != 0:
+                voids.append("fsync: nosync25's windows hold %r sync(s) by the probe (it owns no fd by definition)"
+                             % (n0.get("syncs"),))
+            ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
+            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
+                voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd), %r "
+                             "naming no fd (no_fd)" % (ua.get("foreign_fd"), ua.get("no_fd")))
+            # review 11 LOW 2 / review 12 item 7: the probe's own sync_fds against the arm definitions (check.OP), the
+            # same half of check.py's sync_fds_problems; post trusted the record attribution reads by
+            import check as _ck
+            for t in _ck.sync_fds_def_problems(sj, sorted(sj.get("arms") or {}), sj.get("n")):
+                if t[1] == "missing or overflowed":
+                    voids.append("fsync: %s: missing or overflowed (sync_fds_overflow %r)" % (t[0], t[2]))
+                else:
+                    voids.append("fsync: %s: %s recorded %r, defined %d fd(s) and %d sync(s)" % t)
             merged["app_syncs_per_op"] = {a: round(r.get("syncs", 0) / max(1, r.get("ops", 1)), 4) for a, r in sarms.items()}
         merged["device_flushes"] = {"instrument": "blkflush.py (tracefs block:block_rq_issue, rwbs with F: flush requests "
                                     "and FUA writes, inside each op's CLOCK_MONOTONIC_RAW window)",
@@ -529,8 +567,36 @@ def drift(start_out, end_out):
         print(json.dumps({"outcome": "REFUSED", "why": "unreadable: %r" % e}))
         return 2
     why = []
+    if os.path.realpath(start_out) == os.path.realpath(end_out):  # ninth review L11
+        why.append("the start and the end are the same OUT (%s)" % os.path.realpath(start_out))
     if a.get("frame_arm") != b.get("frame_arm"):
         why.append("the frame arm differs: %r then %r" % (a.get("frame_arm"), b.get("frame_arm")))
+    # the same kind of batch at both ends, each passed by its own gate (eighth review L3)
+    for k in ("exe_sha256", "plp", "fstype", "mount_source", "leaf_write_cache", "n"):
+        if a.get(k) != b.get(k):
+            why.append("%s differs: %r then %r" % (k, a.get(k), b.get(k)))
+    if (a.get("leaf") or {}).get("disk") != (b.get("leaf") or {}).get("disk"):
+        why.append("the leaf disk differs")
+    for side, d in (("start", start_out), ("end", end_out)):
+        try:
+            g = load(os.path.join(d, "gate.json"))
+            bt = open(os.path.join(d, "binary.txt")).read()
+        except (OSError, ValueError) as e:
+            why.append("%s: no gate.json or binary.txt: %r" % (side, e))
+            continue
+        if g.get("rc") != 0:
+            why.append("%s: its own gate gave rc %r" % (side, g.get("rc")))
+        if [l for l in bt.splitlines() if l.startswith("cell=")] != ["cell=%s" % (g.get("cell"),)]:  # exact (ninth review L11)
+            why.append("%s: binary.txt does not name exactly the gate's cell %r" % (side, g.get("cell")))
+    # the same binding at both ends (ninth review L11): cell, shape, what it is bound to, the verdict, rental mode
+    keys = ("cell=", "shape=", "bound=", "verdict_sha256=", "rental=")
+    try:
+        sa = [l for l in open(os.path.join(start_out, "binary.txt")).read().splitlines() if l.startswith(keys)]
+        sb = [l for l in open(os.path.join(end_out, "binary.txt")).read().splitlines() if l.startswith(keys)]
+        if sa != sb:
+            why.append("cell, shape, binding, verdict or rental mode differs: %r then %r" % (sa, sb))
+    except OSError as e:
+        why.append("binary.txt unreadable: %r" % e)
     arms = ["append25"] + ([a["frame_arm"]] if a.get("frame_arm") else [])
     rec, void = {}, []
     for arm in arms:
@@ -621,18 +687,53 @@ def _post_batch(d, sha, mod):
           "leaf_write_cache": "write through" if wt else "write back",
           "virtualization": {"virtualized": False, "evidence": []}, "n": 5, "pid": 4242, "plp": "no",
           "arms": {"append25": {}, "nosync25": {}}, "flush_control_arms": {"append25": {"gated": True}},
+          # [V3 review 12 item 7 / review 11 LOW 2: a current probe summary carries its sync_fds, which post now holds
+          # to the arm definitions: append25 one fd synced once per op, nosync25 none]
+          "sync_fds": {"append25": {"3": 5}, "nosync25": {}}, "sync_fds_overflow": False,
           "timing_control": "not applicable: no volatile cache" if wt else "pass", "d0_threshold_key": "d0_threshold/ext4/wb/bare",
-          "d0_threshold_ref": None, "frame_arm": None}
+          "d0_threshold_ref": None, "frame_arm": None, "traced": False}
     win = {"events": 5, "zero_windows": 0, "flush_carrying_zero_windows": 0, "bare_flush_zero_windows": 0, "per_op": 1.0}
     rep = {"proves": "planted", "devices": {},
            "windows": {"arms": {"append25": {"ops": 5, "devices": {} if wt else {"nvme0n1": win}},
                                 "nosync25": {"ops": 5, "devices": {}}}},
-           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0},
-                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5}}}}
+           # [tenth review HIGH 1: a current report carries windows_short; eleventh review MED 1: and the syncs wholly
+           # inside each arm's windows on any fd, and the events unattributed inside a window]
+           "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0,
+                                                           "syncs_inside_any_fd": 5, "windows_over": 0},
+                                               "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0,
+                                                            "syncs_inside_any_fd": 0, "windows_over": 0}},
+                        "unattributed": {"foreign_fd": 0, "no_fd": 0, "inside_foreign_fd": 0, "inside_no_fd": 0}}}
     if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
         rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
     if mod == "leafkind":
         sj["leaf"]["kind"] = "scsi_debug"
+    if mod == "short":  # tenth review HIGH 1: every window synced, one short of its own (by fd)
+        rep["syscalls"]["arms"]["append25"].update(windows_short=1)
+    if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
+        rep["syscalls"]["arms"]["append25"].update(windows_over=1)
+    # [the three eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an
+    # fd its arm does not own is counted in foreign_fd as well, so each plant now carries the foreign_fd/no_fd a real
+    # report would, and the gate is foreign_fd/no_fd == 0]
+    if mod == "nosync-anyfd":  # eleventh review MED 1: an fsync on fd 7 (no arm's) wholly inside a nosync25 window
+        rep["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
+    if mod == "inside-foreign":  # ... a sync on an fd its window's arm does not own, wholly inside an append25 window
+        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
+    if mod == "inside-nofd":  # ... a sync naming no fd, wholly inside an append25 window
+        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
+        rep["syscalls"]["unattributed"].update(no_fd=1, inside_no_fd=1)
+    if mod == "nosync-ownfd":  # V3 review 12 item 7: nosync25 OWNS an fd and syncs on it, every unattributed count 0
+        sj["sync_fds"]["nosync25"] = {"9": 5}
+        rep["syscalls"]["arms"]["nosync25"].update(syncs=5, windows_without_a_sync=0)
+    if mod == "deffd-short":  # review 11 LOW 2: a probe that records no fd for append25 (its sync unrecorded)
+        sj["sync_fds"]["append25"] = {}
+    if mod == "foreign-edge":  # V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge: foreign_fd only
+        rep["syscalls"]["unattributed"].update(foreign_fd=1)
+    if mod == "nofd-only":  # ... a sync naming no fd outside every window's interior: no_fd only
+        rep["syscalls"]["unattributed"].update(no_fd=1)
+    if mod == "unattr-nokey":  # ... a report whose unattributed lacks foreign_fd (a missing count is not a zero)
+        rep["syscalls"]["unattributed"].pop("foreign_fd")
     if mod in ("nosync", "wt-nosync"):  # one append25 window with no fsync by the probe
         rep["syscalls"]["arms"]["append25"].update(syncs=4, windows_without_a_sync=1)
     if mod == "wt-mismatch":
@@ -644,6 +745,16 @@ def _post_batch(d, sha, mod):
         rep["windows"]["arms"]["append25"]["devices"]["loop0"] = dict(win, flush_carrying_zero_windows=1)
     if mod == "plp":
         sj["plp"] = "yes"
+    if mod == "traced":
+        sj["traced"] = True
+    if mod == "frame-ow64k":  # a drive cell, a registered threshold, frame arm ow64k: only the variant rule is left
+        sj.update(d0_threshold_ref="planted", frame_arm="ow64k")
+    if mod == "loopflush-rental":  # a loop cell, everything registered: only the rental-drive rule is left
+        sj["flush_path"].insert(0, {"fstype": "ext4", "source": "/dev/loop0", "loop_backing": "/x.img", "disk": "loop0",
+                                    "sys": "/sys/block/loop0", "mount": "/l", "write_cache": "write back"})
+        sj["mount_source"] = "/dev/loop0"
+        rep["windows"]["arms"]["append25"]["devices"]["loop0"] = dict(win)
+        sj.update(d0_threshold_ref="planted", frame_arm="ow4k")
     with open(os.path.join(d, "summary.json"), "w") as f:
         json.dump(sj, f)
     with open(os.path.join(d, "stamp_end.json"), "w") as f:
@@ -679,18 +790,34 @@ def post_selftest(chk):
             ("A16: a write-through leaf whose drive reports write back", "wt-mismatch", "smoke", 2, "drive report:", {}),
             ("A16: a write-through window with no fsync by the probe", "wt-nosync", "smoke", 3, "VOID fsync:", {}),
             ("A16: a write-back window with no fsync by the probe", "nosync", "smoke", 3, "VOID fsync:", {}),
+            ("tenth review HIGH 1: a window short of one of its own syncs", "short", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 8: a window over its own syncs (an extra own-fd sync)", "over", "smoke", 3, "VOID fsync:", {}),
+            ("eleventh review MED 1: an fsync on fd 7 wholly inside a nosync25 window", "nosync-anyfd", "smoke", 3,
+             "VOID fsync:", {}),
+            ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,
+             "VOID fsync:", {}),
+            ("eleventh review MED 1: a sync naming no fd wholly inside an append25 window", "inside-nofd", "smoke", 3,
+             "VOID fsync:", {}),
+            ("V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
+             "foreign-edge", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 6: a sync naming no fd (no_fd 1)", "nofd-only", "smoke", 3, "VOID fsync:", {}),
+            ("V3 review 12 item 6: a report whose unattributed lacks foreign_fd", "unattr-nokey", "smoke", 3, "VOID fsync:", {}),
             ("MED 3: a write-back loop layer's window without a flush-carrying request", "loopflush", "smoke", 3,
              "VOID flush-carrying:", {}),
             ("A14: a batch declaring PLP bound to a verdict fire-checked without", "plp", "bound", 2, "plp:", {}),
             ("A17: rental mode with no registered threshold or frame arm", "", "smoke", 2, "registration:",
-             {"V3_REQUIRE_T3": "1"})):
+             {"V3_REQUIRE_T3": "1"}),
+            ("A16/eighth review M6: rental mode on a loop cell", "loopflush-rental", "smoke", 2, "rental:", {"V3_REQUIRE_T3": "1"}),
+            ("ninth review M6 / tenth review LOW 1: rental mode with frame arm ow64k (no fdatasync variant)", "frame-ow64k",
+             "smoke", 2, "registration: the registered frame arm", {"V3_REQUIRE_T3": "1"}),
+            ("eighth review H2: a batch the probe ran traced", "traced", "smoke", 2, "traced:", {})):
         d = os.path.join(td, (mod or "control") + "-" + mode + ("-t3" if env else ""))
         vp = _post_batch(d, sha, mod)
         old = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = post(d, "ext4loop" if mod == "loopflush" else "ext4", sha, mode, vp if mode == "bound" else None)
+                rc = post(d, "ext4loop" if mod.startswith("loopflush") else "ext4", sha, mode, vp if mode == "bound" else None)
         finally:
             for k, x in old.items():
                 if x is None:
@@ -709,16 +836,73 @@ def post_selftest(chk):
                 all(str(r).startswith((want,) + also) for r in refs)
         chk("post() on a planted batch, %s -> rc %d%s" % (name, want_rc, "" if want is None else " (%s)" % want),
             ok, (rc, g))
+    # V3 review 12 item 7 and review 11 LOW 2, each with its EXACT VOID text (expected by hand): nosync25 owning and
+    # syncing an fd with every unattributed count 0 (the foreign_fd gate cannot see it), and a sync_fds that breaks
+    # the arm definitions (post trusted the probe's own record)
+    for name, mod, want_voids in (
+            ("nosync25 owns fd 9 and syncs on it, unattributed all 0", "nosync-ownfd",
+             ["fsync: nosync25's windows hold 5 sync(s) by the probe (it owns no fd by definition)",
+              "fsync: sync_fds disagrees with the arm definitions: nosync25 recorded {'9': 5}, defined 0 fd(s) and 0 sync(s)"]),
+            ("append25's sync_fds records no fd", "deffd-short",
+             ["fsync: sync_fds disagrees with the arm definitions: append25 recorded {}, defined 1 fd(s) and 5 sync(s)"])):
+        d = os.path.join(td, "exact-" + mod)
+        _post_batch(d, sha, mod)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = post(d, "ext4", sha, "smoke", None)
+        g = load(os.path.join(d, "gate.json"))
+        chk("post() (review 12 item 7 / review 11 LOW 2): %s -> rc 3 with exactly %s" % (name, want_voids),
+            rc == 3 and g.get("refusals") == [] and g.get("voids") == want_voids, (rc, g.get("voids"), g.get("refusals")))
     # gate-6 MED 6: the start-to-end drift
     for name, ea, ok_rc in (("4 us", 1004.0, 0), ("61 us", 1061.0, 3)):
-        sd, ed = os.path.join(td, "drift-s-" + name[:2]), os.path.join(td, "drift-e-" + name[:2])
+        sd, ed = os.path.join(td, "drift-s-" + name.split()[0]), os.path.join(td, "drift-e-" + name.split()[0])
         for dd, p50 in ((sd, 1000.0), (ed, ea)):
             os.makedirs(dd)
             with open(os.path.join(dd, "summary.json"), "w") as f:
-                json.dump({"frame_arm": None, "arms": {"append25": {"p50_us": p50}}}, f)
+                json.dump({"frame_arm": None, "arms": {"append25": {"p50_us": p50}}, "exe_sha256": "ab", "plp": "no",
+                           "n": 10000, "leaf": {"disk": "nvme1n1"}}, f)
+            with open(os.path.join(dd, "gate.json"), "w") as f:
+                json.dump({"rc": 0, "cell": "xfs"}, f)
+            with open(os.path.join(dd, "binary.txt"), "w") as f:
+                f.write("cell=xfs\nshape=bound V3: N=10000, append25,fdatasync4k,nosync25\n")
         with contextlib.redirect_stdout(io.StringIO()):
             rc = drift(sd, ed)
         chk("drift: append25 p50 moved %s -> rc %d" % (name, ok_rc), rc == ok_rc, rc)
+    # eighth review L3: ends of a different kind, or an end its own gate did not pass, refuse
+    for name, mut in (("another binary at the end", lambda d: json.dump(dict(json.load(open(os.path.join(d, "summary.json"))),
+                                                                              exe_sha256="cd"), open(os.path.join(d, "summary.json"), "w"))),
+                      ("an end whose gate voided it", lambda d: json.dump({"rc": 3, "cell": "xfs"}, open(os.path.join(d, "gate.json"), "w")))):
+        sd, ed = os.path.join(td, "drift-s-4"), os.path.join(td, "drift-e-4")
+        ed2 = ed + "-" + name[:5].replace(" ", "")
+        shutil.copytree(ed, ed2)
+        mut(ed2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = drift(sd, ed2)
+        chk("drift: %s -> refused (rc 2)" % name, rc == 2, rc)
+    # ninth review L11: drift's identity rules are exact
+    def bt(d, text):
+        with open(os.path.join(d, "binary.txt"), "w") as f:
+            f.write(text)
+    base_bt = "cell=xfs\nshape=bound V3: N=10000, append25,fdatasync4k,nosync25\n"
+    for name, sm, em in (
+            ("binary.txt cell=xfsloop at both ends under a gate for xfs", lambda d: bt(d, base_bt.replace("cell=xfs", "cell=xfsloop")),
+             lambda d: bt(d, base_bt.replace("cell=xfs", "cell=xfsloop"))),
+            ("a bound end and a smoke end", lambda d: bt(d, base_bt + "bound=fire-checked: /v.json\n"),
+             lambda d: bt(d, base_bt + "bound=smoke: V3_SMOKE=1, not bound to a fire-check, never credited\n")),
+            ("ends bound to different verdicts", lambda d: bt(d, base_bt + "verdict_sha256=" + "aa" * 32 + "\n"),
+             lambda d: bt(d, base_bt + "verdict_sha256=" + "bb" * 32 + "\n")),
+            ("a rental end and a dry-run end", lambda d: bt(d, base_bt + "rental=yes\n"), lambda d: bt(d, base_bt + "rental=no\n"))):
+        k = name.split()[0] + name.split()[1] + str(len(name))
+        s2, e2 = os.path.join(td, "drift-s-" + k), os.path.join(td, "drift-e-" + k)
+        shutil.copytree(os.path.join(td, "drift-s-4"), s2)
+        shutil.copytree(os.path.join(td, "drift-e-4"), e2)
+        sm(s2)
+        em(e2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = drift(s2, e2)
+        chk("drift (ninth review L11): %s -> refused (rc 2)" % name, rc == 2, rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = drift(os.path.join(td, "drift-s-4"), os.path.join(td, "drift-s-4"))
+    chk("drift (ninth review L11): the same OUT as both ends -> refused (rc 2)", rc == 2, rc)
     shutil.rmtree(td)
 
 
