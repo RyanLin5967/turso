@@ -1044,9 +1044,6 @@ impl Connection {
         let held = store::take_counted_hold();
         let (id, wal) = forked?;
         store.record_fork(held, wal);
-        if name.is_some() {
-            store.rebuild_name_filter_if_due();
-        }
         Ok(id)
     }
 

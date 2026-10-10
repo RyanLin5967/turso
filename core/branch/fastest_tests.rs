@@ -3552,59 +3552,6 @@ fn every_held_name_reaches_the_name_filter() {
     }
 }
 
-/// Review 3 #7 (f): a rebuild of the name filter, made due by more notes than it held, keeps every
-/// held name and drops the released ones. Held across the rebuild: a name checkpointed before it
-/// (in the catalog the rebuild scans) and one created while it runs (noted into `pending`, joined
-/// at the install). Once their state is evicted (resident cap 0), each must still be refused, a
-/// released name is free again, and the rebuilt filter holds far fewer names than were created.
-/// Mutants `no_note_pending` and `no_pending_merge` must fail it.
-#[test]
-fn a_rebuilt_name_filter_keeps_every_held_name() {
-    use std::sync::atomic::Ordering as O;
-    let _s = serial();
-    let dir = tempfile::TempDir::new().unwrap();
-    let db = open_at(&dir.path().join("name-rebuild.db"), opts(true, SyncClass::Off));
-    let trunk = db.connect().unwrap();
-    seed(&trunk);
-    trunk.create_branch("held-catalog").unwrap();
-    db.branch_compact_now().unwrap();
-    db.branch_wait_name_filter();
-    let builds = db.branch_name_filter_stats().3;
-    super::store::NAME_SCAN_HOLD.store(1, O::Release);
-    let churn = 2 * super::store::NAME_REBUILD_MIN;
-    for i in 0..churn {
-        let name = format!("churn-{i}");
-        trunk.create_branch(&name).unwrap();
-        db.drop_branch(&name).unwrap();
-        if super::store::NAME_SCAN_HOLD.load(O::Acquire) == 1 | super::store::HOLD_ARRIVED {
-            break;
-        }
-    }
-    let t = std::time::Instant::now();
-    while super::store::NAME_SCAN_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
-        if t.elapsed() > std::time::Duration::from_secs(10) {
-            super::store::NAME_SCAN_HOLD.store(0, O::Release);
-            panic!("no rebuild of the name filter started within {churn} create-and-drop cycles");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    trunk.create_branch("held-pending").unwrap();
-    assert!(trunk.create_branch("held-catalog").is_err(), "a held name was given again during the rebuild");
-    super::store::NAME_SCAN_HOLD.store(0, O::Release);
-    db.branch_wait_name_filter();
-    let (built, entries, _, builds_after, _) = db.branch_name_filter_stats();
-    assert!(built && builds_after == builds + 1, "premise: one rebuild installed ({builds} builds before, {builds_after} after)");
-    assert!(
-        entries < super::store::NAME_REBUILD_MIN,
-        "the rebuilt filter holds {entries} entries: the released names were kept"
-    );
-    db.branch_set_resident_cap(Some(0));
-    db.branch_compact_now().unwrap();
-    assert!(trunk.create_branch("held-catalog").is_err(), "a checkpointed held name was given again after the rebuild");
-    assert!(trunk.create_branch("held-pending").is_err(), "a name created during the rebuild was given again after it");
-    trunk.create_branch("churn-0").unwrap();
-}
-
 // ---- review 5 #1, #2: recovery replays, then checks the slots the replayed state references,
 // then decides; and it refuses before it changes anything ----
 
