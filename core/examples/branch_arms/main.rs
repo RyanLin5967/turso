@@ -25,6 +25,10 @@
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
 //! reaps in (amendment 3).
 //!
+//! `--victim newest` (churn arms only) reaps the branch forked one cycle ago, hot in cache: the
+//! turso_curve lane's newest-victim churn locality check, its amendment 3 (`48a2b97a3`, whose
+//! `--victim random|newest` flag this merges into the policy above).
+//!
 //! `--durability volatile|durable|durable-nosync` (default volatile) opens the database with that branch
 //! durability. This copy runs on the DURABLE store's line (turso `ec168128b` + the sota-durable port; round 11
 //! PREREG D3); it is round 10's harness (`b9230a8bb`) with that flag and the durable store's `Result`-returning
@@ -76,6 +80,8 @@ enum Arm {
 enum Victim {
     Random,
     Oldest,
+    /// The branch forked one cycle ago (turso_curve amendment 3, `48a2b97a3`).
+    Newest,
 }
 
 struct Args {
@@ -168,6 +174,7 @@ fn parse_args() -> Args {
                 args.victim = match val().as_str() {
                     "random" => Victim::Random,
                     "oldest" => Victim::Oldest,
+                    "newest" => Victim::Newest,
                     other => die(&format!("unknown victim policy {other}")),
                 }
             }
@@ -883,7 +890,8 @@ fn arm_chain(b: &mut Bench, args: &Args) {
 
 /// Arms (c) `churn`, `churn_hot` and `churn_spread`: steady N. Each cycle forks and writes one
 /// branch (plus one trunk write in `churn_hot` and `churn_spread`) and reaps one older live branch:
-/// a uniformly random one, or with `--victim oldest` the oldest (amendment 3).
+/// a uniformly random one, or with `--victim oldest` the oldest (amendment 3), or with `--victim
+/// newest` the one forked last cycle (turso_curve amendment 3).
 fn arm_churn(b: &mut Bench, args: &Args) {
     println!("{HEADER}");
     let hot = args.arm == Arm::ChurnHot;
@@ -950,6 +958,9 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 let victim = match args.victim {
                     Victim::Random => live.swap_remove_back(b.rng.below(live.len())).unwrap(),
                     Victim::Oldest => live.pop_front().unwrap(),
+                    // Before this cycle's branch is pushed, the back is the one forked last cycle
+                    // (`48a2b97a3`'s `live.pop()`; no policy but random reorders `live`).
+                    Victim::Newest => live.pop_back().unwrap(),
                 };
                 live.push_back(Live {
                     branch,
