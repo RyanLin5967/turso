@@ -130,17 +130,291 @@ fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
         .collect()
 }
 
+/// `s` without PostgreSQL's whitespace at either end: its lexer's `space` (space, tab, newline,
+/// carriage return, form feed, vertical tab) and nothing else. `str::trim` also strips Unicode
+/// spaces, which PostgreSQL lexes as identifier bytes: `COMMIT<NBSP>` was trimmed to a COMMIT the
+/// engine ran, where PostgreSQL answers 42601 (wire review 13 item 1).
+pub fn pg_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8))
+}
+
+/// One byte of PostgreSQL's whitespace (its lexer's `space`): space, tab, newline, carriage return,
+/// form feed and vertical tab (which `is_ascii_whitespace` omits), and no byte of a multi-byte
+/// character, which PostgreSQL lexes as an identifier byte (wire review 13 item 1). The one
+/// definition the server's verb reader, empty-statement test and CHECKPOINT test and the
+/// branch-call fast path read (wire review 14 item 6).
+pub fn pg_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
+}
+
+/// The length of the SQL comment at the start of `b`, as PostgreSQL's lexer reads one (`--` to the
+/// line's end, `/* */` nested): None if none starts there, Some(None) for one that never ends.
+pub fn sql_comment(b: &[u8]) -> Option<Option<usize>> {
+    if b.starts_with(b"--") {
+        let end = b.iter().position(|&c| c == b'\n' || c == b'\r');
+        return Some(Some(end.map_or(b.len(), |p| p + 1)));
+    }
+    if !b.starts_with(b"/*") {
+        return None;
+    }
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if b[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(Some(i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Some(None)
+}
+
+/// A statement's parameters as PostgreSQL's lexer reads them, without a parse (see [`scan_params`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamScan {
+    /// The highest `$n` the text holds, 0 for none; None for a number past MAX_PARAMETER, which
+    /// the parser refuses (42601), so no count is taken from it.
+    pub highest: Option<u32>,
+    /// PostgreSQL analyses the statement at Parse and so counts its `$n`: a query (SELECT, VALUES,
+    /// TABLE, WITH, a parenthesised one), INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, DECLARE,
+    /// and CREATE TABLE ... AS. Any other statement is a utility statement, whose parameters are
+    /// the ones Parse declared, whatever its text holds (COPY's, ALTER's and CREATE's `$n` are
+    /// never counted).
+    pub analysed: bool,
+}
+
+impl Default for ParamScan {
+    fn default() -> Self {
+        Self {
+            highest: Some(0),
+            analysed: false,
+        }
+    }
+}
+
+/// [`ParamScan`] of `sql`, read as PostgreSQL's lexer reads it: a `$` followed by digits is a
+/// parameter unless it continues an identifier (`a$3`, whose `$` is an identifier byte); nothing
+/// inside a string (standard, `E'..'` with backslash escapes, `U&'..'`, `B'..'`, `X'..'`), a quoted
+/// identifier, a dollar-quoted string or a comment (`--`, nested `/* */`) is a parameter. One pass,
+/// no allocation but the first word's. The server reads it at Parse to count a Bind's values
+/// before anything runs: it tested for a `$` byte, so a `$` in a comment or a quoted name skipped
+/// the count and Execute's prepare performed a SET before refusing it (wire review 17 item 2).
+pub fn scan_params(sql: &str) -> ParamScan {
+    let b = sql.as_bytes();
+    let ident_start = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c >= 0x80;
+    let ident_cont = |c: u8| ident_start(c) || c.is_ascii_digit() || c == b'$';
+    // The end of the quoted token opening at `i` (its closing quote doubled inside it; with
+    // `backslash`, a backslash escapes the next byte), or the text's end when it never closes.
+    let quoted = |i: usize, q: u8, backslash: bool| {
+        let mut j = i + 1;
+        while j < b.len() {
+            if backslash && b[j] == b'\\' {
+                j += 2;
+            } else if b[j] == q {
+                if b.get(j + 1) == Some(&q) {
+                    j += 2;
+                } else {
+                    return j + 1;
+                }
+            } else {
+                j += 1;
+            }
+        }
+        b.len()
+    };
+    let mut scan = ParamScan::default();
+    let mut highest: u64 = 0;
+    let mut first: Option<String> = None;
+    let mut depth = 0usize;
+    // CREATE TABLE ... AS <query>, read at depth 0: TABLE seen before an AS, and the AS followed
+    // by a query.
+    let (mut saw_table, mut after_as) = (false, false);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if pg_space(c) {
+            i += 1;
+            continue;
+        }
+        match sql_comment(&b[i..]) {
+            Some(Some(len)) => {
+                i += len;
+                continue;
+            }
+            Some(None) => break,
+            None => {}
+        }
+        let at_depth = depth;
+        let token_start = i;
+        let mut word: Option<&[u8]> = None;
+        match c {
+            b'\'' => i = quoted(i, b'\'', false),
+            b'"' => i = quoted(i, b'"', false),
+            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let mut j = i + 1;
+                let mut n: u64 = 0;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    n = n.saturating_mul(10).saturating_add(u64::from(b[j] - b'0'));
+                    j += 1;
+                }
+                highest = highest.max(n);
+                i = j;
+            }
+            b'$' => {
+                // A dollar quote: $tag$ ... $tag$, the tag empty or an identifier without `$`.
+                let mut j = i + 1;
+                if j < b.len() && ident_start(b[j]) {
+                    while j < b.len() && (ident_start(b[j]) || b[j].is_ascii_digit()) {
+                        j += 1;
+                    }
+                }
+                if b.get(j) == Some(&b'$') {
+                    let delimiter = &b[i..=j];
+                    let body = j + 1;
+                    i = b[body..]
+                        .windows(delimiter.len())
+                        .position(|w| w == delimiter)
+                        .map_or(b.len(), |p| body + p + delimiter.len());
+                } else {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            c if ident_start(c) => {
+                while i < b.len() && ident_cont(b[i]) {
+                    i += 1;
+                }
+                let w = &b[token_start..i];
+                if w.eq_ignore_ascii_case(b"e") && b.get(i) == Some(&b'\'') {
+                    // E'..': a string whose backslash escapes the next byte.
+                    i = quoted(i, b'\'', true);
+                } else {
+                    word = Some(w);
+                }
+            }
+            c if c.is_ascii_digit() => {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_')
+                {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+        let paren = c == b'(';
+        if first.is_none() {
+            first = Some(match word {
+                Some(w) => String::from_utf8_lossy(w).to_ascii_uppercase(),
+                None if paren => "(".to_string(),
+                None => String::new(),
+            });
+        }
+        if first.as_deref() == Some("CREATE") && at_depth == 0 {
+            let is = |k: &str| word.is_some_and(|w| w.eq_ignore_ascii_case(k.as_bytes()));
+            if after_as {
+                if saw_table
+                    && (paren
+                        || ["SELECT", "WITH", "VALUES", "TABLE", "EXECUTE"]
+                            .iter()
+                            .any(|k| is(k)))
+                {
+                    scan.analysed = true;
+                }
+                after_as = false;
+            }
+            if is("AS") {
+                after_as = true;
+            } else if is("TABLE") {
+                saw_table = true;
+            }
+        }
+    }
+    scan.highest = u32::try_from(highest).ok().filter(|n| *n <= MAX_PARAMETER);
+    if let Some(first) = first.as_deref() {
+        if matches!(
+            first,
+            "SELECT"
+                | "VALUES"
+                | "TABLE"
+                | "WITH"
+                | "("
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "MERGE"
+                | "CALL"
+                | "EXPLAIN"
+                | "DECLARE"
+        ) {
+            scan.analysed = true;
+        }
+    }
+    scan
+}
+
+/// The index of the first byte at or after `i` that is neither PostgreSQL's whitespace, nor a
+/// comment, nor a `;` (an empty statement): where the next token starts, `b.len()` when none does.
+/// None inside a comment that never ends.
+pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        while i < b.len() && (pg_space(b[i]) || b[i] == b';') {
+            i += 1;
+        }
+        match sql_comment(&b[i..]) {
+            Some(len) => i += len?,
+            None => return Some(i),
+        }
+    }
+}
+
 /// Split a multi-statement SQL string into individual statements.
 /// Uses pg_query's scanner which correctly handles semicolons inside
 /// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The scanner emits a statement only where it saw a keyword, and skips every other stretch of the
+/// text: `COMMIT<NBSP>` (one identifier) between two statements was dropped, so `INSERT ..;
+/// COMMIT<NBSP>; INSERT ..` ran both INSERTs and nothing answered 42601. So every stretch before,
+/// between and after the statements must be blank (whitespace, comments, `;`), or the text is
+/// refused here: the caller then prepares it whole, and the parser refuses it, as PostgreSQL parses
+/// the whole string before it runs any of it (wire review 16 item 1).
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let b = sql.as_bytes();
+    let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
+    let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
+    let mut at = 0;
+    for part in &parts {
+        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`).
+        let start = (part.as_ptr() as usize)
+            .checked_sub(sql.as_ptr() as usize)
+            .filter(|start| *start >= at && *start + part.len() <= b.len())
+            .ok_or_else(stray)?;
+        if !blank(&b[at..start]) {
+            return Err(stray());
+        }
+        at = start + part.len();
+    }
+    if !blank(&b[at..]) {
+        return Err(stray());
+    }
     Ok(parts
         .into_iter()
-        .map(|s| s.trim().to_string())
+        .map(|s| pg_trim(&s).to_string())
         .filter(|s| !s.is_empty())
         .collect())
 }

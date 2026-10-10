@@ -613,7 +613,8 @@ impl Group {
 
     /// Every byte below `end` was made durable in `class` (and every weaker one) by a catalog
     /// commit that returned before anything it waited on was refused (engine review 9 #6: the
-    /// checkpoint refuses to commit on a store already fail-stopped). Marked even when the store
+    /// checkpoint refuses to commit on a store already fail-stopped); the caller passes the class
+    /// that commit synced in (engine review 15 MED 2). Marked even when the store
     /// fail-stopped since, by the cut that followed the commit: that durability was established
     /// before the fail-stop, unlike a landing after it (`accepts`).
     fn mark_committed(&self, end: u64, class: SyncClass) {
@@ -2652,7 +2653,8 @@ fn run_flight(
             )
             .and_then(|()| {
                 if cap.settle_arena {
-                    BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync)
+                    BranchStore::settle_ordered(&group, cap.deferred_lsn)
+                        .and_then(|()| BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
                 } else {
                     Ok(())
                 }
@@ -2710,16 +2712,24 @@ fn run_flight(
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
-        let (deferred_lsn, committed) = (cap.deferred_lsn, written.is_ok());
+        // The class the catalog commit synced in: the capture's rewrite class (`raise_sync`), not
+        // the one read now, which a raised flight since may have strengthened (engine review 15 MED
+        // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
+        let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         if let Some(journal) = guard.journal.as_ref() {
-            // The catalog's commit made everything the capture covers durable in the rewrite
-            // class, even if the cut failed after it, as at the sharp path (`compact`): a raised D0
-            // store's held frees up to the capture mature on it with no raised operation (engine
-            // review 11 MED 1). Mutant `settle_arena_marks_no_durable` (test builds only): not
-            // marked.
+            // The catalog's commit made everything the capture covers durable in the class it
+            // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
+            // capture mature on it with no raised operation (engine review 11 MED 1). The sharp
+            // path (`compact`) reads its class in the same mutex hold as its commit. Mutant
+            // `settle_arena_marks_no_durable` (test builds only): not marked.
             if committed && !fe_mutant("settle_arena_marks_no_durable") {
-                group.mark_committed(deferred_lsn, journal.rewrite_class());
+                let class = if fe_mutant("fuzzy_committed_class_at_install") {
+                    journal.rewrite_class()
+                } else {
+                    committed_class
+                };
+                group.mark_committed(deferred_lsn, class);
             }
             // What the flights after the capture wrote is durable only in their own class: the
             // arena was settled before them and the cut's rename waits for the next flight's
@@ -4135,6 +4145,41 @@ impl BranchStore {
             }
             group.land(end, flight_class, true, confirm);
             kill_point("flight.landed");
+        }
+    }
+
+    /// A raised D0 store's fuzzy checkpoint, once what its capture covers is written (engine
+    /// review 11 MED 8): an ORDERED flight carrying records the capture covers is acknowledged
+    /// only once its trunk commit's WAL F_FULLFSYNC returns (`trunk_wal_synced`), so its callers
+    /// may still be told they failed, and the catalog must not hold their records before that
+    /// (review 4 #1). While such a flush is still to come (`pending_full`), this waits for it and
+    /// leads nothing: it lands, or it fails and fail-stops the store, which refuses the commit. An
+    /// ordered flight whose flush will not come (its commit ended without one) is left to the
+    /// waiters it covers, which lead their own flush. The wait is bounded as a rider's is
+    /// (`pending_full_wait`): the trunk commit can itself be waiting on this checkpoint's install
+    /// (`Backpressure`, after its barrier), so past the bound the checkpoint fails, which releases
+    /// that wait, and a later one retries. Mutant `settle_ignores_ordered` (test builds only): no
+    /// wait, as before.
+    fn settle_ordered(group: &Group, lsn: u64) -> Result<()> {
+        if fe_mutant("settle_ignores_ordered") {
+            return Ok(());
+        }
+        let full = class_index(SyncClass::FullFsync);
+        let started = Instant::now();
+        let mut g = group.lock();
+        loop {
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if g.durable[full] >= lsn.min(g.ordered) || g.pending_full.is_none() {
+                return Ok(());
+            }
+            let Some(left) = pending_full_wait().checked_sub(started.elapsed()) else {
+                return Err(LimboError::Busy);
+            };
+            #[cfg(test)]
+            note_wait();
+            g = group.cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 

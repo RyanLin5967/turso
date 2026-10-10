@@ -4,12 +4,21 @@
 //! C1b tracers stamp (CLOCK_UPTIME_RAW), so their events can be attributed to steps.
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
-//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra] --out FILE
+//!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra|extra-write]
+//!                [--name-prefix P] --out FILE
+//!
+//! `--name-prefix P` (default `b_`) names op k's branch `P<k>`: the budget passes the prefix the wire
+//! side's spec names its branches with (`b_{run}_{c}_{i}`, so `b_w_0_` for run tag w and one
+//! client), as the bytes the two sides write per step include the name (wire review 11 item 17:
+//! `b_<k>` against `b_w_0_<k>` was 4 bytes a create, which the bytes rule then read as a cost).
 //!
 //! `--siblings K` creates K live branches before the ops, so every measured create forks a trunk
 //! that already has children (the path credited cells take; wire review 1 item 18). `--plant extra`
 //! (a budget fire-check) also commits a trunk row inside each create step, as the wire side's
 //! `--plant both` does, so the two sides stay equal and only the budget's absolute counts can fail.
+//! `--plant extra-write` commits a second row on the branch inside each write step, as the wire
+//! side's `--plant both-write` does: the write step's registered absolute counts must catch it
+//! (wire review 15 item 10).
 //!
 //! The cycle, per op k (the statements the wire side sends, and the engine call each maps to):
 //!   create  SELECT turso_branch_create('b_k')   Connection::create_branch on the trunk connection
@@ -87,6 +96,8 @@ struct Args {
     ops: u64,
     siblings: u64,
     plant_extra: bool,
+    plant_extra_write: bool,
+    name_prefix: String,
     out: String,
 }
 
@@ -96,6 +107,8 @@ fn args() -> Args {
     let (mut durability, mut store) = ("full".to_string(), "catalog".to_string());
     let (mut rows, mut warmup, mut ops, mut siblings) = (1000, 20, 200, 0);
     let mut plant_extra = false;
+    let mut plant_extra_write = false;
+    let mut name_prefix = "b_".to_string();
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
         match k.as_str() {
@@ -108,8 +121,10 @@ fn args() -> Args {
             "--siblings" => siblings = v().parse().unwrap(),
             "--plant" => match v().as_str() {
                 "extra" => plant_extra = true,
-                other => panic!("--plant {other}: extra"),
+                "extra-write" => plant_extra_write = true,
+                other => panic!("--plant {other}: extra or extra-write"),
             },
+            "--name-prefix" => name_prefix = v(),
             "--out" => out = Some(v()),
             other => panic!("unknown argument {other}"),
         }
@@ -133,6 +148,8 @@ fn args() -> Args {
         ops,
         siblings,
         plant_extra,
+        plant_extra_write,
+        name_prefix,
         out: out.expect("--out"),
     }
 }
@@ -192,7 +209,7 @@ fn main() {
     };
     for seq in 0..a.warmup + a.ops {
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
-        let name = format!("b_{seq}");
+        let name = format!("{}{seq}", a.name_prefix);
         let id = 1 + (seq * 7919) % a.rows;
 
         // Two probes with nothing between: what the probes themselves cost, for the budget to
@@ -220,6 +237,9 @@ fn main() {
         stmt.run_ignore_rows().unwrap();
         assert_eq!(stmt.n_change(), 1, "the write touched no row");
         drop(stmt);
+        if a.plant_extra_write {
+            run(&branch, &format!("INSERT INTO t2 VALUES ({seq})"));
+        }
         rec(seq, phase, "write", p0, Probe::now());
 
         let p0 = Probe::now();

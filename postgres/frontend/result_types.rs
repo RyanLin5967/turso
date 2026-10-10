@@ -173,6 +173,10 @@ const TEXT: u32 = 25;
 /// parameters' (see [`parameter_types`]).
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
+    /// Set by the caller, not the parse: whether a Bind supplies this statement's parameters (the
+    /// extended protocol). A statement performed at prepare is refused when it holds a parameter,
+    /// 42P02 without a Bind and 0A000 with one (wire review 13 item 9).
+    pub bound: bool,
     pub columns: Vec<Option<u32>>,
     /// The type OID of each $n its context types, by n; one missing is untyped (text, as
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
@@ -186,6 +190,16 @@ pub struct StatementTypes {
     /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
     /// 1: refused at prepare from the text alone, a declared one could never run).
     pub untyped: std::collections::BTreeSet<u32>,
+    /// The translated statement is a COMMIT (`commits`) or a ROLLBACK of the whole transaction
+    /// (`rolls_back`), whatever its text: the server keys its COMMIT rules on this, never on its own
+    /// reading of the text, which `COMMIT<NBSP>` and other spellings it did not know slipped past
+    /// (wire review 13 item 1).
+    pub commits: bool,
+    pub rolls_back: bool,
+    /// The table a CREATE TABLE creates with foreign keys: the server resolves every key once the
+    /// table exists, in the CREATE's own transaction, and refuses the CREATE (42830) if one does
+    /// not (turso_pg::check_table_keys; wire review 13 item 2).
+    pub new_table_keys: Option<String>,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;
@@ -205,12 +219,71 @@ pub use turso_pg_parser::MAX_PARAMETER;
 ///
 /// A parameter compared with an expression no context types (a function this walk does not know)
 /// is returned apart, in the second set: the server refuses it (42P18) rather than compare it as
-/// text, unless the client declared its type (fail closed; review 8 item 7, review 11 item 1). A
-/// parameter compared with a column the walk cannot resolve (a relation it does not model) is left
-/// untyped (text), as before.
+/// text, unless the client declared its type (fail closed; review 8 item 7, review 11 item 1). So
+/// is one compared with a column of a relation the walk cannot open (another schema's, a function
+/// in FROM it does not model, a circular view): the column is found with no type, never bound to
+/// an outer relation's column of the name (review 11 item 3, review 14 items 1 and 2). A column
+/// reference no relation in scope has is left untyped (text).
 pub fn parameter_types(
     parse: &ParseResult,
+    schema: &std::sync::Arc<Schema>,
+    search_path: &[String],
+    cache: &std::sync::Mutex<ViewCache>,
+    attached: &Attached<'_>,
+) -> (
+    std::collections::BTreeMap<u32, u32>,
+    std::collections::BTreeSet<u32>,
+) {
+    let memo = {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let same = cache
+            .schema
+            .as_ref()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, schema))
+            && cache.search_path == search_path;
+        if !same {
+            cache.schema = Some(schema.clone());
+            cache.search_path = search_path.to_vec();
+            cache.views.clear();
+        }
+        std::mem::take(&mut cache.views)
+    };
+    let view_memo = std::rc::Rc::new(std::cell::RefCell::new(memo));
+    let result = parameter_types_with(parse, schema, search_path, &view_memo, attached);
+    cache.lock().unwrap_or_else(|e| e.into_inner()).views = view_memo.take();
+    result
+}
+
+/// Each view's columns as the parameter-type walk read them, for one schema snapshot and search
+/// path: a statement over views parsed each view every time it was prepared, and a view reached
+/// k times was parsed k times (2^depth for a view joining the one before it twice; wire review 14
+/// item 10). Keyed by the snapshot itself, the Arc the connection hands out until DDL replaces it,
+/// which the cache holds so that it cannot be mistaken for a later one; a view read where the walk
+/// was cut (a cycle, the depth bound) is not kept.
+#[derive(Default)]
+pub struct ViewCache {
+    schema: Option<std::sync::Arc<Schema>>,
+    search_path: Vec<String>,
+    views: ViewMemo,
+}
+
+type ViewMemo = std::collections::HashMap<String, Option<Vec<(String, Option<u32>)>>>;
+
+/// The session's attached schemas, for the walk's unqualified names ([`Infer::main_relname`]):
+/// their names, and `holds(schema, relation)`, whether one holds a relation of the name. The walk
+/// cannot read an attached schema's relations, but it must know which schema the engine resolves a
+/// name to: the engine passes over an attached schema that lacks the name (wire review 17 item 3).
+pub struct Attached<'a> {
+    pub names: &'a [String],
+    pub holds: &'a dyn Fn(&str, &str) -> bool,
+}
+
+fn parameter_types_with(
+    parse: &ParseResult,
     schema: &Schema,
+    search_path: &[String],
+    view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    attached: &Attached<'_>,
 ) -> (
     std::collections::BTreeMap<u32, u32>,
     std::collections::BTreeSet<u32>,
@@ -220,6 +293,13 @@ pub fn parameter_types(
         types: std::collections::BTreeMap::new(),
         compared_untyped: std::collections::BTreeSet::new(),
         ctes: Vec::new(),
+        views: Vec::new(),
+        subselects: Default::default(),
+        search_path: search_path.to_vec(),
+        view_memo: view_memo.clone(),
+        cuts: Default::default(),
+        cut_views: Default::default(),
+        attached,
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -291,7 +371,31 @@ struct Infer<'a> {
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
     ctes: Vec<(String, Vec<(String, Option<u32>)>)>,
+    /// The views being opened, outermost first ([`Infer::view_columns`]).
+    views: Vec<String>,
+    /// Each scalar subquery's column type once typed, by its SelectStmt's address in this
+    /// statement's tree, shared with the walks [`Infer::subselect_type`] starts: each such walk
+    /// walks the subquery's FROM, which can hold scalar subqueries of its own, so unshared the
+    /// walks would double with each level of nesting.
+    subselects: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, Option<u32>>>>,
+    /// The session's search path, as SET search_path left it; empty is public alone
+    /// ([`Infer::main_relname`]).
+    search_path: Vec<String>,
+    /// The views read so far for this snapshot ([`ViewCache`]), shared with every nested walk.
+    view_memo: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    /// How many times a view was cut (a cycle, the depth bound), shared with every nested walk: a
+    /// view whose reading saw a cut is not memoised for the snapshot.
+    cuts: std::rc::Rc<std::cell::Cell<usize>>,
+    /// The views whose reading saw a cut, for this statement's walk only, shared with every nested
+    /// walk ([`Infer::view_columns`]).
+    cut_views: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
+    /// The session's attached schemas ([`Attached`]).
+    attached: &'a Attached<'a>,
 }
+
+/// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
+/// open.
+const MAX_VIEW_DEPTH: usize = 32;
 
 /// The parameter number of a bare `$n`.
 fn param(node: &PgNode) -> Option<u32> {
@@ -385,6 +489,13 @@ impl Infer<'_> {
         }
     }
 
+    /// `node`, if it is a parameter, is one no context types: refused (42P18) unless declared.
+    fn refuse_untyped(&mut self, node: &PgNode) {
+        if let Some(n) = param(node) {
+            self.compared_untyped.insert(n);
+        }
+    }
+
     /// `node` stands where a condition stands: a bare parameter there is boolean.
     fn qual(&mut self, node: Option<&PgNode>, scope: &Scope) {
         if let Some(node) = node {
@@ -434,10 +545,11 @@ impl Infer<'_> {
             Some(Node::UpdateStmt(u)) => {
                 let ctes = self.with(u.with_clause.as_ref(), &scope);
                 if let Some(rel) = u.relation.as_ref() {
-                    let mut level = vec![self.range_var(rel)];
+                    let mut level = vec![self.target(rel)];
                     level.extend(self.from_items(&u.from_clause, &scope));
                     let inner = vec![level];
-                    self.set_targets(&u.target_list, &rel.relname, &inner);
+                    let relname = self.main_relname(&rel.schemaname, &rel.relname);
+                    self.set_targets(&u.target_list, relname.as_deref(), &inner);
                     self.qual(u.where_clause.as_deref(), &inner);
                     self.targets(&u.returning_list, &inner);
                 }
@@ -446,7 +558,7 @@ impl Infer<'_> {
             Some(Node::DeleteStmt(d)) => {
                 let ctes = self.with(d.with_clause.as_ref(), &scope);
                 if let Some(rel) = d.relation.as_ref() {
-                    let mut level = vec![self.range_var(rel)];
+                    let mut level = vec![self.target(rel)];
                     level.extend(self.from_items(&d.using_clause, &scope));
                     let inner = vec![level];
                     self.qual(d.where_clause.as_deref(), &inner);
@@ -514,6 +626,77 @@ impl Infer<'_> {
     /// relation of any other schema is not one this walk can open. The schema was dropped, so `s.t`
     /// was typed as public's t (wire review 11 item 3).
     fn range_var(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Rel {
+        self.relation(rv, true)
+    }
+
+    /// The table an INSERT, UPDATE or DELETE writes: a range variable read with no CTE lookup, as
+    /// PostgreSQL never resolves a DML target to a CTE; one of a CTE's name was typed from the CTE
+    /// (wire review 14 item 3).
+    fn target(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar) -> Rel {
+        self.relation(rv, false)
+    }
+
+    /// The main schema's name for the relation `schemaname.relname` names, as the engine resolves
+    /// it: public's and pg_catalog's relations keep their names and information_schema's views are
+    /// information_schema_<view>. An unqualified name is a catalog relation's first (PostgreSQL
+    /// searches pg_catalog before the path); then, with no path set, main's, else the attached
+    /// schemas' (the engine reads main, then each attached schema); with a path, each entry in turn,
+    /// public being main, an attached schema being passed over when it lacks the name, and any
+    /// other entry (`"$user"`, PostgreSQL's default, or a schema not attached) skipped, as the
+    /// engine skips it. None for a relation of an attached schema (which this walk cannot read: a
+    /// parameter compared with it or written into it is refused untyped, 42P18) and for a name the
+    /// engine resolves nowhere. Every relation was read in public alone (wire review 14 item 3);
+    /// then the walk stopped at the first path entry that was not public, so `"$user", public`
+    /// refused every parameter, and with no path took a name absent from main as main's, which
+    /// typed a parameter into an attached schema's table as text (wire review 17 item 3). A probe of
+    /// an attached schema counts as a cut: its answer can change with no new main snapshot, so a
+    /// view read through it is not kept for the snapshot ([`ViewCache`]).
+    fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
+        match schemaname.to_lowercase().as_str() {
+            "public" | "pg_catalog" => Some(relname.to_string()),
+            "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
+            "" => {
+                let in_main = || {
+                    self.schema.get_table(relname).is_some()
+                        || self.schema.get_view(relname).is_some()
+                };
+                if crate::catalog::is_catalog_table_name(relname) {
+                    return Some(relname.to_string());
+                }
+                let attached_holds = |name: &String| {
+                    self.cuts.set(self.cuts.get() + 1);
+                    (self.attached.holds)(name, relname)
+                };
+                if self.search_path.is_empty() {
+                    if in_main() {
+                        return Some(relname.to_string());
+                    }
+                    return None;
+                }
+                for entry in &self.search_path {
+                    if entry.eq_ignore_ascii_case("public") {
+                        if in_main() {
+                            return Some(relname.to_string());
+                        }
+                    } else if let Some(name) = self
+                        .attached
+                        .names
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(entry))
+                    {
+                        if attached_holds(name) {
+                            return None;
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Infer::range_var`] and [`Infer::target`]: `ctes` false skips the CTE lookup.
+    fn relation(&self, rv: &turso_pg_parser::pg_query::protobuf::RangeVar, ctes: bool) -> Rel {
         let name = rv
             .alias
             .as_ref()
@@ -522,16 +705,13 @@ impl Infer<'_> {
             Some(a) => rename(columns, &a.colnames),
             None => columns,
         };
-        let relname = match rv.schemaname.to_lowercase().as_str() {
-            "" => {
-                if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
-                    return Rel::derived(name, aliased(columns.clone()));
-                }
-                rv.relname.clone()
+        if ctes && rv.schemaname.is_empty() {
+            if let Some((_, columns)) = self.ctes.iter().rev().find(|(n, _)| *n == rv.relname) {
+                return Rel::derived(name, aliased(columns.clone()));
             }
-            "public" | "pg_catalog" => rv.relname.clone(),
-            "information_schema" => format!("information_schema_{}", rv.relname.to_lowercase()),
-            _ => return Rel::Unknown { name },
+        }
+        let Some(relname) = self.main_relname(&rv.schemaname, &rv.relname) else {
+            return Rel::Unknown { name };
         };
         if self.schema.get_table(&relname).is_some() {
             return Rel::Table { name, relname };
@@ -544,25 +724,97 @@ impl Infer<'_> {
 
     /// A view's columns, typed by walking its query (stored as SQL text) as a statement of its own:
     /// the query sees no enclosing scope and none of this statement's CTEs. None for no view of
-    /// that name, or one whose text does not parse as a view. A view was not opened at all, so a
-    /// parameter compared with its count(*) column fell to the text fallback, and rows went missing
-    /// (wire review 11 item 3).
+    /// that name, one whose text does not parse as a view, one already being opened (a circular
+    /// view) and one nested past MAX_VIEW_DEPTH: the relation is then one the walk cannot open, and
+    /// a parameter compared with its columns fails closed (42P18 unless declared). A view was not
+    /// opened at all, so a parameter compared with its count(*) column fell to the text fallback,
+    /// and rows went missing (wire review 11 item 3); then a circular view recursed until the
+    /// session thread's stack overflowed, which aborts the process, every session with it, before
+    /// the engine's own "circularly defined" refusal could run (wire review 14 item 1).
     fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
-        let view = self.schema.get_view(relname)?;
-        let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
-        let parsed = turso_pg_parser::parse(sql).ok()?;
-        let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?;
-        let Some(Node::ViewStmt(v)) = stmt.node.as_ref() else {
+        if self.views.len() >= MAX_VIEW_DEPTH
+            || self.views.iter().any(|v| v.eq_ignore_ascii_case(relname))
+        {
+            self.cuts.set(self.cuts.get() + 1);
             return None;
+        }
+        let key = relname.to_ascii_lowercase();
+        if let Some(columns) = self.view_memo.borrow().get(&key) {
+            return columns.clone();
+        }
+        // A view read with a cut is kept for this statement: a view sees a cut only inside a cycle
+        // through it, which any later reading of it meets too, or past the depth bound, where a
+        // shallower reading might not; either way its columns are fail-closed (whatever a cut
+        // relation held is unknown), so reusing them can only refuse more. Its reader counts the
+        // cut, so nothing read from it reaches the snapshot's memo. Not kept, every sibling FROM
+        // item read its view again: about e*(k-1)! parses for k views that each list all k (wire
+        // review 16 item 3).
+        if let Some(columns) = self.cut_views.borrow().get(&key) {
+            self.cuts.set(self.cuts.get() + 1);
+            return columns.clone();
+        }
+        let view = self.schema.get_view(relname)?;
+        let cuts = self.cuts.get();
+        let columns = self.read_view(&view, relname);
+        let memo = if self.cuts.get() == cuts {
+            &self.view_memo
+        } else {
+            &self.cut_views
+        };
+        memo.borrow_mut().insert(key, columns.clone());
+        columns
+    }
+
+    /// [`Infer::view_columns`] of `view`, read: its stored query walked, or, when libpg_query cannot
+    /// read the text the engine stored (SQLite's rendering: `IS TRUE` is `IS 1`), the engine's own
+    /// columns for the view, typed by their declared types. Such a view became one the walk
+    /// cannot open, and a parameter compared with its columns was refused 42P18 (wire review 14
+    /// item 10).
+    fn read_view(
+        &self,
+        view: &turso_core::schema::View,
+        relname: &str,
+    ) -> Option<Vec<(String, Option<u32>)>> {
+        let engine_columns = || {
+            Some(
+                view.columns
+                    .iter()
+                    .map(|c| (c.name.clone().unwrap_or_default(), column_oid(c)))
+                    .collect(),
+            )
+        };
+        let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
+        let Ok(parsed) = turso_pg_parser::parse(sql) else {
+            return engine_columns();
+        };
+        let Some(stmt) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|raw| raw.stmt.as_deref())
+        else {
+            return engine_columns();
+        };
+        let Some(Node::ViewStmt(v)) = stmt.node.as_ref() else {
+            return engine_columns();
         };
         let Some(Node::SelectStmt(query)) = v.query.as_deref().and_then(|q| q.node.as_ref()) else {
-            return None;
+            return engine_columns();
         };
+        let mut views = self.views.clone();
+        views.push(relname.to_string());
         let mut walk = Infer {
             schema: self.schema,
             types: std::collections::BTreeMap::new(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: Vec::new(),
+            views,
+            subselects: Default::default(),
+            search_path: self.search_path.clone(),
+            view_memo: self.view_memo.clone(),
+            cuts: self.cuts.clone(),
+            cut_views: self.cut_views.clone(),
+            attached: self.attached,
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -606,8 +858,71 @@ impl Infer<'_> {
                 for item in &f.functions {
                     self.expr(item, scope);
                 }
+                // A function in FROM reads the items before it (PostgreSQL's functions in FROM are
+                // implicitly LATERAL).
+                let mut inner = scope.clone();
+                inner.push(level.clone());
+                level.push(self.range_function(f, &inner));
             }
             _ => {}
+        }
+    }
+
+    /// The relation a function in FROM brings into scope (wire review 14 item 2: it brought none, so
+    /// a parameter compared with its column bound to an outer column of the name, or fell to
+    /// text): generate_series over integers is a relation of one column, int4 (int8 if an argument
+    /// is bigint, numeric if one is numeric), named by the alias's column list, else the alias, else
+    /// the function, as PostgreSQL names it; any other function, and a form the walk does not model
+    /// (LATERAL, WITH ORDINALITY, ROWS FROM, an argument it cannot type), is a relation it cannot
+    /// open, so a parameter compared with a bare column there fails closed (42P18).
+    fn range_function(
+        &self,
+        f: &turso_pg_parser::pg_query::protobuf::RangeFunction,
+        scope: &Scope,
+    ) -> Rel {
+        let call = match f.functions.as_slice() {
+            [item] => match item.node.as_ref() {
+                Some(Node::List(l)) => l.items.first().and_then(|i| match i.node.as_ref() {
+                    Some(Node::FuncCall(c)) => Some(c),
+                    _ => None,
+                }),
+                Some(Node::FuncCall(c)) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        let function = call.and_then(func_name);
+        let alias = f.alias.as_ref().filter(|a| !a.aliasname.is_empty());
+        let name = alias
+            .map(|a| a.aliasname.clone())
+            .or_else(|| function.clone())
+            .unwrap_or_default();
+        let (Some(call), Some("generate_series")) = (call, function.as_deref()) else {
+            return Rel::Unknown { name };
+        };
+        if f.lateral || f.ordinality || !(2..=3).contains(&call.args.len()) {
+            return Rel::Unknown { name };
+        }
+        let mut widest = INT4;
+        for arg in &call.args {
+            widest = match self.type_of(arg, scope) {
+                Some(INT2 | INT4) => widest,
+                Some(INT8) if widest != NUMERIC => INT8,
+                Some(INT8) => NUMERIC,
+                Some(NUMERIC) => NUMERIC,
+                _ => return Rel::Unknown { name },
+            };
+        }
+        let column = alias
+            .and_then(|a| a.colnames.first())
+            .and_then(|c| match c.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| name.clone());
+        Rel::Derived {
+            name,
+            columns: vec![(column, Some(widest))],
         }
     }
 
@@ -618,21 +933,46 @@ impl Infer<'_> {
         let Some(rel) = insert.relation.as_ref() else {
             return;
         };
-        let columns: Vec<Option<u32>> = if insert.cols.is_empty() {
-            self.schema
-                .get_btree_table(&rel.relname)
+        // The table written, as the engine resolves it; one this walk cannot read (another
+        // schema's) types nothing, and every value parameter is refused untyped (42P18) rather
+        // than typed from public's table of the name (wire review 14 item 3).
+        let relname = self.main_relname(&rel.schemaname, &rel.relname);
+        let columns: Vec<Option<u32>> = match &relname {
+            None => Vec::new(),
+            Some(relname) if insert.cols.is_empty() => self
+                .schema
+                .get_btree_table(relname)
                 .map(|t| t.columns().iter().map(column_oid).collect())
-                .unwrap_or_default()
-        } else {
-            insert
+                .unwrap_or_default(),
+            Some(relname) => insert
                 .cols
                 .iter()
                 .map(|c| match c.node.as_ref() {
-                    Some(Node::ResTarget(t)) => declared_type(self.schema, &rel.relname, &t.name),
+                    Some(Node::ResTarget(t)) => declared_type(self.schema, relname, &t.name),
                     _ => None,
                 })
-                .collect()
+                .collect(),
         };
+        if relname.is_none() {
+            if let Some(Node::SelectStmt(s)) =
+                insert.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+            {
+                for row in &s.values_lists {
+                    if let Some(Node::List(l)) = row.node.as_ref() {
+                        for item in &l.items {
+                            self.refuse_untyped(item);
+                        }
+                    }
+                }
+                for target in &s.target_list {
+                    if let Some(Node::ResTarget(t)) = target.node.as_ref() {
+                        if let Some(val) = t.val.as_deref() {
+                            self.refuse_untyped(val);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(Node::SelectStmt(s)) =
             insert.select_stmt.as_deref().and_then(|s| s.node.as_ref())
         {
@@ -654,15 +994,18 @@ impl Infer<'_> {
             }
             self.select(s, scope);
         }
-        let target = vec![vec![
-            self.range_var(rel),
-            Rel::Table {
+        let excluded = match &relname {
+            Some(relname) => Rel::Table {
                 name: "excluded".to_string(),
-                relname: rel.relname.clone(),
+                relname: relname.clone(),
             },
-        ]];
+            None => Rel::Unknown {
+                name: "excluded".to_string(),
+            },
+        };
+        let target = vec![vec![self.target(rel), excluded]];
         if let Some(c) = &insert.on_conflict_clause {
-            self.set_targets(&c.target_list, &rel.relname, &target);
+            self.set_targets(&c.target_list, relname.as_deref(), &target);
             self.qual(c.where_clause.as_deref(), &target);
         }
         self.targets(&insert.returning_list, &target);
@@ -670,12 +1013,30 @@ impl Infer<'_> {
 
     /// UPDATE-style SET targets of `relname`: each value takes its column's type, a multi-column
     /// `SET (a, b) = ($1, $2)` element by element.
-    fn set_targets(&mut self, targets: &[PgNode], relname: &str, scope: &Scope) {
+    fn set_targets(&mut self, targets: &[PgNode], relname: Option<&str>, scope: &Scope) {
         for target in targets {
             let Some(Node::ResTarget(t)) = target.node.as_ref() else {
                 continue;
             };
             let Some(val) = t.val.as_deref() else {
+                continue;
+            };
+            // A table the walk cannot read (another schema's): its columns type nothing, and a
+            // parameter assigned to one is refused untyped (wire review 14 item 3).
+            let Some(relname) = relname else {
+                match val.node.as_ref() {
+                    Some(Node::MultiAssignRef(m)) => {
+                        if let Some(Node::RowExpr(row)) =
+                            m.source.as_deref().and_then(|s| s.node.as_ref())
+                        {
+                            for item in &row.args {
+                                self.refuse_untyped(item);
+                            }
+                        }
+                    }
+                    _ => self.refuse_untyped(val),
+                }
+                self.expr(val, scope);
                 continue;
             };
             let column = declared_type(self.schema, relname, &t.name);
@@ -1057,9 +1418,18 @@ impl Infer<'_> {
                     if level.iter().any(|rel| matches!(rel, Rel::Unknown { .. })) {
                         return Some(None);
                     }
-                    let mut found = level.iter().filter_map(|rel| of(rel, column));
-                    if let Some(ty) = found.next() {
-                        return found.next().is_none().then_some(ty);
+                    // In two relations of the level: one column a join merged (USING, NATURAL)
+                    // when they agree on its type, which it then has; untyped when they do not. A
+                    // column no join merges is the engine's 42702 whichever is returned. It was
+                    // read as not found, which fell to text (wire review 14 item 9).
+                    let found: Vec<Option<u32>> =
+                        level.iter().filter_map(|rel| of(rel, column)).collect();
+                    if let [first, rest @ ..] = found.as_slice() {
+                        return Some(if rest.iter().all(|t| t == first) {
+                            *first
+                        } else {
+                            None
+                        });
                     }
                 }
                 None
@@ -1072,7 +1442,18 @@ impl Infer<'_> {
                 }
                 None
             }
-            _ => None,
+            // `public.t.c` is t's c; a reference through any other schema (or deeper) names a
+            // relation this walk cannot read: found, untyped, so a parameter compared with it is
+            // refused (42P18). It was not found, which fell to text (wire review 14 item 3).
+            [schema, table, column] if schema.eq_ignore_ascii_case("public") => {
+                for level in scope.iter().rev() {
+                    if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
+                        return of(rel, column);
+                    }
+                }
+                None
+            }
+            _ => Some(None),
         }
     }
 
@@ -1170,8 +1551,11 @@ impl Infer<'_> {
         }
     }
 
-    /// The type of a scalar subquery's one result column, read in its own FROM (not walked:
-    /// [`Infer::expr`] walks it).
+    /// The type of a scalar subquery's one result column, read in its own FROM as the SELECT walk
+    /// reads a FROM ([`Infer::from_items`]: every kind of item), in a walk of its own whose
+    /// parameter types are dropped ([`Infer::expr`] types them when it walks the subquery). Only
+    /// its tables were read, so a derived table, a join or a function there added nothing, and the
+    /// column bound to an outer relation's column of the name (wire review 14 item 2).
     fn subselect_type(&self, s: &SelectStmt, scope: &Scope) -> Option<u32> {
         if s.larg.is_some() || s.with_clause.is_some() {
             return None;
@@ -1182,15 +1566,30 @@ impl Infer<'_> {
         let Some(Node::ResTarget(t)) = target.node.as_ref() else {
             return None;
         };
-        let mut level = Vec::new();
-        for item in &s.from_clause {
-            if let Some(Node::RangeVar(rv)) = item.node.as_ref() {
-                level.push(self.range_var(rv));
-            }
+        let val = t.val.as_deref()?;
+        let key = s as *const SelectStmt as usize;
+        if let Some(ty) = self.subselects.borrow().get(&key) {
+            return *ty;
         }
+        let mut walk = Infer {
+            schema: self.schema,
+            types: std::collections::BTreeMap::new(),
+            compared_untyped: std::collections::BTreeSet::new(),
+            ctes: self.ctes.clone(),
+            views: self.views.clone(),
+            subselects: self.subselects.clone(),
+            search_path: self.search_path.clone(),
+            view_memo: self.view_memo.clone(),
+            cuts: self.cuts.clone(),
+            cut_views: self.cut_views.clone(),
+            attached: self.attached,
+        };
+        let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
         inner.push(level);
-        self.type_of(t.val.as_deref()?, &inner)
+        let ty = walk.type_of(val, &inner);
+        self.subselects.borrow_mut().insert(key, ty);
+        ty
     }
 }
 
@@ -1213,7 +1612,13 @@ fn target_name(val: &PgNode) -> String {
 }
 
 /// Columns renamed by an alias's column list (`AS d(a, b)`), the rest keeping their names.
+/// A list holding the [`STAR`] marker (a `*` the walk could not expand) is returned as it is: the
+/// marker is what makes the relation one the walk cannot open, and renamed away it read as a
+/// relation of the aliased columns, untyped (wire review 14 item 8).
 fn rename(mut columns: Vec<(String, Option<u32>)>, names: &[PgNode]) -> Vec<(String, Option<u32>)> {
+    if columns.iter().any(|(n, _)| n == STAR) {
+        return columns;
+    }
     for (column, name) in columns.iter_mut().zip(names) {
         if let Some(Node::String(s)) = name.node.as_ref() {
             column.0 = s.sval.clone();

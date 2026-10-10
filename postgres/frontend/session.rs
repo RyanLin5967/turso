@@ -11,8 +11,8 @@ use turso_pg_parser::translator::{
     is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
     try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
     try_extract_drop_schema, try_extract_set, try_extract_show, PgAddConstraints, PgBranchArg,
-    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
+    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
+    PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -29,6 +29,8 @@ struct PgConnectionInner {
     /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
     /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
     broken: std::sync::atomic::AtomicBool,
+    /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
+    view_cache: Mutex<crate::result_types::ViewCache>,
 }
 
 impl PgConnectionInner {
@@ -89,6 +91,7 @@ impl PgConnection {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
+                view_cache: Mutex::new(crate::result_types::ViewCache::default()),
             }),
         }
     }
@@ -112,8 +115,16 @@ impl PgConnection {
     /// [`crate::result_types::aggregate_types`]; `None`, or a short list, where the engine types
     /// the column), and for each parameter its context types (see
     /// [`crate::result_types::parameter_types`]).
-    pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, StatementTypes)> {
-        let mut types = StatementTypes::default();
+    /// `bound`: a Bind supplies the statement's parameters (the extended protocol).
+    pub fn prepare_typed(
+        &self,
+        sql: impl AsRef<str>,
+        bound: bool,
+    ) -> Result<(Statement, StatementTypes)> {
+        let mut types = StatementTypes {
+            bound,
+            ..StatementTypes::default()
+        };
         let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
         Ok((stmt, types))
     }
@@ -126,13 +137,16 @@ impl PgConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, StatementTypes)>> {
-        let mut types = StatementTypes::default();
+        let mut types = StatementTypes {
+            bound: true,
+            ..StatementTypes::default()
+        };
         let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
-        let sql = sql.as_ref().trim();
+        let sql = turso_pg_parser::pg_trim(sql.as_ref());
         if sql.is_empty() {
             return Ok(None);
         }
@@ -214,7 +228,7 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
     let b = sql.as_bytes();
     let mut i = 0;
     let ws = |i: &mut usize| {
-        while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b) {
+        while *i < b.len() && turso_pg_parser::pg_space(b[*i]) {
             *i += 1;
         }
     };
@@ -381,9 +395,9 @@ impl<'a> PgQueryRunner<'a> {
         Self {
             conn,
             stmts: split_statements(sql)
-                .unwrap_or_else(|_| vec![sql.trim().to_string()])
+                .unwrap_or_else(|_| vec![turso_pg_parser::pg_trim(sql).to_string()])
                 .into_iter()
-                .filter(|stmt| !stmt.trim().is_empty())
+                .filter(|stmt| !turso_pg_parser::pg_trim(stmt).is_empty())
                 .collect(),
             index: 0,
         }
@@ -407,15 +421,15 @@ impl Iterator for PgQueryRunner<'_> {
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     // Text with no separator but a trailing one is one statement: no literal, comment or dollar
     // quote can make it two, so libpg_query is not asked.
-    let trimmed = sql.trim();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    let trimmed = turso_pg_parser::pg_trim(sql);
+    let body = turso_pg_parser::pg_trim(trimmed.strip_suffix(';').unwrap_or(trimmed));
     if !body.is_empty() && !body.contains(';') {
         return Ok(vec![body.to_string()]);
     }
     match turso_pg_parser::split_statements(sql) {
-        Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
+        Ok(stmts) if stmts.is_empty() && !trimmed.is_empty() => Ok(vec![trimmed.to_string()]),
         Ok(stmts) => Ok(stmts),
-        Err(_) => Ok(vec![sql.trim().to_string()]),
+        Err(_) => Ok(vec![trimmed.to_string()]),
     }
 }
 
@@ -455,7 +469,21 @@ fn prepare_statement_inner(
     types: Option<&mut StatementTypes>,
     describe: bool,
 ) -> Result<Option<Statement>> {
-    let sql = sql.trim();
+    prepare_statement_checked(pg_conn, sql, types, describe, true)
+}
+
+/// [`prepare_statement_inner`]; `check_keys` false for an ALTER's own rebuild statements, whose
+/// CREATE TABLEs carry the table's keys: the ALTER checks the keys it adds on its own, and an older
+/// key that no longer resolves must not refuse the rebuild (wire review 13 item 3).
+fn prepare_statement_checked(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    mut types: Option<&mut StatementTypes>,
+    describe: bool,
+    check_keys: bool,
+) -> Result<Option<Statement>> {
+    // PostgreSQL's whitespace only (wire review 13 item 1).
+    let sql = turso_pg_parser::pg_trim(sql);
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
             "The supplied SQL string contains no statements".to_string(),
@@ -467,6 +495,14 @@ fn prepare_statement_inner(
     // One parse serves both the special forms and the translation (it was two).
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
+    // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
+    // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
+    if parse_result.protobuf.stmts.len() > 1 {
+        return Err(LimboError::ParseError(
+            "cannot insert multiple commands into a prepared statement".to_string(),
+        ));
+    }
     // Every $n of the whole tree, before anything is sized by one: a number past
     // MAX_PARAMETER (Bind counts in 16 bits) or below 1 names no parameter (42P02, PostgreSQL's
     // "there is no parameter"); `SELECT 1 LIMIT $2147483647` sized a 16 GiB list (wire review 8
@@ -491,29 +527,106 @@ fn prepare_statement_inner(
     if describe && performs_at_prepare(&parse_result) {
         return Ok(None);
     }
+    // A statement this prepare performs, or whose prerequisites it runs (a SERIAL column's
+    // sequence), reads no parameter: one holding a $n is refused before anything of it runs,
+    // 42P02 when nothing binds it (as PostgreSQL answers the simple protocol), 0A000 when a Bind
+    // would. `COPY ... WHERE v = $1` ran inside the prepare before any guard saw it and imported
+    // every row (wire review 13 item 9).
+    let bound = types.as_deref().is_some_and(|t| t.bound);
+    let first_param = used.first().copied();
+    let parameter_refused = |n: u32| {
+        LimboError::ParseError(if bound {
+            format!(
+                "a parameter (${n}) in a statement performed while it is prepared is not supported"
+            )
+        } else {
+            format!("there is no parameter ${n}")
+        })
+    };
+    if let Some(n) = first_param.filter(|_| performs_at_prepare(&parse_result)) {
+        return Err(parameter_refused(n));
+    }
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(Some(stmt));
     }
-    if let Some(types) = types {
+    // A CREATE TABLE's foreign keys: their parents checked now, every key resolved by the server
+    // once the table exists, in the CREATE's own transaction (wire review 13 item 2).
+    let new_table_keys = if check_keys {
+        precheck_create_keys(&pg_conn.conn, &parse_result)?
+    } else {
+        None
+    };
+    if let Some(types) = types.as_deref_mut() {
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
         if !used.is_empty() {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            (types.params, types.untyped) =
-                crate::result_types::parameter_types(&parse_result, &schema);
+            let search_path = pg_conn.session_state.lock().unwrap().search_path.clone();
+            // Which attached schema holds a name, probed only when the walk resolves an
+            // unqualified name through one, once per (schema, name) per statement (wire review 17
+            // item 3).
+            let names = pg_conn.conn.attached_database_names();
+            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+            let holds = |schema: &str, name: &str| {
+                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+                if let Some(held) = probed.borrow().get(&key) {
+                    return *held;
+                }
+                let held = get_table_columns(
+                    &pg_conn.conn,
+                    &name.replace('\'', "''"),
+                    Some(&schema.replace('"', "\"\"")),
+                )
+                .is_ok_and(|columns| !columns.is_empty());
+                probed.borrow_mut().insert(key, held);
+                held
+            };
+            let attached = crate::result_types::Attached {
+                names: &names,
+                holds: &holds,
+            };
+            (types.params, types.untyped) = crate::result_types::parameter_types(
+                &parse_result,
+                &schema,
+                &search_path,
+                &pg_conn.view_cache,
+                &attached,
+            );
         }
         types.used = used;
     }
 
-    let translator = PostgreSQLTranslator::new();
+    // A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
+    // item 7); no other statement pays for the lookup.
+    let translator = if is_delete_using(&parse_result) {
+        let conn = pg_conn.conn.clone();
+        PostgreSQLTranslator::new()
+            .with_columns(move |schema, table| relation_columns(&conn, schema, table))
+    } else {
+        PostgreSQLTranslator::new()
+    };
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if let Some(types) = types {
+        types.new_table_keys = new_table_keys;
+        types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
+        types.rolls_back = matches!(
+            translated.cmd.stmt(),
+            ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
+        );
+    }
     if describe && !translated.prereqs.is_empty() {
         return Ok(None);
+    }
+    if let Some(n) = first_param.filter(|_| !translated.prereqs.is_empty()) {
+        return Err(parameter_refused(n));
     }
 
     let options = {
@@ -586,8 +699,7 @@ fn try_prepare_special(
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return handle_pg_show(pg_conn, &show_stmt).map(Some);
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
@@ -640,8 +752,68 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
     stmt.run_ignore_rows()
 }
 
+/// Parameters SET accepts and this server need not act on, whatever their value: planner, resource
+/// and client settings that change no answer it gives (`enable_*` too).
+const NOOP_PARAMETERS: &[&str] = &[
+    "application_name",
+    "check_function_bodies",
+    "client_min_messages",
+    "cpu_index_tuple_cost",
+    "cpu_operator_cost",
+    "cpu_tuple_cost",
+    "default_statistics_target",
+    "effective_cache_size",
+    "effective_io_concurrency",
+    "from_collapse_limit",
+    "geqo",
+    "idle_in_transaction_session_timeout",
+    "jit",
+    "join_collapse_limit",
+    "lock_timeout",
+    "maintenance_work_mem",
+    "max_parallel_workers_per_gather",
+    "plan_cache_mode",
+    "random_page_cost",
+    "row_security",
+    "seq_page_cost",
+    "statement_timeout",
+    "synchronous_commit",
+    "temp_buffers",
+    "work_mem",
+];
+
+/// A boolean setting or input as PostgreSQL's parse_bool reads one: blanks around it, any case,
+/// `t`/`true`, `y`/`yes`, `f`/`false`, `n`/`no` or any prefix of those words, `on`, `off` (at least
+/// two letters, so `o` is ambiguous), `1` and `0`.
+pub fn pg_bool(text: &str) -> Option<bool> {
+    let s = text
+        .trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .to_ascii_lowercase();
+    let prefix_of = |word: &str| !s.is_empty() && word.starts_with(s.as_str());
+    match s.as_str() {
+        "1" | "on" => Some(true),
+        "0" | "of" | "off" => Some(false),
+        _ if prefix_of("true") || prefix_of("yes") => Some(true),
+        _ if prefix_of("false") || prefix_of("no") => Some(false),
+        _ => None,
+    }
+}
+
+/// SET of `set_stmt`'s parameter, from an allowlist (wire review 15 item 2): search_path; the
+/// engine's foreign_keys, exposed deliberately; a read-only transaction asked for through
+/// transaction_read_only or default_transaction_read_only is 0A000 (the engine has none, as BEGIN
+/// READ ONLY is refused), `off` changes nothing; client_encoding, standard_conforming_strings,
+/// bytea_output, DateStyle, IntervalStyle, TimeZone and extra_float_digits are accepted at the
+/// values this server answers by (UTF8, on, hex, ISO, postgres, UTC, 1 or more) and 0A000 at any
+/// other; NOOP_PARAMETERS and `enable_*` are accepted; a dotted (custom) name is 0A000; any other
+/// name is 42704 "unrecognized configuration parameter", as PostgreSQL answers a name it does not
+/// know (one it knows and this list omits gets 42704 too). Every SET became `PRAGMA name = value`,
+/// which the engine ignores for a name it does not know, so `transaction_read_only = on` answered
+/// SET and the writes after it committed, and one it does know (synchronous, journal_mode) changed
+/// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
-    if set_stmt.name == "search_path" {
+    let name = set_stmt.name.to_ascii_lowercase();
+    if name == "search_path" {
         let path = set_stmt
             .values
             .iter()
@@ -654,8 +826,125 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
-    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    if name == "foreign_keys" {
+        return pg_conn
+            .conn
+            .prepare(format!("PRAGMA foreign_keys = {}", value.to_sql_string()));
+    }
+    let text = match value {
+        PgSetValue::Identifier(v)
+        | PgSetValue::StringLiteral(v)
+        | PgSetValue::Number(v)
+        | PgSetValue::RawSql(v) => v.clone(),
+        PgSetValue::Bool(b) => b.to_string(),
+        PgSetValue::Null => String::new(),
+    };
+    let lower = text.to_ascii_lowercase();
+    let unsupported = |what: &str| {
+        Err(LimboError::ParseError(format!(
+            "SET {name} = {text} is not supported: {what}"
+        )))
+    };
+    let accepted = match name.as_str() {
+        "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
+            Some(false) => true,
+            _ => {
+                return Err(LimboError::ParseError(
+                    "READ ONLY transactions are not supported".to_string(),
+                ))
+            }
+        },
+        "client_encoding" => {
+            let clean: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+            clean == "utf8" || clean == "unicode"
+        }
+        "standard_conforming_strings" => pg_bool(&text) == Some(true),
+        "bytea_output" => lower == "hex",
+        "datestyle" => lower.split(',').any(|part| part.trim() == "iso"),
+        "intervalstyle" => lower == "postgres",
+        "timezone" => matches!(
+            lower.as_str(),
+            "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
+        ),
+        "extra_float_digits" => lower.parse::<i32>().is_ok_and(|d| d >= 1),
+        n if NOOP_PARAMETERS.contains(&n) || n.starts_with("enable_") => true,
+        n if n.contains('.') => {
+            return unsupported("custom configuration parameters are not supported")
+        }
+        _ => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized configuration parameter \"{name}\""
+            )))
+        }
+    };
+    if accepted {
+        noop_statement(&pg_conn.conn)
+    } else {
+        unsupported("this server answers only by its own setting of it")
+    }
+}
+
+/// SHOW of `show`'s parameter, from the settings SET keeps (see [`handle_pg_set`]; wire review 16
+/// item 4), one text row under PostgreSQL's name for it: search_path from the session's own path,
+/// each name quoted as PostgreSQL quotes it (`"$user", public`, PostgreSQL's default, when none was
+/// set); foreign_keys from the engine; transaction_read_only and default_transaction_read_only
+/// off; the client settings at the values this server answers by. SHOW ALL is 0A000, and any other
+/// name 42704, as PostgreSQL answers a name it does not know (one it knows that this list omits,
+/// NOOP_PARAMETERS among them, gets 42704 too: their values are not kept). Every SHOW became
+/// `PRAGMA <name>` from the client's identifier, which the engine performed while compiling, a
+/// Describe included: `SHOW "synchronous = off"` set the sync mode, `SHOW "fullfsync = off"`
+/// turned F_FULLFSYNC into fsync, `SHOW wal_checkpoint` checkpointed.
+fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result<Statement> {
+    let name = show.name.to_ascii_lowercase();
+    let fixed = |column: &'static str, value: &'static str| (column, value.to_string());
+    let (column, value) = match name.as_str() {
+        "search_path" => {
+            let path = pg_conn.session_state.lock().unwrap().search_path.clone();
+            let shown = if path.is_empty() {
+                "\"$user\", public".to_string()
+            } else {
+                path.iter()
+                    .map(|n| turso_pg_parser::quote_identifier(n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            ("search_path", shown)
+        }
+        "foreign_keys" => {
+            let mut stmt = pg_conn.conn.prepare("PRAGMA foreign_keys")?;
+            let rows = stmt.run_collect_rows()?;
+            let on = rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_int())
+                == Some(1);
+            ("foreign_keys", if on { "on" } else { "off" }.to_string())
+        }
+        "transaction_read_only" => fixed("transaction_read_only", "off"),
+        "default_transaction_read_only" => fixed("default_transaction_read_only", "off"),
+        "client_encoding" => fixed("client_encoding", "UTF8"),
+        "standard_conforming_strings" => fixed("standard_conforming_strings", "on"),
+        "bytea_output" => fixed("bytea_output", "hex"),
+        "datestyle" => fixed("DateStyle", "ISO, MDY"),
+        "intervalstyle" => fixed("IntervalStyle", "postgres"),
+        "timezone" => fixed("TimeZone", "UTC"),
+        "extra_float_digits" => fixed("extra_float_digits", "1"),
+        "all" => {
+            return Err(LimboError::ParseError(
+                "SHOW ALL is not supported".to_string(),
+            ))
+        }
+        _ => {
+            return Err(LimboError::ParseError(format!(
+                "unrecognized configuration parameter \"{name}\""
+            )))
+        }
+    };
+    pg_conn.conn.prepare(format!(
+        "SELECT '{}' AS \"{}\"",
+        value.replace('\'', "''"),
+        column
+    ))
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -901,6 +1190,26 @@ fn handle_pg_add_constraints(
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
+    // The keys the ALTER adds, each checked against the catalog before anything is copied or
+    // dropped (a key onto the table itself as far as it can be before the table's own new keys
+    // exist): a refused key cost two copies of the table and an index rebuild, and an arity the
+    // engine refuses in the rebuilt CREATE TABLE was 42601 (wire review 13 item 4).
+    let keys: Vec<AddedForeignKey> = add
+        .constraints
+        .iter()
+        .filter_map(added_foreign_key)
+        .collect();
+    let child_columns: Vec<String> = conn
+        .current_schema()
+        .get_btree_table(table)
+        .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    for key in &keys {
+        check_foreign_key(conn, table, &child_columns, key, true)?;
+    }
+    // Whether the table's older keys resolve: if they do, the engine's own resolution after the
+    // rebuild can refuse only for a key this ALTER adds, and backs the per-key checks.
+    let resolved_before = keys.is_empty() || check_table_keys(conn, table).is_ok();
     let in_tx = !conn.get_auto_commit();
     execute_root(
         conn,
@@ -932,31 +1241,18 @@ fn handle_pg_add_constraints(
                 None => execute_root(conn, sql)?,
             }
         }
-        // The keys the ALTER adds are checked last, once the table's indexes are back (a unique
-        // index re-created above can be a self-reference's parent key, and the orphan query can
-        // use the indexes): the parent and its key (42P01, 42830), the engine's own resolution of
-        // every key of the table with unique parent keys required (with keys off, a non-unique
-        // parent key was accepted, and every later INSERT into the table failed 'foreign key
-        // mismatch'; wire review 11 item 5), then the orphans (23503).
-        let keys: Vec<AddedForeignKey> = add
-            .constraints
-            .iter()
-            .filter_map(added_foreign_key)
-            .collect();
+        // The keys the ALTER adds are checked whole once the table's indexes are back (a unique
+        // index the ALTER adds can be a self-reference's parent key, and the orphan query can use
+        // the indexes): each key on its own (check_foreign_key), then, when the table's older keys
+        // resolved, the engine's own resolution of every key with unique parent keys required
+        // (with keys off, a non-unique parent key was accepted, and every later INSERT into the
+        // table failed 'foreign key mismatch'; wire review 11 item 5), then the orphans (23503).
         let mut parent_keys = Vec::with_capacity(keys.len());
         for key in &keys {
-            parent_keys.push(added_key_parent_columns(conn, &quoted, key)?);
+            parent_keys.push(check_foreign_key(conn, table, &child_columns, key, false)?);
         }
-        if let Some(first) = keys.first() {
-            conn.current_schema()
-                .resolved_fks_for_child(table)
-                .map_err(|_| {
-                    LimboError::ParseError(format!(
-                        "there is no unique constraint matching given keys for referenced table \
-                         \"{}\"",
-                        first.parent
-                    ))
-                })?;
+        if !keys.is_empty() && resolved_before {
+            check_table_keys(conn, table)?;
         }
         for (key, parent_columns) in keys.iter().zip(&parent_keys) {
             check_added_foreign_key(conn, &quoted, key, parent_columns)?;
@@ -1045,20 +1341,158 @@ fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option
     })
 }
 
-/// The parent key of a foreign key an ALTER adds, as PostgreSQL resolves it: the columns named,
-/// or the parent's primary key; a parent that does not exist is 42P01, one with no primary key to
-/// default to, or a key of another column count, 42830 (both were 42601).
-fn added_key_parent_columns(
+/// Every foreign key of `table` resolves as the engine resolves it for a write, unique parent keys
+/// required (Schema::resolved_fks_for_child): one that does not is 42830 "there is no unique
+/// constraint matching given keys for referenced table", naming the parent the engine names. A key
+/// that did not resolve made every later INSERT into the table fail 'foreign key mismatch'. Shared
+/// by ALTER TABLE ADD FOREIGN KEY (wire review 11 item 5) and CREATE TABLE (review 13 item 2), so
+/// the two cannot drift.
+pub fn check_table_keys(conn: &Arc<Connection>, table: &str) -> Result<()> {
+    conn.current_schema()
+        .resolved_fks_for_child(table)
+        .map(|_| ())
+        .map_err(|e| {
+            let message = e.to_string();
+            // fk_mismatch_err: 'foreign key mismatch - "<child>" referencing "<parent>"'.
+            let parent = message
+                .rsplit_once("referencing \"")
+                .and_then(|(_, p)| p.strip_suffix('"'))
+                .unwrap_or(table)
+                .to_string();
+            LimboError::ParseError(format!(
+                "there is no unique constraint matching given keys for referenced table \"{parent}\""
+            ))
+        })
+}
+
+/// The foreign keys a CREATE TABLE declares, in its column constraints (the column the key's own)
+/// and its table constraints.
+fn create_foreign_keys(
+    create: &turso_pg_parser::pg_query::protobuf::CreateStmt,
+) -> Vec<AddedForeignKey> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let mut keys = Vec::new();
+    for elt in &create.table_elts {
+        match elt.node.as_ref() {
+            Some(Node::ColumnDef(col)) => {
+                for mut key in col.constraints.iter().filter_map(added_foreign_key) {
+                    if key.columns.is_empty() {
+                        key.columns = vec![col.colname.clone()];
+                    }
+                    keys.push(key);
+                }
+            }
+            Some(Node::Constraint(_)) => keys.extend(added_foreign_key(elt)),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// A CREATE TABLE's foreign keys, each checked before the table is created, as PostgreSQL checks
+/// them ([`check_foreign_key`]: 42P01, 42703, 42830); a key onto the table itself as far as it can
+/// be before the table exists. Returns the table's name when it declares a key, for the server to
+/// resolve every key once the table exists ([`check_table_keys`]). CREATE TABLE IF NOT EXISTS of a
+/// table that exists checks nothing, as in PostgreSQL, which creates nothing. CREATE TABLE checked
+/// no parent, so a key onto a missing parent or a non-unique column was accepted and every INSERT
+/// into the table then failed (wire review 13 item 2).
+fn precheck_create_keys(
     conn: &Arc<Connection>,
-    table: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<Option<String>> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Ok(None);
+    };
+    let Some(Node::CreateStmt(create)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(relation) = create.relation.as_ref() else {
+        return Ok(None);
+    };
+    let keys = create_foreign_keys(create);
+    if keys.is_empty()
+        || (create.if_not_exists && conn.current_schema().get_table(&relation.relname).is_some())
+    {
+        return Ok(None);
+    }
+    let child_columns: Vec<String> = create
+        .table_elts
+        .iter()
+        .filter_map(|elt| match elt.node.as_ref() {
+            Some(Node::ColumnDef(col)) => Some(col.colname.clone()),
+            _ => None,
+        })
+        .collect();
+    for key in &keys {
+        check_foreign_key(conn, &relation.relname, &child_columns, key, true)?;
+    }
+    Ok(Some(relation.relname.clone()))
+}
+
+/// The names the engine reads as a parent table's rowid when no column of the table has the name
+/// (ROWID_STRS in core's planner).
+const ROWID_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// The checks PostgreSQL makes of a foreign key a CREATE TABLE or an ALTER adds, each key on its
+/// own and in PostgreSQL's order (ATAddForeignKeyConstraint): the parent exists (42P01); the key's
+/// columns are the child's (42703); the parent's columns exist, or it has a primary key to default
+/// to (42703, 42830); a unique key of the parent covers them as the engine resolves a parent key
+/// ([`parent_key_resolves`]; 42830, naming this key's parent); the two column counts agree
+/// (42830). Returns the parent key's columns. `child_columns` are the child's columns. With
+/// `own_keys_pending`, a key onto the child itself is checked as far as it can be before the
+/// child's own keys exist (its columns, and an explicit parent key's columns and count); its
+/// default and its uniqueness wait for the table. Resolving every key of the table instead blamed
+/// the first added key's parent, refused every new key beside an older one that no longer
+/// resolved, and gave a missing column 42830 (wire review 13 item 3).
+fn check_foreign_key(
+    conn: &Arc<Connection>,
+    child: &str,
+    child_columns: &[String],
     key: &AddedForeignKey,
+    own_keys_pending: bool,
 ) -> Result<Vec<String>> {
     let schema = conn.current_schema();
-    let Some(parent) = schema.get_btree_table(&key.parent) else {
-        return Err(LimboError::ParseError(format!(
-            "relation \"{}\" does not exist",
-            key.parent
-        )));
+    let missing = |column: &str| {
+        LimboError::ParseError(format!(
+            "column \"{column}\" referenced in foreign key constraint does not exist"
+        ))
+    };
+    let disagree = |parent_columns: &[String]| {
+        LimboError::ParseError(format!(
+            "number of referencing and referenced columns for foreign key disagree (the key on \
+             {child} names {}, its parent key {})",
+            key.columns.len(),
+            parent_columns.len()
+        ))
+    };
+    let parent = if own_keys_pending && key.parent.eq_ignore_ascii_case(child) {
+        None
+    } else {
+        Some(schema.get_btree_table(&key.parent).ok_or_else(|| {
+            LimboError::ParseError(format!("relation \"{}\" does not exist", key.parent))
+        })?)
+    };
+    if let Some(column) = key
+        .columns
+        .iter()
+        .find(|k| !child_columns.iter().any(|c| c.eq_ignore_ascii_case(k)))
+    {
+        return Err(missing(column));
+    }
+    let is_rowid = |c: &str| ROWID_NAMES.iter().any(|r| c.eq_ignore_ascii_case(r));
+    let Some(parent) = parent else {
+        if let Some(column) = key
+            .parent_columns
+            .iter()
+            .find(|p| !is_rowid(p) && !child_columns.iter().any(|c| c.eq_ignore_ascii_case(p)))
+        {
+            return Err(missing(column));
+        }
+        if !key.parent_columns.is_empty() && key.parent_columns.len() != key.columns.len() {
+            return Err(disagree(&key.parent_columns));
+        }
+        return Ok(key.parent_columns.clone());
     };
     let parent_columns: Vec<String> = if key.parent_columns.is_empty() {
         parent
@@ -1067,6 +1501,13 @@ fn added_key_parent_columns(
             .map(|(c, _)| c.clone())
             .collect()
     } else {
+        if let Some(column) = key
+            .parent_columns
+            .iter()
+            .find(|p| parent.get_column(p).is_none() && !is_rowid(p))
+        {
+            return Err(missing(column));
+        }
         key.parent_columns.clone()
     };
     if parent_columns.is_empty() {
@@ -1075,20 +1516,55 @@ fn added_key_parent_columns(
             key.parent
         )));
     }
-    if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
+    if !parent_key_resolves(&schema, &parent, &parent_columns) {
         return Err(LimboError::ParseError(format!(
-            "number of referencing and referenced columns for foreign key disagree (the key on \
-             {table} names {}, its parent key {})",
-            key.columns.len(),
-            parent_columns.len()
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            key.parent
         )));
+    }
+    if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
+        return Err(disagree(&parent_columns));
     }
     Ok(parent_columns)
 }
 
+/// Whether the engine resolves `columns` of `parent` as a parent key, as core's
+/// Schema::resolve_fk does with unique keys required: the rowid (a single rowid name, or the
+/// column an INTEGER PRIMARY KEY makes the rowid), or a UNIQUE index with no WHERE on exactly those
+/// columns in that order. A key it does not resolve made every INSERT into the child fail
+/// 'foreign key mismatch'. PostgreSQL also accepts a unique key's columns in another order (wire
+/// review 13 item 20).
+fn parent_key_resolves(
+    schema: &turso_core::schema::Schema,
+    parent: &turso_core::schema::BTreeTable,
+    columns: &[String],
+) -> bool {
+    if let [column] = columns {
+        let rowid_alias = parent.columns().iter().any(|c| {
+            c.is_rowid_alias()
+                && c.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
+        });
+        if rowid_alias || ROWID_NAMES.iter().any(|r| column.eq_ignore_ascii_case(r)) {
+            return true;
+        }
+    }
+    schema.get_indices(&parent.name).any(|index| {
+        index.unique
+            && index.where_clause.is_none()
+            && index.columns.len() == columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(columns)
+                .all(|(i, c)| i.name.eq_ignore_ascii_case(c))
+    })
+}
+
 /// The check PostgreSQL makes when it adds a foreign key, as one query: a row of `table` whose key
 /// columns are all non-NULL (MATCH SIMPLE) and match no row of the parent key
-/// ([`added_key_parent_columns`]) fails the ALTER with 23503.
+/// ([`check_foreign_key`]) fails the ALTER with 23503.
 fn check_added_foreign_key(
     conn: &Arc<Connection>,
     table: &str,
@@ -1153,11 +1629,25 @@ fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
 }
 
 /// Run one PostgreSQL statement through this frontend, as a client's would be.
+/// One statement of an ALTER's rebuild, its foreign keys not checked again
+/// ([`prepare_statement_checked`]).
 fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
-    prepare_statement(pg_conn, sql)?.run_ignore_rows()
+    prepare_statement_checked(pg_conn, sql, None, false, false)?
+        .ok_or_else(|| {
+            LimboError::InternalError("only a Describe declines to prepare a statement".to_string())
+        })?
+        .run_ignore_rows()
 }
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    if let Some(why) = &stmt.refused {
+        return Err(LimboError::ParseError(why.clone()));
+    }
+    if stmt.has_where {
+        return Err(LimboError::ParseError(
+            "COPY FROM ... WHERE is not supported".to_string(),
+        ));
+    }
     let conn = &pg_conn.conn;
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
@@ -1267,6 +1757,37 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
                 "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
             )))
         }
+    }
+}
+
+/// Whether `parse` is one DELETE ... USING (its rewrite reads the relations' declared columns).
+fn is_delete_using(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    matches!(
+        parse.protobuf.stmts.as_slice(),
+        [raw] if matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(Node::DeleteStmt(d)) if !d.using_clause.is_empty()
+        )
+    )
+}
+
+/// The columns `table` declares: from the connection's schema for public (or no schema), from the
+/// attached schema's table_info otherwise; None for a relation it cannot read (a view, one that
+/// does not exist).
+fn relation_columns(conn: &Arc<Connection>, schema: &str, table: &str) -> Option<Vec<String>> {
+    match schema {
+        "" | "public" => conn
+            .current_schema()
+            .get_btree_table(table)
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect()),
+        schema => get_table_columns(
+            conn,
+            &table.replace('\'', "''"),
+            Some(&schema.replace('"', "\"\"")),
+        )
+        .ok()
+        .filter(|columns| !columns.is_empty()),
     }
 }
 
@@ -1389,11 +1910,26 @@ mod tests {
         }
     }
 
-    /// Differential: whatever the fast path reads, libpg_query reads the same; every form it does
-    /// not read still reaches the same answer through libpg_query. The corpus crosses keyword case,
-    /// spacing, argument forms, casts, terminators and trailing junk.
+    /// Differential: whatever the fast path reads, libpg_query reads the same; every form, read
+    /// there or not, reaches PostgreSQL 18's answer: libpg_query's, except that a `$n` above
+    /// i32::MAX, which libpg_query's PostgreSQL 17 scanner wraps and PostgreSQL 18's refuses
+    /// ("parameter number too large", 42601), makes no call. That answer is read from the corpus's
+    /// argument by PostgreSQL's scanner rule, never from the code under test; against libpg_query
+    /// alone no implementation could pass, since `$4294967297` is `$1` there (wire review 14 item
+    /// 12; FLAGGED edit, lead pre-approval in DECISIONS, PG 18 recording owed). The corpus crosses
+    /// keyword case, spacing, argument forms, casts, terminators and trailing junk.
     #[test]
     fn the_fast_path_agrees_with_libpg_query() {
+        // PostgreSQL 18's scanner refuses a `$n` whose number is above i32::MAX.
+        let pg18_refuses = |arg: &str| {
+            arg.strip_prefix('$').is_some_and(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                !digits.is_empty()
+                    && digits
+                        .parse::<u128>()
+                        .map_or(true, |n| n > i32::MAX as u128)
+            })
+        };
         let selects = ["SELECT", "select", "SeLeCt"];
         let names = [
             "turso_branch_create",
@@ -1460,11 +1996,17 @@ mod tests {
                             let sql = format!("{sel} {name}{g}({g}{arg}{g}){end}");
                             n += 1;
                             let slow = slow(&sql);
+                            let want = if pg18_refuses(arg) {
+                                None
+                            } else {
+                                slow.clone()
+                            };
                             if let Some(fast) = fast_branch_call(&sql) {
                                 fast_hits += 1;
-                                assert_eq!(Some(fast), slow, "{sql:?}");
+                                assert_eq!(Some(fast.clone()), slow, "libpg_query, {sql:?}");
+                                assert_eq!(Some(fast), want, "{sql:?}");
                             }
-                            assert_eq!(branch_call(&sql), slow, "{sql:?}");
+                            assert_eq!(branch_call(&sql), want, "{sql:?}");
                         }
                     }
                 }
@@ -1507,6 +2049,13 @@ mod tests {
             assert_eq!(fast_branch_call(&sql), None, "fast path, {sql:?}");
             assert_eq!(branch_call(&sql), None, "branch_call, {sql:?}");
         }
+        // The reference's wrap, the wrong call the check above exists to stop (wire review 14
+        // item 12): libpg_query reads $4294967297 as $1.
+        assert_eq!(
+            slow("SELECT turso_branch_create($4294967297)"),
+            call(create, vec![Param(1)]),
+            "libpg_query's wrap"
+        );
         for (sql, n) in [
             ("SELECT turso_branch_create($65535)", 65535),
             ("SELECT turso_branch_create($0001)", 1),
