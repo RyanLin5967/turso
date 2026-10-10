@@ -713,6 +713,24 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<()>;
 
+    /// `write_frame_raw`, the WAL header's sync (after a truncation) reporting a failure to
+    /// `pager`'s branch store at once, as every other WAL-internal sync does (engine review 17 LOW
+    /// 10; `Pager::wal_insert_frame`). The default reports nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn write_frame_raw_watched(
+        &self,
+        pager: &Pager,
+        buffer_pool: Arc<BufferPool>,
+        frame_id: u64,
+        page_id: u64,
+        db_size: u64,
+        page: &[u8],
+        sync_type: FileSyncType,
+    ) -> Result<()> {
+        let _ = pager;
+        self.write_frame_raw(buffer_pool, frame_id, page_id, db_size, page, sync_type)
+    }
+
     /// Prepare WAL header for the future append
     /// Most of the time this method will return Ok(None)
     fn prepare_wal_start(&self, page_sz: PageSize) -> Result<Option<Completion>>;
@@ -3097,11 +3115,18 @@ impl WalFile {
     /// the trunk's device, and the pager acts on it HERE, as it fails (engine review 17 HIGH 1: an
     /// explicit PRAGMA wal_checkpoint answers it with a busy row, so a later check never came, and
     /// a flush on another connection masked it). The pager reads what the failed sync drained now.
-    /// A completion that fails after it yielded fails the statement's step, whose error path acts
-    /// on it. Unless the mutant named `unwatched` is on (test builds only).
+    /// A completion it returned is noted with the pager (`Pager::note_trunk_wal_sync`), so one that
+    /// fails after it yielded is acted on where the statement's checkpoint failure is handled
+    /// (`check_noted_syncs`; engine review 19 HIGH 1: io_uring and an extension VFS fail there, not
+    /// at issue). Unless the mutant named `unwatched` is on (test builds only), or, for the noted
+    /// half alone, mutant `yielded_wal_sync_unnoted` (as 910dbf21c left it).
     fn watched(&self, unwatched: &str, pager: &Pager, issued: Result<Completion>) -> Result<Completion> {
-        if issued.is_err() && !crate::branch::store::fe_mutant(unwatched) {
-            pager.trunk_wal_sync_failed();
+        if !crate::branch::store::fe_mutant(unwatched) {
+            match &issued {
+                Err(_) => pager.trunk_wal_sync_failed(),
+                Ok(c) if !crate::branch::store::fe_mutant("yielded_wal_sync_unnoted") => pager.note_trunk_wal_sync(c),
+                Ok(_) => {}
+            }
         }
         issued
     }
@@ -3874,6 +3899,36 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
+    }
+
+    /// The WAL's header written and synced first when the WAL was truncated, its sync watched
+    /// (engine review 17 LOW 10): a failure at issue goes through `watched`, a failed completion to
+    /// the same at-risk decision; then `write_frame_raw`, which finds the header in place. Mutant
+    /// `raw_header_sync_unwatched` (test builds only): neither reported, as before.
+    #[allow(clippy::too_many_arguments)]
+    fn write_frame_raw_watched(
+        &self,
+        pager: &Pager,
+        buffer_pool: Arc<BufferPool>,
+        frame_id: u64,
+        page_id: u64,
+        db_size: u64,
+        page: &[u8],
+        sync_type: FileSyncType,
+    ) -> Result<()> {
+        if let Some(page_size) = PageSize::new(page.len() as u32) {
+            if let Some(c) = self.prepare_wal_start(page_size)? {
+                self.io.wait_for_completion(c)?;
+                let c = self.watched("raw_header_sync_unwatched", pager, self.prepare_wal_finish(sync_type))?;
+                if let Err(e) = self.io.wait_for_completion(c) {
+                    if !crate::branch::store::fe_mutant("raw_header_sync_unwatched") {
+                        pager.trunk_wal_sync_failed();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.write_frame_raw(buffer_pool, frame_id, page_id, db_size, page, sync_type)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

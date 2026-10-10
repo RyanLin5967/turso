@@ -893,22 +893,34 @@ mod tests {
         stmt.run_ignore_rows()
     }
 
-    /// Engine review 16 #21 (PLAUSIBLE, by reading; `blob_to_bigdecimal`'s validation unread): a
+    /// Engine review 16 #21, rewritten for engine review 20 HIGH 2 (FLAGGED, review-directed): a
     /// blob operand reaches numeric's operators as given, and they read a blob as the type's
-    /// internal encoding, so `x = X'00'` compared the column with a value no INSERT could have
-    /// stored. It must be refused as an INSERT of X'00' is, literal and bound. Red first: the fix
-    /// is written only once this runs red.
+    /// internal encoding, so `x = <blob>` compared the column with a value no INSERT could have
+    /// stored (INSERT refuses every blob). It must be refused as that INSERT is, literal and bound.
+    /// The first version used X'00', which `blob_to_bigdecimal` refuses as too short (under 14
+    /// bytes), so it passed at its own sha and could not discriminate; this one uses a well-formed
+    /// 18-byte encoding of 10.00 (version 1, scale 2, one limb of 1000), which the decoder accepts,
+    /// so `x = <it>` matches row 1 unless the operand is refused. X'00' stays only as a premise.
     #[test]
     fn a_blob_operand_of_numeric_is_refused_as_its_insert_is() {
+        const TEN: [u8; 18] = [1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0xE8, 3, 0, 0];
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&TEN).is_ok(),
+            "premise: the blob is a well-formed numeric encoding"
+        );
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&[0]).is_err(),
+            "premise: X'00' is refused by the decoder itself"
+        );
         let conn = open();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10.00)").unwrap();
-        let insert = conn.execute("INSERT INTO t VALUES (2, X'00')");
-        assert!(insert.is_err(), "premise: numeric refuses to store a blob it never encoded");
+        let insert = conn.execute("INSERT INTO t VALUES (2, X'0100020000000000000001000000E8030000')");
+        assert!(insert.is_err(), "premise: numeric refuses to store a blob, even its own encoding");
         for (sql, param) in [
-            ("x = X'00'", None),
-            ("x = ?1", Some(Value::from_slice(&[0]).unwrap())),
+            ("x = X'0100020000000000000001000000E8030000'", None),
+            ("x = ?1", Some(Value::from_slice(&TEN).unwrap())),
         ] {
             let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {sql}"), param);
             assert!(
@@ -1084,29 +1096,35 @@ mod tests {
     /// `code = $1` shape). The UNIQUE v arm of
     /// `an_over_length_comparison_operand_compares_instead_of_raising` (a user type, t) and of
     /// `a_built_in_length_checked_type_compares_an_over_length_operand` (registered built-in, u).
-    /// Mutant `seek_key_encodes_raising`.
+    /// Mutant `seek_key_encodes_raising`. FLAGGED TEST EDIT (engine review 20 HIGH 3, as review 14
+    /// MED 6 prescribed): both types gained a bare `OPERATOR '<'`, without which no index can be
+    /// created on them (index.rs refuses it), so the test panicked at its CREATE INDEX at its
+    /// parent and at its fix alike; the CREATE INDEX is now an asserted premise.
     #[test]
     fn an_indexed_length_checked_type_compares_an_over_length_operand() {
         let conn = open();
         conn.execute(
             "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
              THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
-             for type tag') END DECODE value OPERATOR '=' instr",
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
         )
         .unwrap();
         register_built_in(
             &conn,
             "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) \
              <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type bpc') END DECODE \
-             value OPERATOR '=' instr",
+             value OPERATOR '<' OPERATOR '=' instr",
         );
         for (table, ty, index) in [("t", "tag(3)", "tv"), ("u", "bpc(3)", "uv")] {
             conn.execute(format!(
                 "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v {ty}) STRICT"
             ))
             .unwrap();
-            conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"))
-                .unwrap();
+            let indexed = conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"));
+            assert!(
+                indexed.is_ok(),
+                "premise: {ty} takes an index (a bare OPERATOR '<' orders it): {indexed:?}"
+            );
             conn.execute(format!("INSERT INTO {table} VALUES (1, 'abc')"))
                 .unwrap();
             assert!(

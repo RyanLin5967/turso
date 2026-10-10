@@ -14,6 +14,11 @@ use turso_parser::ast::RefAct;
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
+/// The mark on a PostgreSQL table's canonical SQLite text after ALTER TABLE ADD or DROP COLUMN
+/// rewrote it (`format_altered_table_sql`): the text is SQLite's, parsed as such, and the table is
+/// still this frontend's, so its rowid alias stays NOT NULL across a reparse (fastest-engine;
+/// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
+const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -50,6 +55,13 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        // This frontend's table, rewritten by ALTER as canonical SQLite text: parsed as SQLite,
+        // its key still NOT NULL (engine review 20 HIGH 1).
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            let mut table = BTreeTable::from_sql(altered, root_page)?;
+            table.rowid_alias_not_null = true;
+            return Ok(table);
+        }
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
@@ -79,6 +91,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            return turso_core::dialect::sqlite::parse_table_sql_ast(altered);
+        }
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
@@ -100,6 +115,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            return turso_core::dialect::sqlite::table_sql_for_replay(altered);
+        }
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::sqlite::table_sql_for_replay(sql);
         };
@@ -140,6 +158,16 @@ impl Dialect for PostgresDialect {
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
         Ok(encode_pg_schema_sql(input))
+    }
+
+    fn format_altered_table_sql(&self, table: &BTreeTable) -> Result<String> {
+        // Only this frontend's own tables carry the NOT NULL key (`parse_table_sql`); a table an
+        // internal SQLite path wrote keeps its plain text.
+        if table.rowid_alias_not_null {
+            Ok(format!("{STORED_PG_ALTERED_PREFIX}{}", table.to_sql()))
+        } else {
+            Ok(table.to_sql())
+        }
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -3389,7 +3417,11 @@ impl PgGetTableDefCursor {
             let postgres_ddl = match sql_map.get(table_name) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
                     .map(str::to_string)
-                    .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
+                    .unwrap_or_else(|| {
+                        // An altered table's SQLite text, its mark dropped (engine review 20 HIGH 1).
+                        let sqlite_sql = schema_sql.strip_prefix(STORED_PG_ALTERED_PREFIX).unwrap_or(schema_sql);
+                        self.convert_to_postgres_ddl(sqlite_sql)
+                    }),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
 

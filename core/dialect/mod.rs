@@ -103,6 +103,16 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
+    /// Produce stored SQL after `ALTER TABLE ... ADD COLUMN` or `DROP COLUMN` changed `table` in
+    /// place. The default stores the table's canonical SQLite text (`BTreeTable::to_sql`), as
+    /// before. A dialect whose `parse_table_sql` marks properties on its own tables (a PostgreSQL
+    /// frontend's NOT NULL rowid alias, `BTreeTable::rowid_alias_not_null`) overrides this, so the
+    /// stored text still carries them through a reparse: a reopen, a restart, a branch's first
+    /// connect (fastest-engine; engine review 20 HIGH 1).
+    fn format_altered_table_sql(&self, table: &crate::schema::BTreeTable) -> crate::Result<String> {
+        Ok(table.to_sql())
+    }
+
     /// Install the dialect's catalog tables into a freshly constructed
     /// schema.
     ///
@@ -1092,6 +1102,14 @@ mod tests {
 
     impl PgKeyTestDialect {
         const PREFIX: &'static str = "/* pgkey */ ";
+        /// The frontend's mark on its own table's canonical SQLite text after ALTER rewrote it
+        /// (`format_altered_table_sql`), as the PG frontend's second marker.
+        const ALTERED_PREFIX: &'static str = "/* pgkey sqlite */ ";
+
+        fn own(sql: &str) -> Option<&str> {
+            sql.strip_prefix(Self::PREFIX)
+                .or_else(|| sql.strip_prefix(Self::ALTERED_PREFIX))
+        }
     }
 
     impl Dialect for PgKeyTestDialect {
@@ -1104,7 +1122,7 @@ mod tests {
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            match sql.strip_prefix(Self::PREFIX) {
+            match Self::own(sql) {
                 Some(own) => {
                     let mut table = BTreeTable::from_sql(own, root_page)?;
                     table.rowid_alias_not_null = true;
@@ -1115,11 +1133,19 @@ mod tests {
         }
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-            sqlite::parse_table_sql_ast(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+            sqlite::parse_table_sql_ast(Self::own(sql).unwrap_or(sql))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            sqlite::table_sql_for_replay(sql.strip_prefix(Self::PREFIX).unwrap_or(sql))
+            sqlite::table_sql_for_replay(Self::own(sql).unwrap_or(sql))
+        }
+
+        fn format_altered_table_sql(&self, table: &BTreeTable) -> crate::Result<String> {
+            if table.rowid_alias_not_null {
+                Ok(format!("{}{}", Self::ALTERED_PREFIX, table.to_sql()))
+            } else {
+                Ok(table.to_sql())
+            }
         }
 
         fn format_table_sql(
@@ -1257,6 +1283,23 @@ mod tests {
             assert_eq!(ints(&conn, "SELECT id FROM k ORDER BY id"), vec![3, 4, 5]);
             conn.close().unwrap();
         }
+        // Engine review 20 HIGH 1: ALTER TABLE DROP COLUMN stores the table again, and a reopen
+        // reparses it.
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("ALTER TABLE k DROP COLUMN w").unwrap();
+            let after_drop = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'after drop')");
+            assert!(not_null(&after_drop), "after ALTER TABLE DROP COLUMN: {after_drop:?}");
+            conn.close().unwrap();
+        }
+        {
+            let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            let reopened = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'reopened after drop')");
+            assert!(not_null(&reopened), "after DROP COLUMN and a reopen: {reopened:?}");
+            conn.close().unwrap();
+        }
 
         let db = open_db(&io, "sqlitekey.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
@@ -1270,5 +1313,54 @@ mod tests {
             "a SQLite table turns a NULL key into a new rowid"
         );
         conn.close().unwrap();
+    }
+
+    /// Engine review 20 HIGH 1, the branch arm: a branch forked after ALTER TABLE ADD COLUMN on a
+    /// frontend table refuses an explicit NULL key as the trunk does. A lock-free fork that sees a
+    /// trunk commit parses the stored schema at its first connect (678b18ba4; review 20 #19), which
+    /// lost the frontend's mark when ALTER stored the table without it. Red at base when that first
+    /// connect reparses; a guard otherwise. Both stores.
+    #[test]
+    fn a_branch_forked_after_alter_refuses_an_explicit_null_key() {
+        for catalog in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("pgkey-branch.db");
+            let sync = crate::branch::SyncClass::Off;
+            let durability = if catalog {
+                crate::branch::BranchDurability::Catalog { sync }
+            } else {
+                crate::branch::BranchDurability::Durable { sync }
+            };
+            let db = Database::open_file_with_flags(
+                Arc::new(crate::PlatformIO::new().unwrap()),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_branch_durability(durability),
+                None,
+                Arc::new(PgKeyTestDialect),
+            )
+            .unwrap();
+            let trunk = db.connect().unwrap();
+            trunk
+                .execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            trunk.execute("ALTER TABLE k ADD COLUMN w INTEGER").unwrap();
+            trunk.execute("INSERT INTO k (id, v) VALUES (1, 'one')").unwrap();
+            let on_trunk = trunk.execute("INSERT INTO k (id, v) VALUES (NULL, 'trunk')");
+            assert!(
+                matches!(&on_trunk, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+                "catalog={catalog}: premise: the trunk refuses an explicit NULL key after the ALTER: {on_trunk:?}"
+            );
+            let branch = trunk.fork_branch().unwrap();
+            let on_branch = branch
+                .connect()
+                .unwrap()
+                .execute("INSERT INTO k (id, v) VALUES (NULL, 'branch')");
+            assert!(
+                matches!(&on_branch, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+                "catalog={catalog}: CLAIM: a branch forked after the ALTER took a new rowid for a NULL key: {on_branch:?}"
+            );
+            drop(branch);
+        }
     }
 }

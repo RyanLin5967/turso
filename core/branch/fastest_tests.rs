@@ -1825,6 +1825,146 @@ fn a_busy_commit_whose_view_merge_yielded_commits_once() {
     }
 }
 
+/// The WAL commit frames `conn` reads past frame `from`, with no checkpoint since (`seq`).
+#[cfg(feature = "conn_raw_api")]
+fn commit_frames_since(conn: &Arc<Connection>, from: u64, seq: u32, page_size: usize) -> usize {
+    let now = conn.wal_state().unwrap();
+    assert_eq!(now.checkpoint_seq_no, seq, "premise: no checkpoint restarted the WAL in between");
+    let mut frame = vec![0u8; 24 + page_size];
+    (from + 1..=now.max_frame)
+        .filter(|&n| conn.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+        .count()
+}
+
+/// Engine review 19 HIGH 2's fixture: main and an attached `aux`, each a durable store with a live
+/// child (so each half takes copy decisions), `BEGIN`, a write to each, and a COMMIT whose main
+/// half commits while aux's decision pass is refused (`TrunkDecisionBusy` on aux's store only).
+/// Premises: the COMMIT is `Busy`, and main's commit frame is in its WAL. `held`: the COMMIT is a
+/// prepared statement kept for a re-step. Returns the databases, the main connection, a direct aux
+/// connection, the held COMMIT, both WALs' starting frames and checkpoint sequences, the page size,
+/// and the children (kept alive).
+#[cfg(feature = "conn_raw_api")]
+#[allow(clippy::type_complexity)]
+fn attached_busy_commit(
+    dir: &Path,
+    catalog: bool,
+    held: bool,
+) -> (
+    Arc<Database>,
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<Connection>,
+    Option<crate::Statement>,
+    [(u64, u32); 2],
+    usize,
+    [Branch; 2],
+) {
+    let aux_path = dir.join("aux.db");
+    let db = open_at(&dir.join("main.db"), opts(catalog, SyncClass::Fsync).with_attach(true));
+    let aux = open_at(&aux_path, opts(catalog, SyncClass::Fsync).with_attach(true));
+    let a = db.connect().unwrap();
+    seed_wide(&a);
+    let child = a.fork_branch().unwrap();
+    let x = aux.connect().unwrap();
+    seed_wide(&x);
+    let aux_child = x.fork_branch().unwrap();
+    a.execute(format!("ATTACH DATABASE '{}' AS aux", aux_path.display())).unwrap();
+    let page_size = a.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+        .as_int()
+        .unwrap() as usize;
+    let (main_before, aux_before) = (a.wal_state().unwrap(), x.wal_state().unwrap());
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+    a.execute("UPDATE aux.t SET v = 'aux-new' WHERE id = 3").unwrap();
+    aux.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+    let (commit, first) = if held {
+        let mut commit = a.prepare("COMMIT").unwrap();
+        let first = commit.run_ignore_rows();
+        (Some(commit), first)
+    } else {
+        (None, a.execute("COMMIT"))
+    };
+    assert!(
+        matches!(first, Err(LimboError::Busy)),
+        "catalog={catalog}: premise: aux's decision pass was refused: {first:?}"
+    );
+    assert_eq!(
+        commit_frames_since(&a, main_before.max_frame, main_before.checkpoint_seq_no, page_size),
+        1,
+        "catalog={catalog}: premise: main's half committed before aux's refusal"
+    );
+    (
+        db,
+        aux,
+        a,
+        x,
+        commit,
+        [
+            (main_before.max_frame, main_before.checkpoint_seq_no),
+            (aux_before.max_frame, aux_before.checkpoint_seq_no),
+        ],
+        page_size,
+        [child, aux_child],
+    )
+}
+
+/// Engine review 19 HIGH 2 (a): 19e2616f4 undid a Busy COMMIT's transition whenever `commit_state`
+/// was still `Ready`, inferring that nothing committed. With an attached database, main's
+/// `commit_tx` is done (frames published, locks released) before aux's decision pass is refused,
+/// with `commit_state` still `Ready`, so the restore reopened an explicit transaction over a durable
+/// main half: autocommit read false, and ROLLBACK returned Ok, undoing aux's half only. Neither may
+/// claim the transaction is still open.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_after_its_main_half_committed_is_not_reopened() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _aux, a, _x, _commit, _from, _page_size, _children) = attached_busy_commit(dir.path(), catalog, false);
+        assert!(
+            a.get_auto_commit(),
+            "catalog={catalog}: CLAIM: autocommit reads false after a COMMIT whose main half is durable"
+        );
+        let rollback = a.execute("ROLLBACK");
+        assert!(
+            rollback.is_err(),
+            "catalog={catalog}: CLAIM: ROLLBACK returned Ok over a durable main half"
+        );
+        assert_eq!(read_wide(&db.connect().unwrap(), 3), "new", "catalog={catalog}: main's half stays committed");
+    }
+}
+
+/// Engine review 19 HIGH 2 (b): the held COMMIT, re-stepped, commits aux's half exactly once and
+/// main's no second time.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_busy_commit_after_its_main_half_committed_re_steps_the_attached_half_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_db, aux, a, x, commit, from, page_size, _children) = attached_busy_commit(dir.path(), catalog, true);
+        let mut commit = commit.expect("a held COMMIT");
+        assert!(
+            a.get_auto_commit(),
+            "catalog={catalog}: CLAIM: autocommit reads false after a COMMIT whose main half is durable"
+        );
+        let second = commit.run_ignore_rows();
+        assert!(second.is_ok(), "catalog={catalog}: CLAIM: the re-stepped COMMIT commits aux's half: {second:?}");
+        drop(commit);
+        assert_eq!(
+            commit_frames_since(&a, from[0].0, from[0].1, page_size),
+            1,
+            "catalog={catalog}: main's half committed exactly once"
+        );
+        assert_eq!(
+            commit_frames_since(&x, from[1].0, from[1].1, page_size),
+            1,
+            "catalog={catalog}: aux's half committed exactly once"
+        );
+        assert_eq!(read_wide(&aux.connect().unwrap(), 3), "aux-new", "catalog={catalog}: aux's half is committed");
+    }
+}
+
 /// Review A-F1: a raw WAL session's commit (`wal_insert_end(true)`) closes the commit gate it opens,
 /// so the next trunk commit takes its own copy decisions and no fork waits on a gate nobody holds.
 #[cfg(feature = "conn_raw_api")]
@@ -4625,7 +4765,63 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
     }
 }
 
-/// Engine review 16 LOW 12: a compaction marked what it made durable in the rewrite class read
+/// Engine review 18 HIGH 1 (review 19 MED 5): the held-free upgrade was led off the
+/// acknowledgement paths (engine review 13 MED 2) but still as an ordinary group flight: it took
+/// everything buffered and the group's one flight slot (`flushing`), so every D0 create, connect,
+/// first write and delete waited through its arena fsync, directory fsync and log sync, and those
+/// whose records were buffered at its take rode it. It syncs what is written and takes no flight
+/// slot: held once taken and before its sync, a create on another connection is acknowledged,
+/// having waited for nothing and synced nothing on its thread, and the held slots come free once
+/// it lands. The writer is first held where it found the upgrade due, so the create that armed it
+/// cannot be carried. Mutant `upgrade_takes_flight_slot`.
+#[test]
+fn a_create_does_not_wait_for_the_held_free_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-slot.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "catalog={catalog}: premise: x's release frees two slots, past the bound");
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("catalog={catalog}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        // Moving the hook releases the first stop; the writer then stops once its upgrade is taken.
+        db.branches.confirm_hold_for_test(super::store::HOLD_FLIGHT_TAKEN);
+        eventually(&format!("catalog={catalog}: premise: the background writer never took the upgrade"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let (waits, syncs) = (super::store::thread_waits(), super::store::thread_syncs());
+                let created = db.connect().and_then(|t| t.fork_branch()).map(|y| y.into_id());
+                let _ = tx.send((
+                    created.is_ok(),
+                    super::store::thread_waits() - waits,
+                    super::store::thread_syncs() - syncs,
+                ));
+            })
+        };
+        let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+        db.branches.confirm_hold_for_test(0);
+        creator.join().unwrap();
+        assert_eq!(
+            created,
+            Ok((true, 0, 0)),
+            "catalog={catalog}: a create during the held-free upgrade was not acknowledged at once \
+             (created, waits, syncs on its thread; a timeout: it waited for the upgrade)"
+        );
+        eventually(&format!("catalog={catalog}: the held slots never came free"), || {
+            slots.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+    }
+}
+
+/// Engine review 16 LOW 12:a compaction marked what it made durable in the rewrite class read
 /// AFTER the rewrite, whose own log reset clears the inherited floor: a D0 store over a log a D2
 /// run wrote compacted in FullFsync and said Off, so the next FULL trunk commit, whose barrier
 /// covers a Release the snapshot carries, led a flight for it. The class is read before the
@@ -5274,7 +5470,8 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
 /// An IO whose WAL file's next sync fails, once (review 6 #2): `armed` 1 fails it at once, as
 /// UnixIO's F_FULLFSYNC does on Apple, 2 fails its completion before returning it, 3 returns it
 /// unfinished and fails it at the IO's next step, after the statement yielded on it (engine review
-/// 9 #10); it reads 0 once spent. Every other file, and every other call, is the platform's.
+/// 9 #10); 4, 5 and 6 pass one sync and fail the next as 1, 2 and 3 do; it reads 0 once spent.
+/// Every other file, and every other call, is the platform's.
 struct FailWalSyncIo {
     inner: Arc<dyn IO>,
     armed: Arc<std::sync::atomic::AtomicU8>,
@@ -5351,6 +5548,14 @@ impl crate::io::File for FailWalSyncFile {
             4 => {
                 if let Some(a) = self.armed.as_ref() {
                     a.store(1, std::sync::atomic::Ordering::Release);
+                }
+                self.inner.sync(c, sync_type)
+            }
+            // This sync passes; the next one fails as mode 2 (5) or mode 3 (6) does: a site after
+            // another sync, failing after its issue (engine review 19 HIGH 1).
+            m @ (5 | 6) => {
+                if let Some(a) = self.armed.as_ref() {
+                    a.store(m - 3, std::sync::atomic::Ordering::Release);
                 }
                 self.inner.sync(c, sync_type)
             }
@@ -5552,6 +5757,45 @@ fn a_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way: &str) 
     );
 }
 
+/// Engine review 17 LOW 10: `wal_insert_frame` (the raw WAL API, open once no branch exists)
+/// writes and syncs the WAL's header first when the WAL was truncated, and that sync was unwatched
+/// while undrained branch records could remain. A D0 store over a fullfsync trunk (so the sync is
+/// a drain on Apple too) with x's Release undrained, the WAL truncated, its header's sync failing:
+/// the next fork is refused. Mutant `raw_header_sync_unwatched`.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_failed_raw_frame_header_sync_fail_stops_a_store_with_an_undrained_record() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("raw-header.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let page_size = trunk.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let mut frame = vec![0u8; 24 + page_size];
+        trunk.wal_get_frame(1, &mut frame).unwrap();
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.wal_insert_begin().unwrap();
+        armed.store(1, O::Release);
+        let inserted = trunk.wal_insert_frame(1, &frame);
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the WAL header's sync was reached");
+        assert!(inserted.is_err(), "{what}: premise: the failed header sync failed the insert");
+        let _ = trunk.wal_insert_end(false);
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a failed raw WAL header sync with an undrained Release"),
+        );
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_failed_pragma_checkpoint_wal_sync_fail_stops_a_snapshot_store() {
@@ -5598,6 +5842,109 @@ fn a_failed_shutdown_wal_sync_fail_stops_a_snapshot_store() {
 #[test]
 fn a_failed_shutdown_wal_sync_fail_stops_a_catalog_store() {
     a_wal_internal_sync_failure_fail_stops(true, "shutdown", "close");
+}
+
+/// Engine review 19 HIGH 1: 910dbf21c acts at issue on the syncs the WAL issues itself (a
+/// checkpoint's sync before its backfill, a TRUNCATE checkpoint's of the truncated log), but no
+/// longer notes a completion it returned, so one that fails after it yielded (io_uring, an
+/// extension VFS) reached the checkpoint-failure path with nothing noted, and the store stayed
+/// live over a failed drain. A D0 store, whose fork is written and never drained on every target,
+/// under a fullfsync trunk (so the sync is a drain on Apple too); the armed sync's completion
+/// fails before it is returned (mode 2) or after the statement yielded on it (mode 3), at the
+/// checkpoint's sync, or at the truncate's once the checkpoint's passed (modes 5 and 6). The PRAGMA
+/// reports it (an error, or a busy row) and the API returns an error; either way a fork from a
+/// fresh connection and another connection's trunk commit are refused after it. Mutant
+/// `yielded_wal_sync_unnoted` (test builds only).
+fn a_yielded_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way: &str, mode: u8) {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let what = format!("catalog={catalog} site={site} way={way} mode={mode}");
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, armed) = open_failing_wal(&dir.path().join("walyield.db"), opts(catalog, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+    // Frames in the WAL, then a D0 fork: written, not drained.
+    trunk.execute("UPDATE t SET v = 'walled' WHERE id = 7").unwrap();
+    let _b = trunk.fork_branch().unwrap().into_id();
+    assert!(
+        drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+        "{what}: premise: the fork is written and not drained"
+    );
+    crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+    armed.store(if site == "truncate" { mode + 3 } else { mode }, O::Release);
+    let truncate = site == "truncate";
+    match way {
+        "pragma" => {
+            let checkpoint = if truncate { "TRUNCATE" } else { "PASSIVE" };
+            let reported = trunk
+                .prepare(format!("PRAGMA wal_checkpoint({checkpoint})"))
+                .and_then(|mut s| s.run_collect_rows());
+            assert!(
+                reported.as_ref().map_or(true, |rows| rows[0][0].as_int() == Some(1)),
+                "{what}: premise: the PRAGMA reported the failed sync (an error, or busy=1): {reported:?}"
+            );
+        }
+        _ => {
+            let checkpoint = if truncate {
+                crate::CheckpointMode::Truncate { upper_bound_inclusive: None }
+            } else {
+                crate::CheckpointMode::Passive { upper_bound_inclusive: None }
+            };
+            assert!(trunk.checkpoint(checkpoint).is_err(), "{what}: premise: the failed sync failed the checkpoint");
+        }
+    }
+    assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the armed sync was reached");
+    assert_eq!(
+        crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+        site,
+        "{what}: premise: the failure reached its site"
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        &format!("{what}: the next fork after a WAL-internal drain that failed after it yielded"),
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().execute("UPDATE t SET v = 'later' WHERE id = 9"),
+        &format!("{what}: another connection's trunk commit after a WAL-internal drain that failed after it yielded"),
+    );
+}
+
+#[test]
+fn a_yielded_checkpoint_wal_sync_failure_reported_by_the_pragma_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "checkpoint", "pragma", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_checkpoint_wal_sync_failure_reported_by_the_api_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "checkpoint", "api", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_truncate_wal_sync_failure_reported_by_the_pragma_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "truncate", "pragma", mode);
+        }
+    }
+}
+
+#[test]
+fn a_yielded_truncate_wal_sync_failure_reported_by_the_api_fail_stops() {
+    for catalog in [false, true] {
+        for mode in [2, 3] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "truncate", "api", mode);
+        }
+    }
 }
 
 /// Engine review 8 #14 (review 3 #9's pager half): a trunk commit with no frames to sync whose
