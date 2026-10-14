@@ -5863,6 +5863,7 @@ fn a_yielded_wal_internal_sync_failure_fail_stops(catalog: bool, site: &str, way
     let (db, armed) = open_failing_wal(&dir.path().join("walyield.db"), opts(catalog, SyncClass::Off));
     let trunk = db.connect().unwrap();
     seed(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("PRAGMA fullfsync = ON").unwrap();
     trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
     // Frames in the WAL, then a D0 fork: written, not drained.
@@ -6961,12 +6962,12 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
         held: Arc::new(std::sync::Mutex::new(None)),
     }));
     let db = open_at(&dir.path().join("cat-sync.db"), opts(true, SyncClass::Off));
-    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
     let trunk = db.connect().unwrap();
     seed_wide(&trunk);
     trunk.execute("PRAGMA synchronous = FULL").unwrap();
     trunk.execute("PRAGMA fullfsync = ON").unwrap();
     let _x = trunk.fork_branch().unwrap().into_id();
+    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
     write_v(&trunk, 3, "raised");
     assert_eq!(db.branches.rewrite_class_for_test(), SyncClass::FullFsync, "premise: the trunk commit raised the log to FullFsync");
     db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
@@ -7004,10 +7005,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
         held: Arc::new(std::sync::Mutex::new(None)),
     }));
     let db = open_at(&dir.path().join("cat-sync-d2.db"), opts(true, SyncClass::FullFsync));
-    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let _x = trunk.fork_branch().unwrap().into_id();
+    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
     db.branch_checkpoint_hold(super::store::HOLD_BEFORE_WAL_TRUNCATE);
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
     eventually("premise: the checkpoint never installed", || {
