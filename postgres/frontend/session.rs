@@ -35,6 +35,9 @@ struct PgConnectionInner {
     /// which here is the server's own lock wait. Lock-free, as the server reads it while a branch
     /// call waits (wire review 16 item 12).
     lock_timeout_ms: std::sync::atomic::AtomicU64,
+    /// SET statement_timeout, in milliseconds, 0 none: the server stops a statement running past
+    /// it with 57014 (it was refused unless 0).
+    statement_timeout_ms: std::sync::atomic::AtomicU64,
     /// SET client_min_messages, as its rank in PostgreSQL's order for it (see [`message_rank`]):
     /// a message of a lower rank is not sent. NOTICE by default.
     min_messages: std::sync::atomic::AtomicU8,
@@ -183,6 +186,7 @@ impl PgConnection {
                 broken: std::sync::atomic::AtomicBool::new(false),
                 view_cache: Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+                statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 explicit_block: std::sync::atomic::AtomicBool::new(false),
@@ -199,6 +203,13 @@ impl PgConnection {
     pub fn lock_timeout_ms(&self) -> u64 {
         self.inner
             .lock_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// SET statement_timeout, in milliseconds; 0 when unset or set to 0.
+    pub fn statement_timeout_ms(&self) -> u64 {
+        self.inner
+            .statement_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -342,6 +353,9 @@ impl PgConnection {
         self.inner
             .lock_timeout_ms
             .store(from.inner.lock_timeout_ms.load(Relaxed), Relaxed);
+        self.inner
+            .statement_timeout_ms
+            .store(from.inner.statement_timeout_ms.load(Relaxed), Relaxed);
         self.inner
             .min_messages
             .store(from.inner.min_messages.load(Relaxed), Relaxed);
@@ -1195,7 +1209,17 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 .store(rank, std::sync::atomic::Ordering::Relaxed);
             true
         }
-        "statement_timeout" | "idle_in_transaction_session_timeout" | "transaction_timeout" => {
+        // The server stops a statement running past it (57014).
+        "statement_timeout" => {
+            let Some(ms) = setting_ms(&text) else {
+                return invalid();
+            };
+            pg_conn
+                .statement_timeout_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        "idle_in_transaction_session_timeout" | "transaction_timeout" => {
             match setting_ms(&text) {
                 Some(0) => true,
                 Some(_) => {

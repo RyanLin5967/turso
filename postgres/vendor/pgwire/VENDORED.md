@@ -63,3 +63,7 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    FLAGGED TEST EDIT, ruled by the lead (2026-10-15T07:40:59Z): test_format's two infinity rows
    now assert `Infinity` / `-Infinity`. The crate's tests do not build alone here (MSRV), so the
    wire test infinities_and_negative_zero_are_written_without_nan is the check that runs.
+7. `api/auth/noop.rs`: `NoopStartupHandler::backend_key`, set on the client before
+   `finish_authentication0` sends BackendKeyData. Upstream never set a key, so every session sent
+   process id 0 and secret 0, and a CancelRequest could not name one session (the wire server's
+   cancel handler, 2026-10-15).
