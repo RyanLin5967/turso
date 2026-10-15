@@ -1796,6 +1796,9 @@ struct CatState {
     /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
     /// no trunk version when it was made. Cleared with the cache.
     trunk_all_complete: bool,
+    /// The count of rows released while held open, from a format 19/20 meta row at the open
+    /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
+    held_released_at_open: Option<u64>,
     /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
     /// catalog read and deleted by the next checkpoint (C-P).
     trunk_gone: HashSet<(u32, u64)>,
@@ -2111,6 +2114,7 @@ impl CatState {
             // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
+            held_released_at_open: None,
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
@@ -3117,7 +3121,16 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &slot in cap.free_list.iter().chain(cap.reserved.iter()).chain(cap.deferred.iter()) {
             catalog.free_put(slot)?;
         }
-        catalog.put_meta(&cap.meta)
+        // LEAP L4: a format 19/20 meta row carries the earliest lease deadline and the count of
+        // rows released while held open, read in this transaction after every row it commits, so
+        // they summarize exactly those rows. Mutant `l4_stale_meta_facts` (test builds only): the
+        // facts read before the rows are written (the oracle's plant).
+        let mut meta = cap.meta;
+        if super::journal::meta_carries_facts(meta.format) {
+            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { catalog.lease_min()? });
+            meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
+        }
+        catalog.put_meta(&meta)
     })()
     .and_then(|()| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
@@ -3823,6 +3836,9 @@ impl BranchStore {
                 inner.splice = splice;
                 if files.exist() {
                     let t = Instant::now();
+                    // The version on disk, if this build reads it (LEAP L4: a 17/18 snapshot store
+                    // opens and stays one); else the arm's, which the scan refuses by name.
+                    let format = super::journal::on_disk_format(&files, format);
                     let scanned = Journal::scan_as(&files, sync, format)?;
                     stats.recover_ns = ns(t);
                     if let Some(mut scanned) = scanned {
@@ -4082,7 +4098,14 @@ impl BranchStore {
         if let Some(g) = marked {
             cat.next_generation = cat.next_generation.max(g + 1);
         }
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: a format 19/20 meta row carries the catalog's earliest lease deadline, written in
+        // the transaction of the rows it summarizes; an older one is asked. Mutant
+        // `l4_lease_min_from_query` (test builds only): asked always, as before.
+        cat.lease_floor = match meta.lease_min {
+            Some(lease_min) if !fe_mutant("l4_lease_min_from_query") => lease_min,
+            _ => cat.catalog.lease_min()?,
+        };
+        cat.held_released_at_open = meta.held_released;
         inner.cat = Some(cat);
         let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
@@ -4166,7 +4189,14 @@ impl BranchStore {
         // none, and the catalog alone would then open in the other splice arm, or under another
         // build's format (r13-compose S-6: 5/6 composed, 7 before F7's merge, 3/4 F7-durable alone,
         // 2 the base, 0 before the key). A refused open pays no catalog prewarm.
-        let format = super::journal::format_version(inner.splice);
+        let arm = super::journal::format_version(inner.splice);
+        // The version this store reads and keeps writing: its catalog's, its arm's own or legacy
+        // one (LEAP L4: a 17/18 catalog opens by the older path), else the log's.
+        let format = match meta {
+            Some(m) if super::journal::accepts_format(m.format, arm) => m.format,
+            Some(_) => arm,
+            None => super::journal::on_disk_format(files, arm),
+        };
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
                 "branch catalog {}: format version {}; this store reads version {format}{}",
@@ -8266,7 +8296,25 @@ impl BranchStore {
                 ));
             }
         }
+        // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
+        let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
+        if let Some(m) = meta.filter(|m| super::journal::meta_carries_facts(m.format)) {
+            let lease_min = cat.catalog.lease_min().map_err(|e| format!("lease_min: {e}"))?;
+            let held = cat.catalog.released_ids().map_err(|e| format!("released_ids: {e}"))?.len() as u64;
+            if m.lease_min != Some(lease_min) || m.held_released != Some(held) {
+                return Err(format!(
+                    "the meta row says lease_min {:?} and {:?} held releases; the catalog answers {lease_min:?} and {held}",
+                    m.lease_min, m.held_released
+                ));
+            }
+        }
         Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted))
+    }
+
+    /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
+    #[cfg(test)]
+    pub(crate) fn format_for_test(&self) -> Option<u32> {
+        self.inner.lock().journal.as_ref().map(Journal::format)
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
@@ -9325,6 +9373,9 @@ impl StoreInner {
                         page_size: page_size as u32,
                         next_id: self.next_id,
                         format: super::journal::format_version(self.splice),
+                        // A new catalog holds no lease and no held release (LEAP L4).
+                        lease_min: Some(None),
+                        held_released: Some(0),
                         ..Meta::default()
                     };
                     if let Err(e) = catalog.put_meta(&meta).and_then(|()| catalog.commit()) {
@@ -9747,7 +9798,14 @@ impl StoreInner {
                 - reserved.len()
                 - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
-            format: super::journal::format_version(self.splice),
+            // The store keeps writing the version it opened (LEAP L4: a 17/18 store stays one).
+            format: self
+                .journal
+                .as_ref()
+                .map_or_else(|| super::journal::format_version(self.splice), Journal::format),
+            // Filled by the writer in the transaction that commits (`checkpoint_write`).
+            lease_min: None,
+            held_released: None,
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
@@ -10599,7 +10657,13 @@ impl StoreInner {
             .filter(|(_, st)| st.handle == Handle::Released && st.open)
             .map(|(&id, _)| id)
             .collect();
-        if let Some(cat) = self.cat.as_mut() {
+        // LEAP L4: a format 19/20 meta row read at this open counted the rows released while held
+        // open; with none, the catalog is not asked (`held_released_at_open`, taken once).
+        let none_held = self
+            .cat
+            .as_mut()
+            .is_some_and(|cat| cat.held_released_at_open.take() == Some(0) && !fe_mutant("l4_lease_min_from_query"));
+        if let Some(cat) = self.cat.as_mut().filter(|_| !none_held) {
             let removed = &cat.removed;
             let rows = cat.catalog.released_ids()?;
             ids.extend(rows.into_iter().map(BranchId).filter(|id| !removed.contains(id)));

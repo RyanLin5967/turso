@@ -41,7 +41,7 @@ impl Rng {
 
 /// One history of `steps` operations from `seed`; the facts checked after every one. Returns how
 /// often each fact was set at a check: (pages complete, all complete, free exhausted).
-fn history(seed: u64, steps: u32) -> (u64, u64, u64) {
+fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("oracle.db");
     let mut db = open(&path);
@@ -51,7 +51,13 @@ fn history(seed: u64, steps: u32) -> (u64, u64, u64) {
         trunk.execute(&format!("INSERT INTO t VALUES ({id}, '{}')", "x".repeat(200))).unwrap();
     }
     let mut rng = Rng(seed | 1);
-    let mut live: Vec<String> = Vec::new();
+    // The store (and its catalog) is made at the first fork: at the legacy version 17 when asked,
+    // as an older build made it; every later step runs this build's own path over it.
+    super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
+    trunk.create_branch("first").unwrap();
+    super::journal::CREATE_LEGACY.with(|c| c.set(false));
+    let want_format = if legacy { 17 } else { 19 };
+    let mut live: Vec<String> = vec!["first".to_string()];
     let mut made = 0u64;
     let mut seen = (0u64, 0u64, 0u64);
     for step in 0..steps {
@@ -89,6 +95,11 @@ fn history(seed: u64, steps: u32) -> (u64, u64, u64) {
             trunk = db.connect().unwrap();
             "reopen"
         };
+        assert_eq!(
+            db.branches.format_for_test(),
+            Some(want_format),
+            "seed {seed} step {step} ({what}): the store writes another format than it was made at"
+        );
         match db.branches.l4_facts_check_for_test() {
             Ok((pages, all, exhausted)) => {
                 seen.0 += u64::from(pages > 0);
@@ -107,13 +118,20 @@ fn history(seed: u64, steps: u32) -> (u64, u64, u64) {
 /// reopened catalog as complete (the oracle names it at the reopen, before anything reads);
 /// `l4_free_ignores_puts` reads the free table empty although the checkpoint wrote slots to it.
 /// (`l4_complete_over_a_row`, a page marked complete at its probe over a version the memory lacks,
-/// is refused by the store's own read first, as Corrupt.)
+/// is refused by the store's own read first, as Corrupt.) Slice 2 (formats 19/20): the meta row's
+/// lease minimum and held-release count equal their queries at every step (plant
+/// `l4_stale_meta_facts`), the store keeps writing the version it was made at, and two histories
+/// run over a store made at the legacy 17 (`journal::CREATE_LEGACY`), opened by the older path.
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     let mut total = (0u64, 0u64, 0u64);
     for seed in [1u64, 7, 42, 1009, 65_537, 0xdead_beef] {
-        let seen = history(seed, 300);
+        let seen = history(seed, 300, false);
         total = (total.0 + seen.0, total.1 + seen.1, total.2 + seen.2);
+    }
+    // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17.
+    for seed in [3u64, 99] {
+        history(seed, 200, true);
     }
     assert!(
         total.0 > 0 && total.1 > 0 && total.2 > 0,

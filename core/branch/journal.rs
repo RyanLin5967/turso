@@ -113,17 +113,75 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// keeps (`scan_base`). A 15 or 16 reader resets that log and loses them, so the layout, unchanged,
 /// takes a new number that reader refuses; this build refuses a 15 or 16 store in turn, never
 /// reinterprets it (red `a_store_needing_the_older_log_replay_is_refused_by_an_older_format`).
-const FORMAT_VERSION: u32 = 17;
-const SPLICE_FORMAT_VERSION: u32 = 18;
+///
+/// 19 and 20 (LEAP L4, fastest-budgets, lead ruling 2026-10-15): a catalog's meta row also carries
+/// the earliest lease deadline and the count of branches released while held open, so an open
+/// reads the meta row only. The log and snapshot layouts are 17's and 18's. This build still opens
+/// a 17 or 18 store, by the older query path, and keeps writing it at its own version: only a store
+/// created by this build is 19 or 20 (`LEGACY_*`, `accepts_format`). An older build refuses 19/20.
+const FORMAT_VERSION: u32 = 19;
+const SPLICE_FORMAT_VERSION: u32 = 20;
+/// The versions before the L4 meta facts this build still opens and keeps writing (17, 18).
+const LEGACY_FORMAT_VERSION: u32 = 17;
+const LEGACY_SPLICE_FORMAT_VERSION: u32 = 18;
 
-/// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
-/// snapshot headers, and a catalog's meta row).
+/// The format version a store in the splice arm (`true`) or not creates, and reads (its log and
+/// snapshot headers, and a catalog's meta row); its arm's legacy version is read too.
 pub(crate) fn format_version(splice: bool) -> u32 {
+    #[cfg(test)]
+    if CREATE_LEGACY.with(std::cell::Cell::get) {
+        return if splice { LEGACY_SPLICE_FORMAT_VERSION } else { LEGACY_FORMAT_VERSION };
+    }
     if splice {
         SPLICE_FORMAT_VERSION
     } else {
         FORMAT_VERSION
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test builds (LEAP L4's oracle), per thread: stores created on this thread while set are made
+    /// at the legacy version (17, 18), as an older build made them; cleared, this build then opens
+    /// them by the older path (no meta facts) and keeps writing them at that version.
+    pub(crate) static CREATE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The older version of `format`'s arm this build still opens (LEAP L4: 19 -> 17, 20 -> 18).
+pub(crate) fn legacy_format(format: u32) -> Option<u32> {
+    match format {
+        FORMAT_VERSION => Some(LEGACY_FORMAT_VERSION),
+        SPLICE_FORMAT_VERSION => Some(LEGACY_SPLICE_FORMAT_VERSION),
+        _ => None,
+    }
+}
+
+/// Whether a store of arm format `format` reads files of version `version`: its own, or its arm's
+/// legacy version. Mutant `legacy_format_refused` (test builds only): its own only, as before.
+pub(crate) fn accepts_format(version: u32, format: u32) -> bool {
+    version == format || (legacy_format(format) == Some(version) && !super::store::fe_mutant("legacy_format_refused"))
+}
+
+/// The version of the branch files at `files` when this build reads it for arm format `format`
+/// (its own or its legacy one), read from the log header's version field, or the snapshot's when
+/// there is no log; else `format`, whose scan then refuses the files by name.
+pub(crate) fn on_disk_format(files: &BranchFiles, format: u32) -> u32 {
+    let peek = |path: &Path, at: usize| -> Option<u32> {
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut b = [0u8; 16];
+        std::io::Read::read_exact(&mut f, &mut b[..at + 4]).ok()?;
+        Some(u32::from_le_bytes(b[at..at + 4].try_into().unwrap()))
+    };
+    let found = peek(&files.log, 8).or_else(|| peek(&files.snap, 8));
+    match found {
+        Some(v) if accepts_format(v, format) => v,
+        _ => format,
+    }
+}
+
+/// Whether a catalog meta row of format `format` carries the L4 facts (19, 20).
+pub(crate) fn meta_carries_facts(format: u32) -> bool {
+    format == FORMAT_VERSION || format == SPLICE_FORMAT_VERSION
 }
 /// magic(8) format(4) page size(4) generation(8) nonce(4) crc32c of the 28 bytes before it(4),
 /// then the raised class (`HEADER_RAISED_AT`, outside the checksum: rewritten in place) and 4
@@ -1475,6 +1533,11 @@ impl Journal {
     /// The format version this journal writes: set by a store in the splice arm before `start`.
     pub(crate) fn set_format(&mut self, format: u32) {
         self.format = format;
+    }
+
+    /// The format version this journal writes (and its store's catalog meta row carries).
+    pub(crate) fn format(&self) -> u32 {
+        self.format
     }
 
     /// The second half of `create`: write the generation-0 header and make its directory entry
