@@ -2745,6 +2745,19 @@ impl Program {
             Ok(IOResult::Done(()))
         };
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
+        // The main pager's commit refused Busy: its copy-decision pass refused before its first
+        // frame, so no commit has begun, even when it is re-entered after a yield inside that commit
+        // (a spill's wait), which left Committing. Back to Ready, so the statement's Busy handling
+        // restores the open transaction as for a first attempt (`undo_commit_transition_after_busy`;
+        // engine review 19 MED 3). Mutant `busy_after_yield_keeps_committing` (test builds only):
+        // left Committing, as before.
+        if matches!(txn_finish_result, Err(LimboError::Busy))
+            && !rollback
+            && !program_state.commit_published
+            && !crate::branch::store::fe_mutant("busy_after_yield_keeps_committing")
+        {
+            *commit_state = CommitState::Ready;
+        }
         match txn_finish_result? {
             IOResult::Done(_) => {
                 // Main pager commit done, now commit attached database pagers. Main's half is
