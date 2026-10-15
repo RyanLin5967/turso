@@ -481,9 +481,13 @@ run_server_cell() { # run_server_cell SPEC C
   fi
   ops_of "$d/bb" "$d"
   read -r total ok created <"$d/ops.txt"
+  # comp review 1 LOW 22: every server here is D2, so a spec's untimed delete must flush (checked at C=1); select1
+  # deletes nothing
+  local ddur=d2
+  case $spec in *-select1) ddur=none ;; esac
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \
     --load-s "$(window_s "$d/load")" --idle-s "$(window_s "$d/idle")" --ops "$total" --ops-ok "$ok" \
-    ${defer[@]+"${defer[@]}"} ${tw[@]+"${tw[@]}"} >"$d/cell.json"
+    --delete-durable "$ddur" ${defer[@]+"${defer[@]}"} ${tw[@]+"${tw[@]}"} >"$d/cell.json"
   judge_cell "$d"
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
@@ -1013,7 +1017,8 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
       ops_of "$d/bb" "$d"
       read -r total ok created <"$d/ops.txt"
       python3 "$SC" cell --name "$SYSTEM/b1-$spec-c$c" --load "$d/load.json" --idle none \
-        --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" >"$d/cell.json"
+        --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" --delete-durable "$sync" \
+        >"$d/cell.json"  # LOW 22: --drop's delete is durable under d2 and takes no flush under d0
       judge_cell "$d"
       python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/cycle', p.get('flushes'), 'create/op(C=1)', p.get('create'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
       expect "b1-$spec-c$c branch files after the labelling run (every created branch deleted: the $PREBRANCH remain)" \

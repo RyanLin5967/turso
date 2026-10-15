@@ -662,6 +662,13 @@ def cell(a):
     if ops <= 0:
         res["verdict"] = "REFUSED: zero ops in the load window"
         return res
+    # comp review 1 LOW 22: the delete's durability the system is registered with: d2 (a durable delete, at least one
+    # flush per cycle in the delete phase), d0 (none), or none (the spec deletes nothing: select1)
+    dd = a.get("delete-durable", "none")
+    if dd not in ("d2", "d0", "none"):
+        res["verdict"] = f"REFUSED: delete-durable {dd!r} is neither d2, d0 nor none"
+        return res
+    res["delete_durable"] = dd
     keys = list(load["flush_by_syscall"]) + ["sync_file_range", "copy_file_range_calls", "ficlone"]
     res["load"] = {k: load["flush_by_syscall"].get(k, load.get(k, 0)) for k in keys}
     res["idle"] = {k: idle["flush_by_syscall"].get(k, idle.get(k, 0)) for k in keys}
@@ -690,6 +697,17 @@ def cell(a):
             per[k] = round((ph[k] - rate * pt.get(k, 0.0)) / ops, 4) if rate is not None else None
         res["phase_split"] = {"counts": ph, "time_s": pt, "rule": "C=1 only: each flush placed by its start stamp "
                               "against the load generator's op times (create [start, end], delete (end, end + after])"}
+    dbad = []  # LOW 22: the delete's durability, checkable only where the flushes split by phase (C=1)
+    if dd != "none" and isinstance(ph, dict):
+        dr = ph["delete"] / ops
+        if dd == "d2" and dr < 1:
+            dbad.append(f"delete not durable: {round(dr, 4)} flushes per cycle in the delete phase, want >= 1 for a "
+                        f"D2 delete")
+        if dd == "d0" and ph["delete"] > 0:
+            dbad.append(f"a D0 delete flushed: {ph['delete']} flushes in the delete phase, want 0")
+        res["delete_check"] = "checked at C=1 by op phase"
+    elif dd != "none":
+        res["delete_check"] = "not checked: no phase split (C>1 ops overlap)"
     res["per_op"] = per
     res["load_by_role"] = load.get("by_role", {})
     res["idle_by_role"] = idle.get("by_role", {})
@@ -732,6 +750,7 @@ def cell(a):
         bad.append(res["deferred"]["verdict"])
     if res["ops_ok"] != ops:
         bad.append(f"{ops - res['ops_ok']} of {ops} ops failed")
+    bad += dbad
     res["verdict"] = ("NOT CLEAN: " + " | ".join(bad)) if bad else "ok"
     return res
 
