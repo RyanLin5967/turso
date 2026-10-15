@@ -37,7 +37,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
+    attach_schema_files, branch_call, element_of, pg_bool, single_statement, split_statements,
+    PgBranchArg,
     PgBranchCall, PgConnection, StatementTypes, TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
@@ -1069,9 +1070,10 @@ struct SessionState {
     /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
     /// so a statement that returns no row succeeds (wire review 13 item 10).
     bad_result_codes: std::collections::HashMap<String, i16>,
-    /// The search path last sent in a ParameterStatus, with its connection's stamp then
-    /// ([`Session::changed_parameters`]); None while it is the one startup announced.
-    reported_path: Option<(u64, String)>,
+    /// The search path last sent in a ParameterStatus, with its connection's stamp then and the
+    /// path as SET gave it ([`Session::changed_parameters`]); None while it is the one startup
+    /// announced.
+    reported_path: Option<(u64, Vec<String>, String)>,
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -1216,13 +1218,20 @@ impl Session {
             (None, None) => return None,
         };
         let stamp = conn.search_path_stamp();
-        let (last_stamp, last_shown) = st
+        let (last_stamp, last_path, last_shown) = st
             .reported_path
-            .get_or_insert_with(|| (0, turso_pg::DEFAULT_SEARCH_PATH.to_string()));
+            .get_or_insert_with(|| (0, Vec::new(), turso_pg::DEFAULT_SEARCH_PATH.to_string()));
         if *last_stamp == stamp {
             return None;
         }
         *last_stamp = stamp;
+        // A branch switch moves the stamp (another connection) and keeps the path (adopted): the
+        // path is compared first, so the switch formats nothing (L5: the shown path was the
+        // switch's one allocation over the empty query's).
+        if conn.search_path_is(last_path) {
+            return None;
+        }
+        *last_path = conn.search_path();
         let shown = conn.shown_search_path();
         if *last_shown == shown {
             return None;
@@ -1324,6 +1333,18 @@ impl Session {
                 if let Err(e) = self.end_implicit() {
                     responses.push(with_notices(Response::Error(e)));
                 }
+            }
+            return responses;
+        }
+        // One statement (no separator but a trailing one): run as it stands in the query, with no
+        // split Vec or copy (L5). It is no branch call (read above).
+        if let Some(sql) = single_statement(query) {
+            let result = self.run(sql, None, None, &Format::UnifiedText);
+            self.after_implicit(sql, result.is_err());
+            let mut responses = Replies::new();
+            responses.push(with_notices(result.unwrap_or_else(Response::Error)));
+            if let Err(e) = self.end_implicit() {
+                responses.push(with_notices(Response::Error(e)));
             }
             return responses;
         }
@@ -2036,7 +2057,7 @@ impl Session {
         let r = if let Some(table) = types.new_table_keys.as_deref() {
             create_with_keys(conn, &mut stmt, sql, table, backoff)
         } else if !query {
-            execute_non_query(&mut stmt, sql, backoff)
+            execute_non_query(&mut stmt, sql, backoff, portal.is_none())
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
             // this reply agree on both protocols (wire review 1 item 14).
@@ -2336,7 +2357,12 @@ impl Shared {
         if self.db_file == ":memory:" {
             return;
         }
-        // Simple detection: look for DROP SCHEMA pattern
+        // Simple detection: look for DROP SCHEMA pattern. Every other statement is turned away
+        // before the lowered copy, so a write pays no allocation here (L5).
+        let head = query.trim_start().as_bytes();
+        if head.len() < 4 || !head[..4].eq_ignore_ascii_case(b"drop") {
+            return;
+        }
         let trimmed = query.trim().to_lowercase();
         if !trimmed.starts_with("drop schema") {
             return;
@@ -4438,12 +4464,47 @@ fn execute_non_query(
     stmt: &mut turso_core::Statement,
     query: &str,
     backoff: &mut Backoff,
+    simple: bool,
 ) -> PgWireResult<Response> {
     run_waiting(stmt, backoff, |_| Ok(())).map_err(engine_error)?;
 
     let affected = stmt.n_change();
+    // A simple Query's INSERT, UPDATE or DELETE completes with its tag encoded inline, with no
+    // allocation (L5; inline_dml_completes_are_the_messages_pgwire_encodes).
+    if simple {
+        if let Some(m) = inline_dml_complete(query, affected as usize) {
+            return Ok(Response::Inline(m));
+        }
+    }
     let tag = command_tag(query, affected as usize);
     Ok(Response::Execution(tag))
+}
+
+/// INSERT, UPDATE or DELETE, read from the statement's first token without copying it, as
+/// [`command_tag`] reads it (skip_blank, then the verb in any case); None for any other verb.
+fn dml_verb(query: &str) -> Option<&'static str> {
+    let start = skip_blank(query.as_bytes(), 0).unwrap_or(query.len());
+    let head = query.as_bytes()[start..].trim_ascii_start();
+    ["INSERT", "UPDATE", "DELETE"].into_iter().find(|verb| {
+        head.len() >= verb.len() && head[..verb.len()].eq_ignore_ascii_case(verb.as_bytes())
+    })
+}
+
+/// The CommandComplete of an INSERT (`INSERT 0 n`), UPDATE or DELETE (`UPDATE n`), encoded inline.
+fn inline_dml_complete(query: &str, rows: usize) -> Option<pgwire::messages::Inline> {
+    let verb = dml_verb(query)?;
+    let mut digits = [0u8; 20];
+    let n = int_text(rows as i64, &mut digits);
+    let oid: &[u8] = if verb == "INSERT" { b" 0 " } else { b" " };
+    let len = 4 + verb.len() + oid.len() + n.len() + 1;
+    let mut m = pgwire::messages::Inline::default();
+    let ok = m.push(b"C")
+        && m.push(&(len as i32).to_be_bytes())
+        && m.push(verb.as_bytes())
+        && m.push(oid)
+        && m.push(n)
+        && m.push(&[0]);
+    ok.then_some(m)
 }
 
 /// The type of each parameter, $1 up to the highest the statement holds or the client declared:
@@ -5343,6 +5404,30 @@ mod tests {
             assert_eq!(inline.bytes(), &slow[..], "create {v}");
         }
         assert!(inline_one_row("f", &Type::TEXT, &[b'x'; 300]).is_none(), "too long fits");
+    }
+
+    /// The inline CommandComplete of an INSERT, UPDATE or DELETE is, byte for byte, the message
+    /// pgwire encodes for command_tag's Tag of the same statement and count (vendored change 8),
+    /// in any case and after blanks and comments; any other verb has none.
+    #[test]
+    fn inline_dml_completes_are_the_messages_pgwire_encodes() {
+        for (sql, rows) in [
+            ("UPDATE t SET v = 1", 1usize),
+            ("  update t set v = 1", 0),
+            ("/* c */ DELETE FROM t", 12345),
+            ("insert into t values (1)", 1),
+            ("INSERT INTO t SELECT 1", 7),
+        ] {
+            let inline = inline_dml_complete(sql, rows).expect("a DML verb");
+            let mut buf = bytes::BytesMut::new();
+            PgWireBackendMessage::CommandComplete(command_tag(sql, rows).into())
+                .encode(&mut buf)
+                .unwrap();
+            assert_eq!(inline.bytes(), &buf[..], "{sql} {rows}");
+        }
+        for sql in ["SELECT 1", "CREATE TABLE x (a int)", "WITH x AS (SELECT 1) UPDATE t SET v = 1"] {
+            assert!(inline_dml_complete(sql, 1).is_none(), "{sql}");
+        }
     }
 
     /// L5's allocation budget in process (lead 2026-10-15; budget.py work's pre-registered rule,

@@ -24,13 +24,16 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
-    session_state: Mutex<SessionState>,
+    /// A parking_lot lock, as is the view cache's: std's Mutex on Apple boxes its pthread mutex at
+    /// the first lock, one allocation per new connection paid inside the branch switch that opens
+    /// it (L5's switch budget).
+    session_state: parking_lot::Mutex<SessionState>,
     /// A statement failed and undoing it failed too: the engine connection holds a transaction in
     /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
     /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
     broken: std::sync::atomic::AtomicBool,
     /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
-    view_cache: Mutex<crate::result_types::ViewCache>,
+    view_cache: parking_lot::Mutex<crate::result_types::ViewCache>,
     /// SET lock_timeout, in milliseconds: 0 when unset or set to 0, PostgreSQL's "no timeout",
     /// which here is the server's own lock wait. Lock-free, as the server reads it while a branch
     /// call waits (wire review 16 item 12).
@@ -125,7 +128,7 @@ fn setting_ms(text: &str) -> Option<u64> {
 
 impl PgConnectionInner {
     fn set_search_path(&self, path: Vec<String>) {
-        let mut state = self.session_state.lock().unwrap();
+        let mut state = self.session_state.lock();
         state.search_path = path;
         use std::sync::atomic::Ordering::Relaxed;
         self.search_path_stamp
@@ -182,9 +185,9 @@ impl PgConnection {
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
-                session_state: Mutex::new(SessionState::default()),
+                session_state: parking_lot::Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
-                view_cache: Mutex::new(crate::result_types::ViewCache::default()),
+                view_cache: parking_lot::Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
@@ -230,9 +233,21 @@ impl PgConnection {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the session's search path is `path`, read with no copy: a switch to another
+    /// connection moves the stamp whatever the path is, and the server asks this before it pays
+    /// for [`PgConnection::shown_search_path`] (L5).
+    pub fn search_path_is(&self, path: &[String]) -> bool {
+        self.inner.session_state.lock().search_path == path
+    }
+
+    /// The session's search path, as SET gave it.
+    pub fn search_path(&self) -> Vec<String> {
+        self.inner.session_state.lock().search_path.clone()
+    }
+
     /// The session's search path as SHOW search_path gives it.
     pub fn shown_search_path(&self) -> String {
-        shown_search_path(&self.inner.session_state.lock().unwrap().search_path)
+        shown_search_path(&self.inner.session_state.lock().search_path)
     }
 
     /// Whether the statements prepared next run in a transaction block the client opened (true)
@@ -347,7 +362,7 @@ impl PgConnection {
         if Arc::ptr_eq(&self.inner, &from.inner) {
             return;
         }
-        let path = from.inner.session_state.lock().unwrap().search_path.clone();
+        let path = from.inner.session_state.lock().search_path.clone();
         self.inner.set_search_path(path);
         use std::sync::atomic::Ordering::Relaxed;
         self.inner
@@ -608,14 +623,22 @@ fn split_script(sql: &str) -> Vec<String> {
     turso_pg_parser::split_statements_lenient(sql).unwrap_or_else(|_| vec![trimmed.to_string()])
 }
 
+/// The one statement `sql` is when it holds no separator but a trailing one (no literal, comment or
+/// dollar quote can make it two), borrowed: [`split_statements`]' first case, which a server can
+/// take without the split's Vec and copy (L5).
+pub fn single_statement(sql: &str) -> Option<&str> {
+    let trimmed = turso_pg_parser::pg_trim(sql);
+    let body = turso_pg_parser::pg_trim(trimmed.strip_suffix(';').unwrap_or(trimmed));
+    (!body.is_empty() && !body.contains(';')).then_some(body)
+}
+
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     // Text with no separator but a trailing one is one statement: no literal, comment or dollar
     // quote can make it two, so libpg_query is not asked.
-    let trimmed = turso_pg_parser::pg_trim(sql);
-    let body = turso_pg_parser::pg_trim(trimmed.strip_suffix(';').unwrap_or(trimmed));
-    if !body.is_empty() && !body.contains(';') {
+    if let Some(body) = single_statement(sql) {
         return Ok(vec![body.to_string()]);
     }
+    let trimmed = turso_pg_parser::pg_trim(sql);
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !trimmed.is_empty() => Ok(vec![trimmed.to_string()]),
         Ok(stmts) => Ok(stmts),
@@ -814,7 +837,7 @@ fn prepare_statement_checked(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().unwrap().search_path.clone();
+            let search_path = pg_conn.session_state.lock().search_path.clone();
             // Which attached schema holds a name, probed only when the walk resolves an
             // unqualified name through one, once per (schema, name) per statement (wire review 17
             // item 3).
@@ -915,7 +938,7 @@ fn prepare_statement_checked(
     }
 
     let options = {
-        let state = pg_conn.session_state.lock().unwrap();
+        let state = pg_conn.session_state.lock();
         let path = state.search_path.clone();
         PrepareOptions {
             unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
@@ -1302,7 +1325,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         .find(|(n, _)| n.eq_ignore_ascii_case(&name));
     let (column, value) = match name.as_str() {
         "search_path" => {
-            let shown = shown_search_path(&pg_conn.session_state.lock().unwrap().search_path);
+            let shown = shown_search_path(&pg_conn.session_state.lock().search_path);
             ("search_path", shown)
         }
         "foreign_keys" => {
@@ -2302,7 +2325,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
 /// first entry holding the table wins, and none holding it is 42P01. None with no path set, where
 /// the engine's default order (main, then the attached schemas) applies.
 fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Result<Option<String>> {
-    let path = pg_conn.session_state.lock().unwrap().search_path.clone();
+    let path = pg_conn.session_state.lock().search_path.clone();
     if path.is_empty() {
         return Ok(None);
     }
@@ -2385,7 +2408,7 @@ fn resident_relation_columns(
 ) -> Option<Vec<String>> {
     use turso_pg_parser::SchemaQualifier;
     let unqualified_main = || {
-        let state = pg_conn.session_state.lock().unwrap();
+        let state = pg_conn.session_state.lock();
         state
             .search_path
             .first()

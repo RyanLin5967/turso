@@ -557,11 +557,11 @@ pub fn parameter_types(
     parse: &ParseResult,
     schema: &std::sync::Arc<Schema>,
     search_path: &[String],
-    cache: &std::sync::Mutex<ViewCache>,
+    cache: &parking_lot::Mutex<ViewCache>,
     attached: &Attached<'_>,
 ) -> Result<Walked, String> {
     let memo = {
-        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = cache.lock();
         let same = cache
             .schema
             .as_ref()
@@ -576,7 +576,7 @@ pub fn parameter_types(
     };
     let view_memo = std::rc::Rc::new(std::cell::RefCell::new(memo));
     let result = parameter_types_with(parse, schema, search_path, &view_memo, attached);
-    cache.lock().unwrap_or_else(|e| e.into_inner()).views = view_memo.take();
+    cache.lock().views = view_memo.take();
     result
 }
 
