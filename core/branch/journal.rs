@@ -5690,7 +5690,9 @@ mod format_tests {
             let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
             flights(&files, 0, &[1, 1], SyncClass::Fsync);
             let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
-            assert!(!journal.raised.syncs(), "arm={arm}: premise: the D1 run never raised the header");
+            // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the D1 run never raised the
+            // header; every run now writes its own class there (`header_class`), so it reads Fsync.
+            assert_eq!(journal.rewrite_class(), SyncClass::Fsync, "arm={arm}: premise: the open decided the D1 run's class");
             let (before, synced) = (dirs(), file_syncs());
             let end = journal.mark();
             let generation = journal.generation;
@@ -5713,7 +5715,10 @@ mod format_tests {
             let end = journal.mark();
             let generation = journal.generation;
             journal.rewrite_from(end, generation).unwrap();
-            assert_eq!(dirs(), before, "arm={arm}: the inherited floor outlived the rewrite that carried its records");
+            // FLAGGED TEST EDIT (engine review 18 MED 2, a claim reversed by the ruled design): the floor
+            // was to be dropped once its records were carried; the class now outlives every rewrite, so a
+            // later rewrite syncs its directory too (the stated cost of review 18 MED 2).
+            assert!(dirs() > before, "arm={arm}: a later rewrite of a log a D1 run synced synced no directory");
         }
     }
 
@@ -5731,7 +5736,9 @@ mod format_tests {
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         flights(&files, 0, &[1, 1], SyncClass::FullFsync);
         let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
-        assert!(!journal.raised.syncs(), "premise: the D2 run never raised the header");
+        // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the D2 run never raised the
+        // header; every run now writes its own class there, so the D1 open reads FullFsync.
+        assert_eq!(journal.rewrite_class(), SyncClass::FullFsync, "premise: the open decided the D2 run's class");
         let before = full();
         journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
         let synced = full() - before;
