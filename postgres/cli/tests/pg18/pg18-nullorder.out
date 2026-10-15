@@ -1,0 +1,79 @@
+>> Q drop table if exists nt
+   N S=NOTICE C=00000 M=table "nt" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q create table nt (a int4, b int4)
+   C CREATE TABLE
+   Z I
+>> Q insert into nt values (1, 1), (NULL, 2), (3, 3), (NULL, 4)
+   C INSERT 0 4
+   Z I
+>> Q select a from nt order by a
+   T oids=[23]
+   D ['1']
+   D ['3']
+   D [None]
+   D [None]
+   C SELECT 4
+   Z I
+>> Q select a from nt order by a asc
+   T oids=[23]
+   D ['1']
+   D ['3']
+   D [None]
+   D [None]
+   C SELECT 4
+   Z I
+>> Q select a from nt order by a desc
+   T oids=[23]
+   D [None]
+   D [None]
+   D ['3']
+   D ['1']
+   C SELECT 4
+   Z I
+>> Q select a from nt order by a nulls first
+   T oids=[23]
+   D [None]
+   D [None]
+   D ['1']
+   D ['3']
+   C SELECT 4
+   Z I
+>> Q select a from nt order by a desc nulls last
+   T oids=[23]
+   D ['3']
+   D ['1']
+   D [None]
+   D [None]
+   C SELECT 4
+   Z I
+>> Q select b, row_number() over (order by a) from nt order by b
+   T oids=[23, 20]
+   D ['1', '1']
+   D ['2', '3']
+   D ['3', '2']
+   D ['4', '4']
+   C SELECT 4
+   Z I
+>> Q select a from nt order by 1
+   T oids=[23]
+   D ['1']
+   D ['3']
+   D [None]
+   D [None]
+   C SELECT 4
+   Z I
+>> Q select a from nt union select 5 order by 1
+   T oids=[23]
+   D ['1']
+   D ['3']
+   D ['5']
+   D [None]
+   C SELECT 4
+   Z I
+>> Q drop table nt
+   C DROP TABLE
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T20:30:40Z with pgproto.py scenario-nullorder.txt

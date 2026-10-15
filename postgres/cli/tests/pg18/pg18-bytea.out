@@ -1,0 +1,47 @@
+>> Q CREATE TABLE bb(id INT, b BYTEA)
+   C CREATE TABLE
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 1 ||| abc
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 2 ||| a\\b
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 3 ||| a\101b
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 4 ||| a\qb
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type bytea
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 5 ||| a\1b
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type bytea
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 6 ||| a\400b
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type bytea
+   Z I
+>> X 23,17 INSERT INTO bb VALUES ($1, $2) ||| 7 ||| \x4142
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT id, b FROM bb ORDER BY id
+   T oids=[23, 17]
+   D ['1', '\\x616263']
+   D ['2', '\\x615c62']
+   D ['3', '\\x614162']
+   D ['7', '\\x4142']
+   C SELECT 4
+   Z I

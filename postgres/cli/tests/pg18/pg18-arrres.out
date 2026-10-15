@@ -1,0 +1,48 @@
+>> X 1009 SELECT $1::text[] ||| {a,b}
+   ParseComplete
+   BindComplete
+   T oids=[1009]
+   D ['{a,b}']
+   C SELECT 1
+   Z I
+>> X 1007 SELECT $1::int[] ||| {1,2}
+   ParseComplete
+   BindComplete
+   T oids=[1007]
+   D ['{1,2}']
+   C SELECT 1
+   Z I
+>> X 1009 SELECT $1 ||| {a,b}
+   ParseComplete
+   BindComplete
+   T oids=[1009]
+   D ['{a,b}']
+   C SELECT 1
+   Z I
+>> Q SELECT ARRAY[1, 2]
+   T oids=[1007]
+   D ['{1,2}']
+   C SELECT 1
+   Z I
+>> Q SELECT ARRAY['a', 'b']
+   T oids=[1009]
+   D ['{a,b}']
+   C SELECT 1
+   Z I
+>> Q SELECT '{a,b}'::text[]
+   T oids=[1009]
+   D ['{a,b}']
+   C SELECT 1
+   Z I
+>> Q SELECT '{1,2}'::int[]
+   T oids=[1007]
+   D ['{1,2}']
+   C SELECT 1
+   Z I
+>> X - SELECT ARRAY[1, 2]
+   ParseComplete
+   BindComplete
+   T oids=[1007]
+   D ['{1,2}']
+   C SELECT 1
+   Z I

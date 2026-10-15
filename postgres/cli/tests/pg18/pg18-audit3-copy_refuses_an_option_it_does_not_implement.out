@@ -1,0 +1,84 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table cp
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE co(id INT, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (QUOTE '"')
+   E S=ERROR C=0A000 M=COPY QUOTE requires CSV mode
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (FORCE_NOT_NULL (v))
+   E S=ERROR C=0A000 M=COPY FORCE_NOT_NULL requires CSV mode
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (DEFAULT 'x')
+   C COPY 2
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (ON_ERROR ignore)
+   C COPY 2
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['4']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (ENCODING 'LATIN1')
+   C COPY 2
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['6']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (HEADER MATCH)
+   E S=ERROR C=22P04 M=column name mismatch in header line field 1: got "1", expected "id"
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['6']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (NOSUCH 1)
+   E S=ERROR C=42601 M=option "nosuch" not recognized
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['6']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (DELIMITER E'\t', DELIMITER E'\t')
+   E S=ERROR C=42601 M=conflicting or redundant options
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['6']
+   C SELECT 1
+   Z I
+>> Q COPY co FROM '/Users/idide/wt/artie-research/frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/audit3-copy-rows.tsv' (FORMAT text, HEADER false, DELIMITER E'\t')
+   C COPY 2
+   Z I
+>> Q SELECT count(*) FROM co
+   T oids=[20]
+   D ['8']
+   C SELECT 1
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:17Z with pgproto.py scenario-audit3-copy_refuses_an_option_it_does_not_implement.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

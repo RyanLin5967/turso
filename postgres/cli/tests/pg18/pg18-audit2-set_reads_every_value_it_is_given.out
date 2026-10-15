@@ -1,0 +1,20 @@
+>> Q SET client_encoding TO UTF8, LATIN1
+   E S=ERROR C=22023 M=SET client_encoding takes only one argument
+   Z I
+>> Q SET TimeZone TO UTC, GMT
+   E S=ERROR C=22023 M=SET timezone takes only one argument
+   Z I
+>> Q SET DateStyle TO ISO, DMY
+   C SET
+   Z I
+>> Q SET DateStyle TO ISO, MDY
+   C SET
+   Z I
+>> Q SHOW DateStyle
+   T oids=[25]
+   D ['ISO, MDY']
+   C SHOW
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:41Z with pgproto.py scenario-audit2-set_reads_every_value_it_is_given.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

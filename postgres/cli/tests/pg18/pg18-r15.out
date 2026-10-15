@@ -1,0 +1,121 @@
+>> Q CREATE TABLE r(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO r VALUES (1, 'a'), (2, 'b'), (3, 'c')
+   C INSERT 0 3
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> P - SELECT id FROM r ORDER BY id
+>> B - -
+>> E - 1
+>> S
+   ParseComplete
+   BindComplete
+   D ['1']
+   PortalSuspended
+   Z T
+>> E - 0
+>> S
+   D ['2']
+   D ['3']
+   C SELECT 2
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> P s1 INSERT INTO r VALUES (10, 'x') RETURNING id
+>> B p1 s1
+>> E p1 0
+>> E p1 0
+>> S
+   ParseComplete
+   BindComplete
+   D ['10']
+   C INSERT 0 1
+   C INSERT 0 0
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> P s2 SELECT id FROM r ORDER BY id
+>> B p2 s2
+>> E p2 1
+>> S
+   ParseComplete
+   BindComplete
+   D ['1']
+   PortalSuspended
+   Z T
+>> B p2 s2
+>> S
+   E S=ERROR C=42P03 M=cursor "p2" already exists
+   Z E
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SELECT * FROM nosuch
+   E S=ERROR C=42P01 M=relation "nosuch" does not exist
+   Z E
+>> Q COMMIT AND CHAIN
+   C ROLLBACK
+   Z T
+>> Q SELECT 1
+   T oids=[23]
+   D ['1']
+   C SELECT 1
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q SELECT 1; COMMIT AND CHAIN
+   T oids=[23]
+   D ['1']
+   C SELECT 1
+   E S=ERROR C=25P01 M=COMMIT AND CHAIN can only be used in transaction blocks
+   Z I
+>> Q SELECT 1; ROLLBACK AND CHAIN
+   T oids=[23]
+   D ['1']
+   C SELECT 1
+   E S=ERROR C=25P01 M=ROLLBACK AND CHAIN can only be used in transaction blocks
+   Z I
+>> X 1009 SELECT $1::text[] ||| {"NUL\L"}
+   ParseComplete
+   BindComplete
+   T oids=[1009]
+   D ['{"NULL"}']
+   C SELECT 1
+   Z I
+>> X 1009 SELECT $1::text[] ||| {NULL}
+   ParseComplete
+   BindComplete
+   T oids=[1009]
+   D ['{NULL}']
+   C SELECT 1
+   Z I
+>> X 1009 SELECT $1::text[] ||| {a}}
+   ParseComplete
+   E S=ERROR C=22P02 M=malformed array literal: "{a}}"
+   Z I
+>> X 1007 SELECT $1::int[] ||| {1,x}
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "x"
+   Z I
+>> X 1009 SELECT $1::text[] ||| {a,b}
+   ParseComplete
+   BindComplete
+   T oids=[1009]
+   D ['{a,b}']
+   C SELECT 1
+   Z I

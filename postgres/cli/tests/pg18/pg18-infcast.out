@@ -1,0 +1,13 @@
+>> Q SELECT 'Infinity'::float8 > 1e308, '-Infinity'::float8 < -1e308, 'inf'::float8 > 1e308, '+INF'::float8 > 1e308, ' infinity '::float8 > 1e308
+   T oids=[16, 16, 16, 16, 16]
+   D ['t', 't', 't', 't', 't']
+   C SELECT 1
+   Z I
+>> Q SELECT 'NaN'::float8 = 'NaN'::float8, 'Infinity'::float4 > 1e38
+   T oids=[16, 16]
+   D ['t', 't']
+   C SELECT 1
+   Z I
+>> Q SELECT 'infinityx'::float8
+   E S=ERROR C=22P02 M=invalid input syntax for type double precision: "infinityx"
+   Z I

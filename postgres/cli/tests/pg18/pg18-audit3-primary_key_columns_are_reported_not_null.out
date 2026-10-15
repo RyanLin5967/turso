@@ -1,0 +1,45 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE pk1(id INT PRIMARY KEY, v INT, nn INT NOT NULL)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE pk2(a INT, b INT, v INT, PRIMARY KEY (a, b))
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE pk3(id SERIAL PRIMARY KEY, v INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO pk2 VALUES (NULL, 1, 1)
+   E S=ERROR C=23502 M=null value in column "a" of relation "pk2" violates not-null constraint
+   Z I
+>> Q SELECT table_name, column_name, is_nullable FROM information_schema.columns WHERE table_name IN ('pk1', 'pk2', 'pk3') ORDER BY table_name, ordinal_position
+   T oids=[19, 19, 1043]
+   D ['pk1', 'id', 'NO']
+   D ['pk1', 'v', 'YES']
+   D ['pk1', 'nn', 'NO']
+   D ['pk2', 'a', 'NO']
+   D ['pk2', 'b', 'NO']
+   D ['pk2', 'v', 'YES']
+   D ['pk3', 'id', 'NO']
+   D ['pk3', 'v', 'YES']
+   C SELECT 8
+   Z I
+>> Q SELECT c.relname, a.attname, a.attnotnull FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname IN ('pk1', 'pk2', 'pk3') AND a.attnum > 0 ORDER BY c.relname, a.attnum
+   T oids=[19, 19, 16]
+   D ['pk1', 'id', 't']
+   D ['pk1', 'v', 'f']
+   D ['pk1', 'nn', 't']
+   D ['pk2', 'a', 't']
+   D ['pk2', 'b', 't']
+   D ['pk2', 'v', 'f']
+   D ['pk3', 'id', 't']
+   D ['pk3', 'v', 'f']
+   C SELECT 8
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:19Z with pgproto.py scenario-audit3-primary_key_columns_are_reported_not_null.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

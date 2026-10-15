@@ -1,0 +1,19 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE nd(x NUMERIC(10,2))
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO nd VALUES (1.5)
+   C INSERT 0 1
+   Z I
+>> Q SELECT x / 0 FROM nd
+   T oids=[1700]
+   E S=ERROR C=22012 M=division by zero
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:15Z with pgproto.py scenario-audit3-a_numeric_division_by_zero_is_22012.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

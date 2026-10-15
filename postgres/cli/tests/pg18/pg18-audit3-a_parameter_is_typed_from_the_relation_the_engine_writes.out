@@ -1,0 +1,82 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table nd
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE p(name TEXT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT)
+   C CREATE TABLE
+   Z I
+>> X 0 INSERT INTO s.t VALUES (1, $1) ||| 007
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 1
+   T oids=[25]
+   D ['007']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO s.t VALUES (2, 'x') ON CONFLICT DO NOTHING
+   C INSERT 0 1
+   Z I
+>> X 0 UPDATE s.t SET c = $1 WHERE id = 2 ||| 007
+   ParseComplete
+   BindComplete
+   NoData
+   C UPDATE 1
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 2
+   T oids=[25]
+   D ['007']
+   C SELECT 1
+   Z I
+>> X 0 INSERT INTO s.t VALUES (2, $1) ON CONFLICT (id) DO UPDATE SET c = excluded.c ||| 007
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 2
+   T oids=[25]
+   D ['007']
+   C SELECT 1
+   Z I
+>> Q SET search_path TO s, public
+   C SET
+   Z I
+>> X 0 INSERT INTO t VALUES (3, $1) ||| 007
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 3
+   T oids=[25]
+   D ['007']
+   C SELECT 1
+   Z I
+>> Q SET search_path TO public
+   C SET
+   Z I
+>> D - WITH p AS (SELECT 1 AS name) DELETE FROM p WHERE name = $1
+   ParseComplete
+   t params=[25]
+   NoData
+   Z I
+>> D - SELECT 1 FROM t WHERE s.t.c = $1
+   E S=ERROR C=42P01 M=invalid reference to FROM-clause entry for table "t"
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:15Z with pgproto.py scenario-audit3-a_parameter_is_typed_from_the_relation_the_engine_writes.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

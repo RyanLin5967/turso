@@ -1,0 +1,27 @@
+>> Q CREATE TABLE ix(id INT PRIMARY KEY, a INT, b TEXT UNIQUE)
+   C CREATE TABLE
+   Z I
+>> Q CREATE INDEX ix_a ON ix(a)
+   C CREATE INDEX
+   Z I
+>> Q SELECT indexname FROM pg_indexes WHERE tablename = 'ix' ORDER BY indexname
+   T oids=[19]
+   D ['ix_a']
+   D ['ix_b_key']
+   D ['ix_pkey']
+   C SELECT 3
+   Z I
+>> Q SELECT indexname FROM pg_indexes WHERE tablename = 'ix' AND indexname NOT LIKE '%_pkey' ORDER BY 1
+   T oids=[19]
+   D ['ix_a']
+   D ['ix_b_key']
+   C SELECT 2
+   Z I
+>> Q SELECT pg_database_size(current_database())
+   T oids=[20]
+   D ['8443583']
+   C SELECT 1
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:40Z with pgproto.py scenario-audit2-pg_indexes_and_pg_database_size_answer.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

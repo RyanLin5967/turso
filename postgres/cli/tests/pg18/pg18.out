@@ -1,0 +1,162 @@
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE big(v BIGINT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO big VALUES (9223372036854775807), (1)
+   C INSERT 0 2
+   Z I
+>> Q CREATE TABLE cw(id INT, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s.t(c TEXT)
+   C CREATE TABLE
+   Z I
+>> D - SELECT v FROM t WHERE id = $1
+   1
+   t params=[23]
+   T oids=[25]
+   Z I
+>> D - SELECT v FROM t WHERE id = $2
+   E S=ERROR C=42P18 M=could not determine data type of parameter $1
+   Z I
+>> D - SELECT v FROM t
+   1
+   t params=[]
+   T oids=[25]
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO t VALUES (2, 'two')
+   C INSERT 0 1
+   Z T
+>> Q SAVEPOINT s
+   C SAVEPOINT
+   Z T
+>> Q SELECT sum(v) FROM big
+   T oids=[1700]
+   D ['9223372036854775808']
+   C SELECT 1
+   Z T
+>> Q SELECT 1/0
+   E S=ERROR C=22012 M=division by zero
+   Z E
+>> Q ROLLBACK TO s
+   C ROLLBACK
+   Z T
+>> Q SELECT 1
+   T oids=[23]
+   D ['1']
+   C SELECT 1
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM t WHERE id = 2
+   T oids=[20]
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q COPY cw FROM '/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/fastest-wire/pgrec/rows.tsv' WHERE v = $1
+   E S=ERROR C=42P02 M=there is no parameter $1
+   Z I
+>> X 25 COPY cw FROM '/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/fastest-wire/pgrec/rows.tsv' WHERE v = $1 ||| one
+   1
+   2
+   n
+   E S=ERROR C=42P02 M=there is no parameter $1
+   Z I
+>> X 0 COPY cw FROM '/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/fastest-wire/pgrec/rows.tsv' WHERE v = $1 ||| one
+   E S=ERROR C=42P18 M=could not determine data type of parameter $1
+   Z I
+>> X - COPY cw FROM '/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/fastest-wire/pgrec/rows.tsv' WHERE v = $1 ||| one
+   1
+   E S=ERROR C=08P01 M=bind message supplies 1 parameters, but prepared statement "" requires 0
+   Z I
+>> Q SELECT count(*) FROM cw
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+>> D - SELECT 1 FROM t WHERE s.t.c = $1
+   E S=ERROR C=42P01 M=invalid reference to FROM-clause entry for table "t"
+   Z I
+>> X 701 SELECT $1::float8 ||| 1e-400
+   1
+   E S=ERROR C=22003 M="1e-400" is out of range for type double precision
+   Z I
+>> X 700 SELECT $1::float4 ||| 1e-50
+   1
+   E S=ERROR C=22003 M="1e-50" is out of range for type real
+   Z I
+>> X 700 SELECT $1::float4 ||| 3.4028235e+38
+   1
+   2
+   T oids=[700]
+   D ['3.4028235e+38']
+   C SELECT 1
+   Z I
+>> X 701 SELECT $1::float8 ||| 4.9e-324
+   1
+   2
+   T oids=[701]
+   D ['5e-324']
+   C SELECT 1
+   Z I
+>> X 23 SELECT $1::int4 ||| 0b_10_0101
+   1
+   2
+   T oids=[23]
+   D ['37']
+   C SELECT 1
+   Z I
+>> D - SELECT varchar $1
+   E S=ERROR C=42601 M=syntax error at or near "$1"
+   Z I
+>> X 25 SELECT varchar $1 ||| prod
+   E S=ERROR C=42601 M=syntax error at or near "$1"
+   Z I
+>> Q CREATE TABLE d(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE k(id INT, flag BOOLEAN)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO k VALUES (2, true), (3, false)
+   C INSERT 0 2
+   Z I
+>> Q INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c')
+   C INSERT 0 3
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id AND k.flag RETURNING v, EXISTS (SELECT 1 FROM k WHERE k.flag)
+   T oids=[25, 16]
+   D ['b', 't']
+   C DELETE 1
+   Z I
+>> Q INSERT INTO d VALUES (2, 'b')
+   C INSERT 0 1
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id AND k.flag RETURNING v, EXISTS (SELECT 1 FROM k AS j WHERE flag)
+   T oids=[25, 16]
+   D ['b', 't']
+   C DELETE 1
+   Z I
+>> Q INSERT INTO d VALUES (2, 'b')
+   C INSERT 0 1
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id AND k.flag RETURNING v, EXISTS (SELECT * FROM k)
+   T oids=[25, 16]
+   D ['b', 't']
+   C DELETE 1
+   Z I
+>> Q DELETE FROM d USING (SELECT id::int FROM k) s WHERE d.id = s.id RETURNING id
+   E S=ERROR C=42702 M=column reference "id" is ambiguous
+   Z I

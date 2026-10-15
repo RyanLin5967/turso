@@ -1,0 +1,105 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> X 700 SELECT $1 ||| 3.4028235e+38
+   ParseComplete
+   BindComplete
+   T oids=[700] names=['?column?']
+   D ['3.4028235e+38']
+   C SELECT 1
+   Z I
+>> X 700 SELECT $1 ||| 3.5e+38
+   ParseComplete
+   E S=ERROR C=22003 M="3.5e+38" is out of range for type real
+   Z I
+>> X 701 SELECT $1 ||| 1e-400
+   ParseComplete
+   E S=ERROR C=22003 M="1e-400" is out of range for type double precision
+   Z I
+>> X 701 SELECT $1 ||| -1e-400
+   ParseComplete
+   E S=ERROR C=22003 M="-1e-400" is out of range for type double precision
+   Z I
+>> X 700 SELECT $1 ||| 1e-50
+   ParseComplete
+   E S=ERROR C=22003 M="1e-50" is out of range for type real
+   Z I
+>> X 701 SELECT $1 ||| 0e-400
+   ParseComplete
+   BindComplete
+   T oids=[701] names=['?column?']
+   D ['0']
+   C SELECT 1
+   Z I
+>> X 701 SELECT $1 ||| 0.000
+   ParseComplete
+   BindComplete
+   T oids=[701] names=['?column?']
+   D ['0']
+   C SELECT 1
+   Z I
+>> X 700 SELECT $1 ||| -0
+   ParseComplete
+   BindComplete
+   T oids=[700] names=['?column?']
+   D ['-0']
+   C SELECT 1
+   Z I
+>> X 701 SELECT $1 ||| 4.9e-324
+   ParseComplete
+   BindComplete
+   T oids=[701] names=['?column?']
+   D ['5e-324']
+   C SELECT 1
+   Z I
+>> X 700 SELECT $1 ||| 1.4e-45
+   ParseComplete
+   BindComplete
+   T oids=[700] names=['?column?']
+   D ['1e-45']
+   C SELECT 1
+   Z I
+>> X 1700 SELECT $1 ||| 1e-400
+   ParseComplete
+   BindComplete
+   T oids=[1700] names=['?column?']
+   D ['0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001']
+   C SELECT 1
+   Z I
+>> X 23 SELECT $1 ||| 0b_10_0101
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['?column?']
+   D ['37']
+   C SELECT 1
+   Z I
+>> X 23 SELECT $1 ||| 0x_1EEE_FFFF
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['?column?']
+   D ['518979583']
+   C SELECT 1
+   Z I
+>> X 23 SELECT $1 ||| _100
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "_100"
+   Z I
+>> X 23 SELECT $1 ||| 0x_
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "0x_"
+   Z I
+>> X 23 SELECT $1 ||| 0b__1
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "0b__1"
+   Z I
+>> X 23 SELECT $1 ||| 0o_
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "0o_"
+   Z I
+>> X 23 SELECT $1 ||| 100_
+   ParseComplete
+   E S=ERROR C=22P02 M=invalid input syntax for type integer: "100_"
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:31Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

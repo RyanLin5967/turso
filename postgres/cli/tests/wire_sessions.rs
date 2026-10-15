@@ -2323,26 +2323,28 @@ fn deleting_a_branch_another_session_is_on_is_refused_with_55006() {
 // ---------------------------------------------------------------------------
 
 /// Review 1 item 1: an error the engine answers by rolling the whole transaction back itself (an
-/// integer overflow in sum()) still aborts the block as PostgreSQL does: 25P02 until its end,
-/// status 'E', and COMMIT answered ROLLBACK with nothing of the block kept. Before, the block's
-/// state was read from the engine after the error, saw autocommit, and the rest committed.
+/// integer overflow) still aborts the block as PostgreSQL does: 25P02 until its end, status 'E',
+/// and COMMIT answered ROLLBACK with nothing of the block kept. Before, the block's state was read
+/// from the engine after the error, saw autocommit, and the rest committed. Every expected value
+/// is PostgreSQL 18.6's (recorded, artie raw loud-20261015/pg18-diff/pg18-c33-engineerr.out). The
+/// overflow was sum() over the int8 maximum until that recording showed PostgreSQL answers it with
+/// a numeric and no error (C33; the sum's own value is pinned by
+/// a_bigint_sum_and_arithmetic_past_int8_answer_as_postgresql_does).
 #[test]
 fn an_engine_side_rollback_inside_a_block_still_aborts_it() {
     let dir = Scratch::new("enginerollback");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    a.q("CREATE TABLE big(v BIGINT)").ok("big");
-    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
-        .ok("rows");
     a.q("BEGIN").ok("begin");
     a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
-    let r = a.q("SELECT sum(v) FROM big");
+    let r = a.q("SELECT abs(-9223372036854775808::int8)");
     assert!(
         r.error.is_some(),
-        "sum overflowed without an error: {:?}",
+        "abs overflowed without an error: {:?}",
         r.rows
     );
     assert_eq!(r.status, b'E', "the block is not marked failed");
+    let code = r.err("abs").code;
     let r = a.q("INSERT INTO t VALUES (3, 'three')");
     assert_eq!(r.status, b'E');
     assert_eq!(r.err("insert 3").code, "25P02");
@@ -2355,6 +2357,37 @@ fn an_engine_side_rollback_inside_a_block_still_aborts_it() {
         "0",
         "part of a failed block committed"
     );
+    assert_eq!(code, "22003", "abs(int8 minimum) is not PostgreSQL's code");
+}
+
+/// sum() over int8 is a numeric in PostgreSQL and does not overflow; int8 + and * past the int8
+/// range raise 22003 "bigint out of range" (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-c33-engineerr.out, every case of its first part). The two tests
+/// below used sum()'s overflow as an engine error until the recording showed PostgreSQL has none.
+#[test]
+fn a_bigint_sum_and_arithmetic_past_int8_answer_as_postgresql_does() {
+    let dir = Scratch::new("int8range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT)").ok("big");
+    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
+        .ok("rows");
+    let r = a.q("SELECT sum(v) FROM big").ok("sum");
+    assert_eq!(r.oids, Some(vec![1700]), "sum(int8) is not a numeric");
+    assert_eq!(r.rows, vec![vec![Some("9223372036854775808".to_string())]]);
+    for sql in [
+        "SELECT v + 1 FROM big WHERE v > 1",
+        "SELECT v * 2 FROM big WHERE v > 1",
+        "SELECT abs(-9223372036854775808::int8)",
+        "SELECT abs(v - 9223372036854775807 - 9223372036854775807 - 2) FROM big WHERE v > 1",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("22003", "bigint out of range"),
+            "{sql}"
+        );
+    }
 }
 
 /// Review 1 item 1: a COMMIT that fails ends the block (PostgreSQL rolls it back): the session is
@@ -3210,6 +3243,114 @@ fn floats_are_written_as_postgresql_writes_them() {
     );
 }
 
+/// The float recording replayed whole, every statement and answer as PostgreSQL 18.6 gave them
+/// (artie raw loud-20261015/pg18-diff/pg18-float.out): a real and a double column side by side,
+/// the two values out of range for real refused with 22003 and PostgreSQL's message, and the cast
+/// row. floats_are_written_as_postgresql_writes_them had kept 14 of its double values and none of
+/// its real ones (C33 audit, 2026-10-15).
+#[test]
+fn the_float_recording_replays_as_postgresql_answered_it() {
+    let dir = Scratch::new("floatrecorded");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE f(id INT, r REAL, d DOUBLE PRECISION)")
+        .ok("f");
+    let stored = [
+        "0",
+        "1",
+        "-1",
+        "0.1",
+        "1.5",
+        "100",
+        "123456",
+        "1234567",
+        "12345678",
+        "1e10",
+        "1e14",
+        "1e15",
+        "1e16",
+        "1e20",
+        "1e-3",
+        "1e-4",
+        "1e-5",
+        "1.5e-5",
+        "3.4028235e38",
+    ];
+    for (i, lit) in stored.iter().enumerate() {
+        a.q(&format!("INSERT INTO f VALUES ({}, {lit}, {lit})", i + 1))
+            .ok(lit);
+    }
+    let big = "179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    let tiny = format!("0.{}5", "0".repeat(323));
+    for (id, lit, shown) in [
+        (20, "1.7976931348623157e308", big.to_string()),
+        (21, "5e-324", tiny),
+    ] {
+        let e = a
+            .q(&format!("INSERT INTO f VALUES ({id}, {lit}, {lit})"))
+            .err(lit);
+        assert_eq!(
+            (e.code, e.message),
+            (
+                "22003".to_string(),
+                format!("\"{shown}\" is out of range for type real")
+            ),
+            "{lit}"
+        );
+    }
+    for (id, lit) in [
+        (22, "123456789012345"),
+        (23, "1234567890123456"),
+        (24, "0.30000000000000004"),
+        (25, "-0.0"),
+    ] {
+        a.q(&format!("INSERT INTO f VALUES ({id}, {lit}, {lit})"))
+            .ok(lit);
+    }
+    let r = a.q("SELECT id, r, d FROM f ORDER BY id").ok("read");
+    assert_eq!(r.oids, Some(vec![23, 700, 701]));
+    let want: Vec<Vec<Option<String>>> = [
+        ["1", "0", "0"],
+        ["2", "1", "1"],
+        ["3", "-1", "-1"],
+        ["4", "0.1", "0.1"],
+        ["5", "1.5", "1.5"],
+        ["6", "100", "100"],
+        ["7", "123456", "123456"],
+        ["8", "1.234567e+06", "1234567"],
+        ["9", "1.2345678e+07", "12345678"],
+        ["10", "1e+10", "10000000000"],
+        ["11", "1e+14", "100000000000000"],
+        ["12", "1e+15", "1e+15"],
+        ["13", "1e+16", "1e+16"],
+        ["14", "1e+20", "1e+20"],
+        ["15", "0.001", "0.001"],
+        ["16", "0.0001", "0.0001"],
+        ["17", "1e-05", "1e-05"],
+        ["18", "1.5e-05", "1.5e-05"],
+        ["19", "3.4028235e+38", "3.4028235e+38"],
+        ["22", "1.2345679e+14", "123456789012345"],
+        ["23", "1.234568e+15", "1.234567890123456e+15"],
+        ["24", "0.3", "0.30000000000000004"],
+        ["25", "0", "0"],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|c| Some(c.to_string())).collect())
+    .collect();
+    assert_eq!(r.rows, want);
+    let r = a
+        .q("SELECT 1e20::float8, 1e15::float8, 1e-5::float8, 1234567::float4, 1e-5::float4")
+        .ok("casts");
+    assert_eq!(r.oids, Some(vec![701, 701, 701, 700, 700]));
+    assert_eq!(
+        r.rows,
+        vec![["1e+20", "1e+15", "1e-05", "1.234567e+06", "1e-05"]
+            .iter()
+            .map(|c| Some(c.to_string()))
+            .collect::<Vec<_>>()]
+    );
+}
+
 /// A string literal cast to a float type is read as PostgreSQL's float8in / float4in reads it
 /// (recorded, artie raw loud-20261015/pg18-diff/pg18-infcast.out): `'Infinity'`, `'-Infinity'`,
 /// `'inf'`, `'+INF'` and `' infinity '` are the infinities, and `'infinityx'` is 22P02. The engine
@@ -3744,7 +3885,10 @@ fn generate_series_refuses_infinite_bounds() {
 /// NULLIF, ARRAY and EXISTS by their keyword, a scalar subquery by its one column, and an operator
 /// or a literal `?column?`. They were named by the engine's text of the translated expression
 /// (`CAST (9e999 AS REAL)`, `MAX (1, 2)`, `'abc'`): the regress corpus's numeric.sql and others,
-/// and a client reading a row by column name.
+/// and a client reading a row by column name. Every recorded statement is replayed whole: the
+/// test had dropped `'nan'::numeric / '0'` and `ROW(1, 2)` from two of them (C33 audit,
+/// 2026-10-15); the types and values of the same statements are
+/// unaliased_results_carry_postgresqls_types_and_values.
 #[test]
 fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
     let dir = Scratch::new("colnames");
@@ -3755,8 +3899,9 @@ fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
     let q = "?column?";
     for (sql, names) in [
         (
-            "SELECT 1 + 1, 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn",
-            vec![q, "numeric", "numeric", "a", "b"],
+            "SELECT 1 + 1, 'nan'::numeric / '0', 'Infinity'::float8::numeric, '42'::int2::numeric, \
+             a::int8, b::text FROM cn",
+            vec![q, q, "numeric", "numeric", "a", "b"],
         ),
         (
             "SELECT CASE WHEN true THEN 1 END, CASE WHEN true THEN a ELSE a END, coalesce(1, 2), \
@@ -3764,9 +3909,9 @@ fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
             vec!["case", "a", "coalesce", "greatest", "least", "nullif"],
         ),
         (
-            "SELECT ARRAY[1], EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), \
+            "SELECT ARRAY[1], ROW(1, 2), EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), \
              round(1.5) = 2, -1, NOT true, 1 IS NULL",
-            vec!["array", "exists", "q", "a", q, q, q, q],
+            vec!["array", "row", "exists", "q", "a", q, q, q, q],
         ),
         ("SELECT 'abc', 42, 1.5, true, NULL, $$d$$", vec![q; 6]),
         (
@@ -3777,6 +3922,62 @@ fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
         let r = a.q(sql).ok(sql);
         let want: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         assert_eq!(r.names, Some(want), "{sql}");
+    }
+}
+
+/// The types and values of the statements an_unaliased_result_column_is_named_as_postgresql_names_it
+/// replays, every one as PostgreSQL 18.6 answered it (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-colnames.out; C33 audit, 2026-10-15).
+#[test]
+fn unaliased_results_carry_postgresqls_types_and_values() {
+    let dir = Scratch::new("colvalues");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cn (a int, b text)").ok("cn");
+    a.q("INSERT INTO cn VALUES (1, 'x')").ok("row");
+    let v = |r: &[Option<&str>]| vec![r.iter().map(|c| c.map(str::to_string)).collect::<Vec<_>>()];
+    for (sql, oids, rows) in [
+        (
+            "SELECT 1 + 1, 'nan'::numeric / '0', 'Infinity'::float8::numeric, '42'::int2::numeric, \
+             a::int8, b::text FROM cn",
+            vec![23, 1700, 1700, 1700, 20, 25],
+            v(&[Some("2"), Some("NaN"), Some("Infinity"), Some("42"), Some("1"), Some("x")]),
+        ),
+        (
+            "SELECT CASE WHEN true THEN 1 END, CASE WHEN true THEN a ELSE a END, coalesce(1, 2), \
+             greatest(1, 2), least(1, 2), nullif(1, 2) FROM cn",
+            vec![23; 6],
+            v(&[Some("1"), Some("1"), Some("1"), Some("2"), Some("1"), Some("1")]),
+        ),
+        (
+            "SELECT ARRAY[1], ROW(1, 2), EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), \
+             round(1.5) = 2, -1, NOT true, 1 IS NULL",
+            vec![1007, 2249, 16, 23, 23, 16, 23, 16, 16],
+            v(&[
+                Some("{1}"),
+                Some("(1,2)"),
+                Some("t"),
+                Some("1"),
+                Some("1"),
+                Some("t"),
+                Some("-1"),
+                Some("f"),
+                Some("f"),
+            ]),
+        ),
+        (
+            "SELECT 'abc', 42, 1.5, true, NULL, $$d$$",
+            vec![25, 23, 1700, 16, 25, 25],
+            v(&[Some("abc"), Some("42"), Some("1.5"), Some("t"), None, Some("d")]),
+        ),
+        (
+            "SELECT current_date IS NOT NULL, 'x'::varchar(3), CAST(1 AS integer), a + 0 FROM cn",
+            vec![16, 1043, 23, 23],
+            v(&[Some("t"), Some("x"), Some("1"), Some("1")]),
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(oids), rows), "{sql}");
     }
 }
 
@@ -6136,27 +6337,29 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
 }
 
 /// Inside a block, an error from a statement with no statement savepoint of its own (an integer
-/// overflow in sum(), a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one
-/// ends the failed state, the block carries on, and COMMIT keeps the work done before the
-/// savepoint. Until the engine kept them (wire review 3 item 10, the engine's half) such an error
-/// rolled the whole transaction back, savepoints with it, and this test pinned the server's 3B001
-/// for the vanished savepoint; its expected values moved to PostgreSQL's behaviour, PROVISIONALLY
-/// (ruled c9c821dd8d, P7): a PostgreSQL 18 recording is LOUD-OWED, and if it differs the edit is
-/// reverted. The name is kept from then. The 3B001 arm (Session::run, an aborted block with no
-/// engine transaction) has no test that reaches it now.
+/// overflow, a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one ends the
+/// failed state, the block carries on, and COMMIT keeps the work done before the savepoint. Until
+/// the engine kept them (wire review 3 item 10, the engine's half) such an error rolled the whole
+/// transaction back, savepoints with it, and this test pinned the server's 3B001 for the vanished
+/// savepoint; its expected values moved to PostgreSQL's behaviour, PROVISIONALLY (ruled
+/// c9c821dd8d, P7). The recording since made (artie raw loud-20261015/pg18-diff/pg18.out) agrees
+/// with every value after the error, and it showed the error itself was not PostgreSQL's: sum()
+/// over the int8 maximum is a numeric there. So the error is abs() of the int8 minimum, 22003 in
+/// PostgreSQL (pg18-c33-engineerr.out, its savepoint part), and the recorded scenario itself, with
+/// its sum and its 1/0, is replayed by a_savepoint_block_replays_postgresqls_recording (C33). The
+/// name is kept from then. The 3B001 arm (Session::run, an aborted block with no engine
+/// transaction) has no test that reaches it now.
 #[test]
 fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     let dir = Scratch::new("discardedsavepoint");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    a.q("CREATE TABLE big(v BIGINT)").ok("big");
-    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
-        .ok("rows");
     a.q("BEGIN").ok("begin");
     a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
     a.q("SAVEPOINT s").ok("savepoint");
-    let r = a.q("SELECT sum(v) FROM big");
-    assert!(r.error.is_some(), "sum did not overflow: {:?}", r.rows);
+    let r = a.q("SELECT abs(-9223372036854775808::int8)");
+    assert!(r.error.is_some(), "abs did not overflow: {:?}", r.rows);
+    assert_eq!(r.status, b'E', "the block is not marked failed");
     let r = a.q("ROLLBACK TO s").ok("rollback to s");
     assert_eq!(r.status, b'T', "the block is still failed");
     assert_eq!(a.q("SELECT 1").single("in the block"), "1");
@@ -6167,6 +6370,45 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
         a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
         "1",
         "the work before the savepoint was kept"
+    );
+}
+
+/// The savepoint scenario exactly as PostgreSQL 18.6 answered it (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18.out, its BEGIN to its count): sum() over the int8 maximum is the
+/// numeric 9223372036854775808, SELECT 1/0 is 22012 and fails the block, ROLLBACK TO s ends the
+/// failure, and COMMIT keeps the row inserted before the savepoint.
+#[test]
+fn a_savepoint_block_replays_postgresqls_recording() {
+    let dir = Scratch::new("savepointrecorded");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE big(v BIGINT)").ok("big");
+    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
+        .ok("rows");
+    assert_eq!(a.q("BEGIN").ok("begin").status, b'T');
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    a.q("SAVEPOINT s").ok("savepoint");
+    let r = a.q("SELECT sum(v) FROM big").ok("sum");
+    assert_eq!(r.oids, Some(vec![1700]));
+    assert_eq!(r.rows, vec![vec![Some("9223372036854775808".to_string())]]);
+    assert_eq!(r.status, b'T');
+    let r = a.q("SELECT 1/0");
+    assert_eq!(r.status, b'E');
+    let e = r.err("1/0");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("22012", "division by zero")
+    );
+    let r = a.q("ROLLBACK TO s").ok("rollback to s");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'T');
+    assert_eq!(a.q("SELECT 1").single("in the block"), "1");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+        "1"
     );
 }
 
@@ -11284,3 +11526,790 @@ fn a_verb_beside_empty_statements_is_its_verb() {
     let r = a.read_reply();
     assert_eq!(r.err("CHECKPOINT -- x with a value").code, "08P01");
 }
+
+// ---------------------------------------------------------------------------
+// PostgreSQL 18.6 recordings, replayed whole (C33, the lead's class rule: every wire expectation
+// comes from a committed PostgreSQL 18.6 recording and keeps every recorded case)
+// ---------------------------------------------------------------------------
+
+/// A recording made with the lane's pgproto.py (artie frontier/fastest/lanes/wire/raw/
+/// loud-20261015/pg18-diff/pgproto.py) against PostgreSQL 18.6, copied verbatim into
+/// tests/pg18/ (tests/pg18/PROVENANCE names each file's artie commit), is replayed here byte for
+/// byte as pgproto.py sent it: the same messages, the same Sync points. Every backend message is
+/// written as pgproto.py's describe() writes it, so each recorded command's answer compares line
+/// by line with PostgreSQL's. Nothing is hand-copied, so no recorded case can be dropped or
+/// reworded: the hand-written tests had dropped cases and changed seeds (the C33 audit,
+/// 2026-10-15).
+///
+/// A command whose answer differs from PostgreSQL's is a DIVERGENCE. Each recording's test names
+/// its divergences, by the command's ordinal in the file (the n-th `>>` line, from 1), with the
+/// reason and owner; the test passes only when the commands that differ are EXACTLY those. So a new
+/// divergence fails it, and so does a registered one that has started to agree (its entry must go).
+/// A divergence entry is a known red at the granularity of one recorded command.
+///
+/// Refuses, rather than skips, a recording with a command kind pgproto.py does not send, or with
+/// no command at all.
+mod recorded {
+    use super::*;
+
+    /// pgproto.py's describe(): one line per backend message, or None for a message it does not
+    /// print. A RowDescription is written with its column names; [`same`] drops them when the
+    /// recording's line has none (pgproto.py printed names only with PGPROTO_NAMES=1).
+    fn describe(tag: u8, b: &[u8]) -> Option<String> {
+        match tag {
+            b'E' | b'N' => {
+                let mut f: Vec<(u8, String)> = Vec::new();
+                for part in b.split(|&c| c == 0).filter(|p| !p.is_empty()) {
+                    let v = String::from_utf8_lossy(&part[1..]).into_owned();
+                    f.retain(|(k, _)| *k != part[0]);
+                    f.push((part[0], v));
+                }
+                let get = |k: u8| {
+                    f.iter()
+                        .find(|(c, _)| *c == k)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| "None".to_string())
+                };
+                Some(format!(
+                    "{} S={} C={} M={}",
+                    tag as char,
+                    get(b'S'),
+                    get(b'C'),
+                    get(b'M')
+                ))
+            }
+            b'T' => {
+                let n = u16::from_be_bytes([b[0], b[1]]) as usize;
+                let (mut i, mut oids, mut names) = (2, Vec::new(), Vec::new());
+                for _ in 0..n {
+                    let j = i + b[i..].iter().position(|&c| c == 0).unwrap();
+                    names.push(py_str(&String::from_utf8_lossy(&b[i..j])));
+                    i = j + 1;
+                    oids.push(
+                        u32::from_be_bytes([b[i + 6], b[i + 7], b[i + 8], b[i + 9]]).to_string(),
+                    );
+                    i += 18;
+                }
+                Some(format!(
+                    "T oids=[{}] names=[{}]",
+                    oids.join(", "),
+                    names.join(", ")
+                ))
+            }
+            b't' => {
+                let n = u16::from_be_bytes([b[0], b[1]]) as usize;
+                let oids: Vec<String> = (0..n)
+                    .map(|k| {
+                        let p = 2 + 4 * k;
+                        u32::from_be_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]).to_string()
+                    })
+                    .collect();
+                Some(format!("t params=[{}]", oids.join(", ")))
+            }
+            b'D' => {
+                let n = u16::from_be_bytes([b[0], b[1]]) as usize;
+                let (mut i, mut vals) = (2, Vec::new());
+                for _ in 0..n {
+                    let l = i32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+                    i += 4;
+                    if l < 0 {
+                        vals.push("None".to_string());
+                    } else {
+                        let l = l as usize;
+                        vals.push(py_str(&String::from_utf8_lossy(&b[i..i + l])));
+                        i += l;
+                    }
+                }
+                Some(format!("D [{}]", vals.join(", ")))
+            }
+            b'C' => Some(format!("C {}", cstr(b))),
+            b'Z' => Some(format!("Z {}", String::from_utf8_lossy(b))),
+            b'1' => Some("ParseComplete".to_string()),
+            b'2' => Some("BindComplete".to_string()),
+            b'n' => Some("NoData".to_string()),
+            b'3' => Some("CloseComplete".to_string()),
+            b's' => Some("PortalSuspended".to_string()),
+            _ => None,
+        }
+    }
+
+    /// Python's repr() of a str, as pgproto.py's `f"D {vals}"` writes each value: single quotes
+    /// unless the text has a single quote and no double one; backslash, the quote, \t \n \r
+    /// escaped; other non-printable characters as \xNN, \uNNNN or \UNNNNNNNN. "Printable" is
+    /// approximated from Rust's classes (control, whitespace other than space, the common format
+    /// characters); a value outside that approximation shows as a divergence, never as agreement.
+    pub(super) fn py_str(s: &str) -> String {
+        let q = if s.contains('\'') && !s.contains('"') {
+            '"'
+        } else {
+            '\''
+        };
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push(q);
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                c if c == q => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                    out.push_str(&format!("\\x{:02x}", c as u32))
+                }
+                c if c.is_ascii() => out.push(c),
+                c if c.is_control()
+                    || (c.is_whitespace() && c != ' ')
+                    || matches!(c, '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2064}' | '\u{feff}') =>
+                {
+                    let v = c as u32;
+                    if v < 0x100 {
+                        out.push_str(&format!("\\x{v:02x}"));
+                    } else if v < 0x10000 {
+                        out.push_str(&format!("\\u{v:04x}"));
+                    } else {
+                        out.push_str(&format!("\\U{v:08x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push(q);
+        out
+    }
+
+    /// One recorded command: its `>>` text and PostgreSQL's lines for it.
+    struct Command {
+        text: String,
+        want: Vec<String>,
+    }
+
+    fn parse(recording: &str) -> Vec<Command> {
+        let mut out: Vec<Command> = Vec::new();
+        for line in recording.lines() {
+            if let Some(cmd) = line.strip_prefix(">> ") {
+                out.push(Command {
+                    text: cmd.to_string(),
+                    want: Vec::new(),
+                });
+            } else if let Some(answer) = line.strip_prefix("   ") {
+                out.last_mut()
+                    .expect("an answer line before any command")
+                    .want
+                    .push(answer.to_string());
+            }
+        }
+        out
+    }
+
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![tag];
+        m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        m.extend_from_slice(body);
+        m
+    }
+
+    fn c(s: &str) -> Vec<u8> {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    }
+
+    fn unnamed(s: &str) -> &str {
+        if s == "-" {
+            ""
+        } else {
+            s
+        }
+    }
+
+    /// Text values as pgproto.py binds them: each `|||` part stripped of surrounding spaces.
+    fn bind_values(vals: &[&str]) -> Vec<u8> {
+        let mut b = (vals.len() as u16).to_be_bytes().to_vec();
+        for v in vals {
+            b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        b
+    }
+
+    fn read_until_ready(w: &mut Wire) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            let mut head = [0u8; 5];
+            if w.s.read_exact(&mut head).is_err() {
+                lines.push("(the server closed the connection)".to_string());
+                return lines;
+            }
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            if let Some(l) = describe(head[0], &body) {
+                lines.push(l);
+            }
+            if head[0] == b'Z' {
+                return lines;
+            }
+        }
+    }
+
+    /// pgproto.py's main loop for one command; the answer lines, or none for a queued message.
+    fn send(w: &mut Wire, pending: &mut Vec<u8>, cmd: &str) -> Vec<String> {
+        let (kind, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        match kind {
+            "P" => {
+                let (name, sql) = rest.split_once(' ').unwrap();
+                let mut b = c(unnamed(name));
+                b.extend(c(sql));
+                b.extend_from_slice(&0u16.to_be_bytes());
+                pending.extend(frame(b'P', &b));
+                Vec::new()
+            }
+            "B" => {
+                let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
+                let mut head = parts[0].split_whitespace();
+                let (portal, stmt) = (head.next().unwrap(), head.next().unwrap());
+                let mut b = c(unnamed(portal));
+                b.extend(c(unnamed(stmt)));
+                b.extend_from_slice(&0u16.to_be_bytes());
+                b.extend(bind_values(&parts[1..]));
+                b.extend_from_slice(&0u16.to_be_bytes());
+                pending.extend(frame(b'B', &b));
+                Vec::new()
+            }
+            "E" => {
+                let mut it = rest.split_whitespace();
+                let (portal, n) = (it.next().unwrap(), it.next().unwrap());
+                let mut b = c(unnamed(portal));
+                b.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes());
+                pending.extend(frame(b'E', &b));
+                Vec::new()
+            }
+            "C" => {
+                let mut it = rest.split_whitespace();
+                let (what, name) = (it.next().unwrap(), it.next().unwrap());
+                let mut b = what.as_bytes().to_vec();
+                b.extend(c(unnamed(name)));
+                pending.extend(frame(b'C', &b));
+                Vec::new()
+            }
+            "S" => {
+                let mut out = std::mem::take(pending);
+                out.extend(frame(b'S', &[]));
+                w.s.write_all(&out).unwrap();
+                read_until_ready(w)
+            }
+            "Q" => {
+                w.s.write_all(&frame(b'Q', &c(rest))).unwrap();
+                read_until_ready(w)
+            }
+            "X" | "D" => {
+                let (oids, rest) = rest.split_once(' ').unwrap();
+                let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
+                let (sql, vals) = (parts[0], &parts[1..]);
+                let oid_list: Vec<u32> = if oids == "-" {
+                    Vec::new()
+                } else {
+                    oids.split(',').map(|o| o.parse().unwrap()).collect()
+                };
+                let mut parse = c("");
+                parse.extend(c(sql));
+                parse.extend_from_slice(&(oid_list.len() as u16).to_be_bytes());
+                for o in &oid_list {
+                    parse.extend_from_slice(&o.to_be_bytes());
+                }
+                let mut out = frame(b'P', &parse);
+                if kind == "D" {
+                    out.extend(frame(b'D', &c("S")));
+                } else {
+                    let mut bind = c("");
+                    bind.extend(c(""));
+                    bind.extend_from_slice(&0u16.to_be_bytes());
+                    bind.extend(bind_values(vals));
+                    bind.extend_from_slice(&0u16.to_be_bytes());
+                    out.extend(frame(b'B', &bind));
+                    out.extend(frame(b'D', &c("P")));
+                    let mut exec = c("");
+                    exec.extend_from_slice(&0i32.to_be_bytes());
+                    out.extend(frame(b'E', &exec));
+                }
+                out.extend(frame(b'S', &[]));
+                w.s.write_all(&out).unwrap();
+                read_until_ready(w)
+            }
+            other => panic!("refused: command kind {other:?} is not one pgproto.py sends ({cmd})"),
+        }
+    }
+
+    /// A RowDescription line compares without its names when PostgreSQL's line has none.
+    fn same(want: &[String], got: &[String]) -> bool {
+        want.len() == got.len()
+            && want.iter().zip(got).all(|(w, g)| {
+                if w.starts_with("T oids=") && !w.contains(" names=") {
+                    g.split(" names=").next() == Some(w.as_str())
+                } else {
+                    w == g
+                }
+            })
+    }
+
+    /// Replay `recording` on a fresh server and check that the commands answering otherwise than
+    /// PostgreSQL are exactly `divergences` (ordinal from 1, reason and owner).
+    pub(super) fn replay(name: &str, recording: &str, divergences: &[(usize, &str)]) {
+        let cmds = parse(recording);
+        assert!(!cmds.is_empty(), "refused: recording {name} has no command");
+        let dir = Scratch::new(&format!("rec{}", name.len()));
+        let server = Server::start(&dir.db(), &[]);
+        let mut w = server.connect();
+        let mut pending = Vec::new();
+        let mut report = String::new();
+        let mut differing = Vec::new();
+        for (i, cmd) in cmds.iter().enumerate() {
+            let got = send(&mut w, &mut pending, &cmd.text);
+            let n = i + 1;
+            let registered = divergences.iter().find(|(k, _)| *k == n);
+            let agrees = same(&cmd.want, &got);
+            if !agrees {
+                differing.push(n);
+            }
+            match (agrees, registered) {
+                (false, None) => report.push_str(&format!(
+                    "\n#{n} >> {}\n  PostgreSQL: {:?}\n  ours:       {:?}",
+                    cmd.text, cmd.want, got
+                )),
+                (true, Some((_, why))) => report.push_str(&format!(
+                    "\n#{n} >> {} now AGREES with PostgreSQL; remove its divergence ({why})",
+                    cmd.text
+                )),
+                _ => {}
+            }
+        }
+        for (k, why) in divergences {
+            assert!(
+                *k >= 1 && *k <= cmds.len(),
+                "{name}: divergence #{k} ({why}) names no command"
+            );
+        }
+        assert!(
+            report.is_empty(),
+            "{name}: {} of {} commands differ from PostgreSQL 18.6 (registered: {:?}; differing: {:?}){report}",
+            differing.len(),
+            cmds.len(),
+            divergences.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            differing
+        );
+    }
+}
+
+#[test]
+fn python_repr_matches_pgproto_for_the_cases_recordings_hold() {
+    // Expected values are CPython 3's repr() of each string (python3 -c 'print(repr(...))').
+    for (s, want) in [
+        ("abc", "'abc'"),
+        ("it's", "\"it's\""),
+        ("a'b\"c", "'a\\'b\"c'"),
+        ("a\\b", "'a\\\\b'"),
+        ("x\ny\tz", "'x\\ny\\tz'"),
+        ("\u{0b}", "'\\x0b'"),
+        ("é", "'é'"),
+        ("\u{a0}", "'\\xa0'"),
+        ("\u{fffd}", "'\u{fffd}'"),
+    ] {
+        assert_eq!(recorded::py_str(s), want, "{s:?}");
+    }
+}
+
+macro_rules! replays_postgresql {
+    ($test:ident, $file:literal, [$(($n:literal, $why:literal)),* $(,)?]) => {
+        #[test]
+        fn $test() {
+            recorded::replay($file, include_str!(concat!("pg18/", $file)), &[$(($n, $why)),*]);
+        }
+    };
+}
+
+// One test per recording; a divergence list is filled only from a read of that command's diff.
+replays_postgresql!(
+    pg18_arrays_replays_as_postgresql_answered,
+    "pg18-arrays.out",
+    []
+);
+replays_postgresql!(
+    pg18_arrres_replays_as_postgresql_answered,
+    "pg18-arrres.out",
+    []
+);
+replays_postgresql!(pg18_audit1_lib_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered, "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out", []);
+replays_postgresql!(
+    pg18_audit1_lib_parameters_decode_at_postgresqls_edges_replays_as_postgresql_answered,
+    "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
+    []
+);
+replays_postgresql!(pg18_audit1_ws_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered, "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_a_chained_or_read_only_transaction_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_chained_or_read_only_transaction_is_refused.out",
+    []
+);
+replays_postgresql!(pg18_audit1_ws_a_correlated_generate_series_column_is_scoped_to_its_select_replays_as_postgresql_answered, "pg18-audit1-ws-a_correlated_generate_series_column_is_scoped_to_its_select.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_a_dump_headers_settings_are_accepted_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_dump_headers_settings_are_accepted.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_a_parameter_is_typed_by_every_kind_of_from_item_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_parameter_is_typed_by_every_kind_of_from_item.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_a_parameter_over_the_simple_protocol_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_parameter_over_the_simple_protocol_is_refused.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_a_read_only_begin_inside_a_block_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_read_only_begin_inside_a_block_is_refused.out",
+    []
+);
+replays_postgresql!(pg18_audit1_ws_a_three_part_reference_resolves_through_its_schema_replays_as_postgresql_answered, "pg18-audit1-ws-a_three_part_reference_resolves_through_its_schema.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_aggregates_have_postgres_types_on_both_protocols_replays_as_postgresql_answered,
+    "pg18-audit1-ws-aggregates_have_postgres_types_on_both_protocols.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_checkpoint_inside_a_block_keeps_the_block_replays_as_postgresql_answered,
+    "pg18-audit1-ws-checkpoint_inside_a_block_keeps_the_block.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_delete_using_deletes_only_the_joined_rows_replays_as_postgresql_answered,
+    "pg18-audit1-ws-delete_using_deletes_only_the_joined_rows.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_delete_using_reads_one_namespace_replays_as_postgresql_answered,
+    "pg18-audit1-ws-delete_using_reads_one_namespace.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_delete_using_returning_a_using_column_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-ws-delete_using_returning_a_using_column_is_refused.out",
+    []
+);
+replays_postgresql!(pg18_audit1_ws_delete_using_returning_resolves_a_bare_name_over_both_replays_as_postgresql_answered, "pg18-audit1-ws-delete_using_returning_resolves_a_bare_name_over_both.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_generate_series_may_read_the_row_it_joins_replays_as_postgresql_answered,
+    "pg18-audit1-ws-generate_series_may_read_the_row_it_joins.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_set_honours_or_refuses_each_parameter_replays_as_postgresql_answered,
+    "pg18-audit1-ws-set_honours_or_refuses_each_parameter.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_set_operations_keep_their_grouping_and_clauses_replays_as_postgresql_answered,
+    "pg18-audit1-ws-set_operations_keep_their_grouping_and_clauses.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit1_ws_untyped_contexts_type_their_parameters_replays_as_postgresql_answered,
+    "pg18-audit1-ws-untyped_contexts_type_their_parameters.out",
+    []
+);
+replays_postgresql!(pg18_audit2_a_create_table_with_a_serial_completes_as_create_table_replays_as_postgresql_answered, "pg18-audit2-a_create_table_with_a_serial_completes_as_create_table.out", []);
+replays_postgresql!(
+    pg18_audit2_a_failed_commit_leaves_the_session_idle_replays_as_postgresql_answered,
+    "pg18-audit2-a_failed_commit_leaves_the_session_idle.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_a_refused_create_table_leaves_no_sequence_replays_as_postgresql_answered,
+    "pg18-audit2-a_refused_create_table_leaves_no_sequence.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_aggregates_report_numeric_types_replays_as_postgresql_answered,
+    "pg18-audit2-aggregates_report_numeric_types.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_alter_table_add_constraint_is_validated_and_atomic_replays_as_postgresql_answered,
+    "pg18-audit2-alter_table_add_constraint_is_validated_and_atomic.out",
+    []
+);
+replays_postgresql!(pg18_audit2_alter_table_add_constraint_takes_effect_and_keeps_the_rows_replays_as_postgresql_answered, "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out", []);
+replays_postgresql!(pg18_audit2_alter_table_add_constraint_works_in_every_transaction_state_replays_as_postgresql_answered, "pg18-audit2-alter_table_add_constraint_works_in_every_transaction_state.out", []);
+replays_postgresql!(pg18_audit2_an_error_inside_a_transaction_aborts_it_as_in_postgres_replays_as_postgresql_answered, "pg18-audit2-an_error_inside_a_transaction_aborts_it_as_in_postgres.out", []);
+replays_postgresql!(
+    pg18_audit2_char_n_is_blank_padded_as_in_postgres_replays_as_postgresql_answered,
+    "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_ddl_statements_report_their_command_tags_replays_as_postgresql_answered,
+    "pg18-audit2-ddl_statements_report_their_command_tags.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_encode_answers_as_postgresql_does_replays_as_postgresql_answered,
+    "pg18-audit2-encode_answers_as_postgresql_does.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_end_and_abort_report_commit_and_rollback_replays_as_postgresql_answered,
+    "pg18-audit2-end_and_abort_report_commit_and_rollback.out",
+    []
+);
+replays_postgresql!(pg18_audit2_foreign_keys_are_enforced_on_the_trunk_and_on_a_branch_replays_as_postgresql_answered, "pg18-audit2-foreign_keys_are_enforced_on_the_trunk_and_on_a_branch.out", []);
+replays_postgresql!(pg18_audit2_generate_series_in_from_names_its_column_after_the_alias_replays_as_postgresql_answered, "pg18-audit2-generate_series_in_from_names_its_column_after_the_alias.out", []);
+replays_postgresql!(
+    pg18_audit2_information_schema_describes_tables_columns_and_keys_replays_as_postgresql_answered,
+    "pg18-audit2-information_schema_describes_tables_columns_and_keys.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_pg_indexes_and_pg_database_size_answer_replays_as_postgresql_answered,
+    "pg18-audit2-pg_indexes_and_pg_database_size_answer.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_pgbench_table_probe_runs_replays_as_postgresql_answered,
+    "pg18-audit2-pgbench_table_probe_runs.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_rollback_to_savepoint_recovers_a_failed_transaction_replays_as_postgresql_answered,
+    "pg18-audit2-rollback_to_savepoint_recovers_a_failed_transaction.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_row_value_comparisons_work_replays_as_postgresql_answered,
+    "pg18-audit2-row_value_comparisons_work.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_set_and_truncate_report_their_command_tags_replays_as_postgresql_answered,
+    "pg18-audit2-set_and_truncate_report_their_command_tags.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_set_reads_every_value_it_is_given_replays_as_postgresql_answered,
+    "pg18-audit2-set_reads_every_value_it_is_given.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit2_show_answers_from_the_settings_set_keeps_replays_as_postgresql_answered,
+    "pg18-audit2-show_answers_from_the_settings_set_keeps.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_bare_numeric_division_by_zero_is_22012_replays_as_postgresql_answered,
+    "pg18-audit3-a_bare_numeric_division_by_zero_is_22012.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_branch_call_parameter_past_the_limit_is_refused_replays_as_postgresql_answered,
+    "pg18-audit3-a_branch_call_parameter_past_the_limit_is_refused.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_deferred_foreign_key_is_checked_at_commit_replays_as_postgresql_answered,
+    "pg18-audit3-a_deferred_foreign_key_is_checked_at_commit.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_from_functions_arguments_read_the_items_before_it_replays_as_postgresql_answered,
+    "pg18-audit3-a_from_functions_arguments_read_the_items_before_it.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_mistyped_commit_or_rollback_aborts_the_block_replays_as_postgresql_answered,
+    "pg18-audit3-a_mistyped_commit_or_rollback_aborts_the_block.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_multi_statement_query_is_one_implicit_transaction_replays_as_postgresql_answered,
+    "pg18-audit3-a_multi_statement_query_is_one_implicit_transaction.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_numeric_division_by_zero_is_22012_replays_as_postgresql_answered,
+    "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
+    []
+);
+replays_postgresql!(pg18_audit3_a_parameter_is_typed_from_the_relation_the_engine_writes_replays_as_postgresql_answered, "pg18-audit3-a_parameter_is_typed_from_the_relation_the_engine_writes.out", []);
+replays_postgresql!(
+    pg18_audit3_a_parameter_number_past_the_limit_is_refused_replays_as_postgresql_answered,
+    "pg18-audit3-a_parameter_number_past_the_limit_is_refused.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_parameter_number_the_scanner_would_wrap_is_refused_replays_as_postgresql_answered,
+    "pg18-audit3-a_parameter_number_the_scanner_would_wrap_is_refused.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_a_view_over_public_t_types_its_parameters_replays_as_postgresql_answered,
+    "pg18-audit3-a_view_over_public_t_types_its_parameters.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_an_explicit_public_qualifier_names_public_replays_as_postgresql_answered,
+    "pg18-audit3-an_explicit_public_qualifier_names_public.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_an_index_on_a_qualified_table_is_that_tables_replays_as_postgresql_answered,
+    "pg18-audit3-an_index_on_a_qualified_table_is_that_tables.out",
+    []
+);
+replays_postgresql!(pg18_audit3_an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind_replays_as_postgresql_answered, "pg18-audit3-an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind.out", []);
+replays_postgresql!(pg18_audit3_an_unqualified_relation_is_resolved_as_the_engine_resolves_it_replays_as_postgresql_answered, "pg18-audit3-an_unqualified_relation_is_resolved_as_the_engine_resolves_it.out", []);
+replays_postgresql!(
+    pg18_audit3_copy_from_runs_inside_the_block_it_is_in_replays_as_postgresql_answered,
+    "pg18-audit3-copy_from_runs_inside_the_block_it_is_in.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_copy_refuses_an_option_it_does_not_implement_replays_as_postgresql_answered,
+    "pg18-audit3-copy_refuses_an_option_it_does_not_implement.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_engine_errors_carry_postgres_sqlstates_replays_as_postgresql_answered,
+    "pg18-audit3-engine_errors_carry_postgres_sqlstates.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_every_parameter_in_the_text_is_a_parameter_replays_as_postgresql_answered,
+    "pg18-audit3-every_parameter_in_the_text_is_a_parameter.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_having_without_group_by_filters_the_aggregate_row_replays_as_postgresql_answered,
+    "pg18-audit3-having_without_group_by_filters_the_aggregate_row.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_integer_division_by_zero_is_22012_replays_as_postgresql_answered,
+    "pg18-audit3-integer_division_by_zero_is_22012.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_integer_modulo_by_zero_is_22012_replays_as_postgresql_answered,
+    "pg18-audit3-integer_modulo_by_zero_is_22012.out",
+    []
+);
+replays_postgresql!(
+    pg18_audit3_primary_key_columns_are_reported_not_null_replays_as_postgresql_answered,
+    "pg18-audit3-primary_key_columns_are_reported_not_null.out",
+    []
+);
+replays_postgresql!(
+    pg18_bytea_replays_as_postgresql_answered,
+    "pg18-bytea.out",
+    []
+);
+replays_postgresql!(
+    pg18_c33_engineerr_replays_as_postgresql_answered,
+    "pg18-c33-engineerr.out",
+    []
+);
+replays_postgresql!(pg18_c33_replays_as_postgresql_answered, "pg18-c33.out", []);
+replays_postgresql!(
+    pg18_colnames_replays_as_postgresql_answered,
+    "pg18-colnames.out",
+    []
+);
+replays_postgresql!(
+    pg18_derivedbool_replays_as_postgresql_answered,
+    "pg18-derivedbool.out",
+    []
+);
+replays_postgresql!(
+    pg18_float_replays_as_postgresql_answered,
+    "pg18-float.out",
+    []
+);
+replays_postgresql!(pg18_gs_replays_as_postgresql_answered, "pg18-gs.out", []);
+replays_postgresql!(
+    pg18_gsinf_replays_as_postgresql_answered,
+    "pg18-gsinf.out",
+    []
+);
+replays_postgresql!(
+    pg18_gsstar_replays_as_postgresql_answered,
+    "pg18-gsstar.out",
+    []
+);
+replays_postgresql!(
+    pg18_ident_replays_as_postgresql_answered,
+    "pg18-ident.out",
+    []
+);
+replays_postgresql!(pg18_inf_replays_as_postgresql_answered, "pg18-inf.out", []);
+replays_postgresql!(
+    pg18_infcast_replays_as_postgresql_answered,
+    "pg18-infcast.out",
+    []
+);
+replays_postgresql!(
+    pg18_inherits_replays_as_postgresql_answered,
+    "pg18-inherits.out",
+    []
+);
+replays_postgresql!(
+    pg18_insdef_replays_as_postgresql_answered,
+    "pg18-insdef.out",
+    []
+);
+replays_postgresql!(
+    pg18_join1_replays_as_postgresql_answered,
+    "pg18-join1.out",
+    []
+);
+replays_postgresql!(
+    pg18_join1b_replays_as_postgresql_answered,
+    "pg18-join1b.out",
+    []
+);
+replays_postgresql!(
+    pg18_join2_replays_as_postgresql_answered,
+    "pg18-join2.out",
+    []
+);
+replays_postgresql!(
+    pg18_nullorder_replays_as_postgresql_answered,
+    "pg18-nullorder.out",
+    []
+);
+replays_postgresql!(pg18_num_replays_as_postgresql_answered, "pg18-num.out", []);
+replays_postgresql!(pg18_r14_replays_as_postgresql_answered, "pg18-r14.out", []);
+replays_postgresql!(pg18_r15_replays_as_postgresql_answered, "pg18-r15.out", []);
+replays_postgresql!(
+    pg18_random_replays_as_postgresql_answered,
+    "pg18-random.out",
+    []
+);
+replays_postgresql!(
+    pg18_short_replays_as_postgresql_answered,
+    "pg18-short.out",
+    []
+);
+replays_postgresql!(
+    pg18_tablestar_replays_as_postgresql_answered,
+    "pg18-tablestar.out",
+    []
+);
+replays_postgresql!(
+    pg18_types_replays_as_postgresql_answered,
+    "pg18-types.out",
+    []
+);
+replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
