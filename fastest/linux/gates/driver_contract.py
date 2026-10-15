@@ -155,6 +155,10 @@ def stamp_problems(j):
                 if type(x) is not int or type(y) is not int or x < 0 or y < x:
                     bad.append(f"window {name}: exception counter {k} before {x!r} after {y!r}: not two non-negative "
                                "ints, never going back")
+    for k in ("tracerpid_tm0", "tracerpid_tm1"):
+        if k not in j or not (j[k] is None or (type(j[k]) is int and j[k] >= 0)):
+            bad.append(f"{k} {j.get(k, '(absent)')!r}: the driver's own TracerPid at the measured span's bound, an int "
+                       ">= 0, or null where there is no /proc")
     first, last = wins[0], wins[-1]
     for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
                     ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):

@@ -354,6 +354,13 @@ static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None, cl
 /// Each client's ready instant, pushed just before the ready barrier: the warm-up's t0 follows the latest of them.
 static READY: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
 
+/// This process's TracerPid (/proc/self/status, read whole, as the shared sweeper reads each task's), or None where
+/// there is no /proc (macOS): recorded at the measured span's open and close, as bbload's tracerpid_tm0/tm1.
+fn tracer_pid() -> Option<u64> {
+    let st = std::fs::read_to_string("/proc/self/status").ok()?;
+    st.lines().find_map(|l| l.strip_prefix("TracerPid:")).and_then(|v| v.trim().parse().ok())
+}
+
 /// CLOCK_REALTIME in seconds, as the shared sweeper's EPOCHREALTIME reads it.
 fn realtime_s() -> f64 {
     SystemTime::now()
@@ -674,6 +681,8 @@ fn main() {
     let mut warm_secs = 0.0f64;
     // the warm-up's start minus the last client's ready, ns (>= 0 by construction; recorded so a gate can see it)
     let mut t0_after_ready_ns = 0i64;
+    // this process's TracerPid at the first window's open and the last one's close
+    let (mut tp0, mut tp1) = (None, None);
     // (window, secs, engine sync counter deltas by field, busy retries in the window, realtime open and close)
     let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64, f64, f64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
@@ -711,12 +720,16 @@ fn main() {
             let s0 = engine_syncs();
             let r0 = retries();
             fence.begin(w);
+            if tp0.is_none() && windows.is_empty() {
+                tp0 = Some(tracer_pid());
+            }
             let rt0 = realtime_s();
             let t = Instant::now();
             gate.wait(); // every client starts the window
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
             let rt1 = realtime_s();
+            tp1 = Some(tracer_pid());
             fence.end(w);
             let s1 = engine_syncs();
             if s1.is_empty() || s1.len() != s0.len() {
@@ -790,7 +803,7 @@ fn main() {
     let even = a.ops_of.iter().all(|&n| n == a.ops_of[0]);
     let by_client: Vec<String> = a.ops_of.iter().map(|n| n.to_string()).collect();
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"tm0_realtime_s\":{:.6},\"tm1_realtime_s\":{:.6},\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"tm0_realtime_s\":{:.6},\"tm1_realtime_s\":{:.6},\"tracerpid_tm0\":{},\"tracerpid_tm1\":{},\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
@@ -802,7 +815,9 @@ fn main() {
         a.phases,
         if a.mode == Mode::Phases { "phases" } else { "cycle" },
         tm0,
-        tm1
+        tm1,
+        tp0.flatten().map_or("null".to_string(), |v| v.to_string()),
+        tp1.flatten().map_or("null".to_string(), |v| v.to_string())
     );
     for (k, (name, secs, syncs, busy, rt0, rt1)) in windows.iter().enumerate() {
         let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();

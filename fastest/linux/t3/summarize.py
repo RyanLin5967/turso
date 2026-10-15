@@ -359,9 +359,9 @@ def ours_sweeper(d, adapter_rc=None):
     (t3lib.sh ours_timed_record), its sweeper_cpu_s RE-DERIVED from the run's own timed.tracer.tsv over the run's own
     window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer). The
     record is held to the competitors' untraced-run rules by their own implementation, timedrun.py tracer_problems
-    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window; its
-    two checks of the load generator's own TracerPid at tm0 and tm1 are not asked of ours (fastest_profile records
-    none: Rust, HELD), so they are dropped by their field names (a reworded refusal there fails closed, as a refusal).
+    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window, with
+    its two checks of the load generator's own TracerPid at tm0 and tm1 asked of fastest_profile's summary.json
+    tracerpid_tm0/tracerpid_tm1, which it records at the measured span's open and close, as bbload does.
     The window is fastest_profile's MEASURED span (bb96279f3): timed.json's t0/t1 are its result/summary.json
     tm0/tm1_realtime_s, inside the wrapper's process window, which timed.json carries as process_t0/process_t1 and which
     must be t3lib.sh's own timed.window record (t0, t1, rc); its rc is the cell's adapter rc.
@@ -406,9 +406,9 @@ def ours_sweeper(d, adapter_rc=None):
         return None, win, [f"{e.name} cannot be imported: the sweeper's record cannot be re-derived or judged"]
     finally:
         sys.path[:] = saved
-    tp = [x for x in timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
-                                              {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1")})
-          if not x.startswith(("the load generator's own tracerpid_tm0 ", "the load generator's own tracerpid_tm1 "))]
+    tp = timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
+                                  {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1"),
+                                   "tracerpid_tm0": sj.get("tracerpid_tm0"), "tracerpid_tm1": sj.get("tracerpid_tm1")})
     if tp:  # tracer_problems also carries the shared reader's own refusals
         return None, win, [f"ours' timed run under the shared sweeper: {x}" for x in tp]
     lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
