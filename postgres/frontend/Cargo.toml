@@ -10,10 +10,16 @@ description = "PostgreSQL frontend for Turso"
 [lib]
 path = "lib.rs"
 
+[features]
+# Test failpoints (fail_next_undo): only turso_pg_server's dev-dependency enables it, so never in a
+# credited build.
+failpoints = []
+
 [dependencies]
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"
+stacker = "0.1"
 tempfile = { workspace = true }
 tracing = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [

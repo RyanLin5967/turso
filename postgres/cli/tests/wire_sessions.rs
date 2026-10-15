@@ -57,51 +57,87 @@ impl Server {
                 .local_addr()
                 .unwrap()
                 .port();
-            let addr = format!("127.0.0.1:{port}");
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tursopg"));
-            cmd.arg(db)
-                .arg("--server")
-                .arg(&addr)
-                .args(extra)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
-            // (`-t`), so a session the server ends without a word says why (lead: find the cause
-            // of "closed the connection during startup").
-            if let Some(trace_dir) = std::env::var_os("WIRE_SERVER_TRACE_DIR") {
-                cmd.arg("-t")
-                    .arg(std::path::Path::new(&trace_dir).join(format!("server-{port}.log")));
+            if let Some(server) = Self::start_on(db, extra, port) {
+                return server;
             }
-            // The server starts at macOS's default open-file soft limit (256) whatever this test
-            // process raised its own to, so a server that serves C + 16 sessions must raise it.
-            unsafe {
-                use std::os::unix::process::CommandExt;
-                cmd.pre_exec(|| {
-                    let mut lim = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
-                        lim.rlim_cur = lim.rlim_cur.min(256);
-                        libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-                    }
-                    Ok(())
-                });
-            }
-            let mut child = cmd.spawn().expect("failed to start tursopg server");
-            for _ in 0..100 {
-                if child.try_wait().unwrap().is_some() {
-                    break;
-                }
-                if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                    return Self { child, port };
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            child.kill().ok();
-            child.wait().ok();
         }
         panic!("tursopg server did not start");
+    }
+
+    /// One attempt on `port`: the server, once it is ready, or None when it is not (it exited, or
+    /// never became ready), the child reaped. Ready means the server's own stdout line "PostgreSQL
+    /// server listening on ADDR", printed after its bind: a connect probe was answered by any
+    /// listener on the port, so a server that lost the bind race was handed out while it exited
+    /// (the startup flake). Its stdout and stderr go to `server_log_dir()`, one file each per
+    /// server.
+    fn start_on(db: &Path, extra: &[&str], port: u16) -> Option<Self> {
+        use std::io::BufRead;
+        let addr = format!("127.0.0.1:{port}");
+        let logs = server_log_dir();
+        let stderr = std::fs::File::create(logs.join(format!("server-{port}.stderr")))
+            .expect("server stderr log");
+        let mut stdout_log = std::fs::File::create(logs.join(format!("server-{port}.stdout")))
+            .expect("server stdout log");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tursopg"));
+        cmd.arg(db)
+            .arg("--server")
+            .arg(&addr)
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr));
+        // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
+        // (`-t`), so a session the server ends without a word says why (lead: find the cause
+        // of "closed the connection during startup").
+        if let Some(trace_dir) = std::env::var_os("WIRE_SERVER_TRACE_DIR") {
+            cmd.arg("-t")
+                .arg(std::path::Path::new(&trace_dir).join(format!("server-{port}.log")));
+        }
+        // The server starts at macOS's default open-file soft limit (256) whatever this test
+        // process raised its own to, so a server that serves C + 16 sessions must raise it.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                let mut lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+                    lim.rlim_cur = lim.rlim_cur.min(256);
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("failed to start tursopg server");
+        // The reader copies every stdout line to the log until the server exits, and reports the
+        // listening line once; a server that never prints it, or exits first, is not ready.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let listening = format!("PostgreSQL server listening on {addr} ");
+        let stdout = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let _ = writeln!(stdout_log, "{line}");
+                if line.starts_with(&listening) {
+                    let _ = ready_tx.send(());
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match ready_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(()) => return Some(Self { child, port }),
+                // The reader ended: stdout closed, so the server is exiting.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+        }
+        child.kill().ok();
+        child.wait().ok();
+        None
     }
 
     fn connect(&self) -> Wire {
@@ -123,11 +159,45 @@ impl Server {
     }
 }
 
+/// Where each server's stdout and stderr logs go: WIRE_SERVER_LOG_DIR, or a directory per test
+/// process under the temp directory. Kept after the test (a Scratch is removed on drop, a failing
+/// test's included), so a failure's server side can be read.
+fn server_log_dir() -> PathBuf {
+    let dir = std::env::var_os("WIRE_SERVER_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tursopg_wire_server_logs")
+                .join(std::process::id().to_string())
+        });
+    std::fs::create_dir_all(&dir).expect("server log dir");
+    dir
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.child.kill().ok();
         self.child.wait().ok();
     }
+}
+
+/// The harness takes a server as ready only from the server itself, never from whatever accepts a
+/// connection on its port: a listener another process holds there must not pass for it. The
+/// connect probe did take one, so a server that lost the bind race (and exits) was handed out, and
+/// its sessions met the other listener: "closed the connection during startup" (the startup flake,
+/// raws artie lanes/wire/raw/loud-20261015/startup-flake/; lead: a real race, fix accepted
+/// 2026-10-15 as test infrastructure that changes no assertion).
+#[test]
+fn a_foreign_listener_on_the_port_is_not_taken_for_the_server() {
+    let dir = Scratch::new("foreignlistener");
+    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let server = Server::start_on(&dir.db(), &[], port);
+    assert!(
+        server.is_none(),
+        "a server that could not bind {port} was taken as ready"
+    );
+    drop(foreign);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,12 +215,16 @@ struct Reply {
     rows: Vec<Vec<Option<String>>>,
     /// The type OIDs of the last RowDescription, if one came.
     oids: Option<Vec<u32>>,
+    /// The column names of the last RowDescription, if one came.
+    names: Option<Vec<String>>,
     tags: Vec<String>,
     error: Option<WireError>,
     /// The parameter type OIDs of the last ParameterDescription, if one came.
     params: Option<Vec<u32>>,
     /// Every NoticeResponse of the reply, in order.
     notices: Vec<WireError>,
+    /// Every ParameterStatus of the reply, name and value, in order.
+    parameters: Vec<(String, String)>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
     status: u8,
 }
@@ -181,6 +255,8 @@ impl Reply {
 
 struct Wire {
     s: TcpStream,
+    /// The ParameterStatus values the server announced at startup, in order.
+    parameters: Vec<(String, String)>,
 }
 
 impl Wire {
@@ -188,7 +264,10 @@ impl Wire {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         s.set_nodelay(true).unwrap();
-        let mut w = Self { s };
+        let mut w = Self {
+            s,
+            parameters: Vec::new(),
+        };
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
         for (k, v) in [("user", "postgres"), ("database", database)] {
@@ -208,7 +287,10 @@ impl Wire {
                 code: String::new(),
                 message: "the server closed the connection during startup".to_string(),
             }),
-            None => Ok(w),
+            None => {
+                w.parameters = r.parameters;
+                Ok(w)
+            }
         }
     }
 
@@ -428,8 +510,11 @@ impl Wire {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     let mut p = 2;
                     let mut oids = Vec::with_capacity(n);
+                    let mut names = Vec::with_capacity(n);
                     for _ in 0..n {
-                        p += body[p..].iter().position(|&c| c == 0).unwrap() + 1;
+                        let end = p + body[p..].iter().position(|&c| c == 0).unwrap();
+                        names.push(String::from_utf8_lossy(&body[p..end]).into_owned());
+                        p = end + 1;
                         oids.push(u32::from_be_bytes([
                             body[p + 6],
                             body[p + 7],
@@ -439,6 +524,7 @@ impl Wire {
                         p += 18;
                     }
                     r.oids = Some(oids);
+                    r.names = Some(names);
                 }
                 b'D' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
@@ -460,6 +546,11 @@ impl Wire {
                 }
                 b'C' => r.tags.push(cstr(&body)),
                 b'N' => r.notices.push(error_fields(&body)),
+                b'S' => {
+                    let name = cstr(&body);
+                    let value = cstr(&body[name.len() + 1..]);
+                    r.parameters.push((name, value));
+                }
                 b't' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     r.params = Some(
@@ -554,6 +645,24 @@ fn raise_nofile(want: u64) {
             lim.rlim_max
         );
     }
+}
+
+/// Run `script` through the non-server CLI on `dir`'s database, as a test makes a schema before
+/// the server starts (the server refuses CREATE SCHEMA, and attaches a schema file present when a
+/// session opens).
+fn cli_script(dir: &Scratch, script: &[u8]) {
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin.take().unwrap().write_all(script).unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI ran the script"
+    );
 }
 
 fn seeded(server: &Server) -> Wire {
@@ -1342,10 +1451,9 @@ fn alter_table_add_constraint_takes_effect_and_keeps_the_rows() {
             a.q("INSERT INTO c (id) VALUES (10)").error.is_some(),
             "{on}: duplicate key accepted"
         );
-        assert!(
-            a.q("INSERT INTO c (id) VALUES (NULL)").error.is_some(),
-            "{on}: NULL key accepted"
-        );
+        // The NOT NULL refusal itself, 23502, not any error (engine review 20 LOW 26).
+        let e = a.q("INSERT INTO c (id) VALUES (NULL)").err("a NULL key");
+        assert_eq!(e.code, "23502", "{on}: NULL key: {}", e.message);
         assert!(
             a.q("INSERT INTO c (id, pid) VALUES (20, 99)")
                 .error
@@ -1623,8 +1731,11 @@ fn ddl_statements_report_their_command_tags() {
 }
 
 /// turso_branch_stats() reports the server process's own counters — unix system calls, mach
-/// traps, instructions retired, cycles — for the wire-versus-embedded budgets: one row of four
-/// int8 columns that never decrease, where a branch create between two reads costs system calls.
+/// traps, instructions retired, cycles — and the server's skipped CHECKPOINTs, the branch
+/// store's checkpoints and its four counted exceptions, for the wire-versus-embedded budgets: one
+/// row of ten int8 columns that never decrease, where a branch create between two reads costs
+/// system calls (ten from six: PRE-APPROVED spec change, artie DECISIONS 2026-10-15T05:16:51Z,
+/// the routing of Database::branch_exception_counters).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn branch_stats_reports_the_servers_counters() {
@@ -1635,8 +1746,8 @@ fn branch_stats_reports_the_servers_counters() {
         let r = a.q("SELECT turso_branch_stats()").ok("stats");
         assert_eq!(
             r.oids,
-            Some(vec![20, 20, 20, 20, 20, 20]),
-            "six int8 columns"
+            Some(vec![20, 20, 20, 20, 20, 20, 20, 20, 20, 20]),
+            "ten int8 columns"
         );
         assert_eq!(r.rows.len(), 1);
         r.rows[0]
@@ -2090,13 +2201,35 @@ fn a_busy_checkpoint_inside_a_block_says_it_was_skipped() {
     assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "4");
 }
 
+/// turso_branch_stats' last four columns are the engine's counted exceptions to "no create,
+/// connect, first write, delete or trunk commit waits on background work" (Database::
+/// branch_exception_counters: hardcap_upgrades, header_raise_exclusive, inline_compaction_syncs,
+/// compaction_waits), so every run can print them and label a window in which one moved
+/// (artie DECISIONS 2026-10-15T05:16:51Z). On every platform: present, never NULL, integers.
+#[test]
+fn branch_stats_reports_the_engines_counted_exceptions() {
+    let dir = Scratch::new("statsexc");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('e')").ok("create");
+    let r = a.q("SELECT turso_branch_stats()").ok("stats");
+    assert_eq!(r.rows.len(), 1);
+    let row = &r.rows[0];
+    assert_eq!(row.len(), 10, "columns {row:?}");
+    for (i, v) in row[6..].iter().enumerate() {
+        let v = v.as_deref().unwrap_or_else(|| panic!("exception counter {i} is NULL"));
+        v.parse::<u64>()
+            .unwrap_or_else(|e| panic!("exception counter {i} = {v:?}: {e}"));
+    }
+}
+
 /// The branch store's checkpoints since the server started (turso_branch_stats' sixth column,
-/// `store_checkpoints`).
+/// `store_checkpoints`, of ten since the engine's counted exceptions joined it).
 fn store_checkpoints(a: &mut Wire) -> i64 {
     let r = a.q("SELECT turso_branch_stats()").ok("stats");
     assert_eq!(
         r.oids.as_ref().map(Vec::len),
-        Some(6),
+        Some(10),
         "turso_branch_stats has no store_checkpoints column: {:?}",
         r.oids
     );
@@ -2118,6 +2251,9 @@ fn a_checkpoint_checkpoints_the_branch_store() {
     let dir = Scratch::new("storeckpt");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
+    // The engine refuses to branch an empty database (no committed page 1): a table first (ruled
+    // c9c821dd8d, P1).
+    a.q("CREATE TABLE t(id INT)").ok("t");
     for i in 0..8 {
         a.q(&format!("SELECT turso_branch_create('c{i}')"))
             .ok("create");
@@ -2195,6 +2331,1315 @@ fn show_answers_from_the_settings_set_keeps() {
     assert_eq!(a.q("SHOW ALL").err("SHOW ALL").code, "0A000");
 }
 
+/// The settings the server announces at startup (ParameterStatus) are the ones SHOW answers, which
+/// are the ones it behaves by: DateStyle `ISO, MDY` (PostgreSQL's boot value), TimeZone UTC,
+/// IntervalStyle postgres, client_encoding UTF8, standard_conforming_strings on, and search_path as
+/// SHOW gives it before any SET. Startup announced pgwire's defaults (`ISO, YMD`, `Etc/UTC`,
+/// `public`) while SHOW answered otherwise (wire review 18 item 19). search_path is reported in
+/// PostgreSQL (GUC_REPORT), so a SET that changes it is followed by a ParameterStatus with the new
+/// path, and one that leaves it as it was by none. SET DateStyle keeps what it is accepted with:
+/// `ISO`, `MDY` and `ISO, MDY` all leave `ISO, MDY`, as in PostgreSQL, and an order or output
+/// style this server does not use (DMY, YMD, SQL, German) is 0A000, where `ISO, DMY` was accepted
+/// and SHOW still said MDY.
+#[test]
+fn startup_announces_the_settings_show_answers() {
+    let dir = Scratch::new("announce");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let announced = a.parameters.clone();
+    for name in [
+        "DateStyle",
+        "TimeZone",
+        "IntervalStyle",
+        "client_encoding",
+        "standard_conforming_strings",
+        "search_path",
+    ] {
+        let sent: Vec<&str> = announced
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let shown = a.q(&format!("SHOW {name}")).single(name);
+        assert_eq!(sent, vec![shown.as_str()], "{name}");
+    }
+    let path = |r: &Reply| {
+        r.parameters
+            .iter()
+            .filter(|(n, _)| n == "search_path")
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    let r = a.q("SET search_path TO s, public").ok("set the path");
+    assert_eq!(path(&r), vec!["s, public".to_string()], "a changed path");
+    let r = a.q("SET search_path TO s, public").ok("the same path");
+    assert_eq!(path(&r), Vec::<String>::new(), "an unchanged path");
+    for sql in [
+        "SET DateStyle = 'ISO'",
+        "SET DateStyle = 'MDY'",
+        "SET DateStyle = 'ISO, MDY'",
+    ] {
+        a.q(sql).ok(sql);
+        assert_eq!(a.q("SHOW DateStyle").single(sql), "ISO, MDY", "{sql}");
+    }
+    for sql in [
+        "SET DateStyle = 'ISO, DMY'",
+        "SET DateStyle = 'YMD'",
+        "SET DateStyle = 'SQL, MDY'",
+        "SET DateStyle = 'German'",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+}
+
+/// `SELECT turso_branch_delete(varchar $1)` is 42601, as PostgreSQL 18 answers `type $n`, a form
+/// only libpg_query's grammar accepts, and the branch the value names is not deleted. It ran as a
+/// branch call, so Bind 'prod' deleted prod (wire review 14 item 14). Over the extended protocol,
+/// $1 declared text.
+#[test]
+fn a_type_name_before_a_parameter_is_refused() {
+    let dir = Scratch::new("typedparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('prod')").ok("prod");
+    for sql in [
+        "SELECT turso_branch_delete(varchar $1)",
+        "SELECT varchar $1",
+    ] {
+        let r = a.xt(sql, &[(25, 0, b"prod")]);
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("42601"),
+            "{sql}: rows {:?}",
+            r.rows
+        );
+    }
+    a.q("SELECT turso_branch_switch('prod')")
+        .ok("prod was not deleted");
+}
+
+/// A parameter compared with an inet[], cidr[] or macaddr[] column takes that array type, and one
+/// compared with ANY of an inet[] column the element type, as PostgreSQL 18.6 types them
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-arrays.out: 1041, 651, 1040, 869). The array
+/// table lacked them, so the first three were 42P18 and ANY's element text (wire review 13 item
+/// 18; oid[] is an_oid_array_column_types_its_parameter_oid_array).
+#[test]
+fn network_and_oid_array_columns_type_their_parameters() {
+    let dir = Scratch::new("netarrays");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE n(a INET[], c CIDR[], m MACADDR[], o OID[])").ok("n");
+    for (sql, oid) in [
+        ("SELECT 1 FROM n WHERE a = $1", 1041),
+        ("SELECT 1 FROM n WHERE c = $1", 651),
+        ("SELECT 1 FROM n WHERE m = $1", 1040),
+        ("SELECT 1 FROM n WHERE $1 = ANY(a)", 869),
+    ] {
+        let r = a.describe_statement(sql);
+        assert_eq!(r.params, Some(vec![oid]), "{sql}: {:?}", r.error);
+    }
+}
+
+/// KNOWN RED (known-red.txt): a parameter compared with an oid[] column is oid[] (1028) in
+/// PostgreSQL 18.6 (recorded, pg18-arrays.out). Here it is int4[] (1007): the translator stores an
+/// OID column as the engine's INTEGER, so the declared type no longer says oid (and a scalar oid
+/// column reads as int4 too). Split out of network_and_oid_array_columns_type_their_parameters
+/// (wire review 13 item 18) when its fix covered the other four rows; the expectation is
+/// unchanged. Green when an OID column keeps its type.
+#[test]
+fn an_oid_array_column_types_its_parameter_oid_array() {
+    let dir = Scratch::new("oidarray");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE n(o OID[])").ok("n");
+    let sql = "SELECT 1 FROM n WHERE o = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(r.params, Some(vec![1028]), "{sql}: {:?}", r.error);
+}
+
+/// A text[] parameter is read as PostgreSQL 18.6's array_in reads it (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-r15.out; wire review 13 item 16): an escaped `NUL\L` is the string
+/// NULL, never SQL NULL (an unquoted, unescaped NULL is SQL NULL); a vertical tab is whitespace
+/// around an element; a stray `}` is 22P02 "malformed array literal" (a `{` inside an element
+/// stays the multidimensional refusal, 0A000). Read through INSERT into a text[] column, whose
+/// rows this server prints as PostgreSQL does.
+#[test]
+fn an_array_parameter_is_read_as_array_in_reads_it() {
+    let dir = Scratch::new("arrayin");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ar(id INT, x TEXT[])").ok("ar");
+    let sql = "INSERT INTO ar VALUES ($1, $2)";
+    for (id, value, want) in [
+        (1, &b"{\"NUL\\L\"}"[..], Some("{\"NULL\"}")),
+        (2, b"{NUL\\L}", Some("{\"NULL\"}")),
+        (3, b"{NULL}", Some("{NULL}")),
+        (4, b"{a,\x0bb}", Some("{a,b}")),
+    ] {
+        let id = id.to_string();
+        a.xt(sql, &[(23, 0, id.as_bytes()), (1009, 0, value)])
+            .ok(&format!("{:?}", String::from_utf8_lossy(value)));
+        let got = a
+            .q(&format!("SELECT x FROM ar WHERE id = {id}"))
+            .ok("read back")
+            .rows;
+        assert_eq!(
+            got,
+            vec![vec![want.map(str::to_string)]],
+            "{:?}",
+            String::from_utf8_lossy(value)
+        );
+    }
+    let r = a.xt(sql, &[(23, 0, b"5"), (1009, 0, b"{a}}")]);
+    assert_eq!(r.err("a stray }").code, "22P02");
+    let r = a.xt(sql, &[(23, 0, b"6"), (1009, 0, b"{{a}}")]);
+    assert_eq!(r.err("a nested array").code, "0A000");
+}
+
+/// AND CHAIN where PostgreSQL 18.6 answers it (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-r15.out; wire review 13 item 13, review 15 item 23): in an implicit block (`SELECT 1;
+/// COMMIT AND CHAIN`) it is 25P01 "... can only be used in transaction blocks" and the session ends
+/// idle, as outside a block (it was 0A000); in a failed block it ends the block, answered
+/// ROLLBACK, and chains a new one (status T, and the next statement runs in it), as a failed
+/// block's COMMIT or ROLLBACK ends it (it was 25P02, the block left failed). In a live block it
+/// stays refused 0A000 (no chain support; COMPAT).
+#[test]
+fn and_chain_answers_as_postgresql_in_implicit_and_failed_blocks() {
+    let dir = Scratch::new("andchain");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for verb in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+        let sql = format!("SELECT 1; {verb}");
+        let r = a.q(&sql);
+        assert_eq!(r.err(&sql).code, "25P01", "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+    }
+    for verb in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'two')").ok("a write");
+        assert_eq!(a.q("SELECT * FROM nosuch").status, b'E', "premise: the block failed");
+        let r = a.q(verb).ok(verb);
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{verb}");
+        assert_eq!(r.status, b'T', "{verb}: a chained block is open");
+        assert_eq!(a.q("SELECT 1").single("in the chained block"), "1");
+        a.q("ROLLBACK").ok("end the chained block");
+        assert_eq!(
+            a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+            "0",
+            "{verb}: the failed block's write was rolled back"
+        );
+    }
+}
+
+/// Arrays in a result and casts to arrays, as PostgreSQL 18.6 answers them (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-arrres.out), on both protocols: `ARRAY[1, 2]` is int4[] (1007) and
+/// `ARRAY['a', 'b']` text[] (1009); a string literal cast to an array type is that array, typed so
+/// (`'{1,2}'::int[]` was int4 0: the engine casts by the element's scalar affinity); a bound array
+/// parameter cast to its array type stays the array, so it is stored as one (`$1::int[]` stored 0).
+/// A cast to an array of anything else (a column, an expression) is refused, 0A000, rather than
+/// answered by scalar affinity (a divergence, COMPAT). A bound array sent back in a result is the
+/// known red a_bound_array_in_a_result_is_sent_as_its_text.
+#[test]
+fn array_results_are_typed_or_refused() {
+    let dir = Scratch::new("arrayresults");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    for (sql, oid, text) in [
+        ("SELECT ARRAY[1, 2]", 1007, "{1,2}"),
+        ("SELECT ARRAY['a', 'b']", 1009, "{a,b}"),
+        ("SELECT '{1,2}'::int[]", 1007, "{1,2}"),
+        ("SELECT '{a,b}'::text[]", 1009, "{a,b}"),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}");
+        let r = a.xt(sql, &[]).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}: extended");
+    }
+    a.q("CREATE TABLE ar(id INT, x INT[])").ok("ar");
+    a.xt("INSERT INTO ar VALUES (1, $1::int[])", &[(1007, 0, b"{1,2}")])
+        .ok("a bound array cast to its type");
+    assert_eq!(
+        a.q("SELECT x FROM ar WHERE id = 1").single("stored"),
+        "{1,2}",
+        "the bound array was stored as the array"
+    );
+    let sql = "SELECT CAST(id AS int[]) FROM ar";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    // A cast to an array of a domain is refused too: its check or coercion would not run
+    // (PostgreSQL truncates ARRAY['too long']::vc4[] to {"too "}; domain.sql of the regression
+    // corpus caught the identity storing 'too long').
+    a.q("CREATE DOMAIN vc4 AS varchar(4)").ok("vc4");
+    let sql = "SELECT ARRAY['too long']::vc4[]";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+}
+
+/// KNOWN RED (known-red.txt): a bound array parameter sent back in a result (`SELECT $1::text[]`,
+/// `SELECT $1` declared text[]) is PostgreSQL 18.6's text[] '{a,b}' (recorded, pg18-arrres.out).
+/// Here it is the engine's record blob: rendering it needs core's serialize_array_from_blob, which is
+/// pub(crate) (asked of the engine), and the server does not copy it.
+#[test]
+fn a_bound_array_in_a_result_is_sent_as_its_text() {
+    let dir = Scratch::new("arrayback");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT $1::text[]", "SELECT $1"] {
+        let r = a.xt(sql, &[(1009, 0, b"{a,b}")]).ok(sql);
+        assert_eq!(
+            (r.oids, r.rows),
+            (Some(vec![1009]), vec![vec![Some("{a,b}".to_string())]]),
+            "{sql}"
+        );
+    }
+}
+
+/// Portals as PostgreSQL 18.6 keeps them (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-r15.out; wire review 15 items 16, 17 and 20):
+/// - an unnamed portal suspended by a row limit continues at its next Execute, in a block, after
+///   a Sync: it was removed after every Execute, so the next one was 34000;
+/// - a portal that returned all its rows answers its own verb's tag with 0 rows when executed
+///   again (`INSERT 0 0` for an INSERT ... RETURNING): the Finished arm said SELECT 0;
+/// - a Bind of a named portal that already exists is 42P03 "cursor ... already exists": it was
+///   replaced silently, a suspended one included.
+#[test]
+fn portals_live_as_postgresql_keeps_them() {
+    let dir = Scratch::new("portals");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)").ok("r");
+    a.q("INSERT INTO r VALUES (1, 'a'), (2, 'b'), (3, 'c')").ok("rows");
+    let rows = |r: &Reply| r.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>();
+    // Unnamed, suspended, continued after a Sync in a block.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"\0SELECT id FROM r ORDER BY id\0\0\0");
+    a.send(b'B', b"\0\0\0\0\0\0\0\0");
+    a.send(b'E', b"\0\0\0\0\x01");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("first row");
+    assert_eq!(rows(&r), vec!["1"]);
+    a.send(b'E', b"\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("the unnamed portal continues");
+    assert_eq!(rows(&r), vec!["2", "3"]);
+    assert_eq!(r.tags, vec!["SELECT 2".to_string()]);
+    a.q("COMMIT").ok("commit");
+    // A finished RETURNING portal answers INSERT 0 0.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"s1\0INSERT INTO r VALUES (10, 'x') RETURNING id\0\0\0");
+    a.send(b'B', b"p1\0s1\0\0\0\0\0\0\0");
+    a.send(b'E', b"p1\0\0\0\0\0");
+    a.send(b'E', b"p1\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("p1 twice");
+    assert_eq!(rows(&r), vec!["10"]);
+    assert_eq!(
+        r.tags,
+        vec!["INSERT 0 1".to_string(), "INSERT 0 0".to_string()]
+    );
+    a.q("ROLLBACK").ok("end");
+    // Binding a named portal that exists is 42P03.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"s2\0SELECT id FROM r ORDER BY id\0\0\0");
+    a.send(b'B', b"p2\0s2\0\0\0\0\0\0\0");
+    a.send(b'E', b"p2\0\0\0\0\x01");
+    a.send(b'S', &[]);
+    a.read_reply().ok("p2 suspended");
+    a.send(b'B', b"p2\0s2\0\0\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err("p2 bound again").code, "42P03");
+    assert_eq!(r.status, b'E');
+    a.q("ROLLBACK").ok("end");
+}
+
+/// A float's text is PostgreSQL's float8out / float4out at the default extra_float_digits (1): the
+/// shortest exact digits, in fixed notation while the decimal exponent is in [-4, 15) for float8
+/// and [-4, 6) for float4, else `d.ddde+XX` with a sign and at least two exponent digits; no
+/// trailing `.0`; Infinity spelled out (PostgreSQL 18.6 recorded, artie raw loud-20261015/
+/// pg18-diff/pg18-float.out). pgwire's ryu text was `1.0`, `100.0`, `1e16`, `0.00001` and `inf`
+/// (the PG 18 differential's finding (d)).
+#[test]
+fn floats_are_written_as_postgresql_writes_them() {
+    let dir = Scratch::new("floattext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE f(id INT, d DOUBLE PRECISION)").ok("f");
+    let cases = [
+        ("1", "1"),
+        ("-1", "-1"),
+        ("100", "100"),
+        ("0.1", "0.1"),
+        ("1234567", "1234567"),
+        ("100000000000000", "100000000000000"),
+        ("1e15", "1e+15"),
+        ("1e20", "1e+20"),
+        ("0.0001", "0.0001"),
+        ("1e-5", "1e-05"),
+        ("1.5e-5", "1.5e-05"),
+        ("3.4028235e38", "3.4028235e+38"),
+        ("0.30000000000000004", "0.30000000000000004"),
+        ("1234567890123456", "1.234567890123456e+15"),
+    ];
+    for (i, (literal, _)) in cases.iter().enumerate() {
+        a.q(&format!("INSERT INTO f VALUES ({i}, {literal})")).ok(literal);
+    }
+    let got: Vec<String> = a
+        .q("SELECT d FROM f ORDER BY id")
+        .ok("read")
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    let want: Vec<String> = cases.iter().map(|(_, w)| w.to_string()).collect();
+    assert_eq!(got, want);
+    let r = a
+        .q("SELECT 1234567::float4, 123456::float4, 1e-5::float4")
+        .ok("float4");
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Some("1.234567e+06".to_string()),
+            Some("123456".to_string()),
+            Some("1e-05".to_string()),
+        ]]
+    );
+}
+
+/// A string literal cast to a float type is read as PostgreSQL's float8in / float4in reads it
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-infcast.out): `'Infinity'`, `'-Infinity'`,
+/// `'inf'`, `'+INF'` and `' infinity '` are the infinities, and `'infinityx'` is 22P02. The engine
+/// cast them by affinity, to 0, so `'Infinity'::float8 > 1e308` was false. NaN, which the engine
+/// cannot hold, is refused 0A000 (PostgreSQL has it: a divergence).
+#[test]
+fn a_float_literal_cast_reads_infinity() {
+    let dir = Scratch::new("infcast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a
+        .q("SELECT 'Infinity'::float8 > 1e308, '-Infinity'::float8 < -1e308, 'inf'::float8 > 1e308, \
+            '+INF'::float8 > 1e308, ' infinity '::float8 > 1e308, 'Infinity'::float4 > 1e38")
+        .ok("infinities");
+    assert_eq!(r.rows, vec![vec![Some("t".to_string()); 6]]);
+    let sql = "SELECT 'infinityx'::float8";
+    assert_eq!(a.q(sql).err(sql).code, "22P02", "{sql}");
+    let sql = "SELECT 'NaN'::float8";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+}
+
+/// KNOWN RED (known-red.txt; ruling asked): PostgreSQL 18.6 writes the infinities `Infinity` and
+/// `-Infinity` and a negative zero `-0` (recorded, artie raw loud-20261015/pg18-diff/pg18-inf.out);
+/// the vendored pgwire writes `inf`, `-inf` and `0`, and its own unit test (test_format) asserts
+/// `inf`, so the change waits on a ruling for that test. Split out of
+/// floats_are_written_as_postgresql_writes_them, its expectations unchanged.
+#[test]
+fn infinities_and_negative_zero_are_written_as_postgresql_writes_them() {
+    let dir = Scratch::new("floatinf");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a
+        .q("SELECT 'Infinity'::float8, '-Infinity'::float8, 'NaN'::float8, '-0'::float8")
+        .ok("specials");
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Some("Infinity".to_string()),
+            Some("-Infinity".to_string()),
+            Some("NaN".to_string()),
+            Some("-0".to_string()),
+        ]]
+    );
+}
+
+/// The infinities are written `Infinity` and `-Infinity` (float8 and float4) and a negative zero
+/// `-0`, as PostgreSQL 18.6 writes them (recorded, artie raw loud-20261015/pg18-diff/pg18-inf.out);
+/// the vendored pgwire wrote `inf`, `-inf` and `0`. NaN, which the engine cannot hold, is left to
+/// infinities_and_negative_zero_are_written_as_postgresql_writes_them (known red) (lead ruling
+/// 2026-10-15T07:40:59Z: pgwire's test_format moves to 'Infinity').
+#[test]
+fn infinities_and_negative_zero_are_written_without_nan() {
+    let dir = Scratch::new("floatinf2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let r = a
+        .q("SELECT 'Infinity'::float8, '-Infinity'::float8, 'Infinity'::float4")
+        .ok("infinities");
+    assert_eq!(r.rows, vec![vec![t("Infinity"), t("-Infinity"), t("Infinity")]]);
+    let r = a.q("SELECT '-0'::float8").ok("negative zero");
+    assert_eq!(r.rows, vec![vec![t("-0")]]);
+}
+
+/// A real (float4) column and a double precision (float8) column keep their declared width: their
+/// results are announced 700 and 701, a parameter compared with one takes its type, and their text
+/// and arithmetic are a float's (REAL affinity, so 2 / 4 is 0.5), as PostgreSQL 18.6 answers
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-types.out: `SELECT r, d FROM k` is
+/// [700, 701]). Both were stored as REAL and announced float8 (the PG 18 differential's finding
+/// (b); lead ruling 2026-10-15T07:40:59Z: the declarations keep FLOAT4 / FLOAT8, REAL affinity).
+#[test]
+fn float_columns_keep_their_declared_width() {
+    let dir = Scratch::new("floatwidth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE fw(r REAL, f4 FLOAT4, d DOUBLE PRECISION, f8 FLOAT8, f FLOAT)")
+        .ok("fw");
+    a.q("INSERT INTO fw VALUES (2, 2, 2, 2, 2)").ok("row");
+    let r = a.q("SELECT r, f4, d, f8, f FROM fw").ok("select");
+    assert_eq!(r.oids, Some(vec![700, 700, 701, 701, 701]));
+    assert_eq!(r.rows, vec![vec![t("2"); 5]]);
+    let r = a.q("SELECT r / 4, f4 / 4, d / 4, f8 / 4, f / 4 FROM fw").ok("affinity");
+    assert_eq!(r.rows, vec![vec![t("0.5"); 5]], "REAL affinity: a float divides as a float");
+    let r = a.describe_statement("SELECT 1 FROM fw WHERE r = $1 AND d = $2").ok("params");
+    assert_eq!(r.params, Some(vec![700, 701]));
+}
+
+/// CREATE TABLE's LIKE clause is refused 0A000, and no table is created: it was silently dropped,
+/// so `CREATE TABLE p11 (LIKE p1)` made a table with none of p1's columns (or only the other ones
+/// listed), and `ALTER TABLE p11 DROP a` on it then panicked the engine (core/translate/alter.rs:941,
+/// the first statement to kill a session in the regress corpus's alter_table, insert and
+/// updatable_views scripts). PostgreSQL copies the columns (a divergence, COMPAT's LIKE row).
+#[test]
+fn create_table_like_is_refused_not_dropped() {
+    let dir = Scratch::new("createlike");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p1(a int, b int)").ok("p1");
+    for sql in ["CREATE TABLE p11 (LIKE p1)", "CREATE TABLE p11 (LIKE p1, c int)"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+        let probe = "SELECT * FROM p11";
+        assert_eq!(a.q(probe).err(probe).code, "42P01", "{sql} created a table");
+    }
+    a.q("SELECT 1").ok("the session lives");
+}
+
+/// INSERT's VALUES lists are checked as PostgreSQL 18.6 checks them (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-insdef.out): lists of different lengths are 42601 "VALUES lists must
+/// all be the same length", and a list shorter or longer than the column list 42601 "INSERT has
+/// more target columns than expressions" / "... more expressions than target columns"; a DEFAULT
+/// in a positional list stands for that column, so the later values keep their columns. Here the
+/// all-DEFAULT positions were dropped first: `(c1, c2, c3) VALUES (DEFAULT, DEFAULT)` left an empty
+/// row and panicked the engine (core/translate/select.rs:868, the regress corpus's insert.sql), a
+/// ragged `VALUES (1, 2), (3)` inserted a row the engine made up, and a positional
+/// `VALUES (DEFAULT, 5, 'x')` was refused, its values shifted one column left.
+#[test]
+fn insert_values_lists_are_checked_as_postgresql_checks_them() {
+    let dir = Scratch::new("insdef");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table it (col1 int4, col2 int4, col3 text default 'testing')")
+        .ok("it");
+    for (sql, message) in [
+        (
+            "insert into it (col1, col2, col3) values (DEFAULT, DEFAULT)",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "insert into it (col1, col2) values (1, 2, 3)",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "insert into it (col1, col2) values (1, 2), (3)",
+            "VALUES lists must all be the same length",
+        ),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42601", "{sql}: {}", e.message);
+        assert!(e.message.contains(message), "{sql}: {}", e.message);
+    }
+    a.q("insert into it values (DEFAULT, 5, 'x')").ok("positional DEFAULT");
+    a.q("insert into it values (DEFAULT, DEFAULT)").ok("positional all DEFAULT");
+    a.q("insert into it (col1, col2, col3) values (DEFAULT, 7, DEFAULT)")
+        .ok("named DEFAULT");
+    let r = a
+        .q("select * from it order by col2 nulls first, col1")
+        .ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![None, None, t("testing")],
+            vec![None, t("5"), t("x")],
+            vec![None, t("7"), t("testing")],
+        ]
+    );
+}
+
+/// A DEFAULT in only some rows of a multi-row VALUES, named or positional, takes the column's
+/// default, as PostgreSQL's does (core's resolve_defaults_in_row replaces the translator's
+/// Expr::Default); pinned while the all-DEFAULT positions are dropped by the translator instead.
+#[test]
+fn a_default_in_some_rows_takes_the_column_default() {
+    let dir = Scratch::new("partialdefault");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table pd (k int, v text default 'dflt')").ok("pd");
+    a.q("insert into pd (k, v) values (1, DEFAULT), (2, 'y')").ok("named");
+    a.q("insert into pd values (3, DEFAULT), (4, 'z')").ok("positional");
+    let r = a.q("select * from pd order by k").ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![t("1"), t("dflt")],
+            vec![t("2"), t("y")],
+            vec![t("3"), t("dflt")],
+            vec![t("4"), t("z")],
+        ]
+    );
+}
+
+/// An identity column numbers its rows as PostgreSQL 18.6 numbers them, 1, 2, ... (recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-ident.out), GENERATED ALWAYS or BY DEFAULT, and a stored
+/// generated column, which the engine cannot hold, is refused 0A000 with no table created. The
+/// translator dropped both clauses: identity ids were NULL (or a NOT NULL failure under a primary
+/// key), and a generated column read NULL.
+#[test]
+fn identity_columns_number_rows_and_stored_generated_is_refused() {
+    let dir = Scratch::new("identity");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table idt (id int generated always as identity, v text)").ok("idt");
+    a.q("insert into idt (v) values ('a'), ('b')").ok("idt rows");
+    a.q("create table idb (id bigint generated by default as identity primary key, v text)")
+        .ok("idb");
+    a.q("insert into idb (v) values ('a'), ('b')").ok("idb rows");
+    for table in ["idt", "idb"] {
+        let r = a.q(&format!("select id, v from {table} order by v")).ok(table);
+        assert_eq!(r.rows, vec![vec![t("1"), t("a")], vec![t("2"), t("b")]], "{table}");
+    }
+    let sql = "create table gs (a int, b int generated always as (a * 2) stored)";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    let probe = "select * from gs";
+    assert_eq!(a.q(probe).err(probe).code, "42P01", "the generated table was created");
+}
+
+/// A positional VALUES list shorter than the table fills its leading columns, the rest taking
+/// their defaults, and one longer is 42601 "INSERT has more expressions than target columns", as
+/// PostgreSQL 18.6 answers (recorded, artie raw loud-20261015/pg18-diff/pg18-short.out); the engine
+/// refused a short list ("table s3 has 3 columns but 2 values were supplied").
+#[test]
+fn a_short_positional_values_list_fills_the_leading_columns() {
+    let dir = Scratch::new("shortvalues");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table s3 (a int, b int, c text default 'd')").ok("s3");
+    a.q("insert into s3 values (1, 2)").ok("two of three");
+    a.q("insert into s3 values (3)").ok("one of three");
+    a.q("insert into s3 values (4, 5), (6, 7)").ok("two rows");
+    let sql = "insert into s3 values (1, 2, 'x', 9)";
+    let e = a.q(sql).err(sql);
+    assert_eq!(e.code, "42601", "{sql}: {}", e.message);
+    assert!(
+        e.message.contains("INSERT has more expressions than target columns"),
+        "{sql}: {}",
+        e.message
+    );
+    let r = a.q("select * from s3 order by a").ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![t("1"), t("2"), t("d")],
+            vec![t("3"), None, t("d")],
+            vec![t("4"), t("5"), t("d")],
+            vec![t("6"), t("7"), t("d")],
+        ]
+    );
+}
+
+/// A domain over numeric or a float type takes a quoted value, as PostgreSQL's input function reads
+/// it (the regress corpus's domain.sql: `INSERT INTO basictest VALUES (..., '123.12')`). Since the
+/// float types are stored FLOAT4 / FLOAT8 (0e4a259fb) a domain's base became the engine's custom
+/// float8 type, which refused the text ("cannot store TEXT value in REAL column").
+#[test]
+fn a_domain_over_numeric_takes_a_quoted_value() {
+    let dir = Scratch::new("domainnumeric");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create domain dn numeric(8,2)").ok("dn");
+    a.q("create domain dd double precision").ok("dd");
+    a.q("create table bt (n dn, d dd)").ok("bt");
+    a.q("insert into bt values ('123.5', '2.5')").ok("quoted values");
+    let r = a.q("select n, d from bt").ok("rows");
+    assert_eq!(r.rows, vec![vec![t("123.5"), t("2.5")]]);
+}
+
+/// A FROM alias's column list renames the relation's columns, the first ones, in order, as in
+/// PostgreSQL 18.6 (recorded, artie raw loud-20261015/pg18-diff/pg18-join1.out): `j1 AS t1 (a, b,
+/// c)` is read as a, b, c and named so in the result, `j1 t1 (a)` renames only the first, and a
+/// NATURAL JOIN joins on the new names. The list was dropped: the result kept i, j, t (the regress
+/// corpus's join.sql) and `t1.a` was 42703. A list longer than the relation is 42P10.
+#[test]
+fn a_from_alias_column_list_renames_the_columns() {
+    let dir = Scratch::new("aliascols");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE j1 (i int, j int, t text)").ok("j1");
+    a.q("CREATE TABLE j2 (i int, k int)").ok("j2");
+    a.q("INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two')").ok("j1 rows");
+    a.q("INSERT INTO j2 VALUES (1, -1), (5, -5)").ok("j2 rows");
+    let r = a.q("SELECT * FROM j1 AS t1 (a, b, c) ORDER BY a").ok("all renamed");
+    assert_eq!(r.names, names(&["a", "b", "c"]));
+    assert_eq!(r.rows, vec![vec![t("1"), t("4"), t("one")], vec![t("2"), t("3"), t("two")]]);
+    let r = a.q("SELECT t1.a, c FROM j1 t1 (a, b, c) ORDER BY a").ok("qualified");
+    assert_eq!((r.names, r.rows), (names(&["a", "c"]), vec![vec![t("1"), t("one")], vec![t("2"), t("two")]]));
+    let r = a.q("SELECT * FROM j1 t1 (a) ORDER BY a").ok("first renamed");
+    assert_eq!(r.names, names(&["a", "j", "t"]));
+    let r = a
+        .q("SELECT * FROM j1 t1 (a, b, c) NATURAL JOIN j2 t2 (a, d) ORDER BY a")
+        .ok("natural join on the new names");
+    assert_eq!(r.names, names(&["a", "b", "c", "d"]));
+    assert_eq!(r.rows, vec![vec![t("1"), t("4"), t("one"), t("-1")]]);
+    let sql = "SELECT * FROM j2 t2 (a, b, c)";
+    assert_eq!(a.q(sql).err(sql).code, "42P10", "{sql}");
+}
+
+/// KNOWN RED (ENGINE; known-red.txt): `SELECT *` over a RIGHT JOIN ... USING or a NATURAL RIGHT
+/// JOIN puts the merged join column first, then the left table's other columns, then the right's,
+/// as PostgreSQL 18.6 does (recorded, artie raw loud-20261015/pg18-diff/pg18-join2.out). The
+/// engine expands it as the right table's own columns after the left's (`j, t, i, k`), so a client
+/// that reads the row by position reads `j` where `i` stands.
+#[test]
+fn a_right_join_using_puts_the_merged_column_first() {
+    let dir = Scratch::new("rightusing");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE j1 (i int, j int, t text)").ok("j1");
+    a.q("CREATE TABLE j2 (i int, k int)").ok("j2");
+    a.q("INSERT INTO j1 VALUES (1, 4, 'one'), (3, 2, 'three')").ok("j1 rows");
+    a.q("INSERT INTO j2 VALUES (1, -1), (5, -5)").ok("j2 rows");
+    for sql in [
+        "SELECT * FROM j1 RIGHT JOIN j2 USING (i) ORDER BY i",
+        "SELECT * FROM j1 NATURAL RIGHT JOIN j2 ORDER BY i",
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.names, names(&["i", "j", "t", "k"]), "{sql}");
+        assert_eq!(
+            r.rows,
+            vec![vec![t("1"), t("4"), t("one"), t("-1")], vec![t("5"), None, None, t("-5")]],
+            "{sql}"
+        );
+    }
+}
+
+/// A boolean or float4 column of a derived table or a CTE keeps its type when the outer SELECT reads
+/// it, by name or through `*`, alone or across a join, as PostgreSQL 18.6 types it (recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-derivedbool.out). It was announced bytea (17) holding 1 and 0
+/// (the regress corpus's join.sql: `true AS linked` read through a LEFT JOIN).
+#[test]
+fn a_derived_tables_boolean_column_stays_boolean() {
+    let dir = Scratch::new("derivedbool");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE parent (k int primary key, pd int)").ok("parent");
+    a.q("CREATE TABLE child (k int unique, cd int)").ok("child");
+    a.q("INSERT INTO parent VALUES (1, 10), (2, 20)").ok("parent rows");
+    a.q("INSERT INTO child VALUES (1, 100), (4, 400)").ok("child rows");
+    for (sql, oids, rows) in [
+        ("SELECT linked FROM (SELECT true AS linked) s", vec![16], vec![vec![t("t")]]),
+        (
+            "SELECT s.b, s.c FROM (SELECT 1 = 1 AS b, 1.5::float4 AS c) s",
+            vec![16, 700],
+            vec![vec![t("t"), t("1.5")]],
+        ),
+        (
+            "SELECT p.k, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) \
+             AS ss ON (p.k = ss.k) ORDER BY p.k",
+            vec![23, 16],
+            vec![vec![t("1"), t("t")], vec![t("2"), None]],
+        ),
+        (
+            "WITH w AS (SELECT k > 1 AS big FROM parent) SELECT big FROM w ORDER BY big",
+            vec![16],
+            vec![vec![t("f")], vec![t("t")]],
+        ),
+        (
+            "SELECT * FROM (SELECT k, k = 1 AS one FROM parent) s ORDER BY k",
+            vec![23, 16],
+            vec![vec![t("1"), t("t")], vec![t("2"), t("f")]],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(oids), rows), "{sql}");
+    }
+}
+
+/// A `*` over a table beside a derived item's boolean column lines the result up with the table's
+/// width, so the boolean stays boolean (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-tablestar.out; the regress corpus's join.sql `p.*, linked`): the typing walk could not
+/// expand a table's `*` and left every column to the engine, which announced the boolean bytea.
+#[test]
+fn a_tables_star_beside_a_derived_boolean_keeps_it_boolean() {
+    let dir = Scratch::new("tablestar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE parent (k int primary key, pd int)").ok("parent");
+    a.q("CREATE TABLE child (k int unique, cd int)").ok("child");
+    a.q("INSERT INTO parent VALUES (1, 10), (2, 20)").ok("parent rows");
+    a.q("INSERT INTO child VALUES (1, 100), (4, 400)").ok("child rows");
+    for (sql, rows) in [
+        (
+            "SELECT p.*, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) \
+             AS ss ON (p.k = ss.k) ORDER BY p.k",
+            vec![vec![t("1"), t("10"), t("t")], vec![t("2"), t("20"), None]],
+        ),
+        (
+            "SELECT * FROM parent p, (SELECT true AS b) s ORDER BY p.k",
+            vec![vec![t("1"), t("10"), t("t")], vec![t("2"), t("20"), t("t")]],
+        ),
+        (
+            "SELECT * FROM (SELECT c.*, k > 1 AS big FROM child c) s ORDER BY k",
+            vec![vec![t("1"), t("100"), t("f")], vec![t("4"), t("400"), t("t")]],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![23, 23, 16]), rows), "{sql}");
+    }
+}
+
+/// KNOWN RED (ENGINE; known-red.txt): generate_series with an infinite start, stop or step is
+/// 22023, as PostgreSQL 18.6 refuses it ("stop value cannot be infinity"; recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-gsinf.out). Since the crash batch reads 'inf' text as the
+/// infinity, the engine's series to an infinite stop never ends: the session's thread spins and
+/// answers nothing more (the regress corpus's numeric.sql statement 867 stopped the script). The
+/// client gives up after 5 s here, so the red fails rather than hangs.
+#[test]
+fn generate_series_refuses_infinite_bounds() {
+    let dir = Scratch::new("gsinf");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for sql in [
+        "select * from generate_series(1, 3, 'inf'::numeric)",
+        "select * from generate_series('-inf'::numeric, 0, 10)",
+        "select * from generate_series(0::numeric, 'inf'::numeric, 10::numeric)",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "22023", "{sql}: {}", e.message);
+    }
+}
+
+/// A result column with no alias is named as PostgreSQL's FigureColname names it (recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-colnames.out): a column reference or a cast of one by the
+/// column, a cast of anything else by the type, a function, CASE, COALESCE, GREATEST, LEAST,
+/// NULLIF, ARRAY and EXISTS by their keyword, a scalar subquery by its one column, and an operator
+/// or a literal `?column?`. They were named by the engine's text of the translated expression
+/// (`CAST (9e999 AS REAL)`, `MAX (1, 2)`, `'abc'`): the regress corpus's numeric.sql and others,
+/// and a client reading a row by column name.
+#[test]
+fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
+    let dir = Scratch::new("colnames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cn (a int, b text)").ok("cn");
+    a.q("INSERT INTO cn VALUES (1, 'x')").ok("row");
+    let q = "?column?";
+    for (sql, names) in [
+        (
+            "SELECT 1 + 1, 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn",
+            vec![q, "numeric", "numeric", "a", "b"],
+        ),
+        (
+            "SELECT CASE WHEN true THEN 1 END, CASE WHEN true THEN a ELSE a END, coalesce(1, 2), \
+             greatest(1, 2), least(1, 2), nullif(1, 2) FROM cn",
+            vec!["case", "a", "coalesce", "greatest", "least", "nullif"],
+        ),
+        (
+            "SELECT ARRAY[1], EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), \
+             round(1.5) = 2, -1, NOT true, 1 IS NULL",
+            vec!["array", "exists", "q", "a", q, q, q, q],
+        ),
+        ("SELECT 'abc', 42, 1.5, true, NULL, $$d$$", vec![q; 6]),
+        (
+            "SELECT current_date IS NOT NULL, 'x'::varchar(3), CAST(1 AS integer), a + 0 FROM cn",
+            vec![q, "varchar", "int4", q],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        let want: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        assert_eq!(r.names, Some(want), "{sql}");
+    }
+}
+
+/// CASE, COALESCE, GREATEST, LEAST and NULLIF over integers are int4, as PostgreSQL 18.6 types
+/// them (recorded, artie raw loud-20261015/pg18-diff/pg18-colnames.out: oids 23); they were
+/// announced text (25), so a driver read a number as a string.
+#[test]
+fn conditional_expressions_over_integers_are_int4() {
+    let dir = Scratch::new("condint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let sql = "SELECT CASE WHEN true THEN 1 END, coalesce(1, 2), greatest(1, 2), least(1, 2), \
+               nullif(1, 2)";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23; 5]), "{sql}");
+    assert_eq!(r.rows, vec![vec![t("1"), t("1"), t("2"), t("1"), t("1")]], "{sql}");
+}
+
+/// A `*` or `alias.*` over a correlated generate_series names its column as PostgreSQL does, by the
+/// alias or the alias's column list (recorded, artie raw loud-20261015/pg18-diff/pg18-gsstar.out):
+/// the engine's table call names it `value`, and only a reference by name was renamed (the regress
+/// corpus's numeric.sql `generate_series(i, 3) j`).
+#[test]
+fn a_star_over_a_correlated_series_names_its_column() {
+    let dir = Scratch::new("gsstar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE gt (x int)").ok("gt");
+    a.q("INSERT INTO gt VALUES (2), (3)").ok("rows");
+    for (sql, want, rows) in [
+        ("select * from generate_series(1, 3) i, generate_series(i, 3) j order by 1, 2", ["i", "j"], 6),
+        ("select * from gt, generate_series(1, gt.x) g order by 1, 2", ["x", "g"], 5),
+        ("select * from gt, generate_series(1, gt.x) g(n) order by 1, 2", ["x", "n"], 5),
+        ("select gt.*, g.* from gt, generate_series(1, gt.x) g order by 1, 2", ["x", "g"], 5),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.names, names(&want), "{sql}");
+        assert_eq!(r.rows.len(), rows, "{sql}");
+    }
+}
+
+/// CREATE TABLE ... INHERITS is refused 0A000, with no table created. PostgreSQL gives the child
+/// its parents' columns too and shows its rows through the parent (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-inherits.out); the clause was dropped, so the child had its own
+/// columns alone and an INSERT of the parents' values went into the wrong columns or failed (the
+/// regress corpus's truncate.sql and returning.sql).
+#[test]
+fn create_table_inherits_is_refused_not_dropped() {
+    let dir = Scratch::new("inherits");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ipa (a int)").ok("parent");
+    let sql = "CREATE TABLE ich (b text) INHERITS (ipa)";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    let probe = "SELECT * FROM ich";
+    assert_eq!(a.q(probe).err(probe).code, "42P01", "the child was created");
+}
+
+/// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
+/// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
+/// integer, so `random()*3` overflowed and the regress corpus's union script drew
+/// 9223372036854775807.
+#[test]
+fn random_is_a_float8_in_the_unit_interval() {
+    let dir = Scratch::new("random");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for _ in 0..50 {
+        let r = a.q("SELECT random(), (random()*3)::int BETWEEN 0 AND 3").ok("random");
+        assert_eq!(r.oids, Some(vec![701, 16]));
+        let v: f64 = r.rows[0][0].as_deref().unwrap().parse().unwrap();
+        assert!((0.0..1.0).contains(&v), "random() = {v}");
+        assert_eq!(r.rows[0][1].as_deref(), Some("t"));
+    }
+}
+
+/// A result column that is a bare parameter is announced as the parameter's type, declared or
+/// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
+/// statement's and the portal's Describe; it was text whatever the declaration (the PG 18
+/// differential's finding (c)).
+#[test]
+fn a_bare_parameter_result_takes_the_parameters_type() {
+    let dir = Scratch::new("paramresult");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    for (oid, value, text) in [
+        (700, &b"1.5"[..], "1.5"),
+        (16, b"t", "t"),
+        (23, b"42", "42"),
+        (25, b"x", "x"),
+    ] {
+        let r = a.xt("SELECT $1", &[(oid, 0, value)]).ok("SELECT $1");
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "declared {oid}");
+    }
+    let r = a.describe_statement("SELECT $1::int4 + 1, $1").ok("describe");
+    assert_eq!(r.oids, Some(vec![23, 23]), "the second column is the parameter, inferred int4");
+}
+
+/// A result column whose expression is boolean in PostgreSQL's grammar (a boolean literal, a
+/// comparison, AND / OR / NOT, IS [NOT] NULL, IN, BETWEEN, LIKE, EXISTS, a cast to bool, a CASE
+/// whose every result is boolean) is announced bool (16) and sent as t / f, and a cast to float4 or
+/// real is announced float4 (700), on both protocols, as PostgreSQL 18 announces them (expected
+/// values from its recording, artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out, never
+/// from this server). They went out as int4 or text holding 1 and 0, and float4 casts as float8: a
+/// driver read a boolean as a number or a string (found by the PG 18 differential; the lead ruled
+/// them FIXED, 2026-10-15T06:03:10Z).
+#[test]
+fn boolean_and_float4_results_are_typed_as_postgresql_types_them() {
+    let dir = Scratch::new("resulttypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN, r REAL, d DOUBLE PRECISION)")
+        .ok("k");
+    a.q("INSERT INTO k VALUES (2, true, 1.5, 2.5)").ok("row");
+    let t = |s: &str| Some(s.to_string());
+    for (sql, oids, row) in [
+        ("SELECT true, false", vec![16, 16], vec![t("t"), t("f")]),
+        (
+            "SELECT 1 = 1, 1 <> 1, 1 < 2, 2 >= 3",
+            vec![16, 16, 16, 16],
+            vec![t("t"), t("f"), t("t"), t("f")],
+        ),
+        (
+            "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1)",
+            vec![16, 16],
+            vec![t("t"), t("f")],
+        ),
+        (
+            "SELECT NOT true, true AND false, true OR false",
+            vec![16, 16, 16],
+            vec![t("f"), t("f"), t("t")],
+        ),
+        (
+            "SELECT id > 1, flag, flag = true, id IS NULL, id IS NOT NULL FROM k",
+            vec![16, 16, 16, 16, 16],
+            vec![t("t"), t("t"), t("t"), t("f"), t("t")],
+        ),
+        (
+            "SELECT id IN (1, 2), id BETWEEN 1 AND 3, 'a' LIKE 'a%' FROM k",
+            vec![16, 16, 16],
+            vec![t("t"), t("t"), t("t")],
+        ),
+        (
+            "SELECT CASE WHEN id > 1 THEN true ELSE false END FROM k",
+            vec![16],
+            vec![t("t")],
+        ),
+        (
+            "SELECT d::float4, 1.5::float4, 1.5::real, 2.5::float8 FROM k",
+            vec![700, 700, 700, 701],
+            vec![t("2.5"), t("1.5"), t("1.5"), t("2.5")],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(oids.clone()), "{sql}: simple");
+        assert_eq!(r.rows, vec![row.clone()], "{sql}: simple");
+        let r = a.xt(sql, &[]).ok(sql);
+        assert_eq!(r.oids, Some(oids), "{sql}: extended");
+        assert_eq!(r.rows, vec![row], "{sql}: extended");
+    }
+    let r = a.xt("SELECT $1::bool", &[(16, 0, b"true")]).ok("$1::bool");
+    assert_eq!((r.oids, r.rows), (Some(vec![16]), vec![vec![t("t")]]));
+    let r = a.describe_statement("SELECT id > $1 FROM k").ok("describe");
+    assert_eq!(r.oids, Some(vec![16]), "a comparison over a parameter");
+}
+
+/// A float8 math function types its result as PostgreSQL resolves it, so an arithmetic over it and
+/// a parameter compared with that are float8: `sqrt(2) + 1` announces 701 and `sqrt(2) + 1 > $1`
+/// types $1 float8, as PostgreSQL 18.6 does (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-r14.out), so a value '1.5' runs. RULED SPEC CHANGE (lead, DECISIONS
+/// 9d8c1c38ef, item 17): this test was `an_operand_the_walk_cannot_type_types_nothing` and pinned
+/// the 42P18 refusal, a divergence. A parameter operand still takes the other side's type
+/// (`$1 + 1 > 2`, int4) (wire review 14 item 17).
+#[test]
+fn a_float8_math_function_types_its_comparison_parameter() {
+    let dir = Scratch::new("untypedoperand");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let r = a.q("SELECT sqrt(2) + 1").ok("result");
+    assert_eq!(r.oids, Some(vec![701]), "sqrt(2) + 1: rows {:?}", r.rows);
+    let sql = "SELECT 1 WHERE sqrt(2) + 1 > $1";
+    let r = a.describe_statement(sql).ok(sql);
+    assert_eq!(r.params, Some(vec![701]), "{sql}");
+    let r = a.xt(sql, &[(0, 0, b"1.5")]).ok("1.5");
+    assert_eq!(r.rows, vec![vec![t("1")]], "{sql} with 1.5");
+    let r = a.describe_statement("SELECT 1 WHERE $1 + 1 > 2").ok("control");
+    assert_eq!(r.params, Some(vec![23]), "a parameter operand takes the other side's type");
+}
+
+/// INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag and row count, as
+/// PostgreSQL 18 answers them (`INSERT 0 n`, `UPDATE n`, `DELETE n`; recorded in artie
+/// lanes/wire/raw/loud-20261015/pg18-diff), on both protocols: drivers read the affected count from
+/// the tag. Their rows went out through the query path, whose tag is `SELECT n` (found by the
+/// PG 18 differential of 2026-10-15).
+#[test]
+fn dml_returning_is_tagged_by_its_verb() {
+    let dir = Scratch::new("returningtag");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)").ok("r");
+    for (sql, tag) in [
+        ("INSERT INTO r VALUES (1, 'a'), (2, 'b') RETURNING id", "INSERT 0 2"),
+        ("UPDATE r SET v = 'c' WHERE id = 1 RETURNING v", "UPDATE 1"),
+        ("DELETE FROM r WHERE id = 2 RETURNING id", "DELETE 1"),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.tags, vec![tag.to_string()], "{sql}: rows {:?}", r.rows);
+    }
+    for (sql, tag) in [
+        ("INSERT INTO r VALUES ($1, 'x') RETURNING id", "INSERT 0 1"),
+        ("UPDATE r SET v = 'y' WHERE id = $1 RETURNING v", "UPDATE 1"),
+        ("DELETE FROM r WHERE id = $1 RETURNING id", "DELETE 1"),
+    ] {
+        let r = a.xt(sql, &[(23, 0, b"7")]).ok(sql);
+        assert_eq!(r.tags, vec![tag.to_string()], "extended {sql}: rows {:?}", r.rows);
+    }
+}
+
+/// An integer literal in base 2, 8 or 16, or with underscores, past int4 (PostgreSQL 16 and later)
+/// is its value, as PostgreSQL 18.6 answers (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-num.out), and never ends the session: `SELECT 0b10000000000000000000000000000000` reached
+/// the engine as that text, whose literal parser assumes SQLite's grammar checked it and hit
+/// unreachable!(), closing the connection (found by the PostgreSQL regression corpus,
+/// numerology.sql, 2026-10-15). A literal past i64 still answers and the session serves on (its
+/// value is a numeric in PostgreSQL, a float here: the bare-NUMERIC divergence).
+#[test]
+fn a_non_decimal_integer_literal_is_its_value() {
+    let dir = Scratch::new("numlit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, want) in [
+        ("SELECT 0b10000000000000000000000000000000", "2147483648"),
+        ("SELECT 0o20000000000", "2147483648"),
+        ("SELECT 0x80000000", "2147483648"),
+        ("SELECT -0x8000000000000000", "-9223372036854775808"),
+        ("SELECT 1_000_000", "1000000"),
+        ("SELECT 0b1_0", "2"),
+    ] {
+        assert_eq!(a.q(sql).single(sql), want, "{sql}");
+    }
+    let sql = "SELECT 0x_7FFF_FFFF_FFFF_FFFF_F";
+    let _ = a.q(sql);
+    assert_eq!(a.q("SELECT 1").single("the session serves on"), "1");
+}
+
+/// A CREATE TABLE with a SERIAL column completes as CREATE TABLE, with no row description, on both
+/// protocols, as PostgreSQL answers it. Since 0693b6c6d performs such a CREATE at prepare (with its
+/// sequence, in one transaction) and steps a no-op, the no-op's one column made the server answer it
+/// as a query: a RowDescription, 0 rows and `SELECT 0` (found by the PostgreSQL regression corpus,
+/// uuid.out, 2026-10-15).
+#[test]
+fn a_create_table_with_a_serial_completes_as_create_table() {
+    let dir = Scratch::new("serialtag");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("CREATE TABLE s1(id SERIAL, v INT)").ok("simple");
+    assert_eq!((r.oids, r.tags), (None, vec!["CREATE TABLE".to_string()]), "simple");
+    let r = a.xt("CREATE TABLE s2(id SERIAL, v INT)", &[]).ok("extended");
+    assert_eq!((r.oids, r.tags), (None, vec!["CREATE TABLE".to_string()]), "extended");
+}
+
+/// A refused CREATE TABLE leaves nothing behind, its SERIAL column's sequence included, as in
+/// PostgreSQL: one whose key onto itself does not resolve (42830, after the CREATE), and one whose
+/// table already exists. The sequence's `CREATE SEQUENCE IF NOT EXISTS` ran and committed at prepare,
+/// before the CREATE's own transaction began, so each refusal left a sequence (wire review 16 item
+/// 15). The controls: the same CREATE that succeeds adds its one sequence.
+#[test]
+fn a_refused_create_table_leaves_no_sequence() {
+    let dir = Scratch::new("serialundo");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sequences = |a: &mut Wire| {
+        a.q("SELECT count(*) FROM pg_sequences")
+            .single("pg_sequences")
+    };
+    a.q("CREATE TABLE p(id INT)").ok("p");
+    let before = sequences(&mut a);
+    let keyed = "CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT, parent INT REFERENCES tree(code))";
+    assert_eq!(a.q(keyed).err(keyed).code, "42830", "premise: code is not unique");
+    assert_eq!(sequences(&mut a), before, "the refused tree left its sequence");
+    let exists = "CREATE TABLE p(id SERIAL)";
+    a.q(exists).err(exists);
+    assert_eq!(sequences(&mut a), before, "the refused p left its sequence");
+    a.q("CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT UNIQUE, parent INT REFERENCES tree(code))")
+        .ok("control: tree with a unique code");
+    let after: u64 = sequences(&mut a).parse().unwrap();
+    assert_eq!(
+        after,
+        before.parse::<u64>().unwrap() + 1,
+        "control: the CREATE that succeeds adds one sequence"
+    );
+}
+
+/// The settings whose effect a ROLLBACK would have to undo, foreign_keys and search_path, are
+/// refused (0A000) inside an explicit transaction block and as SET LOCAL, as this server keeps a
+/// SET past the block whatever ends it: `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off for
+/// the session, and `BEGIN; SET search_path TO s, public; ROLLBACK` sent later unqualified writes
+/// to s (wire review 16 item 18; review 17 folded search_path into it). Each refusal fails its
+/// block, as any error does; outside a block, and in a multi-statement query's implicit block,
+/// both still act.
+#[test]
+fn a_setting_a_rollback_cannot_undo_is_refused_in_a_block() {
+    let dir = Scratch::new("setinblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(x INT REFERENCES p(id))").ok("c");
+    for sql in ["SET foreign_keys = off", "SET search_path TO s, public"] {
+        a.q("BEGIN").ok("begin");
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "0A000", "{sql} in a block");
+        assert_eq!(r.status, b'E', "{sql} fails the block");
+        a.q("ROLLBACK").ok("end");
+    }
+    let orphan = "INSERT INTO c VALUES (5)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "keys still on");
+    for sql in [
+        "SET LOCAL foreign_keys = off",
+        "SET LOCAL search_path TO public",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    a.q("SET search_path TO public; SELECT 1")
+        .ok("in a multi-statement query's implicit block");
+    a.q("SET search_path TO public").ok("outside a block");
+}
+
+/// A pg_dump -s header's settings each answer SET: those PostgreSQL 17 and 18 dumps write, one by
+/// one (the list is recalled from pg_dump's output, not recorded here; the owed run replays the
+/// BranchBench dump through psql). xmloption, transaction_timeout, default_tablespace and
+/// default_table_access_method answered 42704 since the SET allowlist (wire review 16 item 17).
+/// Each is accepted only at the value that changes nothing here, 0A000 at another; a name
+/// PostgreSQL knows that this server does not act on is 0A000 for SET and SHOW alike, not 42704
+/// "unrecognized" (the name list is PostgreSQL 18.6's settings table), and a name PostgreSQL does
+/// not know stays 42704.
+#[test]
+fn a_dump_headers_settings_are_accepted() {
+    let dir = Scratch::new("dumpheader");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        "SET idle_in_transaction_session_timeout = 0",
+        "SET transaction_timeout = 0",
+        "SET client_encoding = 'UTF8'",
+        "SET standard_conforming_strings = on",
+        "SET check_function_bodies = false",
+        "SET xmloption = content",
+        "SET client_min_messages = warning",
+        "SET row_security = off",
+        "SET default_tablespace = ''",
+        "SET default_table_access_method = heap",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    for (sql, code) in [
+        ("SET xmloption = document", "0A000"),
+        ("SET transaction_timeout = '5s'", "0A000"),
+        ("SET default_tablespace = 'fast'", "0A000"),
+        ("SET default_table_access_method = columnar", "0A000"),
+        ("SET geqo_threshold = 12", "0A000"),
+        ("SHOW geqo_threshold", "0A000"),
+        ("SET no_such_parameter = 1", "42704"),
+        ("SHOW no_such_parameter", "42704"),
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, code, "{sql}");
+    }
+}
+
+/// A client's value never chooses its error's SQLSTATE: a SET refused for its value is 0A000
+/// whatever the value says, `'is ambiguous'` and `'specified more than once'` included. The
+/// mapping matched those words anywhere in the message, which embeds the value, so `SET
+/// bytea_output = 'is ambiguous'` answered 42702 (wire review 16 item 20).
+#[test]
+fn a_clients_value_never_chooses_the_sqlstate() {
+    let dir = Scratch::new("valuecode");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET bytea_output = 'is ambiguous'",
+        "SET bytea_output = 'specified more than once'",
+        "SET bytea_output = 'escape'",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+}
+
+/// SET reads every value it is given, as PostgreSQL does: a setting PostgreSQL reads as one value
+/// takes one, so `SET client_encoding TO UTF8, LATIN1` and `SET TimeZone TO UTC, GMT` are 22023
+/// "SET <name> takes only one argument" (its flatten_set_variable_args, guc_funcs.c:233, read),
+/// and DateStyle, a list there, is read whole: `SET DateStyle TO ISO, DMY` is 0A000 and `SET
+/// DateStyle TO ISO, MDY` keeps `ISO, MDY`. Only the first value was read, so each of these
+/// answered SET on its first (wire review 18 item 19).
+#[test]
+fn set_reads_every_value_it_is_given() {
+    let dir = Scratch::new("setvalues");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET client_encoding TO UTF8, LATIN1",
+        "SET TimeZone TO UTC, GMT",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "22023", "{sql}");
+    }
+    let sql = "SET DateStyle TO ISO, DMY";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    a.q("SET DateStyle TO ISO, MDY")
+        .ok("a list that keeps ISO, MDY");
+    assert_eq!(a.q("SHOW DateStyle").single("DateStyle"), "ISO, MDY");
+}
+
+/// encode(bytea, format) answers as PostgreSQL's does: 'abc' in hex is 616263 and 'ab' in base64
+/// YWI=, a NULL argument is NULL, and an unknown format is 22023 "unrecognized encoding". It was no
+/// function at all (42883), found by the cloud run of bind_reads_each_parameter_in_its_format.
+#[test]
+fn encode_answers_as_postgresql_does() {
+    let dir = Scratch::new("encode");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    assert_eq!(a.q("SELECT encode('abc', 'hex')").single("hex"), "616263");
+    assert_eq!(
+        a.q("SELECT encode('ab', 'base64')").single("base64"),
+        "YWI="
+    );
+    let r = a.q("SELECT encode(NULL, 'hex')").ok("NULL");
+    assert_eq!(r.rows, vec![vec![None]]);
+    let sql = "SELECT encode('abc', 'nosuch')";
+    assert_eq!(a.q(sql).err(sql).code, "22023");
+}
+
+/// The parameters SET accepted as no-ops but which change PostgreSQL's answers act as they do
+/// there: `SET lock_timeout = '100ms'` makes a branch create behind another session's write
+/// transaction fail 55P03 within a second, not wait out the server's lock wait (5 s here, 60 s
+/// by default); statement_timeout and idle_in_transaction_session_timeout are accepted at 0 alone
+/// (another value is 0A000, as this server enforces neither); and client_min_messages filters the
+/// warnings a session is sent (COMMIT outside a block warns 25P01 at the default, at warning, not
+/// at error). Each answered SET and changed nothing (wire review 16 item 12).
+#[test]
+fn settings_that_change_answers_act_as_in_postgresql() {
+    let dir = Scratch::new("settings");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "5000"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')")
+        .ok("a write transaction holds the lock");
+    b.q("SET lock_timeout = '100ms'").ok("lock_timeout");
+    let started = Instant::now();
+    let r = b.q("SELECT turso_branch_create('x')");
+    let took = started.elapsed();
+    assert_eq!(r.err("create behind the lock").code, "55P03");
+    assert!(took < Duration::from_secs(1), "the create waited {took:?}");
+    a.q("ROLLBACK").ok("release");
+    for sql in [
+        "SET statement_timeout = '1ms'",
+        "SET idle_in_transaction_session_timeout = '5s'",
+    ] {
+        assert_eq!(b.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    b.q("SET statement_timeout = 0").ok("statement_timeout 0");
+    let warned = |w: &mut Wire| w.q("COMMIT").ok("COMMIT outside a block").notices.len();
+    assert_eq!(warned(&mut b), 1, "the default level sends the warning");
+    b.q("SET client_min_messages = warning").ok("warning");
+    assert_eq!(warned(&mut b), 1, "at warning");
+    b.q("SET client_min_messages = error").ok("error");
+    assert_eq!(warned(&mut b), 0, "at error no warning is sent");
+}
+
 /// The failure triggers the failure-path tests use do fail, each with its code, so a test that
 /// fails a statement or a block takes its failure path: a missing relation at prepare (42P01; in a
 /// block the block fails) and a duplicate key at execution (23505). `SELECT 1/0`, which they used,
@@ -2216,6 +3661,131 @@ fn the_failure_triggers_fail() {
     assert_eq!(a.q(sql).err(sql).code, "23505");
 }
 
+/// In a failed block Parse refuses any statement but a block exit, 25P02, with no ParseComplete
+/// before it and before anything reads the statement's parameters, as PostgreSQL's
+/// exec_parse_message refuses it ahead of parse analysis (postgres.c:1522-1528 at REL_19_BETA1-820,
+/// read). Parse succeeded for every statement, so CHECKPOINT declared one unspecified parameter
+/// answered 42P18 at Bind ahead of the 25P02 (wire review 17 item 8), and ParseComplete went out
+/// for a statement PostgreSQL never parses. A block exit still parses and ends the block.
+#[test]
+fn a_failed_block_refuses_at_parse() {
+    let dir = Scratch::new("abortedparse");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (with `oids` declared), Bind (no values), Execute, Sync: every message type byte up to
+    // ReadyForQuery, the first error and the status ReadyForQuery carries.
+    fn round(w: &mut Wire, sql: &str, oids: &[u32]) -> (Vec<u8>, Option<WireError>, u8) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+        for oid in oids {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        w.send(b'P', &parse);
+        w.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error, body[0]);
+            }
+        }
+    }
+    a.q("BEGIN").ok("begin");
+    let fail = "SELECT * FROM nosuch";
+    assert_eq!(a.q(fail).status, b'E', "{fail} did not fail the block");
+    for (sql, oids) in [
+        ("CHECKPOINT", &[0u32][..]),
+        ("SELECT 1", &[0][..]),
+        ("SELECT v FROM t", &[][..]),
+    ] {
+        let (types, error, status) = round(&mut a, sql, oids);
+        assert_eq!(error.map(|e| e.code), Some("25P02".to_string()), "{sql}");
+        assert_eq!(types, vec![b'E', b'Z'], "{sql}: nothing before the refusal");
+        assert_eq!(status, b'E', "{sql}");
+    }
+    let (types, error, status) = round(&mut a, "ROLLBACK", &[]);
+    assert!(error.is_none(), "a block exit parses: {error:?}");
+    assert_eq!(types, vec![b'1', b'2', b'C', b'Z'], "ROLLBACK");
+    assert_eq!(status, b'I', "ROLLBACK ended the block");
+}
+
+/// A block exit bound with a value in a failed block is refused at the Bind, 25P02, with no
+/// BindComplete before it, as PostgreSQL's exec_bind_message refuses it (numParams != 0), and the
+/// block stays failed; with no value the same ROLLBACK binds and ends the block. Parse refuses
+/// every other statement there (a_failed_block_refuses_at_parse), so this is the Bind's own
+/// refusal. The 25P02 rows before asserted the code alone, which a refusal after BindComplete
+/// gives too (wire review 17 item 13). The mutant that drops `|| !message.parameters.is_empty()`
+/// from on_bind's aborted check must turn this red.
+#[test]
+fn a_block_exit_bound_with_a_value_is_refused_before_bind_complete() {
+    let dir = Scratch::new("abortedbind");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse ROLLBACK declaring `values.len()` text parameters, Bind them, Execute, Sync: every
+    // message type byte up to ReadyForQuery, the first error and the status.
+    fn round(w: &mut Wire, values: &[&[u8]]) -> (Vec<u8>, Option<WireError>, u8) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"ROLLBACK\0");
+        parse.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for _ in values {
+            parse.extend_from_slice(&25u32.to_be_bytes());
+        }
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8, 0, 0];
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error, body[0]);
+            }
+        }
+    }
+    a.q("BEGIN").ok("begin");
+    let fail = "SELECT * FROM nosuch";
+    assert_eq!(a.q(fail).status, b'E', "{fail} did not fail the block");
+    let (types, error, status) = round(&mut a, &[b"x"]);
+    assert_eq!(error.map(|e| e.code), Some("25P02".to_string()));
+    assert_eq!(
+        types,
+        vec![b'1', b'E', b'Z'],
+        "no BindComplete before the refusal"
+    );
+    assert_eq!(status, b'E', "the block is still failed");
+    let (types, error, status) = round(&mut a, &[]);
+    assert!(error.is_none(), "ROLLBACK with no value: {error:?}");
+    assert_eq!(types, vec![b'1', b'2', b'C', b'Z']);
+    assert_eq!(status, b'I', "ROLLBACK ended the block");
+}
+
 /// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer division by zero is 22012 "division by zero"
 /// in PostgreSQL. This engine answers one row holding NULL: core's exec_divide sends an integer /0
 /// to the float path, whose checked division answers None, and the PostgreSQL frontend maps `/` to
@@ -2235,13 +3805,16 @@ fn integer_division_by_zero_is_22012() {
 /// NUMERIC divide refuses a zero divisor as a constraint error with those words, which was mapped
 /// with every other constraint error to 23000, integrity_constraint_violation, so a driver raised an
 /// IntegrityError (wire review 16 item 2, the wire's half; the integer half is the engine's,
-/// integer_division_by_zero_is_22012).
+/// integer_division_by_zero_is_22012). The column is NUMERIC(10,2): only numeric(p,s) reaches the
+/// engine's NUMERIC divide, as a bare NUMERIC is REAL here (wire review 18 HIGH 2, a test change
+/// the lead ruled at 2026-10-15T02:59:32Z; bare NUMERIC's own divergence is the known red
+/// a_bare_numeric_division_by_zero_is_22012).
 #[test]
 fn a_numeric_division_by_zero_is_22012() {
     let dir = Scratch::new("numdiv0");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE nd(x NUMERIC)").ok("nd");
+    a.q("CREATE TABLE nd(x NUMERIC(10,2))").ok("nd");
     a.q("INSERT INTO nd VALUES (1.5)").ok("row");
     let sql = "SELECT x / 0 FROM nd";
     let e = a.q(sql).err(sql);
@@ -2250,6 +3823,25 @@ fn a_numeric_division_by_zero_is_22012() {
         "premise: the engine's NUMERIC divide refused the zero divisor"
     );
     assert_eq!(e.code, "22012");
+}
+
+/// KNOWN RED (known-red.txt; E5-QUEUE M1b): a bare NUMERIC's division by zero is 22012
+/// "division by zero" in PostgreSQL; here a bare NUMERIC is REAL (the translator's type map), so
+/// x / 0 answers one row holding NULL, as an integer's does (the cloud run at abefd2e71: "expected
+/// an error, got rows [[None]]"). It keeps the divergence a_numeric_division_by_zero_is_22012
+/// exposed watched after that test moved to NUMERIC(10,2) (wire review 18 HIGH 2; the lead's
+/// condition, 2026-10-15T02:59:32Z). Green when a bare NUMERIC is a numeric or its divide by zero
+/// raises 22012.
+#[test]
+fn a_bare_numeric_division_by_zero_is_22012() {
+    let dir = Scratch::new("barenumdiv0");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nd(x NUMERIC)").ok("nd");
+    a.q("INSERT INTO nd VALUES (1.5)").ok("row");
+    let sql = "SELECT x / 0 FROM nd";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "22012", "rows {:?}", r.rows);
 }
 
 /// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer modulo by zero is 22012 in PostgreSQL; this
@@ -2471,7 +4063,10 @@ fn an_extended_copy_from_loads_its_rows_once() {
 /// after ParseComplete, BindComplete, the Describe reply, CommandComplete and ReadyForQuery, five
 /// writes against one (wire review 1 item 12). The statement is a branch call that touches no
 /// storage; the five messages arrive in one write; the least of 7 rounds per protocol is compared,
-/// counted by the server itself (turso_branch_stats' unix_syscalls).
+/// counted by the server itself (turso_branch_stats' unix_syscalls), which only an Apple build
+/// counts, so the test is Apple's alone, as branch_stats_reports_the_servers_counters is (ruled
+/// c9c821dd8d, P5).
+#[cfg(target_vendor = "apple")]
 #[test]
 fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
     let dir = Scratch::new("extsyscalls");
@@ -2505,24 +4100,77 @@ fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
 }
 
 /// Describe of a statement whose parameters the client did not declare reports them all, $1 up to
-/// the highest $n used, as text, as PostgreSQL reports every parameter it infers. At 472023b72 it
-/// reported only the declared ones, so asyncpg, tokio-postgres and pgx (which declare none) saw no
-/// parameter and refused to bind (wire review 1 item 13).
+/// the highest $n used, each typed as PostgreSQL infers it: from the column it is compared with
+/// (int4 for id), text for the branch call's name. At 472023b72 it reported only the declared
+/// ones, so asyncpg, tokio-postgres and pgx (which declare none) saw no parameter and refused to
+/// bind (wire review 1 item 13). A parameter below the highest that the statement does not hold
+/// is 42P18, as PostgreSQL's Parse refuses a parameter it cannot type. The expected values were
+/// text throughout until the context typing landed; moved to PostgreSQL's answers, PROVISIONALLY
+/// (ruled c9c821dd8d, P6): a PostgreSQL 18 recording is LOUD-OWED, and if it differs the edit is
+/// reverted.
 #[test]
 fn describe_statement_reports_undeclared_parameters() {
     let dir = Scratch::new("describeparams");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
     const TEXT: u32 = 25;
+    const INT4: u32 = 23;
     for (sql, want) in [
         ("SELECT turso_branch_create($1)", vec![TEXT]),
-        ("SELECT v FROM t WHERE id = $1", vec![TEXT]),
-        ("SELECT v FROM t WHERE id = $2", vec![TEXT, TEXT]),
+        ("SELECT v FROM t WHERE id = $1", vec![INT4]),
         ("SELECT v FROM t", vec![]),
     ] {
         let r = a.describe_statement(sql).ok(sql);
         assert_eq!(r.params, Some(want), "{sql}");
     }
+    let gap = "SELECT v FROM t WHERE id = $2";
+    let r = a.describe_statement(gap);
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P18"),
+        "{gap}: $1 is not in the statement and nothing types it: {:?}",
+        r.params
+    );
+}
+
+/// Wire review 18 item 14, the deep arm: over v1..v1000, each reading the one before, a Describe
+/// of `SELECT * FROM v1000 WHERE x = $1` is refused 54001, cold and again, and the session and the
+/// server still answer after (a stack overflow on a session thread aborts the whole process). The
+/// parameter-type walk cut every view nested 32 deep, so the cold Describe was 42P18. The engine's
+/// own reading of the chain, at CREATE VIEW and at prepare, is core's and has not been run at this
+/// depth: if this arm dies there, the finding is the engine's.
+#[test]
+fn a_thousand_view_chain_is_typed_and_the_server_survives() {
+    let dir = Scratch::new("viewchain");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY)").ok("t");
+    let views = (1..=1000)
+        .map(|k| match k {
+            1 => "CREATE VIEW v1 AS SELECT id AS x FROM t".to_string(),
+            k => format!("CREATE VIEW v{k} AS SELECT x FROM v{p}", p = k - 1),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    a.q(&views).ok("the chain");
+    // FLAGGED RULED SPEC CHANGE (lead, view cap ruling, 2026-10-15): the engine bounds a view
+    // chain by the stack it has, so a chain this deep is refused 54001 (PostgreSQL's stack depth
+    // limit), cleanly, and the session and the server live on; this asserted `$1` int4.
+    let sql = "SELECT * FROM v1000 WHERE x = $1";
+    for round in ["cold", "warm"] {
+        let r = a.describe_statement(sql);
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("54001"),
+            "{round}: {:?}",
+            r.params
+        );
+    }
+    a.q("SELECT 1").ok("the session still answers");
+    server
+        .connect()
+        .q("SELECT 1")
+        .ok("the server still answers");
 }
 
 /// Aggregates have PostgreSQL's result types, the same over both protocols and whatever the rows
@@ -2692,25 +4340,11 @@ fn schema_ddl_is_refused_in_server_mode() {
 #[test]
 fn an_index_on_a_qualified_table_is_that_tables() {
     let dir = Scratch::new("qualindex");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c INT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c INT);\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -2739,6 +4373,54 @@ fn an_index_on_a_qualified_table_is_that_tables() {
     );
 }
 
+/// A view over `public.t` (pg_dump's form) types the parameters compared with its columns: the
+/// view is stored with the engine's name for public, `main.t`, which the parameter-type walk
+/// now reads as public's t, so `c = $1` is int4 (23), as at 0823803c1 and in PostgreSQL. Since
+/// 594edd413 translated public to main, the walk read `main` as another schema it cannot open and
+/// refused every such parameter 42P18 (wire review 18 item 5).
+#[test]
+fn a_view_over_public_t_types_its_parameters() {
+    let dir = Scratch::new("publicview");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY, c INT)").ok("t");
+    a.q("CREATE VIEW v AS SELECT id, c FROM public.t")
+        .ok("a view over public.t");
+    let r = a.describe_statement("SELECT id FROM v WHERE c = $1");
+    assert_eq!(r.params, Some(vec![23]), "{:?}", r.error);
+}
+
+/// A three-part column reference resolves through its schema as the two-part form does: with
+/// pg_class in FROM, `pg_catalog.pg_class.relname = $1` types `$1` exactly as `pg_class.relname
+/// = $1` does (PostgreSQL types both name, 19; this catalog declares relname text, a separate
+/// divergence), and `public.t.c` with t aliased away (FROM t AS x) names no FROM entry, 42P01, as
+/// PostgreSQL's errorMissingRTE answers. The three-part path hard-coded public, so the pg_catalog
+/// form was refused 42P18 (wire review 17 item 5).
+#[test]
+fn a_three_part_reference_resolves_through_its_schema() {
+    let dir = Scratch::new("threepart");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY, c INT)").ok("t");
+    let two = a.describe_statement("SELECT 1 FROM pg_class WHERE pg_class.relname = $1");
+    assert!(
+        two.error.is_none() && two.params.is_some(),
+        "premise: the two-part form is typed: {:?}",
+        two.error
+    );
+    let three =
+        a.describe_statement("SELECT 1 FROM pg_class WHERE pg_catalog.pg_class.relname = $1");
+    assert_eq!(three.params, two.params, "{:?}", three.error);
+    let sql = "SELECT 1 FROM t AS x WHERE public.t.c = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P01"),
+        "{sql}: {:?}",
+        r.params
+    );
+}
+
 /// An unqualified relation is typed from the relation the engine resolves along the search path:
 /// an entry that names no attached schema (`"$user"`, PostgreSQL's default, or `nosuch`) is
 /// skipped, and an attached schema that does not hold the name is passed over, so under `"$user",
@@ -2753,26 +4435,12 @@ fn an_index_on_a_qualified_table_is_that_tables() {
 #[test]
 fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
     let dir = Scratch::new("resolver");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE orders(id INT PRIMARY KEY);\n\
-              CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.u(id INT PRIMARY KEY, n INT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE orders(id INT PRIMARY KEY);\n\
+          CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.u(id INT PRIMARY KEY, n INT);\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -2818,6 +4486,27 @@ fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
     );
 }
 
+/// A foreign key in a schema other than public is refused (0A000), and no table is made: the key
+/// checks read public's catalog alone, so `CREATE TABLE s.c(x INT REFERENCES s.p(id))` was refused
+/// 42P01 with no public p, refused 42830 naming "<unknown>" with a public p but no public c (and
+/// the table rolled back), or committed with its key checked against public's p and never against
+/// s.p, every later INSERT then failing "foreign key mismatch" (wire review 16 item 11; DECISIONS:
+/// a schema is branched or refused). As ALTER TABLE ADD CONSTRAINT refuses outside public. Schema
+/// s is made by the non-server CLI before the server starts.
+#[test]
+fn a_foreign_key_outside_public_is_refused() {
+    let dir = Scratch::new("schemakeys");
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.p(id INT PRIMARY KEY);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "CREATE TABLE s.c(x INT REFERENCES s.p(id))";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "no public p");
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("a public p");
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "with a public p");
+    let r = a.q("SELECT count(*) FROM s.c");
+    assert!(r.error.is_some(), "s.c was made: {:?}", r.rows);
+}
+
 /// An explicit `public.` names public's relation whatever the search path, as in PostgreSQL. With
 /// public.t(c int) and s.t(c text) under `SET search_path TO s, public`, a literal INSERT, an UPDATE,
 /// a DELETE and an INSERT of an undeclared '007' (typed int4 from public.t, stored 7) all reach
@@ -2828,26 +4517,12 @@ fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
 #[test]
 fn an_explicit_public_qualifier_names_public() {
     let dir = Scratch::new("publicqual");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
-              INSERT INTO s.t VALUES (1, 'one');\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
+          INSERT INTO s.t VALUES (1, 'one');\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -2876,12 +4551,87 @@ fn an_explicit_public_qualifier_names_public() {
     assert_eq!(a.q("SELECT count(*) FROM s.t").single("s.t"), "1");
 }
 
+/// An aggregate's result type comes from the relation the engine reads, through the search path:
+/// with public.t(c int) and s.t(c text), after `SET search_path TO s, public` `SELECT max(c) FROM
+/// t` reads s.t, so its column is text (OID 25), on both protocols, as its rows are; `SELECT
+/// max(c) FROM public.t` stays int4. aggregate_types read every FROM table in public alone, so the
+/// first announced int4 over s.t's text (wire review 17 item 15).
+#[test]
+fn an_aggregate_is_typed_from_the_relation_the_engine_reads() {
+    let dir = Scratch::new("aggpath");
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
+          INSERT INTO s.t VALUES (1, 'x');\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path TO s, public").ok("search path");
+    let sql = "SELECT max(c) FROM t";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("x".to_string())]],
+        "premise: s.t's rows"
+    );
+    assert_eq!(r.oids, Some(vec![25]), "simple protocol");
+    assert_eq!(
+        a.x(sql, &[]).ok(sql).oids,
+        Some(vec![25]),
+        "extended protocol"
+    );
+    let sql = "SELECT max(c) FROM public.t";
+    assert_eq!(a.q(sql).ok(sql).oids, Some(vec![23]), "public.t");
+}
+
+/// A parameter only in an ON CONFLICT clause is typed from the target's row, `excluded` included:
+/// with public.t(c int) and s.t(c text), `INSERT INTO s.t ... DO UPDATE SET c = $1` and `... DO
+/// UPDATE SET c = 'z' WHERE excluded.c = $1` are refused 42P18 (the walk cannot read an attached
+/// schema) or typed text, never int4 from public's t; and an UPDATE whose target has a CTE's name
+/// in scope is typed from the table (public p(name text): [25]), not the CTE (an int). The ON
+/// CONFLICT arm of a_parameter_is_typed_from_the_relation_the_engine_writes put its `$1` in VALUES,
+/// which refuses it first, so it never read `excluded` (wire review 17 item 14). The mutant that
+/// types `excluded` from rel.relname (public's t) must turn this red.
+#[test]
+fn a_parameter_in_on_conflict_is_typed_from_the_target() {
+    let dir = Scratch::new("onconflict");
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE TABLE p(name TEXT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "INSERT INTO s.t VALUES (2, 'y') ON CONFLICT (id) DO UPDATE SET c = $1",
+        "INSERT INTO s.t VALUES (2, 'y') ON CONFLICT (id) DO UPDATE SET c = 'z' WHERE excluded.c = $1",
+    ] {
+        let r = a.describe_statement(sql);
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "42P18");
+        assert!(
+            refused || r.params == Some(vec![25]),
+            "{sql}: {:?} {:?}, want 42P18 or [25], never [23]",
+            r.params,
+            r.error
+        );
+    }
+    let sql = "WITH p AS (SELECT 1 AS name) UPDATE p SET name = 'x' WHERE name = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(r.params, Some(vec![25]), "{sql}: {:?}", r.error);
+}
+
 /// A parameter is typed from the relation the engine will write, through its schema and the
 /// session's search path: never from public's table of the same name. With public.t(c int) and
 /// s.t(c text), an undeclared '007' into s.t (INSERT, UPDATE SET, ON CONFLICT's excluded) or into
 /// t after `SET search_path TO s, public` is stored as '007' or refused 42P18 (the walk cannot read
 /// an attached schema), never typed int4 and stored as 7; a DML target is the table even when a
-/// CTE of its name is in scope; and a three-part `s.t.c` reference is refused 42P18, not text. The
+/// CTE of its name is in scope; and a three-part `s.t.c` reference with only public's t in FROM
+/// names no FROM entry, 42P01 as PostgreSQL's errorMissingRTE answers (FLAGGED edit, the lead's
+/// pre-approval of wire review 17 item 5: it asserted 42P18), not text. The
 /// walk read every target in public alone (wire review 14 item 3; psycopg3 sends str parameters
 /// with OID 0, so it reaches this with default settings). The schema is made by the non-server CLI
 /// before the server starts: the server refuses CREATE SCHEMA, and attaches a schema file present
@@ -2889,26 +4639,12 @@ fn an_explicit_public_qualifier_names_public() {
 #[test]
 fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
     let dir = Scratch::new("schematarget");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE TABLE p(name TEXT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE TABLE p(name TEXT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
     );
     assert!(
         dir.0.join("turso-postgres-schema-s.db").exists(),
@@ -2970,9 +4706,9 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
         ));
     }
     let r = a.describe_statement("SELECT 1 FROM t WHERE s.t.c = $1");
-    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
         wrong.push(format!(
-            "a three-part reference: {:?} {:?}, want 42P18",
+            "a three-part reference: {:?} {:?}, want 42P01",
             r.params, r.error
         ));
     }
@@ -2985,37 +4721,29 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
 }
 
 /// A column alias list over a `*` the walk cannot expand (a relation of another schema) leaves the
-/// columns unknown, so a parameter compared with one is refused 42P18: a CTE's column list, a FROM
-/// alias's and a view's. The alias list renamed the `*` marker away, so the relation read as having
-/// the aliased columns, untyped, and $1 fell to text (wire review 14 item 8).
+/// columns unknown, so a parameter compared with one is refused 42P18: a CTE's column list and a
+/// FROM alias's. The alias list renamed the `*` marker away, so the relation read as having the
+/// aliased columns, untyped, and $1 fell to text (wire review 14 item 8). A view's arm cannot be
+/// reached: the engine refuses a view over the attached table, and that refusal is pinned here
+/// (ruled c9c821dd8d, P4; COMPAT's views table).
 #[test]
 fn an_alias_list_over_an_unknown_star_stays_unknown() {
     let dir = Scratch::new("aliasstar");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(b"CREATE SCHEMA s;\nCREATE TABLE s.u(k INT, n INT);\n")
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
-    );
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.u(k INT, n INT);\n");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE VIEW vu(k, n) AS SELECT * FROM s.u")
-        .ok("premise: a view with a column list over s.u");
+    let view = "CREATE VIEW vu(k, n) AS SELECT * FROM s.u";
+    let refused = a.q(view).err(view);
+    assert!(
+        refused
+            .message
+            .contains("view cannot reference table in attached database"),
+        "a view over the attached table: {refused:?}, want the engine's refusal"
+    );
     let mut wrong = Vec::new();
     for sql in [
         "WITH w(k, n) AS (SELECT * FROM s.u) SELECT k FROM w WHERE n > $1",
         "SELECT k FROM (SELECT * FROM s.u) AS d(k, n) WHERE n > $1",
-        "SELECT k FROM vu WHERE n > $1",
     ] {
         let r = a.describe_statement(sql);
         if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
@@ -3530,12 +5258,15 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
         .ok("delete once b left");
 }
 
-/// Inside a block, an error the engine answers by rolling the whole transaction back (an integer
-/// overflow in sum(): a read statement gets no statement savepoint) takes the block's savepoints
-/// with it. A later ROLLBACK TO one of them is refused as PostgreSQL refuses a savepoint that does
-/// not exist (3B001), and the block stays failed until its end; it was XX000 "no such savepoint".
-/// Keeping the work before the savepoint, as PostgreSQL does, is the engine's half (wire review 3
-/// item 10); once it lands this test needs another way to make the engine drop a block.
+/// Inside a block, an error from a statement with no statement savepoint of its own (an integer
+/// overflow in sum(), a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one
+/// ends the failed state, the block carries on, and COMMIT keeps the work done before the
+/// savepoint. Until the engine kept them (wire review 3 item 10, the engine's half) such an error
+/// rolled the whole transaction back, savepoints with it, and this test pinned the server's 3B001
+/// for the vanished savepoint; its expected values moved to PostgreSQL's behaviour, PROVISIONALLY
+/// (ruled c9c821dd8d, P7): a PostgreSQL 18 recording is LOUD-OWED, and if it differs the edit is
+/// reverted. The name is kept from then. The 3B001 arm (Session::run, an aborted block with no
+/// engine transaction) has no test that reaches it now.
 #[test]
 fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     let dir = Scratch::new("discardedsavepoint");
@@ -3549,16 +5280,16 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     a.q("SAVEPOINT s").ok("savepoint");
     let r = a.q("SELECT sum(v) FROM big");
     assert!(r.error.is_some(), "sum did not overflow: {:?}", r.rows);
-    let r = a.q("ROLLBACK TO s");
-    assert_eq!(r.err("rollback to s").code, "3B001");
-    assert_eq!(r.status, b'E', "the block is no longer failed");
-    assert_eq!(a.q("SELECT 1").err("in the failed block").code, "25P02");
+    let r = a.q("ROLLBACK TO s").ok("rollback to s");
+    assert_eq!(r.status, b'T', "the block is still failed");
+    assert_eq!(a.q("SELECT 1").single("in the block"), "1");
     let r = a.q("COMMIT").ok("the block's end");
-    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
     assert_eq!(r.status, b'I');
     assert_eq!(
         a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
-        "0"
+        "1",
+        "the work before the savepoint was kept"
     );
 }
 
@@ -3786,6 +5517,24 @@ fn an_error_outside_a_statements_run_fails_its_block() {
     );
 }
 
+/// A function in FROM reads the FROM items before it (PostgreSQL's functions in FROM are implicitly
+/// LATERAL), in its arguments too: in `... EXISTS (SELECT 1 FROM q, generate_series(1, CASE WHEN
+/// name > $1 ...))` the bare name is q's, int4, the nearer item, never the outer p's text. The walk
+/// read the arguments in the enclosing scope alone, so $1 was typed from p.name (wire review 16
+/// item 24).
+#[test]
+fn a_from_functions_arguments_read_the_items_before_it() {
+    let dir = Scratch::new("fromfnargs");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(name TEXT)").ok("p");
+    a.q("CREATE TABLE q(name INT)").ok("q");
+    let sql = "SELECT 1 FROM p WHERE EXISTS (SELECT 1 FROM q, \
+               generate_series(1, CASE WHEN name > $1 THEN 2 ELSE 3 END))";
+    let r = a.describe_statement(sql).ok(sql);
+    assert_eq!(r.params, Some(vec![23]), "{sql}: $1 is compared with q.name");
+}
+
 /// A correlated generate_series column is the name of its own SELECT only, as in PostgreSQL. It
 /// was one name for the whole statement: a bare `g` in a sublink, another UNION arm, a CTE body,
 /// a derived table's parent, RETURNING or an outer ORDER BY read the series, and two series
@@ -3992,8 +5741,9 @@ fn copy_refuses_an_option_it_does_not_implement() {
 }
 
 /// A statement the frontend performs while preparing it is refused before it runs when it holds a
-/// parameter: 42P02 over the simple protocol (nothing binds one), 0A000 over the extended one (no
-/// such statement takes parameters here); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
+/// parameter: 42P02 on both protocols, as PostgreSQL answers a utility statement's $n (FLAGGED
+/// edit, the lead's pre-approval of wire review 17 item 4: the extended arm asserted an invented
+/// 0A000); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
 /// has no WHERE. The COPY ran inside the prepare before any guard saw it, and its WHERE was never
 /// read, so `WHERE id > 5` and `WHERE v = $1` imported every row (wire review 13 item 9).
 #[test]
@@ -4010,7 +5760,7 @@ fn a_prepare_time_statement_is_refused_before_it_runs() {
     assert_eq!(r.err("COPY with $1 by simple query").code, "42P02");
     assert_eq!(count(&mut a), "0", "nothing imported");
     let r = a.xt(&with_param, &[(25, 0, b"one")]);
-    assert_eq!(r.err("COPY with $1 by Bind").code, "0A000");
+    assert_eq!(r.err("COPY with $1 by Bind").code, "42P02");
     assert_eq!(count(&mut a), "0", "nothing imported");
     let r = a.q(&format!("COPY cw FROM '{}' WHERE id > 5", rows.display()));
     assert_eq!(r.err("COPY ... WHERE").code, "0A000");
@@ -4018,6 +5768,39 @@ fn a_prepare_time_statement_is_refused_before_it_runs() {
     a.q(&format!("COPY cw FROM '{}'", rows.display()))
         .ok("a plain COPY still imports");
     assert_eq!(count(&mut a), "2");
+}
+
+/// The prepare-time `$n` guards leave nothing behind, by simple query and by Bind (wire review 17
+/// item 12: the extended arms of these guards passed without the guard). `ALTER TABLE ... ADD
+/// CONSTRAINT CHECK (v > $1)` is 42P02 and adds no CHECK: bound with 100, a row with v = 5 still
+/// goes in. `CREATE TABLE sn(id SERIAL, v INT DEFAULT $1)` is 42P02 and makes neither the table nor
+/// its sequence: both are created afterwards with no "already exists". Mutants that must turn this
+/// red: the `$n` guard's `performs` filter deleted (the ALTER), and the prerequisites' `$n` refusal
+/// deleted (the sequence).
+#[test]
+fn a_parameter_in_a_prepare_time_statement_runs_nothing() {
+    let dir = Scratch::new("guardpins");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ck(id INT PRIMARY KEY, v INT)").ok("ck");
+    let alter = "ALTER TABLE ck ADD CONSTRAINT big CHECK (v > $1)";
+    let r = a.q(alter);
+    assert_eq!(r.err("ALTER with $1 by simple query").code, "42P02");
+    a.q("INSERT INTO ck VALUES (1, 5)")
+        .ok("no CHECK after the simple query");
+    let r = a.xt(alter, &[(23, 0, b"100")]);
+    assert_eq!(r.err("ALTER with $1 by Bind").code, "42P02");
+    a.q("INSERT INTO ck VALUES (2, 5)")
+        .ok("no CHECK (v > 100) after the Bind");
+    let create = "CREATE TABLE sn(id SERIAL, v INT DEFAULT $1)";
+    let r = a.q(create);
+    assert_eq!(r.err("SERIAL with $1 by simple query").code, "42P02");
+    let r = a.xt(create, &[(23, 0, b"7")]);
+    assert_eq!(r.err("SERIAL with $1 by Bind").code, "42P02");
+    a.q("CREATE SEQUENCE sn_id_seq")
+        .ok("the refused CREATEs left no sequence");
+    a.q("CREATE TABLE sn(id INT, v INT)")
+        .ok("the refused CREATEs left no table");
 }
 
 /// An undeclared parameter has the type PostgreSQL infers from its context, the same at Describe
@@ -4139,7 +5922,10 @@ fn a_fatal_startup_error_ends_the_session() {
     let mut a = seeded(&server);
     let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut w = Wire { s };
+    let mut w = Wire {
+        s,
+        parameters: Vec::new(),
+    };
     let mut body = Vec::new();
     body.extend_from_slice(&196608i32.to_be_bytes());
     for (k, v) in [("user", "postgres"), ("database", "postgres/nosuch")] {
@@ -4300,6 +6086,68 @@ fn a_parameter_number_the_scanner_would_wrap_is_refused() {
         assert_eq!(r.err(sql).code, "42601", "{sql}, extended");
         assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
     }
+}
+
+/// The parameter refusals can be told apart by their words, not by the code alone (42601 is shared):
+/// a `$n` above i32::MAX is PostgreSQL 18's `parameter number too large at or near "$n"`, on both
+/// protocols, and a Bind whose value count is wrong names the unnamed statement as `""`, as
+/// PostgreSQL's exec_bind_message does (recorded on 18.6: `bind message supplies 1 parameters, but
+/// prepared statement "" requires 0`, artie raw loud-20261015/pg18-diff/pg18.out). The arms above
+/// asserted the code only, so a mutant answering the fail-closed "could not read the statement's
+/// parameters" refusal passed every one (wire review 14 item 18). That refusal, which no client
+/// text is known to reach, now has its own code, XX000.
+#[test]
+fn the_parameter_refusals_can_be_told_apart() {
+    let dir = Scratch::new("paramwords");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "SELECT v FROM t WHERE id = $4294967297";
+    let too_large = "parameter number too large at or near \"$4294967297\"";
+    let e = a.q(sql).err(sql);
+    assert!(e.message.contains(too_large), "simple: {e:?}");
+    let e = a.x(sql, &["1"]).err(sql);
+    assert!(e.message.contains(too_large), "extended: {e:?}");
+    let (_, e) = a.bind_round("SELECT 1", &[], &[Some(b"x")], &[]);
+    let e = e.expect("one value for no parameter, none declared, is refused");
+    assert_eq!(e.code, "08P01");
+    assert!(
+        e.message
+            .contains("bind message supplies 1 parameters, but prepared statement \"\" requires 0"),
+        "{e:?}"
+    );
+}
+
+/// A BEGIN inside an open block, bound with a value it has no parameter for, is 08P01 at Bind
+/// (status E: the block fails, as any error there does), never run as the engine's nested BEGIN
+/// nor answered with the 25001 warning; ROLLBACK then ends the block. This is the case
+/// every_statement_checks_its_bind_arity's fix was for, which its rows never sent: its
+/// BEGIN-with-a-value row ran outside a block, refused at the base already, and its two-codes
+/// CHECKPOINT row is refused by check_bind whatever the fix (wire review 14 item 19; the failed
+/// block's ROLLBACK bound with a value is pinned by a_block_exit_bound_with_a_value_is_refused_
+/// before_bind_complete).
+#[test]
+fn a_begin_bound_with_a_value_in_an_open_block_is_08p01() {
+    let dir = Scratch::new("beginvalue");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("a write in the block");
+    let (types, e) = a.bind_round("BEGIN", &[], &[Some(b"v")], &[]);
+    assert_eq!(e.map(|e| e.code), Some("08P01".to_string()));
+    assert!(
+        !types.contains(&b'2'),
+        "BindComplete came before the refusal: {:?}",
+        String::from_utf8_lossy(&types)
+    );
+    assert_eq!(types.last(), Some(&b'Z'));
+    let r = a.q("SELECT 1");
+    assert_eq!(r.err("in the failed block").code, "25P02", "the block failed");
+    a.q("ROLLBACK").ok("end");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+        "0",
+        "the block was rolled back"
+    );
 }
 
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
@@ -4499,6 +6347,45 @@ fn a_parameter_its_type_cannot_read_is_refused_with_its_types_code() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// A branch call checks what an engine statement checks first before it refuses a bad result
+/// format code: two result codes for its one column are 08P01, as `SELECT 1` bound with them is,
+/// and an unknown branch function is 42883, whatever the codes; code 2 alone is still 22023,
+/// before the call changes anything (no branch z). The 22023 came first, so codes [0, 2] answered
+/// 22023 where an engine SELECT answers 08P01 (wire review 17 item 9).
+#[test]
+fn a_branch_call_checks_its_shape_before_its_result_codes() {
+    let dir = Scratch::new("branchcodes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let code = |a: &mut Wire, sql: &str, rcodes: &[i16]| {
+        let (_, error) = a.bind_round(sql, &[], &[], rcodes);
+        error.map(|e| e.code)
+    };
+    assert_eq!(
+        code(&mut a, "SELECT 1", &[0, 2]).as_deref(),
+        Some("08P01"),
+        "premise: an engine SELECT"
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_current()", &[0, 2]).as_deref(),
+        Some("08P01")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_nosuch()", &[2]).as_deref(),
+        Some("42883")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_current()", &[2]).as_deref(),
+        Some("22023")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_create('z')", &[2]).as_deref(),
+        Some("22023")
+    );
+    let sql = "SELECT turso_branch_switch('z')";
+    assert!(a.q(sql).error.is_some(), "the refused create left branch z");
 }
 
 /// A Bind PostgreSQL refuses is refused AT the Bind, before BindComplete, so the Execute after it
@@ -5140,6 +7027,21 @@ fn every_statement_checks_its_bind_arity() {
         .ok("keep was not deleted");
 }
 
+/// The fixed-types tests' schemas: ft(k INT) holding 1 on main, and a branch textk where ft is
+/// (k TEXT) holding `branch_row`. The session is left on main.
+fn ft_text_on_a_branch(a: &mut Wire, branch_row: &str) {
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1)").ok("row");
+    a.q("SELECT turso_branch_create('textk')").ok("branch");
+    a.q("SELECT turso_branch_switch('textk')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(k TEXT)")
+        .ok("ft as text on the branch");
+    a.q(&format!("INSERT INTO ft VALUES ('{branch_row}')"))
+        .ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+}
+
 /// A named statement keeps the types it had when it first met the engine (its first Describe or
 /// Execute), as PostgreSQL fixes a prepared statement's parameter and result types at Parse: on a
 /// branch where its column is TEXT, its Execute is refused (0A000, PostgreSQL's code for "cached
@@ -5152,15 +7054,7 @@ fn a_named_statement_keeps_its_described_parameter_types() {
     let dir = Scratch::new("frozentypes");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE ft(k INT)").ok("ft");
-    a.q("INSERT INTO ft VALUES (1)").ok("row");
-    a.q("SELECT turso_branch_create('textk')").ok("branch");
-    a.q("SELECT turso_branch_switch('textk')").ok("switch");
-    a.q("DROP TABLE ft").ok("drop on the branch");
-    a.q("CREATE TABLE ft(k TEXT)")
-        .ok("ft as text on the branch");
-    a.q("INSERT INTO ft VALUES ('1')").ok("row on the branch");
-    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    ft_text_on_a_branch(&mut a, "1");
     // s is fixed by its Describe: its parameter is int4 on main.
     a.send(b'P', b"s\0SELECT count(*) FROM ft WHERE k = $1\0\0\0");
     a.send(b'D', b"Ss\0");
@@ -5224,6 +7118,94 @@ fn a_named_statement_keeps_its_described_parameter_types() {
     );
 }
 
+/// A CREATE TABLE's foreign keys are checked against the newest schema, not a session's older
+/// snapshot: after session b creates p, session a's `CREATE TABLE c(x INT REFERENCES p(id))`
+/// succeeds and keeps its key (an orphan is 23503). The key precheck read a's snapshot, from
+/// before p existed, and refused 42P01, and since a refused precheck compiles nothing the snapshot
+/// never moved, so every retry was refused the same way (wire review 16 item 10).
+#[test]
+fn a_foreign_key_is_checked_against_the_newest_schema() {
+    let dir = Scratch::new("stalekeys");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE z(id INT)")
+        .ok("a's snapshot, from before p");
+    b.q("CREATE TABLE p(id INT PRIMARY KEY)")
+        .ok("p, by another session");
+    let sql = "CREATE TABLE c(x INT REFERENCES p(id))";
+    a.q(sql).ok(sql);
+    let orphan = "INSERT INTO c VALUES (5)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "c's key was kept");
+}
+
+/// A statement's parameter types are inferred from the schema its compile uses, the newest one,
+/// not from a session's older snapshot: after another session replaces ft(k INT) with ft(k TEXT),
+/// a Describe of `count(*) ... WHERE k = $1` answers [25], and its executions return one row each,
+/// as PostgreSQL does. The inference read the session's snapshot before the compile adopted the
+/// newer schema, so it fixed int4 ([23]) and every Execute after was refused 0A000 against the
+/// text column it then saw (wire review 18 item 8).
+#[test]
+fn parameter_types_come_from_the_schema_the_compile_uses() {
+    let dir = Scratch::new("staletypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("SELECT count(*) FROM ft")
+        .ok("a's snapshot holds ft(k INT)");
+    b.q("DROP TABLE ft").ok("drop");
+    b.q("CREATE TABLE ft(k TEXT)").ok("ft as text");
+    b.q("INSERT INTO ft VALUES ('x')").ok("row");
+    let sql = "SELECT count(*) FROM ft WHERE k = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(r.params, Some(vec![25]), "{:?}", r.error);
+    for _ in 0..2 {
+        let r = a.xt(sql, &[(0, 0, b"x")]).ok(sql);
+        assert_eq!(r.rows, vec![vec![Some("1".to_string())]]);
+    }
+}
+
+/// A statement's result columns are fixed as PostgreSQL's equalRowTypes compares them, names with
+/// types: on a branch where ft is (b int, a int), a `SELECT * FROM ft` described on main as
+/// (a int, b int) is refused 0A000 "cached plan must not change result type". Compared by type
+/// alone it ran, and its rows went out in (b, a) order under the (a, b) RowDescription the client
+/// had, each value in the other's column, silently (wire review 18 item 9; equalRowTypes read in
+/// PostgreSQL's tupdesc.c, REL_19_BETA1).
+#[test]
+fn a_named_statement_keeps_its_described_column_names() {
+    let dir = Scratch::new("fixednames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ft(a INT, b INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1, 2)").ok("row");
+    a.q("SELECT turso_branch_create('swapped')").ok("branch");
+    a.q("SELECT turso_branch_switch('swapped')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(b INT, a INT)").ok("ft swapped");
+    a.q("INSERT INTO ft VALUES (2, 1)").ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    a.send(b'P', b"r\0SELECT * FROM ft\0\0\0");
+    a.send(b'D', b"Sr\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.oids, Some(vec![23, 23]), "premise: {:?}", r.error);
+    a.q("SELECT turso_branch_switch('swapped')")
+        .ok("onto the branch");
+    a.send(b'B', b"\0r\0\0\0\0\0\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error
+            .as_ref()
+            .map(|e| (e.code.as_str(), e.message.as_str())),
+        Some(("0A000", "cached plan must not change result type")),
+        "rows {:?}",
+        r.rows
+    );
+}
+
 /// A named statement's result types are fixed at its first Describe too: on a branch where its
 /// column is TEXT, its Describe and its Execute are refused, 0A000 "cached plan must not change
 /// result type", as PostgreSQL's RevalidateCachedQuery refuses both. Its rows went out as text
@@ -5234,15 +7216,7 @@ fn a_named_statement_keeps_its_described_result_types() {
     let dir = Scratch::new("frozencols");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE ft(k INT)").ok("ft");
-    a.q("INSERT INTO ft VALUES (1)").ok("row");
-    a.q("SELECT turso_branch_create('textk')").ok("branch");
-    a.q("SELECT turso_branch_switch('textk')").ok("switch");
-    a.q("DROP TABLE ft").ok("drop on the branch");
-    a.q("CREATE TABLE ft(k TEXT)")
-        .ok("ft as text on the branch");
-    a.q("INSERT INTO ft VALUES ('x')").ok("row on the branch");
-    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    ft_text_on_a_branch(&mut a, "x");
     a.send(b'P', b"r\0SELECT k FROM ft\0\0\0");
     a.send(b'D', b"Sr\0");
     a.send(b'S', &[]);
@@ -5338,10 +7312,24 @@ fn a_bind_counts_parameters_as_the_lexer_reads_them() {
     // Control: a query's own $1 with one value runs.
     let r = round(&mut a, "SELECT $1::int + 1", &[], &[b"41"]);
     assert_eq!(r.rows, vec![vec![Some("42".to_string())]], "{:?}", r.error);
+    // In a failed block: the statement is parsed BEFORE the failure (named "two"), since a Parse in
+    // a failed block is itself 25P02, as PostgreSQL 18's exec_parse_message refuses it (recorded,
+    // artie raw loud-20261015/pg18-diff); then its Bind with two values is 08P01, the count coming
+    // first (ruled 2026-10-15T06:03:10Z: the Parse moved ahead of the failure, this expectation
+    // unchanged; and the Parse refusal asserted on its own below).
+    a.send(b'P', b"two\0SELECT $1\0\0\0");
+    a.send(b'S', &[]);
+    a.read_reply().ok("Parse of two, before the block");
     a.q("BEGIN").ok("begin");
     assert_eq!(a.q("SELECT * FROM nosuch").status, b'E');
-    let r = round(&mut a, "SELECT $1", &[], &[b"1", b"2"]);
+    a.send(b'B', b"\0two\0\0\0\0\x02\0\0\0\x011\0\0\0\x012\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
     assert_eq!(r.err("two values in a failed block").code, "08P01");
+    assert_eq!(r.status, b'E', "the block is still failed");
+    let r = round(&mut a, "SELECT $1", &[], &[b"1"]);
+    assert_eq!(r.err("a Parse in a failed block").code, "25P02");
     assert_eq!(r.status, b'E', "the block is still failed");
     a.q("ROLLBACK").ok("end");
     let r = round(&mut a, "SELECT $1", &[2], &[b"1", b"2"]);
@@ -5805,6 +7793,30 @@ fn an_empty_named_portal_runs_twice_as_an_empty_query() {
     );
 }
 
+/// A wrong-length result-format list is refused before the statement runs, shown by a statement
+/// that would FAIL if it ran: `INSERT ... RETURNING` of a key that exists answers 08P01 (the format
+/// list), never 23505 (the key). a_wrong_result_format_list_is_refused_before_the_side_effect's
+/// INSERT leg cannot tell the orders apart: the implicit rollback hides its row whichever runs
+/// first (wire review 15 item 21).
+#[test]
+fn a_wrong_result_format_list_is_refused_before_a_failing_insert_runs() {
+    let dir = Scratch::new("formatdup");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "INSERT INTO t VALUES (1, 'dup') RETURNING id, v";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(&[0, 0, 0]);
+    a.send(b'P', &parse);
+    a.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0]);
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err(sql).code, "08P01", "the format list is checked first");
+    let r = a.xt(sql, &[]);
+    assert_eq!(r.err(sql).code, "23505", "control: run, the key refuses it");
+}
+
 /// A wrong-length result-format list is refused BEFORE a statement with a side effect runs: a branch
 /// create, switch or delete changes nothing, and an `INSERT ... RETURNING` writes no row; the
 /// refusals are worded as PostgreSQL words them. No test pinned the order: the earlier rows change
@@ -6093,6 +8105,41 @@ fn an_array_parameter_is_read_by_its_element_type() {
         let r = a.xt(sql, &[(0, 0, value.as_bytes())]);
         assert_eq!(r.err(value).code, "22P02", "{value}");
         assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
+    }
+}
+
+/// A view libpg_query cannot reread types a parameter only from columns the engine traced to a
+/// table column; a computed one (count(*), max(id) + 1) or one read through an inner view the
+/// engine gives a placeholder TEXT, so a parameter compared with it is refused 42P18 (or typed as
+/// PostgreSQL types it), never text: typed text, `n = $1` bound '1' as a string and the row went
+/// missing silently, where the base refused it (wire review 18 item 4).
+#[test]
+fn a_view_libpg_query_cannot_reread_never_types_a_computed_column_text() {
+    let dir = Scratch::new("viewcomputed");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE vt(id INT PRIMARY KEY, flag BOOLEAN)",
+        "INSERT INTO vt VALUES (1, true), (2, false)",
+        "CREATE VIEW vc AS SELECT count(*) AS n, max(id) + 1 AS m FROM vt WHERE flag IS TRUE",
+        "CREATE VIEW vinner AS SELECT id, flag FROM vt",
+        "CREATE VIEW vouter AS SELECT id FROM vinner WHERE flag IS TRUE",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    for (sql, typed) in [
+        ("SELECT 1 FROM vc WHERE n = $1", 20),
+        ("SELECT 1 FROM vc WHERE m = $1", 23),
+        ("SELECT 1 FROM vouter WHERE id = $1", 23),
+    ] {
+        let r = a.describe_statement(sql);
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "42P18");
+        assert!(
+            refused || r.params == Some(vec![typed]),
+            "{sql}: {:?} {:?}, want [{typed}] or 42P18, never [25]",
+            r.params,
+            r.error
+        );
     }
 }
 
@@ -6955,6 +9002,93 @@ fn delete_using_returning_resolves_a_bare_name_over_both() {
     assert_eq!(count(&mut a), "2");
 }
 
+/// A subquery in DELETE ... USING ... RETURNING reads its own FROM: a qualified USING name, a bare
+/// name only a USING table has, and `*` inside it are the subquery's, never refused as the
+/// RETURNING's own references to the USING items (wire review 16 item 21 (d): the existing arm
+/// passed at its base and under a mutant that walks into subqueries). Expected values: PostgreSQL's
+/// by these fixtures' semantics, recorded against PostgreSQL 18 (LOUD-OWED).
+#[test]
+fn delete_using_returning_subqueries_read_their_own_from() {
+    let dir = Scratch::new("deleteusingsub");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true), (3, false)")
+        .ok("k rows");
+    for returning in [
+        "v, EXISTS (SELECT 1 FROM k WHERE k.flag)",
+        "v, EXISTS (SELECT 1 FROM k AS j WHERE flag)",
+        "v, EXISTS (SELECT * FROM k)",
+    ] {
+        a.q("DROP TABLE IF EXISTS d").ok("drop");
+        a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+        a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .ok("d rows");
+        let sql = format!("DELETE FROM d USING k WHERE d.id = k.id AND k.flag RETURNING {returning}");
+        let r = a.q(&sql).ok(&sql);
+        assert_eq!(r.rows.len(), 1, "{sql}: {:?}", r.rows);
+        assert_eq!(r.rows[0][0].as_deref(), Some("b"), "{sql}");
+        assert_eq!(
+            a.q("SELECT count(*) FROM d").single("count"),
+            "2",
+            "{sql}"
+        );
+    }
+}
+
+/// DELETE ... USING names the target's row, and resolves RETURNING's bare names, by the columns of
+/// the table the engine deletes from: under `search_path TO s, public` an unqualified r1 is s.r1,
+/// which declares a rowid column where public.r1 does not, so the rewrite must name its row
+/// `_rowid_`, deleting exactly the two joined rows. The column lookup read public's r1 whatever
+/// the path, so it chose the bare rowid, which s.r1's column shadows on both sides (review 13
+/// item 5's bug; wire review 16 item 21 (b)). Schema s is made by the non-server CLI.
+#[test]
+fn delete_using_reads_the_target_on_the_search_path() {
+    let dir = Scratch::new("deleteusingpath");
+    cli_script(
+        &dir,
+        b"CREATE TABLE u(k INT);\n\
+          INSERT INTO u VALUES (1), (3);\n\
+          CREATE TABLE r1(id INT PRIMARY KEY);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.r1(id INT PRIMARY KEY, rowid INT);\n\
+          INSERT INTO s.r1 VALUES (1, 7), (2, 7), (3, NULL);\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path TO s, public").ok("path");
+    let r = a
+        .q("DELETE FROM r1 USING u WHERE r1.id = u.k")
+        .ok("delete");
+    assert_eq!(r.tags, vec!["DELETE 2".to_string()]);
+    assert_eq!(
+        a.q("SELECT id FROM s.r1").single("the row that joined nothing"),
+        "2"
+    );
+}
+
+/// A USING subquery's output named by a cast (`SELECT id::int`) is named as PostgreSQL names it,
+/// after the cast's argument, so `RETURNING id` over both is 42702 and nothing is deleted. Every
+/// output that was not a column reference, a function call or aliased was named `?column?`, so
+/// the bare id was the target's alone and the DELETE ran (wire review 16 item 21 (c)).
+#[test]
+fn delete_using_names_a_cast_output_as_postgresql_does() {
+    let dir = Scratch::new("deleteusingcast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b')").ok("d rows");
+    a.q("CREATE TABLE k(id INT)").ok("k");
+    a.q("INSERT INTO k VALUES (2)").ok("k row");
+    let sql = "DELETE FROM d USING (SELECT id::int FROM k) s WHERE d.id = s.id RETURNING id";
+    assert_eq!(a.q(sql).err(sql).code, "42702", "{sql}");
+    assert_eq!(
+        a.q("SELECT count(*) FROM d").single("count"),
+        "2",
+        "nothing deleted"
+    );
+}
+
 /// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
 /// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
 /// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
@@ -7134,6 +9268,37 @@ fn an_added_foreign_key_needs_a_unique_parent_key() {
     a.q("INSERT INTO c VALUES (5)").ok("a matching child");
 }
 
+/// A refused ALTER TABLE ADD FOREIGN KEY leaves the child's rows exactly as they were, in
+/// autocommit and inside a block the refusal fails (then ROLLBACK): `SELECT x FROM c` is ["5"]
+/// after each. an_added_foreign_key_needs_a_unique_parent_key checked only that c still takes rows,
+/// so a refusal that lost or doubled the existing ones passed (wire review 13 item 21).
+#[test]
+fn a_refused_foreign_key_leaves_the_childs_rows() {
+    let dir = Scratch::new("fkrows");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("INSERT INTO p VALUES (1, 5), (2, 5)").ok("p rows");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    let rows = |a: &mut Wire| -> Vec<Option<String>> {
+        a.q("SELECT x FROM c").ok("c").rows.into_iter().map(|r| r[0].clone()).collect()
+    };
+    for sql in [
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(code)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id, code)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES nosuch(id)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id)",
+    ] {
+        assert!(a.q(sql).error.is_some(), "premise: {sql} is refused");
+        assert_eq!(rows(&mut a), vec![Some("5".to_string())], "after {sql}");
+        a.q("BEGIN").ok("begin");
+        assert_eq!(a.q(sql).status, b'E', "{sql} fails the block");
+        a.q("ROLLBACK").ok("end");
+        assert_eq!(rows(&mut a), vec![Some("5".to_string())], "after {sql} in a block");
+    }
+}
+
 /// ALTER TABLE ADD FOREIGN KEY checks each key it adds on its own, in PostgreSQL's order
 /// (ATAddForeignKeyConstraint): a second added key onto a non-unique parent column is 42830 naming
 /// that key's parent; a parent column or a key column that does not exist is 42703 "column ...
@@ -7231,6 +9396,61 @@ fn a_foreign_key_the_catalog_refuses_is_refused_before_the_rebuild() {
     a.q("INSERT INTO c VALUES (6)").ok("c is unchanged");
 }
 
+/// create_with_keys's refusal and undo paths, which no test reached (wire review 16 item 13; the
+/// mutants that must turn this red are the server's check_table_keys call deleted and
+/// parent_key_resolves always true): a self-referencing key onto a column with no unique index
+/// (`up INT REFERENCES t(code)`) is 42830 and leaves no table t, in autocommit and in a block
+/// (which fails, then ROLLBACK, and still no t); a self-reference with no primary key to default
+/// to is 42830 too; a keyed CREATE that resolves, in a block, is kept by COMMIT (the RELEASE arm);
+/// and an ALTER adding a key onto a non-unique single column, while another session holds the
+/// trunk's write lock, is 42830 at once, not 55P03 after the wait (server lock wait 300 ms).
+#[test]
+fn create_with_keys_refuses_and_undoes() {
+    let dir = Scratch::new("keysundo");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = server.connect();
+    let exists = |a: &mut Wire, table: &str| {
+        a.q(&format!("SELECT count(*) FROM {table}"))
+            .error
+            .is_none()
+    };
+    let bad = "CREATE TABLE t(id INT PRIMARY KEY, code INT, up INT REFERENCES t(code))";
+    assert_eq!(a.q(bad).err(bad).code, "42830", "autocommit");
+    assert!(!exists(&mut a, "t"), "a refused t was kept");
+    a.q("BEGIN").ok("begin");
+    let r = a.q(bad);
+    assert_eq!(r.err(bad).code, "42830", "in a block");
+    assert_eq!(r.status, b'E', "the block fails");
+    a.q("ROLLBACK").ok("rollback");
+    assert!(!exists(&mut a, "t"), "a refused t was kept by the block");
+    let nopk = "CREATE TABLE n(id INT, up INT REFERENCES n)";
+    assert_eq!(
+        a.q(nopk).err(nopk).code,
+        "42830",
+        "a self-reference with no primary key"
+    );
+    assert!(!exists(&mut a, "n"));
+    a.q("BEGIN").ok("begin");
+    a.q("CREATE TABLE g(id INT PRIMARY KEY, up INT REFERENCES g(id))")
+        .ok("a keyed CREATE that resolves");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert!(exists(&mut a, "g"), "COMMIT kept g");
+    let orphan = "INSERT INTO g VALUES (1, 9)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "g's key holds");
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9, 9)")
+        .ok("another session takes the write lock");
+    let alter = "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(code)";
+    let r = a.q(alter);
+    assert_eq!(r.err(alter).code, "42830", "not 55P03 after the lock wait");
+    assert_eq!(r.status, b'I');
+    w.q("ROLLBACK").ok("end");
+}
+
 /// A key the translator refuses (MATCH FULL over two columns, 0A000) is refused before an ALTER
 /// TABLE ADD FOREIGN KEY rebuilds the table, so while another session holds the trunk's write lock
 /// it is answered as it is, status I, not 55P03 after the lock wait, and the table is unchanged.
@@ -7258,6 +9478,44 @@ fn a_key_the_translator_refuses_is_refused_before_the_rebuild() {
     a.q("INSERT INTO c VALUES (7, 8)")
         .ok("c is unchanged: no key was added");
     assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "2");
+}
+
+/// A foreign key onto a rowid name the parent does not declare (`REFERENCES p(rowid)`, `_rowid_`,
+/// `oid`) is 42703, as PostgreSQL answers, by the precheck: before a CREATE TABLE runs and before an
+/// ALTER's rebuild, so while another session holds the trunk's write lock the ALTER is answered at
+/// once, status I, not 55P03 after the lock wait. A key onto a declared column named rowid is
+/// refused 0A000: the engine never resolves a key onto a rowid name (ForeignKey::validate). The
+/// precheck took any rowid name as the parent's rowid, so the CREATE was refused after it ran and
+/// the ALTER after its lock-held copies (wire review 16 item 16). The server's lock wait is 300 ms.
+#[test]
+fn a_key_onto_a_rowid_name_is_refused_before_anything_runs() {
+    let dir = Scratch::new("fkrowid");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    for name in ["rowid", "_rowid_", "oid"] {
+        let sql = format!("CREATE TABLE k(x INT REFERENCES p({name}))");
+        assert_eq!(a.q(&sql).err(&sql).code, "42703", "{sql}");
+    }
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9)")
+        .ok("another session takes the write lock");
+    let alter = "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(rowid)";
+    let r = a.q(alter);
+    assert_eq!(r.err(alter).code, "42703", "not 55P03 after the lock wait");
+    assert_eq!(r.status, b'I');
+    w.q("ROLLBACK").ok("end");
+    a.q("INSERT INTO c VALUES (7)")
+        .ok("c is unchanged: no key was added");
+    a.q("CREATE TABLE q(rowid INT UNIQUE)")
+        .ok("q declares a column named rowid");
+    let declared = "CREATE TABLE k(x INT REFERENCES q(rowid))";
+    assert_eq!(a.q(declared).err(declared).code, "0A000", "{declared}");
+    a.q("CREATE TABLE k(x INT REFERENCES p(id))")
+        .ok("control: no k was left behind, and a key onto p(id) is accepted");
 }
 
 /// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
@@ -7433,6 +9691,46 @@ fn a_query_with_a_part_that_is_no_statement_runs_nothing() {
         a.q("SELECT sum(id) FROM sp").single("ids"),
         "5",
         "the block's insert or the UPDATE survived"
+    );
+}
+
+/// A simple Query is parsed whole before any of it runs even when its malformed part holds a
+/// keyword (`SELEC * FROM t`, FROM being reserved; `ROLBACK WORK`, WORK unreserved): 42601, and
+/// nothing of it runs, neither the INSERT and COMMIT before it nor a CHECKPOINT (the store's
+/// checkpoint count does not move). The scanner split emitted every stretch holding a keyword as a
+/// part, so the parts before ran and committed, and only then was the malformed one refused (wire
+/// review 18 item 6; 16a9ff5bc refused only stretches holding no keyword).
+#[test]
+fn a_query_with_a_malformed_part_runs_nothing() {
+    let dir = Scratch::new("malformedpart");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('b0')")
+        .ok("a branch, so the store has a log");
+    let store_checkpoints = |a: &mut Wire| {
+        a.q("SELECT turso_branch_stats()").ok("stats").rows[0][5]
+            .clone()
+            .expect("the store checkpoint count")
+    };
+    let before = store_checkpoints(&mut a);
+    for sql in [
+        "INSERT INTO t VALUES (2, 'two'); COMMIT; SELEC * FROM t",
+        "INSERT INTO t VALUES (3, 'three'); COMMIT; ROLBACK WORK",
+        "CHECKPOINT; SELEC * FROM t",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42601", "{sql:?}");
+        assert_eq!(r.status, b'I', "{sql:?}");
+    }
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("rows"),
+        "1",
+        "a part before the malformed one ran"
+    );
+    assert_eq!(
+        store_checkpoints(&mut a),
+        before,
+        "the CHECKPOINT before the malformed part ran"
     );
 }
 
@@ -7669,6 +9967,93 @@ fn a_savepoint_verb_in_an_implicit_block_is_25p01() {
         b.q("INSERT INTO t VALUES (9, 'z')")
             .ok("another session writes");
         b.q("DELETE FROM t WHERE id = 9").ok("undo");
+    }
+}
+
+/// SAVEPOINT, RELEASE and ROLLBACK TO outside a block are 25P01 whatever the name's spelling, read
+/// by their leading keywords: a name the verb reader cannot hold as one word (`U&"a"`) made the
+/// statement Other, so the engine ran SAVEPOINT and opened a transaction with no BEGIN (status T;
+/// after a write it held the trunk's write lock, and other sessions' writes and creates met
+/// 55P03), and RELEASE or ROLLBACK TO reached the engine's XX000 (wire review 14 item 15).
+/// PostgreSQL 18.6 answers 25P01 (recorded, artie raw loud-20261015/pg18-diff/pg18-r14.out).
+/// `SAVEPOINT a$b`, a name the reader
+/// holds, is the control (wire review 14 item 22's wire half).
+#[test]
+fn a_savepoint_verb_outside_a_block_is_25p01_whatever_its_name() {
+    let dir = Scratch::new("savepointnames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "SAVEPOINT U&\"a\"",
+        "RELEASE U&\"a\"",
+        "ROLLBACK TO U&\"a\"",
+        "ROLLBACK TRANSACTION TO SAVEPOINT U&\"a\"",
+        "SAVEPOINT a$b",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "25P01", "{sql}");
+        assert_eq!(r.status, b'I', "{sql} opened a block");
+        a.q("INSERT INTO t VALUES (5, 'x')").ok("a write after it");
+        a.q("DELETE FROM t WHERE id = 5").ok("undo");
+        let mut b = server.connect();
+        b.q("INSERT INTO t VALUES (9, 'z')")
+            .ok("another session writes at once");
+        b.q("DELETE FROM t WHERE id = 9").ok("undo");
+    }
+}
+
+/// A savepoint may be named savepoint, as in PostgreSQL 18.6 (recorded, pg18-r14.out): in a failed
+/// block, `ROLLBACK TO
+/// SAVEPOINT` rolls back to it and the block carries on to its COMMIT. The verb reader stripped the
+/// keyword, found no name and read Other, so the failed block refused it 25P02 (wire review 14
+/// item 21).
+#[test]
+fn a_savepoint_named_savepoint_is_reached() {
+    let dir = Scratch::new("savepointsavepoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    a.q("SAVEPOINT savepoint").ok("savepoint savepoint");
+    let r = a.q("SELECT * FROM nosuch");
+    assert!(r.error.is_some(), "premise: the statement fails");
+    let r = a.q("ROLLBACK TO SAVEPOINT").ok("rollback to savepoint savepoint");
+    assert_eq!(r.status, b'T', "the block is still failed");
+    assert_eq!(a.q("SELECT 2").single("in the block"), "2");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("kept"),
+        "1"
+    );
+}
+
+/// COMMIT or ROLLBACK inside an implicit block warns 25P01 "there is no transaction in progress",
+/// as PostgreSQL warns for `SELECT 1; COMMIT` (18.6, recorded, pg18-r14.out) and for a pipeline's
+/// COMMIT before its Sync (17.11, the review's), and still ends the block. They reached the engine
+/// with no notice, though the commit that made them end the block claimed PostgreSQL's behaviour
+/// (wire review 14 item 20).
+#[test]
+fn a_block_end_in_an_implicit_block_warns_25p01() {
+    let dir = Scratch::new("implicitend");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for verb in ["COMMIT", "ROLLBACK"] {
+        let sql = format!("SELECT 1; {verb}");
+        let r = a.q(&sql).ok(&sql);
+        assert!(
+            r.notices.iter().any(|n| n.code == "25P01"),
+            "{sql}: notices {:?}",
+            r.notices
+        );
+        assert_eq!(r.status, b'I', "{sql}");
+        let r = a.pipeline(&["SELECT 1", verb]).ok(verb);
+        assert!(
+            r.notices.iter().any(|n| n.code == "25P01"),
+            "pipeline {verb}: notices {:?}",
+            r.notices
+        );
+        assert_eq!(r.status, b'I', "pipeline {verb}");
     }
 }
 

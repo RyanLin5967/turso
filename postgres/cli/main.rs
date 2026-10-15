@@ -768,8 +768,10 @@ fn print_result_set(
     table.set_header(header);
 
     stmt.run_with_row_callback(|row| {
+        // A value holding a newline spans as many lines as it holds, as psql shows it: cut to one
+        // line it read `li...`, and escape_string_backslash_n passed only while the column's
+        // header, the engine's text of the literal, held both words.
         let mut table_row = Row::new();
-        table_row.max_height(1);
         for (idx, value) in row.get_values().enumerate() {
             let (content, alignment) = match value {
                 Value::Null => ("NULL".to_string(), CellAlignment::Left),

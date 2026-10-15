@@ -7473,6 +7473,7 @@ dependencies = [
  "chrono",
  "parking_lot",
  "rustc-hash 2.1.1",
+ "stacker",
  "tempfile",
  "tracing",
  "turso_core",

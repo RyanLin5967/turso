@@ -47,27 +47,15 @@ pub const MAX_PARAMETER: u32 = 65535;
 
 /// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
 /// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
-/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
-/// it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is serialized
-/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N,"location":L`
-/// read off it, a pattern a string value in the tree cannot hold, since its quotes are escaped.
-/// The numbers are libpg_query's, which wrap above i32::MAX: [`checked_param_numbers`] reads them
-/// as PostgreSQL 18 does. Only for a statement whose text holds a '$'.
-pub fn param_numbers(parse: &ParseResult) -> Vec<i32> {
-    let mut numbers: Vec<i32> = param_refs(parse)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(number, _)| number)
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
-}
-
-/// [`param_numbers`], each number read again from `sql` (the text `parse` parsed) at its ParamRef's
-/// location, as PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit
-/// int (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound
-/// the wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
+/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a
+/// clause it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is
+/// serialized (pg_query's protobuf types derive Serialize) and each
+/// `"ParamRef":{"number":N,"location":L` read off it, a pattern a string value in the tree cannot
+/// hold, since its quotes are escaped. The numbers are libpg_query's, which wrap above i32::MAX: so
+/// each number is read again from `sql` (the text `parse` parsed) at its ParamRef's location, as
+/// PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit int
+/// (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound the
+/// wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
 /// PostgreSQL 18's "parameter number too large" (42601); a tree number that is not the text's, or a
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
@@ -108,7 +96,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
 }
 
 /// Each ParamRef's number and byte location in a parse tree, read off its serialization (see
-/// [`param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
+/// [`checked_param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
 fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
     const KEY: &str = "\"ParamRef\":{\"number\":";
     const LOCATION: &str = ",\"location\":";
@@ -379,42 +367,68 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
-/// Returns the individual statement strings (without trailing semicolons).
+/// Split a multi-statement SQL string into its statements as PostgreSQL does for a simple Query:
+/// the whole text is parsed first (libpg_query's parser split), so a text any part of which does
+/// not parse is refused whole, and its caller runs none of it. Returns the statements' texts,
+/// trimmed; empty statements are none.
 ///
-/// The scanner emits a statement only where it saw a keyword, and skips every other stretch of the
-/// text: `COMMIT<NBSP>` (one identifier) between two statements was dropped, so `INSERT ..;
-/// COMMIT<NBSP>; INSERT ..` ran both INSERTs and nothing answered 42601. So every stretch before,
-/// between and after the statements must be blank (whitespace, comments, `;`), or the text is
-/// refused here: the caller then prepares it whole, and the parser refuses it, as PostgreSQL parses
-/// the whole string before it runs any of it (wire review 16 item 1).
+/// The scanner split this replaced emitted every stretch holding a keyword as a statement and
+/// skipped the rest: `INSERT ..; COMMIT<NBSP>; INSERT ..` ran both INSERTs (wire review 16 item 1),
+/// and `INSERT ..; COMMIT; SELEC * FROM t` committed the INSERT before the malformed part, which
+/// holds the keyword FROM, was refused (wire review 18 item 6). For the statement-at-a-time split
+/// a REPL wants, see [`split_statements_lenient`].
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
+        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    Ok(parts
+        .into_iter()
+        .map(|s| pg_trim(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Split a multi-statement SQL string statement by statement, as psql sends a script: libpg_query's
+/// scanner finds the statements (`;` inside a string literal, a comment or a dollar quote is no
+/// separator), and a stretch it skips that is not blank (whitespace, comments, `;`) is a part of
+/// its own, in its place, so it fails when it is run instead of vanishing. The scanner emits a
+/// statement only where it saw a keyword: `SELECT 1; selecgt 2` lost `selecgt 2`, and `INSERT ..;
+/// COMMIT<NBSP>; INSERT ..` lost its COMMIT (wire review 16 item 1). The non-server REPL and
+/// PgConnection::execute run their parts this way: the valid parts run, a malformed one fails
+/// (wire review 18 item 7). A simple Query over the wire uses [`split_statements`].
+pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
+    count_libpg_query_call();
+    let found =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
-    let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
+    let mut parts = Vec::with_capacity(found.len());
     let mut at = 0;
-    for part in &parts {
-        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`).
+    for part in &found {
+        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`); one that
+        // is not refuses the split, and its caller runs the text whole.
         let start = (part.as_ptr() as usize)
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
-            .ok_or_else(stray)?;
+            .ok_or_else(|| {
+                ParseError::ParseError("the scanner split lost its place".to_string())
+            })?;
         if !blank(&b[at..start]) {
-            return Err(stray());
+            parts.push(&sql[at..start]);
         }
+        parts.push(*part);
         at = start + part.len();
     }
     if !blank(&b[at..]) {
-        return Err(stray());
+        parts.push(&sql[at..]);
     }
     Ok(parts
         .into_iter()
-        .map(|s| pg_trim(&s).to_string())
+        .map(|s| {
+            // A stray stretch keeps the `;` that ends it; a statement's is not in its slice.
+            let s = pg_trim(s);
+            pg_trim(s.trim_end_matches(';')).to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect())
 }
@@ -437,6 +451,40 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
     pg_query::fingerprint(sql)
         .map(|fp| fp.hex)
         .map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// What a schema qualifier names in this frontend: the one rule every reader of a relation's or a
+/// column's qualifier uses. It was spelled seven ways, and a three-part column reference and COPY
+/// missed it (wire review 18 items 21 and 22). Case-insensitive, as every spelling of it was. A
+/// search path's entries follow the engine's own rule instead (public alone is main there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaQualifier<'a> {
+    /// No qualifier: the search path decides.
+    Unqualified,
+    /// The main database: public, PostgreSQL's schema for it, whatever the search path (wire
+    /// review 17 item 1), and main, the engine's name for it, which stored view text holds.
+    Main,
+    /// pg_catalog, whose relations the engine finds unqualified.
+    PgCatalog,
+    /// information_schema, whose views the engine names `information_schema_<view>`.
+    InformationSchema,
+    /// Any other schema: the attached database of that name.
+    Attached(&'a str),
+}
+
+/// [`SchemaQualifier`] of `schema` ("" for none).
+pub fn schema_qualifier(schema: &str) -> SchemaQualifier<'_> {
+    if schema.is_empty() {
+        SchemaQualifier::Unqualified
+    } else if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") {
+        SchemaQualifier::Main
+    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+        SchemaQualifier::PgCatalog
+    } else if schema.eq_ignore_ascii_case("information_schema") {
+        SchemaQualifier::InformationSchema
+    } else {
+        SchemaQualifier::Attached(schema)
+    }
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
@@ -528,11 +576,12 @@ mod tests {
         }
     }
 
-    /// param_numbers finds every $n in the tree, in clauses the engine folds away or the translator
-    /// never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a comment, a
-    /// quoted identifier or a dollar-quoted string that looks like one (wire review 8 item 5).
+    /// checked_param_numbers finds every $n in the tree, in clauses the engine folds away or the
+    /// translator never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a
+    /// comment, a quoted identifier or a dollar-quoted string that looks like one (wire review 8
+    /// item 5). It read param_numbers, deleted as dead (wire review 14 item 24).
     #[test]
-    fn param_numbers_reads_the_whole_tree() {
+    fn checked_param_numbers_reads_the_whole_tree() {
         for (sql, want) in [
             ("SELECT 1", vec![]),
             ("SELECT v FROM t WHERE false AND id = $1", vec![1]),
@@ -549,7 +598,7 @@ mod tests {
             ("SELECT 1 LIMIT $2147483647", vec![2147483647]),
         ] {
             let parsed = parse(sql).unwrap();
-            assert_eq!(param_numbers(&parsed), want, "{sql}");
+            assert_eq!(checked_param_numbers(&parsed, sql).ok(), Some(want), "{sql}");
         }
     }
 }

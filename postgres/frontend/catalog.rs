@@ -133,12 +133,19 @@ impl Dialect for PostgresDialect {
             unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
         };
 
-        // Unqualified statements replay as the original PostgreSQL DDL. A
-        // schema-qualified statement targets an attached database the replay
-        // destination does not have, so re-render the translated AST without
-        // the qualifier; the canonical text round-trips through the SQLite
-        // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
+        // Unqualified statements replay as the original PostgreSQL DDL, and so
+        // do those qualified with the main database: the translator maps
+        // `public.t` to main, and such a table took the branch below, so VACUUM
+        // stored SQLite text marked as PostgreSQL DDL (wire review 18 item 20).
+        // A statement qualified with another schema targets an attached
+        // database the replay destination does not have, so re-render the
+        // translated AST without the qualifier; the canonical text round-trips
+        // through the SQLite fallback in `Dialect::parse`.
+        let attached = tbl_name
+            .db_name
+            .take()
+            .is_some_and(|db| !db.as_str().eq_ignore_ascii_case("main"));
+        if !attached {
             return Ok(raw_sql.to_string());
         }
 
@@ -353,8 +360,10 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "TEXT" => 25,
         "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
         "BPCHAR" => 1042,
-        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
-        "FLOAT4" => 700,
+        // REAL is PostgreSQL's real, float4: a declaration stored before the FLOAT4 / FLOAT8
+        // split (both were REAL then) reads as float4 (lead ruling 2026-10-15T07:40:59Z).
+        "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
+        "REAL" | "FLOAT4" => 700,
         "BLOB" | "BYTEA" => 17,
         "NUMERIC" | "DECIMAL" => 1700,
         "BOOLEAN" | "BOOL" => 16,
@@ -3743,6 +3752,47 @@ mod tests {
     use super::*;
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
+
+    /// COMPAT: a column declared REAL before the FLOAT4 / FLOAT8 split (both real and double
+    /// precision were stored REAL then; here, engine DDL with no translator) reads as PostgreSQL's
+    /// real, float4 (700), and one declared FLOAT8, as double precision is stored now, as float8
+    /// (701) (lead ruling 2026-10-15T07:40:59Z).
+    #[test]
+    fn an_old_real_declaration_reads_as_float4() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = crate::session::open_database_with_io(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE old_real (r_old REAL, d_new FLOAT8)")
+            .unwrap();
+        let conn = crate::Connection::new(conn);
+        for (column, oid) in [("r_old", 700), ("d_new", 701)] {
+            let mut stmt = conn
+                .prepare(format!(
+                    "SELECT atttypid FROM pg_attribute WHERE attname = '{column}'"
+                ))
+                .unwrap();
+            let StepResult::Row = stmt.step().unwrap() else {
+                panic!("{column} not found in pg_attribute");
+            };
+            let row = stmt.row().unwrap();
+            assert_eq!(
+                row.get_value(0),
+                &Value::from_i64(oid),
+                "{column}'s atttypid"
+            );
+        }
+        assert_eq!(sqlite_type_to_pg_oid("REAL"), 700);
+        assert_eq!(sqlite_type_to_pg_oid("FLOAT4"), 700);
+        assert_eq!(sqlite_type_to_pg_oid("FLOAT8"), 701);
+    }
 
     #[test]
 

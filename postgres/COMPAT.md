@@ -38,31 +38,33 @@ Basics not enumerated by the official feature matrix.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
-| JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
+| JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | A parameter compared with a column USING or NATURAL merges from columns of different types (int4 and int8) is refused 42P18, unless declared; PostgreSQL types it as their common type (int8) |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial (fixes unbuilt) | Including ORDER BY/LIMIT on compounds, PostgreSQL's grouping (INTERSECT binds tighter; parentheses group), an arm's own ORDER BY/LIMIT/OFFSET/WITH and a WITH on the whole set operation (non-left-spine and clause-bearing arms run as subqueries), and a VALUES arm. INTERSECT ALL and EXCEPT ALL are rejected (0A000): the engine has neither. ✅ once the reds (570cbe2c8, 68e5afaf6) run green |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
-| UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
+| FROM alias column lists (`t AS a (x, y)`) | 🟡 Partial | Rename the table's first columns, as in PostgreSQL (42P10 for a list longer than the table); on a table of the main schema only (read from the in-memory schema), elsewhere refused |
+| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | VALUES lists are checked as in PostgreSQL (one length, 42601 "VALUES lists must all be the same length"; against the column list, "INSERT has more target columns than expressions" / "more expressions than target columns"). A DEFAULT takes the column's default in every position, in some rows or all, with or without a column list. A positional VALUES list shorter than the table fills its leading columns, the rest taking their defaults, as in PostgreSQL; one longer is 42601 "INSERT has more expressions than target columns" |
+| UPDATE (incl. FROM clause) | ✅ Supported | Including multi-column `SET (a, b) = (...)` |
 | DELETE | 🟡 Partial (fixes unbuilt) | `USING` runs as `WHERE rowid IN (SELECT <target>.rowid FROM <target>, <using> WHERE <condition>)`: target and USING items in one namespace, so a bare name both have is ambiguous (42702) and the target named again is 42712. RETURNING resolves a bare name over the target and the USING items together, as PostgreSQL does: a name both have is 42702; a `*`, a USING relation's column (qualified, or a bare name only it has), a whole-row reference to a USING item, and a bare name the target has beside a USING item whose columns cannot be read are rejected (0A000); return the target's columns. A target declaring a column named rowid is handled (the rewrite uses the first of rowid, _rowid_, oid it does not declare; all three declared: 0A000). ✅ once the reds (736b058a7, 9181fb31f, 8cbc78699, 9e06059a4, ae70b3f9d) run green |
-| CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions, and DEFERRABLE [INITIALLY DEFERRED], checked at COMMIT); IF NOT EXISTS; tables are created STRICT. A single integer PRIMARY KEY column is the table's rowid: an INSERT of NULL into it takes a new key where PostgreSQL raises 23502 |
+| CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions, and DEFERRABLE [INITIALLY DEFERRED], checked at COMMIT; a multi-column MATCH FULL key is refused 0A000, the engine enforcing MATCH SIMPLE only; a key's parent columns must name a unique key in that key's own column order, where PostgreSQL accepts any order: `REFERENCES p(b, a)` over `UNIQUE (a, b)` is 42830 here); IF NOT EXISTS; tables are created STRICT. A single integer PRIMARY KEY column is the table's rowid: an INSERT of NULL into it takes a new key where PostgreSQL raises 23502 |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP silently ignored; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ADD [CONSTRAINT n] PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works by rebuilding the table (validated against its rows, atomic, indexes and triggers recreated; a table created by CREATE TABLE AS or outside schema public is refused); ADD CONSTRAINT ... USING INDEX, NOT VALID or DEFERRABLE rejected; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ADD [CONSTRAINT n] PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works by rebuilding the table (a multi-column MATCH FULL key refused 0A000 before the rebuild; validated against its rows, atomic, indexes and triggers recreated; a table created by CREATE TABLE AS or outside schema public is refused); ADD CONSTRAINT ... USING INDEX, NOT VALID or DEFERRABLE rejected; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
+| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. A `public` qualifier names the main database wherever it is read (a relation, an index, DROP, a `public.t.c` column reference, COPY), whatever the search path. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of the first table only; CASCADE / RESTART IDENTITY dropped |
-| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
+| BEGIN / COMMIT / ROLLBACK | 🟡 Partial | Isolation-level options accepted (the engine has one level); READ ONLY refused 0A000 (READ WRITE accepted); COMMIT / ROLLBACK AND CHAIN refused 0A000 in a live block (no chained transactions), 25P01 outside a block or in an implicit block, and in a failed block they end it (ROLLBACK) and chain a new block, as PostgreSQL does |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
-| Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
+| Parameters (`$1`, `$2`, ...) | 🟡 Partial | Through the extended wire protocol (over the simple protocol a `$n` is 42P02, as nothing binds it); values in text format, and in binary for the types the V3 row lists. A parameter the client did not declare is typed from its context, as PostgreSQL infers it (the column it is compared with, assigned to or inserted into, an aggregate, a cast, LIMIT's bigint, ...). Where PostgreSQL would still type it, two cases are refused 42P18 "could not determine data type of parameter $n" unless the client declares the type: a parameter compared with, assigned to or inserted into a column of a relation in an attached schema (any schema but public, which the typing walk cannot read; also through a CTE's or a FROM alias's column list over `SELECT *` of such a relation), and one compared with an expression the walk does not type (a function it does not know) |
 | Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
+| Logical operators (AND, OR, NOT) over integer operands | 🟡 Divergence | `SELECT 1 AND 0` and `SELECT NOT 1` are accepted (0 is false, any other integer true) and answer bool (16); PostgreSQL refuses them, 42804 "argument of AND must be type boolean". Pinned by tursopg.rs `wire_logical_operators_accept_integer_operands` (lead ruling, DECISIONS 9d8c1c38ef). Comparisons and logical operators over boolean operands announce bool, as PostgreSQL 18.6 does (recorded) |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM, with joins, and reading the row it is joined to (`FROM t, generate_series(1, t.x) AS g`); its column is named as in PostgreSQL (the alias, `AS g(x)`'s column, or `generate_series`). WITH ORDINALITY and a second column alias are rejected with an error. In the joined form `SELECT *` names the column `value`, and a bare reference to the series column's name resolves to the series even where another FROM item of the same SELECT has a column of that name (PostgreSQL reports it ambiguous, 42702). In a subquery a bare name is resolved against the subquery's own relations first, then outward: where an enclosing SELECT's table has a column of that name it binds there (a correlated reference to that table), and only where no relation has it is it an unknown column (42703); PostgreSQL reads it as the outer series in both cases (write `g.g`). Two series columns of one name make a bare reference ambiguous (42702) |
+| generate_series | ✅ Supported | In FROM, with joins, and reading the row it is joined to (`FROM t, generate_series(1, t.x) AS g`); its column is named as in PostgreSQL (the alias, `AS g(x)`'s column, or `generate_series`). WITH ORDINALITY and a second column alias are rejected with an error. In the joined form `SELECT *` names the column `value`. A bare name of the series column resolves level by level as in PostgreSQL 18.6 (recorded 2026-10-15): another FROM item of the same SELECT with a column of that name makes it ambiguous (42702); a subquery's own relation with the name binds there; where no relation has it, it binds the series (E5-QUEUE G1a-G1d). Two series columns of one name make a bare reference ambiguous (42702) |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
+| SET / SHOW | 🟡 Partial | From an allowlist, never passed to the engine; see Configuration Management |
 
 ## Backend
 
@@ -126,7 +128,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
-| Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
+| Array support | 🟡 Partial | `type[]` columns, ARRAY[...] literals (announced int4[] / text[] when their elements are integer / string literals), subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays. A cast to an array type is kept for a string literal (`'{1,2}'::int[]`), a bound parameter and an ARRAY[...]; of any other expression it is refused 0A000 (the engine casts by the element's scalar type, which answered 0). A bound array parameter sent back in a result is the engine's record bytes, not its text (known red) |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |
@@ -181,7 +183,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DISTINCT ON | ❌ Not supported | Accepted but silently degrades to plain DISTINCT (wrong results) |
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
-| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
+| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING; completes as `INSERT 0 n`, `UPDATE n`, `DELETE n` as in PostgreSQL, except behind a WITH (`SELECT n`) |
 | LATERAL clause | 🟡 Partial | `CROSS JOIN LATERAL (SELECT e1, ...) AS o(n1, ...)` (one row of expressions over the outer row) is inlined when every `ei` is a scalar expression (no aggregate, window, volatile or set-returning function, or subquery) and its columns are read as `o.ni` (`*`, `o.*` and an unqualified `ni` are rejected); a LATERAL join with ON, USING or NATURAL, LEFT JOIN LATERAL, a comma LATERAL and every other LATERAL are rejected with an error |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
@@ -201,7 +203,7 @@ INTEGER. Unknown type names pass through as custom types.
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
-| Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
+| Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets). A bare column in DO UPDATE's SET values or its WHERE names the target's column here, where PostgreSQL refuses it (42702: the target and EXCLUDED both hold it, analyze.c adds both to the namespace); qualify it (`t.c`, `excluded.c`) to mean the same in both |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
 | WITH ORDINALITY clause | ❌ Not supported | Rejected with an error; column aliases on a table function other than generate_series are rejected too |
@@ -218,15 +220,16 @@ INTEGER. Unknown type names pass through as custom types.
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
 | Changing column types (ALTER TABLE .. ALTER COLUMN TYPE) | ❌ Not supported | Translates but breaks at execution ("no such column" on subsequent use) |
 | CREATE ACCESS METHOD | ❌ Not supported | |
-| CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE is silently ignored |
+| CREATE TABLE ... (LIKE) | ❌ Not supported | Refused 0A000, no table created (PostgreSQL copies the source's columns); it was silently dropped, leaving a table without those columns, on which `ALTER TABLE ... DROP` panicked the engine |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | TEMP itself is silently ignored |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Stored generated columns | ❌ Not supported | Refused 0A000, no table created (the clause was dropped and the column read NULL) |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | TEMP silently ignored — the table is persistent |
 | Typed tables | ❌ Not supported | |
-| Virtual generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Virtual generated columns | ❌ Not supported | PostgreSQL 18's VIRTUAL is a syntax error in the vendored libpg_query grammar (42601); GENERATED ALWAYS AS (expr) without it is refused 0A000 |
+| Identity columns (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) | 🟡 Partial | Numbered by a sequence, as a serial column is (1, 2, ...); sequence options are refused 0A000; a GENERATED ALWAYS column takes an explicit value, which PostgreSQL refuses (428C9) |
 
 ## Performance
 
@@ -245,6 +248,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Cross datatype hashing support | ❌ Not supported | |
 | Distributed checkpointing | ❌ Not supported | |
 | Foreign keys marked as NOT VALID | ❌ Not supported | |
+| Foreign keys in a schema other than public (the child or the parent) | ❌ Not supported | Refused with 0A000 before anything is created, in CREATE TABLE and ALTER TABLE ADD CONSTRAINT: the key checks read public's catalog alone (wire review 16 item 11) |
 | Frozen page map | ❌ Not supported | |
 | Full text search | ❌ Not supported | tsvector/tsquery degrade to TEXT |
 | Hash aggregation can use disk | ❌ Not supported | |
@@ -312,6 +316,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Default partition | ❌ Not supported | |
 | Foreign key references for partitioned tables | ❌ Not supported | |
 | Foreign table inheritance | ❌ Not supported | |
+| Table inheritance (CREATE TABLE ... INHERITS) | ❌ Not supported | Refused 0A000, no table created (the clause was dropped, so the child lacked its parents' columns); PARTITION OF is refused the same way |
 | Partitioning by a hash key | ❌ Not supported | |
 | Partition pruning during query execution | ❌ Not supported | |
 | Support for PRIMARY KEY, FOREIGN KEY, indexes, and triggers on partitioned tables | ❌ Not supported | |
@@ -328,6 +333,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SECURITY INVOKER views | ❌ Not supported | |
 | Temporary VIEWs | ❌ Not supported | TEMP silently ignored; the view is persistent |
 | Updatable views | ❌ Not supported | |
+| Views over a table in a schema other than public | ❌ Not supported | CREATE VIEW is refused with the engine's message `view cannot reference table in attached database: s.u` (42601); PostgreSQL creates it |
 | WITH CHECK clause | ❌ Not supported | |
 
 ## Replication
@@ -346,7 +352,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows) |
+| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows). The table is found as any statement's: `public.t` is the main database's whatever the search path, and an unqualified name goes through the search path (42P01 when no entry holds it) |
 | COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
 | COPY FROM ... WHERE | ❌ Not supported | |
 | COPY ... ON_ERROR | ❌ Not supported | |
@@ -357,7 +363,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs (search_path, work_mem, ...) are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | From an allowlist, never passed to the engine as PRAGMAs. search_path is kept per session; SHOW gives it as PostgreSQL does (`"$user", public` before any SET), and a SET that changes it is followed by a ParameterStatus with the new path, as PostgreSQL reports it (GUC_REPORT). lock_timeout and client_min_messages act; statement_timeout, idle_in_transaction_session_timeout and transaction_timeout are accepted at 0 alone (0A000 otherwise); a pg_dump header's xmloption = content, default_tablespace = '' and default_table_access_method = heap are accepted, any other value of them 0A000. The client settings this server answers by (client_encoding UTF8, standard_conforming_strings on, bytea_output hex, DateStyle `ISO, MDY`, IntervalStyle postgres, TimeZone UTC, extra_float_digits 1) come from one table, which SHOW answers from and startup announces in ParameterStatus; SET accepts each only at a value this server behaves by and 0A000 at any other (DateStyle: ISO, MDY, US, NonEuro or DEFAULT; DMY, YMD and the SQL, Postgres and German styles refused). A setting PostgreSQL reads as one value takes one, as there (a list is 22023 `SET <name> takes only one argument`); DateStyle's list is read whole. Two accepted values SHOW does not echo: an equivalent zone name (GMT, Etc/UTC, Z, ...) leaves SHOW TimeZone at UTC, where PostgreSQL shows the name set, and extra_float_digits above 1 leaves SHOW at 1, where PostgreSQL shows the value (from 1 up both print floats in their shortest exact form there). search_path and foreign_keys are 0A000 inside a transaction block the client opened and as SET LOCAL: this server keeps a SET past the block whatever ends it, so a ROLLBACK could not undo them as PostgreSQL does (set them before BEGIN; in a multi-statement query's implicit block they act). Settings given in the startup packet are not applied. Planner and resource settings (work_mem, enable_*, ...) are accepted and change nothing; a custom (dotted) name is 0A000; a name PostgreSQL 18 knows that this server does not act on is 0A000 for SET and SHOW (the names are its settings table's, postgres/frontend/pg_settings.rs); any other name is 42704, as PostgreSQL answers. `pg_catalog.set_config(...)`, which a pg_dump header also calls, is not implemented |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
@@ -594,7 +600,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Describe/Execute/Sync/Close/Flush) protocols; trust auth only; parameters in text format for every type, in binary for int2/int4/int8, float4/float8, bool, bytea, jsonb and the text types (any other binary parameter: 0A000); Execute row limits honoured (PortalSuspended). Bind is checked in PostgreSQL's order (parameter-format count 08P01, value count 08P01, failed block 25P02, each sent value's format code 22023); every statement's value count is checked at Bind, its parameters counted as PostgreSQL counts them (a statement it analyses at Parse: the declared ones and every `$n` its lexer reads, never one in a string, a quoted name, a dollar quote, a comment or an identifier; a utility statement such as SET, COPY or ALTER: the declared ones alone), except a `$n` above 65535, left to the prepare's 42601 (E5-QUEUE R2(a) closed by wire review 17 item 2); the result-format count (PortalSetResultFormat's 08P01) is checked at Describe or Execute, once the column count is known (E5-QUEUE R1); a result format code other than 0 or 1 is refused (22023) when a row is formatted, as in PostgreSQL. A prepared statement's parameter and result types are fixed at its first Describe or Execute (PostgreSQL fixes them at Parse); a later Describe or Execute that finds others (after `turso_branch_switch`, a DDL or a search_path change) is refused 0A000, "cached plan must not change result type" for the result, where PostgreSQL refuses a changed result type the same way but re-plans a changed parameter type with the fixed one, so a parameter whose new type it can coerce runs there and is refused here. No COPY sub-protocol, CancelRequest, or NotificationResponse |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Describe/Execute/Sync/Close/Flush) protocols; trust auth only; parameters in text format for every type, in binary for int2/int4/int8, float4/float8, bool, bytea, jsonb and the text types (any other binary parameter: 0A000); Execute row limits honoured (PortalSuspended). Bind is checked in PostgreSQL's order (parameter-format count 08P01, value count 08P01, failed block 25P02, each sent value's format code 22023); every statement's value count is checked at Bind, its parameters counted as PostgreSQL counts them (a statement it analyses at Parse: the declared ones and every `$n` its lexer reads, never one in a string, a quoted name, a dollar quote, a comment or an identifier; a utility statement such as SET, COPY or ALTER: the declared ones alone), except a `$n` above 65535, left to the prepare's 42601 (E5-QUEUE R2(a) closed by wire review 17 item 2); the result-format count (PortalSetResultFormat's 08P01) is checked at Describe or Execute, once the column count is known (E5-QUEUE R1); a result format code other than 0 or 1 is refused (22023) when a row is formatted, as in PostgreSQL. A prepared statement's parameter and result types are fixed at its first Describe or Execute (PostgreSQL fixes them at Parse); a later Describe or Execute that finds others (after `turso_branch_switch`, a DDL or a search_path change) is refused 0A000, "cached plan must not change result type" for the result, where PostgreSQL refuses a changed result type the same way but re-plans a changed parameter type with the fixed one, so a parameter whose new type it can coerce runs there and is refused here; one it cannot coerce is refused there at Bind, before BindComplete, with the re-analysis's own error (42883 for an operator with no match; PostgreSQL's exec_bind_message revalidates the plan in GetCachedPlan before it sends BindComplete, read in its source, the code unrecorded), and here at the Describe, or at the Execute after BindComplete, 0A000 "cached plan must not change the type of parameter $n". No COPY sub-protocol, CancelRequest, or NotificationResponse |
 
 ## Platforms
 

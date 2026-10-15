@@ -32,6 +32,9 @@ turso_parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The frontend's test failpoints, for this crate's own tests alone (resolver 2 keeps a
+# dev-dependency's features out of every other build).
+turso_pg = { workspace = true, features = ["failpoints"] }
 
 [lints]
 workspace = true

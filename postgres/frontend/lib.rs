@@ -3,15 +3,19 @@ mod catalog;
 mod copy;
 mod functions;
 mod information_schema;
+mod pg_settings;
 mod result_types;
 pub use result_types::{element_of, StatementTypes};
 mod session;
 
 pub use session::PgConnection as Connection;
 pub use session::{
-    attach_schema_files, branch_call, check_table_keys, open_database, open_database_with_io,
-    pg_bool, split_statements, PgConnection, PgQueryRunner, CONNECTION_BROKEN,
+    attach_schema_files, branch_call, check_table_keys, message_rank, open_database,
+    open_database_with_io, pg_bool, split_statements, PgConnection, PgQueryRunner, TxStmt,
+    CONNECTION_BROKEN, DEFAULT_SEARCH_PATH, FIXED_SETTINGS,
 };
+#[cfg(feature = "failpoints")]
+pub use session::fail_next_undo;
 pub use turso_core::{
     Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, Result, StepResult,
 };

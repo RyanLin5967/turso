@@ -753,6 +753,31 @@ fn test_postgres_foreign_key_column_level(db: TempDatabase) {
     assert!(result.is_err(), "FK violation should fail");
 }
 
+/// The plain frontend's twin of the wire's create_with_keys tests (wire review 16 item 13): outside
+/// the server, the CREATE TABLE key precheck (parent_key_resolves) is the only check at CREATE, so
+/// a key onto a parent column with no unique index is refused there ("there is no unique
+/// constraint matching given keys", PostgreSQL's 42830), and no table is created. A precheck that
+/// let it through left a table every INSERT into which failed "foreign key mismatch". The mutant
+/// parent_key_resolves always true must turn this red.
+#[turso_macros::test]
+fn test_postgres_foreign_key_onto_a_non_unique_column_is_refused(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, code INTEGER)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE TABLE c (x INTEGER REFERENCES p(code))")
+        .expect_err("a key onto a non-unique column was accepted")
+        .to_string();
+    assert!(
+        err.contains("there is no unique constraint matching given keys"),
+        "refused for another reason: {err}"
+    );
+    assert!(
+        conn.execute("SELECT count(*) FROM c").is_err(),
+        "the refused table c was created"
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_foreign_key_table_level(db: TempDatabase) {
     let conn = db.connect_postgres();

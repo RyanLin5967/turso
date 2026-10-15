@@ -45,3 +45,21 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
 3. `read_cstring` decodes strictly: invalid UTF-8 is 22021 "invalid byte sequence for encoding
    \"UTF8\": 0x.." (it was read lossily), in one scan for the terminator. `MalformedMessage` and
    `PgWireFrontendMessage::Malformed` carry the SQLSTATE and the message (wire review 12 item 8).
+4. `api/auth/noop.rs`: `NoopStartupHandler` gains `server_parameters`, the provider of the
+   ParameterStatus values startup announces, `DefaultServerParameterProvider::default()` unless
+   the handler overrides it; `on_startup` used that default unconditionally, so the server could
+   not announce the settings SHOW answers (`ISO, YMD` against `ISO, MDY`, `Etc/UTC` against `UTC`,
+   `public` against `"$user", public`; wire review 18 item 19).
+5. `types/format/float_digits.rs`: at extra_float_digits >= 1 (the default, 1) a float's text is
+   PostgreSQL's float8out / float4out layout (`postgres_shortest`): the shortest exact digits (Rust's
+   `{:e}`), fixed notation while the decimal exponent is in [-4, 15) (float8) or [-4, 6) (float4),
+   else `d.ddde+XX`. ryu's text was `1.0`, `100.0`, `1e16`, `0.00001` (PostgreSQL 18.6 recorded,
+   artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-float.out). The infinities are item 6. This crate's tests do not build alone here
+   (rustc 1.88 is below its MSRV); test_format's
+   PI rows were checked by reading: `{:e}` of PI is `3.141592653589793e0`, written `3.141592653589793`.
+6. `types/format/float_digits.rs`: the infinities are written `Infinity` / `-Infinity` and a
+   negative zero `-0`, as PostgreSQL 18.6's float8out / float4out write them (recorded, artie
+   lanes/wire/raw/loud-20261015/pg18-diff/pg18-inf.out); upstream wrote `inf`, `-inf` and `0`.
+   FLAGGED TEST EDIT, ruled by the lead (2026-10-15T07:40:59Z): test_format's two infinity rows
+   now assert `Infinity` / `-Infinity`. The crate's tests do not build alone here (MSRV), so the
+   wire test infinities_and_negative_zero_are_written_without_nan is the check that runs.

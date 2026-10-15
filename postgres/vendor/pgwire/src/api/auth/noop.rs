@@ -23,6 +23,11 @@ pub trait NoopStartupHandler: StartupHandler {
     {
         Ok(())
     }
+
+    /// The ParameterStatus values startup announces (vendored change 4; see VENDORED.md).
+    fn server_parameters(&self) -> DefaultServerParameterProvider {
+        DefaultServerParameterProvider::default()
+    }
 }
 
 #[async_trait]
@@ -43,8 +48,7 @@ where
         if let PgWireFrontendMessage::Startup(ref startup) = message {
             super::protocol_negotiation(client, startup).await?;
             super::save_startup_parameters_to_metadata(client, startup);
-            super::finish_authentication0(client, &DefaultServerParameterProvider::default())
-                .await?;
+            super::finish_authentication0(client, &self.server_parameters()).await?;
 
             self.post_startup(client, message).await?;
 
