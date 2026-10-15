@@ -326,10 +326,45 @@ pub fn param_targets(parse: &ParseResult) -> Vec<Option<u32>> {
         .collect()
 }
 
+/// Whether `text` (a literal pg_query gives as a float's text) is an integer literal, decimal or
+/// 0x / 0o / 0b with underscores, whose value fits int8.
+fn integer_literal_fits_i64(text: &str) -> bool {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
+        (16, b)
+    } else if let Some(b) = lower.strip_prefix("0o") {
+        (8, b)
+    } else if let Some(b) = lower.strip_prefix("0b") {
+        (2, b)
+    } else {
+        (10, lower.as_str())
+    };
+    let clean: String = body.chars().filter(|c| *c != '_').collect();
+    if clean.is_empty() || !clean.chars().all(|c| c.is_digit(radix)) {
+        return false;
+    }
+    match u128::from_str_radix(&clean, radix) {
+        Ok(v) if negative => v <= i64::MAX as u128 + 1,
+        Ok(v) => v <= i64::MAX as u128,
+        Err(_) => false,
+    }
+}
+
 /// [`expression_types`] for one expression.
 fn expression_type(node: &PgNode) -> Option<u32> {
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind, SubLinkType};
     let boolean = match node.node.as_ref()? {
+        // An integer literal past int4 (pg_query gives it as a float's text) is int8 while it fits
+        // one, as PostgreSQL types it (recorded, pg18-diff/pg18-c33.out; Claude C33: announced
+        // int4). One past int8 is numeric in PostgreSQL; the engine holds it as a float, so it is
+        // left to the engine's type (the bare-NUMERIC divergence, a known red).
+        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_fits_i64(&f.fval)) => {
+            return Some(INT8);
+        }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
         // NULLIF is its first argument's type.
