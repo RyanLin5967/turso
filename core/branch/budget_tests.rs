@@ -3667,7 +3667,8 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
 /// Review 2 H1 and DECISIONS (review 6 #1's ruling: "under load, no confirmation word at all"): with
 /// the shipped 5 ms quiet period and C clients making back-to-back creates,
 /// * while flights overlap (C >= 8) the writer writes no word during the burst;
-/// * the idle tail after a burst gets at most one word, at every C;
+/// * the idle tail after a burst gets exactly one word, at every C (DECISIONS 6d491917d2 proposal 3:
+///   with the tail settled, none is a word lost; mutant `confirm_tail_lost`);
 /// * the writer wakes, with a word pending, at most twice per flight during the burst: once at the
 ///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
 ///   between two flights (a stated constant: a poll wakes many times per flight).
@@ -3726,8 +3727,10 @@ fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
     } else if c >= 8 && burst != 0 {
         let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
     }
-    if tail > 1 {
-        let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget <= 1");
+    // DECISIONS 6d491917d2 (proposal 3): exactly one; with the tail settled (unheld, nothing pending)
+    // a tail with no word is a word lost.
+    if tail != 1 {
+        let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget == 1");
     }
     if wakes > 2 * flights {
         let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
