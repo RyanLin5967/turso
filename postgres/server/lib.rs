@@ -839,15 +839,16 @@ impl Parsed {
     /// types are others. The same text with the same declared types has the same parameters, so
     /// only their types can differ.
     fn fix_params(&self, params: &[Type]) -> SqlResult<()> {
-        let fixed = self.params.get_or_init(|| params.to_vec());
-        if fixed.as_slice() == params {
-            return Ok(());
+        match fix_or_first_change(&self.params, params) {
+            None => Ok(()),
+            Some(i) => Err(error(
+                "0A000",
+                format!(
+                    "cached plan must not change the type of parameter ${}",
+                    i + 1
+                ),
+            )),
         }
-        let n = fixed.iter().zip(params).take_while(|(a, b)| a == b).count() + 1;
-        Err(error(
-            "0A000",
-            format!("cached plan must not change the type of parameter ${n}"),
-        ))
     }
 
     /// Fix the statement's result columns, each its name and type, at the first call, and refuse
@@ -856,14 +857,23 @@ impl Parsed {
     /// type. Compared by type alone, a SELECT * over (b int, a int) ran under the (a int, b int)
     /// RowDescription its Describe sent, each value in the other's column (wire review 18 item 9).
     fn fix_columns(&self, columns: &[(String, Type)]) -> SqlResult<()> {
-        if self.columns.get_or_init(|| columns.to_vec()).as_slice() == columns {
-            return Ok(());
+        match fix_or_first_change(&self.columns, columns) {
+            None => Ok(()),
+            Some(_) => Err(error(
+                "0A000",
+                "cached plan must not change result type".to_string(),
+            )),
         }
-        Err(error(
-            "0A000",
-            "cached plan must not change result type".to_string(),
-        ))
     }
+}
+
+/// [`Parsed::fix_params`] and [`Parsed::fix_columns`]' one comparison (they were the same code
+/// twice; wire review 18 item 23): `now` fixed in `cell` at the first call; at a later one, None
+/// when it is what was fixed, else the index of the first element that differs (the shorter
+/// one's length when one is a prefix of the other).
+fn fix_or_first_change<T: Clone + PartialEq>(cell: &OnceLock<Vec<T>>, now: &[T]) -> Option<usize> {
+    let fixed = cell.get_or_init(|| now.to_vec());
+    (fixed.as_slice() != now).then(|| fixed.iter().zip(now).take_while(|(a, b)| a == b).count())
 }
 
 /// pgwire's query parser for [`Parsed`] statements. This server overrides every handler that
@@ -3924,6 +3934,19 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
+    // check_bind_arity made the counts equal; zipped short, a mismatch bound a value under another's
+    // type or left a parameter unbound (NULL to the engine), so it is refused (wire review 18 item
+    // 23).
+    if types.len() != portal.parameters.len() {
+        return Err(PgWireError::UserError(error(
+            "XX000",
+            format!(
+                "internal error: {} parameter types for {} values",
+                types.len(),
+                portal.parameters.len()
+            ),
+        )));
+    }
     // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
     for (i, (pg_type, sent)) in types.iter().zip(&portal.parameters).enumerate() {
         let value = match sent {
