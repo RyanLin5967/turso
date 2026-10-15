@@ -3424,8 +3424,9 @@ fn a_schema_window_adds_nothing_under_the_wal_write_lock() {
 /// 64 B. A cost linear in tables with a fixed part meets this (the fixed part only raises the
 /// 10-table figure); one that grows faster than the tables does not (a schema copied once per parsed
 /// row costs about tables/2 copies per table). Read generously: the 10^3 cell's smallest extra (its
-/// window's least minus its control's most) against the 10 cell's largest. Mutant
-/// `schema_parse_quadratic`. WRITTEN NOT RUN.
+/// window's least minus its control's most) against the 10 cell's largest. A bound on these samples
+/// and the paths they take, not on every allocation path (review C08); pure CPU work is invisible
+/// to it. Mutant `schema_parse_quadratic`. WRITTEN NOT RUN.
 #[test]
 fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
     if in_child() {
@@ -3470,7 +3471,7 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 ///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
 ///   prepared before the mutex is taken, or at the open).
 /// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
-/// RED today. The review's split-transaction mutant is today's code, so this red at base is its
+/// RED today, so no mutant against it can earn a kill before a green baseline exists (review C08). The review's split-transaction mutant is today's code, so this red at base is its
 /// kill; once the FIX lands, mutant `catalog_schema_split` splits the transaction again (registered
 /// against the fixed code). WRITTEN NOT RUN.
 #[test]
@@ -3559,11 +3560,13 @@ fn contention_no_create_is_refused_and_retried_at_any_client_count() {
 /// everything buffered, so an acknowledgement waits for at most two flights — the one in progress,
 /// then its own. At every C from 1 to 1,024 no single acknowledgement (a create, or a first write)
 /// makes more than 2 store waits (`store::thread_waits`, one per condition-variable wait call, so a
-/// waiter woken and waiting again counts again). This holds by construction today (review 2 H5): it
+/// waiter woken and waiting again counts again). A CONSTRUCTION BOUND (review 2 H5, review C08): it
+/// holds by the group's shape today and is no independent evidence of contention efficiency; it
 /// guards the shape, against a waiter that polls on timed waits or a flight that takes part of the
-/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A line at C >= 8 with
-/// no store wait at all is refused: some waiter must sleep, and a wait outside `Group::wait` (a
-/// sleep-and-relock poll, or creates serialised on the store mutex) would read as none. Reported per
+/// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A PREMISE, not a
+/// budget: a line at C >= 8 with no store wait at all is refused (some waiter must sleep, and a wait
+/// outside `Group::wait`, a sleep-and-relock poll or creates serialised on the store mutex, would
+/// read as none); it assumes the clients overlapped, which a serialised scheduler can break. Reported per
 /// line: the mean per acknowledgement, the worst acknowledgement, and the worst client's waits per
 /// its own acknowledgements (the lead's condition, DECISIONS 2026-10-09). Mutants
 /// `group_wait_polls`, `poll_outside_group_wait`, `flush_under_mutex`. WRITTEN NOT RUN.
@@ -3592,10 +3595,10 @@ fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_cou
             locks as f64 / acks as f64,
         );
         if s["store_waits_max_ack"] > 2 {
-            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2", s["store_waits_max_ack"]);
+            let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2 [construction bound: group commit's shape]", s["store_waits_max_ack"]);
         }
         if c >= 8 && waits == 0 {
-            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere (refused)");
+            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere, or the clients never overlapped (premise refused)");
         }
     }
     assert!(failures.is_empty(), "acknowledgements under contention (all:{seen}):\n{failures}");
