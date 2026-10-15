@@ -14,14 +14,16 @@
 //! L2 slice (fastest-engine, budget create_allocates_no_table_of_every_branch_under_the_store_mutex,
 //! 64 KiB per create under the store mutex): a chunk of 1024 branch states was 376,832 bytes
 //! (artie raw l8-chunk_1c58a6f25.txt), allocated whole by the create that first needs it. A chunk is
-//! now CHUNK = 128 states (47,104 bytes for a 368-byte state), and the directory is TWO-LEVEL
+//! now CHUNK = 64 states (23,552 bytes for a 368-byte state), and the directory is TWO-LEVEL
 //! (r11-adversarial's F-R1b): fixed segments of SEG = 1024 chunk slots (24 KiB each) behind a top
-//! `Vec` of segments, so no create allocates more than one chunk, one segment, or a top doubling of
-//! N / 131,072 pointers (8 at 10^6). `growth()` counts the top's doublings.
+//! `Vec` of segments, so the create that needs a new segment AND a new chunk allocates about 47 KiB
+//! (128 states a chunk measured 73,236 bytes there, over the budget: artie raw
+//! l10-d0growth_22c5c5da3.txt), and a top doubling moves N / 65,536 pointers (16 at 10^6).
+//! `growth()` counts the top's doublings.
 
 use super::BranchId;
 
-pub(crate) const CHUNK: usize = 128;
+pub(crate) const CHUNK: usize = 64;
 /// Chunk slots per directory segment.
 const SEG: usize = 1024;
 
@@ -247,7 +249,7 @@ mod tests {
         assert!(t.capacity() >= t.len());
     }
 
-    /// The two-level directory (L2 slice): ids across several segments (CHUNK x SEG = 131,072 ids
+    /// The two-level directory (L2 slice): ids across several segments (CHUNK x SEG = 65,536 ids
     /// each), a whole segment emptied (freed) and refilled, sparse ids far apart; against the model,
     /// with every chunk this table allocates at most 64 KiB for a 368-byte state.
     #[test]
@@ -274,6 +276,6 @@ mod tests {
             assert_eq!(t.get(&BranchId(id)).copied(), m.get(&id).copied(), "id {id}");
         }
         assert_eq!(t.len(), m.len());
-        assert!(CHUNK * 368 <= 64 << 10, "premise: a chunk of 368-byte states fits 64 KiB");
+        assert!(CHUNK * 368 + SEG * 24 <= 64 << 10, "premise: a chunk of 368-byte states and a segment fit 64 KiB together");
     }
 }
