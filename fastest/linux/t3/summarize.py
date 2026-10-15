@@ -343,6 +343,7 @@ def summarize(out, sha, dry, manifest):
     wtext = open(wt).read().split() if os.path.exists(wt) else []
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
+    warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -404,8 +405,9 @@ def summarize(out, sha, dry, manifest):
             # the loop is reported in runs[].warmup_loops, never used to excuse one
             for tcell, b in r.get("warmup_backsteps") or []:
                 if type(b) is not int or b != 0:
-                    parity.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
-                                  "order (PREREG annex A23; refused in either loop mode)")
+                    warm.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
+                                "order (PREREG annex A23; refused in either loop mode)")
+                    parity.append(warm[-1])
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
         runs.append(r)
         if not result:
@@ -454,7 +456,8 @@ def summarize(out, sha, dry, manifest):
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
     parity += [f"warm-up (A23): {x}" for x in conf]
-    summary["warmup_creditable"] = not conf
+    # creditable only when NO warm-up refusal stands: the conformance binding and every backstep (review 7 finding 7)
+    summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
