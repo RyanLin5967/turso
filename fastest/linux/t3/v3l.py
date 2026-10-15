@@ -759,7 +759,7 @@ def self_test():
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
             timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
-            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync=(("ran", True), ("rc", 0)), iostats="1"):
+            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync="auto", iostats="1"):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -775,9 +775,36 @@ def self_test():
         # (data plus filesystem metadata: 2 x the data by default)
         r["arms"]["fsync"]["timed"]["sectors_written_delta"] = sectors
         r["arms"]["fsync"]["timed"]["lab_sectors_written_delta"] = lab_sectors
-        # the sync before each run, as measure() records it since annex A24
+        # the sync before each run, as measure() records it since annex A24. TEST EDIT, flagged (review 6 MED 2,
+        # annex A24-AM1): the default record also carries one `sync -f` entry per filesystem under DIR (DIR's, plus one
+        # per loop layer's backing file), each rc 0: a new required field at its passing value; no expectation changes
+        if sync == "auto":
+            sync = {"ran": True, "rc": 0, "layers": [{"path": f"/fs{i}", "rc": 0, "secs": 0.0}
+                                                     for i in range(1 + len(layers or []))]}
         if sync is not None:
-            r["arms"]["fsync"]["sync"] = {"labelling": dict(sync), "timed": dict(sync)}
+            r["arms"]["fsync"]["sync"] = {"labelling": json.loads(json.dumps(dict(sync))),
+                                          "timed": json.loads(json.dumps(dict(sync)))}
+        return r
+
+    def fake_sync(rc_f=0):
+        """a sync runner recording each argv; `sync -f` exits rc_f"""
+        calls = []
+
+        def run(argv, **_k):
+            calls.append(list(argv))
+            f = "-f" in argv
+            return subprocess.CompletedProcess(argv, rc_f if f else 0, "", "boom" if f and rc_f else "")
+        return calls, run
+
+    def sync_argv_case():
+        calls, run = fake_sync()
+        r = sync_record(runner=run, paths=["/mnt/t3-xfs/v3l", "/var/tmp/b.img"])
+        return (calls == [["sync"], ["sync", "-f", "/mnt/t3-xfs/v3l"], ["sync", "-f", "/var/tmp/b.img"]]
+                and [(x["path"], x["rc"]) for x in r["layers"]] == [("/mnt/t3-xfs/v3l", 0), ("/var/tmp/b.img", 0)]
+                and all(isinstance(x["secs"], float) for x in r["layers"]))
+
+    def sync_mut(r, run, f):
+        f(r["arms"]["fsync"]["sync"][run])
         return r
 
     cases += [
@@ -1021,6 +1048,23 @@ def self_test():
         ("A24: sync_record() on a sync that exits 1 refuses the measurement",
          _ok(lambda: _raises(lambda: sync_record(lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "boom")),
                              "sync before a V3L run failed"))),
+        # review 6 MED 2 (annex A24-AM1): sync(1) with no operand calls the void sync(2), so its rc is 0 by construction;
+        # the rc that carries a writeback error is `sync -f` (syncfs) on each filesystem under DIR, top-down
+        ("A24-AM1: sync_record(paths) runs sync(1), then sync -f per filesystem under DIR, top-down, recording each",
+         _ok(sync_argv_case)),
+        ("A24-AM1: a sync -f that exits 1 refuses the measurement, naming the filesystem",
+         _ok(lambda: _raises(lambda: sync_record(runner=fake_sync(1)[1], paths=["/var/tmp/b.img"]), "/var/tmp/b.img"))),
+        ("A24-AM1: a record whose sync -f failed on one filesystem VOIDs, naming it",
+         _ok(lambda: _has(gates(sync_mut(rec(), "timed", lambda y: y["layers"][-1].__setitem__("rc", 1))),
+                          "drive nvme1n1:", "the sync before the timed fsync run", "/fs0"))),
+        ("A24-AM1: a loop record whose labelling sync skipped the backing file's filesystem VOIDs",
+         _ok(lambda: _has(gates(sync_mut(rec(layers=[{"name": "loop3", "write_cache": "write through",
+                                                      "flush_ios_delta": 0}]), "labelling", lambda y: y["layers"].pop())),
+                          "drive nvme1n1:", "the sync before the labelling fsync run", "filesystems"))),
+        ("A24-AM1: plant unsynced-layer fires on a write-back record, on the failed filesystem's text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:",
+                                                                  "the sync before the timed fsync run", "failed on"))(
+             _plant(plants(rec(delta=20003))[0], "unsynced-layer")))),
         # review 5 MED 4: the write rule's labelling half gets its own plant, matched on its own text
         ("MED 4: plant wt-unwritten-lab fires on a write-back record, on the labelling half's text",
          _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:", "in the labelling fsync run",
