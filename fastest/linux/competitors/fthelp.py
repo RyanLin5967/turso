@@ -272,6 +272,17 @@ def selftest():
     ok(f"pg_waits: template 2+1, delete 2+1, unattributed 1 (got {got})", got == want)
     got = pw("") if pw else None
     ok(f"pg_waits: an empty log is all zeros (got {got})", got == {k: 0 for k in want})
+    # comp review 1 LOW 28: the seed's GC settings record (dolt.sh SHOW VARIABLES LIKE '%gc%'; doltgres.sh pg_settings
+    # LIKE '%gc%') is refused when empty, when its query failed, or when no row is a GC setting
+    gs = globals().get("gc_settings_problem")
+    for name, text, want_ok in (
+            ("Dolt's variables, tab-separated", "dolt_gc_lag\t0\ndolt_auto_gc_enabled\t1\n", True),
+            ("Doltgres's pg_settings rows, |-separated", "dolt_auto_gc_enabled|on\n", True),
+            ("an empty record", "", False),
+            ("a failed query", "ERROR 2013 (HY000): Lost connection\nrc=1 (not read)\n", False),
+            ("rows, none a GC setting", "max_connections\t1100\n", False)):
+        why = gs(text) if gs else "no gc_settings_problem() in fthelp.py"
+        ok(f"gc settings record: {name} -> {'ok' if not why else why}", (not why) == want_ok)
     print(f"fthelp selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
