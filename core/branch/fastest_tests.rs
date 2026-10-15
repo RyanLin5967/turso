@@ -8000,3 +8000,215 @@ fn a_damaged_slot_a_held_free_upgrade_made_durable_is_refused_when_read() {
         );
     }
 }
+
+/// Engine review 21 MEDs 7 and 8: how a forked child makes a slot-naming last flight durable by a
+/// trunk commit's WAL F_FULLFSYNC alone, in a store whose trunk F_FULLFSYNCs its WAL on the branch
+/// files' device (Apple, `fullfsync`), so the commit's barrier is ORDERED.
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Unconfirmed {
+    /// MED 7: a D1 store. A branch commit on z, in the window between the trunk commit's decision
+    /// and its barrier, leads a synced flight carrying the TrunkRetain and takes the arena's mark;
+    /// the barrier is then an ordered zero-byte upgrade with no arena to barrier, so no empty end
+    /// frame closes z's flight, whose own confirmation is unproved (a plain fsync, on Apple) and was
+    /// written only at a clean close.
+    D1,
+    /// MED 7: a raised D0 catalog store. A fuzzy checkpoint captured after the trunk commit's
+    /// decision writes the TrunkRetain in its own D0 flight and settles the arena (`settle_arena`
+    /// takes the mark); the barrier is then an ordered zero-byte upgrade with no arena to barrier,
+    /// and nothing confirms the checkpoint's flight.
+    SettledUpgrade,
+    /// MED 8: a raised D0 catalog store. The capture comes before the trunk commit's decision and
+    /// the settle after it: the barrier's ordered flight carries the TrunkRetain over an arena the
+    /// settle took, so it is tagged as a synced flight (a7423baa8), slot-checked at open, and has
+    /// no confirmation.
+    SettledFlight,
+}
+
+/// Engine review 21 MEDs 7 and 8: a forked child (`unconfirmed_workload`) has a trunk commit
+/// acknowledged whose WAL F_FULLFSYNC made a slot-naming last flight durable, gives the
+/// confirmation writer its chance, and ends as a kill does (`_exit`: no close, so nothing a close
+/// would confirm); then x's pre-image slot is flipped and the store reopened. x's read must be
+/// refused: that flush proved the last flight's confirmation, which the writer wrote. At the base
+/// nothing confirmed the flight before a close, so open's slot check dropped it silently and x read
+/// the trunk's newer page. Mutants `trunk_flush_promotes_nothing` (every arm) and
+/// `ordered_confirms_nothing` (the settled arms).
+#[cfg(target_vendor = "apple")]
+fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill(name: &str, catalog: bool, arm: Unconfirmed) {
+    use crate::branch::fork_driver;
+    let Some(sentinel) = fork_driver::alone(name) else {
+        return;
+    };
+    let what = format!("catalog={catalog} {arm:?}");
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("unconfirmed.db");
+    let out = dir.path().join("child-out");
+    let class = if arm == Unconfirmed::D1 { SyncClass::Fsync } else { SyncClass::Off };
+    // SAFETY: the child runs the workload, which `_exit`s; it never returns into the harness.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unconfirmed_workload(&path, &out, catalog, class, arm)
+        }))
+        .map_or(100, |()| 0);
+        // SAFETY: ends the child as a kill would: nothing more is flushed, no destructor runs.
+        unsafe { libc::_exit(code) };
+    }
+    let code = fork_driver::exit_code(pid);
+    assert_eq!(code, 0, "{what}: the workload failed in the child (100: a panic)");
+    let text = std::fs::read_to_string(&out).unwrap();
+    let mut lines = text.lines();
+    let id = BranchId(lines.next().unwrap().parse().unwrap());
+    let kept: u32 = lines.next().unwrap().parse().unwrap();
+    let arena = std::path::PathBuf::from(lines.next().unwrap());
+    flip_slot_byte(&arena, kept);
+    let db = open_at(&path, opts(catalog, class));
+    let got = read_row_of(&db, id, 3);
+    assert!(
+        got.is_err(),
+        "{what}: a damaged slot a trunk commit's flush made durable was dropped silently after a kill, x read {got:?}"
+    );
+    fork_driver::finished(&sentinel);
+}
+
+/// The forked child's part of `a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill`:
+/// the arm's stops up to the trunk commit's acknowledgement, then up to 2 s for the confirmation
+/// writer to write a word (it writes a proved one once the group has been idle `confirm_quiet()`,
+/// 5 ms; at the base it writes none), then x's id, its pre-image's slot and the arena's path into
+/// `out`, and `_exit` with every handle open.
+#[cfg(target_vendor = "apple")]
+fn unconfirmed_workload(path: &Path, out: &Path, catalog: bool, class: SyncClass, arm: Unconfirmed) -> ! {
+    use std::sync::atomic::Ordering as O;
+    let what = format!("catalog={catalog} {arm:?}");
+    let db = open_at(path, opts(catalog, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    if arm != Unconfirmed::D1 {
+        // A trunk commit that keeps w a pre-image raises the log (its ordered flight is
+        // FullFsync), so a fuzzy checkpoint settles the arena itself (`Captured::settle_arena`).
+        let w = trunk.fork_branch().unwrap();
+        write_v(&trunk, 30, "warm");
+        let _w = w.into_id();
+        assert!(db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the log is raised");
+    }
+    let x = trunk.fork_branch().unwrap();
+    let z = (arm == Unconfirmed::D1).then(|| trunk.fork_branch().unwrap());
+    let zc = z.as_ref().map(|z| z.connect().unwrap());
+    let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+    if arm == Unconfirmed::SettledFlight {
+        // Captured before the trunk commit decides: its TrunkRetain is not the checkpoint's to write.
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_SETTLE);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "{what}: premise: a fuzzy checkpoint started");
+        eventually(&format!("{what}: premise: the checkpoint never reached its settle"), || {
+            db.branch_checkpoint_held() == super::store::HOLD_BEFORE_SETTLE | super::store::HOLD_ARRIVED
+        });
+    }
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_DECIDED, O::Release);
+    let committing = std::thread::spawn(move || {
+        write_v(&trunk, 3, "new");
+        trunk
+    });
+    eventually(&format!("{what}: premise: the trunk commit never decided"), || {
+        hold.load(O::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED
+    });
+    match arm {
+        Unconfirmed::D1 => {
+            // z's commit leads a synced flight in the window: it carries the TrunkRetain.
+            write_v(zc.as_ref().unwrap(), 40, "z");
+        }
+        Unconfirmed::SettledUpgrade => {
+            // Captured after the decision: the checkpoint's own D0 flight writes the TrunkRetain,
+            // and its settle takes the arena's mark.
+            db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+            assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "{what}: premise: a fuzzy checkpoint started");
+            eventually(&format!("{what}: premise: the checkpoint never reached its commit"), || {
+                db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+            });
+            assert_eq!(
+                db.branches.log_lsn_for_test(),
+                db.branches.durable_for_test(SyncClass::Off),
+                "{what}: premise: the checkpoint's flight wrote the TrunkRetain"
+            );
+        }
+        Unconfirmed::SettledFlight => {
+            // Settled after the decision: the settle takes the mark over the TrunkRetain's slot,
+            // and the record stays buffered for the barrier's own flight.
+            db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+            eventually(&format!("{what}: premise: the checkpoint never reached its commit"), || {
+                db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+            });
+            assert!(
+                db.branches.log_lsn_for_test() > db.branches.durable_for_test(SyncClass::Off),
+                "{what}: premise: the TrunkRetain is still buffered"
+            );
+        }
+    }
+    assert!(
+        !db.branches.arena_dirty_for_test(),
+        "{what}: premise: the trunk commit's barrier finds the arena's mark taken"
+    );
+    let barriers = sync_counts().barrier;
+    let written = db.branches.confirm_counts()[0];
+    hold.store(0, O::Release);
+    let trunk = committing.join().unwrap();
+    assert!(sync_counts().barrier > barriers, "{what}: premise: the trunk commit's barrier was ordered");
+    assert_eq!(read_v(&trunk, 3), "new", "{what}: premise: the trunk commit was acknowledged");
+    let t = std::time::Instant::now();
+    while db.branches.confirm_counts()[0] == written && t.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let z_slots: std::collections::HashSet<u32> = z.as_ref().map(|z| z.owned_slots()).unwrap_or_default().into_iter().collect();
+    let kept: Vec<u32> = db
+        .branch_slots_in_use()
+        .into_iter()
+        .filter(|s| !before.contains(s) && !z_slots.contains(s))
+        .collect();
+    assert_eq!(kept.len(), 1, "{what}: premise: the trunk commit kept one pre-image for x");
+    std::fs::write(out, format!("{}\n{}\n{}\n", x.into_id().0, kept[0], arena_path(&db).display())).unwrap();
+    // SAFETY: ends the child as a kill would: nothing more is flushed, no destructor runs.
+    unsafe { libc::_exit(0) }
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_d1_snapshot() {
+    a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill(
+        "branch::fastest_tests::a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_d1_snapshot",
+        false,
+        Unconfirmed::D1,
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_d1_catalog() {
+    a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill(
+        "branch::fastest_tests::a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_d1_catalog",
+        true,
+        Unconfirmed::D1,
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_settled_upgrade() {
+    a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill(
+        "branch::fastest_tests::a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_settled_upgrade",
+        true,
+        Unconfirmed::SettledUpgrade,
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_settled_flight() {
+    a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill(
+        "branch::fastest_tests::a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_settled_flight",
+        true,
+        Unconfirmed::SettledFlight,
+    );
+}

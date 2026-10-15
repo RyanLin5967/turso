@@ -1625,6 +1625,12 @@ pub(crate) const HOLD_CONNECT_LOOKED_UP: u8 = 12;
 /// catalog WAL's PASSIVE backfill done and its TRUNCATE not begun (engine review 21 MED 5).
 #[cfg(test)]
 pub(crate) const HOLD_AFTER_WAL_PASSIVE: u8 = 14;
+
+/// fastest-engine (test hook `checkpoint_hold`): a raised D0 store's fuzzy checkpoint waits here,
+/// what its capture covers written and its arena not yet settled (`settle_arena`; engine review 21
+/// MED 8: a trunk commit that decides in this window writes a slot the settle then takes).
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_SETTLE: u8 = 15;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -2812,7 +2818,8 @@ fn run_flight(
         // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. In a
         // raised D0 store the arena is then synced alone (`settle_arena`; engine review 9 #8). The
         // test hook pauses the step that syncs the slots, once taken (`HOLD_FLIGHT_TAKEN`): that
-        // arena sync, or else the flight this wait leads.
+        // arena sync, or else the flight this wait leads; and before that arena sync is taken
+        // (`HOLD_BEFORE_SETTLE`).
         if !fe_mutant("commit_unsettled") {
             #[cfg(test)]
             let syncs = thread_syncs();
@@ -2825,6 +2832,8 @@ fn run_flight(
             )
             .and_then(|()| {
                 if cap.settle_arena {
+                    #[cfg(test)]
+                    pause_at(Some(&*hold), HOLD_BEFORE_SETTLE);
                     BranchStore::settle_ordered(&group, cap.deferred_lsn)
                         .and_then(|()| BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
                 } else {
