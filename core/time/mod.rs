@@ -160,8 +160,10 @@ fn time_date_internal(args: &[Value]) -> Value {
 }
 
 /// [`time_date_internal`], answering `none()` for a value that is no date (out of range, or an
-/// argument past i32): NULL for `time_date`, as before; PostgreSQL's out-of-range error for
-/// `make_date` and `make_timestamp` (22008; the crash batch, 2026-10-15).
+/// argument past i32): NULL for `time_date`, `make_date` and `make_timestamp`, as before;
+/// PostgreSQL's out-of-range error (22008; the crash batch, 2026-10-15) for
+/// [`make_date_or_refuse`] and [`make_timestamp_or_refuse`], which only the PostgreSQL frontend
+/// registers.
 fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     if args.len() != 3 && args.len() != 6 && args.len() != 7 && args.len() != 8 {
         return Value::error(ResultCode::InvalidArgs);
@@ -245,11 +247,33 @@ fn make_date(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    time_date_or(args, || out_of_range(args))
+    time_date_internal(args)
 }
 
 #[scalar(name = "make_timestamp")]
 fn make_timestamp(args: &[Value]) -> Value {
+    if args.len() != 6 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    time_date_internal(args)
+}
+
+/// `make_date` refusing arguments that are no date with PostgreSQL's 22008, where the SQLite
+/// dialect's answers NULL (ultrareview of fastest-wire, finding 10: the refusal reached every
+/// dialect). Registered under the name `make_date` by the PostgreSQL frontend alone.
+#[scalar(name = "make_date")]
+pub fn make_date_or_refuse(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::error(ResultCode::InvalidArgs);
+    }
+
+    time_date_or(args, || out_of_range(args))
+}
+
+/// `make_timestamp` as [`make_date_or_refuse`] is `make_date`.
+#[scalar(name = "make_timestamp")]
+pub fn make_timestamp_or_refuse(args: &[Value]) -> Value {
     if args.len() != 6 {
         return Value::error(ResultCode::InvalidArgs);
     }
