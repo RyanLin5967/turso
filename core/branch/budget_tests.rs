@@ -3594,9 +3594,11 @@ fn contention_no_create_is_refused_and_retried_at_any_client_count() {
 /// holds by the group's shape today and is no independent evidence of contention efficiency; it
 /// guards the shape, against a waiter that polls on timed waits or a flight that takes part of the
 /// buffer. It cannot see review 1 #9's herd: that is the futile-lead budget's. A PREMISE, not a
-/// budget: a line at C >= 8 with no store wait at all is refused (some waiter must sleep, and a wait
-/// outside `Group::wait`, a sleep-and-relock poll or creates serialised on the store mutex, would
-/// read as none); it assumes the clients overlapped, which a serialised scheduler can break. Reported per
+/// budget: a line at C >= 8 whose flights were shared (more acknowledgements than device flushes) and
+/// that made no store wait at all is refused (a rider must sleep, and a wait outside `Group::wait`, a
+/// sleep-and-relock poll, would read as none). Lines with no shared flight are reported, not refused
+/// (DECISIONS 6d491917d2 proposal 2; control `shared_serial`, red at 8678d5485): a serialised
+/// schedule waits for nothing. Reported per
 /// line: the mean per acknowledgement, the worst acknowledgement, and the worst client's waits per
 /// its own acknowledgements (the lead's condition, DECISIONS 2026-10-09). Mutants
 /// `group_wait_polls`, `poll_outside_group_wait`, `flush_under_mutex`. WRITTEN NOT RUN.
@@ -3627,8 +3629,13 @@ fn contention_an_acknowledgement_waits_for_at_most_two_flights_at_any_client_cou
         if s["store_waits_max_ack"] > 2 {
             let _ = writeln!(failures, "  {spec}: {arm}: one acknowledgement made {} store waits with {c} clients; budget <= 2 [construction bound: group commit's shape]", s["store_waits_max_ack"]);
         }
-        if c >= 8 && waits == 0 {
-            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients made no store wait at all: a wait outside Group::wait, or creates serialised elsewhere, or the clients never overlapped (premise refused)");
+        // DECISIONS 6d491917d2 (proposal 2): only where the flights were SHARED (more
+        // acknowledgements than device flushes) must some waiter have slept; a serialised schedule
+        // shares none and waits for none (control `shared_serial`), and the poll mutants share
+        // flights, so they still trip it.
+        let shared_flights = acks > s[FULL];
+        if c >= 8 && shared_flights && waits == 0 {
+            let _ = writeln!(failures, "  {spec}: {arm}: {c} clients shared flights ({acks} acknowledgements over {} device flushes) and made no store wait at all: a wait outside Group::wait (premise refused)", s[FULL]);
         }
     }
     assert!(failures.is_empty(), "acknowledgements under contention (all:{seen}):\n{failures}");
