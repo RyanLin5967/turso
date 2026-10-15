@@ -238,6 +238,12 @@ def selftest():
     for p in sorted(glob.glob(os.path.join(here, "*.sh"))):
         found |= driver_subcommands(open(p).read())
     ok(f"the drivers' gen_seed.py calls are exactly {sorted(SUBCMDS)} (found {sorted(found)})", found == SUBCMDS)
+    # comp review 1 LOW 27: the pg read-back hashes each row ONCE (an OFFSET 0 subquery is not flattened, so md5 runs
+    # once per row there, not twelve times in the hex-digit sum), and the mysql one already does
+    for dial in ("pg", "mysql"):
+        q = readback_sql(dial)
+        ok(f"read-back ({dial}) names md5 exactly once ({q.lower().count('md5(')} times)", q.lower().count("md5(") == 1)
+    ok("the pg read-back's hash is in an OFFSET 0 subquery", "offset 0" in readback_sql("pg").lower())
     # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
