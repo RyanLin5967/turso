@@ -103,9 +103,11 @@ fn history(seed: u64, steps: u32) -> (u64, u64, u64) {
 
 /// The facts equal the queries they replace at every step of 6 seeded histories of 300 operations,
 /// and each fact was set at some step (an oracle over facts never set checks nothing). Plants (test
-/// builds only): `l4_complete_over_a_row` marks a page complete although the catalog holds a
-/// version the memory does not; `l4_free_ignores_puts` reads the free table empty although the
-/// checkpoint wrote slots to it. Each must fail this test.
+/// builds only), each of which must fail this test: `l4_all_complete_at_open` takes every page of a
+/// reopened catalog as complete (the oracle names it at the reopen, before anything reads);
+/// `l4_free_ignores_puts` reads the free table empty although the checkpoint wrote slots to it.
+/// (`l4_complete_over_a_row`, a page marked complete at its probe over a version the memory lacks,
+/// is refused by the store's own read first, as Corrupt.)
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     let mut total = (0u64, 0u64, 0u64);

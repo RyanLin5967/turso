@@ -2108,7 +2108,9 @@ impl CatState {
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
             trunk_complete: HashSet::new(),
-            trunk_all_complete: false,
+            // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
+            // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
+            trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
