@@ -585,6 +585,27 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
 /// branch no connection has touched since the open (`pop-<i>`, not resident: its state is read from
 /// the catalog on demand), one per round, after `WARMUP` unmeasured ones (`connect_cold`). The
 /// connection is dropped unmeasured. At most `n` rounds in all.
+/// Name counts the name mirror is measured at (`mirror_bytes`): 10^4, 10^5 and 10^6 (lead: the
+/// slope at all three before any 10^6 number is quoted).
+const MIRROR_NS: [u64; 3] = [10_000, 100_000, 1_000_000];
+
+/// The name mirror alone (LEAP L4 slice 4's `NameIndex::catalog`, built as the name filter's scan
+/// builds it, from `(name, id)` pairs named as `populate` names them): the heap it keeps, per name,
+/// at each of `MIRROR_NS`, from before its pairs exist to after it is built (the pairs are consumed),
+/// with the counting allocator's live bytes (requested sizes; this child runs nothing else).
+fn mirror_bytes(cell: &str, out: &mut String) {
+    for (i, &n) in MIRROR_NS.iter().enumerate() {
+        let before = probe::live_heap_bytes();
+        let pairs: Vec<(Arc<str>, u64)> = (0..n).map(|i| (Arc::from(format!("pop-{i}").as_str()), 16 + i)).collect();
+        let mirror = super::store::name_mirror_from_pairs(pairs);
+        let after = probe::live_heap_bytes();
+        assert_eq!(mirror.len() as u64, n, "{cell}: premise: every name mirrored");
+        let kept = u64::try_from(after - before).expect("the mirror's heap is negative: the count is broken");
+        line(out, cell, "mirror", i as u64, &Sample::from([("names", n), ("kept_bytes", kept)]));
+        drop(mirror);
+    }
+}
+
 /// Branches the written tail rewrites and first-writes (`written_tail`).
 const WTAIL: u64 = 8;
 
@@ -2047,6 +2068,8 @@ fn budget_child() {
         open_flush(&spec, &mut text);
     } else if let Some(&(_, tables)) = SCHEMA_TABLES.iter().find(|(c, _)| *c == spec) {
         schema_window(&spec, tables, &mut text);
+    } else if spec == "mirror_bytes" {
+        mirror_bytes(&spec, &mut text);
     } else if spec == "first_create" {
         first_create(&spec, &mut text);
     } else {
@@ -2189,7 +2212,8 @@ fn cell(spec: &str) -> Arc<CellData> {
     // DECISIONS bd0d845f97: a credited cell has all four counted exceptions at 0 inside every
     // window; one that moved one, or a window that did not record them, is refused before any budget
     // reads the cell. The instruments' cell reads no database (its fire-checks are of the probes).
-    if spec != "instruments" {
+    // The mirror_bytes cell reads no database either (it builds the name mirror alone).
+    if spec != "instruments" && spec != "mirror_bytes" {
         let bad = uncredited(&data);
         assert!(
             bad.is_empty(),
@@ -3394,6 +3418,42 @@ fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
         }
     }
     assert!(failures.is_empty(), "LEAP L4 not reached at a written tail's open (budget: 1 query, the meta row):\n{failures}");
+}
+
+/// LEAP L4 slice 4's name mirror, shrunk (lead, DECISIONS 2026-10-15: the 100 B per branch budget is
+/// kept, the mirror shrinks first and the child index fits into what it frees): the mirror keeps at
+/// most 48 B per name at 10^4, 10^5 and 10^6 names, and its slope between each pair is at most 48 B
+/// (cell `mirror_bytes`). 48 is the design's worst case (a 12 B entry and a 1 B tag at a table's
+/// lowest load, 0.375, plus a name of 7-11 bytes and its length), fixed before the first reading.
+/// Expected RED at 2ba05eb84, where each name is an `Arc<str>` in a std table.
+#[test]
+fn leap_l4_the_name_mirror_keeps_at_most_48_bytes_per_name() {
+    if in_child() {
+        return;
+    }
+    let c = cell("mirror_bytes");
+    let s = &c.ops["mirror"];
+    assert_eq!(s.len(), MIRROR_NS.len(), "premise: one line per name count");
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for (i, m) in s.iter().enumerate() {
+        let (n, kept) = (m["names"], m["kept_bytes"]);
+        assert_eq!(n, MIRROR_NS[i], "premise: the lines in order");
+        let per = kept as f64 / n as f64;
+        let _ = write!(seen, " {n}: {kept} B ({per:.1} B/name);");
+        if per > 48.0 {
+            let _ = writeln!(failures, "  {n} names: {per:.1} B per name; budget 48");
+        }
+        if i > 0 {
+            let (n0, k0) = (s[i - 1]["names"], s[i - 1]["kept_bytes"]);
+            let slope = (kept as f64 - k0 as f64) / (n - n0) as f64;
+            let _ = write!(seen, " slope {n0}->{n}: {slope:.1} B/name;");
+            if slope > 48.0 {
+                let _ = writeln!(failures, "  slope {n0} -> {n} names: {slope:.1} B per name; budget 48");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "the name mirror is over budget (all:{seen}):\n{failures}");
 }
 
 /// LEAP L4 2b, batched (lead, DECISIONS 81152ec501): over the written tail (`wtail_n10`,

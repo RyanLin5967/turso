@@ -1454,6 +1454,15 @@ impl Drop for StoreGuard<'_> {
     }
 }
 
+/// LEAP L4 slice 4's name mirror (`NameIndex::catalog`): every name in the catalog's `branch_name`,
+/// with its branch.
+pub(crate) type NameMirror = HashMap<Arc<str>, BranchId>;
+
+/// A mirror of a scan's `(name, id)` pairs.
+pub(crate) fn name_mirror_from_pairs(pairs: Vec<(Arc<str>, u64)>) -> NameMirror {
+    pairs.into_iter().map(|(name, id)| (name, BranchId(id))).collect()
+}
+
 /// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
 /// use) and at its first touch (`first`: in use), which LEAP L4 2b reads as its state at the
 /// checkpoint the tail follows; and the slots first touched in use AFTER a parked Commit (C-R),
@@ -2533,7 +2542,7 @@ struct NameIndex {
     /// (`start_name_filter`) and kept by every install, which applies the names the checkpoint
     /// wrote and deleted. Under the overlays (`map`, `gone`) it answers a lookup the catalog would,
     /// asking nothing; `None` until built (the catalog answers). Oracle: `l4_facts_check_for_test`.
-    catalog: Option<HashMap<Arc<str>, BranchId>>,
+    catalog: Option<NameMirror>,
     /// The name the last lookup found, with its branch, so that branch's load reads no name (names
     /// and ids are each unique, and an id's name never changes).
     last_found: Option<(BranchId, Arc<str>)>,
@@ -8141,8 +8150,7 @@ impl BranchStore {
                 let (scanned, mirror) = match scanned {
                     Ok(pairs) => {
                         let hashes: Vec<u64> = pairs.iter().map(|(name, _)| hasher.hash_one(&**name)).collect();
-                        let mirror: HashMap<Arc<str>, BranchId> =
-                            pairs.into_iter().map(|(name, id)| (name, BranchId(id))).collect();
+                        let mirror = name_mirror_from_pairs(pairs);
                         (Ok(hashes), Some(mirror))
                     }
                     Err(e) => (Err(e), None),
