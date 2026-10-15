@@ -181,6 +181,17 @@ expect {
     1.5|real|real|integer
 }
 
+# A domain over float8 converts before its CHECK reads the value: left text, '0.5' passed
+# CHECK (value > 1), text sorting above every number (fresh-context review of the ultrareview
+# fixes).
+@requires strict "uses STRICT tables"
+test cast-to-a-domain-over-float8-converts-before-its-check {
+    CREATE DOMAIN over_one AS float8 CHECK (value > 1);
+    SELECT CAST('0.5' AS over_one);
+}
+expect error {
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));

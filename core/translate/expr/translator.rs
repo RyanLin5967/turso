@@ -576,6 +576,19 @@ pub fn translate_expr(
                             }
                         }
 
+                        // A domain over a numeric base with no ENCODE converts as that base
+                        // before its CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK
+                        // (value > 1), text sorting above every number (fresh-context review of
+                        // the ultrareview fixes).
+                        if let Some(base) =
+                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
+                        {
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(base),
+                            });
+                        }
+
                         // Validate domain constraints on the encoded value
                         emit_domain_cast_constraints(
                             program,
@@ -621,11 +634,12 @@ pub fn translate_expr(
                         // A numeric base with no ENCODE (bigint, float4, float8) converts as
                         // its base does: left a no-op, CAST('1.5' AS float8) stayed text where
                         // SQLite's name rule ("FLOA") makes it REAL.
-                        let base_affinity = Affinity::affinity(type_def.base());
-                        if matches!(base_affinity, Affinity::Integer | Affinity::Real) {
+                        if let Some(base) =
+                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
+                        {
                             program.emit_insn(Insn::Cast {
                                 reg: target_register,
-                                affinity: base_affinity,
+                                affinity: Affinity::affinity(base),
                             });
                         }
                         return Ok(target_register);
