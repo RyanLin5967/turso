@@ -59,6 +59,8 @@ seed)
   # then DOLT_GC. The server's GC settings are recorded beside it.
   my -N bench -e "CALL DOLT_COMMIT('-am', 'age', '--allow-empty')" >/dev/null
   my -N bench -e "SHOW VARIABLES LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 || echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
   # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
   # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the

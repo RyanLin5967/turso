@@ -136,6 +136,22 @@ def gc_verdict(rc, out, log):
     return why
 
 
+def gc_settings_problem(text):
+    """Comp review 1 LOW 28: why the seed's GC settings record cannot say what GC the server ran with (None = it can):
+    an empty record, a failed query (dolt.sh / doltgres.sh append 'rc=N (not read)'), or rows none of which names a
+    GC setting (name<TAB>value from Dolt, name|value from Doltgres). The explicit config.yaml pinning
+    behavior.auto_gc_behavior at the vendor default is owed: the default is unverified here (a probe of each binary)."""
+    rows = [ln for ln in text.splitlines() if ln.strip()]
+    if not rows:
+        return "the GC settings record is empty"
+    if any(re.match(r"rc=\d+ \(not read\)", ln) or ln.startswith("ERROR") for ln in rows):
+        return f"the GC settings query failed: {rows[-1][:160]!r}"
+    names = [re.split(r"[\t|]", ln, 1)[0].strip().lower() for ln in rows]
+    if not any("gc" in nm for nm in names):
+        return f"no GC setting among {names[:8]}"
+    return None
+
+
 AV_TERM = re.compile(r"\[(\d+)\]\s+(?:(\S+)\s+)?FATAL:\s+terminating autovacuum process due to administrator command")
 AV_CTX = re.compile(r"\[(\d+)\]\s+(?:\S+\s+)?CONTEXT:\s+automatic (?:vacuum|analyze) of table \"([^\".]+)\.")
 BUSY_DELETE = re.compile(r"(?<!source )database \"([^\"]+)\" is being accessed by other users")
@@ -295,6 +311,13 @@ if __name__ == "__main__":
         sys.exit(0 if not why else 1)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(selftest())
+    if len(sys.argv) == 3 and sys.argv[1] == "gcsettings":  # the seed's GC settings record (LOW 28)
+        try:
+            why = gc_settings_problem(open(sys.argv[2], errors="replace").read())
+        except OSError as e:
+            why = f"unreadable: {e}"
+        print("ok" if not why else "REFUSED: " + why)
+        sys.exit(0 if not why else 1)
     if len(sys.argv) == 5 and sys.argv[1] == "pgwaits":  # LOG TEMPLATE_WAITS_OUT DELETE_WAITS_OUT (LOW 19)
         try:
             w = pg_waits(open(sys.argv[2], errors="replace").read())

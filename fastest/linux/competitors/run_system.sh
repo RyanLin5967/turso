@@ -771,9 +771,13 @@ server_main() {
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
   srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { cp "$DATA".gc.* "$RAW/" 2>/dev/null; fail "seed"; return; }
   # the GC's own record, banked with the job (MED 9: gc.txt was never banked): client output, log slice, verdict
-  for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict "$DATA".gc-settings.txt; do
+  for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict "$DATA".gc-settings.txt "$DATA".gc-settings.verdict; do
     [ -e "$f" ] && cp "$f" "$RAW/seed-$(basename "$f")"
   done
+  # comp review 1 LOW 28: Dolt's and Doltgres's GC settings record must say what GC the server ran with
+  if [ "$KIND" = dolt ] || [ "$KIND" = doltgres ]; then
+    expect "seed GC settings record (fthelp.py gcsettings)" "$(head -1 "$DATA.gc-settings.verdict" 2>/dev/null)" ok
+  fi
   parent_du_before_prebranch  # LOW 26: the parent's du, comparable across systems, before any branch exists
   prebranch_server
   server_fixture  # after prebranch: it records the live-branch count read back there (HIGH 1, MED 3)

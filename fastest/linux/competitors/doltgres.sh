@@ -72,6 +72,8 @@ seed)
   psqlc -At -c "SELECT dolt_commit('-am', 'age', '--allow-empty')"
   psqlc -At -c "SELECT name, setting FROM pg_settings WHERE name LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 ||
     echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
   # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
   # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
