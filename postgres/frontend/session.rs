@@ -434,7 +434,8 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
         return None;
     }
     let name = word(&mut i)?;
-    let function = sql[name].to_ascii_lowercase();
+    // Borrowed when it is a branch function's name: no allocation for the common calls.
+    let function = turso_pg_parser::translator::branch_function_name(&sql[name]);
     if !function.starts_with(BRANCH_FUNCTION_PREFIX) {
         return None;
     }
@@ -444,12 +445,12 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
     }
     i += 1;
     ws(&mut i);
-    let mut args = Vec::new();
+    let mut args = smallvec::SmallVec::new();
     if b.get(i) != Some(&b')') {
         let arg = match b.get(i)? {
             b'\'' => {
                 i += 1;
-                let mut text = String::new();
+                let mut text = compact_str::CompactString::default();
                 let mut run = i;
                 loop {
                     let q = i + b[i..].iter().position(|&c| c == b'\'')?;
@@ -2591,8 +2592,8 @@ mod tests {
 
     fn call(function: &str, args: Vec<PgBranchArg>) -> Option<PgBranchCall> {
         Some(PgBranchCall {
-            function: function.to_string(),
-            args,
+            function: function.to_string().into(),
+            args: args.into(),
         })
     }
 
@@ -2636,7 +2637,7 @@ mod tests {
             ),
             (
                 "SELECT turso_branch_create('')",
-                call(create, vec![Text(String::new())]),
+                call(create, vec![Text(String::new().into())]),
             ),
             (
                 "\tSELECT\nturso_branch_create(\r'x'\x0b)\x0c;\n",

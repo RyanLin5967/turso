@@ -184,7 +184,7 @@ struct Shared {
     /// while a session is on the branch (55006, as PostgreSQL refuses DROP DATABASE of a database in
     /// use), and a switch while the branch is being deleted. One hash operation under the lock per
     /// switch, per leave and two per delete; no engine call is made under it.
-    in_use: Mutex<std::collections::HashMap<String, BranchUse>>,
+    in_use: Mutex<std::collections::HashMap<compact_str::CompactString, BranchUse>>,
     /// Signalled when an entry leaves `in_use`, for a delete waiting on a session that is closing.
     in_use_freed: std::sync::Condvar,
     /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
@@ -323,7 +323,7 @@ impl Shared {
         }
     }
 
-    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<String, BranchUse>> {
+    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
         self.in_use.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -331,11 +331,11 @@ impl Shared {
     /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
     fn wait_while<'a>(
         &'a self,
-        mut uses: MutexGuard<'a, std::collections::HashMap<String, BranchUse>>,
+        mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
         name: &str,
         states: &[BranchUse],
-    ) -> MutexGuard<'a, std::collections::HashMap<String, BranchUse>> {
-        let held = |uses: &std::collections::HashMap<String, BranchUse>| {
+    ) -> MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        let held = |uses: &std::collections::HashMap<compact_str::CompactString, BranchUse>| {
             uses.get(name).is_some_and(|u| states.contains(u))
         };
         if !held(&uses) {
@@ -370,7 +370,8 @@ impl Shared {
             e.severity = severity.to_string();
             return Err(e);
         }
-        uses.insert(name.to_string(), BranchUse::Held);
+        // A name of up to 24 bytes is held inline: a claim allocates nothing for it (L5).
+        uses.insert(name.into(), BranchUse::Held);
         Ok(())
     }
 
@@ -389,7 +390,7 @@ impl Shared {
         if let Some(u) = uses.get(name) {
             return Err(in_use_error(name, *u));
         }
-        uses.insert(name.to_string(), BranchUse::Deleting);
+        uses.insert(name.into(), BranchUse::Deleting);
         Ok(())
     }
 }
@@ -906,6 +907,10 @@ impl StartupHandler for Refusal {
 // Sessions
 // ---------------------------------------------------------------------------
 
+/// A simple Query's replies, each with its statement's notices: inline room for one, so a query
+/// of one statement (a branch call's) costs no allocation for its list (L5).
+type Replies = smallvec::SmallVec<[(Vec<Box<ErrorInfo>>, Response); 1]>;
+
 struct Session {
     shared: Arc<Shared>,
     state: Mutex<SessionState>,
@@ -1033,12 +1038,13 @@ struct SessionState {
     /// branch, so switching back to the trunk opens nothing.
     trunk: Option<PgConnection>,
     /// The named branch the session is on, with the branch's connection.
-    branch: Option<(String, PgConnection)>,
+    /// The name inline up to 24 bytes: a switch allocates nothing for it (L5).
+    branch: Option<(compact_str::CompactString, PgConnection)>,
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
-    left: Option<String>,
+    left: Option<compact_str::CompactString>,
     /// The session's connection is in the implicit transaction block PostgreSQL wraps a
     /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
     /// (see [`Session::begin_implicit`]).
@@ -1098,17 +1104,24 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
-        use std::hash::BuildHasher;
         let interrupts = Arc::new(Interrupts::new());
         let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
-        // A secret from std's randomly seeded hasher (no syscall past the thread's first): only a
-        // client that read the BackendKeyData can cancel the session.
-        let secret = std::collections::hash_map::RandomState::new().hash_one(pid) as i32;
-        shared
-            .cancels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((pid, secret), Arc::downgrade(&interrupts));
+        // The secret from the OS's CSPRNG (getentropy, one call per session): only a client that
+        // read the BackendKeyData can cancel the session, and a CancelRequest must name both. A
+        // session whose secret cannot be drawn is registered for no cancel at all (fail closed);
+        // its BackendKeyData still carries a key, which names nothing.
+        let mut bytes = [0u8; 4];
+        let drawn = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0;
+        let secret = i32::from_ne_bytes(bytes);
+        if drawn {
+            shared
+                .cancels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((pid, secret), Arc::downgrade(&interrupts));
+        } else {
+            warn!("no cancel key for session {pid}: getentropy failed");
+        }
         Self {
             shared,
             state: Mutex::new(SessionState::default()),
@@ -1274,7 +1287,7 @@ impl Session {
         };
         let conn = PgConnection::new(conn);
         self.arm(conn.inner());
-        self.state().branch = Some((branch.to_string(), conn));
+        self.state().branch = Some((branch.into(), conn));
         Ok(())
     }
 
@@ -1287,8 +1300,8 @@ impl Session {
             .collect()
     }
 
-    /// [`Session::simple`], each result with the notices its statement raised.
-    fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
+    /// [`Session::simple`], each result with the notices its statement raised, in [`Replies`].
+    fn simple_with_notices(&self, query: &str) -> Replies {
         let with_notices = |r: Response| {
             let notices = std::mem::take(&mut self.state().notices);
             (self.deliverable(notices), r)
@@ -1304,7 +1317,9 @@ impl Session {
             if open {
                 self.after_implicit(query, result.is_err());
             }
-            let mut responses = vec![with_notices(result.unwrap_or_else(Response::Error))];
+            // Inline room for the one reply: a branch call's list costs no allocation (L5).
+            let mut responses = Replies::new();
+            responses.push(with_notices(result.unwrap_or_else(Response::Error)));
             if open {
                 if let Err(e) = self.end_implicit() {
                     responses.push(with_notices(Response::Error(e)));
@@ -1314,9 +1329,13 @@ impl Session {
         }
         let statements = match split_statements(query) {
             Ok(s) => s,
-            Err(e) => return vec![(Vec::new(), Response::Error(engine_info(&e)))],
+            Err(e) => {
+                let mut responses = Replies::new();
+                responses.push((Vec::new(), Response::Error(engine_info(&e))));
+                return responses;
+            }
         };
-        let mut responses = Vec::with_capacity(statements.len());
+        let mut responses = Replies::with_capacity(statements.len());
         // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let multi = statements.len() > 1;
         for sql in &statements {
@@ -2070,13 +2089,13 @@ impl Session {
                 Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
                 None => Ok(()),
             };
-        let f = call.function.as_str();
+        let f = &*call.function;
         if f == "turso_branch_current" {
             arity(call, 0)?;
             result_format(format, 0, 1)?;
             bad_code(&*st)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
-            return one_text(f, name, format);
+            return branch_text(f, name, portal.is_some(), format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
@@ -2084,13 +2103,31 @@ impl Session {
             bad_code(&*st)?;
             return stats_row(format, &self.shared.db);
         }
+        // The allocations the server process has made, for the per-step allocation budget
+        // (budget.py work); NULL in a build that counts none (no `alloc-count` feature).
+        if f == "turso_branch_allocations" {
+            arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
+            let n = counters::allocations().map(|n| n as i64);
+            return one_row(f, Type::INT8, format, |e| e.encode_field(&n));
+        }
+        // The work budget's one reading (budget.py work): unix system calls, instructions and
+        // allocations read together, so a window holds one reading statement, as its floor does
+        // (read as two calls, the allocations' call fell inside the next window's system calls).
+        if f == "turso_branch_work" {
+            arity(call, 0)?;
+            result_format(format, 0, WORK_COLUMNS.len())?;
+            bad_code(&*st)?;
+            return work_row(format, &self.shared.db);
+        }
         if !matches!(
             f,
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
                 "42883",
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current() and turso_branch_stats()"),
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations() and turso_branch_work()"),
             ));
         }
         arity(call, 1)?;
@@ -2116,7 +2153,7 @@ impl Session {
                     ));
                 }
                 match self.waiting(|| conn.inner().create_branch(&name)) {
-                    Ok(id) => one_int8(f, id.0 as i64, format),
+                    Ok(id) => branch_int8(f, id.0 as i64, portal.is_some(), format),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
             }
@@ -2136,9 +2173,9 @@ impl Session {
                         let next = PgConnection::new(opened);
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
-                        st.branch = Some((name.clone(), next));
+                        st.branch = Some((name.as_ref().into(), next));
                     }
-                    return one_text(f, &name, format);
+                    return branch_text(f, &name, portal.is_some(), format);
                 }
                 let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
@@ -2161,7 +2198,7 @@ impl Session {
                     let next = PgConnection::new(opened);
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
-                    st.branch.replace((name.clone(), next))
+                    st.branch.replace((name.as_ref().into(), next))
                 };
                 // The branch left is free for a delete once its connection is closed: `run`
                 // releases it after the statement's own handle on the connection goes.
@@ -2169,7 +2206,7 @@ impl Session {
                     drop(left_conn);
                     st.left = Some(left);
                 }
-                one_text(f, &name, format)
+                branch_text(f, &name, portal.is_some(), format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
                 "55006",
@@ -2183,7 +2220,7 @@ impl Session {
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
-                    Ok(_) => one_text(f, &name, format),
+                    Ok(_) => branch_text(f, &name, portal.is_some(), format),
                     Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
                 }
             }
@@ -2732,9 +2769,13 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
 }
 
 /// A branch name argument: a string literal, or a `$n` bound to text.
-fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<String> {
+fn text_arg<'a>(
+    arg: &'a PgBranchArg,
+    portal: Option<&Portal<Parsed>>,
+) -> SqlResult<std::borrow::Cow<'a, str>> {
     match arg {
-        PgBranchArg::Text(s) => Ok(s.clone()),
+        // Borrowed: a literal name costs the call no copy (L5).
+        PgBranchArg::Text(s) => Ok(std::borrow::Cow::Borrowed(s.as_str())),
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
         PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
@@ -2760,6 +2801,7 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<Str
                 return Err(error("22004", "a branch name must not be null".to_string()));
             };
             String::from_utf8(bytes.to_vec())
+                .map(std::borrow::Cow::Owned)
                 .map_err(|e| error("22021", format!("invalid UTF-8 in parameter ${n}: {e}")))
         }
     }
@@ -2792,6 +2834,120 @@ fn one_text(f: &str, value: &str, format: &Format) -> SqlResult<Response> {
 
 fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
+}
+
+/// A branch call's one-row, one-column text reply to a simple Query, encoded here into a fixed
+/// buffer: RowDescription (the column named `f`, of `pg_type`, text format), the DataRow holding
+/// `value`'s text, and CommandComplete `SELECT 1`, byte for byte what pgwire encodes for
+/// [`one_row`]'s response (inline_replies_are_the_messages_pgwire_encodes), with no heap
+/// allocation (L5: they cost the wire 7 of its 20 allocations a call). None when they do not fit.
+fn inline_one_row(f: &str, pg_type: &Type, value: &[u8]) -> Option<pgwire::messages::Inline> {
+    let mut m = pgwire::messages::Inline::default();
+    let t_len = 4 + 2 + f.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2;
+    let d_len = 4 + 2 + 4 + value.len();
+    let tag = b"SELECT 1\0";
+    let ok = m.push(b"T")
+        && m.push(&(i32::try_from(t_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(f.as_bytes())
+        && m.push(&[0])
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&pg_type.oid().to_be_bytes())
+        // pgwire's FieldInfo sends type size and modifier 0 (its From<&FieldInfo>), and so must this.
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(b"D")
+        && m.push(&(i32::try_from(d_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(&(i32::try_from(value.len()).ok()?).to_be_bytes())
+        && m.push(value)
+        && m.push(b"C")
+        && m.push(&((4 + tag.len()) as i32).to_be_bytes())
+        && m.push(tag);
+    ok.then_some(m)
+}
+
+/// A branch call's text reply: inline to a simple Query (`portal` None, text), else pgwire's.
+fn branch_text(f: &str, value: &str, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        if let Some(m) = inline_one_row(f, &Type::TEXT, value.as_bytes()) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_text(f, value, format)
+}
+
+/// [`branch_text`] for a branch id (int8).
+fn branch_int8(f: &str, value: i64, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        let mut digits = [0u8; 20];
+        let text = int_text(value, &mut digits);
+        if let Some(m) = inline_one_row(f, &Type::INT8, text) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_int8(f, value, format)
+}
+
+/// `value`'s decimal text in `buf`, no allocation.
+fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut n = value.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
+const WORK_COLUMNS: [&str; 5] = [
+    "unix_syscalls",
+    "instructions",
+    "allocations",
+    "thread_instructions",
+    "confirms_written",
+];
+
+/// turso_branch_work(): this process's system calls and instructions (counters::process_counters),
+/// allocations (counters::allocations, NULL without the alloc-count feature), this session
+/// thread's own instructions (counters::thread_counters) and the branch store's confirmation words
+/// written (its background confirm writer's work, Database::branch_confirm_counts), read at once.
+fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
+    let fields = WORK_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            Ok(FieldInfo::new(
+                name.to_string(),
+                None,
+                None,
+                Type::INT8,
+                result_format(format, i, WORK_COLUMNS.len())?,
+            ))
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    let header = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(header.clone());
+    let counters = counters::process_counters();
+    let allocations = counters::allocations();
+    let row = encoder
+        .encode_field(&counters.map(|c| c.unix_syscalls as i64))
+        .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
+        .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
+        .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
+        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
+        .and_then(|()| encoder.finish());
+    Ok(Response::Query(QueryResponse::new(header, stream::iter(vec![row]))))
 }
 
 const STATS_COLUMNS: [&str; 10] = [
@@ -2909,13 +3065,31 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
     }
-    let pg_type = if call.function == "turso_branch_create" {
+    if call.function == "turso_branch_work" {
+        return WORK_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Ok(FieldInfo::new(
+                    name.to_string(),
+                    None,
+                    None,
+                    Type::INT8,
+                    result_format(format, i, WORK_COLUMNS.len())?,
+                ))
+            })
+            .collect();
+    }
+    let pg_type = if matches!(
+        &*call.function,
+        "turso_branch_create" | "turso_branch_allocations"
+    ) {
         Type::INT8
     } else {
         Type::TEXT
     };
     Ok(vec![FieldInfo::new(
-        call.function.clone(),
+        call.function.to_string(),
         None,
         None,
         pg_type,
@@ -3196,7 +3370,8 @@ impl SimpleQueryHandler for Session {
         let responses = if is_blank(&query.query) {
             // An empty Query ends an unsynced pipeline's implicit block as any Query does
             // (committing it); it left the block open (wire review 16 item 6).
-            let mut responses = vec![(Vec::new(), Response::EmptyQuery)];
+            let mut responses = Replies::new();
+            responses.push((Vec::new(), Response::EmptyQuery));
             if let Err(e) = self.end_implicit() {
                 responses.push((Vec::new(), Response::Error(e)));
             }
@@ -3257,6 +3432,8 @@ impl SimpleQueryHandler for Session {
                         ))
                         .await?;
                 }
+                // A branch call's reply, encoded by the fast path (inline_one_row).
+                Response::Inline(m) => client.feed(PgWireBackendMessage::Inline(m)).await?,
                 // This server answers COPY FROM a file itself and never streams COPY.
                 Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                     return Err(PgWireError::UserError(error(
@@ -3570,6 +3747,13 @@ impl ExtendedQueryHandler for Session {
                         client
                             .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                             .await?;
+                    }
+                    // The fast path encodes a simple Query's reply alone (branch, portal None).
+                    Response::Inline(_) => {
+                        return Err(PgWireError::UserError(error(
+                            "XX000",
+                            "internal error: an inline reply reached an Execute".to_string(),
+                        )));
                     }
                     // This server answers COPY FROM a file itself and never streams COPY.
                     Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
@@ -5083,6 +5267,12 @@ fn is_create_table_as(upper: &str) -> bool {
 #[cfg(test)]
 mod crash_batch_tests;
 
+/// This crate's tests count allocations per thread (the per-statement allocation budget's
+/// in-process tests).
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: counters::CountingAlloc = counters::CountingAlloc;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5101,6 +5291,134 @@ mod tests {
             1,
             std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
         )))
+    }
+
+    /// The fast path's inline replies are, byte for byte, the messages pgwire encodes for the same
+    /// reply through one_row (RowDescription, DataRow, CommandComplete `SELECT 1`), for a text and
+    /// an int8 column, an empty and a long value (L5, vendored change 8).
+    #[test]
+    fn inline_replies_are_the_messages_pgwire_encodes() {
+        use futures::StreamExt;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let encoded = |r: Response| -> Vec<u8> {
+            let Response::Query(mut results) = r else {
+                panic!("not a query response")
+            };
+            let mut buf = bytes::BytesMut::new();
+            let fields = results.row_schema().iter().map(Into::into).collect();
+            PgWireBackendMessage::RowDescription(RowDescription::new(fields))
+                .encode(&mut buf)
+                .unwrap();
+            let tag = results.command_tag().to_owned();
+            let mut rows = 0;
+            rt.block_on(async {
+                let data = results.data_rows();
+                while let Some(row) = data.next().await {
+                    PgWireBackendMessage::DataRow(row.unwrap())
+                        .encode(&mut buf)
+                        .unwrap();
+                    rows += 1;
+                }
+            });
+            PgWireBackendMessage::CommandComplete(Tag::new(&tag).with_rows(rows).into())
+                .encode(&mut buf)
+                .unwrap();
+            buf.to_vec()
+        };
+        let long = "x".repeat(150);
+        for (f, value) in [
+            ("turso_branch_current", "main"),
+            ("turso_branch_switch", ""),
+            ("turso_branch_delete", long.as_str()),
+        ] {
+            let inline = inline_one_row(f, &Type::TEXT, value.as_bytes()).expect("fits");
+            let slow = encoded(one_text(f, value, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "{f} {value:?}");
+        }
+        for v in [0i64, 7, 1234567890123, -5] {
+            let mut digits = [0u8; 20];
+            let inline =
+                inline_one_row("turso_branch_create", &Type::INT8, int_text(v, &mut digits)).unwrap();
+            let slow = encoded(one_int8("turso_branch_create", v, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "create {v}");
+        }
+        assert!(inline_one_row("f", &Type::TEXT, &[b'x'; 300]).is_none(), "too long fits");
+    }
+
+    /// L5's allocation budget in process (lead 2026-10-15; budget.py work's pre-registered rule,
+    /// DECISIONS 2f239db68a, at one statement): a branch call allocates, beyond what the engine's
+    /// own call allocates (create_branch, connect_named, drop_branch; none for current and for a
+    /// switch back to the kept trunk), no more than the empty query does. Counted per thread
+    /// (counters::thread_allocations) around Session::on_query with a client that stores the reply
+    /// messages in reserved room, as the socket's codec encodes them into its reused buffer. At
+    /// 154e357e6 the wire paid 15 to 36 allocations a call over the engine.
+    #[test]
+    fn a_branch_call_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "SELECT turso_branch_create('b')");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let mut wire = |sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(&mut c, q)).unwrap();
+            let used = n() - a0;
+            assert!(
+                !c.replies.iter().any(|m| matches!(m, PgWireBackendMessage::ErrorResponse(_))),
+                "{sql}: {:?}",
+                c.replies
+            );
+            used
+        };
+        // Warm: every statement once, so a first use's one-time setup is not counted.
+        for sql in [
+            ";",
+            "SELECT turso_branch_current()",
+            "SELECT turso_branch_switch('b')",
+            "SELECT turso_branch_switch('main')",
+            "SELECT turso_branch_create('w')",
+            "SELECT turso_branch_delete('w')",
+        ] {
+            wire(sql);
+        }
+        let empty = wire(";");
+        let measure_engine = |f: &dyn Fn()| {
+            let a0 = n();
+            f();
+            n() - a0
+        };
+        let mut over = Vec::new();
+        let mut check = |what: &str, wire_cost: u64, engine_cost: u64| {
+            let excess = wire_cost.saturating_sub(engine_cost);
+            if excess > empty {
+                over.push(format!(
+                    "{what}: wire {wire_cost}, engine {engine_cost}, excess {excess} > the empty query's {empty}"
+                ));
+            }
+        };
+        check("current", wire("SELECT turso_branch_current()"), 0);
+        // The engine's connect first: the session on b would hold it (BranchInUse).
+        let engine_switch = measure_engine(&|| drop(s.shared.db.connect_named("b").unwrap()));
+        check("switch b", wire("SELECT turso_branch_switch('b')"), engine_switch);
+        check("switch main", wire("SELECT turso_branch_switch('main')"), 0);
+        // On the session's own connection, as the wire's create runs (a fresh connection's create
+        // allocated one fewer: the engine's cost is the connection's, and is not the wire's).
+        let own = s.current(&mut s.state()).unwrap();
+        let engine_create = measure_engine(&|| {
+            own.inner().create_branch("e1").unwrap();
+        });
+        let engine_delete = measure_engine(&|| {
+            s.shared.db.drop_branch("e1").unwrap();
+        });
+        check("create", wire("SELECT turso_branch_create('c')"), engine_create);
+        check("delete", wire("SELECT turso_branch_delete('c')"), engine_delete);
+        assert!(over.is_empty(), "over the budget: {over:#?}");
     }
 
     fn ok(session: &Session, sql: &str) {

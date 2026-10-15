@@ -116,6 +116,9 @@ pub trait SimpleQueryHandler: Send + Sync {
                         copy::send_copy_both_response(client, result).await?;
                         client.set_state(PgWireConnectionState::CopyInProgress(false));
                     }
+                    Response::Inline(msg) => {
+                        client.feed(PgWireBackendMessage::Inline(msg)).await?;
+                    }
                 }
             }
         }
@@ -288,6 +291,13 @@ pub trait ExtendedQueryHandler: Send + Sync {
                         Response::CopyBoth(result) => {
                             client.set_state(PgWireConnectionState::CopyInProgress(true));
                             copy::send_copy_both_response(client, result).await?;
+                        }
+                        // Pre-encoded replies are a simple Query's (vendored change 8): an
+                        // extended Execute never gets one.
+                        Response::Inline(_) => {
+                            return Err(PgWireError::ApiError(
+                                "an inline reply reached the extended protocol".into(),
+                            ));
                         }
                     }
                 }

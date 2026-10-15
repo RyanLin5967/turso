@@ -387,6 +387,53 @@ pub enum PgWireBackendMessage {
     CopyInResponse(copy::CopyInResponse),
     CopyOutResponse(copy::CopyOutResponse),
     CopyBothResponse(copy::CopyBothResponse),
+
+    /// Backend messages already encoded, written as they are (vendored change 8).
+    Inline(Inline),
+}
+
+/// The room an [`Inline`] reply has.
+pub const INLINE_CAP: usize = 256;
+
+/// Backend messages a server encoded itself, in a fixed buffer, so a short reply costs no heap
+/// allocation (vendored change 8: the wire server's branch-call fast path, L5).
+#[derive(Clone)]
+pub struct Inline {
+    len: u16,
+    buf: [u8; INLINE_CAP],
+}
+
+impl std::fmt::Debug for Inline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Inline").field(&self.bytes()).finish()
+    }
+}
+
+impl Default for Inline {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            buf: [0; INLINE_CAP],
+        }
+    }
+}
+
+impl Inline {
+    /// Appends `bytes`; false, and nothing appended, when they do not fit.
+    pub fn push(&mut self, bytes: &[u8]) -> bool {
+        let at = self.len as usize;
+        let Some(end) = at.checked_add(bytes.len()).filter(|&e| e <= INLINE_CAP) else {
+            return false;
+        };
+        self.buf[at..end].copy_from_slice(bytes);
+        self.len = end as u16;
+        true
+    }
+
+    /// The encoded messages.
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
 }
 
 impl PgWireBackendMessage {
@@ -422,6 +469,10 @@ impl PgWireBackendMessage {
             Self::CopyInResponse(msg) => msg.encode(buf),
             Self::CopyOutResponse(msg) => msg.encode(buf),
             Self::CopyBothResponse(msg) => msg.encode(buf),
+            Self::Inline(msg) => {
+                buf.extend_from_slice(msg.bytes());
+                Ok(())
+            }
         }
     }
 

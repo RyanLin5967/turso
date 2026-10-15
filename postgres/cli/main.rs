@@ -1030,6 +1030,11 @@ fn is_exit_command(line: &str) -> bool {
 // main
 // ---------------------------------------------------------------------------
 
+/// The wire budget's allocation counter (feature `alloc-count`, budget builds only).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOC: turso_pg_server::counters::CountingAlloc = turso_pg_server::counters::CountingAlloc;
+
 fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
     let _guard = init_tracing(&opts)?;

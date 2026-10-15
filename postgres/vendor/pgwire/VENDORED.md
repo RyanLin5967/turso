@@ -67,3 +67,11 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    `finish_authentication0` sends BackendKeyData. Upstream never set a key, so every session sent
    process id 0 and secret 0, and a CancelRequest could not name one session (the wire server's
    cancel handler, 2026-10-15).
+8. `messages/mod.rs`, `api/results.rs`, `api/query.rs`: `PgWireBackendMessage::Inline` and
+   `Response::Inline`, backend messages the server encoded itself into a fixed 256-byte buffer and
+   written as they are, so a branch call's simple-Query reply (RowDescription, DataRow,
+   CommandComplete) costs no heap allocation (L5). pgwire's own simple-query loop feeds one as it
+   is; its extended loop refuses one (a pre-encoded reply holds a RowDescription, which Execute
+   never sends). The server checks the bytes equal pgwire's encoding of the same reply
+   (inline_replies_are_the_messages_pgwire_encodes).
+

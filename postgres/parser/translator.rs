@@ -6570,7 +6570,8 @@ pub const BRANCH_FUNCTION_PREFIX: &str = "turso_branch_";
 /// One argument of a branch function call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgBranchArg {
-    Text(String),
+    /// A string literal's text, inline up to 24 bytes (no allocation for a branch name that short).
+    Text(compact_str::CompactString),
     Bool(bool),
     Null,
     /// `$n`, 1-based, bound by the extended protocol.
@@ -6582,9 +6583,30 @@ pub enum PgBranchArg {
 /// engine (the engine refuses a fork inside the read transaction a SELECT would open).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgBranchCall {
-    /// The function name, lower-cased, e.g. `turso_branch_create`.
-    pub function: String,
-    pub args: Vec<PgBranchArg>,
+    /// The function name, lower-cased, e.g. `turso_branch_create`: one of [`BRANCH_FUNCTIONS`]
+    /// borrowed, so a call costs no allocation for it, or any other name, owned.
+    pub function: std::borrow::Cow<'static, str>,
+    /// The arguments, held inline up to two (no allocation for a branch call's one or two).
+    pub args: smallvec::SmallVec<[PgBranchArg; 2]>,
+}
+
+/// The branch functions the server answers, their names as [`PgBranchCall::function`] borrows them.
+pub const BRANCH_FUNCTIONS: [&str; 7] = [
+    "turso_branch_create",
+    "turso_branch_switch",
+    "turso_branch_delete",
+    "turso_branch_current",
+    "turso_branch_stats",
+    "turso_branch_allocations",
+    "turso_branch_work",
+];
+
+/// `name` lower-cased, borrowed from [`BRANCH_FUNCTIONS`] when it is one of them.
+pub fn branch_function_name(name: &str) -> std::borrow::Cow<'static, str> {
+    match BRANCH_FUNCTIONS.iter().find(|f| f.eq_ignore_ascii_case(name)) {
+        Some(f) => std::borrow::Cow::Borrowed(f),
+        None => std::borrow::Cow::Owned(name.to_ascii_lowercase()),
+    }
 }
 
 /// Rename `columns` by an alias's column list, the first ones in order; the rest keep their names.
@@ -6828,7 +6850,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     };
     // An unquoted name arrives lower-cased; a quoted one keeps its case, and PostgreSQL would look
     // up exactly that name, which no branch function has.
-    let function = name.sval.clone();
+    let function = name.sval.as_str();
     if !function.starts_with(BRANCH_FUNCTION_PREFIX)
         || function.bytes().any(|c| c.is_ascii_uppercase())
         || call.agg_star
@@ -6845,7 +6867,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
         match node.node.as_ref()? {
             Node::AConst(c) if c.isnull => Some(PgBranchArg::Null),
             Node::AConst(c) => match c.val.as_ref()? {
-                Val::Sval(s) => Some(PgBranchArg::Text(s.sval.clone())),
+                Val::Sval(s) => Some(PgBranchArg::Text(s.sval.as_str().into())),
                 Val::Boolval(b) => Some(PgBranchArg::Bool(b.boolval)),
                 _ => None,
             },
@@ -6868,7 +6890,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
                     && to_text(cast.type_name.as_ref()?) =>
             {
                 match arg(cast.arg.as_deref()?)? {
-                    PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string())),
+                    PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string().into())),
                     other => Some(other),
                 }
             }
@@ -6899,7 +6921,9 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             && !t.setof
             && !t.pct_type
     }
-    let args = call.args.iter().map(arg).collect::<Option<Vec<_>>>()?;
+    let args = call.args.iter().map(arg).collect::<Option<smallvec::SmallVec<_>>>()?;
+    // Lower-case already (an upper-case byte was refused above): borrowed when it is a known name.
+    let function = branch_function_name(function);
     Some(PgBranchCall { function, args })
 }
 
@@ -9438,8 +9462,8 @@ mod tests {
         let call = |sql: &str| try_extract_branch_call(&crate::parse(sql).unwrap());
         let ok = |function: &str, args: Vec<A>| {
             Some(PgBranchCall {
-                function: function.to_string(),
-                args,
+                function: function.to_string().into(),
+                args: args.into(),
             })
         };
         assert_eq!(

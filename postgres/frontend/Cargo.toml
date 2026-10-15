@@ -16,6 +16,8 @@ path = "lib.rs"
 failpoints = []
 
 [dependencies]
+smallvec = "1.15.1"
+compact_str = "0.8.1"
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"

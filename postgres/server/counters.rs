@@ -86,3 +86,78 @@ pub fn process_counters() -> Option<ProcessCounters> {
         None
     }
 }
+
+/// A global allocator that counts the allocations (alloc, alloc_zeroed and realloc calls) it serves,
+/// over the system allocator, for the per-step allocation budget (budget.py work). A binary installs
+/// it as its `#[global_allocator]` only in a build with the `alloc-count` feature: one relaxed atomic
+/// add per allocation, shared by every thread, which a credited build must not pay.
+pub struct CountingAlloc;
+
+static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The allocations served to this thread (a const-initialized Cell: reading it allocates
+    /// nothing, and it has no destructor to run while the thread ends).
+    static THREAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count() {
+    ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = THREAD_ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+}
+
+/// The allocations [`CountingAlloc`] has served to this thread (0 when it is not the allocator):
+/// for an in-process test of one statement's allocations, which other threads cannot disturb.
+pub fn thread_allocations() -> u64 {
+    THREAD_ALLOCATIONS.try_with(|n| n.get()).unwrap_or(0)
+}
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+/// The allocations [`CountingAlloc`] has served in this process; None when it is not this process's
+/// allocator (it has served none: every process allocates before it could ask).
+pub fn allocations() -> Option<u64> {
+    match ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// This thread's own instructions retired and cycles (`thread_selfcounts`, the kernel's per-thread
+/// fixed counters; no privilege), so a budget window counts the session's work alone: the engine's
+/// background threads (the branch store's confirm writer) land in windows at random and made the
+/// process-wide counts swing by tens of thousands of instructions. `None` off Apple platforms.
+pub fn thread_counters() -> Option<(u64, u64)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            fn thread_selfcounts(kind: i32, buf: *mut u64, size: usize) -> i32;
+        }
+        let mut c = [0u64; 2];
+        let rc = unsafe { thread_selfcounts(1, c.as_mut_ptr(), std::mem::size_of_val(&c)) };
+        (rc == 0).then_some((c[0], c[1]))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
