@@ -305,6 +305,21 @@ fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
     assert!(wrong.is_empty(), "sqlite3 answers NULL for each:\n{}", wrong.join("\n"));
 }
 
+/// The one case found where the chained adds wrap i64 and land back in range: 64 modifiers of
+/// 2^58 ms each sum to exactly 2^64 ms. sqlite3 3.51.0 (/usr/bin/sqlite3) answers
+/// '2000-01-01 00:00:00' here, not NULL: SQLite's own `iJD +=` wraps as well (raw artie
+/// lanes/budgets/raw/sqlite3-date-oracle.txt). This pins the engine's answer to sqlite3's.
+#[test]
+fn date_arithmetic_that_wraps_answers_as_sqlite3_does() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let mods: Vec<&str> = (0..64).map(|_| "'+288230376151711.744 seconds'").collect();
+    let sql = format!("SELECT datetime('2000-01-01', {})", mods.join(", "));
+    let rows = conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+    assert_eq!(rows, vec![vec![Value::build_text("2000-01-01 00:00:00")]], "sqlite3 3.51.0's answer");
+}
+
 /// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
 fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
     let joined = std::thread::Builder::new()
