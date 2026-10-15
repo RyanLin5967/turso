@@ -172,7 +172,7 @@ POST_COND = {"R_post_layerflush": lambda cell, leaf: v3cell.is_loop(cell) or lea
 # the fire-check harness a verdict vouches for (fourth review L9: the fixtures' and plants' sources, the banked test
 # data, the loop maker and the workflow too); a missing file is a mismatch
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
-           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "REGISTERED.tsv",
+           "mkfixtures.sh", "nestloops.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "REGISTERED.tsv",
            "statfs_shim.c", "noop_shim.c",
            "../fs/mkloop.sh",
            "../../../.github/workflows/fastest-v3.yml"]
@@ -1270,7 +1270,16 @@ def self_test():
     # loop cells), and an f_nest that ignores V3_NEST_DIR must fail on a block cell (the old check read the dir back
     # from the n1 it judged, so it could not)
     nnp = globals().get("nest_n1_problems")
+    # The original path fixtures describe two filesystems. Supply their stat
+    # evidence explicitly; preserve every original expected verdict.
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    def nest_fixture_stat(path):
+        return SimpleNamespace(st_dev=1 if canon_path(path) in ("/", "/mnt/fastest-v3-ext4") else 2)
     for name, cdir, first, rebuilt, ok in (
+            ("root ext4 cell directory has the root filesystem identity", "/", "/mnt/fastest-v3-ext4/v3fx-n1.img",
+             "/mnt/fastest-v3-ext4/v3fx-n1.img", True),
+            ("brd cell's first n1 is wrongly on root", "/mnt/brd", "/v3fx-n1.img", "/mnt/brd/v3fx-n1.img", False),
             ("a loop cell, dir '/': n1 /v3fx-n1.img both builds", "/", "/v3fx-n1.img", "/v3fx-n1.img", True),
             ("a block cell: n1 on the cell's filesystem both builds", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
              "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
@@ -1282,7 +1291,8 @@ def self_test():
              "/v3fx-n1.img", False),
             ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
             ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
-        got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
+        with patch.object(os, "stat", side_effect=nest_fixture_stat):
+            got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
         chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
@@ -1977,7 +1987,9 @@ def main(argv):
     # V3 review 12 item 5: both builds' n1 image against the cell's own directory (firecheck derives it from the work
     # dir's mount, independently of the n1 it judges)
     n1p = nest_n1_problems((rd(os.path.join(nm, "cell_nest_dir.txt")) or "").strip(),
-                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1)
+                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1,
+                           devices=[(rd(os.path.join(nm, f)) or "").strip() for f in
+                                    ("cell_nest_dev.txt", "first_n1_dev.txt", "rebuilt_n1_dev.txt")])
     ast = rd(os.path.join(nm, "after_stray.txt"))
     # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
     # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
@@ -2532,17 +2544,29 @@ def canon_path(p):
     return os.path.normpath(p) if p else ""
 
 
-def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
-    """V3 review 12 item 5: P_nest_modes' n1 image, first built and rebuilt, against the CELL's own directory, which
-    firecheck derives from the work dir's mount (a /dev/loop source: its backing file's directory; else the mount
-    target), never from the n1 under test (the old check read the directory back from it, so an f_nest that ignored
-    V3_NEST_DIR passed, and a loop cell's '//v3fx-n1.img' was a false red). [] when both are cell_dir/v3fx-n1.img."""
+def nest_n1_problems(cell_dir, first_n1, rebuilt_n1, devices=None):
+    """Judge the recorded stat -c %d identities, never pathname equality.
+
+    The live collector records all three while the directories exist. Direct
+    callers can stat directories themselves; offline fire-check judgment always
+    passes the recorded identities, so it never stats the reviewing machine.
+    """
     cd = canon_path(cell_dir)
     if not cd.startswith("/"):
         return ["no cell directory was derived (%r)" % (cell_dir,)]
-    want = canon_path(cd + "/v3fx-n1.img")
-    return ["the %s n1 image is %r, not the cell's %s" % (what, got, want)
-            for what, got in (("first-built", first_n1), ("rebuilt", rebuilt_n1)) if canon_path(got) != want]
+    images = [canon_path(first_n1), canon_path(rebuilt_n1)]
+    if any(not p.startswith("/") for p in images):
+        return ["missing or non-absolute n1 backing path"]
+    if devices is None:
+        try:
+            devices = [os.stat(p).st_dev for p in [cd] + [os.path.dirname(p) for p in images]]
+        except OSError as e:
+            return ["cannot stat n1 filesystem: %s" % e]
+    if len(devices) != 3 or any(re.fullmatch(r"[0-9]+", str(d)) is None for d in devices):
+        return ["missing or unreadable n1 filesystem identities: %r" % (devices,)]
+    cell_dev, first_dev, rebuilt_dev = map(int, devices)
+    return ["the %s n1 st_dev %s differs from leaf-holding st_dev %s" % (what, dev, cell_dev)
+            for what, dev in (("first-built", first_dev), ("rebuilt", rebuilt_dev)) if dev != cell_dev]
 
 
 def f1b_window_syncs(text):
