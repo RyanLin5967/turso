@@ -1,4 +1,8 @@
 mod aliases;
+
+/// How many times the PostgreSQL time aliases were registered (observation; see `aliases`).
+#[doc(hidden)]
+pub use aliases::registrations as alias_registrations;
 mod catalog;
 mod copy;
 mod functions;
