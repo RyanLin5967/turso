@@ -184,7 +184,7 @@ struct Shared {
     /// while a session is on the branch (55006, as PostgreSQL refuses DROP DATABASE of a database in
     /// use), and a switch while the branch is being deleted. One hash operation under the lock per
     /// switch, per leave and two per delete; no engine call is made under it.
-    in_use: Mutex<std::collections::HashMap<String, BranchUse>>,
+    in_use: Mutex<std::collections::HashMap<compact_str::CompactString, BranchUse>>,
     /// Signalled when an entry leaves `in_use`, for a delete waiting on a session that is closing.
     in_use_freed: std::sync::Condvar,
     /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
@@ -323,7 +323,7 @@ impl Shared {
         }
     }
 
-    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<String, BranchUse>> {
+    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
         self.in_use.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -331,11 +331,11 @@ impl Shared {
     /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
     fn wait_while<'a>(
         &'a self,
-        mut uses: MutexGuard<'a, std::collections::HashMap<String, BranchUse>>,
+        mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
         name: &str,
         states: &[BranchUse],
-    ) -> MutexGuard<'a, std::collections::HashMap<String, BranchUse>> {
-        let held = |uses: &std::collections::HashMap<String, BranchUse>| {
+    ) -> MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        let held = |uses: &std::collections::HashMap<compact_str::CompactString, BranchUse>| {
             uses.get(name).is_some_and(|u| states.contains(u))
         };
         if !held(&uses) {
@@ -370,7 +370,8 @@ impl Shared {
             e.severity = severity.to_string();
             return Err(e);
         }
-        uses.insert(name.to_string(), BranchUse::Held);
+        // A name of up to 24 bytes is held inline: a claim allocates nothing for it (L5).
+        uses.insert(name.into(), BranchUse::Held);
         Ok(())
     }
 
@@ -389,7 +390,7 @@ impl Shared {
         if let Some(u) = uses.get(name) {
             return Err(in_use_error(name, *u));
         }
-        uses.insert(name.to_string(), BranchUse::Deleting);
+        uses.insert(name.into(), BranchUse::Deleting);
         Ok(())
     }
 }
@@ -906,6 +907,10 @@ impl StartupHandler for Refusal {
 // Sessions
 // ---------------------------------------------------------------------------
 
+/// A simple Query's replies, each with its statement's notices: inline room for one, so a query
+/// of one statement (a branch call's) costs no allocation for its list (L5).
+type Replies = smallvec::SmallVec<[(Vec<Box<ErrorInfo>>, Response); 1]>;
+
 struct Session {
     shared: Arc<Shared>,
     state: Mutex<SessionState>,
@@ -1294,8 +1299,8 @@ impl Session {
             .collect()
     }
 
-    /// [`Session::simple`], each result with the notices its statement raised.
-    fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
+    /// [`Session::simple`], each result with the notices its statement raised, in [`Replies`].
+    fn simple_with_notices(&self, query: &str) -> Replies {
         let with_notices = |r: Response| {
             let notices = std::mem::take(&mut self.state().notices);
             (self.deliverable(notices), r)
@@ -1311,7 +1316,9 @@ impl Session {
             if open {
                 self.after_implicit(query, result.is_err());
             }
-            let mut responses = vec![with_notices(result.unwrap_or_else(Response::Error))];
+            // Inline room for the one reply: a branch call's list costs no allocation (L5).
+            let mut responses = Replies::new();
+            responses.push(with_notices(result.unwrap_or_else(Response::Error)));
             if open {
                 if let Err(e) = self.end_implicit() {
                     responses.push(with_notices(Response::Error(e)));
@@ -1321,9 +1328,13 @@ impl Session {
         }
         let statements = match split_statements(query) {
             Ok(s) => s,
-            Err(e) => return vec![(Vec::new(), Response::Error(engine_info(&e)))],
+            Err(e) => {
+                let mut responses = Replies::new();
+                responses.push((Vec::new(), Response::Error(engine_info(&e))));
+                return responses;
+            }
         };
-        let mut responses = Vec::with_capacity(statements.len());
+        let mut responses = Replies::with_capacity(statements.len());
         // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let multi = statements.len() > 1;
         for sql in &statements {
@@ -2077,7 +2088,7 @@ impl Session {
                 Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
                 None => Ok(()),
             };
-        let f = call.function.as_str();
+        let f = &*call.function;
         if f == "turso_branch_current" {
             arity(call, 0)?;
             result_format(format, 0, 1)?;
@@ -2152,7 +2163,7 @@ impl Session {
                         let next = PgConnection::new(opened);
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
-                        st.branch = Some((name.clone(), next));
+                        st.branch = Some((name.to_string(), next));
                     }
                     return branch_text(f, &name, portal.is_some(), format);
                 }
@@ -2177,7 +2188,7 @@ impl Session {
                     let next = PgConnection::new(opened);
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
-                    st.branch.replace((name.clone(), next))
+                    st.branch.replace((name.to_string(), next))
                 };
                 // The branch left is free for a delete once its connection is closed: `run`
                 // releases it after the statement's own handle on the connection goes.
@@ -2748,9 +2759,13 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
 }
 
 /// A branch name argument: a string literal, or a `$n` bound to text.
-fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<String> {
+fn text_arg<'a>(
+    arg: &'a PgBranchArg,
+    portal: Option<&Portal<Parsed>>,
+) -> SqlResult<std::borrow::Cow<'a, str>> {
     match arg {
-        PgBranchArg::Text(s) => Ok(s.clone()),
+        // Borrowed: a literal name costs the call no copy (L5).
+        PgBranchArg::Text(s) => Ok(std::borrow::Cow::Borrowed(s.as_str())),
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
         PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
@@ -2776,6 +2791,7 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<Str
                 return Err(error("22004", "a branch name must not be null".to_string()));
             };
             String::from_utf8(bytes.to_vec())
+                .map(std::borrow::Cow::Owned)
                 .map_err(|e| error("22021", format!("invalid UTF-8 in parameter ${n}: {e}")))
         }
     }
@@ -3000,7 +3016,7 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
         return stats_fields(format);
     }
     let pg_type = if matches!(
-        call.function.as_str(),
+        &*call.function,
         "turso_branch_create" | "turso_branch_allocations"
     ) {
         Type::INT8
@@ -3008,7 +3024,7 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
         Type::TEXT
     };
     Ok(vec![FieldInfo::new(
-        call.function.clone(),
+        call.function.to_string(),
         None,
         None,
         pg_type,
@@ -3286,7 +3302,8 @@ impl SimpleQueryHandler for Session {
         let responses = if is_blank(&query.query) {
             // An empty Query ends an unsynced pipeline's implicit block as any Query does
             // (committing it); it left the block open (wire review 16 item 6).
-            let mut responses = vec![(Vec::new(), Response::EmptyQuery)];
+            let mut responses = Replies::new();
+            responses.push((Vec::new(), Response::EmptyQuery));
             if let Err(e) = self.end_implicit() {
                 responses.push((Vec::new(), Response::Error(e)));
             }
@@ -5303,7 +5320,6 @@ mod tests {
             wire(sql);
         }
         let empty = wire(";");
-        let engine = s.shared.db.connect().unwrap();
         let measure_engine = |f: &dyn Fn()| {
             let a0 = n();
             f();
@@ -5323,8 +5339,11 @@ mod tests {
         let engine_switch = measure_engine(&|| drop(s.shared.db.connect_named("b").unwrap()));
         check("switch b", wire("SELECT turso_branch_switch('b')"), engine_switch);
         check("switch main", wire("SELECT turso_branch_switch('main')"), 0);
+        // On the session's own connection, as the wire's create runs (a fresh connection's create
+        // allocated one fewer: the engine's cost is the connection's, and is not the wire's).
+        let own = s.current(&mut s.state()).unwrap();
         let engine_create = measure_engine(&|| {
-            engine.create_branch("e1").unwrap();
+            own.inner().create_branch("e1").unwrap();
         });
         let engine_delete = measure_engine(&|| {
             s.shared.db.drop_branch("e1").unwrap();

@@ -23,6 +23,8 @@ anyhow.workspace = true
 async-trait = "0.1"
 futures = { workspace = true }
 libc = "0.2.172"
+smallvec = "1.15.1"
+compact_str = "0.8.1"
 pgwire = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tracing = { workspace = true }
