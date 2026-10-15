@@ -6900,12 +6900,6 @@ impl BranchStore {
 
     /// This store's group's own handle, for its catalog to forward failed syncs to
     /// (`Catalog::link_drain_parent`).
-    /// This store's group (the `vacuum_target_drains_into_source` mutant links a VACUUM target's
-    /// store to it).
-    pub(crate) fn group_ref(&self) -> &Group {
-        &self.group
-    }
-
     pub(crate) fn group_handle(group: &Group) -> Option<crate::sync::Weak<Group>> {
         group.me.get().cloned()
     }

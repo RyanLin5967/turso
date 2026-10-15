@@ -313,13 +313,12 @@ pub(crate) fn open_vacuum_temp_db(
         )?,
     };
     // Mutant `vacuum_target_drains_into_source` (test builds only; lead order 5's guard,
-    // a_failed_vacuum_target_wal_sync_leaves_the_trunk_store_untouched): the target's failed syncs
-    // go to the source store's at-risk decision, the routing that finding feared. The target is its
-    // own Database with its own branch store, so nothing routes them there otherwise.
+    // a_failed_vacuum_target_wal_sync_leaves_the_trunk_store_untouched): the target's pagers report
+    // to the SOURCE's branch store, the routing that finding feared. The target is its own Database
+    // with its own branch store, so nothing routes its syncs there otherwise.
+    #[cfg(test)]
     if crate::branch::store::fe_mutant("vacuum_target_drains_into_source") {
-        if let Some(parent) = crate::branch::store::BranchStore::group_handle(source_db.branches.group_ref()) {
-            db.branches.link_drain_parent(parent);
-        }
+        let _ = db.pager_store_for_test.set(source_db.branches.clone());
     }
     let conn = match page_codec {
         Some(codec) => db.connect_with_page_codec(codec)?,
