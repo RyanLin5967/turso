@@ -2998,6 +2998,36 @@ fn a_from_alias_column_list_renames_the_columns() {
     assert_eq!(a.q(sql).err(sql).code, "42P10", "{sql}");
 }
 
+/// KNOWN RED (ENGINE; known-red.txt): `SELECT *` over a RIGHT JOIN ... USING or a NATURAL RIGHT
+/// JOIN puts the merged join column first, then the left table's other columns, then the right's,
+/// as PostgreSQL 18.6 does (recorded, artie raw loud-20261015/pg18-diff/pg18-join2.out). The
+/// engine expands it as the right table's own columns after the left's (`j, t, i, k`), so a client
+/// that reads the row by position reads `j` where `i` stands.
+#[test]
+fn a_right_join_using_puts_the_merged_column_first() {
+    let dir = Scratch::new("rightusing");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE j1 (i int, j int, t text)").ok("j1");
+    a.q("CREATE TABLE j2 (i int, k int)").ok("j2");
+    a.q("INSERT INTO j1 VALUES (1, 4, 'one'), (3, 2, 'three')").ok("j1 rows");
+    a.q("INSERT INTO j2 VALUES (1, -1), (5, -5)").ok("j2 rows");
+    for sql in [
+        "SELECT * FROM j1 RIGHT JOIN j2 USING (i) ORDER BY i",
+        "SELECT * FROM j1 NATURAL RIGHT JOIN j2 ORDER BY i",
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.names, names(&["i", "j", "t", "k"]), "{sql}");
+        assert_eq!(
+            r.rows,
+            vec![vec![t("1"), t("4"), t("one"), t("-1")], vec![t("5"), None, None, t("-5")]],
+            "{sql}"
+        );
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
