@@ -294,7 +294,12 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("locks_process", delta(s0.locks, s1.locks));
     s.insert("held_syscalls", delta(s0.held_syscalls, s1.held_syscalls));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
-    s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
+    // Mutant `budget_catalog_loads_unwired` (the MEASUREMENT class's fire-check): the counter
+    // reads 0 whatever was loaded; every_zero_budgeted_counter_is_seen_moving must fail.
+    s.insert(
+        "catalog_loads",
+        if super::store::fe_mutant("budget_catalog_loads_unwired") { 0 } else { delta(o0.cat.0, o1.cat.0) },
+    );
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
     s.insert("catalog_rows", delta(o0.cat.3, o1.cat.3));
     s.insert("catalog_stmts", delta(s0.t_cat_stmts, s1.t_cat_stmts));
