@@ -616,6 +616,14 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                        } else {
+                            // A BASE-only type (no ENCODE, e.g. float4/float8) casts as its
+                            // primitive base does (C32 MED: nothing was emitted, so the value kept
+                            // its own type).
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(&resolved.primitive),
+                            });
                         }
                         return Ok(target_register);
                     }
