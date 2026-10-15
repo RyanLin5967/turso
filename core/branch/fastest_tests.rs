@@ -7422,6 +7422,11 @@ fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
 fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 runs only once
+    // the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (fa0897b69); this test fails phase 4's WAL sync,
+    // so it forces every checkpoint's (measured: its premise failed at 5344a5878, artie raw
+    // l17-branch_5344a5878.txt). No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
