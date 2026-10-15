@@ -2343,6 +2343,65 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// Portals as PostgreSQL 18.6 keeps them (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-r15.out; wire review 15 items 16, 17 and 20):
+/// - an unnamed portal suspended by a row limit continues at its next Execute, in a block, after
+///   a Sync: it was removed after every Execute, so the next one was 34000;
+/// - a portal that returned all its rows answers its own verb's tag with 0 rows when executed
+///   again (`INSERT 0 0` for an INSERT ... RETURNING): the Finished arm said SELECT 0;
+/// - a Bind of a named portal that already exists is 42P03 "cursor ... already exists": it was
+///   replaced silently, a suspended one included.
+#[test]
+fn portals_live_as_postgresql_keeps_them() {
+    let dir = Scratch::new("portals");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)").ok("r");
+    a.q("INSERT INTO r VALUES (1, 'a'), (2, 'b'), (3, 'c')").ok("rows");
+    let rows = |r: &Reply| r.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>();
+    // Unnamed, suspended, continued after a Sync in a block.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"\0SELECT id FROM r ORDER BY id\0\0\0");
+    a.send(b'B', b"\0\0\0\0\0\0\0\0");
+    a.send(b'E', b"\0\0\0\0\x01");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("first row");
+    assert_eq!(rows(&r), vec!["1"]);
+    a.send(b'E', b"\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("the unnamed portal continues");
+    assert_eq!(rows(&r), vec!["2", "3"]);
+    assert_eq!(r.tags, vec!["SELECT 2".to_string()]);
+    a.q("COMMIT").ok("commit");
+    // A finished RETURNING portal answers INSERT 0 0.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"s1\0INSERT INTO r VALUES (10, 'x') RETURNING id\0\0\0");
+    a.send(b'B', b"p1\0s1\0\0\0\0\0\0\0");
+    a.send(b'E', b"p1\0\0\0\0\0");
+    a.send(b'E', b"p1\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply().ok("p1 twice");
+    assert_eq!(rows(&r), vec!["10"]);
+    assert_eq!(
+        r.tags,
+        vec!["INSERT 0 1".to_string(), "INSERT 0 0".to_string()]
+    );
+    a.q("ROLLBACK").ok("end");
+    // Binding a named portal that exists is 42P03.
+    a.q("BEGIN").ok("begin");
+    a.send(b'P', b"s2\0SELECT id FROM r ORDER BY id\0\0\0");
+    a.send(b'B', b"p2\0s2\0\0\0\0\0\0\0");
+    a.send(b'E', b"p2\0\0\0\0\x01");
+    a.send(b'S', &[]);
+    a.read_reply().ok("p2 suspended");
+    a.send(b'B', b"p2\0s2\0\0\0\0\0\0\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err("p2 bound again").code, "42P03");
+    assert_eq!(r.status, b'E');
+    a.q("ROLLBACK").ok("end");
+}
+
 /// A result column whose expression is boolean in PostgreSQL's grammar (a boolean literal, a
 /// comparison, AND / OR / NOT, IS [NOT] NULL, IN, BETWEEN, LIKE, EXISTS, a cast to bool, a CASE
 /// whose every result is boolean) is announced bool (16) and sent as t / f, and a cast to float4 or
