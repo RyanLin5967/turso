@@ -146,7 +146,7 @@ pub fn register_builtin_catalog(
     schema: &mut Schema,
     enable_custom_types: bool,
 ) -> crate::Result<()> {
-    for vtab in pragma_vtabs() {
+    for vtab in pragma_vtabs()? {
         schema.tables.insert(
             vtab.name.to_owned(),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
@@ -169,21 +169,22 @@ pub fn register_builtin_catalog(
     Ok(())
 }
 
-/// Build a `VirtualTable` for each PRAGMA table-valued function.
-fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
+/// Build a `VirtualTable` for each PRAGMA table-valued function. The schemas are fixed and parse,
+/// but the parse can still be refused by the stack guard on a thread with almost no stack left
+/// (the stack-guard class: it panicked here on a 128 KiB thread), so the refusal is returned.
+fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
     PragmaVirtualTable::functions()
         .into_iter()
         .map(|(tab, schema_sql)| {
-            Arc::new(VirtualTable {
+            Ok(Arc::new(VirtualTable {
                 name: format!("pragma_{}", tab.pragma_name),
-                columns: VirtualTable::resolve_columns(schema_sql)
-                    .expect("pragma table-valued function schema resolution should not fail"),
+                columns: VirtualTable::resolve_columns(schema_sql)?,
                 kind: VTabKind::TableValuedFunction,
                 vtab_type: VirtualTableType::Pragma(tab),
                 vtab_id: 0,
                 is_droppable: false,
                 innocuous: true,
-            })
+            }))
         })
         .collect()
 }
