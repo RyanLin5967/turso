@@ -151,6 +151,14 @@ const META_LEASE_NOW: i64 = 6;
 const META_ARENA_HW: i64 = 7;
 const META_IN_USE: i64 = 8;
 const META_STATES: i64 = 9;
+/// LEAP L4, formats 19 and 20 (`journal::meta_carries_facts`): the catalog's earliest lease
+/// deadline (`NO_LEASE`: none), and how many branches it lists released while held open, each
+/// written in the same transaction as the rows they summarize, so an open reads them from the meta
+/// row instead of asking (`lease_min`, `released_ids`).
+const META_LEASE_MIN: i64 = 10;
+const META_HELD_RELEASED: i64 = 11;
+/// `META_LEASE_MIN`'s value for "no lease" (an integer column holds at most i64::MAX).
+const NO_LEASE: u64 = i64::MAX as u64;
 
 /// Pages of Turso page cache each catalog connection keeps (r11-restart-r2, item 4): sized to hold
 /// a checkpoint window's dirty leaves (~31.8k commits at 33 B in a 1 MiB log) so the writer does
@@ -201,6 +209,11 @@ pub(crate) struct Meta {
     /// high 32 bits of the page-size key's value, so the meta row keeps its nine keys (F7-durable
     /// fa16116b3; r13-compose A2.R6, S-6).
     pub(crate) format: u32,
+    /// Formats 19 and 20 only (LEAP L4; `None` in an older catalog, whose open asks the catalog):
+    /// the earliest lease deadline of any row (`Some(None)`: no lease), and the count of rows
+    /// released while held open.
+    pub(crate) lease_min: Option<Option<u64>>,
+    pub(crate) held_released: Option<u64>,
 }
 
 /// One branch as the catalog holds it.
@@ -473,6 +486,9 @@ pub(crate) struct Catalog {
     pub(crate) prewarm: PrewarmStats,
     meta_all: Stmt,
     meta_put: Stmt,
+    /// LEAP L4: the facts' keys, deleted when a meta row of a format without them is written over
+    /// one that had them, so no stale fact is left behind.
+    meta_del_facts: Stmt,
     branch_get: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
@@ -577,6 +593,7 @@ impl Catalog {
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
+            meta_del_facts: p("DELETE FROM meta WHERE k >= 10")?,
             branch_get: p(
                 "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
             )?,
@@ -795,13 +812,20 @@ impl Catalog {
                 META_ARENA_HW => m.arena_hw = v as u32,
                 META_IN_USE => m.in_use = v,
                 META_STATES => m.states = v,
+                META_LEASE_MIN => m.lease_min = Some((v != NO_LEASE).then_some(v)),
+                META_HELD_RELEASED => m.held_released = Some(v),
                 _ => return Err(LimboError::Corrupt(format!("branch catalog: meta key {k}"))),
             }
             seen += 1;
         }
-        if seen != 9 {
+        // A format that carries the L4 facts has 11 keys, an older one 9; either refuses the other
+        // count, so a stale or missing fact is never read as one.
+        let want = if super::journal::meta_carries_facts(m.format) { 11 } else { 9 };
+        let facts = m.lease_min.is_some() as u32 + m.held_released.is_some() as u32;
+        if seen != want || (want == 9 && facts != 0) {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog: meta row has {seen} of 9 keys"
+                "branch catalog: meta row of format {} has {seen} of {want} keys",
+                m.format
             )));
         }
         Ok(Some(m))
@@ -985,6 +1009,21 @@ impl Catalog {
         ] {
             self.meta_put
                 .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
+        }
+        // LEAP L4: only a format that carries them writes the facts, and it must have them.
+        if super::journal::meta_carries_facts(m.format) {
+            let (Some(lease_min), Some(held)) = (m.lease_min, m.held_released) else {
+                return Err(LimboError::InternalError(format!(
+                    "branch catalog: a format {} meta row without its L4 facts",
+                    m.format
+                )));
+            };
+            for (k, v) in [(META_LEASE_MIN, lease_min.unwrap_or(NO_LEASE)), (META_HELD_RELEASED, held)] {
+                self.meta_put
+                    .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
+            }
+        } else {
+            self.meta_del_facts.exec(&[], &mut self.counters)?;
         }
         Ok(())
     }

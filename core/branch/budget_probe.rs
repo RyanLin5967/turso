@@ -357,6 +357,10 @@ pub(crate) fn store_unlocked() {
 /// counters, which see one connection each. BLIND SPOT: transaction control and pragmas
 /// (`conn.execute("BEGIN")`, `wal_checkpoint`) are not statements of `Stmt` and are not counted.
 pub(crate) fn catalog_statement(write: bool, rows: u64) {
+    // Diagnostic (`trace_lifecycle_catalog`): who runs each catalog statement.
+    if TRACE_CAT.load(Relaxed) {
+        eprintln!("CATALOG STMT write={write} rows={rows}\n{}", std::backtrace::Backtrace::force_capture());
+    }
     CAT_STMTS.fetch_add(1, Relaxed);
     CAT_ROWS.fetch_add(rows, Relaxed);
     bump(&T_CAT_STMTS, 1);
@@ -806,3 +810,6 @@ fn linux_threads() -> Option<u64> {
         None
     }
 }
+
+/// Diagnostic (`trace_lifecycle_catalog`): print a backtrace at every catalog statement while set.
+pub(crate) static TRACE_CAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

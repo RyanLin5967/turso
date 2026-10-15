@@ -1765,6 +1765,11 @@ pub(crate) mod budget_probe;
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
 
+// LEAP L4's oracle: each in-memory fact that skips a catalog query equals that query, over a
+// randomized lifecycle history (lead, 2026-10-15).
+#[cfg(all(test, feature = "fs"))]
+mod l4_oracle_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

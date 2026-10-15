@@ -1786,6 +1786,19 @@ struct CatState {
     /// containment: a known version holding the fork epoch asked about is the answer, since one
     /// page's versions are disjoint (C-P).
     trunk_cache: HashMap<u32, BTreeMap<u64, Retained>>,
+    /// LEAP L4 (fastest-budgets, 2026-10-15): trunk pages whose every catalog version is in memory,
+    /// in `trunk_cache`, in the lineage or reaped (`trunk_gone`), so a predecessor the memory does
+    /// not hold is not in the catalog either and `trunk_version_at` asks it nothing. A page joins
+    /// when its probe (`trunk_written_known`) finds no catalog version; it stays exact because every
+    /// version a checkpoint writes moves from the lineage to `trunk_cache` at its install, and it is
+    /// cleared with the cache. Oracle: `l4_facts_check_for_test`.
+    trunk_complete: HashSet<u32>,
+    /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
+    /// no trunk version when it was made. Cleared with the cache.
+    trunk_all_complete: bool,
+    /// The count of rows released while held open, from a format 19/20 meta row at the open
+    /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
+    held_released_at_open: Option<u64>,
     /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
     /// catalog read and deleted by the next checkpoint (C-P).
     trunk_gone: HashSet<(u32, u64)>,
@@ -2097,6 +2110,11 @@ impl CatState {
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
+            trunk_complete: HashSet::new(),
+            // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
+            // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
+            trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
+            held_released_at_open: None,
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
@@ -2944,6 +2962,9 @@ struct Captured {
     trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
     trunk_gone: Vec<(u32, u64)>,
     free_cursor: Option<Slot>,
+    /// The catalog held no free slot above `free_cursor` at the capture (`CatState::free_exhausted`):
+    /// once this commits, its free table is exactly the slots it writes (LEAP L4).
+    free_exhausted: bool,
     taken: Vec<Slot>,
     /// An empty store's page-size restart (`checkpoint_catalog_as`, review 6 #4): the arena is
     /// replaced by an empty one once this commits, so the free table is cleared (every row deleted)
@@ -3084,7 +3105,16 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &slot in cap.free_list.iter().chain(cap.reserved.iter()).chain(cap.deferred.iter()) {
             catalog.free_put(slot)?;
         }
-        catalog.put_meta(&cap.meta)
+        // LEAP L4: a format 19/20 meta row carries the earliest lease deadline and the count of
+        // rows released while held open, read in this transaction after every row it commits, so
+        // they summarize exactly those rows. Mutant `l4_stale_meta_facts` (test builds only): the
+        // facts read before the rows are written (the oracle's plant).
+        let mut meta = cap.meta;
+        if super::journal::meta_carries_facts(meta.format) {
+            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { catalog.lease_min()? });
+            meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
+        }
+        catalog.put_meta(&meta)
     })()
     .and_then(|()| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
@@ -3838,6 +3868,9 @@ impl BranchStore {
                 inner.splice = splice;
                 if files.exist() {
                     let t = Instant::now();
+                    // The version on disk, if this build reads it (LEAP L4: a 17/18 snapshot store
+                    // opens and stays one); else the arm's, which the scan refuses by name.
+                    let format = super::journal::on_disk_format(&files, format);
                     let scanned = Journal::scan_as(&files, sync, format)?;
                     stats.recover_ns = ns(t);
                     if let Some(mut scanned) = scanned {
@@ -4097,7 +4130,14 @@ impl BranchStore {
         if let Some(g) = marked {
             cat.next_generation = cat.next_generation.max(g + 1);
         }
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: a format 19/20 meta row carries the catalog's earliest lease deadline, written in
+        // the transaction of the rows it summarizes; an older one is asked. Mutant
+        // `l4_lease_min_from_query` (test builds only): asked always, as before.
+        cat.lease_floor = match meta.lease_min {
+            Some(lease_min) if !fe_mutant("l4_lease_min_from_query") => lease_min,
+            _ => cat.catalog.lease_min()?,
+        };
+        cat.held_released_at_open = meta.held_released;
         inner.cat = Some(cat);
         let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
@@ -4181,7 +4221,14 @@ impl BranchStore {
         // none, and the catalog alone would then open in the other splice arm, or under another
         // build's format (r13-compose S-6: 5/6 composed, 7 before F7's merge, 3/4 F7-durable alone,
         // 2 the base, 0 before the key). A refused open pays no catalog prewarm.
-        let format = super::journal::format_version(inner.splice);
+        let arm = super::journal::format_version(inner.splice);
+        // The version this store reads and keeps writing: its catalog's, its arm's own or legacy
+        // one (LEAP L4: a 17/18 catalog opens by the older path), else the log's.
+        let format = match meta {
+            Some(m) if super::journal::accepts_format(m.format, arm) => m.format,
+            Some(_) => arm,
+            None => super::journal::on_disk_format(files, arm),
+        };
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
                 "branch catalog {}: format version {}; this store reads version {format}{}",
@@ -8281,6 +8328,73 @@ impl BranchStore {
         self.commit_yield.swap(false, Ordering::AcqRel)
     }
 
+    /// Test builds (LEAP L4's oracle): every in-memory fact that lets a query be skipped equals that
+    /// query's answer now. (1) For each trunk page complete in memory (`trunk_complete`, or every
+    /// page under `trunk_all_complete`), every catalog trunk version not reaped is in `trunk_cache`
+    /// or the lineage, so `trunk_pred` could answer nothing the memory does not. (2) Under
+    /// `free_exhausted`, the catalog has no free slot above `free_cursor`. The catalog is read by
+    /// the store's own reader connection, as the skipped queries would read it. `Err` names the
+    /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
+    /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
+    #[cfg(test)]
+    pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
+        let mut inner = self.inner.lock();
+        let inner = &mut *inner;
+        let Some(cat) = inner.cat.as_mut() else {
+            return Ok((0, false, false, false));
+        };
+        let rows = cat
+            .catalog
+            .trunk_born_range(None, u64::MAX, u64::MAX >> 1)
+            .map_err(|e| format!("reading the catalog's trunk versions: {e}"))?;
+        for (page, born, _, _, _) in rows {
+            if !(cat.trunk_all_complete || cat.trunk_complete.contains(&page)) {
+                continue;
+            }
+            let in_cache = cat.trunk_cache.get(&page).is_some_and(|vs| vs.contains_key(&born));
+            let in_lineage = inner.trunk.lineage.retained.get(&page).is_some_and(|vs| vs.contains_key(&born));
+            if !(in_cache || in_lineage || cat.trunk_gone.contains(&(page, born))) {
+                return Err(format!(
+                    "trunk page {page} is complete in memory (all={}), but the catalog holds version born {born} the memory does not",
+                    cat.trunk_all_complete
+                ));
+            }
+        }
+        if cat.free_exhausted {
+            let after = cat
+                .catalog
+                .free_batch(cat.free_cursor, 1)
+                .map_err(|e| format!("reading the catalog's free table: {e}"))?;
+            if let Some(slot) = after.first() {
+                return Err(format!(
+                    "free_exhausted, yet the catalog lists free slot {slot} above the cursor {:?}",
+                    cat.free_cursor
+                ));
+            }
+        }
+        // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
+        let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
+        let mut meta_set = false;
+        if let Some(m) = meta.filter(|m| super::journal::meta_carries_facts(m.format)) {
+            meta_set = matches!(m.lease_min, Some(Some(_))) || m.held_released.is_some_and(|h| h > 0);
+            let lease_min = cat.catalog.lease_min().map_err(|e| format!("lease_min: {e}"))?;
+            let held = cat.catalog.released_ids().map_err(|e| format!("released_ids: {e}"))?.len() as u64;
+            if m.lease_min != Some(lease_min) || m.held_released != Some(held) {
+                return Err(format!(
+                    "the meta row says lease_min {:?} and {:?} held releases; the catalog answers {lease_min:?} and {held}",
+                    m.lease_min, m.held_released
+                ));
+            }
+        }
+        Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted, meta_set))
+    }
+
+    /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
+    #[cfg(test)]
+    pub(crate) fn format_for_test(&self) -> Option<u32> {
+        self.inner.lock().journal.as_ref().map(Journal::format)
+    }
+
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
     /// releases it), and read the hook (`HOLD_ARRIVED` or-ed in once it waits there).
     #[cfg(test)]
@@ -8691,6 +8805,9 @@ impl StoreInner {
         let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
         if cached > cap {
             cat.trunk_cache.clear();
+            // What the cache held is no longer in memory (LEAP L4).
+            cat.trunk_complete.clear();
+            cat.trunk_all_complete = false;
         }
     }
 
@@ -9020,6 +9137,12 @@ impl StoreInner {
         if cat.trunk_known.contains(&page) {
             return Ok(());
         }
+        // A page whose catalog versions are all in memory needs no probe: `written` already counts
+        // them (LEAP L4).
+        if cat.trunk_all_complete && !fe_mutant("l4_probe_always") {
+            cat.trunk_known.insert(page);
+            return Ok(());
+        }
         // Mutant `probe_marked_first` (test builds only): as before review 3 #2, the page is known
         // before its probe answers.
         if fe_mutant("probe_marked_first") {
@@ -9046,6 +9169,14 @@ impl StoreInner {
             }
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
+            // Mutant `l4_complete_over_a_row` (test builds only): marked complete although the
+            // catalog holds a version the memory does not (the oracle's plant).
+            if fe_mutant("l4_complete_over_a_row") {
+                cat.trunk_complete.insert(page);
+            }
+        } else {
+            // No catalog version of the page at all: the memory holds every one (LEAP L4).
+            cat.trunk_complete.insert(page);
         }
         cat.trunk_known.insert(page);
         Ok(())
@@ -9083,6 +9214,10 @@ impl StoreInner {
                 *examined += 1;
                 return Ok(Some((v.slot, v.crc)));
             }
+        }
+        // Every catalog version of the page is in memory, and none holds `at` (LEAP L4).
+        if (cat.trunk_all_complete || cat.trunk_complete.contains(&page)) && !fe_mutant("l4_probe_always") {
+            return Ok(None);
         }
         cat.trunk_probes += 1;
         cat.tva_probes += 1;
@@ -9318,13 +9453,19 @@ impl StoreInner {
                         page_size: page_size as u32,
                         next_id: self.next_id,
                         format: super::journal::format_version(self.splice),
+                        // A new catalog holds no lease and no held release (LEAP L4).
+                        lease_min: Some(None),
+                        held_released: Some(0),
                         ..Meta::default()
                     };
                     if let Err(e) = catalog.put_meta(&meta).and_then(|()| catalog.commit()) {
                         catalog.rollback();
                         return Err(e);
                     }
-                    self.cat = Some(CatState::new(catalog, self.sync, 0)?);
+                    let mut cat = CatState::new(catalog, self.sync, 0)?;
+                    // A catalog made now holds no trunk version (LEAP L4).
+                    cat.trunk_all_complete = !fe_mutant("l4_probe_always");
+                    self.cat = Some(cat);
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
                         let mut built = BTreeSet::new();
@@ -9493,6 +9634,8 @@ impl StoreInner {
         if fresh_arena && !fe_mutant("restart_keeps_free_table") {
             cap.fresh_arena = true;
             cap.free_cursor = None;
+            // The free table is cleared, then nothing written: empty (LEAP L4).
+            cap.free_exhausted = true;
             cap.taken.clear();
             cap.free_list.clear();
             cap.reserved.clear();
@@ -9735,7 +9878,14 @@ impl StoreInner {
                 - reserved.len()
                 - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
-            format: super::journal::format_version(self.splice),
+            // The store keeps writing the version it opened (LEAP L4: a 17/18 store stays one).
+            format: self
+                .journal
+                .as_ref()
+                .map_or_else(|| super::journal::format_version(self.splice), Journal::format),
+            // Filled by the writer in the transaction that commits (`checkpoint_write`).
+            lease_min: None,
+            held_released: None,
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
@@ -9770,6 +9920,7 @@ impl StoreInner {
             trunk_new,
             trunk_gone,
             free_cursor: cat.free_cursor,
+            free_exhausted: cat.free_exhausted,
             fresh_arena: false,
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
@@ -9937,7 +10088,12 @@ impl StoreInner {
             cat.taken = arena.remove_free(&listed).into_iter().collect();
         }
         cat.free_cursor = None;
-        cat.free_exhausted = false;
+        // LEAP L4: a capture that read the catalog's free table to its end deleted what it read and
+        // wrote its own lists, so the table is exactly those: with none, it is empty, and the next
+        // allocation asks it nothing. Mutant `l4_free_ignores_puts` (test builds only): empty
+        // whatever was written (the oracle's plant).
+        let wrote_free = !(cap.free_list.is_empty() && cap.reserved.is_empty() && cap.deferred.is_empty());
+        cat.free_exhausted = cap.free_exhausted && (!wrote_free || fe_mutant("l4_free_ignores_puts"));
         cat.lease_floor = cat.catalog.lease_min()?;
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
@@ -10581,7 +10737,13 @@ impl StoreInner {
             .filter(|(_, st)| st.handle == Handle::Released && st.open)
             .map(|(&id, _)| id)
             .collect();
-        if let Some(cat) = self.cat.as_mut() {
+        // LEAP L4: a format 19/20 meta row read at this open counted the rows released while held
+        // open; with none, the catalog is not asked (`held_released_at_open`, taken once).
+        let none_held = self
+            .cat
+            .as_mut()
+            .is_some_and(|cat| cat.held_released_at_open.take() == Some(0) && !fe_mutant("l4_lease_min_from_query"));
+        if let Some(cat) = self.cat.as_mut().filter(|_| !none_held) {
             let removed = &cat.removed;
             let rows = cat.catalog.released_ids()?;
             ids.extend(rows.into_iter().map(BranchId).filter(|id| !removed.contains(id)));
