@@ -701,16 +701,27 @@ def self_test():
     def ours_windows(kind="ok"):
         """fastest_profile's summary.json windows with the engine's four branch exception counters read at each window's
         open and close (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z; Database::branch_exception_counters()).
-        kind: ok (two windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 3 -> 5), missing (the
+        TEST EDIT, flagged (fresh read of 4529742d8, finding 1): the windows are now what --mode phases with 4 phases
+        measures (create, connect, write, delete; fastest_profile main.rs PHASES), so the coverage rule can hold them
+        to it; the ok case's expected deltas follow (unruled, unrun red f2abbc8cb).
+        kind: ok (four windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 3 -> 5), missing (the
         write window has no exception_counters), noname (its after lacks compaction_waits), backwards (hardcap_upgrades
         4 -> 2), notint (inline_compaction_syncs after is "9"), boolean (header_raise_exclusive before is true),
-        nowindows (no windows at all)"""
+        nowindows (no windows at all), dropwin (no delete window), extrawin (a cycle window too), unnamed (the connect
+        window has no name), crossback (create reads hardcap_upgrades 8 -> 8, then connect 7 -> 7: the engine's counter
+        fell between windows)"""
         if kind == "nowindows":
             return []
         out = []
-        for name in ("create", "write"):
+        for name in ("create", "connect", "write", "delete") + (("cycle",) if kind == "extrawin" else ()):
+            if name == "delete" and kind == "dropwin":
+                continue
             before, after = {k: 7 for k in EXC}, {k: 7 for k in EXC}
+            if name == "create" and kind == "crossback":
+                before["hardcap_upgrades"] = after["hardcap_upgrades"] = 8
             win = {"window": name, "secs": 1.0}
+            if name == "connect" and kind == "unnamed":
+                del win["window"]
             if name == "write":
                 if kind == "nonzero":
                     before["compaction_waits"], after["compaction_waits"] = 3, 5
@@ -798,10 +809,10 @@ def self_test():
                 fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
                 # TEST EDIT, flagged (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): ours' summary.json
                 # gains its windows with the four exception counters, a new required record at its passing value
-                w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": ours_rule, "ops_total": ours_ops[0],
-                                                           "ops_total_asked": ours_ops[1],
-                                                           "windows": ours_windows(ours_counters)}
-                                                          | ({"fixture": fx} if fx is not None else {})))
+                w(f"{a1}/result/summary.json", "[]" if ours_counters == "notobject" else json.dumps(
+                    {"warmup_rule": ours_rule, "ops_total": ours_ops[0], "ops_total_asked": ours_ops[1],
+                     "mode": "phases", "phases_run": 4, "windows": ours_windows(ours_counters)}
+                    | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
                 # leaves the shared sweeper's record and timed.json; a new required record at its passing value
@@ -1085,13 +1096,29 @@ def self_test():
         # inside a credited window labels the cell uncredited. A missing or unreadable record is a refusal
         ("exception counters: ours with every window's counters unchanged passes, credited, with each window's deltas",
          {}, True, lambda s: s["runs"][0].get("exception_counter_deltas") == {w: {k: 0 for k in EXC}
-                                                                             for w in ("create", "write")}
-         and s["runs"][0].get("counters_credited") is True and s.get("uncredited_cells") == []),
+                                                                             for w in ("create", "connect", "write",
+                                                                                       "delete")}
+         and s["runs"][0].get("counters_credited") is True and s.get("uncredited_cells") == []
+         and s.get("counters_creditable") is True),
         ("exception counters: compaction_waits 3 -> 5 in the write window labels the cell uncredited, naming it; the "
          "package still passes", {"ours_counters": "nonzero"}, True,
          lambda s: s["runs"][0].get("counters_credited") is False
          and s["runs"][0]["exception_counter_deltas"]["write"]["compaction_waits"] == 2
-         and any("write" in x and "compaction_waits" in x and "+2" in x for x in s.get("uncredited_cells") or [])),
+         and any("write" in x and "compaction_waits" in x and "+2" in x for x in s.get("uncredited_cells") or [])
+         and s.get("counters_creditable") is False),
+        # fresh read of 4529742d8: the windows must be the ones the run measured, each named, and no counter may fall
+        # between windows; a package-level counters_creditable; a summary.json that is not an object refuses
+        ("exception counters f1: a phases-4 run whose summary lists no delete window fails, naming it",
+         {"ours_counters": "dropwin"}, False, lambda s: any("delete" in x and "window" in x for x in s["parity_refusals"])),
+        ("exception counters f1: a window the run did not measure (cycle in a phases run) fails, naming it",
+         {"ours_counters": "extrawin"}, False, lambda s: any("cycle" in x for x in s["parity_refusals"])),
+        ("exception counters f2: a window with no name fails", {"ours_counters": "unnamed"}, False,
+         lambda s: any("no name" in x for x in s["parity_refusals"])),
+        ("exception counters f3: hardcap_upgrades falling between windows (create after 8, connect before 7) fails",
+         {"ours_counters": "crossback"}, False,
+         lambda s: any("hardcap_upgrades" in x and "between" in x for x in s["parity_refusals"])),
+        ("exception counters f5: a summary.json that is not an object refuses instead of crashing",
+         {"ours_counters": "notobject"}, False, lambda s: any("not an object" in x for x in s["parity_refusals"])),
         ("exception counters: a window with no exception_counters fails, naming it", {"ours_counters": "missing"}, False,
          lambda s: any("exception_counters" in x and "write" in x for x in s["parity_refusals"])),
         ("exception counters: a counter missing from a window's after fails, naming it", {"ours_counters": "noname"},
@@ -1161,7 +1188,8 @@ def self_test():
                 a1 = f"{out}/fs-{fs}/cells/{cell}/a1"
                 if system == "ours":
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
-                                                               "ops_total_asked": int(ops),
+                                                               "ops_total_asked": int(ops), "mode": "phases",
+                                                               "phases_run": 4,
                                                                "windows": ours_windows()}))  # TEST EDIT, flagged
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
