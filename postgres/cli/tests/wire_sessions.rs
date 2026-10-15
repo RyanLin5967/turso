@@ -4542,6 +4542,42 @@ fn a_refused_create_table_leaves_no_sequence() {
     );
 }
 
+// C41: defaults and transaction results recorded on PostgreSQL 18.6 (C26 MED 3).
+#[test]
+fn setting_scope_rollback_restores_client_min_messages() {
+    setting_scope_round_trip("client_min_messages", "error", false, "ROLLBACK", "notice");
+}
+
+#[test]
+fn setting_scope_local_client_min_messages_expires_at_commit() {
+    setting_scope_round_trip("client_min_messages", "error", true, "COMMIT", "notice");
+}
+
+#[test]
+fn setting_scope_local_lock_timeout_expires_at_commit() {
+    setting_scope_round_trip("lock_timeout", "'100ms'", true, "COMMIT", "0");
+}
+
+#[test]
+fn setting_scope_rollback_restores_lock_timeout() {
+    setting_scope_round_trip("lock_timeout", "'100ms'", false, "ROLLBACK", "0");
+}
+
+fn setting_scope_round_trip(setting: &str, value: &str, local: bool, end: &str, expected: &str) {
+    let dir = Scratch::new("setting-scope");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let qualifier = if local { "LOCAL " } else { "" };
+    a.q(&format!("BEGIN; SET {qualifier}{setting} = {value}; {end}"))
+        .ok("setting transaction");
+    if setting == "client_min_messages" {
+        let r = a.q("DROP TABLE IF EXISTS c41_missing_table").ok("notice after block");
+        assert_eq!(r.notices.len(), 1, "the default notice level must be restored");
+    }
+    let show = format!("SHOW {setting}");
+    assert_eq!(a.q(&show).single(&show), expected);
+}
+
 /// The settings whose effect a ROLLBACK would have to undo, foreign_keys and search_path, are
 /// refused (0A000) inside an explicit transaction block and as SET LOCAL, as this server keeps a
 /// SET past the block whatever ends it: `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off for

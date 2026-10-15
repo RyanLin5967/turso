@@ -5616,6 +5616,25 @@ static TEST_ALLOC: counters::CountingAlloc = counters::CountingAlloc;
 mod tests {
     use super::*;
 
+    #[test]
+    fn setting_scope_local_lock_timeout_restores_the_effective_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "BEGIN; SET LOCAL lock_timeout = '100ms'; COMMIT");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 0);
+    }
+
+    #[test]
+    fn setting_scope_rollback_restores_the_effective_lock_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "BEGIN; SET lock_timeout = '100ms'; ROLLBACK");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 0);
+    }
+
+
     /// A session on a fresh database of its own (catalog branch store, D0: no flush slows the test).
     fn session(dir: &tempfile::TempDir) -> Session {
         let path = dir.path().join("w.db").to_string_lossy().into_owned();
