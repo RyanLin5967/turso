@@ -2988,6 +2988,17 @@ impl ExtendedQueryHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // In a failed block only a block exit is parsed, as PostgreSQL's exec_parse_message refuses
+        // anything else (25P02) ahead of parse analysis (postgres.c:1522-1528); a blank query is no
+        // statement there and parses. ParseComplete went out for every statement, and a utility
+        // statement's declared unspecified parameter then answered 42P18 at Bind ahead of the
+        // 25P02 (wire review 17 item 8).
+        if self.state().aborted
+            && !is_blank(&message.query)
+            && !TxVerb::of(&message.query).ends_block()
+        {
+            return Err(PgWireError::UserError(aborted_error()));
+        }
         // The text as it is, and the branch call it is, read here once (wire review 13 item 6).
         let types = message
             .type_oids
