@@ -91,6 +91,17 @@ nestloops_self_test() {
   printf '#!/bin/sh\nexit 0\n' > "$td/losetup"
   PATH="$td:$PATH" nest_loops /mnt/v3fx > /dev/null; rc=$?
   t "no loop attached: nest_loops prints nothing and returns 0" "$rc" 0
+  # V3 review 13 item 10: a filter (awk) that fails is a failure, returned as 2 like a listing failure, never an empty
+  # "nothing attached"; and loop_list passes losetup's own stderr straight through
+  mkdir -p "$td/badawk"
+  printf '#!/bin/sh\nprintf "%%s\\n" "/dev/loop2 /mnt/v3fx/n1/x.img"\n' > "$td/losetup"
+  printf '#!/bin/sh\nexit 3\n' > "$td/badawk/awk"
+  chmod +x "$td/badawk/awk"
+  PATH="$td/badawk:$td:$PATH" nest_loops /mnt/v3fx > /dev/null 2>&1; rc=$?
+  t "a filter (awk) that fails -> nest_loops returns 2 (never 'nothing attached')" "$rc" 2
+  printf '#!/bin/sh\necho "losetup: cannot open /dev/loop-control" >&2\nexit 1\n' > "$td/losetup"
+  t "a failing losetup's own stderr reaches loop_list's stderr" \
+    "$(PATH="$td:$PATH" loop_list 2>&1 > /dev/null | grep -q 'losetup: cannot open /dev/loop-control' && echo seen)" seen
   rm -rf "$td"
   echo "NESTLOOPS SELF-TEST $pass/$((pass + fail)) $([ "$fail" = 0 ] && [ "$pass" -gt 0 ] && echo PASS || echo FAIL)"
   [ "$fail" = 0 ] && [ "$pass" -gt 0 ]
