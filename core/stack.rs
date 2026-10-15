@@ -103,6 +103,12 @@ pub(crate) const STACK_DEPTH_EXCEEDED: &str = "stack depth limit exceeded";
 /// finding 3).
 const STACK_MARGIN: usize = 512 << 10;
 
+/// One level of the deepest phase (a debug build's view expansion, about 93 KiB), with slack: the
+/// least a nested step is ever entered with, however small the thread. A thread that cannot afford
+/// one level refuses every nested step and still runs flat statements (fastest-engine's review of
+/// ed4e4e9a5: a quarter of a 256 KiB stack is 64 KiB, less than one level).
+const LEVEL_COST: usize = 128 << 10;
+
 /// Where no stack bound is known (no platform answer): nested views and subqueries are refused past
 /// this depth instead, the only bound left.
 const FALLBACK_DEPTH: usize = 64;
@@ -156,9 +162,13 @@ pub(crate) fn remaining_stack() -> Option<usize> {
 }
 
 /// The stack a nested step must find left on this thread: `STACK_MARGIN`, or a quarter of a
-/// smaller thread's whole stack.
+/// smaller thread's whole stack, never less than `LEVEL_COST`.
 fn margin() -> usize {
-    STACK_BOUNDS.with(|b| b.map_or(STACK_MARGIN, |(_, size)| STACK_MARGIN.min(size / 4)))
+    STACK_BOUNDS.with(|b| {
+        b.map_or(STACK_MARGIN, |(_, size)| {
+            STACK_MARGIN.min(size / 4).max(LEVEL_COST)
+        })
+    })
 }
 
 /// One recursive step of a nested query (a view's expansion, a subquery's planning, optimizing or
