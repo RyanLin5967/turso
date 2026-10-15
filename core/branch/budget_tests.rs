@@ -572,6 +572,39 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
 /// branch no connection has touched since the open (`pop-<i>`, not resident: its state is read from
 /// the catalog on demand), one per round, after `WARMUP` unmeasured ones (`connect_cold`). The
 /// connection is dropped unmeasured. At most `n` rounds in all.
+/// Branches the written tail rewrites and first-writes (`written_tail`).
+const WTAIL: u64 = 8;
+
+/// The written tail (lead, 2026-10-15, L4 2b): over a built database, first writes on `WTAIL`
+/// populated branches, checkpointed, so their pages hold slots below the checkpoint's high-water
+/// mark; then, in the log only: a rewrite of each (its old slot freed, its new one taken), a first
+/// write and a rewrite on each of the build's tail branches (made before this checkpoint), and a
+/// create plus first write on `WTAIL` branches made after it. Closed when this returns.
+fn written_tail(built: &mut Built) {
+    let db = open_at(&built.path);
+    let trunk = db.connect().unwrap();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'p{i}' WHERE id = {}", 1 + i % 50));
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'q{i}' WHERE id = {}", 1 + i % 50));
+        drop(c);
+        let c = db.connect_named(&format!("tail-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'w{i}' WHERE id = {}", 1 + i % 50));
+        exec(&c, &format!("UPDATE t SET v = 'x{i}' WHERE id = {}", 1 + i % 50));
+        drop(c);
+        let name = format!("wnew-{i}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'n{i}' WHERE id = {}", 1 + i % 50));
+    }
+    built.incarnation = db.incarnation;
+}
+
 fn cold_connects(cell: &str, db: &Arc<Database>, base: Option<u64>, n: u64, k: u64, out: &mut String) {
     for i in 0..(WARMUP + k).min(n) {
         let (c, s) = measure(db, base, || db.connect_named(&format!("pop-{i}")).unwrap());
@@ -1960,10 +1993,10 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "wtail_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
-            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" => (N_LARGE, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" | "wtail_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -1977,6 +2010,9 @@ fn budget_child() {
             }
         };
         let mut built = build(&spec, n, large, named);
+        if spec.starts_with("wtail_") {
+            written_tail(&mut built);
+        }
         // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
         // Mach traps per hold inside the measured mutex otherwise).
         probe::arm(!spec.starts_with("shared_"));
@@ -1988,6 +2024,18 @@ fn budget_child() {
             return;
         }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
+        if spec.starts_with("wtail_") {
+            let s = db.branch_open_stats();
+            let facts: Sample = [
+                ("touched_below_hw", s.touched_below_hw),
+                ("free_probes", s.free_probes),
+                ("touched_slots", s.touched_slots),
+                ("records", s.records),
+            ]
+            .into_iter()
+            .collect();
+            line(&mut text, &spec, "open_facts", 0, &facts);
+        }
         if spec == "confirm_load" {
             confirm_load(&spec, &db, &mut text);
         } else if spec == "confirm_n10" {
@@ -3253,6 +3301,44 @@ fn leap_l4_an_open_reads_only_the_catalog_meta_row() {
         }
     }
     assert!(failures.is_empty(), "LEAP L4 not reached at open (budget: 1 query, the meta row):\n{failures}");
+}
+
+/// LEAP L4 2b (lead, 2026-10-15): an open over a WRITTEN tail (rewrites of checkpointed branches,
+/// first writes and rewrites of branches made before the checkpoint, creates and first writes after
+/// it; `written_tail`) reads the catalog for its meta row only, at 10 and 10^4 live branches (cells
+/// `wtail_n10`, `wtail_n1e4`): the arena rebuild knows each touched slot's state at the checkpoint
+/// without a free-table probe. Premise: the tail touched at least `WTAIL` slots below the
+/// checkpoint's high-water mark (the rewrites' freed slots). Expected RED at bcac1c6f2: 1 + one probe
+/// per such slot. leap_l4_an_open_reads_only_the_catalog_meta_row is green for a writeless tail only.
+#[test]
+fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wtail_n10", "wtail_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["open_facts"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 1 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probes, {} touched slots below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached at a written tail's open (budget: 1 query, the meta row):\n{failures}");
 }
 
 /// The L4 memory ruling (DECISIONS.md 2026-10-06T02:55Z (i): "about 50-100 MB at 10^6 live branches

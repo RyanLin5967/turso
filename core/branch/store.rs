@@ -4344,6 +4344,7 @@ impl BranchStore {
         let mut taken = HashSet::new();
         let mut high_water = file_hw.max(meta.arena_hw);
         for (&slot, &used) in &touched {
+            stats.touched_below_hw += u64::from(slot < meta.arena_hw);
             stats.free_probes += u64::from(slot < meta.arena_hw);
             let was_used = slot < meta.arena_hw && !cat.catalog.free_has(slot)?;
             in_use += used as i64 - was_used as i64;
