@@ -3113,6 +3113,36 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
 /// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
 /// (test builds only): logged only, as before.
+/// The catalog WAL length from which a fuzzy checkpoint's phase 4 backfills and truncates it
+/// (checkpoint FIX, budget a_checkpoint_flushes_at_most_three_times). That phase cost 4 full flushes
+/// (PASSIVE: the WAL barrier and the database file's sync; TRUNCATE: the truncation's sync and the
+/// next commit's new WAL header), measured by red 39507c379 (artie raw l16-ckpt_3fb66f4ef.txt), and
+/// it ran after EVERY checkpoint. Bounded by size instead, as SQLite's and Turso's own
+/// auto-checkpoints are (1000 pages): the WAL stays under about this much plus one checkpoint's
+/// commit. Test builds: `CATALOG_WAL_TRUNCATE_AT_FORCED` (0: the constant; the tests that hold a
+/// checkpoint inside its truncation force every one with `CatalogWalTruncateAlways`).
+const CATALOG_WAL_TRUNCATE_AT: u64 = 4 << 20;
+
+#[cfg(test)]
+pub(crate) static CATALOG_WAL_TRUNCATE_AT_FORCED: AtomicU64 = AtomicU64::new(0);
+
+fn catalog_wal_truncate_at() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CATALOG_WAL_TRUNCATE_AT_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CATALOG_WAL_TRUNCATE_AT
+}
+
+/// Whether phase 4 runs: the catalog WAL has reached `catalog_wal_truncate_at()`. Mutant
+/// `catalog_wal_truncated_every_checkpoint` (test builds only): always, as before.
+fn catalog_wal_due(catalog: &Catalog) -> bool {
+    fe_mutant("catalog_wal_truncated_every_checkpoint") || catalog.wal_len() >= catalog_wal_truncate_at()
+}
+
 fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&AtomicU8>) {
     #[cfg(not(test))]
     let _ = hold;
@@ -3310,6 +3340,9 @@ fn run_flight(
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
+        Ok(()) if !catalog_wal_due(&writer.lock()) => {
+            truncating.store(false, Ordering::Release);
+        }
         Ok(()) => {
             #[cfg(test)]
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);

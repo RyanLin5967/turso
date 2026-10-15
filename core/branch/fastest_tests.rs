@@ -6031,6 +6031,23 @@ fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std:
     (db, armed)
 }
 
+/// Every fuzzy checkpoint runs its phase 4 (the catalog WAL's backfill and truncation) while this
+/// lives: `CATALOG_WAL_TRUNCATE_AT_FORCED` at 1 byte, restored on drop.
+struct CatalogWalTruncateAlways;
+
+impl CatalogWalTruncateAlways {
+    fn set() -> Self {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for CatalogWalTruncateAlways {
+    fn drop(&mut self) {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// `what` was refused because the store is fail-stopped.
 fn assert_fail_stopped<T: std::fmt::Debug>(got: crate::Result<T>, what: &str) {
     match got {
@@ -7459,6 +7476,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
 fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -7510,6 +7531,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
 fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
