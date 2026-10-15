@@ -2433,6 +2433,71 @@ fn a_failed_block_refuses_at_parse() {
     assert_eq!(status, b'I', "ROLLBACK ended the block");
 }
 
+/// A block exit bound with a value in a failed block is refused at the Bind, 25P02, with no
+/// BindComplete before it, as PostgreSQL's exec_bind_message refuses it (numParams != 0), and the
+/// block stays failed; with no value the same ROLLBACK binds and ends the block. Parse refuses
+/// every other statement there (a_failed_block_refuses_at_parse), so this is the Bind's own
+/// refusal. The 25P02 rows before asserted the code alone, which a refusal after BindComplete
+/// gives too (wire review 17 item 13). The mutant that drops `|| !message.parameters.is_empty()`
+/// from on_bind's aborted check must turn this red.
+#[test]
+fn a_block_exit_bound_with_a_value_is_refused_before_bind_complete() {
+    let dir = Scratch::new("abortedbind");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse ROLLBACK declaring `values.len()` text parameters, Bind them, Execute, Sync: every
+    // message type byte up to ReadyForQuery, the first error and the status.
+    fn round(w: &mut Wire, values: &[&[u8]]) -> (Vec<u8>, Option<WireError>, u8) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"ROLLBACK\0");
+        parse.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for _ in values {
+            parse.extend_from_slice(&25u32.to_be_bytes());
+        }
+        w.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8, 0, 0];
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        w.send(b'B', &bind);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error, body[0]);
+            }
+        }
+    }
+    a.q("BEGIN").ok("begin");
+    let fail = "SELECT * FROM nosuch";
+    assert_eq!(a.q(fail).status, b'E', "{fail} did not fail the block");
+    let (types, error, status) = round(&mut a, &[b"x"]);
+    assert_eq!(error.map(|e| e.code), Some("25P02".to_string()));
+    assert_eq!(
+        types,
+        vec![b'1', b'E', b'Z'],
+        "no BindComplete before the refusal"
+    );
+    assert_eq!(status, b'E', "the block is still failed");
+    let (types, error, status) = round(&mut a, &[]);
+    assert!(error.is_none(), "ROLLBACK with no value: {error:?}");
+    assert_eq!(types, vec![b'1', b'2', b'C', b'Z']);
+    assert_eq!(status, b'I', "ROLLBACK ended the block");
+}
+
 /// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer division by zero is 22012 "division by zero"
 /// in PostgreSQL. This engine answers one row holding NULL: core's exec_divide sends an integer /0
 /// to the float path, whose checked division answers None, and the PostgreSQL frontend maps `/` to
