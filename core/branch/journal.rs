@@ -106,8 +106,15 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// were acknowledged in, no weaker and no stronger. One bump for every tag change since 12: a 13
 /// or 14 log carried two tag sets (with and without the ordered tags), and a build reading the
 /// other set cut an ordered last flight as torn. Refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 15;
-const SPLICE_FORMAT_VERSION: u32 = 16;
+///
+/// 17 and 18 (lead order 1, 2026-10-15T07:29:43Z, after 1f70dde48): a snapshot store's background
+/// compaction installs its snapshot over a log it then cuts, so a crash between the two leaves an
+/// OLDER log whose records past the marker of the snapshot's generation only the older-log replay
+/// keeps (`scan_base`). A 15 or 16 reader resets that log and loses them, so the layout, unchanged,
+/// takes a new number that reader refuses; this build refuses a 15 or 16 store in turn, never
+/// reinterprets it (red `a_store_needing_the_older_log_replay_is_refused_by_an_older_format`).
+const FORMAT_VERSION: u32 = 17;
+const SPLICE_FORMAT_VERSION: u32 = 18;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -4027,6 +4034,8 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
         " (written before per-flight writer evidence; recreate the branch files)".to_string()
     } else if version < 15 {
         " (written before per-flight sync-class tags; recreate the branch files)".to_string()
+    } else if version < 17 {
+        " (written before the older-log replay of a background compaction; recreate the branch files)".to_string()
     } else {
         String::new()
     }
