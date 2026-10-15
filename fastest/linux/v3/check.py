@@ -25,6 +25,8 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
+import hostbin  # noqa: E402  every "bash" here is hostbin's bash 4+, never the caller's PATH's (the platform class)
 
 
 def current_f3_sync_record(sy):
@@ -1408,7 +1410,7 @@ def self_test():
     if not sys.platform.startswith("linux"):
         print(f"N/A-on-{sys.platform}: nestloops.sh --self-test (GNU readlink -m, and a /var that is not a symlink)", flush=True)
     else:
-        r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
+        r12 = _sp12.run([hostbin.bash(), nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
         chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
             "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
             and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
@@ -1453,7 +1455,7 @@ def self_test():
             open(loops8, "w").write("/dev/loopfake9 /elsewhere/v3fx-n1.img\n")
             env8 = dict(os.environ, PATH=sh8 + os.pathsep + os.environ.get("PATH", ""), FAKE_LOOPS=loops8,
                         FAKE_DETACH=detach)
-            r8 = _sp12.run(["bash", script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
+            r8 = _sp12.run([hostbin.bash(), script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
                            timeout=120)
             return r8.returncode, r8.stdout + r8.stderr
         t1 = td_run(mk8, "0", "t1")

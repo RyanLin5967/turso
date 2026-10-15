@@ -20,6 +20,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import hostbin  # noqa: E402  the one bash every row and its children run under (the platform class)
 PLATFORMS = ("any", "linux")
 PY_MARK = re.compile(r'''(==|in|\[)\s*\(?\s*\[?\s*["'](--)?self-?test["']''')
 SH_MARK = re.compile(r'''--self-test\)|= *"?--self-test"?''')
@@ -80,6 +82,13 @@ def run(root, plat=None, timeout=1800):
         if p not in listed:
             fails.append(f"{p}: a self-test entry point with no row in gates/platforms.tsv (state its platform)")
     na = passed = 0
+    try:
+        env = hostbin.env_with_bash()
+        lines.append(f"bash: {hostbin.bash()} (hostbin; first on every row's PATH)")
+    except hostbin.BashMissing as e:
+        env = None
+        fails.append(f"REFUSED before any row: {e}")
+        rows = []
     for path, args, pf, why in rows:
         full = os.path.join(root, path)
         if pf not in PLATFORMS:
@@ -92,10 +101,11 @@ def run(root, plat=None, timeout=1800):
             na += 1
             lines.append(f"N/A-on-{plat}: {path} ({why})")
             continue
-        cmd = ([sys.executable, "-B", os.path.basename(full)] if path.endswith(".py") else ["bash", os.path.basename(full)])
+        cmd = ([sys.executable, "-B", os.path.basename(full)] if path.endswith(".py")
+               else [hostbin.bash(env["PATH"]), os.path.basename(full)])
         cmd += args.split()
         try:
-            r = subprocess.run(cmd, cwd=os.path.dirname(full), capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, cwd=os.path.dirname(full), capture_output=True, text=True, timeout=timeout, env=env)
             rc, out = r.returncode, r.stdout + r.stderr
         except subprocess.TimeoutExpired:
             rc, out = None, "timed out"
