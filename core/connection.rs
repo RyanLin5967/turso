@@ -3042,6 +3042,18 @@ impl Connection {
             .collect()
     }
 
+    /// The column names `table` declares in `database` (main, temp or an attached database's
+    /// name), read from this connection's in-memory schema with no catalog query. None when there
+    /// is no such database, or no such table in it.
+    pub fn resident_table_columns(&self, database: &str, table: &str) -> Option<Vec<String>> {
+        let database_id = self.get_database_id_by_name(database).ok()?;
+        self.with_schema(database_id, |schema| {
+            schema
+                .get_btree_table(table)
+                .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+        })
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
     }

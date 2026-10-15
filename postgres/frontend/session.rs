@@ -2405,36 +2405,38 @@ fn is_positional_insert_values(parse: &turso_pg_parser::pg_query::ParseResult) -
     })
 }
 
-/// The columns `table` declares when the in-memory schema answers alone, with no catalog query
-/// (lead ruling: an INSERT's lookup adds none): a main table named as main or public, or unqualified
-/// under no search path or one that starts at public. None otherwise, and the statement keeps the
-/// engine's refusal (an attached schema's table is read only through PRAGMA table_info).
+/// The columns `table` declares, read from the connection's in-memory schemas alone, with no
+/// catalog query (lead ruling: an INSERT's lookup adds none): main, an attached schema by name, or
+/// an unqualified name through the whole search path. Only a path starting at public was read, so
+/// under PostgreSQL's own default path ("$user", public) a positional INSERT with DEFAULT was
+/// refused (ultrareview of fastest-wire, finding 6). None for a relation none of them holds.
 fn resident_relation_columns(
     pg_conn: &Arc<PgConnectionInner>,
     schema: &str,
     table: &str,
 ) -> Option<Vec<String>> {
     use turso_pg_parser::SchemaQualifier;
-    let unqualified_main = || {
-        let state = pg_conn.session_state.lock();
-        state
-            .search_path
-            .first()
-            .is_none_or(|first| first.eq_ignore_ascii_case("public"))
-    };
-    let main = match turso_pg_parser::schema_qualifier(schema) {
-        SchemaQualifier::Main => true,
-        SchemaQualifier::Unqualified => unqualified_main(),
-        _ => false,
-    };
-    main.then(|| {
-        pg_conn
-            .conn
-            .current_schema()
-            .get_btree_table(table)
-            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
-    })
-    .flatten()
+    let columns_in = |database: &str| pg_conn.conn.resident_table_columns(database, table);
+    match turso_pg_parser::schema_qualifier(schema) {
+        SchemaQualifier::Main => columns_in("main"),
+        // The first schema on the path that holds the table, as the engine resolves the name; an
+        // entry naming no database ("$user", PostgreSQL's default first entry) holds nothing.
+        SchemaQualifier::Unqualified => {
+            let path = pg_conn.session_state.lock().search_path.clone();
+            if path.is_empty() {
+                return columns_in("main");
+            }
+            path.iter().find_map(|entry| {
+                if entry.eq_ignore_ascii_case("public") {
+                    columns_in("main")
+                } else {
+                    columns_in(entry)
+                }
+            })
+        }
+        SchemaQualifier::Attached(database) => columns_in(database),
+        _ => None,
+    }
 }
 
 /// The columns `table` declares, from the table the engine reads under the name: an unqualified
