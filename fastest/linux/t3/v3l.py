@@ -827,6 +827,20 @@ def _measure_with(patches, env=None):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _with_global(name, value, f):
+    """f() with module global NAME set to VALUE, restored after (absent before: removed after)"""
+    g, had = globals(), name in globals()
+    old = g.get(name)
+    g[name] = value
+    try:
+        return f()
+    finally:
+        if had:
+            g[name] = old
+        else:
+            g.pop(name, None)
+
+
 def _fake_box(iostats="1", chain=("nvme1n1",), disk="nvme1n1"):
     """the module functions measure() reads the box through, faked: a drive under DIR, fio and strace present"""
     return {"resolve_leaf": lambda d: (list(chain), disk, [d]),
@@ -1194,6 +1208,16 @@ def self_test():
         ("LOW 25: measure() with V3L_REAL=1 on a loop refuses before it makes OUT",
          _ok(lambda: (lambda r: r[0] is not None and "dry-run only" in r[0] and r[1] is False)(
              _measure_with(_fake_box(chain=("loop0", "sda1"), disk="sda"), env={"V3L_REAL": "1"})))),
+        # review 5 LOW 29: SLACK can gate a billed run, so a real run refuses until a PREREG annex row registers it;
+        # the registration check is also t3run's preflight (v3l.py registration), before deps and build are paid for
+        ("LOW 29: a real run on a drive with its leaf record refuses while SLACK is unregistered",
+         _ok(lambda: "SLACK" in (real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json") or ""))),
+        ("LOW 29: with SLACK registered (an annex row named), the same real run is allowed",
+         _ok(lambda: _with_global("SLACK_REGISTERED", "A99 (self-test)",
+                                  lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json")) is None)),
+        ("LOW 29: registration_problem() names the unregistered SLACK; with a row named it is None",
+         _ok(lambda: "unregistered" in (registration_problem() or "")
+             and _with_global("SLACK_REGISTERED", "A99 (self-test)", registration_problem) is None)),
         # review 5 LOW 23: a write-back record whose flush counts VOID never reads as "flush requests completed"
         ("LOW 23: floor_kind of a write-back record with 0 flushes is the VOID text",
          _ok(lambda: floor_kind(rec(delta=0)) == "write-back drive with flushes short (VOID)")),
