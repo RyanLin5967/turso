@@ -11,21 +11,29 @@
 //! reallocates the chunk DIRECTORY (N / 1024 pointers); no branch state ever moves. A chunk whose
 //! states are all gone is freed.
 //!
-//! Residual, stated: the directory is a `Vec` and doubles, moving N / 1024 pointers at a doubling (977
-//! at 10^6). r11-adversarial's F-R1b bounds that too, with fixed segments behind a two-level directory;
-//! at this lane's N it is a few microseconds, and `growth()` counts it.
+//! L2 slice (fastest-engine, budget create_allocates_no_table_of_every_branch_under_the_store_mutex,
+//! 64 KiB per create under the store mutex): a chunk of 1024 branch states was 376,832 bytes
+//! (artie raw l8-chunk_1c58a6f25.txt), allocated whole by the create that first needs it. A chunk is
+//! now CHUNK = 128 states (47,104 bytes for a 368-byte state), and the directory is TWO-LEVEL
+//! (r11-adversarial's F-R1b): fixed segments of SEG = 1024 chunk slots (24 KiB each) behind a top
+//! `Vec` of segments, so no create allocates more than one chunk, one segment, or a top doubling of
+//! N / 131,072 pointers (8 at 10^6). `growth()` counts the top's doublings.
 
 use super::BranchId;
 
-pub(crate) const CHUNK: usize = 1024;
+pub(crate) const CHUNK: usize = 128;
+/// Chunk slots per directory segment.
+const SEG: usize = 1024;
 
 struct Chunk<T> {
     entries: Box<[Option<(BranchId, T)>]>,
     live: usize,
 }
 
+type Segment<T> = Box<[Option<Chunk<T>>]>;
+
 pub(crate) struct BranchTable<T> {
-    dir: Vec<Option<Chunk<T>>>,
+    dir: Vec<Option<Segment<T>>>,
     len: usize,
     chunks: usize,
     /// Directory reallocations, and the chunk pointers they moved (observation only).
@@ -47,19 +55,21 @@ impl<T> BranchTable<T> {
         }
     }
 
-    fn at(id: &BranchId) -> (usize, usize) {
+    /// (segment, chunk within it, slot within the chunk).
+    fn at(id: &BranchId) -> (usize, usize, usize) {
         let i = usize::try_from(id.0).expect("a branch id fits usize");
-        (i / CHUNK, i % CHUNK)
+        let c = i / CHUNK;
+        (c / SEG, c % SEG, i % CHUNK)
     }
 
     pub(crate) fn get(&self, id: &BranchId) -> Option<&T> {
-        let (c, i) = Self::at(id);
-        self.dir.get(c)?.as_ref()?.entries[i].as_ref().map(|(_, v)| v)
+        let (g, c, i) = Self::at(id);
+        self.dir.get(g)?.as_ref()?[c].as_ref()?.entries[i].as_ref().map(|(_, v)| v)
     }
 
     pub(crate) fn get_mut(&mut self, id: &BranchId) -> Option<&mut T> {
-        let (c, i) = Self::at(id);
-        self.dir.get_mut(c)?.as_mut()?.entries[i].as_mut().map(|(_, v)| v)
+        let (g, c, i) = Self::at(id);
+        self.dir.get_mut(g)?.as_mut()?[c].as_mut()?.entries[i].as_mut().map(|(_, v)| v)
     }
 
     pub(crate) fn contains_key(&self, id: &BranchId) -> bool {
@@ -67,16 +77,17 @@ impl<T> BranchTable<T> {
     }
 
     pub(crate) fn insert(&mut self, id: BranchId, val: T) -> Option<T> {
-        let (c, i) = Self::at(&id);
-        if c >= self.dir.len() {
+        let (g, c, i) = Self::at(&id);
+        if g >= self.dir.len() {
             let (len, cap) = (self.dir.len(), self.dir.capacity());
-            self.dir.resize_with(c + 1, || None);
+            self.dir.resize_with(g + 1, || None);
             if self.dir.capacity() != cap {
                 self.dir_grows += 1;
                 self.dir_moved += len as u64;
             }
         }
-        let chunk = self.dir[c].get_or_insert_with(|| Chunk {
+        let segment = self.dir[g].get_or_insert_with(|| (0..SEG).map(|_| None).collect());
+        let chunk = segment[c].get_or_insert_with(|| Chunk {
             entries: (0..CHUNK).map(|_| None).collect(),
             live: 0,
         });
@@ -93,14 +104,19 @@ impl<T> BranchTable<T> {
     }
 
     pub(crate) fn remove(&mut self, id: &BranchId) -> Option<T> {
-        let (c, i) = Self::at(id);
-        let chunk = self.dir.get_mut(c)?.as_mut()?;
+        let (g, c, i) = Self::at(id);
+        let segment = self.dir.get_mut(g)?.as_mut()?;
+        let chunk = segment[c].as_mut()?;
         let (_, val) = chunk.entries[i].take()?;
         chunk.live -= 1;
         self.len -= 1;
         if chunk.live == 0 {
-            self.dir[c] = None;
+            segment[c] = None;
             self.chunks -= 1;
+            // A segment whose chunks are all gone is freed too.
+            if segment.iter().all(Option::is_none) {
+                self.dir[g] = None;
+            }
         }
         Some(val)
     }
@@ -123,13 +139,13 @@ impl<T> BranchTable<T> {
         (self.chunks as u64, self.chunk_allocs)
     }
 
-    /// `(directory reallocations, chunk pointers they moved)` since the table was made.
     /// Test builds: chunks allocated now.
     #[cfg(test)]
     pub(crate) fn chunks_for_test(&self) -> usize {
         self.chunks
     }
 
+    /// `(top directory reallocations, segment pointers they moved)` since the table was made.
     pub(crate) fn growth(&self) -> (u64, u64) {
         (self.dir_grows, self.dir_moved)
     }
@@ -138,6 +154,7 @@ impl<T> BranchTable<T> {
         self.dir
             .iter()
             .flatten()
+            .flat_map(|g| g.iter().flatten())
             .flat_map(|c| c.entries.iter().flatten().map(|(id, v)| (id, v)))
     }
 
@@ -154,6 +171,8 @@ impl<T> BranchTable<T> {
     ) -> impl Iterator<Item = (&'a BranchId, &'a T)> + 'a {
         self.dir
             .iter()
+            .flatten()
+            .flat_map(|g| g.iter())
             .inspect(move |_| scanned.set(scanned.get() + 1))
             .flatten()
             .flat_map(move |c| {
@@ -226,5 +245,35 @@ mod tests {
             assert_eq!(t.get(&BranchId(id)).copied(), m.get(&id).copied());
         }
         assert!(t.capacity() >= t.len());
+    }
+
+    /// The two-level directory (L2 slice): ids across several segments (CHUNK x SEG = 131,072 ids
+    /// each), a whole segment emptied (freed) and refilled, sparse ids far apart; against the model,
+    /// with every chunk this table allocates at most 64 KiB for a 368-byte state.
+    #[test]
+    fn a_branch_table_spans_segments_and_frees_an_empty_one() {
+        let span = (CHUNK * SEG) as u64;
+        let mut t: BranchTable<u64> = BranchTable::new();
+        let mut m: BTreeMap<u64, u64> = BTreeMap::new();
+        let ids: Vec<u64> = (0..300).map(|k| k * 1_009).chain([span - 1, span, span + 1, 3 * span + 7, 10 * span]).collect();
+        for &id in &ids {
+            assert_eq!(t.insert(BranchId(id), id + 5), m.insert(id, id + 5));
+        }
+        // Empty segment 1 (it held span, span + 1, and the k * 1009 ids in it), then refill one id.
+        let seg1: Vec<u64> = m.keys().copied().filter(|id| id / span == 1).collect();
+        assert!(!seg1.is_empty(), "premise: segment 1 holds ids");
+        for id in &seg1 {
+            assert_eq!(t.remove(&BranchId(*id)), m.remove(id));
+        }
+        assert!(t.dir.get(1).is_none_or(Option::is_none), "an empty segment was not freed");
+        assert_eq!(t.insert(BranchId(span + 2), 9), m.insert(span + 2, 9));
+        let got: Vec<(u64, u64)> = t.iter().map(|(id, &v)| (id.0, v)).collect();
+        let want: Vec<(u64, u64)> = m.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(got, want);
+        for &id in ids.iter().chain([span + 2, 2 * span, 11 * span].iter()) {
+            assert_eq!(t.get(&BranchId(id)).copied(), m.get(&id).copied(), "id {id}");
+        }
+        assert_eq!(t.len(), m.len());
+        assert!(CHUNK * 368 <= 64 << 10, "premise: a chunk of 368-byte states fits 64 KiB");
     }
 }
