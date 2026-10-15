@@ -155,8 +155,10 @@ def main(argv):
         print(f"fixed_api_mutants: REFUSED: stale table: {stale}")
         return 2
     top = tempfile.mkdtemp(prefix="fixed-api-mut-")
-    for d, cmd in sorted({(r[2], tuple(r[4])) for r in todo}):
-        rc, out = run_test(copy_of(d, os.path.join(top, "control-" + d.replace("/", "_"))), list(cmd))
+    # one control per (dir, command): two commands over one dir each get their own copy (the first run, 2026-10-15,
+    # crashed copying t3/ a second time into control-t3)
+    for k, (d, cmd) in enumerate(sorted({(r[2], tuple(r[4])) for r in todo})):
+        rc, out = run_test(copy_of(d, os.path.join(top, f"control-{k}-" + d.replace("/", "_"))), list(cmd))
         if rc != 0:
             print(f"fixed_api_mutants: REFUSED: the unmutated {d} control ({' '.join(cmd)}) is not green (rc {rc}): "
                   f"{out[-300:]!r}")
