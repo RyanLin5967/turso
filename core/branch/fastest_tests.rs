@@ -4843,6 +4843,12 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
         };
         let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
         let trunk = db.connect().unwrap();
+        // FLAGGED TEST EDIT (engine review 19 LOW 12's assertion, its count moved; for the lead's
+        // ruling): the upgrade count is read before the reap. Read after it, it raced an upgrade the
+        // reap had already armed (taken before the read, landing after the held-slot premise): the
+        // count read 0 in the catalog arm at bb6af4d94 and 9d27592bf (artie raws l1-branch*), and in
+        // the snapshot arm in a dev-tree run. The claim, exactly one upgrade, is unchanged.
+        let upgrades = db.branches.group_counters()[4];
         db.branch(id).unwrap().reap().unwrap();
         // FLAGGED TEST EDIT (engine review 19 LOW 10, a premise added): the slots are held after the
         // reap, deterministically: a release never matures frees, so nothing arms the upgrade
@@ -4852,7 +4858,6 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
             assert!(!db.branch_slot_is_free(s), "{what}: premise: slot {s} is held after x's reap");
         }
         let syncs = super::store::thread_syncs();
-        let upgrades = db.branches.group_counters()[4];
         let _y = trunk.fork_branch().unwrap().into_id();
         assert_eq!(
             super::store::thread_syncs() - syncs,
