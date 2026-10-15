@@ -662,8 +662,29 @@ def summarize(out, sha, dry, manifest):
                                     "every ours run is refused (routing ruling 05:16:51Z)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
+    # the lead's --dry-block ruling (2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT (mode.txt stamp,
+    # OUT/STAMP). The only stamp there is; a DRY-VIRT stamp on a run that is not a dry run is a contradiction
+    stamp = mode.get("stamp") or None
+    mode_refusals = []
+    if stamp not in (None, "DRY-VIRT"):
+        mode_refusals.append(f"mode.txt names the stamp {stamp!r}; DRY-VIRT is the only stamp a run carries")
+    if stamp == "DRY-VIRT" and (dry != "1" or mode.get("dry") != "1"):
+        mode_refusals.append(f"a DRY-VIRT run says dry={mode.get('dry')!r} (package dry={dry!r}): a run on a virtual "
+                             "disk is a dry run, never a real one")
+    summary["stamp"], summary["mode_refusals"] = stamp, mode_refusals
+    # credit: every reason this package's numbers cannot be credited, so one field answers (False for any dry run)
+    credit = []
+    if dry == "1":
+        credit.append("a dry run is never credited")
+    if stamp == "DRY-VIRT":
+        credit.append("DRY-VIRT: a dry run on a VM's virtual disk, behind a hypervisor whose flush path is unknown")
+    for k in ("warmup_creditable", "sweeper_creditable", "counters_creditable"):
+        if summary.get(k) is not True:
+            credit.append(f"{k} is {summary.get(k)!r}")
+    summary["credit_refusals"], summary["creditable"] = credit, not credit
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
-        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet
+        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet \
+        and not mode_refusals
     summary["ok"] = ok  # the one verdict the workflow reads (fourth lane review LOW 23)
     return summary, ok
 

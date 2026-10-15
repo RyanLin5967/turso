@@ -87,12 +87,14 @@
 set -uo pipefail
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
+DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
 DEV_NAME=""
 while [ $# -gt 0 ]; do
   case $1 in
     --sha) SHA=$2; shift ;;
     --out) OUT=$2; shift ;;
     --dry-run) DRY=1 ;;
+    --dry-block) DRY_BLOCK=$2; DRYB_GIVEN=1; shift ;;
     --manifest) MANIFEST=$2; shift ;;
     --fs) FSLIST=$2; shift ;;
     --device) DEVICE=$2; shift ;;
@@ -124,7 +126,7 @@ if [ -z "${T3RUN_INSIDE:-}" ]; then
   T3RUN_INSIDE=1 exec bash "$SRC/fastest/linux/t3/t3run.sh" --sha "$SHA" --out "$OUT" \
     $([ $DRY = 1 ] && echo --dry-run) ${MANIFEST:+--manifest "$MANIFEST"} ${FSLIST:+--fs "$FSLIST"} \
     ${DEVICE:+--device "$DEVICE"} ${DESTROY:+--destroy "$DESTROY"} --seed "$SEED" \
-    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"} ${PLP:+--plp "$PLP"}
+    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"} ${PLP:+--plp "$PLP"} ${DRYB_GIVEN:+--dry-block "$DRY_BLOCK"}
 fi
 
 SRC=$(git -C "$HERE" rev-parse --show-toplevel)
@@ -140,7 +142,18 @@ L=$SRC/fastest/linux
 # preflight refuses unless its functions are defined here
 [ -f "$L/gates/sweeper.sh" ] && source "$L/gates/sweeper.sh"
 SETTLE_DEV=""
-if [ $DRY = 1 ]; then
+# --dry-block DEV (the lead's gate item 6 amendment, 2026-10-15): a DRY run on a VM's real non-loop virtual disk, through
+# the device branch (devguard, the drive's identity, device_make and device_wipe), stamped DRY-VIRT in mode.txt and
+# OUT/STAMP, which summarize refuses for credit. The virtualized box is allowed here only (virt_ok dryblock); a real
+# run still refuses one (virt_ok real). No plant, no --block, no --device/--destroy, no --plp yes
+if [ -n "$DRYB_GIVEN" ]; then
+  [ -n "$DRY_BLOCK" ] || { echo "t3run: REFUSED: --dry-block needs a device (a VM's whole virtual disk)" >&2; exit 2; }
+  [ -z "$BLOCK" ] || { echo "t3run: REFUSED: --block and --dry-block are exclusive" >&2; exit 2; }
+  [ -z "$PLANT" ] || { echo "t3run: REFUSED: --plant is for --dry-run --block loop|brd, not --dry-block" >&2; exit 2; }
+  [ -z "$DEVICE$DESTROY" ] || { echo "t3run: REFUSED: --device/--destroy are a real run's; --dry-block names its own disk" >&2; exit 2; }
+  case ${PLP:=no} in no) ;; *) echo "t3run: REFUSED: --plp is for real runs (a virtual disk has no power-loss protection)" >&2; exit 2 ;; esac
+  DRY=1 BLOCK=device DEVICE=$DRY_BLOCK DESTROY=$DRY_BLOCK STAMP=DRY-VIRT
+elif [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
   case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-cache-lie) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
   # brd batches are smoke (unbound) and brd has no loop, so these plants would plant nothing there
@@ -164,7 +177,8 @@ DIST=$OUT/dist
 mkdir -p "$DIST" "$OUT/cells"
 exec > >(tee -a "$OUT/t3run.log") 2>&1
 echo "# t3run sha=$SHA src=$SRC out=$OUT dry=$DRY block=$BLOCK plant=${PLANT:-none} manifest=$MANIFEST seed=$SEED start=$(date -u +%FT%TZ)"
-printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" > "$OUT/mode.txt"
+printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\nstamp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" "$STAMP" > "$OUT/mode.txt"
+[ -z "$STAMP" ] || echo "$STAMP" > "$OUT/STAMP"
 
 stage() { # stage <name> <function>: time it, record rc; a failed stage ends the run (rc 1)
   local name=$1 s e rc
@@ -246,12 +260,15 @@ preflight() {
   if [ $DRY = 0 ]; then
     grep -qx "$msha" "$L/t3/REGISTERED-MANIFESTS" 2>/dev/null ||
       { echo "REFUSED: manifest $msha is not registered (fastest/linux/t3/REGISTERED-MANIFESTS)"; return 2; }
-    [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
-      { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
-    [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
     # V3L's floor-rule SLACK gates the billed run, so it must be registered first (review 5 LOW 29)
     python3 -B "$L/t3/v3l.py" registration > "$OUT/v3l-registration.txt" 2>&1 ||
       { cat "$OUT/v3l-registration.txt"; echo "REFUSED: V3L's SLACK has no PREREG annex row"; return 2; }
+  fi
+  # the device branch: a real run's --device, or a --dry-block run's virtual disk (stamped DRY-VIRT)
+  if [ $DRY = 0 ] || [ "$STAMP" = DRY-VIRT ]; then
+    [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
+      { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
+    [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
     sudo -n python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
     # the node devguard just checked; every block's mkfs re-checks against it (devguard round-2 attack LOW 4)
     DEV_REAL=$(readlink -f "$DEVICE")
@@ -267,12 +284,17 @@ preflight() {
     # V3L's write rule reads the drive's sectors-written counter, which moves only with iostats on (review 5 MED 2)
     [ "$(cat "/sys/block/$DEV_NAME/queue/iostats" 2>/dev/null)" = 1 ] ||
       { echo "REFUSED: $DEV_NAME's queue/iostats is not 1: its sectors-written counter does not advance, so every V3L would VOID"; return 2; }
-    # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
-    local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
-    [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
+    # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8);
+    # only a --dry-block run, stamped DRY-VIRT, may run on one (t3lib.sh virt_ok, tested by t3lib_test.sh)
+    local virt VIRT_MODE=real; virt=$(systemd-detect-virt 2>/dev/null || true)
+    [ "$STAMP" = DRY-VIRT ] && VIRT_MODE=dryblock
+    echo "virt=${virt:-unknown} mode=$VIRT_MODE" > "$OUT/virt.txt"
+    virt_ok "$VIRT_MODE" "$virt" || return 2
     # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
     local fsl
+    # the rest is a real run's: PLP and the A17 registration (a dry-block run is never credited, so it asks neither)
+    if [ $DRY = 0 ]; then
     # --plp yes names a registered drive: model and firmware (NVMe firmware_rev, SCSI/SATA rev) in t3/PLP-DRIVES
     if [ "$PLP" = yes ]; then
       plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" ||
@@ -283,6 +305,7 @@ preflight() {
     fsl=$(python3 -B "$L/t3/cells.py" fslist "$MAN") && fslist_ok "$fsl" ||
       { echo "REFUSED: the manifest names no filesystem block (cells.py fslist: '$fsl')"; return 2; }
     registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$fsl" || return 2
+    fi
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -499,7 +522,8 @@ fs_block() {
       # only through device_make (t3lib.sh, review 6 MED 1): DEV_REAL held open, devguard, the drive re-read, mkfs
       # with this UUID (review 6 LOW 6: the UUID is chosen here, so the probe after mkfs checks it rather than
       # reading it), the probe, the re-read, mount -t, the mount checked. o/made.txt names what block_cleanup wipes
-      device_make "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$PLP" "$L/v3/REGISTERED.tsv" \
+      device_make "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$PLP" \
+        "$([ "$STAMP" = DRY-VIRT ] && echo DRY-VIRT || echo "$L/v3/REGISTERED.tsv")" \
         "$fs" "$(cat /proc/sys/kernel/random/uuid)" "$mnt" "$o/made.txt" > "$o/mkfs.txt" 2>&1 ||
         { cat "$o/mkfs.txt"; echo "fs-$fs: device_make refused or failed on $DEV_REAL"; return 1; }
       sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
