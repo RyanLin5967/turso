@@ -3058,8 +3058,6 @@ struct Captured {
     shape_rows_written: u64,
 }
 
-/// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
-/// transaction. Holds no store lock: nothing here reads the store.
 /// What a checkpoint's writer read of the catalog in its own transaction, after every row it
 /// committed (LEAP L4): its earliest lease deadline, the fork epoch of the trunk's newest child row,
 /// and whether it holds any trunk version. Exact as of that commit, so the install sets the facts
@@ -3071,6 +3069,9 @@ pub(crate) struct CkptFacts {
     trunk_versions: bool,
 }
 
+/// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
+/// transaction, and return what it read there after its rows (`CkptFacts`). Holds no store lock:
+/// nothing here reads the store.
 fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<CkptFacts> {
     if cap.fail_write {
         return Err(LimboError::InternalError(
@@ -3102,7 +3103,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.set_commit_sync(cap.arena_sync)?;
     catalog.begin()?;
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<CkptFacts> {
         for (b, what) in &cap.rows {
             if what & DIRTY_NEW != 0 {
                 catalog.put_branch(b)?;
@@ -3308,7 +3309,7 @@ fn run_flight(
     // Inside a panic guard too (review 4 #16): a panic in the cut must still reach the install, or
     // `flight` would stay set. Safe to catch: the cut leads no flight, and its gate's drop, which
     // unwinding runs, lets group flights start again. Mutant `cut_unguarded` (test builds only).
-    let cut = written.as_ref().ok().and_then(|()| {
+    let cut = written.as_ref().ok().and_then(|_| {
         if fe_mutant("cut_unguarded") {
             return begin_cut(&inner, &group, &cap);
         }
