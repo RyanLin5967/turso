@@ -7661,10 +7661,24 @@ fn a_fork_inside_a_ddl_commits_schema_window_parses_no_schema() {
     for (catalog, first) in [(false, true), (false, false), (true, true), (true, false)] {
         let what = format!("catalog={catalog} first={first}");
         let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("schema-window-cost.db"), opts(catalog, SyncClass::Fsync));
+        let path = dir.path().join("schema-window-cost.db");
+        let db = open_at(&path, opts(catalog, SyncClass::Fsync));
         let ddl = db.connect().unwrap();
         seed(&ddl);
         let forker = db.connect().unwrap();
+        // FLAGGED TEST EDIT (a premise repair, ruled ACCEPTED by the lead 2026-10-15T03:14:51Z in
+        // fastest DECISIONS): a catalog store creates its catalog at its first fork, and that
+        // one-time creation parses the catalog's own 14 schema rows (cloud gdb, 2026-10-10; budgets
+        // L6 covers its cost). The catalog first=true arm forks and reaps a throwaway child before
+        // the window, so the catalog exists and the window's fork is still the trunk's first live
+        // child.
+        if catalog && first {
+            forker.fork_branch().unwrap().reap().unwrap();
+            assert!(
+                std::path::PathBuf::from(format!("{}-branch-cat", path.display())).exists(),
+                "{what}: premise: the catalog exists before the window"
+            );
+        }
         let _live = (!first).then(|| forker.fork_branch().unwrap().into_id());
         let version = forker.schema.read().schema_version;
         let published = db.clone_schema().schema_version;
