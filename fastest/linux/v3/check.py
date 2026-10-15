@@ -1696,8 +1696,11 @@ def real_selftest(chk):
             # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
             # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
             # clock read and an undecorated in-window fsync make the windows unreadable
+            # [V3 review 13 item 21, disclosed EXPECTATION CHANGE: this guard wanted the wrong reason, "no F1b real-all
+            # trace" (rd() returns None for a missing file and a corrupt one alike); a trace that is THERE but cannot be
+            # read whole is its own refusal]
             ("a truncated F1b gzip", {"f1b": "truncated"}, "F3:devflush",
-             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+             ["the F1b real-all trace cannot be read whole"]),
             ("an F1b trace with one clock read deleted", {"f1b": f1b_noclock}, "F3:devflush",
              ["the F1b trace's timed windows cannot be read"]),
             ("an F1b trace with an in-window fsync without fd<path>", {"f1b": f1b_nodecor}, "F3:devflush",
