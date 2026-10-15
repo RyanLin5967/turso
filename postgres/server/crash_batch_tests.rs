@@ -169,7 +169,9 @@ fn find_killer() {
     let text = std::fs::read_to_string(&path).unwrap();
     let text: String = text
         .lines()
-        .filter(|l| !l.starts_with('\\'))
+        // Meta-commands and whole-line comments go; a statement after a comment block stays
+        // (find_killer.py dropped such a statement whole, so a script's first CREATE never ran).
+        .filter(|l| !l.starts_with('\\') && !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
     let mut stmts = Vec::new();
