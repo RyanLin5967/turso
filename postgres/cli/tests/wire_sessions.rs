@@ -2788,6 +2788,25 @@ fn float_columns_keep_their_declared_width() {
     assert_eq!(r.params, Some(vec![700, 701]));
 }
 
+/// CREATE TABLE's LIKE clause is refused 0A000, and no table is created: it was silently dropped,
+/// so `CREATE TABLE p11 (LIKE p1)` made a table with none of p1's columns (or only the other ones
+/// listed), and `ALTER TABLE p11 DROP a` on it then panicked the engine (core/translate/alter.rs:941,
+/// the first statement to kill a session in the regress corpus's alter_table, insert and
+/// updatable_views scripts). PostgreSQL copies the columns (a divergence, COMPAT's LIKE row).
+#[test]
+fn create_table_like_is_refused_not_dropped() {
+    let dir = Scratch::new("createlike");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p1(a int, b int)").ok("p1");
+    for sql in ["CREATE TABLE p11 (LIKE p1)", "CREATE TABLE p11 (LIKE p1, c int)"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+        let probe = "SELECT * FROM p11";
+        assert_eq!(a.q(probe).err(probe).code, "42P01", "{sql} created a table");
+    }
+    a.q("SELECT 1").ok("the session lives");
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
