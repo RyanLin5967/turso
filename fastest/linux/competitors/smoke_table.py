@@ -101,12 +101,16 @@ ROWS = [
 ]
 
 
-def load(rundir, system, runner, fs, spec, c):
-    p = os.path.join(rundir, f"competitors-{system}-{runner}-{fs}", "run", "cells", f"{spec}-c{c}", "cell.json")
+def load_json(p):
     try:
         return json.load(open(p))
     except (OSError, ValueError):
         return None
+
+
+def load(rundir, system, runner, fs, spec, c):
+    return load_json(os.path.join(rundir, f"competitors-{system}-{runner}-{fs}", "run", "cells", f"{spec}-c{c}",
+                                  "cell.json"))
 
 
 def short(role):
@@ -191,6 +195,23 @@ def main(rundir, c, table=pins.TABLE):
                 vals.append("MISSING" if cj is None else (f"{d['per_op']:.2f}" if d else "—"))
             if any(v != "MISSING" for v in vals):
                 print(f"| {system} | {spec} | " + " | ".join(vals) + " |")
+    if str(c) == "1":
+        # comp review 1 MED 8: the cells' per-cycle DROP discards each branch's dirty pages before any checkpoint, so
+        # the deferred column above reads about 0; the KEPT arm (run_system.sh kept_arm, C=1) is what a kept branch pays
+        print("\n#### PostgreSQL 18 deferred flushes per KEPT create at C=1 (kept arm: K creates, no DROP, one CHECKPOINT)\n")
+        print("| Job | Spec | " + " | ".join(h for _, _, h in COLS) + " |")
+        print("|---|---|" + "---|" * len(COLS))
+        for spec in ("pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal",
+                     "pg18-create-copy"):
+            vals = []
+            for runner, fs, _ in COLS:
+                p = os.path.join(rundir, f"competitors-pg18-d2-{runner}-{fs}", "run", "cells", f"{spec}-c1", "kept.json")
+                kj = load_json(p)
+                pc = (kj or {}).get("per_create")
+                vals.append("MISSING" if kj is None else (f"{pc:.2f}" if isinstance(pc, (int, float)) else
+                                                          f"FAIL ({(kj or {}).get('verdict')})"))
+            if any(v != "MISSING" for v in vals):
+                print(f"| pg18-d2 | {spec} | " + " | ".join(vals) + " |")
     print(f"\n#### Load-window flushes per op by process role at C={c} (raw, no subtraction; x86_64 XFS / arm64 btrfs)\n")
     print("| Job | Spec | x86_64 XFS | arm64 btrfs |")
     print("|---|---|---|---|")

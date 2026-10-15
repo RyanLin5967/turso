@@ -15,8 +15,11 @@
 #               (timed.tracer.tsv) and exit status (timed.rc), judged by timedrun.py into timed.json: the cell's only
 #               latency file is timed/raw.tsv (gate-6 review, t3run item 2; PREREG :173)
 #   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
-#               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
-#               op's dirty pages), reported apart from the window and never added to it
+#               (counted as the trace's "post" part): the flushes the ops left for later, reported apart from the
+#               window and never added to it. Every cycle DROPs its branch, and dropdb discards the branch's dirty
+#               pages before its own checkpoint, so this reads about 0 at C=1 (comp review 1 MED 8): what a KEPT
+#               branch pays later is the kept arm's (C=1 cells, FT_KEPT_K kept creates and one CHECKPOINT in one
+#               attach, CELLDIR/kept.json; the kept branches are dropped afterwards, untraced)
 #   cell.json : stracecount.py cell: flushes per CYCLE = (load - idle x load_s/idle_s) / ops, the raw count, and the
 #               split by process role (foreground: main, the load generator's backends, PG checkpointer/walwriter/
 #               bgwriter/io workers; background: everything else); background_free when the idle control and the
@@ -49,6 +52,9 @@ N4=${FT_N4:-200}
 ROWS=${FT_ROWS:-10000}
 IDLE_S=${FT_IDLE_S:-30}
 CLIENTS=${FT_CLIENTS:-1 4}
+# comp review 1 MED 8: the PG kept arm's creates per C=1 cell (kept_arm), a count or nothing runs
+KEPT_K=${FT_KEPT_K:-10}
+[[ $KEPT_K =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_KEPT_K [$KEPT_K] is not a positive count" >&2; exit 2; }
 # The warm-up of every timed and labelling run (gate-6 review, t3run item 3): PREREG :210's one rule,
 # min(max(1000 ops, 10 s), 10% of the cap), as bbload/clonebench --warmup OPS:S:MAX_S; FT_WARMUP overrides it only
 # with the same OPS:S:MAX_S form (the T3 driver passes the value it gives fastest_profile). FT_CAP_S is the
@@ -277,6 +283,36 @@ cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command li
   # timed runs are identical, as bb_args makes the servers' (LOW 27: the two were hand-copied)
   CBA=(timeout "$OUTER_S" "$CB" run --mode b1 --op "$1" --sync "$2" --parent "$ROOT/parent.db" --dir "$3"
     --clients "$4" --max-ops "$5" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" --drop --out "$6")
+}
+# kept_arm SPEC CELLDIR -- comp review 1 MED 8 (PG, at C=1): KEPT_K creates of SPEC whose branches are KEPT (bbload
+# --skip-after: no close, no DROP), then one CHECKPOINT inside the same attach after a tsplit stamp. That "post" part is
+# the deferred writes a kept branch pays, which the cells' per-cycle DROP throws away (dropdb's DropDatabaseBuffers and
+# ForgetDatabaseSyncRequests run before its forced checkpoint, so the cells' deferred window reads about 0 at C=1).
+# CELLDIR/kept.json: K, the deferred flushes, per create, by class, and the count's verdict. Then the K branches are
+# dropped and checkpointed, untraced, and the live-branch count must be back at LIVE0.
+kept_arm() {
+  local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0
+  template_idle || { fail "$spec kept arm: a backend stayed on template p for 30 s"; return; }
+  strace_attach "$kd" "$(server_pid)" || { fail "$spec kept arm attach"; return; }
+  bb_args "$spec" 1 "$k" "$d/kept-bb" nowarm
+  "${BBA[@]}" --skip-after >"$d/kept-bb.txt" 2>&1 || rc=$?
+  strace_mark "$kd" tsplit
+  sqlq "CHECKPOINT" >"$d/kept.checkpoint.txt" 2>&1 || fail "$spec kept arm CHECKPOINT rc=$?"
+  strace_detach "$kd"
+  [ $rc -eq 0 ] || fail "$spec kept arm bbload rc=$rc ($(tail -1 "$d/kept-bb.txt"))"
+  count "$kd" "$d/kept-bb/backends.tsv" post "$d/kept-deferred.json"
+  python3 -B -c 'import json, sys
+c = json.load(open(sys.argv[1])); k = int(sys.argv[2]); ok = c.get("verdict") == "ok" and isinstance(c.get("flushes"), int)
+json.dump({"spec": sys.argv[3], "k": k, "verdict": c.get("verdict"), "deferred_flushes": c.get("flushes"),
+           "per_create": c["flushes"] / k if ok else None, "by_class": c.get("by_class")}, open(sys.argv[4], "w"))' \
+    "$d/kept-deferred.json" "$k" "$spec" "$d/kept.json" || fail "$spec kept arm: kept.json"
+  tag=$(jf "$d/kept-bb/summary.json" run_tag)
+  [[ $tag =~ ^[a-z0-9]+$ ]] || { fail "$spec kept arm: run tag [$tag]"; return; }
+  for ((i = 0; i < k; i++)); do
+    sqlq "DROP DATABASE b_${tag}_0_${i}" >>"$d/kept.drops.txt" 2>&1 || fail "$spec kept arm: DROP DATABASE b_${tag}_0_${i}"
+  done
+  sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "$spec kept arm: CHECKPOINT after the drops"
+  expect "kept arm $spec: branches back at LIVE0 after the drops" "$(count_branches)" "$LIVE0"
 }
 # Every spec's create is its step 1 (comp review 1 MED 6: variant (a)'s timed no-op checkout of main is gone, so its
 # create_step 2 case went with it), so fthelp.py ops reads the create at step 1 everywhere.
