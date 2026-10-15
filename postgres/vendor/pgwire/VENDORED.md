@@ -45,3 +45,8 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
 3. `read_cstring` decodes strictly: invalid UTF-8 is 22021 "invalid byte sequence for encoding
    \"UTF8\": 0x.." (it was read lossily), in one scan for the terminator. `MalformedMessage` and
    `PgWireFrontendMessage::Malformed` carry the SQLSTATE and the message (wire review 12 item 8).
+4. `api/auth/noop.rs`: `NoopStartupHandler` gains `server_parameters`, the provider of the
+   ParameterStatus values startup announces, `DefaultServerParameterProvider::default()` unless
+   the handler overrides it; `on_startup` used that default unconditionally, so the server could
+   not announce the settings SHOW answers (`ISO, YMD` against `ISO, MDY`, `Etc/UTC` against `UTC`,
+   `public` against `"$user", public`; wire review 18 item 19).

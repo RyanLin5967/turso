@@ -38,6 +38,43 @@ struct PgConnectionInner {
     /// SET client_min_messages, as its rank in PostgreSQL's order for it (see [`message_rank`]):
     /// a message of a lower rank is not sent. NOTICE by default.
     min_messages: std::sync::atomic::AtomicU8,
+    /// A stamp of the last assignment to the search path, unique across connections, 0 before any
+    /// ([`PgConnection::search_path_stamp`]).
+    search_path_stamp: std::sync::atomic::AtomicU64,
+}
+
+/// The source of [`PgConnectionInner::search_path_stamp`]'s values.
+static SEARCH_PATH_ASSIGNMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The client settings this server answers by, under PostgreSQL's names, at the values it behaves
+/// by: what SHOW gives and what startup announces (ParameterStatus), from this one table, as they
+/// disagreed (wire review 18 item 19). SET accepts each only at a value this server behaves by
+/// ([`handle_pg_set`]); all but two leave it as listed, and TimeZone's equivalent zone names and
+/// extra_float_digits above 1 are accepted with SHOW unchanged (postgres/COMPAT.md). DateStyle is
+/// PostgreSQL's boot value, which this server's ISO dates fit.
+pub const FIXED_SETTINGS: &[(&str, &str)] = &[
+    ("client_encoding", "UTF8"),
+    ("standard_conforming_strings", "on"),
+    ("bytea_output", "hex"),
+    ("DateStyle", "ISO, MDY"),
+    ("IntervalStyle", "postgres"),
+    ("TimeZone", "UTC"),
+    ("extra_float_digits", "1"),
+];
+
+/// search_path as SHOW gives it, and startup announces it, before any SET: PostgreSQL's default.
+pub const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
+
+/// A search path as SHOW search_path gives it: each name quoted as PostgreSQL quotes it, the
+/// default for an empty path.
+fn shown_search_path(path: &[String]) -> String {
+    if path.is_empty() {
+        return DEFAULT_SEARCH_PATH.to_string();
+    }
+    path.iter()
+        .map(|n| turso_pg_parser::quote_identifier(n))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A message level's rank in PostgreSQL's order for client_min_messages: debug5 to debug1 1 to 5,
@@ -83,6 +120,9 @@ impl PgConnectionInner {
     fn set_search_path(&self, path: Vec<String>) {
         let mut state = self.session_state.lock().unwrap();
         state.search_path = path;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.search_path_stamp
+            .store(SEARCH_PATH_ASSIGNMENTS.fetch_add(1, Relaxed), Relaxed);
     }
 }
 
@@ -140,6 +180,7 @@ impl PgConnection {
                 view_cache: Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
+                search_path_stamp: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -161,6 +202,21 @@ impl PgConnection {
         self.inner
             .min_messages
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A stamp that changes whenever the search path is assigned (SET search_path, or a branch
+    /// switch copying it), unique across connections; 0 for a connection whose path was never
+    /// assigned. Lock-free, so the server can check it at every ReadyForQuery and read
+    /// [`PgConnection::shown_search_path`] only when it moved.
+    pub fn search_path_stamp(&self) -> u64 {
+        self.inner
+            .search_path_stamp
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The session's search path as SHOW search_path gives it.
+    pub fn shown_search_path(&self) -> String {
+        shown_search_path(&self.inner.session_state.lock().unwrap().search_path)
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
@@ -905,18 +961,37 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
+    // DateStyle is a list in PostgreSQL, read whole below (search_path is one too, above); any
+    // other setting given more than one value is refused there (its flatten_set_variable_args).
+    // Only the first value was read, so `SET client_encoding TO UTF8, LATIN1` answered SET (wire
+    // review 18 item 19).
+    if set_stmt.values.len() > 1 && name != "datestyle" {
+        return Err(LimboError::InvalidArgument(format!(
+            "SET {name} takes only one argument"
+        )));
+    }
     if name == "foreign_keys" {
         return pg_conn
             .conn
             .prepare(format!("PRAGMA foreign_keys = {}", value.to_sql_string()));
     }
-    let text = match value {
+    let value_text = |value: &PgSetValue| match value {
         PgSetValue::Identifier(v)
         | PgSetValue::StringLiteral(v)
         | PgSetValue::Number(v)
         | PgSetValue::RawSql(v) => v.clone(),
         PgSetValue::Bool(b) => b.to_string(),
         PgSetValue::Null => String::new(),
+    };
+    let text = if name == "datestyle" {
+        set_stmt
+            .values
+            .iter()
+            .map(value_text)
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        value_text(value)
     };
     let lower = text.to_ascii_lowercase();
     let unsupported = |what: &str| {
@@ -971,7 +1046,13 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         }
         "standard_conforming_strings" => pg_bool(&text) == Some(true),
         "bytea_output" => lower == "hex",
-        "datestyle" => lower.split(',').any(|part| part.trim() == "iso"),
+        // Every element ISO, MDY or PostgreSQL's other names for that order (US, NonEuro...), or
+        // DEFAULT, PostgreSQL's ISO, MDY: what SHOW gives stays true. DMY, YMD and the SQL,
+        // Postgres and German output styles are refused, as this server reads and writes ISO
+        // dates alone; `ISO, DMY` was accepted and SHOW still said MDY (wire review 18 item 19).
+        "datestyle" => lower.split(',').map(str::trim).all(|part| {
+            matches!(part, "iso" | "mdy" | "us" | "default") || part.starts_with("noneuro")
+        }),
         "intervalstyle" => lower == "postgres",
         "timezone" => matches!(
             lower.as_str(),
@@ -1008,17 +1089,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result<Statement> {
     let name = show.name.to_ascii_lowercase();
     let fixed = |column: &'static str, value: &'static str| (column, value.to_string());
+    let setting = FIXED_SETTINGS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(&name));
     let (column, value) = match name.as_str() {
         "search_path" => {
-            let path = pg_conn.session_state.lock().unwrap().search_path.clone();
-            let shown = if path.is_empty() {
-                "\"$user\", public".to_string()
-            } else {
-                path.iter()
-                    .map(|n| turso_pg_parser::quote_identifier(n))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
+            let shown = shown_search_path(&pg_conn.session_state.lock().unwrap().search_path);
             ("search_path", shown)
         }
         "foreign_keys" => {
@@ -1033,13 +1109,10 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         }
         "transaction_read_only" => fixed("transaction_read_only", "off"),
         "default_transaction_read_only" => fixed("default_transaction_read_only", "off"),
-        "client_encoding" => fixed("client_encoding", "UTF8"),
-        "standard_conforming_strings" => fixed("standard_conforming_strings", "on"),
-        "bytea_output" => fixed("bytea_output", "hex"),
-        "datestyle" => fixed("DateStyle", "ISO, MDY"),
-        "intervalstyle" => fixed("IntervalStyle", "postgres"),
-        "timezone" => fixed("TimeZone", "UTC"),
-        "extra_float_digits" => fixed("extra_float_digits", "1"),
+        _ if setting.is_some() => {
+            let &(column, value) = setting.expect("matched above");
+            fixed(column, value)
+        }
         "all" => {
             return Err(LimboError::ParseError(
                 "SHOW ALL is not supported".to_string(),

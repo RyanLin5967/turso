@@ -62,7 +62,7 @@ Basics not enumerated by the official feature matrix.
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM, with joins, and reading the row it is joined to (`FROM t, generate_series(1, t.x) AS g`); its column is named as in PostgreSQL (the alias, `AS g(x)`'s column, or `generate_series`). WITH ORDINALITY and a second column alias are rejected with an error. In the joined form `SELECT *` names the column `value`, and a bare reference to the series column's name resolves to the series even where another FROM item of the same SELECT has a column of that name (PostgreSQL reports it ambiguous, 42702). In a subquery a bare name is resolved against the subquery's own relations first, then outward: where an enclosing SELECT's table has a column of that name it binds there (a correlated reference to that table), and only where no relation has it is it an unknown column (42703); PostgreSQL reads it as the outer series in both cases (write `g.g`). Two series columns of one name make a bare reference ambiguous (42702) |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
+| SET / SHOW | 🟡 Partial | From an allowlist, never passed to the engine; see Configuration Management |
 
 ## Backend
 
@@ -358,7 +358,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs (search_path, work_mem, ...) are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | From an allowlist, never passed to the engine as PRAGMAs. search_path is kept per session; SHOW gives it as PostgreSQL does (`"$user", public` before any SET), and a SET that changes it is followed by a ParameterStatus with the new path, as PostgreSQL reports it (GUC_REPORT). lock_timeout and client_min_messages act; statement_timeout and idle_in_transaction_session_timeout are accepted at 0 alone (0A000 otherwise). The client settings this server answers by (client_encoding UTF8, standard_conforming_strings on, bytea_output hex, DateStyle `ISO, MDY`, IntervalStyle postgres, TimeZone UTC, extra_float_digits 1) come from one table, which SHOW answers from and startup announces in ParameterStatus; SET accepts each only at a value this server behaves by and 0A000 at any other (DateStyle: ISO, MDY, US, NonEuro or DEFAULT; DMY, YMD and the SQL, Postgres and German styles refused). A setting PostgreSQL reads as one value takes one, as there (a list is 22023 `SET <name> takes only one argument`); DateStyle's list is read whole. Two accepted values SHOW does not echo: an equivalent zone name (GMT, Etc/UTC, Z, ...) leaves SHOW TimeZone at UTC, where PostgreSQL shows the name set, and extra_float_digits above 1 leaves SHOW at 1, where PostgreSQL shows the value (from 1 up both print floats in their shortest exact form there). Settings given in the startup packet are not applied. Planner and resource settings (work_mem, enable_*, ...) are accepted and change nothing; a custom (dotted) name is 0A000; any other name is 42704 |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |

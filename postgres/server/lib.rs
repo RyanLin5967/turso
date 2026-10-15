@@ -43,7 +43,7 @@ use turso_pg::{
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use pgwire::api::query::{send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -66,6 +66,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
+use pgwire::messages::startup::ParameterStatus;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
@@ -595,6 +596,7 @@ async fn serve_session(
                 for name in session.ended_portals() {
                     socket.portal_store().rm_portal(&name);
                 }
+                let changed = session.changed_parameters();
                 let sent = async {
                     socket
                         .feed(PgWireBackendMessage::ErrorResponse(info.into()))
@@ -604,6 +606,11 @@ async fn serve_session(
                             .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
                                 *notice,
                             )))
+                            .await?;
+                    }
+                    if let Some(changed) = changed {
+                        socket
+                            .feed(PgWireBackendMessage::ParameterStatus(changed))
                             .await?;
                     }
                     socket
@@ -659,6 +666,18 @@ async fn serve_session(
                     .send(PgWireBackendMessage::ErrorResponse(info.into()))
                     .await;
                 break sent.map_err(std::io::Error::other);
+            }
+            // Outside the extended protocol process_error ends the round with ReadyForQuery; a
+            // changed reported setting goes ahead of it, as on_query sends it.
+            if !is_extended_query {
+                if let Some(changed) = session.changed_parameters() {
+                    if let Err(e) = socket
+                        .feed(PgWireBackendMessage::ParameterStatus(changed))
+                        .await
+                    {
+                        break Err(std::io::Error::other(e));
+                    }
+                }
             }
             if let Err(io) = pgwire::tokio::server::process_error(
                 &mut socket,
@@ -900,6 +919,9 @@ struct SessionState {
     /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
     /// so a statement that returns no row succeeds (wire review 13 item 10).
     bad_result_codes: std::collections::HashMap<String, i16>,
+    /// The search path last sent in a ParameterStatus, with its connection's stamp then
+    /// ([`Session::changed_parameters`]); None while it is the one startup announced.
+    reported_path: Option<(u64, String)>,
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -1003,6 +1025,35 @@ impl Session {
             std::mem::take(&mut st.notices)
         };
         (self.deliverable(notices), self.transaction_status())
+    }
+
+    /// The ParameterStatus PostgreSQL sends ahead of a ReadyForQuery for a reported setting
+    /// (GUC_REPORT) whose value changed since it was last sent: here search_path, the one such
+    /// setting SET changes (the others keep the values startup announced, from turso_pg's
+    /// FIXED_SETTINGS). None when the path is as last sent, or before any connection is open, as
+    /// nothing has set one then. A SET search_path changed SHOW's answer and the client's copy
+    /// stayed at the startup value (wire review 18 item 19). Per round: one relaxed load of the
+    /// connection's stamp; the path is read only when the stamp moved.
+    fn changed_parameters(&self) -> Option<ParameterStatus> {
+        let mut st = self.state();
+        let conn = match (&st.branch, &st.trunk) {
+            (Some((_, conn)), _) | (None, Some(conn)) => conn.clone(),
+            (None, None) => return None,
+        };
+        let stamp = conn.search_path_stamp();
+        let (last_stamp, last_shown) = st
+            .reported_path
+            .get_or_insert_with(|| (0, turso_pg::DEFAULT_SEARCH_PATH.to_string()));
+        if *last_stamp == stamp {
+            return None;
+        }
+        *last_stamp = stamp;
+        let shown = conn.shown_search_path();
+        if *last_shown == shown {
+            return None;
+        }
+        last_shown.clone_from(&shown);
+        Some(ParameterStatus::new("search_path".to_string(), shown))
     }
 
     /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
@@ -2718,7 +2769,8 @@ fn sqlstate(e: &LimboError) -> &'static str {
         // invalid_parameter_value.
         LimboError::InvalidArgument(m)
             if m.starts_with("unrecognized encoding")
-                || m.starts_with("invalid value for parameter") =>
+                || m.starts_with("invalid value for parameter")
+                || (m.starts_with("SET ") && m.ends_with(" takes only one argument")) =>
         {
             "22023"
         }
@@ -2746,6 +2798,27 @@ fn engine_error(e: LimboError) -> PgWireError {
 
 #[async_trait]
 impl NoopStartupHandler for Session {
+    /// The settings SHOW answers, from turso_pg's one table, over pgwire's defaults, which
+    /// announced DateStyle `ISO, YMD`, TimeZone `Etc/UTC` and search_path `public` (wire review 18
+    /// item 19). bytea_output and extra_float_digits are not reported settings in PostgreSQL.
+    fn server_parameters(&self) -> DefaultServerParameterProvider {
+        let mut provider = DefaultServerParameterProvider::default();
+        for &(name, value) in turso_pg::FIXED_SETTINGS {
+            match name {
+                "client_encoding" => provider.client_encoding = Some(value.to_string()),
+                "standard_conforming_strings" => {
+                    provider.standard_conforming_strings = value == "on"
+                }
+                "DateStyle" => provider.date_style = value.to_string(),
+                "IntervalStyle" => provider.interval_style = value.to_string(),
+                "TimeZone" => provider.time_zone = value.to_string(),
+                _ => {}
+            }
+        }
+        provider.search_path = turso_pg::DEFAULT_SEARCH_PATH.to_string();
+        provider
+    }
+
     async fn post_startup<C>(
         &self,
         client: &mut C,
@@ -2861,6 +2934,11 @@ impl SimpleQueryHandler for Session {
         // its one-write-per-statement check must catch (gap review item 2, wire review 5 item 3).
         #[cfg(feature = "budget-plant-split-reply")]
         client.flush().await?;
+        if let Some(changed) = self.changed_parameters() {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(changed))
+                .await?;
+        }
         client
             .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 status,
@@ -3327,6 +3405,11 @@ impl ExtendedQueryHandler for Session {
                 .await?;
         }
         client.set_transaction_status(status);
+        if let Some(changed) = self.changed_parameters() {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(changed))
+                .await?;
+        }
         send_ready_for_query(client, status).await?;
         Ok(())
     }
