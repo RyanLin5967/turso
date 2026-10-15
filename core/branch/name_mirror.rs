@@ -553,8 +553,8 @@ mod tests {
 
     /// MED-2: random operations over a small name pool with long names among them, so chunks are
     /// evacuated many times and names are put into fresh chunks after each; equal to a std map
-    /// throughout, and the evacuations are counted (a run with none fails). Copies made with room
-    /// (`with_room`) along the way equal the model too.
+    /// throughout, and the evacuations are counted (a run with none fails). Two copies made with
+    /// room (`with_room`) along the way equal the model too.
     #[test]
     fn the_mirror_equals_a_std_map_across_arena_rewrites() {
         for seed in [3u64, 11, 0xfeed] {
@@ -575,7 +575,8 @@ mod tests {
                 if step % 97 == 0 {
                     assert!(m.same_as(&model), "seed {seed} step {step}: the mirror differs from the model");
                 }
-                if step % 5_003 == 0 {
+                // Two copies with room, late, so evacuations happen between them (each copy packs).
+                if step == 20_000 || step == 30_000 {
                     m = m.with_room(1 + (r % 3_000) as usize).unwrap();
                     assert!(m.same_as(&model), "seed {seed} step {step}: a copy with room differs");
                 }
