@@ -1518,6 +1518,17 @@ impl Database {
         self.branches.checkpoint_counters()
     }
 
+    /// The counted exceptions to "no create, connect, first write, delete or trunk commit waits on
+    /// background work" (DECISIONS c9c821dd8d; the C15 ruling): `[held-free upgrades led by a
+    /// freeing operation past the hard cap, held-free upgrades that took the flight slot to raise
+    /// the header's class, compactions that synced inline on an operation, operations that waited
+    /// behind a background compaction]`, since the database opened. Every run prints them, and a
+    /// window in which one moved is labelled and not credited.
+    #[doc(hidden)]
+    pub fn branch_exception_counters(&self) -> [u64; 4] {
+        self.branches.exception_counters()
+    }
+
     /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
     /// observing only).
     #[doc(hidden)]

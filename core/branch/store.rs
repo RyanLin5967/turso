@@ -402,6 +402,15 @@ pub(crate) struct Group {
     /// The held frees passed the hard cap (`UPGRADE_HARD_CAP` bounds): the background writer has
     /// fallen behind, so the next freeing operation leads the upgrade after its own wait.
     upgrade_overdue: AtomicBool,
+    /// A compaction that syncs (DECISIONS c9c821dd8d): `COMPACT_DUE` once the operation that found
+    /// the log past the threshold owed it (`BranchStore::maybe_compact`), `COMPACT_RUNNING` while
+    /// the background writer leads it (`BranchStore::lead_compaction`), off every acknowledgement
+    /// path; `COMPACT_IDLE` otherwise. Owed only from idle, so an operation finding the log still
+    /// long while one runs neither wakes the writer nor owes a second.
+    compact_due: AtomicU8,
+    /// The process whose background writer runs (`start_confirm_writer`), 0 once it has stopped
+    /// (`WriterExit`): a fork(2) child inherits the value and has no writer, so it compares its pid.
+    writer_pid: crate::sync::atomic::AtomicU32,
     /// Test hook (engine review 8 #11): while it holds `HOLD_CONFIRM_WRITE`, the confirmation
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
@@ -447,6 +456,21 @@ pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
 #[cfg(test)]
 pub(crate) const HOLD_UPGRADE_DUE: u8 = 13;
 
+/// `Group::compact_due`'s states.
+const COMPACT_IDLE: u8 = 0;
+const COMPACT_DUE: u8 = 1;
+const COMPACT_RUNNING: u8 = 2;
+
+/// Test hook stage (`Group::confirm_hold`): the confirmation writer found a compaction due and has
+/// not yet taken the store mutex for it (DECISIONS c9c821dd8d).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_DUE: u8 = 16;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction holds the store mutex and
+/// has not yet compacted (DECISIONS c9c821dd8d).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_LOCKED: u8 = 17;
+
 #[derive(Default)]
 struct GroupState {
     /// A flight is being written.
@@ -487,6 +511,19 @@ struct GroupState {
     already_durable: u64,
     upgrades: u64,
     riders: u64,
+    /// Compactions the background writer led (DECISIONS c9c821dd8d; observation only), and
+    /// compactions that synced inline, on the operation that found the log past the threshold:
+    /// past the hard limit with the writer behind, with no writer, or in a sharp catalog store. An
+    /// exception counter (`BranchStore::exception_counters`): an operation that paid it is not
+    /// credited.
+    background_compactions: u64,
+    inline_compaction_syncs: u64,
+    /// The C15 ruling's two counted exceptions (2026-10-15T04:15:07Z; `BranchStore::
+    /// exception_counters`): held-free upgrades a freeing operation led past the hard cap
+    /// (`upgrade_if_overdue`), and upgrades that took the flight slot to raise the header's class
+    /// (`Upgrade::exclusive`).
+    hardcap_upgrades: u64,
+    header_raise_exclusive: u64,
     /// The confirmation of the last flight that landed, and when it landed (review 6 #1): written
     /// by the confirmation writer once no flight has landed for `confirm_quiet()`, or at close.
     confirm: Option<(Instant, Confirm)>,
@@ -554,6 +591,8 @@ impl Group {
             confirm_failures: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
             upgrade_overdue: AtomicBool::new(false),
+            compact_due: AtomicU8::new(COMPACT_IDLE),
+            writer_pid: crate::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
             me: crate::sync::OnceLock::new(),
@@ -961,6 +1000,7 @@ fn confirm_quiet() -> Duration {
 /// (`BranchStore::lead_upgrade`), each one sync holding no flight slot, and returns the frees each
 /// covers under the store mutex (engine review 13 MED 2, review 18 HIGH 1 and #12).
 fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
+    let _exit = WriterExit(&group);
     let mut g = group.lock();
     loop {
         if g.confirm_stop {
@@ -977,6 +1017,17 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             #[cfg(test)]
             pause_at(Some(&group.confirm_hold), HOLD_UPGRADE_DUE);
             BranchStore::lead_upgrade(&store, &group);
+            g = group.lock();
+            continue;
+        }
+        // A compaction that syncs, owed by an operation that crossed the threshold (DECISIONS
+        // c9c821dd8d): led here, off every acknowledgement path. It holds the store mutex while it
+        // syncs, so operations arriving meanwhile wait, and are counted (`compaction_waits`).
+        if group.compact_due.load(Ordering::Acquire) == COMPACT_DUE && !group.poisoned() {
+            drop(g);
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_DUE);
+            BranchStore::lead_compaction(&store, &group);
             g = group.lock();
             continue;
         }
@@ -1041,6 +1092,16 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// The background writer stopped, a panic included: nothing more is owed to it
+/// (`Group::writer_pid`; DECISIONS c9c821dd8d).
+struct WriterExit<'a>(&'a Group);
+
+impl Drop for WriterExit<'_> {
+    fn drop(&mut self) {
+        self.0.writer_pid.store(0, Ordering::Release);
     }
 }
 
@@ -1148,15 +1209,38 @@ thread_local! {
 /// The store mutex. A thin wrapper: in test builds its guard also marks this thread as holding it,
 /// so every sync issued meanwhile is counted (`syncs_under_store_mutex`; lead review 1 item 7's
 /// instrument — a flush inside the store mutex stalls every operation behind it).
-struct StoreMutex(Mutex<StoreInner>);
+struct StoreMutex {
+    inner: Mutex<StoreInner>,
+    /// Odd while the background writer's compaction holds, or is about to take, this mutex
+    /// (`BranchStore::lead_compaction`; DECISIONS c9c821dd8d): set before it locks and cleared after
+    /// it unlocks, so every operation that waited behind its syncs found it odd as it arrived.
+    compacting: AtomicU64,
+    /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
+    /// background compaction's syncs (an exception counter, `BranchStore::exception_counters`). One
+    /// that arrived in the margins (before the writer locked, or after it unlocked) and did not wait
+    /// is counted too: an overcount, never a miss.
+    compaction_waits: AtomicU64,
+}
 
 impl StoreMutex {
     fn new(inner: StoreInner) -> Self {
-        Self(Mutex::new(inner))
+        Self {
+            inner: Mutex::new(inner),
+            compacting: AtomicU64::new(0),
+            compaction_waits: AtomicU64::new(0),
+        }
     }
 
     fn lock(&self) -> StoreGuard<'_> {
-        let guard = self.0.lock();
+        if self.compacting.load(Ordering::Acquire) & 1 == 1 {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        self.lock_uncounted()
+    }
+
+    /// `lock`, not counted as waiting behind a compaction: the background compaction's own.
+    fn lock_uncounted(&self) -> StoreGuard<'_> {
+        let guard = self.inner.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
@@ -5042,6 +5126,33 @@ impl BranchStore {
             return;
         }
         if inner.cat.is_none() || !self.fuzzy {
+            // A compaction that syncs (a D1 or D2 store's, a raised D0 store's) leaves this
+            // operation's acknowledgement path (DECISIONS c9c821dd8d): a snapshot store's is owed
+            // to the background writer, which this wakes once. Past the hard limit (the writer
+            // fell behind), with no writer running (it could not start; a fork(2) child), and in
+            // a sharp catalog store it still runs here, and is counted (`inline_compaction_syncs`).
+            // Mutant `compaction_on_ack_path` (test builds only): here always, as before.
+            let syncs = inner.journal.as_ref().is_some_and(|j| j.rewrite_class().syncs());
+            if syncs {
+                let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
+                if inner.cat.is_none() && !past_hard && self.writer_runs() && !fe_mutant("compaction_on_ack_path") {
+                    if self
+                        .group
+                        .compact_due
+                        .compare_exchange(COMPACT_IDLE, COMPACT_DUE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // Under the group's lock, which the writer holds while it checks the flag
+                        // and then waits: the wake cannot fall between the two.
+                        let _g = self.group.lock();
+                        #[cfg(test)]
+                        self.group.confirm_notified();
+                        self.group.confirm_cv.notify_one();
+                    }
+                    return;
+                }
+                self.group.lock().inline_compaction_syncs += 1;
+            }
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
                 if let Some(journal) = inner.journal.as_mut() {
@@ -5204,6 +5315,8 @@ impl BranchStore {
         let store = self.inner.clone();
         #[cfg(test)]
         super::budget_probe::persistent_started();
+        // Before the spawn, so a writer that stops at once leaves it 0 (`WriterExit`).
+        self.group.writer_pid.store(std::process::id(), Ordering::Release);
         match crate::thread::Builder::new()
             .name("branch-confirm".to_string())
             .spawn(move || {
@@ -5214,6 +5327,7 @@ impl BranchStore {
         {
             Ok(handle) => *self.confirm_writer.lock() = Some((std::process::id(), handle)),
             Err(e) => {
+                self.group.writer_pid.store(0, Ordering::Release);
                 #[cfg(test)]
                 super::budget_probe::persistent_ended();
                 tracing::warn!("branch log confirmation writer not started: {e}")
@@ -5288,10 +5402,19 @@ impl BranchStore {
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
         }
+        Self::compact_snapshot(inner, &self.group, fail_after_rename)?;
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// A snapshot store's compaction (`compact`): the log replaced by a snapshot of the state.
+    /// Called holding the store mutex, by an operation or by the background writer
+    /// (`lead_compaction`).
+    fn compact_snapshot(inner: &mut StoreInner, group: &Group, fail_after_rename: bool) -> Result<()> {
         // No flight may be writing the log this truncates. The snapshot carries every applied
         // operation, the early-released ones still buffered included, so once it is durable so are
         // they.
-        drop(self.group.quiesce());
+        drop(group.quiesce());
         let snapshot = inner.snapshot();
         let StoreInner {
             journal,
@@ -5304,12 +5427,72 @@ impl BranchStore {
         };
         let class = rewritten_class(journal);
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
+        group.mark_durable(journal.lsn(), rewrite_class_marked(Some(class), journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
-        self.unsynced.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// The compaction an operation owed to the background writer (`Group::compact_due`; DECISIONS
+    /// c9c821dd8d), led by it under the store mutex, off every acknowledgement path. Nothing is
+    /// done if the log no longer wants one (an operation past the hard limit compacted it inline).
+    /// A failure backs off as an operation's does (`defer_compaction`). The store's `unsynced` hint
+    /// is left as it was: a trunk barrier then takes the lock and finds nothing to flush.
+    /// Operations that arrive while it holds the mutex wait behind its syncs, and are counted
+    /// (`StoreMutex::compaction_waits`).
+    fn lead_compaction(store: &StoreMutex, group: &Group) {
+        if group
+            .compact_due
+            .compare_exchange(COMPACT_DUE, COMPACT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut inner = store.lock_uncounted();
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_LOCKED);
+            if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                group.lock().background_compactions += 1;
+                if let Err(e) = Self::compact_snapshot(&mut inner, group, false) {
+                    tracing::warn!("branch store compaction failed: {e}");
+                    if let Some(journal) = inner.journal.as_mut() {
+                        journal.defer_compaction();
+                    }
+                }
+            }
+        }
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        group.compact_due.store(COMPACT_IDLE, Ordering::Release);
+    }
+
+    /// Whether this process's background writer runs (`start_confirm_writer`): not when it could
+    /// not start, not in a fork(2) child, not once the store closed.
+    fn writer_runs(&self) -> bool {
+        self.group.writer_pid.load(Ordering::Acquire) == std::process::id()
+    }
+
+    /// The counted exceptions to "no create, connect, first write, delete or trunk commit waits on
+    /// background work" (DECISIONS c9c821dd8d and the C15 ruling, 2026-10-15T04:15:07Z): `[held-free
+    /// upgrades led by a freeing operation past the hard cap, held-free upgrades that took the
+    /// flight slot to raise the header's class, compactions that synced inline on an operation,
+    /// operations that waited behind a background compaction]`. Each must not move inside a
+    /// credited window: a cell whose window moves one is labelled and not credited.
+    pub(crate) fn exception_counters(&self) -> [u64; 4] {
+        let g = self.group.lock();
+        [
+            g.hardcap_upgrades,
+            g.header_raise_exclusive,
+            g.inline_compaction_syncs,
+            self.inner.compaction_waits.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Compactions the background writer led (DECISIONS c9c821dd8d; observation only).
+    pub(crate) fn background_compactions(&self) -> u64 {
+        self.group.lock().background_compactions
     }
 
     /// The commit gate's count, for a lock-free trunk fork to read before it takes its WAL read
@@ -7605,6 +7788,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn log_lsn_for_test(&self) -> u64 {
         self.inner.lock().journal.as_ref().map_or(0, |j| j.lsn())
+    }
+
+    /// Test builds: whether a compaction is owed to the background writer or being led by it
+    /// (`Group::compact_due`; DECISIONS c9c821dd8d). Takes no store mutex.
+    #[cfg(test)]
+    pub(crate) fn compaction_owed_for_test(&self) -> bool {
+        self.group.compact_due.load(Ordering::Acquire) != COMPACT_IDLE
     }
 
     /// The log file's written length, what the compaction threshold and its back-off measure

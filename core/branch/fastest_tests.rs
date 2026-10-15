@@ -8773,3 +8773,88 @@ fn a_raised_d0_compaction_syncs_off_the_acknowledgement_path() {
         );
     }
 }
+
+/// DECISIONS c9c821dd8d, the counted exception: with the background writer held where it found the
+/// owed compaction, the log grows past the hard limit, and the operation that finds it there
+/// compacts inline (the log's growth stays bounded when the writer falls behind) and is counted
+/// (`branch_exception_counters()[2]`). The creates before it, the one that owed the compaction
+/// among them, synced nothing on their own thread and moved no counter (the control). Raised D0
+/// snapshot store.
+#[test]
+fn a_compaction_past_the_hard_limit_runs_inline_and_is_counted() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-hard.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_DUE);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let (mut owed, mut synced_before) = (false, Vec::new());
+    let t = std::time::Instant::now();
+    let synced = loop {
+        let syncs = super::store::thread_syncs();
+        let _ = trunk.fork_branch().unwrap().into_id();
+        let n = super::store::thread_syncs() - syncs;
+        if db.branch_exception_counters()[2] != base[2] {
+            break n;
+        }
+        if n > 0 {
+            synced_before.push(n);
+        }
+        owed |= db.branches.compaction_owed_for_test();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create reached the hard limit");
+    };
+    let after = db.branch_exception_counters();
+    let held = db.branches.confirm_held_for_test();
+    db.branches.confirm_hold_for_test(0);
+    assert!(owed, "premise: no create owed the compaction to the background writer below the hard limit");
+    assert_eq!(held, super::store::HOLD_COMPACT_DUE | super::store::HOLD_ARRIVED, "premise: the writer was held at the owed compaction");
+    assert!(synced_before.is_empty(), "creates below the hard limit synced on their own thread: {synced_before:?}");
+    assert_eq!(after[2] - base[2], 1, "the create past the hard limit was not counted exactly once");
+    assert!(synced > 0, "the create past the hard limit compacted the raised log without syncing on its thread");
+    for i in [0, 1, 3] {
+        assert_eq!(after[i], base[i], "exception counter {i} moved: {base:?} -> {after:?}");
+    }
+}
+
+/// DECISIONS c9c821dd8d: the background compaction holds the store mutex while it syncs, so an
+/// operation arriving meanwhile waits behind it, and is counted (`branch_exception_counters()[3]`).
+/// The writer held inside that hold (`HOLD_COMPACT_LOCKED`), a create from another thread is
+/// counted as it arrives, waits, and completes once the hold ends. The creates before the hold,
+/// the one that owed the compaction among them, moved no counter (the control).
+#[test]
+fn a_create_behind_a_background_compaction_is_counted() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-wait.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_LOCKED);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never reached its hold", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_LOCKED | super::store::HOLD_ARRIVED
+    });
+    let before = db.branch_exception_counters();
+    let other = {
+        let db = db.clone();
+        std::thread::spawn(move || db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id()))
+    };
+    let t = std::time::Instant::now();
+    while db.branch_exception_counters()[3] == before[3] && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let arrived = db.branch_exception_counters();
+    let finished_while_held = other.is_finished();
+    db.branches.confirm_hold_for_test(0);
+    let joined = other.join().unwrap();
+    assert_eq!(before, base, "the creates before the background compaction moved an exception counter");
+    assert!(joined.is_ok(), "the create behind the compaction failed: {joined:?}");
+    assert!(!finished_while_held, "the create finished while the compaction held the store mutex");
+    assert!(arrived[3] > before[3], "a create that waited behind the background compaction was not counted");
+    eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
+}
