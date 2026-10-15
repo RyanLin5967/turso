@@ -1426,7 +1426,7 @@ impl Session {
         // or a refusal here is a statement that ran), and whether its translated parse was a
         // COMMIT or a ROLLBACK of the block.
         let mut ran = true;
-        let mut parsed = (false, false);
+        let mut parsed: Option<TxVerb> = None;
         let result = match call {
             Some(call) => {
                 // A statement a Describe kept holds its connection open: a switch away, or a
@@ -1456,7 +1456,13 @@ impl Session {
                 st = self.state();
                 r.map_err(|f| {
                     ran = f.prepared;
-                    parsed = (f.commits, f.rolls_back);
+                    parsed = if f.commits {
+                        Some(TxVerb::Commit)
+                    } else if f.rolls_back {
+                        Some(TxVerb::Rollback)
+                    } else {
+                        None
+                    };
                     f.info
                 })
             }
@@ -1476,11 +1482,7 @@ impl Session {
         if result.is_err() {
             // The block's end is read from the verb the reader saw or the parse the engine ran,
             // whichever says COMMIT or ROLLBACK, never from the text alone (wire review 14 item 7).
-            let verb = match parsed {
-                (true, _) => TxVerb::Commit,
-                (_, true) => TxVerb::Rollback,
-                _ => verb,
-            };
+            let verb = parsed.unwrap_or(verb);
             match verb {
                 // A COMMIT that ran and failed ends the block, as in PostgreSQL: whatever the
                 // engine kept of the transaction is rolled back and the session is idle. If that
@@ -1696,10 +1698,14 @@ impl Session {
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
                 // A COMMIT, as the verb reader or the parse the engine ran says, is settled as a
                 // COMMIT is and never run again. So is the state backstop's case: a statement that
-                // failed after the engine left the block it ran in, which, now that the reader
-                // and the parse agree (wire review 14 item 6), is an error the engine answered by
-                // rolling the whole transaction back: run anew it would run outside the block
-                // (wire review 9 item 7; 476798d89 had dropped f2804f119's state check).
+                // failed after the engine left the block it ran in, which, now that the reader and
+                // the parse agree (wire review 14 item 6), is an error the engine answered by
+                // rolling the whole transaction back. A sum() overflow is one, and there E, the
+                // answer either way, is right; the backstop changes an answer only for a Busy that
+                // also rolled the transaction back, which the retry would otherwise run anew
+                // outside the block, and which no test reaches without a core failpoint (wire
+                // review 9 item 7, review 17 item 19; 476798d89 had dropped f2804f119's state
+                // check).
                 Err(mut f)
                     if verb == TxVerb::Commit
                         || f.commits
@@ -2097,7 +2103,8 @@ impl Shared {
 }
 
 /// What a statement does to the transaction block, read by the verb's WHOLE grammar (PostgreSQL's
-/// gram.y), after any leading comments:
+/// gram.y), after any leading whitespace, comments and empty statements (`;COMMIT` is COMMIT), and
+/// with any run of `;` after it (`COMMIT;;` is COMMIT and an empty statement; [`tx_words`]):
 /// - Begin: `BEGIN [WORK | TRANSACTION] [modes]`, `START TRANSACTION [modes]`;
 /// - Commit: `COMMIT | END [WORK | TRANSACTION] [AND NO CHAIN]`;
 /// - Rollback: `ROLLBACK | ABORT [WORK | TRANSACTION] [AND NO CHAIN]`;
@@ -2215,7 +2222,8 @@ impl TxVerb {
 /// wherever it stands (`--` to the line's end, `/* */` nested), as PostgreSQL's lexer reads one, so
 /// it also ends a word; a `"quoted"` name is one word, `,` a word of its own, and `$` continues a
 /// word after its first byte, as in an identifier; a `;` ends the statement, after which only
-/// whitespace and comments may follow. None for a statement that does not start with a
+/// whitespace, comments and more `;` (empty statements) may follow, as whitespace, comments and
+/// empty statements may come before the verb. None for a statement that does not start with a
 /// transaction verb (one word's scan, no allocation), and for text the verbs' grammar cannot hold
 /// (a `'` string, a word starting with `$`, a second statement, an unterminated comment), which is
 /// Other. A comment after the verb made it Other, so `COMMIT -- c` skipped the failed-COMMIT rule
@@ -2449,11 +2457,10 @@ fn schema_ddl(sql: &str) -> Option<&str> {
     Some(name.trim_matches('"'))
 }
 
-/// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
-/// form this does not read, e.g. one behind a comment, reaches the engine's PRAGMA path.
-/// Whether `sql` is CHECKPOINT alone, read as PostgreSQL's lexer reads it: whitespace (a vertical
-/// tab included), comments and empty statements around it. A comment was a second word, so
-/// `CHECKPOINT -- x` went to the engine as text (wire review 14 item 6).
+/// Whether `sql` is CHECKPOINT alone, which the server runs itself ([`Session::checkpoint`]), read
+/// as PostgreSQL's lexer reads it: whitespace (a vertical tab included), comments and empty
+/// statements around it. A comment was a second word, so `CHECKPOINT -- x` went to the engine as
+/// text (wire review 14 item 6).
 fn is_checkpoint(sql: &str) -> bool {
     let b = sql.as_bytes();
     let Some(start) = skip_blank(b, 0) else {
