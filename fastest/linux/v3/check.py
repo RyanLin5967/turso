@@ -1181,16 +1181,17 @@ def self_test():
     # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
 
     def frp_run(fn, cases):
-        """[(name, ok, passed, got)] of the floor-reference cases with fn as floor_reference_problems. V3 review 13 item
-        14 RED: this keeps the a8b6e5d89 TypeError shim exactly, so a TypeError raised INSIDE fn reads as a problem
-        list and every ok=False case passes; the registered mutant below must fail every case."""
+        """[(name, ok, passed, got)] of the floor-reference cases with fn as floor_reference_problems, called directly.
+        V3 review 13 item 14: the a8b6e5d89 `except TypeError` shim that stood here turned a TypeError raised INSIDE
+        the rule into a problem list, so every ok=False case passed on a crash; now any exception fails its case, ok
+        or not (it is recorded, never read as a refusal), and the registered mutant below must fail every case."""
         out = []
         for name, sj, ns, ok in cases:
             try:
-                got = fn(sj, ns)
-            except TypeError as e:  # the base takes no raw p50s
-                got = [("the floor rule reads no raw p50s", repr(e))]
-            out.append((name, ok, (got == []) is ok, got))
+                got, exc = fn(sj, ns), None
+            except Exception as e:  # noqa: BLE001 -- a crash is a FAIL of the case, whatever it expected
+                got, exc = None, repr(e)
+            out.append((name, ok, exc is None and (got == []) is ok, exc or got))
         return out
 
     def fsj(p50us, fr, frame="ow4k", variant="fdatasync4k (ow4k + fdatasync)"):
