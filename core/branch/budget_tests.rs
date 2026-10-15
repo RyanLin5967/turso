@@ -1046,6 +1046,7 @@ fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: st
 ///   close writes the word: at once where the class proves stable storage, D2 on Apple, and at D1
 ///   after a full flush of the log of its own, `Confirm::write_at_close`, a81058160), then reopened 5
 ///   times, each reopen closed cleanly again.
+///
 /// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
 /// by the class asked (`journal::CLASS_SYNCS`) and directory syncs (`journal::DIR_SYNCS`), and the
 /// premises: the log's inode and length unchanged across the open (it was kept: no rewrite, no
@@ -2963,7 +2964,10 @@ fn a_checkpoint_costs_the_same_at_10_and_at_10_000_live_branches() {
     }
     if let (Some(&x), Some(&y)) = (a.get("syscalls"), b.get("syscalls")) {
         let ratio = y as f64 / x.max(1) as f64;
-        if ratio > CKPT_SYSCALL_SLACK || ratio < 1.0 / CKPT_SYSCALL_SLACK {
+        // Two comparisons, not a range's `contains`: a NaN ratio must not read as outside it.
+        #[allow(clippy::manual_range_contains)]
+        let outside = ratio > CKPT_SYSCALL_SLACK || ratio < 1.0 / CKPT_SYSCALL_SLACK;
+        if outside {
             let _ = writeln!(failures, "  syscalls: N=10 {x}, N=10^4 {y} (x{ratio:.2})");
         }
     }
@@ -3084,6 +3088,7 @@ fn leap_l2_a_create_takes_no_store_mutex() {
 /// - creates per flush RISE with C at every step 1, 8, 64, 256, 1024 (lead, 2026-10-06), "near-linear
 ///   until CPU-bound" (DECISIONS L3): past 64 the serial section, not the flush, may bound it, so only
 ///   the rise is held there.
+///
 /// Alternating cohorts (review 1 #9) give about C/2 per flush: the 0.9·C bound up to 64 catches
 /// them; the rise alone above 64 does not (C/2 rises too), and a CPU ceiling past 64 would fail
 /// the rise while L3 is reached — that case is argued from its numbers, not waived.
@@ -3209,6 +3214,7 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 /// * the largest single hold by the OPENING thread (marked foreground), the same;
 /// * the opening thread's held bytes summed over every hold of the open, at most + 4 KiB;
 /// * the all-threads maximum, the same as the per-kind ones.
+///
 /// Both samples must be quiet (review 2 M7's LOW: a hold still open when the maxima are taken would
 /// be lost). The opening thread's held allocations are also held exactly equal between n10 and n1e4
 /// by recovery_of_named_branches_is_independent_of_live_branches_on_the_opening_thread (the
@@ -3434,6 +3440,7 @@ fn a_fork_outside_a_schema_window_rereads_nothing() {
 ///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet;
 /// * neither does the child's first connection, made while the DDL is still parked (review C08 #2):
 ///   not released at 30 s, and no more store waits and sleeps than the control's first connection.
+///
 /// On both paths, at 10 and at 10^3 tables. Mutants `schema_reread_twice`,
 /// `schema_window_waits_for_publish`, `connect_waits_for_publish`, env `fork_rereads_schema_window`.
 /// WRITTEN NOT RUN.
@@ -3594,6 +3601,7 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 /// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
 ///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
 ///   prepared before the mutex is taken, or at the open).
+///
 /// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
 /// RED today, so no mutant against it can earn a kill before a green baseline exists (review C08). The review's split-transaction mutant is today's code, so this red at base is its
 /// kill; once the FIX lands, mutant `catalog_schema_split` splits the transaction again (registered
@@ -3766,6 +3774,7 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
 /// * the writer wakes, with a word pending, at most twice per flight during the burst: once at the
 ///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
 ///   between two flights (a stated constant: a poll wakes many times per flight).
+///
 /// At C = 1 the burst's words are reported and not budgeted: one client's creates do not overlap,
 /// and a gap of 5 ms between two of them is a legitimate idle tail. Review C08 #1: a word is the
 /// tail's when it is the burst's last landed flight's own and a burst's otherwise (the writer counts
@@ -3918,6 +3927,7 @@ fn a_d2_open_of_an_unconfirmed_log_makes_one_device_flush_and_one_directory_sync
 ///   re-syncs the log (1 F_FULLFSYNC + 1 fsync), the restart-path engine SHAVE the lead filed;
 /// * it fails: a directory cannot be drained directly, so its entry reaches the device only through
 ///   a device flush after its plain fsync, and today's 1 F_FULLFSYNC + 1 fsync is the minimum.
+///
 /// No default: a line without `dir_full_rc` refuses. `open_cat_d2` (a catalog store) is the same case
 /// and is held to the same budget when its premises hold; when they do not (its open rewrites the
 /// log), its numbers stand in the raw as an observation and the test does not fail on it. Mutant env
