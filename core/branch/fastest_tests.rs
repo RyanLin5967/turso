@@ -8866,3 +8866,93 @@ fn a_create_behind_a_background_compaction_is_counted() {
     assert!(arrived[3] > before[3], "a create that waited behind the background compaction was not counted");
     eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
 }
+
+/// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: the
+/// schedule of `a_delete_past_the_hard_cap_leads_one_held_free_upgrade` (the bound forced to 1, the
+/// background writer held where it found the upgrade due, eight slots held), where the next delete
+/// leads the upgrade on its own thread, is counted exactly once (`branch_exception_counters()[0]`).
+/// The reaps and the fork before it, which held the frees, armed the upgrade and marked it overdue,
+/// moved no counter (the control). Both modes.
+#[test]
+fn a_hard_cap_upgrade_is_counted() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, mut held) = raised_d0_with_a_kept_pre_image(&dir.path().join("hard-cap-count.db"), catalog, true);
+        let others: Vec<Branch> = (0..3i64)
+            .map(|i| {
+                let b = trunk.fork_branch().unwrap();
+                write_v(&b.connect().unwrap(), 20 + i, "b");
+                write_v(&b.connect().unwrap(), 45 + i, "b");
+                b
+            })
+            .collect();
+        let base = db.branch_exception_counters();
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        for b in others {
+            held.extend(b.owned_slots());
+            b.reap().unwrap();
+        }
+        let d = trunk.fork_branch().unwrap();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        assert!(held.len() > 4, "{what}: premise: more than 4 slots are held ({}), past the hard cap", held.len());
+        let before = db.branch_exception_counters();
+        d.reap().unwrap();
+        let after = db.branch_exception_counters();
+        db.branches.confirm_hold_for_test(0);
+        assert_eq!(before, base, "{what}: the operations before the hard-cap delete moved an exception counter");
+        assert_eq!(after[0] - before[0], 1, "{what}: CLAIM: the delete that led the hard-cap upgrade was not counted once: {before:?} -> {after:?}");
+        for i in [1, 2, 3] {
+            assert_eq!(after[i], before[i], "{what}: exception counter {i} moved: {before:?} -> {after:?}");
+        }
+    }
+}
+
+/// C15 ruling, exception (b): a held-free upgrade that takes the header's raised-class patch holds
+/// the flight slot (`Upgrade::exclusive`; flights wait for it), and is counted
+/// (`branch_exception_counters()[1]`). Its natural schedule (a log whose header field was written
+/// before 82fa78c66, opened under a weaker class) is not built here; the plant reaches the same
+/// branch through the real store path by marking the header stale just before the upgrade's take
+/// (`stale_log_header_for_test`), with the writer held where it found the upgrade due. The same
+/// schedule without the stale header is the control: an ordinary upgrade, not counted. Both modes.
+#[test]
+fn a_header_raising_upgrade_is_counted() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        for stale in [false, true] {
+            let what = format!("catalog={catalog} stale={stale}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("header-raise.db"), catalog, true);
+            assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+            db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+            x.reap().unwrap();
+            let _armed = trunk.fork_branch().unwrap().into_id();
+            eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+                db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+            });
+            if stale {
+                db.branches.stale_log_header_for_test();
+            }
+            let before = db.branch_exception_counters();
+            db.branches.confirm_hold_for_test(0);
+            eventually(&format!("{what}: the held slots never came free"), || {
+                slots.iter().all(|&s| db.branch_slot_is_free(s))
+            });
+            let after = db.branch_exception_counters();
+            assert_eq!(
+                after[1] - before[1],
+                u64::from(stale),
+                "{what}: CLAIM: header-raising upgrades counted {before:?} -> {after:?}"
+            );
+            for i in [0, 2, 3] {
+                assert_eq!(after[i], before[i], "{what}: exception counter {i} moved: {before:?} -> {after:?}");
+            }
+        }
+    }
+}

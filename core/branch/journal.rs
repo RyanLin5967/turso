@@ -2132,6 +2132,15 @@ impl Journal {
         }
     }
 
+    /// Test builds (C15 ruling, the plant of exception (b)): the header's raised-class field is
+    /// stale, as after a raise no write has carried yet, so the next write that takes it (a
+    /// flight's, or a held-free upgrade's, which is then exclusive) rewrites it. It rewrites the
+    /// value it holds; nothing is raised.
+    #[cfg(test)]
+    pub(crate) fn stale_header_for_test(&mut self) {
+        self.header_stale = true;
+    }
+
     /// The header's raised-class field, if it must be rewritten by the write being prepared.
     fn take_header_patch(&mut self) -> Option<[u8; 4]> {
         std::mem::take(&mut self.header_stale).then(|| (class_code(self.header_class())).to_le_bytes())

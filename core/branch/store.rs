@@ -397,10 +397,14 @@ pub(crate) struct Group {
     /// log sequence number to make durable in the free class, 0 for none, `UPGRADE_IN_AIR` while
     /// one is led. Armed by `mature` under the store mutex; led by the store's background writer
     /// (`run_confirm_writer`), off every acknowledgement path (engine review 13 MED 2), as a sync
-    /// that holds no flight slot (`BranchStore::sync_upgrade`; engine review 18 HIGH 1).
+    /// that holds no flight slot (`BranchStore::sync_upgrade`; engine review 18 HIGH 1), OUTSIDE
+    /// two counted exceptions (C15 ruling, fastest DECISIONS 2026-10-15T04:15:07Z): the hard-cap
+    /// fallback (`upgrade_overdue`, counted `hardcap_upgrades`) and the first raise of the header's
+    /// class, which holds the flight slot (`Upgrade::exclusive`, counted `header_raise_exclusive`).
     upgrade_due: AtomicU64,
     /// The held frees passed the hard cap (`UPGRADE_HARD_CAP` bounds): the background writer has
-    /// fallen behind, so the next freeing operation leads the upgrade after its own wait.
+    /// fallen behind, so the next freeing operation leads the upgrade after its own wait: the
+    /// memory and slot safety bound, a counted exception (`hardcap_upgrades`).
     upgrade_overdue: AtomicBool,
     /// A compaction that syncs (DECISIONS c9c821dd8d): `COMPACT_DUE` once the operation that found
     /// the log past the threshold owed it (`BranchStore::maybe_compact`), `COMPACT_RUNNING` while
@@ -4729,7 +4733,7 @@ impl BranchStore {
     /// logged here. Mutant `upgrade_takes_flight_slot` (test builds only): an ordinary flight in
     /// the free class, taking what is buffered and holding the flight slot, as before engine
     /// review 18 HIGH 1.
-    fn lead_upgrade(store: &StoreMutex, group: &Group) {
+    fn lead_upgrade(store: &StoreMutex, group: &Group) -> bool {
         let due = group.upgrade_due.load(Ordering::Acquire);
         if due == 0
             || due == UPGRADE_IN_AIR
@@ -4738,7 +4742,7 @@ impl BranchStore {
                 .compare_exchange(due, UPGRADE_IN_AIR, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
-            return;
+            return false;
         }
         // Test builds: the store's confirmation hook (`HOLD_FLIGHT_TAKEN`; engine review 18 HIGH 1).
         #[cfg(test)]
@@ -4767,6 +4771,7 @@ impl BranchStore {
         let _ = group
             .upgrade_due
             .compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
+        true
     }
 
     /// The held-free upgrade's sync (engine review 18 HIGH 1, review 19 MED 5, review 21 MEDs 2-4
@@ -4830,7 +4835,9 @@ impl BranchStore {
                     upgrade.fail = fail;
                     g.upgrading = true;
                     if upgrade.exclusive {
+                        // The C15 ruling's exception (b), counted: flights wait for this one.
                         g.flushing = true;
+                        g.header_raise_exclusive += 1;
                     }
                     g.upgrades += 1;
                     break (upgrade, end);
@@ -4873,10 +4880,12 @@ impl BranchStore {
     }
 
     /// A freeing operation, after its own wait: lead the owed upgrade if the held frees passed
-    /// the hard cap (`Group::upgrade_overdue`; the background writer fell behind).
+    /// the hard cap (`Group::upgrade_overdue`; the background writer fell behind). Counted when
+    /// this operation led it (`hardcap_upgrades`; the C15 ruling's exception (a)), whether or not
+    /// it then found anything left to sync: an overcount, never a miss.
     fn upgrade_if_overdue(&self) {
-        if self.group.upgrade_overdue.swap(false, Ordering::AcqRel) {
-            Self::lead_upgrade(&self.inner, &self.group);
+        if self.group.upgrade_overdue.swap(false, Ordering::AcqRel) && Self::lead_upgrade(&self.inner, &self.group) {
+            self.group.lock().hardcap_upgrades += 1;
         }
     }
 
@@ -7305,6 +7314,15 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn synced_base_for_test(&self) -> SyncClass {
         self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
+    }
+
+    /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
+    /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
+    #[cfg(test)]
+    pub(crate) fn stale_log_header_for_test(&self) {
+        if let Some(journal) = self.inner.lock().journal.as_mut() {
+            journal.stale_header_for_test();
+        }
     }
 
     /// Test builds: whether a slot was written since the arena's last sync (engine review 21 MED
