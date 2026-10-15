@@ -577,19 +577,71 @@ fn prepare_statement_typed(
     })
 }
 
-/// Whether preparing this statement performs it: the special forms the frontend carries out at
-/// prepare (SET, CREATE SCHEMA, DROP SCHEMA, ALTER TABLE ADD CONSTRAINT, COPY FROM), read from the
-/// parse, never from the text's first word.
-fn performs_at_prepare(parse_result: &turso_pg_parser::pg_query::ParseResult) -> bool {
-    try_extract_set(parse_result).is_some()
-        || try_extract_create_schema(parse_result).is_some()
-        || try_extract_drop_schema(parse_result).is_some()
-        || try_extract_add_constraints(parse_result).is_some()
-        || try_extract_copy_from(parse_result).is_some()
+/// A statement this frontend answers itself instead of through the translator, read from the
+/// parse once ([`Special::of`]), never from the text's first word. The Describe decline, the `$n`
+/// guard and the dispatch ([`try_prepare_special`]) all read this one value; they read two lists
+/// kept by hand, which could drift, and walked the parse up to nineteen times per statement where
+/// this walks it at most nine (wire review 17 item 11, review 2 L17).
+enum Special {
+    Set(PgSetStmt),
+    Show(PgShowStmt),
+    CreateSchema(PgCreateSchemaStmt),
+    DropSchema(PgDropSchemaStmt),
+    RefreshMatview,
+    CommentOn,
+    Checkpoint,
+    AddConstraints(PgAddConstraints),
+    CopyFrom(PgCopyFromStmt),
+}
+
+impl Special {
+    fn of(parse_result: &turso_pg_parser::pg_query::ParseResult) -> Option<Special> {
+        if let Some(stmt) = try_extract_set(parse_result) {
+            return Some(Special::Set(stmt));
+        }
+        if let Some(stmt) = try_extract_show(parse_result) {
+            return Some(Special::Show(stmt));
+        }
+        if let Some(stmt) = try_extract_create_schema(parse_result) {
+            return Some(Special::CreateSchema(stmt));
+        }
+        if let Some(stmt) = try_extract_drop_schema(parse_result) {
+            return Some(Special::DropSchema(stmt));
+        }
+        if is_refresh_matview(parse_result) {
+            return Some(Special::RefreshMatview);
+        }
+        if is_comment_on(parse_result) {
+            return Some(Special::CommentOn);
+        }
+        if is_checkpoint(parse_result) {
+            return Some(Special::Checkpoint);
+        }
+        if let Some(add) = try_extract_add_constraints(parse_result) {
+            return Some(Special::AddConstraints(add));
+        }
+        if let Some(stmt) = try_extract_copy_from(parse_result) {
+            return Some(Special::CopyFrom(stmt));
+        }
+        None
+    }
+
+    /// Whether preparing it performs it: SET, CREATE SCHEMA, DROP SCHEMA, ALTER TABLE ADD
+    /// CONSTRAINT's rebuild and COPY FROM's import run in the prepare.
+    fn performs(&self) -> bool {
+        matches!(
+            self,
+            Special::Set(_)
+                | Special::CreateSchema(_)
+                | Special::DropSchema(_)
+                | Special::AddConstraints(_)
+                | Special::CopyFrom(_)
+        )
+    }
 }
 
 /// The prepare behind [`prepare_statement_typed`]. With `describe`, a statement that preparing
-/// would perform (see [`performs_at_prepare`]), or one that needs prerequisite statements run
+/// would perform (see [`Special::performs`]), or one that needs prerequisite statements run
 /// first (a SERIAL column's sequence), is declined with `None`: it returns no rows, and only its
 /// execution may perform it (wire review 2 item 2, review 3 item 2).
 fn prepare_statement_inner(
@@ -653,7 +705,9 @@ fn prepare_statement_checked(
     } else {
         Vec::new()
     };
-    if describe && performs_at_prepare(&parse_result) {
+    let special = Special::of(&parse_result);
+    let performs = special.as_ref().is_some_and(Special::performs);
+    if describe && performs {
         return Ok(None);
     }
     // Everything below reads the schema the compile will use: the engine adopts the database's
@@ -673,16 +727,12 @@ fn prepare_statement_checked(
     // `COPY ... WHERE v = $1` ran inside the prepare before any guard saw it and imported every
     // row (wire review 13 item 9); a Bind's then answered an invented 0A000 (wire review 17 item
     // 4, the lead's ruling).
-    if let Some(n) = used
-        .first()
-        .copied()
-        .filter(|_| performs_at_prepare(&parse_result))
-    {
+    if let Some(n) = used.first().copied().filter(|_| performs) {
         return Err(LimboError::ParseError(format!(
             "there is no parameter ${n}"
         )));
     }
-    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, special)? {
         return Ok(Some(stmt));
     }
     // A CREATE TABLE's foreign keys: their parents checked now, every key resolved by the server
@@ -826,56 +876,39 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 
 fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
-    parse_result: &turso_pg_parser::pg_query::ParseResult,
+    special: Option<Special>,
 ) -> Result<Option<Statement>> {
-    if let Some(set_stmt) = try_extract_set(&parse_result) {
-        let stmt = handle_pg_set(pg_conn, &set_stmt)?;
-        return Ok(Some(stmt));
-    }
-
-    if let Some(show_stmt) = try_extract_show(&parse_result) {
-        return handle_pg_show(pg_conn, &show_stmt).map(Some);
-    }
-
-    if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
-    }
-
-    if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
-    }
-
-    if is_refresh_matview(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
-    }
-
-    if is_comment_on(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
-    }
-
-    // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
-    // copies every frame back into the database file and truncates the log is the same act here.
-    if is_checkpoint(&parse_result) {
-        return Ok(Some(
-            pg_conn.conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?,
-        ));
-    }
-
-    if let Some(add) = try_extract_add_constraints(&parse_result) {
-        handle_pg_add_constraints(pg_conn, &add)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
-    }
-
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
-        let stmt = noop_statement(&pg_conn.conn)?;
-        stmt.set_n_change(rows_inserted as i64);
-        return Ok(Some(stmt));
-    }
-
-    Ok(None)
+    let Some(special) = special else {
+        return Ok(None);
+    };
+    let stmt = match special {
+        Special::Set(set_stmt) => handle_pg_set(pg_conn, &set_stmt)?,
+        Special::Show(show_stmt) => handle_pg_show(pg_conn, &show_stmt)?,
+        Special::CreateSchema(stmt) => {
+            handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+            noop_statement(&pg_conn.conn)?
+        }
+        Special::DropSchema(stmt) => {
+            handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+            noop_statement(&pg_conn.conn)?
+        }
+        Special::RefreshMatview | Special::CommentOn => noop_statement(&pg_conn.conn)?,
+        // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
+        // copies every frame back into the database file and truncates the log is the same act
+        // here.
+        Special::Checkpoint => pg_conn.conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?,
+        Special::AddConstraints(add) => {
+            handle_pg_add_constraints(pg_conn, &add)?;
+            noop_statement(&pg_conn.conn)?
+        }
+        Special::CopyFrom(stmt) => {
+            let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
+            let stmt = noop_statement(&pg_conn.conn)?;
+            stmt.set_n_change(rows_inserted as i64);
+            stmt
+        }
+    };
+    Ok(Some(stmt))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
