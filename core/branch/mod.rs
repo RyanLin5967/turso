@@ -1406,17 +1406,27 @@ impl Database {
         self.branches.pause_connect_looked_up();
         // A drop that lands between the lookup and the open leaves the open an untyped error (the
         // branch gone, or reaped): the name no longer names an unreleased branch, which is
-        // NoSuchBranch, as the lookup would now answer (engine review 14 MED 9). Error path only:
-        // the success path is unchanged. Mutant `connect_race_untyped` (test builds only): the
-        // open's own error, as before.
+        // NoSuchBranch (engine review 14 MED 9). Error path only, the success path unchanged: the
+        // lookup is asked again, and it decides (engine review 20 item 4), since it waits for this
+        // name's Release to be durable and keeps finding a branch a fail-stopped store's Release
+        // did not make durable. No branch by that name: NoSuchBranch. The same branch, another one
+        // (a drop and re-create in between), or a failed lookup: the open's own error. Mutants
+        // (test builds only) `connect_race_untyped`: the open's own error always, as before
+        // review 14 MED 9; `connect_race_maps_released`: NoSuchBranch whenever the branch reads
+        // released in memory, as before this.
         self.connect_branch(id).map_err(|e| {
-            if crate::branch::store::fe_mutant("connect_race_untyped")
-                || matches!(e, LimboError::NoSuchBranch(_))
-                || !self.branches.is_gone_or_released(id)
-            {
-                e
+            if crate::branch::store::fe_mutant("connect_race_untyped") || matches!(e, LimboError::NoSuchBranch(_)) {
+                return e;
+            }
+            let gone = if crate::branch::store::fe_mutant("connect_race_maps_released") {
+                self.branches.is_gone_or_released(id)
             } else {
+                matches!(self.branches.branch_named(name), Ok(None))
+            };
+            if gone {
                 store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+            } else {
+                e
             }
         })
     }

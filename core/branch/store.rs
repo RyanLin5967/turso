@@ -5957,9 +5957,11 @@ impl BranchStore {
         pause_at(Some(&*self.trunk_commit_hold), HOLD_CONNECT_LOOKED_UP);
     }
 
-    /// Whether branch `id` is gone or released (`Handle::is_released`): what a drop that landed
-    /// after `connect_named`'s lookup leaves (engine review 14 MED 9). Called on the connect's
-    /// error path only. A failed lookup counts as not gone, so the connect's own error stands.
+    /// Test builds, mutant `connect_race_maps_released` only (engine review 20 item 4): whether
+    /// branch `id` is gone or released in memory (`Handle::is_released`), which `connect_named`'s
+    /// error path read before: it neither waits for the Release to be durable nor applies the
+    /// fail-stop rule. A failed lookup counts as not gone.
+    #[cfg(test)]
     pub(crate) fn is_gone_or_released(&self, id: BranchId) -> bool {
         let mut inner = self.inner.lock();
         match inner.ensure(id) {
