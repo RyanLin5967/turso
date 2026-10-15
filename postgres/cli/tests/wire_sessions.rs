@@ -3354,18 +3354,63 @@ fn insert_values_lists_are_checked_as_postgresql_checks_them() {
     }
     a.q("insert into it values (DEFAULT, 5, 'x')").ok("positional DEFAULT");
     a.q("insert into it values (DEFAULT, DEFAULT)").ok("positional all DEFAULT");
-    a.q("insert into it (col1, col2, col3) values (DEFAULT, 7, DEFAULT)")
-        .ok("named DEFAULT");
+    // The recording's own multi-row statement, restored (Claude C33: red 8e8469d1f had replaced it
+    // by a one-row INSERT and dropped its (8, DEFAULT, DEFAULT) row; replayed, it showed col1's
+    // NULLs sorted first where PostgreSQL's ascending default puts them last).
+    a.q("insert into it (col1, col2, col3) values (DEFAULT, 7, DEFAULT), (8, DEFAULT, DEFAULT)")
+        .ok("named DEFAULT, two rows");
     let r = a
         .q("select * from it order by col2 nulls first, col1")
         .ok("rows");
     assert_eq!(
         r.rows,
         vec![
+            vec![t("8"), None, t("testing")],
             vec![None, None, t("testing")],
             vec![None, t("5"), t("x")],
             vec![None, t("7"), t("testing")],
         ]
+    );
+}
+
+/// ORDER BY's default NULL placement is PostgreSQL's (recorded, pg18-diff/pg18-nullorder.out, every
+/// case): ascending puts NULLs last and descending first, in a plain ORDER BY, by ordinal, after a
+/// UNION and in a window; NULLS FIRST / LAST as written. The engine's default (SQLite's) put them
+/// first ascending.
+#[test]
+fn order_by_places_nulls_as_postgresql_does_by_default() {
+    let dir = Scratch::new("nullorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table nt (a int4, b int4)").ok("nt");
+    a.q("insert into nt values (1, 1), (NULL, 2), (3, 3), (NULL, 4)").ok("rows");
+    let col = |a: &mut Wire, sql: &str| {
+        a.q(sql).ok(sql).rows.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>()
+    };
+    let asc = vec![t("1"), t("3"), None, None];
+    assert_eq!(col(&mut a, "select a from nt order by a"), asc);
+    assert_eq!(col(&mut a, "select a from nt order by a asc"), asc);
+    assert_eq!(col(&mut a, "select a from nt order by a desc"), vec![None, None, t("3"), t("1")]);
+    assert_eq!(col(&mut a, "select a from nt order by a nulls first"), vec![None, None, t("1"), t("3")]);
+    assert_eq!(
+        col(&mut a, "select a from nt order by a desc nulls last"),
+        vec![t("3"), t("1"), None, None]
+    );
+    let r = a.q("select b, row_number() over (order by a) from nt order by b").ok("window");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![t("1"), t("1")],
+            vec![t("2"), t("3")],
+            vec![t("3"), t("2")],
+            vec![t("4"), t("4")],
+        ]
+    );
+    assert_eq!(col(&mut a, "select a from nt order by 1"), asc);
+    assert_eq!(
+        col(&mut a, "select a from nt union select 5 order by 1"),
+        vec![t("1"), t("3"), t("5"), None]
     );
 }
 
