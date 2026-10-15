@@ -1017,6 +1017,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     // The first install after the mirror's build, with one new name in it: its largest hold.
     let e0 = exceptions(&db);
     let _ = probe::take_hold_maxima();
+    let _ = db.branches.take_mirror_install_bytes_for_test();
     let trunk = db.connect().unwrap();
     trunk.create_branch("mirror-install-0").unwrap();
     db.branch_compact_now().unwrap();
@@ -1026,6 +1027,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     put_exceptions(&mut m, e0, exceptions(&db));
     m.insert("max_hold_alloc_bytes", maxima.all.0);
     m.insert("max_bg_hold_alloc_bytes", maxima.background.0);
+    m.insert("mirror_install_bytes", db.branches.take_mirror_install_bytes_for_test());
     line(out, cell, "mirror_install", 0, &m);
 }
 
@@ -3522,6 +3524,28 @@ fn leap_l4_the_name_mirror_keeps_at_most_56_bytes_per_name_at_its_worst() {
         }
     }
     assert!(failures.is_empty(), "the name mirror at its worst is over budget (all:{seen}):\n{failures}");
+}
+
+/// The same claim read by the precise instrument: the bytes the name mirror's own part of that
+/// install allocates (the store's `mirror_install_bytes`, counted around it, under the mutex) are at
+/// most 8 KiB at 10^4 and at 10^5 named branches (one 4 KiB name chunk, with room). Added after the
+/// whole-hold reading below was found to vary by 18 KiB in a hold of about 2 MiB that the mirror is
+/// not in (raws green-nm_9969c26ec and l4nmfix-budgets_56ab5811a); registered before its own first
+/// reading.
+#[test]
+fn the_first_install_after_the_mirror_allocates_at_most_one_chunk_for_it() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["mem_n1e4", "mem_n1e5"] {
+        let c = cell(spec);
+        let bytes = c.ops["mirror_install"][0]["mirror_install_bytes"];
+        if bytes > 8192 {
+            let _ = writeln!(failures, "  {spec}: the mirror's part of the install allocated {bytes} B; budget 8 KiB");
+        }
+    }
+    assert!(failures.is_empty(), "the name mirror grows under the store mutex at the install:\n{failures}");
 }
 
 /// The mirror adversary's LOW-1 / class (4) (DECISIONS f398de1ff0): the first checkpoint install after

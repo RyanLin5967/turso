@@ -2562,6 +2562,10 @@ struct NameIndex {
     /// Mirrors dropped because a table would have needed a probe past `name_mirror::MAX_PROBE`
     /// (the mirror adversary's MED-1; instrument).
     mirror_refusals: u64,
+    /// Test builds: the most bytes the name mirror's part of one install allocated (under the store
+    /// mutex), since the last read (`take_mirror_install_bytes_for_test`).
+    #[cfg(test)]
+    mirror_install_bytes_max: u64,
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -8691,6 +8695,12 @@ impl BranchStore {
 
     /// Test builds: whether the exact name mirror is built (LEAP L4 slice 4).
     #[cfg(test)]
+    /// Test builds: the most bytes the name mirror's part of one install allocated, since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_mirror_install_bytes_for_test(&self) -> u64 {
+        std::mem::take(&mut self.inner.lock().names.mirror_install_bytes_max)
+    }
+
     pub(crate) fn name_mirror_built_for_test(&self) -> bool {
         self.inner.lock().names.catalog.is_some()
     }
@@ -10387,6 +10397,8 @@ impl StoreInner {
         // the checkpoint thread (`Captured::mirror_grown`) and is swapped in here; the copy it was
         // made from is still held by that thread, so the old mirror is freed there, after the
         // mutex. The capture's own reference goes first, so the mirror is changed in place.
+        #[cfg(test)]
+        let mirror_bytes0 = super::budget_probe::thread_allocs().1;
         if let Some((from, grown)) = cap.mirror_grown.take() {
             if self.names.catalog.as_ref().is_some_and(|m| Arc::as_ptr(m) as usize == from) {
                 self.names.catalog = match grown {
@@ -10399,6 +10411,13 @@ impl StoreInner {
             }
         }
         drop(cap.mirror_base.take());
+        // Mutant `name_mirror_grown_under_mutex` (test builds only): the room is made here, under the
+        // mutex (the instrument's fire-check).
+        if fe_mutant("name_mirror_grown_under_mutex") {
+            if let Some(grown) = self.names.catalog.as_ref().and_then(|m| m.with_room(cap.names_fresh.len()).ok()) {
+                self.names.catalog = Some(Arc::new(grown));
+            }
+        }
         if let Some(arc) = self.names.catalog.as_mut() {
             let applied = match Arc::get_mut(arc) {
                 Some(mirror) => {
@@ -10418,6 +10437,11 @@ impl StoreInner {
                 self.names.mirror_refusals += 1;
                 self.names.catalog = None;
             }
+        }
+        #[cfg(test)]
+        {
+            let bytes = super::budget_probe::thread_allocs().1 - mirror_bytes0;
+            self.names.mirror_install_bytes_max = self.names.mirror_install_bytes_max.max(bytes);
         }
         // The catalog holds the captured names now: drop each entry no release or create since
         // has moved (see `NameIndex`).
