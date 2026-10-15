@@ -142,6 +142,10 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM branch_name WHERE id = ?1",
 ];
 
+/// Slots one `free_has_many` statement asks (LEAP L4 2b, DECISIONS 81152ec501: fixed, so its
+/// statement is prepared once).
+pub(crate) const FREE_HAS_CHUNK: usize = 16;
+
 const META_GENERATION: i64 = 1;
 const META_PAGE_SIZE: i64 = 2;
 const META_NEXT_ID: i64 = 3;
@@ -519,6 +523,7 @@ pub(crate) struct Catalog {
     free_after: Stmt,
     free_first: Stmt,
     free_has: Stmt,
+    free_has_many: Stmt,
     free_all: Stmt,
     free_del_upto: Stmt,
     free_del: Stmt,
@@ -662,6 +667,10 @@ impl Catalog {
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
             free_first: p("SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1")?,
             free_has: p("SELECT 1 FROM free WHERE slot = ?1")?,
+            free_has_many: p(&format!(
+                "SELECT slot FROM free WHERE slot IN ({})",
+                (1..=FREE_HAS_CHUNK).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
+            ))?,
             free_all: p("SELECT slot FROM free")?,
             free_del_upto: p("DELETE FROM free WHERE slot <= ?1")?,
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
@@ -1535,6 +1544,21 @@ impl Catalog {
             None => self.free_first.rows(&[int(limit as u64)], &mut self.counters)?,
         };
         rows.iter().map(|row| get(row, 0).map(|s| s as Slot)).collect()
+    }
+
+    /// Which of `slots` the free table lists: one statement per `FREE_HAS_CHUNK` slots (LEAP L4 2b:
+    /// an open's slots that its log tail cannot settle), the unused places bound to -1, which no
+    /// slot is.
+    pub(crate) fn free_has_many(&mut self, slots: &[Slot]) -> Result<std::collections::HashSet<Slot>> {
+        let mut listed = std::collections::HashSet::new();
+        for chunk in slots.chunks(FREE_HAS_CHUNK) {
+            let mut params: Vec<Value> = chunk.iter().map(|&s| int(s as u64)).collect();
+            params.resize(FREE_HAS_CHUNK, Value::from_i64(-1));
+            for row in self.free_has_many.rows(&params, &mut self.counters)? {
+                listed.insert(get(&row, 0)? as Slot);
+            }
+        }
+        Ok(listed)
     }
 
     pub(crate) fn free_has(&mut self, slot: Slot) -> Result<bool> {

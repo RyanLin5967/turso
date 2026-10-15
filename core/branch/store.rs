@@ -4467,11 +4467,42 @@ impl BranchStore {
             cat.free_inferred_at_open = 0;
             cat.free_inference_mismatch = None;
         }
+        // DECISIONS 81152ec501: the slots the first touch cannot settle (first used after a parked
+        // Commit) are asked together, one statement per `FREE_HAS_CHUNK`, not one each. Mutant
+        // `l4_free_probe_one_by_one` (test builds only): one probe each, as before.
+        let batched: Option<HashSet<Slot>> = if infer && !fe_mutant("l4_free_probe_one_by_one") {
+            let mut ask: Vec<Slot> = touched
+                .after_park
+                .iter()
+                .copied()
+                .filter(|&s| s < meta.arena_hw && touched.now.contains_key(&s))
+                .collect();
+            ask.sort_unstable();
+            stats.free_probes += ask.len() as u64;
+            Some(cat.catalog.free_has_many(&ask)?)
+        } else {
+            None
+        };
         for (&slot, &used) in &touched.now {
             let below = slot < meta.arena_hw;
             stats.touched_below_hw += u64::from(below);
             let listed = if !below {
                 false
+            } else if let (Some(listed), true) = (batched.as_ref(), touched.after_park.contains(&slot)) {
+                let listed = listed.contains(&slot);
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open's batched probe read slot {slot} {} at the checkpoint, the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
             } else if infer && !touched.after_park.contains(&slot) {
                 let listed = touched.first[&slot] != inverted;
                 #[cfg(test)]

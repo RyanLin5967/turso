@@ -616,9 +616,10 @@ pub struct BranchOpenStats {
     pub cat_rows_read: u64,
     /// Catalog stores: arena slots the log's replay named or freed.
     pub touched_slots: u64,
-    /// Catalog stores: free-table probes the arena rebuild made, one per touched slot below the
-    /// checkpoint's high-water mark (each one catalog query, in `cat_queries`), so a test can tell
-    /// them from the open's own reads (LEAP L4: the meta row only, at formats 19/20).
+    /// Catalog stores: touched slots below the checkpoint's high-water mark whose state the arena
+    /// rebuild asked the free table: one query each at formats 17/18, so a test can tell them from
+    /// the open's own reads; at 19/20 only those the log tail cannot settle, asked together, one
+    /// query per `catalog::FREE_HAS_CHUNK` (LEAP L4 2b).
     pub free_probes: u64,
     /// Catalog stores: touched slots below the checkpoint's high-water mark, whose state at the
     /// checkpoint the arena rebuild needs, however it learns it (instrument: the written-tail open
