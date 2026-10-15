@@ -1885,6 +1885,55 @@ mod tests {
         }
     }
 
+    /// The domain CHECK identifier class (lead order, from the ultrareview fix session): a domain CHECK
+    /// written with `VALUE` (any case but lower) was SILENTLY not enforced, because its `value` was
+    /// bound under the exact key "value" and looked up by the identifier as written. PostgreSQL folds
+    /// the identifier: VALUE, value, Value and "value" all enforce (PG 18.6, artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-domain-check-case.txt 6e02bd34ec): CAST(-5 AS d) is
+    /// refused (23514), CAST(5 AS d) is 5, and an INSERT of -5 into a column of the domain is refused.
+    /// The same map binds a type's parameters in its ENCODE: a parameter declared `Scale` and used
+    /// as `scale` must bind too (identifiers are case-insensitive here).
+    #[test]
+    fn a_domain_check_binds_value_in_any_case() {
+        let mut bad = Vec::new();
+        for spelling in ["VALUE", "value", "Value", "\"value\""] {
+            let conn = open();
+            let ddl = format!("CREATE DOMAIN d AS integer CHECK ({spelling} > 0)");
+            if let Err(e) = conn.execute(&ddl) {
+                bad.push(format!("{ddl} refused: {e}"));
+                continue;
+            }
+            let neg = conn.prepare("SELECT CAST(-5 AS d)").and_then(|mut s| s.run_collect_rows());
+            if !matches!(&neg, Err(e) if e.to_string().contains("violates check constraint")) {
+                bad.push(format!("{spelling}: CAST(-5 AS d) gave {neg:?}, not PostgreSQL's 23514"));
+            }
+            let pos = conn.prepare("SELECT CAST(5 AS d)").and_then(|mut s| s.run_collect_rows());
+            if !matches!(&pos, Ok(rows) if rows.len() == 1) {
+                bad.push(format!("{spelling}: CAST(5 AS d) gave {pos:?}, not PostgreSQL's 5"));
+            }
+            let _ = conn.execute("CREATE TABLE dt(id INTEGER PRIMARY KEY, x d) STRICT");
+            let ins = conn.execute("INSERT INTO dt VALUES (1, -5)");
+            if !matches!(&ins, Err(e) if e.to_string().contains("violates check constraint")) {
+                bad.push(format!("{spelling}: INSERT of -5 gave {ins:?}, not PostgreSQL's 23514"));
+            }
+        }
+        let conn = open();
+        let ddl = "CREATE TYPE pct(value any, Scale integer) BASE integer ENCODE value * scale DECODE value";
+        match conn.execute(ddl) {
+            Err(e) => bad.push(format!("{ddl} refused: {e}")),
+            Ok(()) => {
+                let got = conn
+                    .execute("CREATE TABLE pt(id INTEGER PRIMARY KEY, x pct(10)) STRICT")
+                    .and_then(|()| conn.execute("INSERT INTO pt VALUES (1, 3)"))
+                    .and_then(|()| conn.prepare("SELECT CAST(x AS TEXT) FROM pt").and_then(|mut s| s.run_collect_rows()));
+                if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some("30")) {
+                    bad.push(format!("a parameter declared Scale and used as scale: {got:?}, not 30"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: an identifier bound by a custom type or domain matched only in its exact case: {bad:?}");
+    }
+
     /// Runs `steps` in order on a fresh connection, on a thread of its own: the first error, the last
     /// statement's first column as text, or `Err("timeout")` after 10 s (a red: it never finished).
     fn run_bounded(steps: Vec<String>) -> Result<Option<String>, String> {
