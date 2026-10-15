@@ -323,6 +323,7 @@ def gates(rec):
             bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
         bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
         bad += sync_cover_gate(rec["leaf"], rec["arms"]["fsync"].get("sync"))
+        bad += a27_problems(rec)
     return bad
 
 
@@ -358,17 +359,60 @@ def sync_gate(disk, sy):
 
 
 def sync_cover_gate(leaf, sy):
-    """Annex A24-AM1: the sync before each fsync run reached every filesystem under DIR, one sync -f each: DIR's and
-    each loop layer's backing file's (1 + the loop layers), so a buffered loop's dirty pages in its backing file's
-    cache are not written back inside a later window. A missing record is sync_gate's to report."""
+    """Annex A24-AM1: the sync before each fsync run reached every filesystem under DIR, one sync -f each, IN ORDER:
+    the entries' paths are exactly leaf.sync_paths (DIR, then each loop layer's backing file, as resolve_leaf named
+    them; 1 + the loop layers), so a buffered loop's dirty pages in its backing file's cache are not written back
+    inside a later window. A duplicate, wrong or missing path fails, not only a short count (review 7 finding 5). A
+    missing record is sync_gate's to report."""
     want, bad = 1 + len(leaf.get("layers") or []), []
+    exp = leaf.get("sync_paths")
+    if not (isinstance(exp, list) and all(isinstance(p, str) and p for p in exp)):
+        return [f"drive {leaf.get('disk')}: the record names no sync paths under DIR (leaf.sync_paths {exp!r}): its "
+                "coverage cannot be judged (annex A24-AM1)"]
+    if len(exp) != want:
+        bad.append(f"drive {leaf.get('disk')}: leaf.sync_paths names {len(exp)} filesystems, the chain has {want} "
+                   "(annex A24-AM1)")
     for run in ("timed", "labelling"):
         r = sy.get(run) if isinstance(sy, dict) else None
-        lay = r.get("layers") if isinstance(r, dict) else None
-        if isinstance(r, dict) and (not isinstance(lay, list) or len(lay) != want):
+        if not isinstance(r, dict):  # a missing record is sync_gate's to report
+            continue
+        lay = r.get("layers")
+        if not isinstance(lay, list) or len(lay) != want:
             bad.append(f"drive {leaf.get('disk')}: the sync before the {run} fsync run synced "
                        f"{len(lay) if isinstance(lay, list) else 'no'} filesystems, not the {want} under DIR "
                        "(annex A24-AM1)")
+        elif [x.get("path") if isinstance(x, dict) else None for x in lay] != exp:
+            bad.append(f"drive {leaf.get('disk')}: the sync before the {run} fsync run synced "
+                       f"{[x.get('path') if isinstance(x, dict) else None for x in lay]}, not the filesystems under DIR "
+                       f"in order {exp} (annex A24-AM1)")
+    return bad
+
+
+def a27_problems(rec):
+    """Annex A27 on a stored record (review 7 finding 4): the record names its mode; a real one names the SLACK
+    registration this code implements and carries a labelling pair whose counts are re-derived here (a stored
+    problem text is never read): its first count is the record's own labelling count, and the two differ by at most
+    SLACK/2 of the larger. A dry record keeps its label and needs no pair (publish() says whether one binds SLACK)."""
+    disk = rec["leaf"].get("disk")
+    mode = rec.get("mode")
+    if mode not in ("real", "dry"):
+        return [f"drive {disk}: the record names no mode ({mode!r}, not real or dry): its A27 credit cannot be judged"]
+    if mode == "dry":
+        return []
+    bad = []
+    if rec.get("slack_registered") != SLACK_REGISTERED:
+        bad.append(f"drive {disk}: the record's SLACK registration {rec.get('slack_registered')!r} is not "
+                   f"{SLACK_REGISTERED!r}, the row this code implements (annex A27)")
+    lp = rec["arms"]["fsync"].get("lab_pair")
+    if not isinstance(lp, dict):
+        return bad + [f"drive {disk}: no A27 labelling pair in a real record: SLACK is not bound, so it cannot be "
+                      "credited"]
+    lab = rec["arms"]["fsync"]["timed"].get("lab_flush_ios_delta")
+    if lp.get("first") != lab:
+        bad.append(f"drive {disk}: the A27 pair's first count {lp.get('first')!r} is not its labelling count {lab!r}")
+    why = lab_pair_problem(lp.get("first"), lp.get("second"))
+    if why:
+        bad.append(f"drive {disk}: {why}")
     return bad
 
 
@@ -539,6 +583,10 @@ def measure(d, out, leafrec=None):
                     "layers": [{"name": c, "write_cache": disk_attr(c, "queue/write_cache")}
                                for c in chain if c.startswith("loop")]},
            "virtualization": virt, "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
+    # review 7 finding 4, 5: what the record is judged against later, by gates() and summarize
+    rec["mode"] = "real" if os.environ.get("V3L_REAL") == "1" else "dry"
+    rec["slack_registered"] = SLACK_REGISTERED
+    rec["leaf"]["sync_paths"] = list(sync_paths)
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
     ip = None if disk.startswith("ram") else iostats_problem(rec["leaf"]["iostats"])
@@ -641,6 +689,9 @@ def publish(rec):
     """The record's published numbers (not gates): the fsync p50s, and both runs' flushes per fsync for the drive and
     for every loop layer, with the floor's slack (T3 runner review item 18)."""
     ft, ct = rec["arms"]["fsync"]["timed"], rec["arms"]["control"]["timed"]
+    lp = rec["arms"]["fsync"].get("lab_pair")
+    bound = (isinstance(lp, dict) and lp.get("first") == ft.get("lab_flush_ios_delta")
+             and lab_pair_problem(lp.get("first"), lp.get("second")) is None)
     return {"fsync_p50_us": ft.get("fsync_p50_us"), "fsync_p99_us": ft.get("fsync_p99_us"),
             "control_write_p50_us": ct.get("write_p50_us"),
             "fsync_over_control_write_p50": ratio(ft.get("fsync_p50_us"), ct.get("write_p50_us")),
@@ -650,8 +701,10 @@ def publish(rec):
                                          "lab_flush_ios_per_fsync": per_fsync(lay.get("lab_flush_ios_delta"))}
                        for lay in rec["leaf"].get("layers") or []},
             "floor_slack": float(SLACK),
+            "slack_bound": bound,
             "floor_rule": "write back: timed flushes per fsync >= labelling flushes per fsync x (1 - floor_slack); "
-                          "the slack is annex A27, bound to a labelling pair within floor_slack/2"}
+                          "the slack is annex A27, and slack_bound says whether this record's labelling pair, "
+                          "re-derived from its counts, binds it within floor_slack/2"}
 
 
 def floor_kind(rec):
@@ -802,10 +855,12 @@ def plants(rec):
     def plant_layer(r):
         r["leaf"].setdefault("layers", []).append({"name": "loop-plant", "write_cache": "write back",
                                                    "flush_ios_delta": 2 * N, "lab_flush_ios_delta": 2 * N})
-        # and its backing filesystem synced, as a real loop's would be (annex A24-AM1's coverage rule)
+        # and its backing filesystem synced and expected, as a real loop's would be (annex A24-AM1's coverage rule)
         for y in (r["arms"]["fsync"].get("sync") or {}).values():
             if isinstance(y, dict) and isinstance(y.get("layers"), list):
                 y["layers"].append({"path": "/plant/loop-plant.img", "rc": 0, "secs": 0.0})
+        if isinstance(r["leaf"].get("sync_paths"), list):
+            r["leaf"]["sync_paths"].append("/plant/loop-plant.img")
 
     arm("wb-layer-half", "write back",
         lambda r: r["leaf"]["layers"][-1].__setitem__("flush_ios_delta", 3 * N // 2),
@@ -828,6 +883,18 @@ def plants(rec):
         arm("unsynced-lab", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("labelling", {"ran": True, "rc": 1}),
             (f"drive {disk}:", "the sync before the labelling fsync run"))
+        # review 7 finding 5: coverage by path identity, each plant on the path text: a wrong path, a missing one, and
+        # (on a base with a loop layer) DIR's entry duplicated over the backing file's
+        arm("sync-wrong-path", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"][-1].__setitem__("path", "/elsewhere"),
+            (f"drive {disk}:", "in order"))
+        arm("sync-missing-path", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"][-1].pop("path", None),
+            (f"drive {disk}:", "in order"))
+        arm("sync-dup-path", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"].__setitem__(
+                -1, dict(r["arms"]["fsync"]["sync"]["timed"]["layers"][0])),
+            (f"drive {disk}:", "in order"), extra=plant_layer)
         # A24-AM1: the deepest filesystem's sync -f failed (the one shape of a failed sync measure() can see)
         arm("unsynced-layer", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"][-1].__setitem__("rc", 1),

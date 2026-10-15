@@ -93,7 +93,7 @@ def v3_batch(fsdir, when, rc, block=None, plp="no"):
     return rec
 
 
-def block_record(out, fs, plp="no"):
+def block_record(out, fs, plp="no", dry=None):
     fsdir = os.path.join(out, f"fs-{fs}")
     if not os.path.isdir(fsdir):
         return {"fs": fs, "ok": False, "why": ["the block never ran"]}
@@ -151,6 +151,12 @@ def block_record(out, fs, plp="no"):
         except (OSError, ValueError) as e:
             rec["why"].append(f"V3L {when}: v3l-{when}/v3l.json unreadable ({type(e).__name__})")
             continue
+        # review 7 / C21 finding 4: the record's own mode is its package's (a dry label is kept, never upgraded; a
+        # record saying real in a dry package, or the reverse, does not stand for this package)
+        want = {"1": "dry", "0": "real"}.get(str(dry))
+        if want and (not isinstance(meas, dict) or meas.get("mode") != want):
+            rec["why"].append(f"V3L {when}: the record's mode is {(meas or {}).get('mode') if isinstance(meas, dict) else None!r}, "
+                              f"this package is {want}")
         try:
             again, ok_again = v3l.plants(meas)
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -412,7 +418,7 @@ def summarize(out, sha, dry, manifest):
     mt0 = os.path.join(out, "mode.txt")
     if os.path.exists(mt0):
         plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
-    blocks = [block_record(out, fs, plp) for fs in fslist]
+    blocks = [block_record(out, fs, plp, dry) for fs in fslist]
     # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
     pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
     verdicts = {b["fs"]: {pr["k"]: pr["verdict"] for pr in (b.get("v3l") or {}).get("blocks") or []} for b in blocks}
