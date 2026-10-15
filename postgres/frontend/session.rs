@@ -2572,6 +2572,12 @@ mod tests {
             call("turso_branch_delete", vec![PgBranchArg::Param(1)]),
             "control"
         );
+        // A typed literal's cast has no location either (libpg_query), and stays a call.
+        assert_eq!(
+            branch_call("SELECT turso_branch_delete(text 'b')"),
+            call("turso_branch_delete", vec![PgBranchArg::Text("b".into())]),
+            "control: a typed literal"
+        );
     }
 
     /// A `$n` outside 1..=MAX_PARAMETER names no parameter, so no branch call holds one: on both

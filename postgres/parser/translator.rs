@@ -6375,9 +6375,17 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
                 Some(PgBranchArg::Param(p.number as usize))
             }
-            // A cast with no location is libpg_query's `type $n`, which PostgreSQL 18's grammar
-            // refuses (42601, by the ordinary path): no call (wire review 14 item 14).
-            Node::TypeCast(cast) if cast.location >= 0 && to_text(cast.type_name.as_ref()?) => {
+            // A cast with no location over a parameter is libpg_query's `type $n`, which
+            // PostgreSQL 18's grammar refuses (42601, by the ordinary path): no call (wire review
+            // 14 item 14). A typed literal (`text 'x'`) has no location either, and is a call.
+            Node::TypeCast(cast)
+                if !(cast.location < 0
+                    && matches!(
+                        cast.arg.as_deref().and_then(|a| a.node.as_ref()),
+                        Some(Node::ParamRef(_))
+                    ))
+                    && to_text(cast.type_name.as_ref()?) =>
+            {
                 match arg(cast.arg.as_deref()?)? {
                     PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string())),
                     other => Some(other),
@@ -8302,6 +8310,33 @@ mod tests {
                 err.to_string().contains("not supported"),
                 "expected loud error for {sql}, got: {err}"
             );
+        }
+    }
+
+    /// The premise of wire review 14 item 14's fix, read off libpg_query's own trees (the lead's
+    /// owed dump, 2026-10-15): `type $n`, libpg_query's PostgreSQL 17 extension, makes a TypeCast
+    /// with no location (-1), and so does a typed literal `type 'x'` (MEASURED: the review's "only
+    /// that extension makes one" is false), while `$1::type` and `CAST($1 AS type)` carry one. So
+    /// the fix refuses a location-less cast only over a parameter: a typed literal stays valid.
+    #[test]
+    fn a_cast_with_no_location_over_a_parameter_is_type_n() {
+        fn cast_location(sql: &str) -> i32 {
+            let parsed = crate::parse(sql).unwrap();
+            parsed
+                .protobuf
+                .nodes()
+                .into_iter()
+                .find_map(|(n, ..)| match n {
+                    pg_query::NodeRef::TypeCast(c) => Some(c.location),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{sql}: no TypeCast"))
+        }
+        assert_eq!(cast_location("SELECT varchar $1"), -1, "type $n");
+        assert_eq!(cast_location("SELECT text $1"), -1, "type $n");
+        assert_eq!(cast_location("SELECT varchar 'x'"), -1, "a typed literal");
+        for sql in ["SELECT $1::varchar", "SELECT CAST($1 AS varchar)", "SELECT 'x'::text"] {
+            assert!(cast_location(sql) >= 0, "{sql}: {}", cast_location(sql));
         }
     }
 
