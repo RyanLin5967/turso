@@ -8484,3 +8484,37 @@ fn a_d0_compactions_snapshot_is_synced_before_anything_syncs_on_top_of_it() {
     assert_eq!(snaps() - before, 1, "(b) the first syncing flight after a D0 compaction synced its snapshot {} times, not once", snaps() - before);
     drop(x);
 }
+
+/// Engine review 19 MED 3: a COMMIT that yielded inside the main pager's commit before its
+/// copy-decision pass (a spill's wait on an async IO: io_uring, MemoryYieldIO, the simulator; here
+/// the store's test hook yields there once) re-entered as Committing, and the re-entered decision
+/// pass's Busy then skipped the restore a first attempt's Busy makes
+/// (`undo_commit_transition_after_busy`): the connection read autocommit while its write
+/// transaction stayed open, review 16 HIGH 1's gap state. The Busy leaves the connection out of
+/// autocommit, and the re-step commits. Mutant `busy_after_yield_keeps_committing`.
+#[test]
+fn a_busy_commit_after_a_yield_leaves_the_connection_out_of_autocommit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-yield.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let _child = a.fork_branch().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        a.execute("BEGIN").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        db.branches.arm_commit_yield_for_test();
+        let mut commit = a.prepare("COMMIT").unwrap();
+        let first = commit.run_ignore_rows();
+        assert!(!db.branches.commit_yield_armed_for_test(), "{what}: premise: the commit yielded before its decision pass");
+        assert!(matches!(first, Err(LimboError::Busy)), "{what}: premise: the decision pass was refused: {first:?}");
+        assert!(
+            !a.get_auto_commit(),
+            "{what}: autocommit reads true while the write transaction is open, after a Busy that followed a yield"
+        );
+        commit.run_ignore_rows().unwrap();
+        assert_eq!(read_wide(&db.connect().unwrap(), 3), "new", "{what}: the re-step committed the transaction");
+    }
+}

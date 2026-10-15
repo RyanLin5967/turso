@@ -304,6 +304,10 @@ pub(crate) struct BranchStore {
     /// catalog's own volatile store counts its catalog's, which the main store routes through its
     /// at-risk decision (`truncate_catalog_wal`; engine review 17 MED 3).
     sync_failures: AtomicU64,
+    /// Test builds (engine review 19 MED 3): the next trunk commit on this store yields once inside
+    /// its pager commit, before its copy-decision pass, as a spill's wait on an async IO does.
+    #[cfg(test)]
+    commit_yield: AtomicBool,
     /// A branch catalog's own store: the group of the store whose catalog it is, which its failed
     /// syncs go to as they happen (`trunk_wal_sync_failed`; engine review 21 MED 5). Unset
     /// elsewhere.
@@ -3357,6 +3361,8 @@ impl BranchStore {
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            commit_yield: AtomicBool::new(false),
             drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
@@ -3620,6 +3626,8 @@ impl BranchStore {
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            commit_yield: AtomicBool::new(false),
             drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
@@ -7474,6 +7482,25 @@ impl BranchStore {
     pub(crate) fn confirm_park_for_test(&self) -> Option<(bool, bool, u64)> {
         let g = self.group.state.try_lock().ok()?;
         Some((g.confirm_parked, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
+    }
+
+    /// Test builds: the next trunk commit yields once inside its pager commit, before its
+    /// copy-decision pass (`commit_yield`; engine review 19 MED 3).
+    #[cfg(test)]
+    pub(crate) fn arm_commit_yield_for_test(&self) {
+        self.commit_yield.store(true, Ordering::Release);
+    }
+
+    /// Test builds: whether the armed commit yield is still to be taken.
+    #[cfg(test)]
+    pub(crate) fn commit_yield_armed_for_test(&self) -> bool {
+        self.commit_yield.load(Ordering::Acquire)
+    }
+
+    /// Test builds: take the armed commit yield, once (`Pager::commit_wal`).
+    #[cfg(test)]
+    pub(crate) fn take_commit_yield_for_test(&self) -> bool {
+        self.commit_yield.swap(false, Ordering::AcqRel)
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
