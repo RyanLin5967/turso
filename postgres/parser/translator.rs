@@ -520,6 +520,13 @@ impl PostgreSQLTranslator {
                         _ => {}
                     }
                 }
+                // LIKE copies another table's columns, which this translator does not do: it was
+                // dropped, leaving a table without them (and an engine panic on a later DROP).
+                Node::TableLikeClause(_) => {
+                    return Err(ParseError::ParseError(
+                        "CREATE TABLE ... (LIKE ...) is not supported".into(),
+                    ));
+                }
                 _ => {}
             }
         }

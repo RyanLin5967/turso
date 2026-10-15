@@ -219,7 +219,7 @@ INTEGER. Unknown type names pass through as custom types.
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
 | Changing column types (ALTER TABLE .. ALTER COLUMN TYPE) | ❌ Not supported | Translates but breaks at execution ("no such column" on subsequent use) |
 | CREATE ACCESS METHOD | ❌ Not supported | |
-| CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE is silently ignored |
+| CREATE TABLE ... (LIKE) | ❌ Not supported | Refused 0A000, no table created (PostgreSQL copies the source's columns); it was silently dropped, leaving a table without those columns, on which `ALTER TABLE ... DROP` panicked the engine |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | TEMP itself is silently ignored |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
