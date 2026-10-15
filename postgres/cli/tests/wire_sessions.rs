@@ -4355,6 +4355,39 @@ fn a_prepare_time_statement_is_refused_before_it_runs() {
     assert_eq!(count(&mut a), "2");
 }
 
+/// The prepare-time `$n` guards leave nothing behind, by simple query and by Bind (wire review 17
+/// item 12: the extended arms of these guards passed without the guard). `ALTER TABLE ... ADD
+/// CONSTRAINT CHECK (v > $1)` is 42P02 and adds no CHECK: bound with 100, a row with v = 5 still
+/// goes in. `CREATE TABLE sn(id SERIAL, v INT DEFAULT $1)` is 42P02 and makes neither the table nor
+/// its sequence: both are created afterwards with no "already exists". Mutants that must turn this
+/// red: the `$n` guard's `performs` filter deleted (the ALTER), and the prerequisites' `$n` refusal
+/// deleted (the sequence).
+#[test]
+fn a_parameter_in_a_prepare_time_statement_runs_nothing() {
+    let dir = Scratch::new("guardpins");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ck(id INT PRIMARY KEY, v INT)").ok("ck");
+    let alter = "ALTER TABLE ck ADD CONSTRAINT big CHECK (v > $1)";
+    let r = a.q(alter);
+    assert_eq!(r.err("ALTER with $1 by simple query").code, "42P02");
+    a.q("INSERT INTO ck VALUES (1, 5)")
+        .ok("no CHECK after the simple query");
+    let r = a.xt(alter, &[(23, 0, b"100")]);
+    assert_eq!(r.err("ALTER with $1 by Bind").code, "42P02");
+    a.q("INSERT INTO ck VALUES (2, 5)")
+        .ok("no CHECK (v > 100) after the Bind");
+    let create = "CREATE TABLE sn(id SERIAL, v INT DEFAULT $1)";
+    let r = a.q(create);
+    assert_eq!(r.err("SERIAL with $1 by simple query").code, "42P02");
+    let r = a.xt(create, &[(23, 0, b"7")]);
+    assert_eq!(r.err("SERIAL with $1 by Bind").code, "42P02");
+    a.q("CREATE SEQUENCE sn_id_seq")
+        .ok("the refused CREATEs left no sequence");
+    a.q("CREATE TABLE sn(id INT, v INT)")
+        .ok("the refused CREATEs left no table");
+}
+
 /// An undeclared parameter has the type PostgreSQL infers from its context, the same at Describe
 /// and at Bind: the column it is compared with, assigned to or inserted into, an aggregate it is
 /// compared with, LIMIT's bigint, a cast's type; text where nothing says. A $n with an unused $k
