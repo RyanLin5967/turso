@@ -4977,6 +4977,52 @@ mod tests {
         }
     }
 
+    /// Wire review 18 item 3: a CHECKPOINT never holds up a branch create. Its store checkpoint is
+    /// the fuzzy one, written on a thread of its own, so while that write is held (the hook at stage
+    /// 2: rows written, not committed) a create from another session returns. The sharp checkpoint
+    /// (branch_compact_now) held the store mutex through the settle, the catalog write and its
+    /// syncs and the log's rewrite, so every create, switch and connect of every session waited
+    /// for it. At the base the premise fails: no fuzzy checkpoint ever reaches the hold. Mutant:
+    /// the sharp call.
+    #[test]
+    fn a_checkpoint_does_not_hold_up_a_create() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        ok(&s, "SELECT turso_branch_create('b0')");
+        let db = s.shared.db.clone();
+        db.branch_checkpoint_hold(2);
+        let checkpoint = {
+            let shared = s.shared.clone();
+            std::thread::spawn(move || ok(&Session::new(shared), "CHECKPOINT"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while db.branch_checkpoint_held() & 0x80 == 0 {
+            if std::time::Instant::now() > deadline {
+                db.branch_checkpoint_hold(0);
+                panic!("premise: the CHECKPOINT's store checkpoint never reached the fuzzy hold");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let create = {
+            let shared = s.shared.clone();
+            std::thread::spawn(move || {
+                ok(&Session::new(shared), "SELECT turso_branch_create('b1')");
+                let _ = tx.send(());
+            })
+        };
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        db.branch_checkpoint_hold(0);
+        checkpoint.join().unwrap();
+        create.join().unwrap();
+        assert!(
+            returned,
+            "a create waited for the CHECKPOINT's store checkpoint"
+        );
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
