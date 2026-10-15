@@ -76,5 +76,12 @@ for b in bbload clonebench; do
   case_ "$b --warmup-decide ends the warm-up as warm_ends does" 0 "stop_at=1 warm_ops=1 capped=0 backsteps=0" \
     "$S/trace-end" -- "$DIST/$b" --warmup-decide 1:5:100
 done
+# --- comp review 1 LOW 39: clonebench configures SQLite before any other call (MULTITHREAD, MEMSTATUS 0 by default, as
+# the macOS clonebench at 4010ff3b06:172-177): --memstatus takes 0 or 1 only; a control with --memstatus 1 is accepted
+# and stops at the missing parent (its sq_open refusal)
+case_ "clonebench --memstatus 2 is refused" 2 "--memstatus needs 0 or 1" \
+  -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms)" --memstatus 2
+case_ "control: clonebench --memstatus 1 passes the flag checks and stops at the missing parent" 2 "no-parent.db" \
+  -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms1)" --memstatus 1
 if [ $bad = 0 ]; then echo "VERDICT PASS $n/$n"; else echo "VERDICT FAIL $((n - bad))/$n"; fi
 [ $bad = 0 ]
