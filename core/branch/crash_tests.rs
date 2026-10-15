@@ -1498,6 +1498,9 @@ fn c1_d1_log_reopened_in_d0_survives_a_power_cut_at_cut_dir_synced() {
         let (hit, bad, what, _) =
             c1_trial_from(&exe, true, SyncClass::Fsync, SyncClass::Off, true, 4, "cut.dir_synced", n, 0x16 ^ trial, None);
         landed += u64::from(hit);
+        if !hit {
+            println!("C1 LOW 16 trial {trial} unaimed: {what}");
+        }
         for b in bad {
             violations.push(format!("trial {trial} [{what}]: {b}"));
         }
