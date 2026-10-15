@@ -2352,6 +2352,14 @@ impl Program {
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(_) => {
+                                // Its delta is in the view's pages now, in this transaction: a
+                                // commit that starts over after a later view's merge fails merges
+                                // it no more (engine review 19 LOW 15), and a write made meanwhile
+                                // starts it a fresh delta. Mutant `view_merge_restarts_merged`
+                                // (test builds only): kept, as before.
+                                if !crate::branch::store::fe_mutant("view_merge_restarts_merged") {
+                                    self.connection.view_transaction_states.remove(view_name);
+                                }
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),
@@ -2393,7 +2401,16 @@ impl Program {
         // Apply view deltas with I/O handling. A yield is recorded in `commit_state`, so the
         // statement's re-entry resumes this commit rather than judging it a new one (an explicit
         // COMMIT has already made its transition; engine review 16 HIGH 1).
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        let applied = self.apply_view_deltas(program_state, rollback, &pager);
+        // A merge that failed part-way: the commit, if re-entered, starts its view merges over
+        // from the connection's view states, where each view already merged no longer has a delta
+        // (engine review 19 LOW 15: resumed at the failed view, the views before it never saw a
+        // write made in between). Mutant `view_merge_restarts_merged` (test builds only): resumed
+        // where it stopped, as before.
+        if applied.is_err() && !crate::branch::store::fe_mutant("view_merge_restarts_merged") {
+            program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        }
+        match applied? {
             IOResult::IO(io) => {
                 if matches!(program_state.commit_state, CommitState::Ready) {
                     program_state.commit_state = CommitState::ApplyingViewDeltas;
