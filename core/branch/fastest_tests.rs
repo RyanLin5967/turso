@@ -8646,6 +8646,48 @@ fn no_name_table_regrows_past_64_kib_inside_a_named_create() {
     assert!(over.is_empty(), "CLAIM: a named create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
 }
 
+/// Checkpoint FIX (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3
+/// checkpoints in ckpt_n10, budget 3 each, review 1 #7): a fuzzy checkpoint of a D2 catalog store,
+/// its full flushes attributed to its thread's phases (`store::CKPT_PHASES`: start, settled,
+/// written, cut, installed, truncated). Budget: the catalog commit's one, one for the WAL header after
+/// the truncation, the cut log's one. Three checkpoints, each after 30 creates; nothing else runs.
+#[test]
+fn a_fuzzy_checkpoint_issues_at_most_three_full_flushes() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-flushes.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut over = Vec::new();
+    for round in 0..3 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_PHASES.lock().unwrap().clear();
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        eventually("premise: the checkpoint thread reached its truncation", || {
+            super::store::CKPT_PHASES.lock().unwrap().iter().any(|(p, ..)| *p == "truncated")
+        });
+        let phases = super::store::CKPT_PHASES.lock().unwrap().clone();
+        let (_, _, f0) = phases[0];
+        let fulls = phases.last().unwrap().2 - f0;
+        let mut last = f0;
+        let steps: Vec<String> = phases[1..]
+            .iter()
+            .map(|(p, _, f)| {
+                let d = f - last;
+                last = *f;
+                format!("{p}+{d}")
+            })
+            .collect();
+        if fulls > 3 {
+            over.push(format!("round {round}: {fulls} full flushes [{}]", steps.join(" ")));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than three full flushes: {over:?}");
+}
+
 /// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex: 7 held allocations per
 /// create in every cell, budget 1): a steady create's allocations under a store mutex, attributed to
 /// its steps by the `held_trace` points (fork_trunk's hold and the flight lead's hold), for both

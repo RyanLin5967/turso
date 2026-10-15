@@ -3160,6 +3160,23 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
 /// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
 /// is in flight, so the two cannot deadlock.
 #[allow(clippy::too_many_arguments)]
+/// Test builds (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3 checkpoints,
+/// budget 3 each): the process's sync counters (`super::sync_counts`: fsync, F_FULLFSYNC) at each
+/// phase of a fuzzy checkpoint's thread, so a test can attribute its flushes. Observation only; the
+/// counters are process-wide, so a test reading them runs nothing else meanwhile.
+#[cfg(test)]
+pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn ckpt_phase(label: &'static str) {
+    #[cfg(test)]
+    {
+        let c = super::sync_counts();
+        CKPT_PHASES.lock().unwrap_or_else(|e| e.into_inner()).push((label, c.fsync, c.full_fsync));
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
 fn run_flight(
     inner: Arc<StoreMutex>,
     group: Arc<Group>,
@@ -3172,6 +3189,7 @@ fn run_flight(
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
+    ckpt_phase("start");
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3212,9 +3230,11 @@ fn run_flight(
                 return (Err(e), 0);
             }
         }
+        ckpt_phase("settled");
         let mut w = writer.lock();
         let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
+        ckpt_phase("written");
         if written.is_err() {
             w.rollback();
         }
@@ -3251,6 +3271,7 @@ fn run_flight(
                 None
             })
     });
+    ckpt_phase("cut");
     let installed = {
         let mut guard = inner.lock();
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
@@ -3304,6 +3325,7 @@ fn run_flight(
     };
     // Flights go on, into the new log.
     drop(cut);
+    ckpt_phase("installed");
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
@@ -3315,6 +3337,7 @@ fn run_flight(
                 truncate_catalog_wal(&mut writer.lock(), &group, Some(&*hold))
             }));
             truncating.store(false, Ordering::Release);
+            ckpt_phase("truncated");
             if truncated.is_err() {
                 tracing::warn!("the branch catalog WAL truncation panicked");
             }
