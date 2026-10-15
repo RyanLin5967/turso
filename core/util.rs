@@ -1468,7 +1468,7 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     }
 
     let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
-        crate::numeric::str_to_f64(text)
+        crate::numeric::str_to_f64(text.as_ref())
     else {
         return Err(LimboError::ParseError(format!(
             "malformed numeric literal: {text}"
