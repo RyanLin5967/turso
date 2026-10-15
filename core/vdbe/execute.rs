@@ -16230,7 +16230,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -16238,6 +16238,16 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    // A dialect may read a text as a float in its own way (PostgreSQL's 'Infinity').
+    if matches!(affinity, Affinity::Real) {
+        if let Some(text) = value.to_text() {
+            if let Some(float) = program.connection.dialect().cast_text_to_float(text) {
+                state.registers[*reg].set_value(Value::from_f64(float?));
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),

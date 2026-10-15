@@ -167,6 +167,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn requires_custom_types(&self) -> bool {
         false
     }
+
+    /// A text this dialect reads as a float in its own way, for a CAST to REAL (`Ok`), or refuses
+    /// (`Err`); `None` takes SQLite's rules, which read a text that is no number as 0. The default
+    /// for every dialect but PostgreSQL's, which reads 'Infinity' as the infinity (the crash batch,
+    /// 2026-10-15).
+    fn cast_text_to_float(&self, _text: &str) -> Option<crate::Result<f64>> {
+        None
+    }
 }
 
 #[cfg(test)]
