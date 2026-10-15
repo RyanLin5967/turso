@@ -618,7 +618,9 @@ fn emit_rowid_alias_not_null_check(
     let Some(btree) = column_ctx.target_table.table.btree() else {
         return Ok(());
     };
-    if !btree.rowid_alias_refuses_null() {
+    // Mutant `null_key_update_unchecked` (test builds only; engine review 20 LOW 26): this path
+    // alone unchecked.
+    if !btree.rowid_alias_refuses_null() || crate::branch::store::fe_mutant("null_key_update_unchecked") {
         return Ok(());
     }
     let Some(alias) = btree.columns().iter().find(|c| c.is_rowid_alias()) else {
