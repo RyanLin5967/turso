@@ -1387,6 +1387,43 @@ fn a_released_name_is_free_while_a_fuzzy_checkpoint_is_in_flight() {
     assert_eq!(db.branch_named("x").unwrap(), Some(b), "after a reopen");
 }
 
+/// L2(d) (the capture freezes `fresh` and `gone` instead of copying them, `NameIndex`): a fuzzy
+/// checkpoint whose write fails gives its frozen names back, so the next checkpoint writes them. A
+/// name created before the failed capture (`kept`) is still found once its state is evicted (resident
+/// cap 0) and after a reopen, and a name released before it (`freed`) is still free: it resolves to
+/// nothing and can be given again, also after a reopen. Mutant `frozen_names_dropped_on_failure`.
+#[test]
+fn a_failed_fuzzy_checkpoint_gives_its_frozen_names_back() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("frozen-back.db");
+    let fuzzy = || opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy);
+    let (kept, incarnation) = {
+        let db = open_at(&path, fuzzy());
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("freed").unwrap();
+        db.branch_compact_now().unwrap();
+        db.drop_branch("freed").unwrap();
+        let kept = trunk.create_branch("kept").unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the failing fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        db.branch_failpoint(None);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the next fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        db.branch_set_resident_cap(Some(0));
+        db.branch_compact_now().unwrap();
+        assert_eq!(db.branch_named("kept").unwrap(), Some(kept), "CLAIM: a name created before a failed checkpoint was lost once evicted");
+        assert_eq!(db.branch_named("freed").unwrap(), None, "CLAIM: a name released before a failed checkpoint resolved again");
+        (kept, db.incarnation)
+    };
+    let db = reopen(&path, fuzzy(), incarnation);
+    assert_eq!(db.branch_named("kept").unwrap(), Some(kept), "CLAIM: after a reopen, a name created before a failed checkpoint was lost");
+    assert_eq!(db.branch_named("freed").unwrap(), None, "CLAIM: after a reopen, a name released before a failed checkpoint resolved again");
+    assert!(db.connect().unwrap().create_branch("freed").is_ok(), "CLAIM: a released name could not be given again");
+}
+
 /// Review C-F3: a named server branch takes no `Branch` handle — a handle's drop would release it
 /// and a handle could lease it, and nothing but `Database::drop_branch` may end a named branch.
 #[test]

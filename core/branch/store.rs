@@ -2422,10 +2422,14 @@ struct BranchState {
 /// masks with `gone` the catalog rows of names released since (deleted at the next); every other
 /// name is read from the catalog's `branch_name` table.
 ///
-/// A checkpoint's capture COPIES `fresh` and `gone`, and its install removes only the entries that
-/// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
-/// index still masks and still names what it did, and a capture that is never written (a write
-/// that failed, a thread that did not start) leaves nothing to restore.
+/// A checkpoint's capture FREEZES `fresh` and `gone` (L2(d), O(1) under the mutex: before, it
+/// copied them, 3,115 of a create's 6,288 held allocations when the create started a checkpoint,
+/// raw l90): both are swapped into `frozen` and start empty. Until the catalog holds what the
+/// capture wrote, the index still masks and still names what it did (review C-F1, C-F2): a lookup
+/// reads `gone` and then the frozen `gone`, and the name filter's build seeds `fresh` and the frozen
+/// `fresh`. The install drops `frozen` (its memory freed after the store mutex); a write that failed
+/// merges it back, each entry that nothing since has moved (a name released since is in `gone`, a
+/// frozen fresh name kept only while its branch still holds it).
 ///
 /// Ordered maps, not hash maps (L2 slope, budget create_allocates_no_table_of_every_branch_under_the_store_mutex:
 /// a named create rehashed `map`, 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the
@@ -2439,6 +2443,43 @@ struct NameIndex {
     /// later release of the same name moved it.
     gone: BTreeMap<Arc<str>, u64>,
     releases: u64,
+    /// The `fresh` and `gone` a capture froze, until its install (see above).
+    frozen: Option<Arc<FrozenNames>>,
+    /// A frozen generation the install let go of, dropped by the install's caller after the store
+    /// mutex (`take_retired_names`), so its maps are freed with no lock held.
+    retired: Option<Arc<FrozenNames>>,
+}
+
+impl NameIndex {
+    /// A capture that is not written (its write failed, or its thread did not start): the frozen
+    /// names go back for the next checkpoint, each entry nothing since has moved: a frozen fresh name
+    /// only while its branch still holds it (released since, it is in `gone` now), a frozen gone name
+    /// unless a later release replaced it. Mutant `frozen_names_dropped_on_failure` (test builds
+    /// only): not merged back.
+    fn unfreeze(&mut self) {
+        let Some(frozen) = self.frozen.take() else {
+            return;
+        };
+        if !fe_mutant("frozen_names_dropped_on_failure") {
+            for (name, id) in &frozen.fresh {
+                if self.map.get(name) == Some(id) && !self.fresh.contains_key(name) {
+                    self.fresh.insert(name.clone(), *id);
+                }
+            }
+            for (name, release) in &frozen.gone {
+                self.gone.entry(name.clone()).or_insert(*release);
+            }
+        }
+        self.retired = Some(frozen);
+    }
+}
+
+/// The names a checkpoint's capture froze (`NameIndex::frozen`): created and released since the
+/// checkpoint before it, written by this one.
+#[derive(Default)]
+struct FrozenNames {
+    fresh: BTreeMap<Arc<str>, BranchId>,
+    gone: BTreeMap<Arc<str>, u64>,
 }
 
 /// Test builds: allocations made inside `NameFilter::note`, by any store (lead ruling 2026-10-15:
@@ -3319,8 +3360,7 @@ struct Captured {
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
-    names_gone: BTreeMap<Arc<str>, u64>,
-    names_fresh: BTreeMap<Arc<str>, BranchId>,
+    names: Arc<FrozenNames>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -3404,10 +3444,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // fastest-engine M1 item 4: freed names first, so a name released and created again since
         // the last checkpoint ends up naming its new branch.
-        for name in cap.names_gone.keys() {
+        for name in cap.names.gone.keys() {
             catalog.name_del(name)?;
         }
-        for (name, id) in &cap.names_fresh {
+        for (name, id) in &cap.names.fresh {
             catalog.name_put(name, id.0)?;
         }
         if cap.fresh_arena {
@@ -3703,6 +3743,8 @@ fn run_flight(
         ckpt_held("install.installed");
         // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
         let retired = guard.journal.as_mut().and_then(Journal::take_retired);
+        // And the names the install let go of, freed after it too (L2(d), `NameIndex`).
+        let retired_names = guard.names.retired.take();
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3742,11 +3784,12 @@ fn run_flight(
         let (count, signal) = &*installs;
         *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         signal.notify_all();
-        (installed, retired)
+        (installed, (retired, retired_names))
     };
-    let (installed, retired) = installed;
-    // Holding no lock now: the old log's handles close here.
+    let (installed, (retired, retired_names)) = installed;
+    // Holding no lock now: the old log's handles close here, and the frozen names are freed.
     drop(retired);
+    drop(retired_names);
     // Flights go on, into the new log.
     drop(cut);
     ckpt_phase("installed");
@@ -6028,7 +6071,11 @@ impl BranchStore {
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         let writer = cat.writer.clone();
-        let dirty = cap.dirty.clone();
+        // The capture travels in a slot the job empties, so a dispatch that fails gives it back to
+        // undo with (L2(d): before, its dirty map was cloned under the mutex for that undo, 3,126
+        // of a create's 6,288 held allocations when the create started a checkpoint, raw l90).
+        let slot: Arc<std::sync::Mutex<Option<Box<Captured>>>> = Arc::new(std::sync::Mutex::new(Some(cap)));
+        let job_slot = slot.clone();
         let shared = self.inner.clone();
         let group = self.group.clone();
         let hold = self.flight_hold.clone();
@@ -6039,7 +6086,10 @@ impl BranchStore {
             Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
         } else {
             self.dispatch_flight(Box::new(move || {
-                run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+                let cap = job_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(cap) = cap {
+                    run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+                }
             }))
         };
         match spawned {
@@ -6054,12 +6104,16 @@ impl BranchStore {
                 // commits (recovery cuts only at a committed one): undo the capture (the thread's
                 // closure, and the capture with it, are gone).
                 tracing::warn!("branch catalog checkpoint thread not started: {e}");
+                let cap = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                 let cat = inner.cat.as_mut().expect("captured above");
                 cat.catalog.end_read_snapshot();
                 cat.flight = false;
-                for (id, what) in dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+                if let Some(cap) = cap {
+                    for (id, what) in cap.dirty {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
                 }
+                inner.names.unfreeze();
                 FlightStart::Failed
             }
         }
@@ -8426,6 +8480,8 @@ impl BranchStore {
             ("names.map", inner.names.map.len(), 0),
             ("names.fresh", inner.names.fresh.len(), 0),
             ("names.gone", inner.names.gone.len(), 0),
+            ("names.frozen_fresh", inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len()), 0),
+            ("names.frozen_gone", inner.names.frozen.as_ref().map_or(0, |f| f.gone.len()), 0),
         ];
         // The name filter's tables at their real bytes (8 per slot; lead condition, review MED-2: the
         // 0-byte listing of 4cb167221 blinded the regrowth test). They are grown by
@@ -8629,7 +8685,8 @@ impl BranchStore {
             if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
                 return FilterBuild::Ended;
             }
-            (cat.catalog.database(), inner.sync, inner.names.fresh.len(), inner.names.filter.hasher.clone())
+            let frozen = inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len());
+            (cat.catalog.database(), inner.sync, inner.names.fresh.len() + frozen, inner.names.filter.hasher.clone())
         };
         // Room for the names created since the checkpoint and as many again created while the scan
         // runs; the connection, its pragmas and prepares. Both with the mutex let go.
@@ -8647,8 +8704,11 @@ impl BranchStore {
             if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
                 return FilterBuild::Ended;
             }
+            // The names created since the last checkpoint, frozen by a capture in flight or not
+            // (`NameIndex`): neither is in the catalog the scan reads yet.
             let mut fits = true;
-            for name in names.fresh.keys() {
+            let frozen = names.frozen.as_ref().map(|f| f.fresh.keys()).into_iter().flatten();
+            for name in names.fresh.keys().chain(frozen) {
                 fits &= pending.insert(names.filter.hash(name));
             }
             if !fits {
@@ -9693,6 +9753,12 @@ impl StoreInner {
             if self.names.gone.contains_key(name) {
                 return Ok(None);
             }
+            // A release the capture froze masks the catalog's row until the install, as `gone`
+            // does (see `NameIndex`). Mutant `names_taken_at_capture` (test builds only): as before
+            // review C-F1, a capture's names are out of the index's reach.
+            if !fe_mutant("names_taken_at_capture") && self.names.frozen.as_ref().is_some_and(|f| f.gone.contains_key(name)) {
+                return Ok(None);
+            }
             // Never held by any branch: no catalog query (lead review 1 item 2).
             if self.names.filter.says_absent(name) {
                 return Ok(None);
@@ -10674,12 +10740,14 @@ impl StoreInner {
         let child_keys: Vec<(u64, u64)> = self.children.map.keys().copied().collect();
         let child_removed: Vec<(u64, u64)> = self.children.removed.keys().copied().collect();
         held_trace("capture.child_keys");
-        let names_gone = if fe_mutant("names_taken_at_capture") {
-            std::mem::take(&mut self.names.gone)
-        } else {
-            self.names.gone.clone()
-        };
-        let names_fresh = self.names.fresh.clone();
+        // O(1): swapped, not copied (see `NameIndex`). A capture never runs with a frozen generation
+        // left (one flight at a time, and the install or a failed write ends it).
+        debug_assert!(self.names.frozen.is_none(), "a capture with names still frozen");
+        let names = Arc::new(FrozenNames {
+            fresh: std::mem::take(&mut self.names.fresh),
+            gone: std::mem::take(&mut self.names.gone),
+        });
+        self.names.frozen = Some(names.clone());
         held_trace("capture.names");
         Ok(Box::new(Captured {
             generation,
@@ -10705,10 +10773,7 @@ impl StoreInner {
             settle_class,
             settle_arena,
             fail_stop: self.fail_stop.clone(),
-            // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
-            // C-F1, the capture takes the names out of the index (taken above).
-            names_gone,
-            names_fresh,
+            names,
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -10748,7 +10813,7 @@ impl StoreInner {
                     *cat.dirty.entry(id).or_insert(0) |= what;
                 }
             }
-            // The capture copied the names; the index still holds them, for the next checkpoint.
+            self.names.unfreeze();
             // Not retried before another threshold's worth of log (review 2 #5).
             if let Some(journal) = self.journal.as_mut() {
                 journal.defer_compaction();
@@ -10757,18 +10822,9 @@ impl StoreInner {
         }
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
-        // The catalog holds the captured names now: drop each entry no release or create since
-        // has moved (see `NameIndex`).
-        for (name, release) in &cap.names_gone {
-            if self.names.gone.get(name) == Some(release) {
-                self.names.gone.remove(name);
-            }
-        }
-        for (name, id) in &cap.names_fresh {
-            if self.names.fresh.get(name) == Some(id) {
-                self.names.fresh.remove(name);
-            }
-        }
+        // The catalog holds the captured names now: the frozen generation is let go of, and freed
+        // after the store mutex (see `NameIndex`).
+        self.names.retired = self.names.frozen.take();
         // From here the catalog is the truth up to the capture's log position.
         let Some(journal) = self.journal.as_mut() else {
             return Err(LimboError::InternalError(
