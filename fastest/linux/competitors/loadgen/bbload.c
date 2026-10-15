@@ -184,6 +184,9 @@ typedef struct {
     int16_t err;
     uint64_t free, claim; /* the client's free time (its previous op's after_end, or t0) and the claim's time */
     uint64_t intended, start, end, after_end;
+    uint64_t serial_wait_ns;
+    unsigned nserial_waits;
+    struct { uint64_t lo, hi; } serial_waits[MAXSTEPS + MAXAFTER];
     uint64_t step_end[MAXSTEPS];
     uint64_t aft_start, aft_end[MAXAFTER]; /* comp review 1 MED 9: the after-steps' start and each one's end */
 } oprec;
@@ -393,7 +396,7 @@ static int load_spec(const char *path, char **text) {
 }
 
 /* Expand {c} {i} {run} {rand:a:b} {var}. Returns -1 on an unknown or malformed placeholder. */
-typedef struct { int c; uint32_t i; uint64_t *rng; char *vval[MAXLIST]; int nv; } ctx_t;
+typedef struct { int c; uint32_t i; uint64_t *rng; char *vval[MAXLIST]; int nv; oprec *op; } ctx_t;
 static const char *lookup(const char *key, const ctx_t *x) {
     for (int v = 0; v < x->nv; v++) if (!strcmp(S.vname[v], key)) return x->vval[v];
     for (int v = 0; v < NSET; v++) if (!strcmp(SETK[v], key)) return SETV[v];
@@ -576,11 +579,24 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
 
 /* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
 static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
-    int s = -1, rc = 0;
-    if (x->pg) { int fd = PQsocket(x->pg); if (fd >= 0) s = dup(fd); PQfinish(x->pg); }
-    if (x->my) { int fd = (int)mysql_get_socket(x->my); if (fd >= 0) s = dup(fd); mysql_close(x->my); }
+    int s = -1, rc = 0, dup_errno = 0;
+    if (x->pg) {
+        int fd = PQsocket(x->pg);
+        if (fd >= 0 && (s = dup(fd)) < 0) dup_errno = errno;
+        PQfinish(x->pg);
+    }
+    if (x->my) {
+        int fd = (int)mysql_get_socket(x->my);
+        if (fd >= 0 && (s = dup(fd)) < 0) dup_errno = errno;
+        mysql_close(x->my);
+    }
     x->pg = NULL;
     x->my = NULL;
+    if (dup_errno) {
+        if (s >= 0) close(s);
+        snprintf(why, wsz, "close: dup: %s", strerror(dup_errno));
+        return -1;
+    }
     if (s < 0) return 0;
     uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     char b[512];
@@ -681,7 +697,16 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
     /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
      * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
+    uint64_t wait_end = now_ns();
+    if (x->op) {
+        /* Each step executes at most once; MAXSTEPS+MAXAFTER bounds this list. */
+        unsigned n = x->op->nserial_waits++;
+        x->op->serial_waits[n].lo = wait_start;
+        x->op->serial_waits[n].hi = wait_end;
+        x->op->serial_wait_ns += wait_end - wait_start;
+    }
     int rc = conn_exec(target, text, 0, why, wsz);
     pthread_mutex_unlock(&g_serial_mu);
     return rc;
@@ -956,7 +981,7 @@ static void *client_main(void *arg) {
         r.arrival = kc.arrival;
         r.claim = kc.claim;
         r.free = free_since;
-        ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar};
+        ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar, .op = &r};
         char vbuf[MAXLIST][1024];
         int bad = 0;
         for (int v = 0; v < S.nvar && !bad; v++) {
@@ -1287,7 +1312,7 @@ int main(int argc, char **argv) {
     fprintf(f, "client\tseq\tphase\tok\tarrival\tfree_ns\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\tsend_late_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
     for (int s = 0; s < NA; s++) fprintf(f, "\tafter%d_ns", s + 1); /* the macOS columns (4010ff3b06:1183) */
-    fprintf(f, "\tafter_ns\terr\n");
+    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits\terr\n"); /* serial_wait*: Codex C04 */
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
         uint64_t base = o->intended > o->free ? o->intended : o->free;
@@ -1306,7 +1331,12 @@ int main(int argc, char **argv) {
             if (s < o->nafter) { fprintf(f, "\t%llu", (unsigned long long)(o->aft_end[s] - prev)); prev = o->aft_end[s]; }
             else fprintf(f, "\t");
         }
-        fprintf(f, "\t%llu\t%d\n", (unsigned long long)(o->after_end - o->end), o->err);
+        fprintf(f, "\t%llu\t%llu\t", (unsigned long long)(o->after_end - o->end),
+                (unsigned long long)o->serial_wait_ns);
+        for (unsigned w = 0; w < o->nserial_waits; w++)
+            fprintf(f, "%s%llu-%llu", w ? ";" : "", (unsigned long long)o->serial_waits[w].lo,
+                    (unsigned long long)o->serial_waits[w].hi);
+        fprintf(f, "\t%d\n", o->err);
     }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: raw.tsv close failed\n"); return 2; }
     snprintf(p, sizeof p, "%s/errors.txt", out);
@@ -1334,8 +1364,20 @@ int main(int argc, char **argv) {
     double sum = 0;
     uint64_t *late = malloc((total ? total : 1) * sizeof *late);
     size_t nlate = 0;
+    long double inflight_ns = 0; /* Codex C04: effective concurrency */
+    long double serial_waiter_ns = 0;
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
+        /* Integrate actual timed work, including warm-up/drain/error intervals that
+         * overlap the window. Intended-time queueing and after-steps are excluded. */
+        uint64_t lo = o->start > g_tm0 ? o->start : g_tm0;
+        uint64_t hi = o->end < g_tm1 ? o->end : g_tm1;
+        if (hi > lo) inflight_ns += hi - lo;
+        for (unsigned w = 0; w < o->nserial_waits; w++) {
+            lo = o->serial_waits[w].lo > g_tm0 ? o->serial_waits[w].lo : g_tm0;
+            hi = o->serial_waits[w].hi < g_tm1 ? o->serial_waits[w].hi : g_tm1;
+            if (hi > lo) serial_waiter_ns += hi - lo;
+        }
         if (o->end >= g_tm0 && o->end <= g_tm1 && o->ok) in_window_done++;
         if (o->phase == PH_DRAIN) drain++;
         if (o->phase != PH_MEAS) continue;
@@ -1403,6 +1445,13 @@ int main(int argc, char **argv) {
         free(byarr);
     }
     double win = (g_tm1 - g_tm0) / 1e9;
+    double mean_inflight = g_tm1 > g_tm0 ? (double)(inflight_ns / (g_tm1 - g_tm0)) : 0;
+    int sql_serial = 0;
+    for (int s = 0; s < S.nstep; s++) sql_serial |= S.step[s].serial;
+    for (int s = 0; s < S.nafter; s++) sql_serial |= S.after[s].serial;
+    double mean_serial_waiters = g_tm1 > g_tm0 ? (double)(serial_waiter_ns / (g_tm1 - g_tm0)) : 0;
+    double effective_c = C - mean_serial_waiters;
+    int reduced_concurrency = effective_c < C - 0.5;
     double cpu = (g_ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (g_ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
                  (g_ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (g_ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = 0;
@@ -1456,6 +1505,14 @@ int main(int argc, char **argv) {
     else fprintf(f, "\"send_late_us\":null,\"pool_late_us\":null,\"fifo_violations\":null,\"schedule_hash\":null,"
                     "\"schedule_arrivals\":null,\"timerslack_ok\":null,");
     fprintf(f, "\"max_send_late_us\":%.1f,", MAX_SEND_LATE_US);
+    /* Codex C04 (sql-serial per the lead's corrected rule, DECISIONS 4317e92c2b): the effective concurrency and its
+     * label (tm0_ns and tm1_ns are written once, above) */
+    fprintf(f, "\"mean_inflight\":%.12f,\"mean_serial_waiters\":%.12f,\"effective_c\":%.12f,\"sql_serial\":%s,"
+               "\"concurrency_label\":\"%s\",\"c_label_credit\":%s,\"serial_delete_note\":\"%s\",",
+            mean_inflight, mean_serial_waiters, effective_c,
+            sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
+            reduced_concurrency ? "false" : "true",
+            sql_serial && C > 1 ? "Dolt 2.4.1 concurrent-delete panic: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;
