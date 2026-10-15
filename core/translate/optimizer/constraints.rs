@@ -324,6 +324,25 @@ pub(super) fn automatic_index_terms(
     terms
 }
 
+/// Engine review 20 item 7: an IN constraint on a column whose custom type ENCODEs its values or
+/// compares them with a function '=' cannot drive an IN seek, which compares the raw elements with
+/// the index's keys (the encodings, under the plain comparison): numeric's `x IN (1.5)` found
+/// nothing, tag's (instr) '=' was compared bytewise. No such constraint is made, so no IN seek is
+/// planned on it and the term stays a filter evaluated through the type's '=' (fa3f83cdc). The bad
+/// plan is unrepresentable rather than patched. Mutant `in_seek_on_custom_type` (test builds only):
+/// made, as before.
+fn in_seek_refused(schema: &Schema, table_reference: &JoinedTable, column: usize) -> bool {
+    if crate::branch::store::fe_mutant("in_seek_on_custom_type") {
+        return false;
+    }
+    let Some(col) = table_reference.table.columns().get(column) else {
+        return false;
+    };
+    schema
+        .get_type_def(&col.ty_str, table_reference.table.is_strict())
+        .is_some_and(|t| t.encode().is_some() || crate::translate::expr::type_eq_function(t).is_some())
+}
+
 /// Return true when an expression names a custom text order.
 pub(super) fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
     let mut uses_custom = false;
@@ -862,7 +881,8 @@ pub fn constraints_from_where_clause(
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
-                        if *table == table_reference.internal_id =>
+                        if *table == table_reference.internal_id
+                            && !in_seek_refused(schema, table_reference, *column) =>
                     {
                         let is_rowid = rowid_alias_column == Some(*column);
                         cs.constraints.push(Constraint {
@@ -959,7 +979,8 @@ pub fn constraints_from_where_clause(
 
                     match lhs_expr.as_ref() {
                         ast::Expr::Column { table, column, .. }
-                            if *table == table_reference.internal_id =>
+                            if *table == table_reference.internal_id
+                                && !in_seek_refused(schema, table_reference, *column) =>
                         {
                             let is_rowid = rowid_alias_column == Some(*column);
                             cs.constraints.push(Constraint {
