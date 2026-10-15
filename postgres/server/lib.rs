@@ -5445,6 +5445,52 @@ mod tests {
         assert_eq!(val, Value::from_f64(1.23));
     }
 
+    /// Wire review 16 item 23: parameter decoding at the edges, as PostgreSQL's input functions read
+    /// them. float4's own largest output, '3.4028235e+38' (float4out of FLT_MAX), binds, where it
+    /// was refused 22003 (compared as an f64 above f32::MAX); a spelling that underflows to zero
+    /// ('1e-400' for float8, '1e-50' for float4) is 22003 (recalled from float8in's ERANGE rule,
+    /// not re-read), where it bound 0, while a zero spelled as zero and the smallest denormals
+    /// bind; numeric keeps its range. An integer in base 2, 8 or 16 may put an underscore right
+    /// after its prefix ('0b_10_0101' is 37 in PostgreSQL 16 and later, conformance
+    /// upstream/int4.out), where it was 22P02; in base 10 a leading underscore is still 22P02, and
+    /// so is a prefix with no digit.
+    #[test]
+    fn parameters_decode_at_postgresqls_edges() {
+        let code = |bytes: &[u8], t: &Type| match pg_bytes_to_value(bytes, t) {
+            Err(PgWireError::UserError(e)) => Some(e.code.clone()),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => None,
+        };
+        let float4_max = pg_bytes_to_value(b"3.4028235e+38", &Type::FLOAT4).unwrap();
+        assert_eq!(float4_max, Value::from_f64(3.4028235e+38));
+        assert_eq!(code(b"3.5e+38", &Type::FLOAT4).as_deref(), Some("22003"));
+        assert_eq!(code(b"1e-400", &Type::FLOAT8).as_deref(), Some("22003"));
+        assert_eq!(code(b"-1e-400", &Type::FLOAT8).as_deref(), Some("22003"));
+        assert_eq!(code(b"1e-50", &Type::FLOAT4).as_deref(), Some("22003"));
+        for (zero, t) in [
+            (&b"0e-400"[..], &Type::FLOAT8),
+            (b"0.000", &Type::FLOAT8),
+            (b"-0", &Type::FLOAT4),
+            (b"4.9e-324", &Type::FLOAT8),
+            (b"1.4e-45", &Type::FLOAT4),
+            (b"1e-400", &Type::NUMERIC),
+        ] {
+            assert_eq!(code(zero, t), None, "{:?} as {t}", std::str::from_utf8(zero));
+        }
+        let based = pg_bytes_to_value(b"0b_10_0101", &Type::INT4).unwrap();
+        assert_eq!(based, Value::from_i64(37));
+        let based = pg_bytes_to_value(b"0x_1EEE_FFFF", &Type::INT4).unwrap();
+        assert_eq!(based, Value::from_i64(518979583));
+        for bad in [&b"_100"[..], b"0x_", b"0b__1", b"0o_", b"100_"] {
+            assert_eq!(
+                code(bad, &Type::INT4).as_deref(),
+                Some("22P02"),
+                "{:?}",
+                std::str::from_utf8(bad)
+            );
+        }
+    }
+
     #[test]
     fn test_pg_bytes_to_value_bool() {
         let val = pg_bytes_to_value(b"t", &Type::BOOL).unwrap();
