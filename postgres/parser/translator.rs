@@ -1572,6 +1572,27 @@ impl PostgreSQLTranslator {
                         "INSERT has more expressions than target columns".into(),
                     ));
                 }
+            } else if let Some(declared) = self
+                .columns
+                .is_some()
+                .then(|| self.columns_of(relation))
+                .flatten()
+                .filter(|declared| width != declared.len())
+            {
+                // A positional list of another length than the table's (the session asks again with
+                // the lookup once the engine refused it): a shorter one fills the leading columns,
+                // the rest taking their defaults, as in PostgreSQL; a longer one is its 42601.
+                if width > declared.len() {
+                    return Err(ParseError::ParseError(
+                        "INSERT has more expressions than target columns".into(),
+                    ));
+                }
+                columns = declared
+                    .iter()
+                    .take(width)
+                    .map(|c| ast::Name::from_string(c))
+                    .collect();
+                has_explicit_columns = true;
             } else if default_in_every_row(&select_stmt.values_lists) {
                 // A positional list's DEFAULT position is dropped by naming the columns it stands
                 // for, the table's first `width` columns; dropped unnamed, the later values moved

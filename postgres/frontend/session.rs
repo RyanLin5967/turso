@@ -897,10 +897,25 @@ fn prepare_statement_checked(
         }
     };
     if !performs {
-        return pg_conn
+        let prepared = pg_conn
             .conn
-            .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
-            .map(Some);
+            .prepare_translated_cmd_with_options(translated.cmd, sql, &options);
+        // A positional INSERT whose VALUES lists are of another length than the table's is refused
+        // by the engine, which takes only the full length; PostgreSQL fills a shorter list's
+        // leading columns. Asked again, the translator reads the table's columns and names them, on
+        // this refusal path only, so a positional INSERT that fits pays for no lookup.
+        if prepared.is_err() && is_positional_insert_values(&parse_result) {
+            let lookup_conn = pg_conn.clone();
+            let retried = PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| relation_columns(&lookup_conn, schema, table))
+                .translate_with_prereqs(&parse_result)
+                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            return pg_conn
+                .conn
+                .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
+                .map(Some);
+        }
+        return prepared.map(Some);
     }
     // Performed here, whole, in a transaction of its own (own_transaction): the prerequisites, the
     // statement, and for a table with foreign keys their resolution (42830 if one does not
@@ -2294,15 +2309,16 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
 fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
-    use turso_pg_parser::pg_query::protobuf::node::Node;
-    use turso_pg_parser::pg_query::NodeRef;
-    if !sql
-        .as_bytes()
+    sql.as_bytes()
         .windows(7)
         .any(|w| w.eq_ignore_ascii_case(b"default"))
-    {
-        return false;
-    }
+        && is_positional_insert_values(parse)
+}
+
+/// Whether the statement holds an INSERT with no column list whose body is VALUES lists.
+fn is_positional_insert_values(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    use turso_pg_parser::pg_query::NodeRef;
     parse.protobuf.nodes().iter().any(|(n, ..)| match n {
         NodeRef::InsertStmt(i) if i.cols.is_empty() => {
             matches!(
