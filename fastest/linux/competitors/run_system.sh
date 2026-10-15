@@ -948,6 +948,31 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
     fi
   done
   expect "warm-up plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
+  # Comp review 1 LOW 22: the delete's durability is checked, at C=1 where the flushes split by op phase -- a D2
+  # delete (clonebench --drop under --sync d2: the unlinks and an fsync of the branch directory) flushes at least once
+  # per cycle, a D0 one never. Each sync's traced run is judged as itself (ok) and as the other (refused).
+  local dsync dpd dv
+  for dsync in d2 d0; do
+    dpd="$RAW/plants/delete-$dsync"
+    mkdir -p "$dpd"
+    strace_run "$dpd/load" timeout 120 "$CB" run --mode b1 --op m1c --sync "$dsync" --parent "$ROOT/parent.db" \
+      --dir "$ROOT/branches/prebranch" --clients 1 --max-ops 20 --rows "$ROWS" --warmup 0:0:0 --max-window-s 60 \
+      --drop --out "$dpd/bb" >"$dpd/bb.txt" 2>&1 || fail "delete plant $dsync: clonebench rc ($(tail -1 "$dpd/bb.txt"))"
+    CPHASES="$dpd/bb/raw.tsv" count "$dpd/load"
+    for dv in d2 d0; do
+      python3 "$SC" cell --name "plant/delete-$dsync-as-$dv" --load "$dpd/load.json" --idle none --load-s 1 --idle-s 0 \
+        --ops 20 --ops-ok 20 --delete-durable "$dv" >"$dpd/cell-as-$dv.json" 2>&1
+      if [ "$dsync" = "$dv" ]; then
+        expect "delete plant: a $dsync delete judged $dv (verdict)" "$(jf "$dpd/cell-as-$dv.json" verdict)" ok
+      else
+        case $(jf "$dpd/cell-as-$dv.json" verdict) in
+          "NOT CLEAN"*delete*) pass "delete plant: a $dsync delete judged $dv is refused" ;;
+          *) fail "delete plant: a $dsync delete judged $dv: verdict [$(jf "$dpd/cell-as-$dv.json" verdict)] (want NOT CLEAN on its delete)" ;;
+        esac
+      fi
+    done
+  done
+  expect "delete plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
   if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \

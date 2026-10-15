@@ -841,6 +841,28 @@ def selftest():
            (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")) == (1.3333, 0.6667, 0.3333,
                                                                                                0.3333),
            (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")))
+        # comp review 1 LOW 22: a cell names its delete's durability (delete-durable): a D2 delete must flush at least
+        # once per cycle in the delete phase, a D0 one never. The plant's delete phase holds 1 flush over 3 cycles.
+        for dd, want, why in (("d2", False, "delete not durable"), ("d0", False, "a D0 delete flushed")):
+            cd = cell({"name": "plant/dd", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                       "delete-durable": dd})
+            ok(f"delete-durable {dd}: 1 delete-phase flush over 3 cycles is refused ({why})",
+               cd.get("verdict", "").startswith("NOT CLEAN") and why in cd.get("verdict", ""), cd.get("verdict"))
+        r3d = dict(r, flush_by_phase={"create": 2, "delete": 3, "between": 1})
+        json.dump(r3d, open(lj + ".d2", "w"))
+        cd = cell({"name": "plant/dd2", "load": lj + ".d2", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d2"})
+        ok("control: delete-durable d2 with one delete-phase flush per cycle is ok", cd.get("verdict") == "ok",
+           cd.get("verdict"))
+        r0d = dict(r, flush_by_phase={"create": 2, "delete": 0, "between": 1})
+        json.dump(r0d, open(lj + ".d0", "w"))
+        cd = cell({"name": "plant/dd0", "load": lj + ".d0", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d0"})
+        ok("control: delete-durable d0 with no delete-phase flush is ok", cd.get("verdict") == "ok", cd.get("verdict"))
+        cd = cell({"name": "plant/ddx", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d1"})
+        ok("a delete-durable that is neither d2, d0 nor none is refused", cd.get("verdict", "").startswith("REFUSED"),
+           cd.get("verdict"))
         r2 = count(tr, [], "/x", w)
         ok("no split unless asked", "flush_by_phase" not in r2, r2.get("flush_by_phase"))
         open(p, "w").write(raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)]))
