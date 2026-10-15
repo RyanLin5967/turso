@@ -4568,6 +4568,7 @@ fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
 /// Minimum 2; the engine issues 2. Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
 #[cfg(target_vendor = "apple")]
 #[test]
+#[ignore = "SUPERSEDED by the D1 derivation, DECISIONS 2026-10-15T19:12:48Z"]
 fn a_d1_open_makes_two_plain_fsyncs() {
     if in_child() {
         return;
