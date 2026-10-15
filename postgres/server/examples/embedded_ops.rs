@@ -160,14 +160,13 @@ fn run(conn: &PgConnection, sql: &str) {
 
 fn main() {
     let a = args();
+    // The server's options (database_opts), less the tursopg binary's `turso_cli()`, which exists
+    // only under core's cli_only feature (this crate does not enable it, so the call did not
+    // compile: the cloud's all-targets build at abefd2e71) and only allows loading extensions,
+    // which no operation measured here does.
     let opts = turso_pg_server::database_opts(a.branches);
-    let (_io, db) = turso_pg::open_database(
-        &a.db,
-        None,
-        turso_core::OpenFlags::default(),
-        opts.turso_cli(),
-    )
-    .unwrap();
+    let (_io, db) =
+        turso_pg::open_database(&a.db, None, turso_core::OpenFlags::default(), opts).unwrap();
     // The session's trunk connection, as a server session opens it.
     let trunk = PgConnection::new(db.connect().unwrap());
     turso_pg::attach_schema_files(&trunk, &a.db);
