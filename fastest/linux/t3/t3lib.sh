@@ -74,7 +74,9 @@
 #                                       (sut) by FASTEST_CELL in /proc/PID/environ, which is the environment at exec,
 #                                       so a sweeper forked straight from t3run's shell would read as foreign while the
 #                                       competitors' (inside the exec'd run_system.sh) reads as sut. t3run calls this.
-#                                       Returns 2, CMD never run, when gates/sweeper.sh is not there
+#                                       Returns 2, CMD never run, when gates/sweeper.sh is not there or fails to source.
+#                                       Blind spot, stated: a CMD that itself exits 2 reads as rc 2 too; adapter.txt's
+#                                       REFUSED line tells them apart (summarize marks either as no result)
 #   ours_timed_record D READER          D/timed.json from D/timed.window and READER's (sweeper_record.py) reading of
 #                                       D/timed.tracer.tsv over [t0, t1]: sweeper_cpu_s and the reader's other fields,
 #                                       sweeper_window "process"; on a missing window or a refused record,
@@ -284,7 +286,9 @@ ours_timed_run() { # ours_timed_run D CMD...
 ours_timed_exec() { # ours_timed_exec D CMD...
   local sw=$T3LIB_DIR/../gates/sweeper.sh
   [ -f "$sw" ] || { echo "REFUSED: no shared sweeper at $sw: ours' timed run would go unswept"; return 2; }
-  bash -c 'source "$1" && source "$2" && shift 2 && ours_timed_run "$@"' ours-timed "$sw" "$T3LIB_DIR/t3lib.sh" "$@"
+  bash -c 'source "$1" || { echo "REFUSED: $1 failed to source"; exit 2; }
+           source "$2" || { echo "REFUSED: $2 failed to source"; exit 2; }
+           shift 2; ours_timed_run "$@"' ours-timed "$sw" "$T3LIB_DIR/t3lib.sh" "$@"
 }
 
 ours_timed_record() { # ours_timed_record D READER
