@@ -704,7 +704,8 @@ pub fn emit_upsert(
             });
             // A NOT NULL rowid alias (fastest-engine 4c): DO UPDATE SET key = NULL raises the NOT
             // NULL constraint rather than MustBeInt's "datatype mismatch". DO UPDATE runs with
-            // ABORT semantics, as the NOT NULL check above does.
+            // ABORT semantics, as the NOT NULL check above does, so the alias's own NOT NULL
+            // conflict clause is not read here, on purpose (engine review 20 LOW 26).
             // Mutant `null_key_upsert_unchecked` (test builds only; engine review 20 LOW 26): this
             // path alone unchecked.
             if ctx.table.rowid_alias_refuses_null() && !crate::branch::store::fe_mutant("null_key_upsert_unchecked") {
