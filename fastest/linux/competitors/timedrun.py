@@ -362,7 +362,7 @@ RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
 
 
-def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100"):
+def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children"):
     """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX" line per
     sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every 0.05 s
     to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]."""
@@ -462,7 +462,7 @@ def selftest():
          dict(tracer=trace_rec(sw[:6] + [("end", 100.28, 0, 0, 12, 0)])), False),
         ("B1: no server role; the command's tree sampled throughout",
          dict(tracer=trace_rec([(p, t, n, m, 0, 0) for p, t, n, m, _, _ in sw] + [("end", 100.45, 0, 0, 0, 0)],
-                               roles="cmd=500 srv=none")), True),
+                               roles="cmd=500 srv=none tree=children")), True),
         ("a server role whose start sweep found no task",
          dict(tracer=trace_rec([("start", 100.0, 3, 0, 0, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
         ("no roles header", dict(tracer="".join(ln for ln in clean.splitlines(True) if not ln.startswith("roles"))),
