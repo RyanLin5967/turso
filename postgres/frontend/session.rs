@@ -837,11 +837,12 @@ fn prepare_statement_checked(
     }
 
     // A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
-    // item 7); no other statement pays for the lookup.
-    let translator = if is_delete_using(&parse_result) {
-        let conn = pg_conn.conn.clone();
+    // item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21); a translator with no
+    // lookup refuses one. No other statement pays for the lookup.
+    let translator = if is_delete_using(sql, &parse_result) {
+        let pg_conn = pg_conn.clone();
         PostgreSQLTranslator::new()
-            .with_columns(move |schema, table| relation_columns(&conn, schema, table))
+            .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
     } else {
         PostgreSQLTranslator::new()
     };
@@ -2258,31 +2259,55 @@ fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Resul
     )))
 }
 
-/// Whether `parse` is one DELETE ... USING (its rewrite reads the relations' declared columns).
-fn is_delete_using(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
-    use turso_pg_parser::pg_query::protobuf::node::Node;
-    matches!(
-        parse.protobuf.stmts.as_slice(),
-        [raw] if matches!(
-            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
-            Some(Node::DeleteStmt(d)) if !d.using_clause.is_empty()
-        )
-    )
+/// Whether `parse` holds a DELETE ... USING anywhere (its rewrite reads the relations' declared
+/// columns): the statement itself, EXPLAIN's, a CTE's. The text is read for the word first, so any
+/// other statement pays one byte scan and no tree walk.
+fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::NodeRef;
+    if !sql
+        .as_bytes()
+        .windows(5)
+        .any(|w| w.eq_ignore_ascii_case(b"using"))
+    {
+        return false;
+    }
+    parse
+        .protobuf
+        .nodes()
+        .iter()
+        .any(|(n, ..)| matches!(n, NodeRef::DeleteStmt(d) if !d.using_clause.is_empty()))
 }
 
-/// The columns `table` declares: from the connection's schema for public (or no schema), from the
-/// attached schema's table_info otherwise; None for a relation it cannot read (a view, one that
-/// does not exist).
-fn relation_columns(conn: &Arc<Connection>, schema: &str, table: &str) -> Option<Vec<String>> {
+/// The columns `table` declares, from the table the engine reads under the name: an unqualified
+/// name through the session's search path (the first schema on it that holds the table; public,
+/// or no path, is main), public from the connection's schema, another schema from its attached
+/// table_info. None for a relation it cannot read (a view, one that does not exist). An
+/// unqualified name read public's table whatever the path (wire review 16 item 21).
+fn relation_columns(
+    pg_conn: &Arc<PgConnectionInner>,
+    schema: &str,
+    table: &str,
+) -> Option<Vec<String>> {
     use turso_pg_parser::SchemaQualifier;
-    match turso_pg_parser::schema_qualifier(schema) {
-        SchemaQualifier::Unqualified | SchemaQualifier::Main => conn
-            .current_schema()
+    let conn = &pg_conn.conn;
+    let main = || {
+        conn.current_schema()
             .get_btree_table(table)
-            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect()),
-        _ => get_table_columns(conn, table, Some(schema))
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+    };
+    let attached = |schema: &str| {
+        get_table_columns(conn, table, Some(schema))
             .ok()
-            .filter(|columns| !columns.is_empty()),
+            .filter(|columns| !columns.is_empty())
+    };
+    match turso_pg_parser::schema_qualifier(schema) {
+        SchemaQualifier::Main => main(),
+        SchemaQualifier::Unqualified => match schema_on_search_path(pg_conn, table) {
+            Ok(Some(database)) if database != "main" => attached(&database),
+            Ok(_) => main(),
+            Err(_) => None,
+        },
+        _ => attached(schema),
     }
 }
 

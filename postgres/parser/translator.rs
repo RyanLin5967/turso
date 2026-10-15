@@ -1794,6 +1794,15 @@ impl PostgreSQLTranslator {
                     "table name \"{target}\" specified more than once"
                 )));
             }
+            // With no column lookup (core's dialect parse) the target's row has no name that is
+            // known not to be a declared column: refused, never the bare rowid a declared column
+            // of that name shadows (wire review 16 item 21; review 13 item 5's bug).
+            if self.columns.is_none() {
+                return Err(ParseError::ParseError(
+                    "DELETE ... USING is not supported here: the target's columns cannot be read"
+                        .into(),
+                ));
+            }
             let target_columns = self.columns_of(relation);
             let mut using = Vec::new();
             for item in &delete.using_clause {
@@ -6114,19 +6123,33 @@ fn select_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<St
             if !t.name.is_empty() {
                 return Some(t.name.clone());
             }
-            match t.val.as_deref().and_then(|v| v.node.as_ref()) {
-                Some(Node::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
-                    Some(Node::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                },
-                Some(Node::FuncCall(f)) => match f.funcname.last().and_then(|n| n.node.as_ref()) {
-                    Some(Node::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                },
-                _ => Some("?column?".to_string()),
-            }
+            t.val.as_deref().and_then(output_name)
         })
         .collect()
+}
+
+/// The name PostgreSQL gives an unaliased output (FigureColname), for the forms read here: a
+/// column reference's last name, a function's name, a cast's argument's name, else the type's.
+/// None for any other expression, so its relation's columns count as unknown and a bare name over
+/// them is refused rather than resolved: every other output was named `?column?`, which PostgreSQL
+/// gives only some (`SELECT id::int` is `id` there; wire review 16 item 21).
+fn output_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    let last = |names: &[pg_query::protobuf::Node]| match names.last().and_then(|n| n.node.as_ref())
+    {
+        Some(Node::String(s)) => Some(s.sval.clone()),
+        _ => None,
+    };
+    match node.node.as_ref()? {
+        Node::ColumnRef(c) => last(&c.fields),
+        Node::FuncCall(f) => last(&f.funcname),
+        Node::TypeCast(c) => c
+            .arg
+            .as_deref()
+            .and_then(output_name)
+            .or_else(|| c.type_name.as_ref().and_then(|t| last(&t.names))),
+        _ => None,
+    }
 }
 
 /// A DELETE ... USING's RETURNING, resolved as PostgreSQL resolves it, over the target and the
