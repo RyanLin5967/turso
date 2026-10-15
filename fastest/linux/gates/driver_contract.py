@@ -22,6 +22,8 @@ swaps S and MAX_S, stops at once, or splits T into T+1 ops fails the job, not on
 import json
 import sys
 
+# Database::branch_exception_counters(), in its order (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z)
+EXC = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
 SLACK = 0.5  # seconds past MAX_S a stop may land: the next claim after a cycle in flight, plus a loaded runner's delay
 
 
@@ -80,6 +82,55 @@ def check(j, t, c, rule, by_client=None):
             bad.append(f"not capped, stopped at {st} s before S {s}: only MAX_S ends a warm-up before S")
         if cap and oa >= ops and st >= s + 1e-3:
             bad.append(f"capped, but OPS {ops} and S {s} were both met ({oa} ops at {st} s): done is not capped")
+    # review 5 MED 8 (the driver half): the warm-up's clock starts after every client is ready (bbload's g_t0)
+    rd = w.get("t0_after_ready_ns")
+    if type(rd) is not int or rd < 0:
+        bad.append(f"warmup.t0_after_ready_ns {rd!r}: the warm-up's start must follow the last client's ready (an int "
+                   ">= 0 ns), so no connect or setup counts as warm-up")
+    return bad + stamp_problems(j)
+
+
+STAMP_SLACK_S = 0.05  # a window's realtime span vs its monotonic secs: two clocks read a few calls apart
+
+
+def stamp_problems(j):
+    """The MED 12 ruling's window stamps: every window's realtime bounds (CLOCK_REALTIME, as the shared sweeper's
+    EPOCHREALTIME), opening at or after the previous one closed, each span within STAMP_SLACK_S of its secs, and the
+    run's measured span tm0/tm1_realtime_s (the competitors' names) from the first window's open to the last's close."""
+    wins = j.get("windows")
+    if not isinstance(wins, list) or not wins:
+        return ["no windows: the measured span has no realtime bounds"]
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    bad, prev = [], None
+    for i, w in enumerate(wins):
+        a, b, secs = (w.get(k) if isinstance(w, dict) else None for k in ("t0_realtime_s", "t1_realtime_s", "secs"))
+        name = w.get("window") if isinstance(w, dict) else f"#{i}"
+        if not (num(a) and num(b) and num(secs)):
+            bad.append(f"window {name}: realtime bounds {a!r}, {b!r} and secs {secs!r} are not all numbers")
+            prev = None
+        else:
+            if b < a:
+                bad.append(f"window {name}: closes at {b} before it opens at {a}")
+            elif abs((b - a) - secs) > STAMP_SLACK_S:
+                bad.append(f"window {name}: realtime span {b - a:.6f} s vs secs {secs} (over {STAMP_SLACK_S} s apart)")
+            if prev is not None and a < prev:
+                bad.append(f"window {name}: opens at {a} before the previous window closed at {prev}")
+            prev = b
+        # the engine's four branch exception counters at the window's open and close (routing ruling 05:16:51Z)
+        ec = w.get("exception_counters") if isinstance(w, dict) else None
+        if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
+            bad.append(f"window {name}: no exception_counters {{before, after}} (Database::branch_exception_counters())")
+        else:
+            for k in EXC:
+                x, y = ec["before"].get(k), ec["after"].get(k)
+                if type(x) is not int or type(y) is not int or x < 0 or y < x:
+                    bad.append(f"window {name}: exception counter {k} before {x!r} after {y!r}: not two non-negative "
+                               "ints, never going back")
+    first, last = wins[0], wins[-1]
+    for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
+                    ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):
+        if not num(j.get(k)) or j.get(k) != want:
+            bad.append(f"{k} {j.get(k)!r}, want {want!r} (the measured span's bound)")
     return bad
 
 
@@ -87,14 +138,36 @@ def self_test():
     # TEST EDIT, flagged (review 5 LOW 15): ot defaults to oa. It was 5010 beside oa 5000, and two cases gave 40 beside
     # 12: a completion-counting driver's numbers, which A23's claim count cannot produce. No expectation changes.
     def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=None, by=None, per="auto", wpc=None,
-            capped=True):
+            capped=True, ready=1500, wins="auto", tm=("auto", "auto")):
         ot = oa if ot is None else ot
         by = by if by is not None else split(t, c)
-        return {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
-                "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
-                "warmup_per_client": wpc, "warmup_rule": rule,
-                "warmup": {"rule": rule, "ops_at_stop": oa, "ops": ot, "stop_secs": st, "drain_secs": dr,
-                           "secs": round(st + dr, 3), "capped": capped}}
+        # TEST EDIT, flagged (review 5 MED 8's driver half; the MED 12 ruling's window stamps): the record gains the
+        # warm-up's start after the last client was ready (t0_after_ready_ns) and each window's realtime bounds with
+        # the run's measured span (tm0/tm1_realtime_s), new required fields at passing values; no expectation changes
+        if wins == "auto":
+            # TEST EDIT, flagged (the lead's routing ruling 05:16:51Z): each window also carries the engine's four
+            # branch exception counters read at its open and close, at passing values
+            ec = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+            wins = [{"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5,
+                     "exception_counters": ec},
+                    {"window": "connect", "secs": 0.25, "t0_realtime_s": 1000.6, "t1_realtime_s": 1000.85,
+                     "exception_counters": ec}]
+        r = {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
+             "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
+             "warmup_per_client": wpc, "warmup_rule": rule,
+             "warmup": {"rule": rule, "ops_at_stop": oa, "ops": ot, "stop_secs": st, "drain_secs": dr,
+                        "secs": round(st + dr, 3), "capped": capped}, "windows": wins}
+        if ready is not None:
+            r["warmup"]["t0_after_ready_ns"] = ready
+        for k, v, x in (("tm0_realtime_s", tm[0], 0), ("tm1_realtime_s", tm[1], -1)):
+            if v == "auto":
+                v = wins[x]["t0_realtime_s" if x == 0 else "t1_realtime_s"] if wins else None
+            if v is not None:
+                r[k] = v
+        return r
+
+    EC = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+    W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5, "exception_counters": EC}
 
     cases = [
         ("a run to MAX_S with T=33 over 4 clients keeps the contract", check(rec(), 33, 4, "1000000:0:2") == []),
@@ -140,6 +213,50 @@ def self_test():
          check(rec(rule="10:5:2", st=2.0, oa=12, capped=False), 33, 4, "10:5:2") != []),
         ("LOW 15: MAX_S below S, OPS met, capped keeps the contract (done needs S too)",
          check(rec(rule="10:5:2", st=2.0, oa=12, capped=True), 33, 4, "10:5:2") == []),
+        # review 5 MED 8 (the driver half): the warm-up's clock starts only after every client is ready, as bbload's
+        # g_t0 does, so no client's connect or setup counts as warm-up: t0 minus the last client's ready, in ns, >= 0
+        ("MED 8: a warm-up record with no t0_after_ready_ns fails", check(rec(ready=None), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0 before the last client was ready (-5 ns) fails", check(rec(ready=-5), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0_after_ready_ns as a bool fails", check(rec(ready=True), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0 exactly at the last ready (0 ns) keeps the contract", check(rec(ready=0), 33, 4, "1000000:0:2") == []),
+        # the MED 12 ruling's window stamps: each window's realtime bounds and the run's measured span, so ours' timed
+        # run is judged over its measured windows as the competitors' is (tm0/tm1_realtime_s, their names)
+        ("stamps: no windows fails", check(rec(wins=[]), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window without t0_realtime_s fails",
+         check(rec(wins=[{k: v for k, v in W0.items() if k != "t0_realtime_s"}], tm=(1000.0, 1000.5)), 33, 4,
+               "1000000:0:2") != []),
+        ("stamps: a window closing before it opens fails",
+         check(rec(wins=[W0 | {"t1_realtime_s": 999.5, "secs": -0.5}], tm=(1000.0, 999.5)), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window opening before the previous one closed fails",
+         check(rec(wins=[W0, W0 | {"window": "connect", "t0_realtime_s": 1000.4, "t1_realtime_s": 1000.9}]), 33, 4,
+               "1000000:0:2") != []),
+        ("stamps: tm0_realtime_s other than the first window's open fails",
+         check(rec(tm=(999.0, "auto")), 33, 4, "1000000:0:2") != []),
+        ("stamps: tm1_realtime_s other than the last window's close fails",
+         check(rec(tm=("auto", 1001.0)), 33, 4, "1000000:0:2") != []),
+        ("stamps: no tm1_realtime_s fails", check(rec(tm=("auto", None)), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window whose realtime span (0.5 s) disagrees with its secs (0.2) by over 0.05 s fails",
+         check(rec(wins=[W0 | {"secs": 0.2}]), 33, 4, "1000000:0:2") != []),
+        # the lead's routing ruling (DECISIONS 2026-10-15T05:16:51Z): every run records the engine's four branch exception
+        # counters (Database::branch_exception_counters()) at each window's open and close, as non-negative ints; the
+        # record is the driver's contract, a nonzero delta is summarize's to label (here a moved counter still keeps it)
+        ("counters: a window without exception_counters fails",
+         check(rec(wins=[{k: v for k, v in W0.items() if k != "exception_counters"}]), 33, 4, "1000000:0:2") != []),
+        ("counters: a window whose after lacks compaction_waits fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": {k: 7 for k in EXC[:3]}}}]), 33, 4, "1000000:0:2") != []),
+        ("counters: a counter that is a string fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"hardcap_upgrades": "7"}}}]), 33, 4,
+               "1000000:0:2") != []),
+        ("counters: a counter that went backwards (7 -> 6) fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"compaction_waits": 6}}}]), 33, 4,
+               "1000000:0:2") != []),
+        ("counters: a counter that moved (7 -> 9) keeps the contract (summarize labels the cell)",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"compaction_waits": 9}}}]), 33, 4,
+               "1000000:0:2") == []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:

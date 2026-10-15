@@ -65,10 +65,9 @@
 #                                       start sweep, stamps t0, runs CMD, stamps t1, so the start sweep is at or before
 #                                       t0 and the end sweep (after the wrapper is reaped) at or after t1.
 #                                       D/timed.window: "t0=T t1=T rc=R". Returns CMD's rc; 2, with CMD never run,
-#                                       when the sweeper is not sourced or its start sweep never came. Blind spot,
-#                                       stated: the window is fastest_profile's whole process (setup and warm-up
-#                                       included), not the measured windows it times, as the competitors' window is;
-#                                       those realtime bounds are fastest_profile's to stamp (Rust, HELD: LOUD-OWED)
+#                                       when the sweeper is not sourced or its start sweep never came. That window is
+#                                       the wrapper's PROCESS window; the sweeper's cost is read over the measured span
+#                                       inside it (ours_timed_record), as the competitors' is
 #   ours_timed_exec D CMD...            ours_timed_run in an EXEC'D bash that sources gates/sweeper.sh (beside this
 #                                       file's t3/) and this file: foreign_cpu.py classes a process as the run's own
 #                                       (sut) by FASTEST_CELL in /proc/PID/environ, which is the environment at exec,
@@ -77,10 +76,13 @@
 #                                       Returns 2, CMD never run, when gates/sweeper.sh is not there or fails to source.
 #                                       Blind spot, stated: a CMD that itself exits 2 reads as rc 2 too; adapter.txt's
 #                                       REFUSED line tells them apart (summarize marks either as no result)
-#   ours_timed_record D READER          D/timed.json from D/timed.window and READER's (sweeper_record.py) reading of
-#                                       D/timed.tracer.tsv over [t0, t1]: sweeper_cpu_s and the reader's other fields,
-#                                       sweeper_window "process"; on a missing window or a refused record,
-#                                       sweeper_cpu_s null and sweeper_refused the reason, and rc 1
+#   ours_timed_record D READER          D/timed.json: READER's (sweeper_record.py) reading of D/timed.tracer.tsv over
+#                                       fastest_profile's MEASURED span (D/result/summary.json tm0/tm1_realtime_s, since
+#                                       bb96279f3; the competitors' names), which must lie inside the process window of
+#                                       D/timed.window (kept as process_t0/process_t1, with its rc): sweeper_cpu_s and
+#                                       the reader's other fields, sweeper_window "measured"; on a missing window or
+#                                       span, a span outside it, or a refused record, sweeper_cpu_s null and
+#                                       sweeper_refused the reason, and rc 1
 
 T3LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -297,17 +299,30 @@ import json, os, sys
 d, reader = sys.argv[1:3]
 sys.path.insert(0, os.path.dirname(os.path.abspath(reader)))
 import sweeper_record  # noqa: E402
-rec = {"system": "ours", "sweeper_window": "process", "t0": None, "t1": None, "rc": None, "sweeper_cpu_s": None,
-       "sweeper_cpu_span_s": None, "sweeper_nice": None, "sweeper_clk_tck": None, "sweeper_refused": None}
+rec = {"system": "ours", "sweeper_window": "measured", "t0": None, "t1": None, "process_t0": None, "process_t1": None,
+       "rc": None, "sweeper_cpu_s": None, "sweeper_cpu_span_s": None, "sweeper_nice": None, "sweeper_clk_tck": None,
+       "sweeper_refused": None}
 try:
     w = open(os.path.join(d, "timed.window")).read().split()
 except OSError:
     w = []
 kv = dict(x.split("=", 1) for x in w if "=" in x)
 try:
-    rec["t0"], rec["t1"], rec["rc"] = float(kv["t0"]), float(kv["t1"]), int(kv["rc"])
+    rec["process_t0"], rec["process_t1"], rec["rc"] = float(kv["t0"]), float(kv["t1"]), int(kv["rc"])
 except (KeyError, ValueError):
     rec["sweeper_refused"] = f"no timed window in timed.window ({' '.join(w)!r})"
+if rec["sweeper_refused"] is None:
+    try:
+        sj = json.load(open(os.path.join(d, "result", "summary.json")))
+        tm = (float(sj["tm0_realtime_s"]), float(sj["tm1_realtime_s"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        tm = None
+        rec["sweeper_refused"] = "result/summary.json carries no tm0_realtime_s/tm1_realtime_s: no measured span"
+    if tm is not None and not rec["process_t0"] <= tm[0] <= tm[1] <= rec["process_t1"]:
+        rec["sweeper_refused"] = (f"the measured span {tm} lies outside the process window "
+                                  f"{(rec['process_t0'], rec['process_t1'])}")
+    elif tm is not None:
+        rec["t0"], rec["t1"] = tm
 if rec["sweeper_refused"] is None:
     try:
         lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()

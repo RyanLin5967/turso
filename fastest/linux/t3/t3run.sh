@@ -24,8 +24,8 @@
 #              does not yet mean an equal warm-up in the credited runs
 #              Every timed run, ours and the competitors', runs under the ONE shared tracer sweeper (gates/sweeper.sh,
 #              read by gates/sweeper_record.py; the lead's MED 12 ruling): ours through t3lib.sh ours_timed_exec, its
-#              timed.json recording sweeper_cpu_s over fastest_profile's whole process (its measured windows' realtime
-#              bounds are Rust, HELD: LOUD-OWED, and no ours-vs-competitor timed ratio credits until then)
+#              timed.json recording sweeper_cpu_s over fastest_profile's measured span (its summary.json
+#              tm0/tm1_realtime_s, as the competitors' timed runs record theirs)
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
