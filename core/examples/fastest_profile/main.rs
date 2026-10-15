@@ -719,18 +719,22 @@ fn main() {
         for w in &windows_wanted {
             let s0 = engine_syncs();
             let r0 = retries();
-            fence.begin(w);
-            if tp0.is_none() && windows.is_empty() {
+            // the TracerPid reads sit outside every window's fences (no counted or marked syscall), the first before
+            // the first window opens and the last after the last one closes
+            if windows.is_empty() {
                 tp0 = Some(tracer_pid());
             }
+            fence.begin(w);
             let rt0 = realtime_s();
             let t = Instant::now();
             gate.wait(); // every client starts the window
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
             let rt1 = realtime_s();
-            tp1 = Some(tracer_pid());
             fence.end(w);
+            if windows.len() + 1 == windows_wanted.len() {
+                tp1 = Some(tracer_pid());
+            }
             let s1 = engine_syncs();
             if s1.is_empty() || s1.len() != s0.len() {
                 not_a_result(&format!("engine sync counters unreadable: {:?}", sync_counts()));

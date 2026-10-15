@@ -1168,7 +1168,7 @@ def self_test():
          and any("saw a TracerPid" in x for x in s["parity_refusals"])),
         ("MED 12 fix 1: ours whose sweeps leave a 0.45 s gap fails, naming the gap", {"ours_sweeper": "gap"}, False,
          lambda s: any("stretch with no sweep" in x for x in s["parity_refusals"])),
-        ("MED 12 fix 1: the clean ours record raises no tracer refusal (its TracerPid at tm0/tm1 is not asked of ours)",
+        ("MED 12 fix 1: the clean ours record raises no tracer refusal (its own TracerPid 0 at tm0 and tm1)",
          {}, True, lambda s: not any("tracer" in x.lower() for x in s["parity_refusals"])),
         ("MED 12 fix 3: ours whose timed.json window is not its timed.window fails", {"ours_sweeper": "window"}, False,
          lambda s: any("timed.window" in x for x in s["parity_refusals"])),
