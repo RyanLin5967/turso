@@ -1195,8 +1195,12 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
             group.write_confirm(&confirm, false);
         }
+        // Mutant `confirm_word_log_off` (test builds only): the word goes unlogged (the instrument's
+        // fire-check: confirm_load must refuse the cell).
         #[cfg(test)]
-        group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()).push(took);
+        if !fe_mutant("confirm_word_log_off") {
+            group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()).push(took);
+        }
         drop(confirm);
         g = group.lock();
     }
