@@ -518,7 +518,10 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
-        "percent_rank" | "cume_dist" => FLOAT8,
+        // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
+        // float by the engine (random() is not here: the engine's is SQLite's 64-bit integer).
+        "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "atan2" | "degrees" | "radians" | "pi" => FLOAT8,
         "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp" => 1184,
         _ => return None,
     })
@@ -1615,6 +1618,13 @@ impl Infer<'_> {
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
                     }
+                    // PostgreSQL has these for float8 and numeric: an integer or float argument
+                    // resolves to the float8 one (float8 is the numeric category's preferred type),
+                    // a numeric one keeps numeric, left untyped here (the engine computes a float).
+                    (
+                        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow",
+                        INT2 | INT4 | INT8 | FLOAT4 | FLOAT8,
+                    ) => Some(FLOAT8),
                     _ => None,
                 }
             }
