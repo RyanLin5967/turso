@@ -315,7 +315,7 @@ def selftest():
                 "b1": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged 0; wal_checkpoint(TRUNCATE)"}
     ev_of = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
              "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
-             "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0"}}
+             "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0", "autoindex": "0"}}
 
     def v(**kw):
         d = dict(base)
@@ -389,7 +389,13 @@ def selftest():
          [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], checkpoints="0|0|0"))], False),
         ("a system with no registered maintenance", [v(), v(system="mystery", maintenance="none")], False),
         # MED 11: the schema line is compared by itself
-        ("a system loaded another schema (INT PRIMARY KEY)", [v(), v(system="b1", schema_sha256="ee" * 32)], False),
+        # comp review 1 LOW 30: schema_sha256 hashed the generator's own CREATE line, so it could never fire; what
+        # MED 11 protects is B1's table as SQLite READS it -- id the rowid, no sqlite_autoindex_t_1 (fixture.py sqlite's
+        # evidence) -- and the generator's line is already inside gen_seed_sha256
+        ("a B1 parent whose table carries an autoindex (INT PRIMARY KEY)",
+         [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], autoindex="1"))], False),
+        ("a B1 parent with no autoindex record",
+         [v(), v(system="b1", maintenance_evidence={k: x for k, x in ev["b1"].items() if k != "autoindex"})], False),
         ("every system's registered maintenance, unaged",
          [v(), v(system="dolt"), v(system="doltgres"), v(system="b1")], True),
     ]
