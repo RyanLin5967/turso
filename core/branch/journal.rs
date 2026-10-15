@@ -1018,7 +1018,7 @@ impl Scanned {
                         if class.syncs() {
                             // The directory first, in Fsync: the log's full sync after it drains
                             // the device, both writes included (engine review 16 LOW 11).
-                            fsync_dir_of(&files.log, open_dir_class(SyncClass::FullFsync))?;
+                            fsync_dir_of(&files.log, torn_cut_dir_class())?;
                             fsync_file(&journal.file, SyncClass::FullFsync)?;
                             journal.prev_synced = true;
                         }
@@ -4526,6 +4526,18 @@ thread_local! {
 /// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
 /// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
 /// class, as before (two device flushes per syncing open).
+/// The class an open's in-place torn-tail cut syncs its directory in: Fsync, the log's F_FULLFSYNC
+/// after it draining the device (engine review 16 LOW 11). Its own mutant (engine review 20 LOW 14:
+/// `open_dir_sync_in_class` was killed by the whole-log arm alone): `torn_cut_dir_sync_in_class`
+/// (test builds only), in FullFsync, as before.
+fn torn_cut_dir_class() -> SyncClass {
+    if super::store::fe_mutant("torn_cut_dir_sync_in_class") {
+        SyncClass::FullFsync
+    } else {
+        SyncClass::Fsync
+    }
+}
+
 fn open_dir_class(class: SyncClass) -> SyncClass {
     if super::store::fe_mutant("open_dir_sync_in_class") {
         class
@@ -6078,21 +6090,27 @@ mod format_tests {
         // A hole in the last flight: it was never acknowledged, and is cut.
         overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
         let inode = std::fs::metadata(&files.log).unwrap().ino();
-        let before = super::super::sync_counts();
+        // FLAGGED TEST EDIT (engine review 20 LOW 14's expectation; for the lead's ruling): the cut is
+        // made durable by a directory sync in Fsync and then a FullFsync of the log, whose device
+        // drain covers both (engine review 16 LOW 11, accepted: one flush, not two). The old
+        // assertion, at least 2 F_FULLFSYNCs, was red since that change (artie raws l1-branch*,
+        // "1 full syncs") and held only under mutant open_dir_sync_in_class. Counted by class
+        // requested (CLASS_SYNCS) and directory (DIR_SYNCS), so it holds off Apple too.
+        let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
+        let dirs = || DIR_SYNCS.with(|c| c.get());
+        let ((fsyncs, fulls), dir) = (classes(), dirs());
         let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
-        let after = super::super::sync_counts();
+        let ((fsyncs_after, fulls_after), dir_after) = (classes(), dirs());
         assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
         drop(recovered);
         let meta = std::fs::metadata(&files.log).unwrap();
         assert_eq!(meta.ino(), inode, "the cut replaced the log instead of truncating it");
         assert_eq!(meta.len(), starts[2], "the log was not truncated at the first dropped record");
-        // F_FULLFSYNC is Apple's; elsewhere the full sync is an fsync(2).
-        let full = after.full_fsync - before.full_fsync;
-        let synced = if cfg!(target_vendor = "apple") { full } else { full + after.fsync - before.fsync };
-        assert!(
-            synced >= 2,
-            "the cut was not made durable (a full sync of the log and of its directory) before the next \
-             append: {synced} full syncs"
+        assert_eq!(
+            (fulls_after - fulls, fsyncs_after - fsyncs, dir_after - dir),
+            (1, 1, 1),
+            "the cut was not made durable (one FullFsync of the log after one Fsync of its directory) \
+             before the next append: (FullFsync, Fsync, directory) syncs"
         );
         assert_eq!(end_tags(&files), (true, false), "the cut retagged synced flights as unsynced");
     }
