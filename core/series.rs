@@ -318,6 +318,26 @@ mod tests {
         }
     }
     // Helper function to collect all values from a cursor, returns Result with error code
+    /// The crash batch (lead, 2026-10-15): an infinite bound saturated to i64::MAX/MIN, so an
+    /// infinite stop generated ~10^18 rows (a session thread spun) and an infinite step one row.
+    /// PostgreSQL refuses each with 22023; here the filter refuses (OutOfRange) every non-finite
+    /// float bound, start, stop or step, before any row.
+    #[test]
+    fn an_infinite_bound_is_refused_before_any_row() {
+        let tbl = GenerateSeriesTable {};
+        for (at, bad) in [(0usize, f64::NEG_INFINITY), (1, f64::INFINITY), (2, f64::INFINITY), (1, f64::NEG_INFINITY)] {
+            let mut args = vec![Value::from_integer(0), Value::from_integer(100), Value::from_integer(10)];
+            args[at] = Value::from_float(bad);
+            let mut cursor = tbl.open(None).unwrap();
+            let rc = cursor.filter(&args, Some(("idx", 1 | 2 | 4)));
+            assert_eq!(rc, ResultCode::OutOfRange, "argument {at} = {bad}: {rc:?}");
+        }
+        // A finite float bound still truncates as before.
+        let mut cursor = tbl.open(None).unwrap();
+        let args = vec![Value::from_integer(1), Value::from_float(3.5), Value::from_integer(1)];
+        assert_eq!(cursor.filter(&args, Some(("idx", 1 | 2 | 4))), ResultCode::OK);
+    }
+
     fn collect_series(series: Series) -> Result<Vec<i64>, ResultCode> {
         let tbl = GenerateSeriesTable {};
         let mut cursor = tbl.open(None)?;

@@ -329,3 +329,44 @@ fn every_depth_of_a_view_chain_answers_or_is_refused_never_overflows() {
         });
     }
 }
+
+/// `generate_series` with an infinite bound (lead, 2026-10-15; the wire's red ebc1845e9 against
+/// PostgreSQL 18.6's recording pg18-gsinf): an infinite stop saturated to i64::MAX and the session
+/// thread spun through ~10^18 rows while the client got nothing more, so any client could wedge a
+/// session thread; an infinite step answered 1 row. PostgreSQL refuses each with 22023 ("stop value
+/// cannot be infinity", "step size ...", "start value ..."). Each must be refused 22023 within 10 s
+/// (a wedged session fails here at the deadline instead of hanging the test), and a finite series
+/// still answers.
+#[test]
+fn an_infinite_generate_series_bound_is_refused_22023_promptly() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            on_session(move |s| {
+                for sql in [
+                    "select * from generate_series(0::numeric, 'inf'::numeric, 10::numeric)",
+                    "select * from generate_series(1, 3, 'inf'::numeric)",
+                    "select * from generate_series('-inf'::numeric, 0, 10)",
+                ] {
+                    let got = first_error(s, sql);
+                    tx.send(Some((sql, got))).unwrap();
+                }
+                let rows = s.shared.db.connect().unwrap().prepare("select count(*) from generate_series(1, 5)").unwrap().run_collect_rows().unwrap();
+                assert_eq!(rows, vec![vec![Value::from_i64(5)]], "a finite series");
+                tx.send(None).unwrap();
+            });
+        })
+        .unwrap();
+    for _ in 0..4 {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Some((sql, got))) => match got {
+                Some((code, m)) => assert_eq!(code, "22023", "{sql}: {code} {m}"),
+                None => panic!("{sql}: answered; want 22023"),
+            },
+            Ok(None) => return,
+            Err(_) => panic!("a generate_series with an infinite bound did not answer within 10 s: the session thread is wedged"),
+        }
+    }
+    panic!("the finite control never reported");
+}
