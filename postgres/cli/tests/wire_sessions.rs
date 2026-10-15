@@ -2691,6 +2691,22 @@ fn dml_returning_is_tagged_by_its_verb() {
     }
 }
 
+/// A CREATE TABLE with a SERIAL column completes as CREATE TABLE, with no row description, on both
+/// protocols, as PostgreSQL answers it. Since 0693b6c6d performs such a CREATE at prepare (with its
+/// sequence, in one transaction) and steps a no-op, the no-op's one column made the server answer it
+/// as a query: a RowDescription, 0 rows and `SELECT 0` (found by the PostgreSQL regression corpus,
+/// uuid.out, 2026-10-15).
+#[test]
+fn a_create_table_with_a_serial_completes_as_create_table() {
+    let dir = Scratch::new("serialtag");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("CREATE TABLE s1(id SERIAL, v INT)").ok("simple");
+    assert_eq!((r.oids, r.tags), (None, vec!["CREATE TABLE".to_string()]), "simple");
+    let r = a.xt("CREATE TABLE s2(id SERIAL, v INT)", &[]).ok("extended");
+    assert_eq!((r.oids, r.tags), (None, vec!["CREATE TABLE".to_string()]), "extended");
+}
+
 /// A refused CREATE TABLE leaves nothing behind, its SERIAL column's sequence included, as in
 /// PostgreSQL: one whose key onto itself does not resolve (42830, after the CREATE), and one whose
 /// table already exists. The sequence's `CREATE SEQUENCE IF NOT EXISTS` ran and committed at prepare,
