@@ -413,13 +413,16 @@ run_server_cell() { # run_server_cell SPEC C
   # "terminating autovacuum process due to administrator command") and errors after 5 s if another backend stays
   # ("source database ... is being accessed by other users"). Those creates are FLAGGED here, not dropped.
   tail -c +$((log0 + 1)) "$DATA.log" | head -c $((log1 - log0)) >"$d/server_log_load.txt"
+  # Comp review 1 LOW 19: the per-cycle DROP runs CountOtherDBBackends too, so its terminations and busy errors are
+  # counted apart (fthelp.py pgwaits: delete_waits.txt) and only the template's flag the cell
   if [ "$KIND" = pg ]; then
     local av busy
-    av=$(grep -c 'terminating autovacuum process due to administrator command' "$d/server_log_load.txt")
-    busy=$(grep -c 'is being accessed by other users' "$d/server_log_load.txt")
-    echo "autovacuum_terminated_in_window=$av template_busy_errors=$busy" >"$d/template_waits.txt"
+    python3 -B "$HERE/fthelp.py" pgwaits "$d/server_log_load.txt" "$d/template_waits.txt" "$d/delete_waits.txt" \
+      >"$d/pgwaits.txt" 2>&1 || fail "$spec-c$c: pgwaits ($(tail -1 "$d/pgwaits.txt"))"
+    av=$(sed -n 's/.*autovacuum_terminated_in_window=\([0-9]*\).*/\1/p' "$d/template_waits.txt")
+    busy=$(sed -n 's/.*template_busy_errors=\([0-9]*\).*/\1/p' "$d/template_waits.txt")
     tw=(--template-waits "$d/template_waits.txt")
-    [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
+    [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av (unattributed included), busy-template errors $busy"
   fi
   # The TIMED run: the identical bbload command with no tracer anywhere (gate-6 review, t3run item 2; PREREG :173).
   # The labelling run above gives the flush counts, never a latency; this one gives the only latency file
@@ -438,11 +441,12 @@ run_server_cell() { # run_server_cell SPEC C
   tail -c +$((tlog0 + 1)) "$DATA.log" | head -c $((tlog1 - tlog0)) >"$d/timed.server_log.txt"
   if [ "$KIND" = pg ]; then
     local tav tbusy
-    tav=$(grep -c 'terminating autovacuum process due to administrator command' "$d/timed.server_log.txt")
-    tbusy=$(grep -c 'is being accessed by other users' "$d/timed.server_log.txt")
-    echo "autovacuum_terminated_in_window=$tav template_busy_errors=$tbusy" >"$d/timed.template_waits.txt"
+    python3 -B "$HERE/fthelp.py" pgwaits "$d/timed.server_log.txt" "$d/timed.template_waits.txt" \
+      "$d/timed.delete_waits.txt" >"$d/timed.pgwaits.txt" 2>&1 || fail "$spec-c$c: timed pgwaits ($(tail -1 "$d/timed.pgwaits.txt"))"
+    tav=$(sed -n 's/.*autovacuum_terminated_in_window=\([0-9]*\).*/\1/p' "$d/timed.template_waits.txt")
+    tbusy=$(sed -n 's/.*template_busy_errors=\([0-9]*\).*/\1/p' "$d/timed.template_waits.txt")
     [ "$tav" = 0 ] && [ "$tbusy" = 0 ] ||
-      fun "FLAG $spec-c$c timed run: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $tav, busy-template errors $tbusy"
+      fun "FLAG $spec-c$c timed run: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $tav (unattributed included), busy-template errors $tbusy"
   fi
   if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
   # Comp review 1 MED 8: the per-cycle DROP throws a branch's dirty pages away before any checkpoint writes them, so

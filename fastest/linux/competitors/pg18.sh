@@ -63,6 +63,9 @@ init)
     # shared_buffers = 25% of MemTotal (gate-6 review, t3run item 15; initdb's default is 128 MB); run_system.sh
     # refuses a server whose pg_settings value differs (pins.py check-pg)
     echo "shared_buffers = $SB"
+    # comp review 1 LOW 19: each log line names its database (%d), so a cell's template waits are told from the
+    # per-cycle DROP's (fthelp.py pgwaits)
+    echo "log_line_prefix = '%m [%p] %d '"
     if [ "$MODE" = d2 ]; then
       echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"

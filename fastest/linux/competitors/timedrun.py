@@ -538,6 +538,11 @@ def write_verdict(celldir, n, why, warm_rule, cap, dry):
         w = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", open(tw).read())}
         out["template_waits"] = w
         out["template_waits_flagged"] = any(w.values())
+    # comp review 1 LOW 19: the per-cycle DROP's own CountOtherDBBackends events (fthelp.py pgwaits), recorded apart and
+    # never in the template flag
+    dw = os.path.join(celldir, "timed.delete_waits.txt")
+    if os.path.exists(dw):
+        out["delete_waits"] = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", open(dw).read())}
     with open(os.path.join(celldir, "timed.json"), "w") as f:
         json.dump(out, f)
     return out
