@@ -1476,6 +1476,56 @@ mod tests {
         }
     }
 
+    /// Engine review 21 MED 13: the division red's four rows never had equal first digits, a zero
+    /// dividend, a zero divisor or a quotient past 10^17, so several wrong ports passed it. These
+    /// rows' expectations are PostgreSQL's own output, copied verbatim from the in-tree regression
+    /// file postgres/conformance/upstream/numeric.out (the quot column at lines 737-754, and the
+    /// queries at 2781, 2829 and 2841; division by zero at 791), with the dividend's display scale
+    /// carried by the column's scale and the divisor given as text, as the literals are there. Not
+    /// covered by any row in that file, so owed to the PostgreSQL 18 run (rpgdiv): an operand below
+    /// 1 (the weight's div_euclid), an exact rounding tie, an operand display scale above 16 and
+    /// one above 1000. Mutant `div_scale_first_digit_strict` (test builds only).
+    #[test]
+    fn numeric_division_matches_postgresqls_regression_output() {
+        let conn = open();
+        conn.execute(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, i numeric(25, 0), f numeric(25, 1)) STRICT",
+        )
+        .unwrap();
+        conn.execute(
+            // The 21- and 20-digit dividends as text: as integer literals they would be read as reals.
+            "INSERT INTO d VALUES (1, 0, 4.2), (2, 1, 70.0), (3, -1, 4.2), \
+             (4, '999999999999999999999', 4.2), (5, '12345678901234567890', 4.2)",
+        )
+        .unwrap();
+        for (sql, want) in [
+            ("SELECT i / '1' FROM d WHERE id = 1", Some("0.00000000000000000000")),
+            ("SELECT i / '1' FROM d WHERE id = 2", Some("1.00000000000000000000")),
+            ("SELECT i / '1' FROM d WHERE id = 3", Some("-1.00000000000000000000")),
+            ("SELECT f / '1' FROM d WHERE id = 1", Some("4.2000000000000000")),
+            ("SELECT f / '-1' FROM d WHERE id = 1", Some("-4.2000000000000000")),
+            ("SELECT i / '4.2' FROM d WHERE id = 2", Some("0.23809523809523809524")),
+            ("SELECT i / '4.2' FROM d WHERE id = 3", Some("-0.23809523809523809524")),
+            ("SELECT f / '4.2' FROM d WHERE id = 1", Some("1.00000000000000000000")),
+            ("SELECT f / '70' FROM d WHERE id = 2", Some("1.00000000000000000000")),
+            ("SELECT i / '1000000000000000000000' FROM d WHERE id = 4", Some("1.00000000000000000000")),
+            ("SELECT i / '123' FROM d WHERE id = 5", Some("100371373180768845")),
+            ("SELECT i / '0' FROM d WHERE id = 1", None),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            match want {
+                Some(want) => assert!(
+                    matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                    "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+                ),
+                None => assert!(
+                    matches!(&got, Err(e) if e.to_string().contains("division by zero")),
+                    "CLAIM: {sql} gave {got:?}, not PostgreSQL's \"division by zero\""
+                ),
+            }
+        }
+    }
+
     /// Engine review 21 MED 10: a numeric operand's scale was bounded only by i64, so
     /// `x / '1e-2000000000'` built 10^(2*10^9) inside one division, with no interrupt point, and
     /// `'1e9223372036854775807' / x` overflowed i64 (a panic in a debug build, a wrapped value in a

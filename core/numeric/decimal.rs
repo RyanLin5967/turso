@@ -213,7 +213,14 @@ fn pg_div_scale(a: &BigDecimal, b: &BigDecimal) -> i64 {
     let (weight1, first1) = pg_weight_and_first_digit(a);
     let (weight2, first2) = pg_weight_and_first_digit(b);
     let mut qweight = weight1 - weight2;
-    if first1 <= first2 {
+    // Mutant `div_scale_first_digit_strict` (test builds only; engine review 21 MED 13): equal
+    // first digits taken as a > b.
+    let lower = if crate::branch::store::fe_mutant("div_scale_first_digit_strict") {
+        first1 < first2
+    } else {
+        first1 <= first2
+    };
+    if lower {
         qweight -= 1;
     }
     let display = |v: &BigDecimal| v.as_bigint_and_exponent().1.max(0);
