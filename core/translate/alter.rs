@@ -1345,7 +1345,7 @@ pub fn translate_alter_table(
                     }
                 }
                 // The typmod as CREATE TABLE bounds it (class (a), DECISIONS 994f7d41e0).
-                super::schema::check_numeric_typmod(ty, &column.ty_params)?;
+                super::schema::check_numeric_typmod(ty, &column.ty_params, btree.is_strict)?;
 
                 default_type_mismatch = strict_default_type_mismatch(&column)?;
             }
