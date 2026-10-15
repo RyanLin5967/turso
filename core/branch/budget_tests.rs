@@ -603,6 +603,22 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     super::journal::set_compact_threshold(0);
 }
 
+/// Stops a shared arm's trunk writer (`creating` false) and releases its clients (`go` true) when
+/// dropped, on every exit of the arm's scope, a panic included: a client spawn refused after the
+/// writer started had left it looping, and the scope joining it, until the child's timeout (review
+/// C08 #3; plant `budget_spawn_fails`).
+struct ReleaseArm<'a> {
+    creating: &'a std::sync::atomic::AtomicBool,
+    go: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ReleaseArm<'_> {
+    fn drop(&mut self) {
+        self.go.store(true, std::sync::atomic::Ordering::Release);
+        self.creating.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The shared-flight arm (LEAP L3): `c` threads, released together, each making `shared_rounds(c)`
 /// named creates (arm `shared_create`), then, at C <= 64, as many create-then-first-write cycles
 /// (arm `shared_cfw`), closed loop. One line per arm: the durable acknowledgements (creates, plus
@@ -635,6 +651,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let per: Vec<(u64, u64, u64, u64, u64, u64)> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             let creating = &creating;
+            // On every exit of this scope, a panic included, the writer stops and the clients are
+            // released before the scope joins them (review C08 #3).
+            let _release = ReleaseArm { creating, go: &go };
             let writer = commits.then(|| {
                 s.spawn(move || {
                     let trunk = db.connect().unwrap();
@@ -700,11 +719,8 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                 };
                 match spawned {
                     Ok(h) => clients.push(h),
-                    Err(e) => {
-                        // The clients already started must not be left parked for ever.
-                        go.store(true, std::sync::atomic::Ordering::Release);
-                        panic!("{cell}: a thread of {c} did not start: {e}");
-                    }
+                    // `_release` stops the writer and releases the started clients as this unwinds.
+                    Err(e) => panic!("{cell}: {arm}: a thread of {c} did not start: {e}"),
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
