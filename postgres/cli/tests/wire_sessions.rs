@@ -4369,6 +4369,24 @@ fn an_error_outside_a_statements_run_fails_its_block() {
     );
 }
 
+/// A function in FROM reads the FROM items before it (PostgreSQL's functions in FROM are implicitly
+/// LATERAL), in its arguments too: in `... EXISTS (SELECT 1 FROM q, generate_series(1, CASE WHEN
+/// name > $1 ...))` the bare name is q's, int4, the nearer item, never the outer p's text. The walk
+/// read the arguments in the enclosing scope alone, so $1 was typed from p.name (wire review 16
+/// item 24).
+#[test]
+fn a_from_functions_arguments_read_the_items_before_it() {
+    let dir = Scratch::new("fromfnargs");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(name TEXT)").ok("p");
+    a.q("CREATE TABLE q(name INT)").ok("q");
+    let sql = "SELECT 1 FROM p WHERE EXISTS (SELECT 1 FROM q, \
+               generate_series(1, CASE WHEN name > $1 THEN 2 ELSE 3 END))";
+    let r = a.describe_statement(sql).ok(sql);
+    assert_eq!(r.params, Some(vec![23]), "{sql}: $1 is compared with q.name");
+}
+
 /// A correlated generate_series column is the name of its own SELECT only, as in PostgreSQL. It
 /// was one name for the whole statement: a bare `g` in a sublink, another UNION arm, a CTE body,
 /// a derived table's parent, RETURNING or an outer ORDER BY read the series, and two series
