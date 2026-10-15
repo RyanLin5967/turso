@@ -617,7 +617,20 @@ def self_test():
                            text=True, timeout=60, env=dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", "")))
         return r.returncode, r.stdout, r.stderr
 
-    def fake_box():
+    # the fake box's block-device major: NVMe's 259 where the platform's dev_t keeps it (Linux), else a major it does
+    # keep (macOS dev_t holds 8 bits of major, signed, so os.makedev(259, 3) reads back as 3:3 and every case comparing the
+    # opened node with sysfs dev would refuse for the platform, not the rule). The identity rule is then tested on
+    # every platform; the Linux-only case below keeps NVMe's real 259 where it can exist
+    def fake_maj(want=259):
+        def keeps(m):
+            try:
+                return os.major(os.makedev(m, 3)) == m and os.minor(os.makedev(m, 3)) == 3
+            except (OverflowError, ValueError):  # macOS: a major of 128 or more overflows its signed 32-bit dev_t
+                return False
+        return want if keeps(want) else 8  # 8: sd's major, which every dev_t keeps
+
+    def fake_box(maj=None):
+        maj = fake_maj() if maj is None else maj
         """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to
         controllers (nvme0 carries the root disk nvme0n1 and a second namespace nvme0n2; nvme1 carries the spare
         nvme1n1; review 6 LOW 8: nvme2 a multipath head nvme2n1, nvme3 a disk nvme3n1 held by dm-9), each disk's sysfs
@@ -647,10 +660,10 @@ def self_test():
             os.makedirs(os.path.join(sroot, "block", d, "holders"))
             os.symlink(os.path.join("..", "..", "devices", "pci", c), os.path.join(sroot, "block", d, "device"))
             with open(os.path.join(sroot, "block", d, "dev"), "w") as f:
-                f.write(f"259:{nums[d]}\n")
+                f.write(f"{maj}:{nums[d]}\n")
         os.makedirs(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "holders"))
         with open(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "dev"), "w") as f:
-            f.write("259:1\n")
+            f.write(f"{maj}:1\n")
         os.makedirs(os.path.join(sroot, "block", "nvme2n1", "multipath"))
         open(os.path.join(sroot, "block", "nvme2n1", "multipath", "nvme2c2n1"), "w").close()
         open(os.path.join(sroot, "block", "nvme3n1", "holders", "dm-9"), "w").close()
@@ -663,7 +676,7 @@ def self_test():
             head = os.path.join(sub, f"nvme{hs}n1")
             os.makedirs(os.path.join(head, "holders"))
             with open(os.path.join(head, "dev"), "w") as f:
-                f.write(f"259:{nums[f'nvme{hs}n1']}\n")
+                f.write(f"{maj}:{nums[f'nvme{hs}n1']}\n")
             with open(os.path.join(sub, "subsysnqn"), "w") as f:
                 f.write(f"nqn.2014-08.org.nvmexpress:uuid:cmic{hs}\n")
             os.symlink("..", os.path.join(head, "device"))
@@ -687,12 +700,13 @@ def self_test():
                 b = os.path.basename(path)
                 if b in ("nvme0n1", "nvme0n1p1"):
                     raise OSError(16, "Device or resource busy")
-                return (node or {}).get(b, (stat.S_IFBLK | 0o660, os.makedev(259, nums[b])))
+                return (node or {}).get(b, (stat.S_IFBLK | 0o660, os.makedev(maj, nums[b])))
             return check(os.path.join(droot, dev) if not os.path.isabs(dev) else dev, sys_root=sroot, dev_root=droot,
                          lsblk=lsblk, blkid=lambda k: answers.get(k, (2, "")), excl=excl)
         return run
 
     box = fake_box()
+    M = fake_maj()
 
     def ends_check(d):
         big, empty = os.path.join(d, "ends-3m"), os.path.join(d, "ends-0")
@@ -883,9 +897,11 @@ def self_test():
         # sysfs dev (a hand-made /dev/<sub>/nvme1n1 carrying the root disk's MAJ:MIN passed as the spare)
         ("LOW 5: check() refuses a by-id link to <dev root>/sub/nvme1n1 (a node not directly under the dev root)",
          lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("by-id-sub"))),
-        ("LOW 5: check() refuses a spare whose opened node carries the root disk's MAJ:MIN (259:0, sysfs 259:3)",
-         lambda: (lambda r: (any("nvme1n1's node is device 259:0, not its sysfs dev 259:3" in b for b in r[1]), r))(
-             box("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(259, 0))}))),
+        # TEST EDIT, flagged (lead order 2026-10-15: the fake box Mac-safe, no assertion changed): the major is the fake
+        # box's own (259 on Linux), so the text names it
+        (f"LOW 5: check() refuses a spare whose opened node carries the root disk's MAJ:MIN ({M}:0, sysfs {M}:3)",
+         lambda: (lambda r: (any(f"nvme1n1's node is device {M}:0, not its sysfs dev {M}:3" in b for b in r[1]), r))(
+             box("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(M, 0))}))),
         ("LOW 5: check() refuses a spare whose opened node is not a block device",
          lambda: (lambda r: (any("nvme1n1's node is not a block device" in b for b in r[1]), r))(
              box("nvme1n1", node={"nvme1n1": (stat.S_IFREG | 0o644, 0)}))),
@@ -914,6 +930,19 @@ def self_test():
         ("LOW 20: blkid_probe on a node it cannot read is a failed probe (rc None), though blkid answers blank",
          lambda: (lambda r: (r[0] is None, r))(probe_unreadable(tmp))),
     ]
+    # NVMe's real major 259, where the platform's dev_t can hold it (Linux): the spare passes and LOW 5's refusal names
+    # 259:0 against 259:3. Elsewhere it is reported N/A, never counted as a pass
+    if fake_maj() == 259:
+        box259 = fake_box(259)
+        cases += [
+            ("Linux, major 259: check() allows the blank spare", lambda: (lambda r: (r == ("nvme1n1", []), r))(
+                box259("nvme1n1"))),
+            ("Linux, major 259: LOW 5's node 259:0 against sysfs 259:3 refuses",
+             lambda: (lambda r: (any("nvme1n1's node is device 259:0, not its sysfs dev 259:3" in b for b in r[1]), r))(
+                 box259("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(259, 0))})))]
+    else:
+        print(f"DEVGUARD self-test N/A-on-{sys.platform}: the two major-259 cases (this dev_t cannot hold major 259: "
+              f"os.makedev(259, 3) reads back {os.major(os.makedev(259, 3))}:{os.minor(os.makedev(259, 3))})")
     bad = []
     try:
         for n, fn in cases:
