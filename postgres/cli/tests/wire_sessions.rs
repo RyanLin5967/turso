@@ -2859,6 +2859,24 @@ fn insert_values_lists_are_checked_as_postgresql_checks_them() {
     );
 }
 
+/// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
+/// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
+/// integer, so `random()*3` overflowed and the regress corpus's union script drew
+/// 9223372036854775807.
+#[test]
+fn random_is_a_float8_in_the_unit_interval() {
+    let dir = Scratch::new("random");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for _ in 0..50 {
+        let r = a.q("SELECT random(), (random()*3)::int BETWEEN 0 AND 3").ok("random");
+        assert_eq!(r.oids, Some(vec![701, 16]));
+        let v: f64 = r.rows[0][0].as_deref().unwrap().parse().unwrap();
+        assert!((0.0..1.0).contains(&v), "random() = {v}");
+        assert_eq!(r.rows[0][1].as_deref(), Some("t"));
+    }
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
