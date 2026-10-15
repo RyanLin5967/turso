@@ -850,8 +850,14 @@ def selftest():
         # LOW 16: a window's fields are read from their own lines, never from the launch command's text (cmd=)
         good = open(w).read()
         w2 = os.path.join(d, "c2.window")
-        open(w2, "w").write(good.replace("cmd=planted", "cmd=planted --tag strace_rc=0").replace("strace_rc=0\n",
-                                                                                                  "strace_rc=1\n"))
+        # comp review 1 LOW 18: the window's own line is changed FIRST and by its line-start form only, then the cmd=
+        # token added (the old unbounded replace turned the cmd= token into strace_rc=1 too, so c2 could not fail at
+        # 5b9d0395f, the unanchored search's base: both lines read 1)
+        open(w2, "w").write(good.replace("\nstrace_rc=0\n", "\nstrace_rc=1\n").replace("cmd=planted",
+                                                                                     "cmd=planted --tag strace_rc=0"))
+        ok("c2's premise: the cmd= line says strace_rc=0 and the window's own line strace_rc=1",
+           open(w2).read().startswith("cmd=planted --tag strace_rc=0\n") and "\nstrace_rc=1\n" in open(w2).read(),
+           open(w2).read())
         r4 = count(tr, [], "/x", w2)
         ok("c2: strace_rc=0 in the cmd= line does not mask the window's strace_rc=1",
            r4.get("verdict", "").startswith("REFUSED") and "strace_rc=1" in r4.get("verdict", ""), r4.get("verdict"))
