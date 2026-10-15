@@ -381,8 +381,10 @@ pub(crate) struct BranchStore {
 pub(crate) struct Group {
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
-    /// Wakes the confirmation writer (`run_confirm_writer`): a landing that left a confirmation to
-    /// write where there was none, and the store's close.
+    /// Wakes the background writer (`run_confirm_writer`): a landing that left a confirmation to
+    /// write where there was none, a trunk WAL flush that proved one, a held-free upgrade becoming
+    /// owed (`arm_upgrade`, once per crossing), a compaction becoming owed (`maybe_compact`), and
+    /// the store's close (engine review 18 LOW 12: the doc named only the first and the last).
     confirm_cv: std::sync::Condvar,
     /// `GroupState::durable`, readable without the group's lock (lead review 1 item 10): written
     /// under it, after the state, by `set_durable`.
@@ -824,7 +826,10 @@ impl Group {
         if overdue {
             self.upgrade_overdue.store(true, Ordering::Release);
         }
-        if woken {
+        // Mutant `arm_wakes_nobody` (test builds only; engine review 18 LOW 8's lost wakeup): the
+        // transition notifies no one, so only an observer that re-armed (`slot_is_free`'s `mature`
+        // did, every poll, before this wake was once per crossing) could hide it.
+        if woken && !fe_mutant("arm_wakes_nobody") {
             let _g = self.lock();
             #[cfg(test)]
             self.confirm_notified();
@@ -4956,7 +4961,12 @@ impl BranchStore {
     /// this operation led it (`hardcap_upgrades`; the C15 ruling's exception (a)), whether or not
     /// it then found anything left to sync: an overcount, never a miss.
     fn upgrade_if_overdue(&self) {
-        if self.group.upgrade_overdue.swap(false, Ordering::AcqRel) && Self::lead_upgrade(&self.inner, &self.group) {
+        // A plain load first (engine review 18 MED 5): every commit and delete in every class came
+        // here, and an unconditional swap was a read-modify-write of the group's shared line each.
+        if self.group.upgrade_overdue.load(Ordering::Acquire)
+            && self.group.upgrade_overdue.swap(false, Ordering::AcqRel)
+            && Self::lead_upgrade(&self.inner, &self.group)
+        {
             self.group.lock().hardcap_upgrades += 1;
         }
     }
