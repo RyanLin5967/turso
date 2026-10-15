@@ -321,6 +321,15 @@ impl BranchFiles {
         name.push(".tmp");
         PathBuf::from(name)
     }
+
+    /// The temp files of a snapshot store's background compaction (`BgCompaction`; DECISIONS
+    /// bd0d845f97): its own names, so an operation's inline compaction (past the hard limit, or
+    /// `compact_now`) never writes the file the background one is writing.
+    fn bg_tmp(path: &Path) -> PathBuf {
+        let mut name = path.to_path_buf().into_os_string();
+        name.push(".bgtmp");
+        PathBuf::from(name)
+    }
 }
 
 /// One entry of the operation log.
@@ -1262,6 +1271,107 @@ pub(crate) struct CutPrep {
     /// The temp log was synced (the prep's rewrite class syncs): with a synced delta, every byte
     /// of the new log is (`Journal::prev_synced`).
     synced: bool,
+    /// The temp log's path (`CutSource::tmp`): renamed over the log by the install.
+    tmp: PathBuf,
+    /// The old log, for a catch-up copy off the store mutex (`Journal::extend_cut`).
+    source: File,
+    /// The class the kept records are rewritten in (`CutSource::class`).
+    class: SyncClass,
+    /// The journal's fail-stop flag (`CutSource::poisoned`).
+    poisoned: Arc<AtomicBool>,
+}
+
+impl CutPrep {
+    /// Where the prepared copy of the old log ends: the install copies only what follows.
+    pub(crate) fn upto(&self) -> u64 {
+        self.upto
+    }
+}
+
+impl CutSource {
+    /// The same source, prepared into `tmp` instead (a snapshot store's background compaction).
+    fn with_tmp(mut self, tmp: PathBuf) -> Self {
+        self.tmp = tmp;
+        self
+    }
+}
+
+/// A snapshot store's compaction led by the background writer (DECISIONS bd0d845f97), taken under
+/// the store mutex (`Journal::begin_bg_compaction`) and synced holding no lock: the encoded
+/// snapshot of the next generation, the log position past its marker, and the arena's handle.
+pub(crate) struct BgCompaction {
+    out: Vec<u8>,
+    generation: u64,
+    from: u64,
+    class: SyncClass,
+    arena: Option<File>,
+    snap: PathBuf,
+    snap_tmp: PathBuf,
+    log_tmp: PathBuf,
+    rewrites: u64,
+    nonce: u32,
+    fail_arena_sync: bool,
+    fail_sync: bool,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl BgCompaction {
+    /// Where the marker ends in the log: everything below it is in the snapshot.
+    pub(crate) fn from(&self) -> u64 {
+        self.from
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The class the snapshot is synced in (the log's rewrite class at the capture).
+    pub(crate) fn class(&self) -> SyncClass {
+        self.class
+    }
+
+    pub(crate) fn snapshot_len(&self) -> u64 {
+        self.out.len() as u64
+    }
+
+    /// Holding no lock: the arena's slots synced (a plain fsync, as `compact`'s), then the snapshot
+    /// written to its temp file and synced in its class. A failed sync fail-stops the store, as a
+    /// failed compaction sync does (review 3 #5); a failed write leaves it running, the temp file
+    /// removed.
+    pub(crate) fn sync_snapshot(&self) -> Result<()> {
+        if let Some(arena) = self.arena.as_ref() {
+            let synced = if self.fail_arena_sync {
+                Err(LimboError::InternalError("failpoint: the compaction's arena sync failed".to_string()))
+            } else {
+                fsync_file(arena, SyncClass::Fsync)
+            };
+            if let Err(e) = synced {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
+        let written = (|| -> Result<()> {
+            let f = open_rw(&self.snap_tmp, true)?;
+            write_at(&f, &self.out, 0)?;
+            sync_replacement(&f, self.class, self.fail_sync, &self.poisoned)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&self.snap_tmp);
+        }
+        written
+    }
+
+    /// Holding no lock: the snapshot's directory entry synced. A failure fail-stops the store, as
+    /// `compact`'s does.
+    pub(crate) fn sync_dir(&self) -> Result<()> {
+        fsync_dir_of(&self.snap, self.class).inspect_err(|_| self.poisoned.store(true, Ordering::Release))
+    }
+
+    /// The background compaction gave up before its snapshot was installed: its temp files go.
+    pub(crate) fn discard(&self) {
+        let _ = std::fs::remove_file(&self.snap_tmp);
+        let _ = std::fs::remove_file(&self.log_tmp);
+    }
 }
 
 impl Journal {
@@ -1550,9 +1660,15 @@ impl Journal {
         let mut records = Vec::new();
         // The end offset of each record in `records`, for the cut an older log needs (F-FZ).
         let mut ends: Vec<usize> = Vec::new();
-        // Replayed: the log of the snapshot's or catalog's own generation; and in a catalog store,
-        // an older one, cut at the checkpoint's marker below (F-FZ).
-        let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
+        // Replayed: the log of the snapshot's or catalog's own generation; and an older one, cut at
+        // the checkpoint's marker below (F-FZ): in a catalog store, and since the background
+        // compaction (DECISIONS bd0d845f97) in a snapshot store too, which renames its snapshot in
+        // before it cuts the log. An older snapshot-store log with no marker of the snapshot's
+        // generation (an inline compaction stopped between its rename and its log reset) replays
+        // nothing, as its reset did. Mutant `snapshot_older_log_reset` (test builds only): a
+        // snapshot store resets an older log, as before.
+        let older_replayable = catalog_store || !super::store::fe_mutant("snapshot_older_log_reset");
+        let replayable = |log_gen: u64| log_gen == generation || (older_replayable && log_gen < generation);
         let end = match header {
             Some((log_ps, log_gen, nonce)) if replayable(log_gen) => {
                 // A log of the state's own generation must share its page size. An OLDER catalog
@@ -1749,9 +1865,9 @@ impl Journal {
                     "log generation is ahead of the snapshot"
                 }));
             }
-            // An older generation in a snapshot store (a compaction crashed after its rename, before
-            // the log reset) or a torn header: nothing in it is newer than the snapshot. (A whole header of
-            // another format version never gets here: `parse_log_header` refused it.)
+            // A torn header (or, under mutant `snapshot_older_log_reset`, an older generation in a
+            // snapshot store): nothing in it is newer than the snapshot. (A whole header of another
+            // format version never gets here: `parse_log_header` refused it.)
             _ => End::Reset,
         };
         Ok(Some(Scanned {
@@ -1808,7 +1924,7 @@ impl Journal {
     }
 
     /// Whether the next replacement sync fails (spends the failpoint).
-    fn take_replacement_sync_failure(&self) -> bool {
+    pub(crate) fn take_replacement_sync_failure(&self) -> bool {
         self.fail_next_replacement_sync.swap(false, Ordering::AcqRel)
     }
 
@@ -2002,6 +2118,10 @@ impl Journal {
                 raised: src.raised,
                 all_synced,
                 synced: src.class.syncs(),
+                tmp: src.tmp,
+                source: src.log,
+                class: src.class,
+                poisoned: src.poisoned,
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&src.tmp);
@@ -2018,15 +2138,11 @@ impl Journal {
     /// for another cut — is dropped and the whole cut done here instead.
     pub(crate) fn finish_cut(&mut self, prep: CutPrep, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
-        let usable = prep.rewrites == self.rewrites
-            && prep.old_nonce == self.nonce
-            && prep.from == from
-            && prep.generation == generation
-            && prep.upto <= self.len
-            && !super::store::fe_mutant("cut_under_mutex");
+        let usable = self.cut_usable(&prep, from, generation) && !super::store::fe_mutant("cut_under_mutex");
         if !usable {
+            let tmp = prep.tmp.clone();
             drop(prep);
-            let _ = std::fs::remove_file(self.files.log_tmp());
+            let _ = std::fs::remove_file(tmp);
             return self.rewrite_from(from, generation);
         }
         let class = self.rewrite_class();
@@ -2052,8 +2168,8 @@ impl Journal {
                 len += frames.len() as u64;
             }
         }
-        if let Err(e) = rename_file(&self.files.log_tmp(), &self.files.log) {
-            let _ = std::fs::remove_file(self.files.log_tmp());
+        if let Err(e) = rename_file(&prep.tmp, &self.files.log) {
+            let _ = std::fs::remove_file(&prep.tmp);
             return Err(io_error(e, "rename branch log rewrite"));
         }
         super::store::kill_point("cut.renamed");
@@ -2077,6 +2193,116 @@ impl Journal {
         self.inherited = SyncClass::Off;
         self.prev_synced = synced;
         Ok(())
+    }
+
+    /// Whether `prep` still matches this log (`finish_cut`): no rewrite since, the same incarnation,
+    /// the same cut, and the log no shorter than what it copied.
+    pub(crate) fn cut_usable(&self, prep: &CutPrep, from: u64, generation: u64) -> bool {
+        prep.rewrites == self.rewrites
+            && prep.old_nonce == self.nonce
+            && prep.from == from
+            && prep.generation == generation
+            && prep.upto <= self.len
+    }
+
+    /// A cut's catch-up, holding NO lock (DECISIONS bd0d845f97): the old log's whole flights in
+    /// `[prep.upto, to)`, written since the prep while group flights went on, re-framed onto the
+    /// temp log after what it holds and synced in the prep's class, as `finish_cut` copies its delta
+    /// under the mutex. `to` is the log's length read with no flight in the air, so it ends a
+    /// flight. The install then copies only what landed after the last catch-up (usually nothing).
+    pub(crate) fn extend_cut(prep: &mut CutPrep, to: u64, fail_sync: bool) -> Result<()> {
+        if to <= prep.upto {
+            return Ok(());
+        }
+        let mut delta = vec![0u8; (to - prep.upto) as usize];
+        read_at(&prep.source, &mut delta, prep.upto)?;
+        let (frames, last_crc, delta_synced) = reframe_tagged(&delta, prep.old_nonce, prep.nonce, prep.class.syncs())?;
+        if !frames.is_empty() {
+            let at = LOG_HEADER_LEN as u64 + prep.written;
+            write_at(&prep.file, &frames, at)?;
+            prep.all_synced &= delta_synced;
+            write_cut_word(&prep.file, prep.class, prep.all_synced, last_crc, at + frames.len() as u64)?;
+            if prep.class.syncs() {
+                sync_replacement(&prep.file, prep.class, fail_sync, &prep.poisoned)?;
+            }
+            prep.written += frames.len() as u64;
+        }
+        prep.upto = to;
+        Ok(())
+    }
+
+    /// A snapshot store's compaction for the background writer (DECISIONS bd0d845f97), its first
+    /// phase, under the store mutex: `state` is the store's state now. A `Record::Checkpoint` of the
+    /// next generation is buffered after everything `state` holds (flown by the next flight, as a
+    /// catalog store's capture marker is), so a crash after the snapshot's rename and before the
+    /// log's cut leaves an older log whose records past that marker recovery replays over the
+    /// snapshot (`scan_base`'s older-log rule, as for a catalog). The snapshot is encoded, and the
+    /// arena's handle taken when it holds slots no sync covered: both are synced holding no lock
+    /// (`BgCompaction::sync_snapshot`). Nothing is written to the files here.
+    pub(crate) fn begin_bg_compaction(&mut self, state: &SnapshotState, arena: &Arena) -> Result<BgCompaction> {
+        self.check_live()?;
+        let class = self.rewrite_class();
+        let generation = self.generation + 1;
+        self.buffer(&Record::Checkpoint { generation })?;
+        let from = self.lsn();
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(SNAP_MAGIC);
+        put_u32(&mut out, self.format);
+        put_u32(&mut out, self.page_size);
+        put_u64(&mut out, generation);
+        state.encode(&mut out);
+        let crc = crc32c::crc32c(&out);
+        put_u32(&mut out, crc);
+        let arena = if class.syncs() && arena.is_dirty() { arena.sync_handle()? } else { None };
+        Ok(BgCompaction {
+            out,
+            generation,
+            from,
+            class,
+            arena,
+            snap: self.files.snap.clone(),
+            snap_tmp: BranchFiles::bg_tmp(&self.files.snap),
+            log_tmp: BranchFiles::bg_tmp(&self.files.log),
+            rewrites: self.rewrites,
+            nonce: self.nonce,
+            fail_arena_sync: std::mem::take(&mut self.fail_next_arena_sync),
+            fail_sync: self.take_replacement_sync_failure(),
+            poisoned: self.poisoned.clone(),
+        })
+    }
+
+    /// The background compaction's install of its synced snapshot, under the store mutex: `false`
+    /// (nothing changed, its temp file removed) when the log is not the one it captured (a rewrite,
+    /// a cut or an inline compaction since). Otherwise the snapshot is renamed in and this journal
+    /// takes its generation; the old log, still the file appended to, is from here an older log
+    /// whose records past the marker follow the snapshot. Its directory entry is synced holding no
+    /// lock (`BgCompaction::sync_dir`), and also by the next flight that syncs (`dir_dirty`).
+    pub(crate) fn install_bg_snapshot(&mut self, bg: &BgCompaction) -> Result<bool> {
+        self.check_live()?;
+        if bg.rewrites != self.rewrites || bg.nonce != self.nonce || self.generation + 1 != bg.generation {
+            let _ = std::fs::remove_file(&bg.snap_tmp);
+            return Ok(false);
+        }
+        rename_file(&bg.snap_tmp, &bg.snap).map_err(|e| {
+            self.set_poisoned();
+            io_error(e, "rename branch snapshot")
+        })?;
+        super::store::kill_point("compact.bg_renamed");
+        self.generation = bg.generation;
+        self.snapshot_len = bg.out.len() as u64;
+        self.snap_dirty = false;
+        self.dir_dirty = true;
+        Ok(true)
+    }
+
+    /// A background compaction's cut source (`cut_source`), prepared into its own temp log.
+    pub(crate) fn bg_cut_source(&self, bg: &BgCompaction) -> Result<Option<CutSource>> {
+        Ok(self.cut_source(bg.from)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
+    }
+
+    /// The snapshot's length, after a cut (`finish_cut` zeroes it, as a catalog store has none).
+    pub(crate) fn set_snapshot_len(&mut self, len: u64) {
+        self.snapshot_len = len;
     }
 
     /// The page size the next header or snapshot is written with. Only `restart_empty` changes it,

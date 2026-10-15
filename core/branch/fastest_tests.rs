@@ -8854,18 +8854,32 @@ fn a_compaction_past_the_hard_limit_runs_inline_and_is_counted() {
     }
 }
 
-/// DECISIONS c9c821dd8d: the background compaction holds the store mutex while it syncs, so an
-/// operation arriving meanwhile waits behind it, and is counted (`branch_exception_counters()[3]`).
-/// The writer held inside that hold (`HOLD_COMPACT_LOCKED`), a create from another thread is
-/// counted as it arrives, waits, and completes once the hold ends. The creates before the hold,
-/// the one that owed the compaction among them, moved no counter (the control).
+/// DECISIONS c9c821dd8d: an operation arriving while the background compaction holds the store
+/// mutex for a step that may sync waits behind it, and is counted (`branch_exception_counters()[3]`).
+/// The writer held inside that hold, a create from another thread is counted as it arrives, waits,
+/// and completes once the hold ends. The creates before the hold, the one that owed the compaction
+/// among them, moved no counter (the control).
+///
+/// FLAGGED TEST EDIT (DECISIONS bd0d845f97, a premise the fix changes; for the lead's ruling): since
+/// the compaction syncs outside the mutex, the only such hold is its cut's last pass, which copies
+/// what flights left after the catch-ups. The plant takes it every time (`COMPACT_CATCH_UPS_OFF`,
+/// restored by a guard) and holds the writer inside it (`HOLD_COMPACT_TAIL`), where it held it at
+/// `HOLD_COMPACT_LOCKED` before. The assertions are unchanged.
 #[test]
 fn a_create_behind_a_background_compaction_is_counted() {
     let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_CATCH_UPS_OFF.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_CATCH_UPS_OFF.store(true, std::sync::atomic::Ordering::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-wait.db"), false, true);
     let _x = x.into_id();
-    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_LOCKED);
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_TAIL);
     let _t = Threshold::set(8 << 10);
     let base = db.branch_exception_counters();
     let t = std::time::Instant::now();
@@ -8874,7 +8888,7 @@ fn a_create_behind_a_background_compaction_is_counted() {
         assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
     }
     eventually("premise: the background compaction never reached its hold", || {
-        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_LOCKED | super::store::HOLD_ARRIVED
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_TAIL | super::store::HOLD_ARRIVED
     });
     let before = db.branch_exception_counters();
     let other = {
@@ -9358,4 +9372,56 @@ fn a_create_does_not_wait_for_a_background_compaction() {
     let after = db.branch_exception_counters();
     assert_eq!(after[3], base[3], "an operation was counted waiting behind the background compaction");
     assert_eq!(after[2], base[2], "a compaction synced inline on an operation");
+}
+
+/// DECISIONS bd0d845f97, the recovery rule the background compaction rests on: it renames its
+/// snapshot in before it cuts the log, so a crash between the two leaves the snapshot of generation
+/// g + 1 beside the log of generation g, whose records past the compaction's `Record::Checkpoint`
+/// marker follow the snapshot. Recovery replays them (as a catalog store's older log), where a
+/// snapshot store reset an older log before. A D1 snapshot store whose compaction stops there
+/// (`COMPACT_STOP_BEFORE_CUT`), then branches created and written after it, then a reopen: every
+/// branch is back, and the one written after reads its row. Mutant `snapshot_older_log_reset`.
+#[test]
+fn a_background_compaction_stopped_before_its_cut_loses_nothing() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("compact-stop.db");
+    let (ids, written, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        super::store::COMPACT_STOP_BEFORE_CUT.store(true, O::Release);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.background_compactions() == 0 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction ran");
+        }
+        eventually("premise: the background compaction never stopped", || !db.branches.compaction_owed_for_test());
+        // After the stopped compaction: created and written into the older log only.
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 3, "after");
+        let written = y.into_id();
+        let ids = db.branch_ids().unwrap();
+        assert!(ids.contains(&written), "premise: the branch written after the compaction is live");
+        (ids, written, db.incarnation)
+    };
+    super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+    let db = reopen(&path, opts(false, SyncClass::Fsync), incarnation);
+    let back = db.branch_ids().unwrap();
+    let lost: Vec<_> = ids.iter().filter(|id| !back.contains(id)).collect();
+    assert!(lost.is_empty(), "CLAIM: branches lost after a compaction stopped before its cut: {lost:?}");
+    assert_eq!(
+        read_v(&db.branch(written).unwrap().connect().unwrap(), 3),
+        "after",
+        "CLAIM: the write made after the stopped compaction was lost"
+    );
 }

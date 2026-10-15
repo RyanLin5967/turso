@@ -472,10 +472,20 @@ const COMPACT_RUNNING: u8 = 2;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_DUE: u8 = 16;
 
-/// Test hook stage (`Group::confirm_hold`): the background compaction holds the store mutex and
-/// has not yet compacted (DECISIONS c9c821dd8d).
+/// Test hook stage (`Group::confirm_hold`): the background compaction has taken what it syncs
+/// and written its marker, and syncs nothing yet; it holds no lock (DECISIONS bd0d845f97).
 #[cfg(test)]
-pub(crate) const HOLD_COMPACT_LOCKED: u8 = 17;
+pub(crate) const HOLD_COMPACT_TAKEN: u8 = 17;
+
+/// `HOLD_COMPACT_TAKEN`'s name at c9c821dd8d, when the stage was inside the store mutex (the
+/// bd0d845f97 red names it).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_LOCKED: u8 = HOLD_COMPACT_TAKEN;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut copies what is left of
+/// the log under the store mutex, counted (`compaction_waits`; DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 
 #[derive(Default)]
 struct GroupState {
@@ -1140,6 +1150,48 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
     }
 }
 
+/// Catch-up passes of a background compaction's cut before it copies what is left under the store
+/// mutex (`BranchStore::cut_in_background`; DECISIONS bd0d845f97).
+const COMPACT_CATCH_UPS: usize = 3;
+
+/// Test builds: no catch-up pass, so the cut always takes the counted tail path (the plant of
+/// `compaction_waits`).
+#[cfg(test)]
+pub(crate) static COMPACT_CATCH_UPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: a background compaction stops once its snapshot is installed and synced, before
+/// it cuts the log, as a crash there would leave it (DECISIONS bd0d845f97's recovery rule).
+#[cfg(test)]
+pub(crate) static COMPACT_STOP_BEFORE_CUT: AtomicBool = AtomicBool::new(false);
+
+fn compact_catch_ups_off() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A background compaction's mutex hold that may sync, counted (`StoreMutex::compacting` odd)
+/// from before it locks to after it unlocks.
+struct Compacting<'a>(&'a StoreMutex);
+
+impl<'a> Compacting<'a> {
+    fn begin(store: &'a StoreMutex) -> Self {
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        Self(store)
+    }
+}
+
+impl Drop for Compacting<'_> {
+    fn drop(&mut self) {
+        self.0.compacting.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// A held-free upgrade in the air (`Group::upgrade_due` == `UPGRADE_IN_AIR`), reset to none
 /// when its leader is done, however it is done (`BranchStore::lead_upgrade`).
 struct InAir<'a>(&'a AtomicU64);
@@ -1266,14 +1318,16 @@ thread_local! {
 /// instrument — a flush inside the store mutex stalls every operation behind it).
 struct StoreMutex {
     inner: Mutex<StoreInner>,
-    /// Odd while the background writer's compaction holds, or is about to take, this mutex
-    /// (`BranchStore::lead_compaction`; DECISIONS c9c821dd8d): set before it locks and cleared after
-    /// it unlocks, so every operation that waited behind its syncs found it odd as it arrived.
+    /// Odd while the background compaction holds, or is about to take, this mutex for a step that
+    /// may sync under it (DECISIONS c9c821dd8d, bd0d845f97: only its cut's last pass, `Compacting`,
+    /// and the whole compaction under mutant `compaction_syncs_under_mutex`): set before it locks
+    /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
+    /// as it arrived.
     compacting: AtomicU64,
     /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
-    /// background compaction's syncs (an exception counter, `BranchStore::exception_counters`). One
-    /// that arrived in the margins (before the writer locked, or after it unlocked) and did not wait
-    /// is counted too: an overcount, never a miss.
+    /// background compaction's sync under the mutex (an exception counter,
+    /// `BranchStore::exception_counters`). One that arrived in the margins (before the writer
+    /// locked, or after it unlocked) and did not wait is counted too: an overcount, never a miss.
     compaction_waits: AtomicU64,
 }
 
@@ -5532,12 +5586,10 @@ impl BranchStore {
     }
 
     /// The compaction an operation owed to the background writer (`Group::compact_due`; DECISIONS
-    /// c9c821dd8d), led by it under the store mutex, off every acknowledgement path. Nothing is
-    /// done if the log no longer wants one (an operation past the hard limit compacted it inline).
-    /// A failure backs off as an operation's does (`defer_compaction`). The store's `unsynced` hint
-    /// is left as it was: a trunk barrier then takes the lock and finds nothing to flush.
-    /// Operations that arrive while it holds the mutex wait behind its syncs, and are counted
-    /// (`StoreMutex::compaction_waits`).
+    /// c9c821dd8d), led by it off every acknowledgement path (`compact_in_background`). A failure
+    /// backs off as an operation's does (`defer_compaction`). Mutant `compaction_syncs_under_mutex`
+    /// (test builds only): the whole compaction under the store mutex, as at c9c821dd8d, with every
+    /// operation arriving meanwhile counted (`compaction_waits`).
     fn lead_compaction(store: &StoreMutex, group: &Group) {
         if group
             .compact_due
@@ -5546,26 +5598,174 @@ impl BranchStore {
         {
             return;
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
-        {
+        let led = if fe_mutant("compaction_syncs_under_mutex") {
+            store.compacting.fetch_add(1, Ordering::AcqRel);
             let mut inner = store.lock_uncounted();
             #[cfg(test)]
-            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_LOCKED);
-            if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
-                #[cfg(test)]
-                {
-                    group.lock().background_compactions += 1;
-                }
-                if let Err(e) = Self::compact_snapshot(&mut inner, group, false) {
-                    tracing::warn!("branch store compaction failed: {e}");
-                    if let Some(journal) = inner.journal.as_mut() {
-                        journal.defer_compaction();
-                    }
-                }
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_TAKEN);
+            let led = if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                Self::compact_snapshot(&mut inner, group, false)
+            } else {
+                Ok(())
+            };
+            drop(inner);
+            store.compacting.fetch_add(1, Ordering::AcqRel);
+            led
+        } else {
+            Self::compact_in_background(store, group)
+        };
+        if let Err(e) = led {
+            tracing::warn!("branch store compaction failed: {e}");
+            if let Some(journal) = store.lock().journal.as_mut() {
+                journal.defer_compaction();
             }
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
         group.compact_due.store(COMPACT_IDLE, Ordering::Release);
+    }
+
+    /// A snapshot store's syncing compaction with no sync under the store mutex (DECISIONS
+    /// bd0d845f97), the held-free upgrade's shape: what it syncs is taken under the mutex, synced
+    /// holding no lock, and landed under the mutex only over the log it was taken from (the
+    /// journal's rewrites count, nonce and generation). Operations go on throughout, their group
+    /// flights included.
+    ///
+    /// 1. Capture (mutex): the state's snapshot, a `Record::Checkpoint` marker of the next
+    ///    generation buffered after it, the arena's handle (`Journal::begin_bg_compaction`).
+    /// 2. The marker written (holding no lock; a flight is led if none does it).
+    /// 3. The arena and the snapshot's temp file synced (no lock).
+    /// 4. The snapshot renamed in (mutex, if the log is unchanged); from here a crash leaves an
+    ///    older log whose records past the marker recovery replays over the snapshot.
+    /// 5. Its directory synced (no lock); everything below the marker is then durable in the class.
+    /// 6. The log cut to what follows the marker: copied and synced into a temp log holding no
+    ///    lock (`prepare_cut`), caught up likewise with what flights wrote meanwhile
+    ///    (`extend_cut`, up to `COMPACT_CATCH_UPS` passes), then renamed in under the mutex
+    ///    (`finish_cut`) once nothing is left to copy. Only if flights still landed after the last
+    ///    pass is that tail copied and synced under the mutex: counted (`compaction_waits`).
+    ///
+    /// Test hooks (`Group::confirm_hold`): `HOLD_COMPACT_TAKEN` after step 2, and
+    /// `HOLD_COMPACT_TAIL` inside the counted tail's mutex hold.
+    fn compact_in_background(store: &StoreMutex, group: &Group) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let bg = {
+            let mut inner = store.lock();
+            if inner.cat.is_some() || !inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                return Ok(());
+            }
+            let snapshot = inner.snapshot();
+            let StoreInner { journal, arena, .. } = &mut *inner;
+            let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            journal.begin_bg_compaction(&snapshot, arena)?
+        };
+        #[cfg(test)]
+        {
+            group.lock().background_compactions += 1;
+        }
+        let landed = (|| -> Result<()> {
+            Self::wait_durable_on(store, group, None, bg.from(), SyncClass::Off)?;
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_TAKEN);
+            bg.sync_snapshot()?;
+            let installed = match store.lock().journal.as_mut() {
+                Some(journal) => journal.install_bg_snapshot(&bg)?,
+                None => false,
+            };
+            if !installed {
+                return Ok(());
+            }
+            bg.sync_dir()?;
+            group.mark_committed(bg.from(), bg.class());
+            // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
+            // would (`COMPACT_STOP_BEFORE_CUT`).
+            #[cfg(test)]
+            if COMPACT_STOP_BEFORE_CUT.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            Self::cut_in_background(store, group, &bg)
+        })();
+        bg.discard();
+        landed
+    }
+
+    /// Step 6 of `compact_in_background`: the log cut to what follows the marker.
+    fn cut_in_background(store: &StoreMutex, group: &Group, bg: &super::journal::BgCompaction) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let (from, generation) = (bg.from(), bg.generation());
+        let source = {
+            let inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_ref() else {
+                return Ok(());
+            };
+            match journal.bg_cut_source(bg)? {
+                Some(source) => source,
+                None => return Ok(()),
+            }
+        };
+        let mut prep = Journal::prepare_cut(source, from, generation)?;
+        let passes = if compact_catch_ups_off() { 0 } else { COMPACT_CATCH_UPS };
+        for pass in 0..=passes {
+            let last = pass == passes;
+            // The last pass copies and syncs under the mutex whatever is left: counted from before
+            // it locks to after it unlocks (`Compacting`; dropped after `inner`).
+            let _counted = last.then(|| Compacting::begin(store));
+            let mut inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_mut() else {
+                break;
+            };
+            if !journal.cut_usable(&prep, from, generation) {
+                break;
+            }
+            let to = journal.log_len();
+            if to > prep.upto() && !last {
+                let fail = journal.take_replacement_sync_failure();
+                drop(inner);
+                Journal::extend_cut(&mut prep, to, fail)?;
+                continue;
+            }
+            #[cfg(test)]
+            if last {
+                pause_at(hold, HOLD_COMPACT_TAIL);
+            }
+            journal.finish_cut(prep, from, generation)?;
+            journal.set_snapshot_len(bg.snapshot_len());
+            // What the flights after the marker wrote is durable only in their own class: the cut's
+            // rename waits for the next flight's directory sync, as a catalog store's install's.
+            let written = journal.lsn() - journal.pending_len();
+            let class = journal.sync_class();
+            group.mark_durable(written, class);
+            let durable = group.durable(inner.free_class());
+            inner.mature_frees(durable);
+            return Ok(());
+        }
+        // The log changed under the cut: the snapshot stays installed, the older log is replayed
+        // past its marker, and the next compaction cuts it.
+        Ok(())
+    }
+
+    /// The store mutex with no group flight in the air (a cut's copy must end a flight): waited for
+    /// holding no lock, then re-checked under it. Fails once the store is fail-stopped.
+    fn lock_quiesced<'a>(store: &'a StoreMutex, group: &Group) -> Result<StoreGuard<'a>> {
+        loop {
+            {
+                let mut g = group.lock();
+                while g.flushing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let inner = store.lock_uncounted();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if !group.lock().flushing {
+                return Ok(inner);
+            }
+        }
     }
 
     /// Whether this process's background writer runs (`start_confirm_writer`): not when it could
