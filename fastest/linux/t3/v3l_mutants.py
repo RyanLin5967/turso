@@ -120,6 +120,13 @@ MUTANTS = [
     ("24a-timed-count-unread", "review 5 LOW 24: a timed count that is not an int VOIDs as unreadable",
      '        if timed is not None and (not isinstance(timed, int) or isinstance(timed, bool)):\n',
      '        if False:\n', "UNRUN (QUIET)"),
+    # annex A27: SLACK bound to a labelling pair (the refusal, and the SLACK/2 threshold)
+    ("A27a-pair-not-refused", "annex A27: a real run refuses on a labelling pair that differs by more than SLACK/2",
+     '            if pair["problem"] and os.environ.get("V3L_REAL") == "1":\n',
+     '            if False:\n', "UNRUN (QUIET)"),
+    ("A27b-pair-threshold-slack", "annex A27: the pair's allowance is SLACK/2 of the larger, not SLACK",
+     '    if Fraction(abs(first - second)) > SLACK / 2 * big:\n',
+     '    if Fraction(abs(first - second)) > SLACK * big:\n', "UNRUN (QUIET)"),
     # review 6 MED 2 (annex A24-AM1): the per-filesystem sync -f, its rc, its coverage, and its plant
     ("A24e-layer-rc-not-judged", "A24-AM1: each filesystem's sync -f rc is judged",
      '                if not isinstance(x, dict) or type(x.get("rc")) is not int or x["rc"] != 0:\n',

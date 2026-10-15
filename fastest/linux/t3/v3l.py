@@ -817,18 +817,27 @@ def _block_of(r):
         os.rmdir(d)
 
 
-def _measure_with(patches, env=None):
+def _measure_with(patches, env=None, leaf=None):
     """measure() on a fake box (review 5 LOW 25, review 6 LOW 10): PATCHES replaces module functions (resolve_leaf,
-    disk_attr, sh) for one call and ENV sets variables; returns (the exception's text or None, whether OUT was made).
-    Both are restored, and the temp dir removed, whatever the call did."""
+    disk_attr, sh, ...) for one call and ENV sets variables; LEAF, when given, is written as the V3 leaf record and
+    passed as LEAFREC. Returns (the exception's text or None, whether OUT was made). Both are restored, and the temp
+    dir removed, whatever the call did."""
     g, d = globals(), tempfile.mkdtemp(prefix="v3l-m-")
     saved, env0 = {k: g[k] for k in patches}, {k: os.environ.get(k) for k in (env or {})}
     out = os.path.join(d, "out")
+    lr = None
+    if leaf is not None:
+        lr = os.path.join(d, "leaf.json")
+        with open(lr, "w") as f:
+            json.dump(leaf, f)
     try:
         g.update(patches)
         os.environ.update(env or {})
         try:
-            measure(os.path.join(d, "dir"), out)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):  # measure() prints its summary line
+                measure(os.path.join(d, "dir"), out, lr)
             return None, os.path.exists(out)
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}", os.path.exists(out)
@@ -840,6 +849,44 @@ def _measure_with(patches, env=None):
             else:
                 os.environ[k] = v
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _runs_box(lab1, lab2, calls):
+    """_fake_box plus the runs (annex A27's labelling pair): a fake subprocess whose run() records each command in
+    CALLS and writes what the command would (the trace, fio's JSON, the data file), a flush counter that rises LAB1
+    across the first labelling run and LAB2 across the second (then N + 3 per timed run, 0 on the control), and a
+    passing sync record. Nothing real runs."""
+    import types
+    fio = {"jobs": [{"write": {"total_ios": N, "lat_ns": {"percentile": {"50.000000": 100000.0}}},
+                     "sync": {"lat_ns": {"N": N - 1, "percentile": {"50.000000": 300000.0, "99.000000": 900000.0},
+                                         "bins": {"300000": N - 1}}}}]}
+
+    def run(cmd, **_k):
+        calls.append(list(cmd))
+        for x in cmd:
+            if x.startswith("--output="):
+                with open(x[len("--output="):], "w") as f:
+                    json.dump(fio, f)
+            if x.startswith("--filename="):
+                open(x[len("--filename="):], "w").close()
+        if "-o" in cmd:
+            open(cmd[cmd.index("-o") + 1], "w").close()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    seq = iter([0, lab1, lab1, lab1 + lab2, lab1 + lab2, lab1 + lab2 + N + 3])
+    last = [0]
+
+    def flush(_disk):
+        last[0] = next(seq, last[0])
+        return last[0]
+    box = _fake_box()
+    box.update({"subprocess": types.SimpleNamespace(run=run, CompletedProcess=subprocess.CompletedProcess,
+                                                    TimeoutExpired=subprocess.TimeoutExpired),
+                "flush_ios": flush, "sectors_written": lambda _d: 0,
+                "sync_record": lambda **_k: {"ran": True, "rc": 0, "layers": [{"path": "/fs0", "rc": 0, "secs": 0.0}]}})
+    return box
+
+
+_LEAF = {"leaf": {"disk": "nvme1n1", "drive_reports": "write back"}, "virtualization": {"virtualized": False}}
 
 
 def _with_global(name, value, f):
@@ -854,6 +901,16 @@ def _with_global(name, value, f):
             g[name] = old
         else:
             g.pop(name, None)
+
+
+def _main_out(argv):
+    """main(ARGV) with its stdout captured: (rc, stdout)"""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue()
 
 
 def _fake_box(iostats="1", chain=("nvme1n1",), disk="nvme1n1"):
@@ -1225,14 +1282,40 @@ def self_test():
              _measure_with(_fake_box(chain=("loop0", "sda1"), disk="sda"), env={"V3L_REAL": "1"})))),
         # review 5 LOW 29: SLACK can gate a billed run, so a real run refuses until a PREREG annex row registers it;
         # the registration check is also t3run's preflight (v3l.py registration), before deps and build are paid for
+        # TEST EDIT, flagged as a SPEC CHANGE (annex A27 registers SLACK): the two LOW 29 cases that read the
+        # unregistered state now set SLACK_REGISTERED to None for their call; expectations unchanged
         ("LOW 29: a real run on a drive with its leaf record refuses while SLACK is unregistered",
-         _ok(lambda: "SLACK" in (real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json") or ""))),
+         _ok(lambda: "SLACK" in (_with_global("SLACK_REGISTERED", None,
+                                              lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json"))
+                                 or ""))),
         ("LOW 29: with SLACK registered (an annex row named), the same real run is allowed",
          _ok(lambda: _with_global("SLACK_REGISTERED", "A99 (self-test)",
                                   lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json")) is None)),
         ("LOW 29: registration_problem() names the unregistered SLACK; with a row named it is None",
-         _ok(lambda: "unregistered" in (registration_problem() or "")
+         _ok(lambda: "unregistered" in (_with_global("SLACK_REGISTERED", None, registration_problem) or "")
              and _with_global("SLACK_REGISTERED", "A99 (self-test)", registration_problem) is None)),
+        # annex A27 (the lead's ruling, DECISIONS cb6074aa3a): SLACK = 0.05 is registered, bound to a measurement: every
+        # real run takes two labelling runs back to back and refuses (rc 2, before any timed run) when their drive
+        # flush counts differ by more than SLACK/2 of the larger
+        ("A27: SLACK_REGISTERED is 'A27', so registration_problem() is None",
+         _ok(lambda: SLACK_REGISTERED == "A27" and registration_problem() is None)),
+        ("A27: `v3l.py registration` exits 0 and names A27",
+         _ok(lambda: (lambda r: r[0] == 0 and "A27" in r[1])(_main_out(["v3l.py", "registration"])))),
+        ("A27: a labelling pair of 20000 and 20000 binds SLACK", _ok(lambda: lab_pair_problem(20000, 20000) is None)),
+        ("A27: 20000 and 20500 (500 <= 0.025 x 20500 = 512.5) binds SLACK",
+         _ok(lambda: lab_pair_problem(20000, 20500) is None)),
+        ("A27: 20000 and 20600 (600 > 0.025 x 20600 = 515) refuses, naming A27",
+         _ok(lambda: "A27" in (lab_pair_problem(20000, 20600) or ""))),
+        ("A27: 0 and 0 (a write-through drive) binds SLACK", _ok(lambda: lab_pair_problem(0, 0) is None)),
+        ("A27: a pair with a count that is not an int refuses", _ok(lambda: lab_pair_problem("20000", 20000) is not None)),
+        ("A27: measure(), real, a labelling pair 20000 and 21000 refuses (A27) after exactly the two labelling runs",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "A27" in r[0] and len(calls) == 2
+                                     and all(c[0] == "strace" for c in calls))(
+             _measure_with(_runs_box(20000, 21000, calls), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        ("A27: measure(), real, a labelling pair 20000 and 20000 goes on: the third run is the timed fio",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is None and len(calls) >= 3 and calls[0][0] == calls[1][0] == "strace"
+                                     and calls[2][0] == "fio")(
+             _measure_with(_runs_box(20000, 20000, calls), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
         # review 5 LOW 23: a write-back record whose flush counts VOID never reads as "flush requests completed"
         ("LOW 23: floor_kind of a write-back record with 0 flushes is the VOID text",
          _ok(lambda: floor_kind(rec(delta=0)) == "write-back drive with flushes short (VOID)")),
