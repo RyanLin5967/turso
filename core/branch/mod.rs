@@ -507,6 +507,9 @@ pub enum BranchFailpoint {
     /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
     /// #3: the capture's other fallible step, beside its read snapshot).
     ArenaHandleFails,
+    /// The next held-free upgrade's sync (`BranchStore::sync_upgrade`) fails as an I/O error would
+    /// (engine review 21 MED 4: nothing could fail it before).
+    UpgradeSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

@@ -6852,6 +6852,13 @@ impl BranchStore {
         self.group.durable(class)
     }
 
+    /// Test builds: whether a slot was written since the arena's last sync (engine review 21 MED
+    /// 4: a premise that an upgrade has the arena to sync).
+    #[cfg(test)]
+    pub(crate) fn arena_dirty_for_test(&self) -> bool {
+        self.inner.lock().arena.as_ref().is_some_and(super::arena::Arena::is_dirty)
+    }
+
     /// Test builds: the log position that makes the newest Release durable (engine review 17
     /// HIGH 2: a drain-failure route's premise that only its own record is undrained).
     #[cfg(test)]

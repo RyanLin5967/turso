@@ -4821,6 +4821,169 @@ fn a_create_does_not_wait_for_the_held_free_upgrade() {
     }
 }
 
+/// `a_create_does_not_wait_for_the_held_free_upgrade`'s stops, for the tests that follow it: x is
+/// reaped past the bound, a fork arms the upgrade while the writer is held where it found it due
+/// (so nothing rides it), and the writer is then held once the upgrade is taken and before its sync.
+/// Returns the fork that armed it, still live.
+fn hold_the_held_free_upgrade(db: &Arc<Database>, trunk: &Arc<Connection>, x: Branch, what: &str) -> BranchId {
+    db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+    x.reap().unwrap();
+    let armed = trunk.fork_branch().unwrap().into_id();
+    eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+    });
+    db.branches.confirm_hold_for_test(super::store::HOLD_FLIGHT_TAKEN);
+    eventually(&format!("{what}: premise: the background writer never took the upgrade"), || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+    });
+    armed
+}
+
+/// Run `f` on a thread of its own and wait for it at most 10 s: `Err` on a timeout. The caller joins
+/// the thread once whatever holds it is released.
+fn within_10s<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (Result<T, std::sync::mpsc::RecvTimeoutError>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    (rx.recv_timeout(std::time::Duration::from_secs(10)), handle)
+}
+
+/// Engine review 21 MED 3 (review 18 HIGH 1's residual, wider than 7fa0b2853 stated): the upgrade
+/// took the arena's dirty mark and the directory's, so every flight that syncs waited for its sync
+/// (`syncing_outside_flight`): a trunk commit that keeps a pre-image, whose barrier syncs, waited
+/// through the upgrade's arena fsync and log sync holding the WAL write lock, and so did every fork
+/// riding an ordered trunk commit (Apple). Held once taken and before its sync, a trunk commit
+/// that keeps a pre-image for the live child that armed it commits within 10 s. Both stores.
+#[test]
+fn a_trunk_commit_that_keeps_a_pre_image_does_not_wait_for_the_held_free_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-barrier.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+        let _armed = hold_the_held_free_upgrade(&db, &trunk, x, &what);
+        let (committed, handle) = {
+            let db = db.clone();
+            within_10s(move || {
+                let t = db.connect().unwrap();
+                t.execute("PRAGMA synchronous = FULL").unwrap();
+                t.execute("UPDATE t SET v = 'during' WHERE id = 50").map_err(|e| e.to_string())
+            })
+        };
+        db.branches.confirm_hold_for_test(0);
+        handle.join().unwrap();
+        assert_eq!(
+            committed,
+            Ok(Ok(())),
+            "{what}: a trunk commit that keeps a pre-image waited for the held-free upgrade's sync (a timeout) or failed"
+        );
+    }
+}
+
+/// Engine review 21 MED 2: begin_cut waited only for `flushing` and `cutting`, so a fuzzy
+/// checkpoint went on to its install while a held-free upgrade synced, and the install, holding the
+/// store mutex, waited in `quiesce` for the upgrade's sync: every create, connect, first write and
+/// delete queued behind it on the mutex. The checkpoint is held after its catalog commit, the
+/// upgrade is armed and held once taken, and the checkpoint released: its install completes within
+/// 10 s while the upgrade is still in the air, and so does a create on another connection.
+#[test]
+fn a_fuzzy_install_does_not_wait_for_the_held_free_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    let what = "catalog=true";
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-install.db"), true, true);
+    assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "{what}: premise: a fuzzy checkpoint started");
+    eventually(&format!("{what}: premise: the checkpoint never committed"), || {
+        db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let _armed = hold_the_held_free_upgrade(&db, &trunk, x, what);
+    db.branch_checkpoint_hold(0);
+    let (installed, install) = {
+        let db = db.clone();
+        within_10s(move || db.branch_checkpoint_wait())
+    };
+    let (created, create) = {
+        let db = db.clone();
+        within_10s(move || db.connect().and_then(|t| t.fork_branch()).map(|y| y.into_id()).is_ok())
+    };
+    db.branches.confirm_hold_for_test(0);
+    install.join().unwrap();
+    create.join().unwrap();
+    assert_eq!(installed, Ok(()), "{what}: the fuzzy install waited for the held-free upgrade's sync");
+    assert_eq!(created, Ok(true), "{what}: a create waited behind the install for the upgrade (or failed)");
+}
+
+/// Engine review 21 MED 4: the held-free upgrade's sync is the only step that makes a raised D0
+/// store's held frees safe to reuse, and nothing could fail it. With its sync failing
+/// (`UpgradeSyncFails`), the store fail-stops, and the slots it was to free stay held. Both stores.
+#[test]
+fn a_failed_held_free_upgrade_fail_stops_the_store_and_frees_nothing() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-fails.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+        db.branch_failpoint(Some(BranchFailpoint::UpgradeSyncFails));
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("{what}: a failed upgrade sync left the store running"), || {
+            db.connect().unwrap().fork_branch().is_err()
+        });
+        assert_fail_stopped(trunk.fork_branch().map(|y| y.into_id()), &format!("{what}: the next fork"));
+        for &slot in &slots {
+            assert!(!db.branch_slot_is_free(slot), "{what}: slot {slot} came free after a failed upgrade");
+        }
+    }
+}
+
+/// Engine review 21 MED 4, the mutants' killer (a guard at the base, where the upgrade's sync makes
+/// both): a held-free upgrade over a dirty arena makes exactly two syncs in a store whose free
+/// class is Fsync, the arena's and the log's. Mutants (test builds only) `upgrade_no_arena_sync`
+/// and `upgrade_no_log_sync`.
+#[test]
+fn a_held_free_upgrade_syncs_the_arena_and_the_log() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-syncs.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+        assert_eq!(db.branches.rewrite_class_for_test(), SyncClass::Fsync, "{what}: premise: the free class is Fsync");
+        let z = trunk.fork_branch().unwrap();
+        write_v(&z.connect().unwrap(), 40, "z");
+        assert!(db.branches.arena_dirty_for_test(), "{what}: premise: z's D0 write left the arena unsynced");
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        let before = sync_counts();
+        db.branches.confirm_hold_for_test(0);
+        eventually(&format!("{what}: the held slots never came free"), || {
+            slots.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+        let after = sync_counts();
+        assert_eq!(
+            (after.fsync - before.fsync, after.full_fsync - before.full_fsync),
+            (2, 0),
+            "{what}: the upgrade's syncs (fsync, full fsync): the arena's and the log's"
+        );
+        drop(z);
+    }
+}
+
 /// Engine review 16 LOW 12:a compaction marked what it made durable in the rewrite class read
 /// AFTER the rewrite, whose own log reset clears the inherited floor: a D0 store over a log a D2
 /// run wrote compacted in FullFsync and said Off, so the next FULL trunk commit, whose barrier
