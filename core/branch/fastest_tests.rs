@@ -5840,6 +5840,9 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
 struct FailWalSyncIo {
     inner: Arc<dyn IO>,
     armed: Arc<std::sync::atomic::AtomicU8>,
+    /// Only a WAL whose path ends with this (`/<file name>-wal`) is armed (`None`: every `-wal`
+    /// file): `open_failing_source_wal`. A suffix, as the IO sees the path canonicalized.
+    only: Option<String>,
     /// Mode 3's sync, failed at the next `step`.
     held: Arc<std::sync::Mutex<Option<crate::Completion>>>,
 }
@@ -5863,7 +5866,8 @@ impl IO for FailWalSyncIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
         Ok(Arc::new(FailWalSyncFile {
             inner: self.inner.open_file(path, flags, direct)?,
-            armed: path.ends_with("-wal").then(|| self.armed.clone()),
+            armed: (path.ends_with("-wal") && self.only.as_deref().is_none_or(|only| path.ends_with(only)))
+                .then(|| self.armed.clone()),
             held: self.held.clone(),
         }))
     }
@@ -5939,9 +5943,25 @@ impl crate::io::File for FailWalSyncFile {
 }
 
 /// A store opened through `FailWalSyncIo`, its WAL's next sync failing once `armed` is set.
+/// `open_failing_wal`, arming only the database's own WAL: the WAL of a database it opens on the
+/// same IO (an in-place VACUUM's target build) is left alone.
+fn open_failing_source_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std::sync::atomic::AtomicU8>) {
+    let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+        only: Some(format!("/{}-wal", path.file_name().unwrap().to_str().unwrap())),
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        armed: armed.clone(),
+        held: Arc::new(std::sync::Mutex::new(None)),
+    });
+    let db = Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
+        .unwrap();
+    (db, armed)
+}
+
 fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std::sync::atomic::AtomicU8>) {
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+        only: None,
         inner: Arc::new(PlatformIO::new().unwrap()),
         armed: armed.clone(),
         held: Arc::new(std::sync::Mutex::new(None)),
@@ -7325,6 +7345,7 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -7378,6 +7399,7 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync-d2.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -7428,6 +7450,7 @@ fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync-late.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -8392,7 +8415,12 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
         for header in [true, false] {
             let what = format!("catalog={catalog} header={header}");
             let dir = tempfile::TempDir::new().unwrap();
-            let (db, armed) = open_failing_wal(
+            // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): only the source's
+            // WAL is armed. Run at 9d27592bf (artie raw l1-branch_9d27592bf.txt), the armed sync was
+            // the VACUUM target build's own commit (a database opened on the same IO, its WAL also
+            // `-wal`; backtrace through vacuum_target_build_step, dev tree, unbanked), synced in
+            // Fsync, which drains nothing on Apple: never the two syncs this test is about.
+            let (db, armed) = open_failing_source_wal(
                 &dir.path().join("vacuum-sync.db"),
                 opts(catalog, SyncClass::Off).with_vacuum(true),
             );
