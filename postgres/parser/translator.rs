@@ -52,6 +52,10 @@ struct LateralScope {
     /// Each correlated generate_series call's (table name, PostgreSQL's name for its column),
     /// which the engine names `value` (see `translate_range_function`).
     series: Vec<(String, String)>,
+    /// The FROM items' names in order, for a `*` that a correlated generate_series is under.
+    order: Vec<String>,
+    /// Whether a join of the FROM merges columns (NATURAL, USING): a `*` is then left whole.
+    merged: bool,
 }
 
 impl PostgreSQLTranslator {
@@ -177,6 +181,37 @@ impl PostgreSQLTranslator {
         Ok(())
     }
 
+    /// The result columns a `*` (alias None) or `alias.*` stands for when the current SELECT reads
+    /// a correlated generate_series, whose column the engine's table call names `value`: each FROM
+    /// item's own `*`, and the series' column under PostgreSQL's name (the alias or the alias's
+    /// column list). None when no series is read, or a join merges columns (left whole).
+    fn series_star(&self, alias: Option<&str>) -> Option<Vec<ast::ResultColumn>> {
+        let scopes = self.lateral_scopes.borrow();
+        let scope = scopes.last()?;
+        if scope.series.is_empty() {
+            return None;
+        }
+        let item = |name: &str| match scope.series.iter().find(|(table, _)| table == name) {
+            Some((table, column)) => ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(table),
+                    ast::Name::from_string("value"),
+                )),
+                Some(ast::As::As(ast::Name::from_string(column))),
+            ),
+            None => ast::ResultColumn::TableStar(ast::Name::from_string(name)),
+        };
+        match alias {
+            Some(a) => scope
+                .series
+                .iter()
+                .any(|(table, _)| table == a)
+                .then(|| vec![item(a)]),
+            None if scope.merged || scope.order.is_empty() => None,
+            None => Some(scope.order.iter().map(|name| item(name)).collect()),
+        }
+    }
+
     /// Whether `name` is a column of a LATERAL subselect inlined into the current SELECT.
     fn is_current_lateral_column(&self, name: &str) -> bool {
         self.lateral_scopes
@@ -189,6 +224,7 @@ impl PostgreSQLTranslator {
     fn note_from_name(&self, name: &str) {
         if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
             scope.names.insert(name.to_string());
+            scope.order.push(name.to_string());
         }
     }
 
@@ -2843,6 +2879,11 @@ impl PostgreSQLTranslator {
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
     ) -> Result<ast::FromClause, ParseError> {
+        if join_expr.is_natural || !join_expr.using_clause.is_empty() {
+            if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
+                scope.merged = true;
+            }
+        }
         // Flatten the left-deep join tree: collect the primary table and all joins
         let mut joins = Vec::new();
         let primary_table = self.flatten_join_tree(join_expr, &mut joins)?;
@@ -2995,7 +3036,10 @@ impl PostgreSQLTranslator {
                         // Check if this is a SELECT *
                         if let Some(pg_query::protobuf::node::Node::AStar(_)) = &val.node {
                             self.refuse_star_over_lateral(None)?;
-                            result_columns.push(ast::ResultColumn::Star);
+                            match self.series_star(None) {
+                                Some(columns) => result_columns.extend(columns),
+                                None => result_columns.push(ast::ResultColumn::Star),
+                            }
                         } else if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) =
                             &val.node
                         {
@@ -3005,16 +3049,24 @@ impl PostgreSQLTranslator {
                                     if col_ref.fields.len() == 1 {
                                         // SELECT *
                                         self.refuse_star_over_lateral(None)?;
-                                        result_columns.push(ast::ResultColumn::Star);
+                                        match self.series_star(None) {
+                                            Some(columns) => result_columns.extend(columns),
+                                            None => result_columns.push(ast::ResultColumn::Star),
+                                        }
                                     } else if let Some(first) = col_ref.fields.first() {
                                         // SELECT table.* or alias.*
                                         if let Some(pg_query::protobuf::node::Node::String(s)) =
                                             &first.node
                                         {
                                             self.refuse_star_over_lateral(Some(&s.sval))?;
-                                            result_columns.push(ast::ResultColumn::TableStar(
-                                                ast::Name::from_string(&s.sval),
-                                            ));
+                                            match self.series_star(Some(&s.sval)) {
+                                                Some(columns) => result_columns.extend(columns),
+                                                None => result_columns.push(
+                                                    ast::ResultColumn::TableStar(
+                                                        ast::Name::from_string(&s.sval),
+                                                    ),
+                                                ),
+                                            }
                                         }
                                     }
                                     continue;
