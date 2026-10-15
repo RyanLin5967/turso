@@ -217,6 +217,8 @@ struct Reply {
     oids: Option<Vec<u32>>,
     /// The column names of the last RowDescription, if one came.
     names: Option<Vec<String>>,
+    /// The BackendKeyData's body, if one came.
+    key: Option<Vec<u8>>,
     tags: Vec<String>,
     error: Option<WireError>,
     /// The parameter type OIDs of the last ParameterDescription, if one came.
@@ -257,6 +259,8 @@ struct Wire {
     s: TcpStream,
     /// The ParameterStatus values the server announced at startup, in order.
     parameters: Vec<(String, String)>,
+    /// The BackendKeyData's body (process id and secret key), for a CancelRequest.
+    key: Option<Vec<u8>>,
 }
 
 impl Wire {
@@ -267,6 +271,7 @@ impl Wire {
         let mut w = Self {
             s,
             parameters: Vec::new(),
+            key: None,
         };
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
@@ -289,6 +294,7 @@ impl Wire {
             }),
             None => {
                 w.parameters = r.parameters;
+                w.key = r.key;
                 Ok(w)
             }
         }
@@ -546,6 +552,7 @@ impl Wire {
                 }
                 b'C' => r.tags.push(cstr(&body)),
                 b'N' => r.notices.push(error_fields(&body)),
+                b'K' => r.key = Some(body.clone()),
                 b'S' => {
                     let name = cstr(&body);
                     let value = cstr(&body[name.len() + 1..]);
@@ -3224,6 +3231,53 @@ fn create_table_inherits_is_refused_not_dropped() {
     assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
     let probe = "SELECT * FROM ich";
     assert_eq!(a.q(probe).err(probe).code, "42P01", "the child was created");
+}
+
+/// A statement running long stops on a CancelRequest sent on a second connection with the
+/// session's BackendKeyData, and on SET statement_timeout, with 57014 within seconds, and the
+/// session answers after, as PostgreSQL 18.6 does (recorded with cancel.py, artie raw
+/// loud-20261015/pg18-diff/pg18-cancel.out: 1.03 s and 1.01 s). Here a cancel did nothing (the
+/// server's cancel handler was pgwire's no-op) and statement_timeout was refused unless 0, so any
+/// client could hold a session thread at full CPU for as long as its statement ran
+/// (turso-cancel-3f6b2dbff.out: no answer in 20 s, the server at 198% CPU after).
+#[test]
+fn a_long_statement_stops_on_cancel_and_on_statement_timeout() {
+    let dir = Scratch::new("cancel");
+    let server = Server::start(&dir.db(), &[]);
+    let slow = "SELECT count(*) FROM generate_series(1, 1000000000000000)";
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((slow.len() + 5) as i32).to_be_bytes());
+    q.extend_from_slice(slow.as_bytes());
+    q.push(0);
+    let started = Instant::now();
+    a.s.write_all(&q).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut cancel = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102i32.to_be_bytes());
+    m.extend_from_slice(&key);
+    cancel.write_all(&m).unwrap();
+    drop(cancel);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("57014"),
+        "cancel: {:?} after {:?}",
+        r.error,
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(10), "cancel took {:?}", started.elapsed());
+    a.q("SELECT 1").ok("the session after the cancel");
+    a.q("SET statement_timeout = 1000").ok("statement_timeout");
+    let started = Instant::now();
+    let e = a.q(slow).err("statement_timeout");
+    assert_eq!(e.code, "57014", "statement_timeout: {}", e.message);
+    assert!(started.elapsed() < Duration::from_secs(10), "timeout took {:?}", started.elapsed());
+    a.q("SET statement_timeout = 0").ok("statement_timeout off");
+    a.q("SELECT 1").ok("the session after the timeout");
 }
 
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
@@ -5925,6 +5979,7 @@ fn a_fatal_startup_error_ends_the_session() {
     let mut w = Wire {
         s,
         parameters: Vec::new(),
+        key: None,
     };
     let mut body = Vec::new();
     body.extend_from_slice(&196608i32.to_be_bytes());
