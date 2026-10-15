@@ -485,8 +485,6 @@ struct GroupState {
     confirm_parks: u64,
 }
 
-<<<<<<< 96ccc4a6872aa22e4fb9bfd21391971c7d262a94
-=======
 impl GroupState {
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer enters a wait.
     #[cfg(test)]
@@ -500,15 +498,8 @@ impl GroupState {
     fn confirm_wait_left(&mut self) {
         self.confirm_parked = false;
     }
-
-    /// A sync is in the air outside any flight: a checkpoint's arena sync (`arena_syncing`) or a
-    /// held-free upgrade's (`upgrading`). Neither holds the flight slot.
-    fn syncing_outside_flight(&self) -> bool {
-        self.arena_syncing || self.upgrading
-    }
 }
 
->>>>>>> fork/fastest-budgets
 fn class_index(class: SyncClass) -> usize {
     match class {
         SyncClass::Off => 0,
