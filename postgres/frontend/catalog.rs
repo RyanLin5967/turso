@@ -133,12 +133,19 @@ impl Dialect for PostgresDialect {
             unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
         };
 
-        // Unqualified statements replay as the original PostgreSQL DDL. A
-        // schema-qualified statement targets an attached database the replay
-        // destination does not have, so re-render the translated AST without
-        // the qualifier; the canonical text round-trips through the SQLite
-        // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
+        // Unqualified statements replay as the original PostgreSQL DDL, and so
+        // do those qualified with the main database: the translator maps
+        // `public.t` to main, and such a table took the branch below, so VACUUM
+        // stored SQLite text marked as PostgreSQL DDL (wire review 18 item 20).
+        // A statement qualified with another schema targets an attached
+        // database the replay destination does not have, so re-render the
+        // translated AST without the qualifier; the canonical text round-trips
+        // through the SQLite fallback in `Dialect::parse`.
+        let attached = tbl_name
+            .db_name
+            .take()
+            .is_some_and(|db| !db.as_str().eq_ignore_ascii_case("main"));
+        if !attached {
             return Ok(raw_sql.to_string());
         }
 
