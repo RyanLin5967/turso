@@ -500,7 +500,9 @@ RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_
        "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
        "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
        "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
-       "pool_late_us": None, "max_send_late_us": 100.0}
+       "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op"}
+# (comp review 1 MED 9: a bbload run's after record -- its spec's after-step count, whether --skip-after ran none, and
+# what its tput_* count: "op", or "cycle" when every op's untimed after-steps ran inside the client's loop)
 # An open-loop run's own fields (bbload --mode open --rate 100): its mode and loop, and its lateness record within the
 # 100 us bound; a fixture puts these in BOTH runs of a cell
 OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0},
@@ -795,6 +797,20 @@ def selftest():
         ("control: --skip-after needs no after columns and is per op",
          dict(tracer=clean, lab_extra=dict(BB, skip_after=True, tput_unit="op"),
               timed_extra=dict(BB, skip_after=True, tput_unit="op")), True),
+        ("a bbload run with no after_steps record", dict(tracer=clean, timed_extra={"after_steps": None}), False),
+        ("a bbload run with no skip_after record", dict(tracer=clean, timed_extra={"skip_after": None}), False),
+        ("a bbload run with no after-steps that says tput_unit cycle",
+         dict(tracer=clean, timed_extra={"tput_unit": "cycle"}), False),
+        ("a bbload run with an after3_ns column past its 2 after-steps",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=3)), False),
+        ("a --skip-after run with after<k>_ns columns",
+         dict(tracer=clean, lab_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=2)), False),
+        ("control: clonebench (mode b1) runs no after-step and has no after record",
+         dict(tracer=clean, lab_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None},
+              timed_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None}), True),
     ]
     bad = n = 0
 
