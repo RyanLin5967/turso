@@ -19,12 +19,13 @@ const FLOAT4: u32 = 700;
 const FLOAT8: u32 = 701;
 const NUMERIC: u32 = 1700;
 
-/// For each result column of a plain SELECT (one statement, no set operation, no `*` target), the
-/// PostgreSQL type OID of an aggregate over a table column: count is bigint; sum of smallint or
-/// integer is bigint, of bigint or numeric numeric, of a float its own type; avg of an integer or
-/// numeric is numeric, of a float double precision; min and max are their argument's type. `None`
-/// for every other column, which the engine types. Empty when the statement is not such a SELECT.
-pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>> {
+/// Which result columns of a plain SELECT (one statement, no set operation, no `*` target) are
+/// aggregates, count, sum, avg, min or max over no window, whose PostgreSQL type the parameter
+/// walk gives ([`aggregate_types`]): count is bigint; sum of smallint or integer is bigint, of
+/// bigint or numeric numeric, of a float its own type; avg of an integer or numeric is numeric, of
+/// a float double precision; min and max are their argument's type. Empty when the statement is
+/// not such a SELECT; every other column is the engine's to type.
+pub fn aggregate_targets(parse: &ParseResult) -> Vec<bool> {
     let [raw] = parse.protobuf.stmts.as_slice() else {
         return Vec::new();
     };
@@ -34,7 +35,7 @@ pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>>
     if select.larg.is_some() || select.rarg.is_some() {
         return Vec::new();
     }
-    let mut targets = Vec::with_capacity(select.target_list.len());
+    let mut aggregates = Vec::with_capacity(select.target_list.len());
     for target in &select.target_list {
         let Some(Node::ResTarget(t)) = target.node.as_ref() else {
             return Vec::new();
@@ -49,127 +50,35 @@ pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>>
                 return Vec::new();
             }
         }
-        targets.push(val);
+        let aggregate = match val {
+            Some(Node::FuncCall(call)) => {
+                call.over.is_none()
+                    && func_name(call).is_some_and(|n| {
+                        matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max")
+                    })
+            }
+            _ => false,
+        };
+        aggregates.push(aggregate);
     }
-    if !targets.iter().any(|v| matches!(v, Some(Node::FuncCall(_)))) {
-        return vec![None; targets.len()];
-    }
-    let tables = from_tables(select);
-    targets
-        .into_iter()
-        .map(|val| match val {
-            Some(Node::FuncCall(call)) => aggregate_type(call, &tables, schema),
-            _ => None,
-        })
-        .collect()
+    aggregates
 }
 
-fn aggregate_type(
-    call: &turso_pg_parser::pg_query::protobuf::FuncCall,
-    tables: &[(String, String)],
-    schema: &Schema,
-) -> Option<u32> {
-    if call.over.is_some() {
-        return None;
+/// The aggregate columns' types ([`aggregate_targets`]) out of the walk's types for the result
+/// columns ([`Walked::columns`]), which reads an aggregate's argument through its scope: the
+/// relation the engine reads, through the search path, a CTE, a derived table or a view. None for
+/// every other column, and for all of them when the two do not line up. The aggregates read every
+/// FROM table in public alone, so after `SET search_path TO s, public` `max(c)` over s.t's text
+/// announced public t's int4 (wire review 17 item 15).
+pub fn aggregate_types(aggregates: &[bool], columns: &[Option<u32>]) -> Vec<Option<u32>> {
+    if aggregates.len() != columns.len() {
+        return vec![None; aggregates.len()];
     }
-    let name = match call.funcname.as_slice() {
-        [name] | [_, name] => match name.node.as_ref()? {
-            Node::String(s) => s.sval.as_str(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if name == "count" {
-        return Some(INT8);
-    }
-    let [arg] = call.args.as_slice() else {
-        return None;
-    };
-    let arg = column_type(arg, tables, schema)?;
-    match (name, arg) {
-        ("sum", INT2 | INT4) => Some(INT8),
-        ("sum", INT8 | NUMERIC) => Some(NUMERIC),
-        ("sum", FLOAT4 | FLOAT8) => Some(arg),
-        ("avg", INT2 | INT4 | INT8 | NUMERIC) => Some(NUMERIC),
-        ("avg", FLOAT4 | FLOAT8) => Some(FLOAT8),
-        ("min" | "max", _) => Some(arg),
-        _ => None,
-    }
-}
-
-/// The type OID of a table column an aggregate reads: `col` when exactly one FROM table has it, or
-/// `t.col` by a FROM table's alias or name.
-fn column_type(arg: &PgNode, tables: &[(String, String)], schema: &Schema) -> Option<u32> {
-    let Some(Node::ColumnRef(c)) = arg.node.as_ref() else {
-        return None;
-    };
-    let names: Vec<&str> = c
-        .fields
+    aggregates
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(Node::String(s)) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    let declared = |relname: &str, column: &str| -> Option<Option<u32>> {
-        let table = schema.get_btree_table(relname)?;
-        let (_, col) = table.get_column(column)?;
-        Some(column_oid(col))
-    };
-    let ty = match names.as_slice() {
-        [column] => {
-            let mut found = tables.iter().filter_map(|(_, rel)| declared(rel, *column));
-            let ty = found.next()?;
-            if found.next().is_some() {
-                return None;
-            }
-            ty
-        }
-        [table, column] => {
-            let (_, rel) = tables.iter().find(|(name, _)| name.as_str() == *table)?;
-            declared(rel, *column)?
-        }
-        _ => return None,
-    };
-    ty
-}
-
-/// The FROM clause's tables, as (the name a column reference qualifies them by, relation name),
-/// through joins; only tables of the default schema.
-fn from_tables(select: &SelectStmt) -> Vec<(String, String)> {
-    from_items(&select.from_clause)
-}
-
-/// [`from_tables`] of a list of FROM items (a SELECT's FROM, UPDATE's FROM, DELETE's USING).
-fn from_items(items: &[PgNode]) -> Vec<(String, String)> {
-    fn walk(node: &PgNode, out: &mut Vec<(String, String)>) {
-        match node.node.as_ref() {
-            Some(Node::RangeVar(rv))
-                if matches!(
-                    turso_pg_parser::schema_qualifier(&rv.schemaname),
-                    turso_pg_parser::SchemaQualifier::Unqualified
-                        | turso_pg_parser::SchemaQualifier::Main
-                ) =>
-            {
-                let name = rv
-                    .alias
-                    .as_ref()
-                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
-                out.push((name, rv.relname.clone()));
-            }
-            Some(Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().flatten() {
-                    walk(side, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for item in items {
-        walk(item, &mut out);
-    }
-    out
+        .zip(columns)
+        .map(|(&aggregate, &ty)| ty.filter(|_| aggregate))
+        .collect()
 }
 
 const BOOL: u32 = 16;
@@ -177,6 +86,18 @@ const TEXT: u32 = 25;
 
 /// The types a statement's parse gives: its result columns' (see [`aggregate_types`]) and its
 /// parameters' (see [`parameter_types`]).
+
+/// What the parameter walk gives a statement ([`parameter_types`]).
+pub struct Walked {
+    /// The type OID of each $n its context types, by n ([`StatementTypes::params`]).
+    pub params: std::collections::BTreeMap<u32, u32>,
+    /// The $n compared with an expression no context types ([`StatementTypes::untyped`]).
+    pub untyped: std::collections::BTreeSet<u32>,
+    /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
+    /// statement): [`aggregate_types`] takes the aggregates' from these.
+    pub columns: Vec<Option<u32>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
     pub columns: Vec<Option<u32>>,
@@ -232,13 +153,7 @@ pub fn parameter_types(
     search_path: &[String],
     cache: &std::sync::Mutex<ViewCache>,
     attached: &Attached<'_>,
-) -> Result<
-    (
-        std::collections::BTreeMap<u32, u32>,
-        std::collections::BTreeSet<u32>,
-    ),
-    String,
-> {
+) -> Result<Walked, String> {
     let memo = {
         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         let same = cache
@@ -289,13 +204,7 @@ fn parameter_types_with(
     search_path: &[String],
     view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     attached: &Attached<'_>,
-) -> Result<
-    (
-        std::collections::BTreeMap<u32, u32>,
-        std::collections::BTreeSet<u32>,
-    ),
-    String,
-> {
+) -> Result<Walked, String> {
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
@@ -310,9 +219,10 @@ fn parameter_types_with(
         attached,
         missing_rte: Default::default(),
     };
+    let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
-            infer.statement(stmt);
+            columns = infer.statement(stmt);
         }
     }
     let untyped = infer
@@ -324,7 +234,11 @@ fn parameter_types_with(
     if let Some(missing) = infer.missing_rte.take() {
         return Err(missing);
     }
-    Ok((infer.types, untyped))
+    Ok(Walked {
+        params: infer.types,
+        untyped,
+        columns,
+    })
 }
 
 /// A relation a column reference can name, by the name references qualify it by: a table (its
@@ -549,11 +463,16 @@ impl Infer<'_> {
         }
     }
 
-    fn statement(&mut self, stmt: &PgNode) {
+    /// Walk a statement; returns a SELECT's result columns' types (empty for any other).
+    fn statement(&mut self, stmt: &PgNode) -> Vec<Option<u32>> {
         let scope: Scope = Vec::new();
         match stmt.node.as_ref() {
             Some(Node::SelectStmt(s)) => {
-                self.select(s, &scope);
+                return self
+                    .select(s, &scope)
+                    .into_iter()
+                    .map(|(_, ty)| ty)
+                    .collect();
             }
             Some(Node::InsertStmt(i)) => {
                 let ctes = self.with(i.with_clause.as_ref(), &scope);
@@ -586,6 +505,7 @@ impl Infer<'_> {
             }
             _ => {}
         }
+        Vec::new()
     }
 
     /// Walk a WITH clause and bring its CTEs into scope; returns the depth to truncate back to.

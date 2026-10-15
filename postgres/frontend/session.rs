@@ -744,8 +744,12 @@ fn prepare_statement_checked(
     };
     if let Some(types) = types.as_deref_mut() {
         let schema = pg_conn.conn.current_schema();
-        types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
-        if !used.is_empty() {
+        // An aggregate's result type is read through the walk, as a parameter's is, so its
+        // argument's relation is the one the engine reads (wire review 17 item 15): the walk runs
+        // for a statement with a parameter or an aggregate result column.
+        let aggregates = crate::result_types::aggregate_targets(&parse_result);
+        types.columns = vec![None; aggregates.len()];
+        if !used.is_empty() || aggregates.contains(&true) {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
@@ -771,7 +775,7 @@ fn prepare_statement_checked(
             };
             // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
             // item 5).
-            (types.params, types.untyped) = crate::result_types::parameter_types(
+            let walked = crate::result_types::parameter_types(
                 &parse_result,
                 &schema,
                 &search_path,
@@ -779,6 +783,9 @@ fn prepare_statement_checked(
                 &attached,
             )
             .map_err(LimboError::ParseError)?;
+            types.params = walked.params;
+            types.untyped = walked.untyped;
+            types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
         types.used = used;
     }
