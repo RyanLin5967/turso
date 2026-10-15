@@ -623,7 +623,8 @@ run_cell() {
         # runs under its own); timeout signals its own process group, which holds the wrapper and the sweeper. The
         # inner timeout makes a group of its own, so it escalates to KILL (-k 30) rather than wait on a fastest_profile
         # that ignores TERM
-        timeout 7300 bash -c 'source "$1" && shift && ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
+        timeout 7300 bash -c 'source "$1" || { echo "REFUSED: $1 failed to source"; exit 2; }
+          shift; ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
           "$d" timeout -k 30 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
           --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
           > "$d/adapter.txt" 2>&1 ;;

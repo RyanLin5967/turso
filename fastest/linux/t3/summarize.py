@@ -301,6 +301,7 @@ def ours_sweeper(d, adapter_rc=None):
     if tw is None or (tj.get("t0"), tj.get("t1"), tj.get("rc")) != tw:
         return None, win, [f"timed.json's window and rc {(tj.get('t0'), tj.get('t1'), tj.get('rc'))!r} are not "
                            f"timed.window's {tw!r}"]
+    saved = list(sys.path)  # timedrun inserts its own gates path at import: restore the whole list, not a slice
     try:
         sys.path[:0] = [GATES, COMPETITORS]
         import sweeper_record  # noqa: E402
@@ -308,7 +309,7 @@ def ours_sweeper(d, adapter_rc=None):
     except ImportError as e:
         return None, win, [f"{e.name} cannot be imported: the sweeper's record cannot be re-derived or judged"]
     finally:
-        del sys.path[:2]
+        sys.path[:] = saved
     tp = [x for x in timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
                                               {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1")})
           if not x.startswith(("the load generator's own tracerpid_tm0 ", "the load generator's own tracerpid_tm1 "))]
