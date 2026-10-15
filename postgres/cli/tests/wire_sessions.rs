@@ -2456,13 +2456,14 @@ fn and_chain_answers_as_postgresql_in_implicit_and_failed_blocks() {
     }
 }
 
-/// Arrays in a result as far as this server can answer them right (PostgreSQL 18.6 recorded, artie
-/// raw loud-20261015/pg18-diff/pg18-arrres.out): `ARRAY[1, 2]` is announced int4[] (1007) and
-/// `ARRAY['a', 'b']` text[] (1009), with PostgreSQL's text, on both protocols (both were announced
-/// text). A cast to an array type is refused, 0A000: the engine casts by the element's scalar
-/// affinity, so `'{1,2}'::int[]` answered 0 (int4) and `$1::text[]` the engine's record bytes
-/// (text), silent wrong answers, where PostgreSQL answers the array. A divergence (COMPAT), not
-/// PostgreSQL's answer: it holds until the engine casts to arrays.
+/// Arrays in a result and casts to arrays, as PostgreSQL 18.6 answers them (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-arrres.out), on both protocols: `ARRAY[1, 2]` is int4[] (1007) and
+/// `ARRAY['a', 'b']` text[] (1009); a string literal cast to an array type is that array, typed so
+/// (`'{1,2}'::int[]` was int4 0: the engine casts by the element's scalar affinity); a bound array
+/// parameter cast to its array type stays the array, so it is stored as one (`$1::int[]` stored 0).
+/// A cast to an array of anything else (a column, an expression) is refused, 0A000, rather than
+/// answered by scalar affinity (a divergence, COMPAT). A bound array sent back in a result is the
+/// known red a_bound_array_in_a_result_is_sent_as_its_text.
 #[test]
 fn array_results_are_typed_or_refused() {
     let dir = Scratch::new("arrayresults");
@@ -2472,17 +2473,43 @@ fn array_results_are_typed_or_refused() {
     for (sql, oid, text) in [
         ("SELECT ARRAY[1, 2]", 1007, "{1,2}"),
         ("SELECT ARRAY['a', 'b']", 1009, "{a,b}"),
+        ("SELECT '{1,2}'::int[]", 1007, "{1,2}"),
+        ("SELECT '{a,b}'::text[]", 1009, "{a,b}"),
     ] {
         let r = a.q(sql).ok(sql);
         assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}");
         let r = a.xt(sql, &[]).ok(sql);
         assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}: extended");
     }
-    for sql in ["SELECT '{1,2}'::int[]", "SELECT '{a,b}'::text[]", "SELECT CAST('{1}' AS int[])"] {
-        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    a.q("CREATE TABLE ar(id INT, x INT[])").ok("ar");
+    a.xt("INSERT INTO ar VALUES (1, $1::int[])", &[(1007, 0, b"{1,2}")])
+        .ok("a bound array cast to its type");
+    assert_eq!(
+        a.q("SELECT x FROM ar WHERE id = 1").single("stored"),
+        "{1,2}",
+        "the bound array was stored as the array"
+    );
+    let sql = "SELECT CAST(id AS int[]) FROM ar";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+}
+
+/// KNOWN RED (known-red.txt): a bound array parameter sent back in a result (`SELECT $1::text[]`,
+/// `SELECT $1` declared text[]) is PostgreSQL 18.6's text[] '{a,b}' (recorded, pg18-arrres.out).
+/// Here it is the engine's record blob: rendering it needs core's serialize_array_from_blob, which is
+/// pub(crate) (asked of the engine), and the server does not copy it.
+#[test]
+fn a_bound_array_in_a_result_is_sent_as_its_text() {
+    let dir = Scratch::new("arrayback");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT $1::text[]", "SELECT $1"] {
+        let r = a.xt(sql, &[(1009, 0, b"{a,b}")]).ok(sql);
+        assert_eq!(
+            (r.oids, r.rows),
+            (Some(vec![1009]), vec![vec![Some("{a,b}".to_string())]]),
+            "{sql}"
+        );
     }
-    let r = a.xt("SELECT $1::text[]", &[(1009, 0, b"{a,b}")]);
-    assert_eq!(r.err("a bound array cast").code, "0A000");
 }
 
 /// Portals as PostgreSQL 18.6 keeps them (recorded, artie raw loud-20261015/pg18-diff/
