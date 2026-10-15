@@ -1410,13 +1410,16 @@ impl StoreMutex {
         }
     }
 
-    /// Counted when `compacting` was odd before the mutex was tried, or moved while it was tried
-    /// (Codex C25 MED 1): every counted hold adds one as it begins and one as it ends, so a hold that
-    /// began, and took the mutex first, after the precheck read it even leaves a different value by
-    /// the time this thread holds the mutex. Mutant `compaction_wait_precheck_only` (test builds
-    /// only): the precheck alone decides, as before.
+    /// Counted as it arrives when `compacting` is odd (so a waiter shows while it waits), and
+    /// otherwise once it holds the mutex if `compacting` moved meanwhile (Codex C25 MED 1): every
+    /// counted hold adds one as it begins and one as it ends, so a hold that began, and took the
+    /// mutex first, after the precheck read it even leaves a different value by then. Mutant
+    /// `compaction_wait_precheck_only` (test builds only): the precheck alone decides, as before.
     fn lock(&self) -> StoreGuard<'_> {
         let before = self.compacting.load(Ordering::Acquire);
+        if before & 1 == 1 {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg(test)]
         AFTER_PRECHECK.with(|h| {
             if let Some(hook) = h.borrow_mut().as_mut() {
@@ -1424,8 +1427,10 @@ impl StoreMutex {
             }
         });
         let guard = self.lock_uncounted();
-        let moved = self.compacting.load(Ordering::Acquire) != before && !fe_mutant("compaction_wait_precheck_only");
-        if before & 1 == 1 || moved {
+        if before & 1 == 0
+            && self.compacting.load(Ordering::Acquire) != before
+            && !fe_mutant("compaction_wait_precheck_only")
+        {
             self.compaction_waits.fetch_add(1, Ordering::Relaxed);
         }
         guard
