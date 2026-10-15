@@ -1597,6 +1597,43 @@ fn run_instruments(cell: &str) -> String {
             ("settled_after", u64::from(after)),
         ]),
     );
+    // Review C14 (MED): the held case, with the writer delayed between a notification and its
+    // wait's return. After the arm above the writer is parked with no word pending; it is suspended
+    // (Mach `thread_suspend`, outside any window), and a held create's landing notifies it. It
+    // cannot wake, so its parked flag still reads true from the wait it entered before the create:
+    // `writer_settled` must refuse that stale park. Resumed, it takes the word, enters the held
+    // quiet period's wait, and is settled. The create runs on a thread of its own, bounded, so a
+    // writer suspended while holding the group's lock (a spurious wake just before the suspend)
+    // cannot hang the cell: the record says whether the create had landed before the check.
+    #[cfg(target_vendor = "apple")]
+    {
+        let parked_before = writer_settled(&db, std::time::Duration::from_secs(5));
+        let suspended = probe::suspend_thread_named("branch-confirm");
+        let found = suspended.is_some();
+        let creating = {
+            let trunk = trunk.clone();
+            std::thread::spawn(move || trunk.create_branch("fc-stale-park").map(|_| ()).map_err(|e| e.to_string()))
+        };
+        let t = std::time::Instant::now();
+        while !creating.is_finished() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let landed = creating.is_finished();
+        let stale = writer_settled(&db, std::time::Duration::from_millis(50));
+        drop(suspended);
+        creating.join().unwrap().unwrap_or_else(|e| panic!("fc_writer_stale_park: the create failed: {e}"));
+        let resumed = writer_settled(&db, std::time::Duration::from_secs(5));
+        put(
+            "fc_writer_stale_park",
+            &Sample::from([
+                ("parked_before", u64::from(parked_before)),
+                ("found", u64::from(found)),
+                ("landed_before_check", u64::from(landed)),
+                ("settled_stale", u64::from(stale)),
+                ("settled_resumed", u64::from(resumed)),
+            ]),
+        );
+    }
     out
 }
 
@@ -2078,6 +2115,14 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert!(get("fc_writer_park", "live") >= 1, "premise: the instruments store runs a confirmation writer");
     assert_eq!(get("fc_writer_park", "settled_mid_write"), 0, "a confirmation writer held mid-write read as parked (review 2 L3)");
     assert_eq!(get("fc_writer_park", "settled_after"), 1, "a released confirmation writer never parked with nothing pending (review 2 L3)");
+    #[cfg(target_vendor = "apple")]
+    {
+        assert_eq!(get("fc_writer_stale_park", "parked_before"), 1, "premise: the writer parked before it was suspended");
+        assert_eq!(get("fc_writer_stale_park", "found"), 1, "premise: exactly one branch-confirm thread, suspended");
+        assert_eq!(get("fc_writer_stale_park", "landed_before_check"), 1, "premise: the held create landed while the writer was suspended");
+        assert_eq!(get("fc_writer_stale_park", "settled_stale"), 0, "a held window accepted the writer's stale park: notified, not yet woken (review C14 MED)");
+        assert_eq!(get("fc_writer_stale_park", "settled_resumed"), 1, "a resumed writer never parked again (review C14)");
+    }
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
