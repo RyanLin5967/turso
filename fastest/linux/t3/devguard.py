@@ -50,9 +50,11 @@ the first three, so the O_EXCL rule refuses them; the signature rule refuses all
 know (a raw partition with no metadata, a disk holding only ciphertext) is not seen, and the partition-table rule
 covers it only when the raw data sits in a partition.
 """
+import errno
 import json
 import os
 import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -507,30 +509,51 @@ def self_test():
         return r.returncode, r.stdout, r.stderr
 
     def fake_box():
-        """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to two
+        """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to
         controllers (nvme0 carries the root disk nvme0n1 and a second namespace nvme0n2; nvme1 carries the spare
-        nvme1n1), lsblk's JSON, blkid's answers and an O_EXCL opener that finds the root disk claimed"""
+        nvme1n1; review 6 LOW 8: nvme2 a multipath head nvme2n1, nvme3 a disk nvme3n1 held by dm-9), each disk's sysfs
+        dev, lsblk's JSON, blkid's answers and an O_EXCL opener that finds the root disk claimed. TEST EDIT, flagged
+        (review 6 LOW 5, LOW 8): the opener now opens the node it is handed, under the dev root only (a path elsewhere
+        is ENOENT, as the real opener's would be), and answers the opened node's (st_mode, st_rdev) as the real one
+        does; the box gains the nodes, sysfs dev files and the two disks above. No expectation changes."""
         top = tempfile.mkdtemp(dir=tmp)
         droot, sroot = os.path.join(top, "dev"), os.path.join(top, "sys")
-        os.makedirs(droot)
-        for d in ("nvme0n1", "nvme0n1p1", "nvme0n2", "nvme1n1"):
+        os.makedirs(os.path.join(droot, "sub"))
+        nums = {"nvme0n1": 0, "nvme0n1p1": 1, "nvme0n2": 2, "nvme1n1": 3, "nvme2n1": 4, "nvme3n1": 5}
+        for d in nums:
             open(os.path.join(droot, d), "w").close()
+        open(os.path.join(droot, "sub", "nvme1n1"), "w").close()
         os.symlink(os.path.join(droot, "nvme1n1"), os.path.join(droot, "by-id-spare"))
-        for c in ("nvme0", "nvme1"):
+        os.symlink(os.path.join(droot, "sub", "nvme1n1"), os.path.join(droot, "by-id-sub"))
+        for c in ("nvme0", "nvme1", "nvme2", "nvme3"):
             os.makedirs(os.path.join(sroot, "devices", "pci", c))
-        for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1")):
+        for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1"), ("nvme2n1", "nvme2"),
+                     ("nvme3n1", "nvme3")):
             os.makedirs(os.path.join(sroot, "block", d, "holders"))
             os.symlink(os.path.join("..", "..", "devices", "pci", c), os.path.join(sroot, "block", d, "device"))
+            with open(os.path.join(sroot, "block", d, "dev"), "w") as f:
+                f.write(f"259:{nums[d]}\n")
         os.makedirs(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "holders"))
+        with open(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "dev"), "w") as f:
+            f.write("259:1\n")
+        os.makedirs(os.path.join(sroot, "block", "nvme2n1", "multipath"))
+        open(os.path.join(sroot, "block", "nvme2n1", "multipath", "nvme2c2n1"), "w").close()
+        open(os.path.join(sroot, "block", "nvme3n1", "holders", "dm-9"), "w").close()
         lsblk = json.dumps({"blockdevices": [N("nvme0n1", "disk", children=[N("nvme0n1p1", "part", "nvme0n1", ["/"])]),
-                                             N("nvme0n2", "disk"), N("nvme1n1", "disk")]})
+                                             N("nvme0n2", "disk"), N("nvme1n1", "disk"), N("nvme2n1", "disk"),
+                                             N("nvme3n1", "disk")]})
         answers = {"nvme0n1": (0, "DEVNAME=/dev/nvme0n1\nPTTYPE=gpt\n"), "nvme0n1p1": (0, "TYPE=ext4\n")}
 
-        def excl(path):
-            if os.path.basename(path) in ("nvme0n1", "nvme0n1p1"):
-                raise OSError(16, "Device or resource busy")
-
-        def run(dev):
+        def run(dev, node=None):
+            """check() on DEV; NODE overrides the opened node's (st_mode, st_rdev) per name"""
+            def excl(path):
+                if os.path.dirname(os.path.realpath(path)) != os.path.realpath(droot):
+                    raise OSError(errno.ENOENT, "No such file or directory")
+                open(path, "rb").close()
+                b = os.path.basename(path)
+                if b in ("nvme0n1", "nvme0n1p1"):
+                    raise OSError(16, "Device or resource busy")
+                return (node or {}).get(b, (stat.S_IFBLK | 0o660, os.makedev(259, nums[b])))
             return check(os.path.join(droot, dev) if not os.path.isabs(dev) else dev, sys_root=sroot, dev_root=droot,
                          lsblk=lsblk, blkid=lambda k: answers.get(k, (2, "")), excl=excl)
         return run
@@ -687,12 +710,30 @@ def self_test():
          lambda: (lambda r: (r == ("nvme1n1", []), r))(box("by-id-spare"))),
         ("MED 1: check() refuses nvme0n2, a second namespace on the root drive's controller, by the controller rule",
          lambda: (lambda r: (any("nvme0n2 shares its controller" in b for b in r[1]), r))(box("nvme0n2"))),
+        # TEST EDIT, flagged (review 6 LOW 8): the O_EXCL text now includes the kernel's EBUSY reason, as t3run's root
+        # fire requires; a strengthening
         ("MED 1: check() on the root disk gives the root, O_EXCL and signature texts and no 'cannot read' line",
          lambda: (lambda r: (all(any(t in b for b in r[1]) for t in (f"nvme0n1 {ROOT}", "nvme0n1 cannot be opened "
-                                                                     "exclusively", f"nvme0n1 {SIG}"))
+                                                                     "exclusively (Device or resource busy)",
+                                                                     f"nvme0n1 {SIG}"))
                              and not any("cannot read" in b for b in r[1]), r))(box("nvme0n1"))),
         ("MED 1: check() refuses a path that does not resolve under the dev root",
          lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("/etc/hosts"))),
+        # review 6 LOW 8: check()'s multipath and holder readings on the fake box (the self-test fed problems() only)
+        ("LOW 8: check() refuses nvme2n1, a multipath NVMe head (multipath/nvme2c2n1)",
+         lambda: (lambda r: (any("nvme2n1 is a multipath NVMe head" in b for b in r[1]), r))(box("nvme2n1"))),
+        ("LOW 8: check() refuses nvme3n1, held by dm-9",
+         lambda: (lambda r: (any("nvme3n1 is held by ['dm-9']" in b for b in r[1]), r))(box("nvme3n1"))),
+        # review 6 LOW 5: the node itself: directly under the dev root, a block device, and its st_rdev the disk's own
+        # sysfs dev (a hand-made /dev/<sub>/nvme1n1 carrying the root disk's MAJ:MIN passed as the spare)
+        ("LOW 5: check() refuses a by-id link to <dev root>/sub/nvme1n1 (a node not directly under the dev root)",
+         lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("by-id-sub"))),
+        ("LOW 5: check() refuses a spare whose opened node carries the root disk's MAJ:MIN (259:0, sysfs 259:3)",
+         lambda: (lambda r: (any("nvme1n1's node is device 259:0, not its sysfs dev 259:3" in b for b in r[1]), r))(
+             box("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(259, 0))}))),
+        ("LOW 5: check() refuses a spare whose opened node is not a block device",
+         lambda: (lambda r: (any("nvme1n1's node is not a block device" in b for b in r[1]), r))(
+             box("nvme1n1", node={"nvme1n1": (stat.S_IFREG | 0o644, 0)}))),
     ]
     bad = []
     try:

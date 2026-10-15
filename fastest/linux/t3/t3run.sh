@@ -660,7 +660,8 @@ selftests() {
   for d in $rd; do
     sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$d" > "$OUT/devguard-root-$d.txt" 2>&1
     rc=$?
-    for t in "holds the root filesystem" "cannot be opened exclusively" "carries a signature"; do
+    # (the O_EXCL text with the kernel's EBUSY: an ENOENT from a wrong path also "cannot be opened"; review 6 LOW 8)
+    for t in "holds the root filesystem" "cannot be opened exclusively (Device or resource busy)" "carries a signature"; do
       want_text="REFUSED: $d $t"
       if [ $rc != 2 ] || ! grep -qF "$want_text" "$OUT/devguard-root-$d.txt"; then
         cat "$OUT/devguard-root-$d.txt"
