@@ -3313,6 +3313,8 @@ fn run_flight(
         ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         ckpt_held("install.installed");
+        // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
+        let retired = guard.journal.as_mut().and_then(Journal::take_retired);
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3352,8 +3354,11 @@ fn run_flight(
         let (count, signal) = &*installs;
         *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         signal.notify_all();
-        installed
+        (installed, retired)
     };
+    let (installed, retired) = installed;
+    // Holding no lock now: the old log's handles close here.
+    drop(retired);
     // Flights go on, into the new log.
     drop(cut);
     ckpt_phase("installed");
@@ -5916,7 +5921,10 @@ impl BranchStore {
             group.mark_durable(written, class);
             let durable = group.durable(inner.free_class());
             inner.mature_frees(durable);
+            let retired = inner.journal.as_mut().and_then(Journal::take_retired);
             drop(inner);
+            // The old log's handles close holding no lock.
+            drop(retired);
             drop(counted);
             return Ok(());
         }

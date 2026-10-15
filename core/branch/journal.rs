@@ -1189,6 +1189,12 @@ pub(crate) struct Journal {
     /// allocate nothing under the store mutex in steady state (budget
     /// create_allocates_at_most_once_under_the_store_mutex).
     recycled: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// The handles a cut retires (the old log, its shared duplicate, the cut's source), closed by
+    /// whoever takes them (`take_retired`) once it holds no lock: a close is a syscall, and a cut
+    /// finishes under the store mutex (checkpoint FIX, budget
+    /// a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex). A later cut closes any left
+    /// untaken, so they never pile up.
+    retired: Option<Retired>,
     /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
     /// run off the store mutex (`prepare_cut`, through its `CutSource`).
     fail_next_replacement_sync: AtomicBool,
@@ -1267,6 +1273,13 @@ pub(crate) struct CutSource {
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
 /// the header and the kept records `[from, upto)` of the old one as one flight, synced; locked.
+/// File handles a cut retired, closed when this is dropped (`Journal::take_retired`).
+pub(crate) struct Retired {
+    _old: Option<File>,
+    _shared: Option<Arc<File>>,
+    _source: Option<File>,
+}
+
 pub(crate) struct CutPrep {
     file: File,
     from: u64,
@@ -1462,6 +1475,7 @@ impl Journal {
             fail_next_confirm: false,
             shared: None,
             recycled: Arc::new(std::sync::Mutex::new(None)),
+            retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
@@ -1668,6 +1682,7 @@ impl Journal {
             fail_next_confirm: false,
             shared: None,
             recycled: Arc::new(std::sync::Mutex::new(None)),
+            retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
@@ -1937,6 +1952,11 @@ impl Journal {
     /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
     pub(crate) fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// The handles the last cut retired (`retired`), for the caller to close holding no lock.
+    pub(crate) fn take_retired(&mut self) -> Option<Retired> {
+        self.retired.take()
     }
 
     /// The incarnation's shared duplicate of the log (`shared`), made on first use.
@@ -2216,9 +2236,15 @@ impl Journal {
             return Err(io_error(e, "rename branch log rewrite"));
         }
         super::store::kill_point("cut.renamed");
-        // From here the new file is the log.
-        self.file = prep.file;
-        self.shared = None;
+        // From here the new file is the log. The old handles are retired, not closed here (mutant
+        // `cut_closes_under_mutex`, test builds only: closed here, as before).
+        let old = std::mem::replace(&mut self.file, prep.file);
+        let retired = Retired { _old: Some(old), _shared: self.shared.take(), _source: Some(prep.source) };
+        if super::store::fe_mutant("cut_closes_under_mutex") {
+            drop(retired);
+        } else {
+            drop(self.retired.replace(retired));
+        }
         self.rewrites += 1;
         // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
         if !super::store::fe_mutant("no_backoff_reset") {
