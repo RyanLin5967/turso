@@ -681,8 +681,10 @@ def self_test():
         ("A14: the plants record missing fails the block", {"plants": False}, False, None),
         ("A14: a plant that did not fire fails the block", {"plants_fired": False}, False, None),
         ("review L5: a VALID recorded over VOID arms fails the block", {"lie": True}, False, None),
-        # T3 runner review item 6: with a stored plants record that passes, the block fails through block()'s own
-        # re-derivation, on its text (the case above also fails through the plants path, so it could not see L5 go)
+        # T3 runner review item 6: the block must fail on block()'s own re-derivation, on its text. Corrected (review 5
+        # LOW 26): a passing stored plants record does not take the plants path out. summarize re-derives the plants
+        # from the record, the lie record's VOID arms fail plants()' control, and its recorded VALID keeps that reason,
+        # so this case fails on BOTH paths. Only the text lambda below sees L5's re-derivation go (it kills mutant 6a)
         ("item 6: a VALID recorded over VOID arms, stored plants passing, fails on block()'s re-derivation text",
          {"lie": True, "v3l_plants_record": {"plants": [], "all_fired": True}}, False,
          lambda s: "disagrees with the gates re-run" in s["failed_blocks"][0]),
