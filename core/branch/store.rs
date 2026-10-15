@@ -1415,6 +1415,7 @@ impl StoreMutex {
     /// counted hold adds one as it begins and one as it ends, so a hold that began, and took the
     /// mutex first, after the precheck read it even leaves a different value by then. Mutant
     /// `compaction_wait_precheck_only` (test builds only): the precheck alone decides, as before.
+    #[track_caller]
     fn lock(&self) -> StoreGuard<'_> {
         let before = self.compacting.load(Ordering::Acquire);
         if before & 1 == 1 {
@@ -1436,14 +1437,19 @@ impl StoreMutex {
         guard
     }
 
-    /// `lock`, not counted as waiting behind a compaction: the background compaction's own.
+    /// `lock`, not counted as waiting behind a compaction: the background compaction's own. The
+    /// caller's site is kept for the lifecycle audit (`budget_probe::HoldRec`; `#[track_caller]`
+    /// through every wrapper).
+    #[track_caller]
     fn lock_uncounted(&self) -> StoreGuard<'_> {
+        #[cfg(test)]
+        let site = std::panic::Location::caller();
         let guard = self.inner.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
-        super::budget_probe::store_locked();
+        super::budget_probe::store_locked_at(site);
         StoreGuard(guard)
     }
 }
@@ -6348,6 +6354,7 @@ impl BranchStore {
 
     /// The store mutex with no group flight in the air (a cut's copy must end a flight): waited for
     /// holding no lock, then re-checked under it. Fails once the store is fail-stopped.
+    #[track_caller]
     fn lock_quiesced<'a>(store: &'a StoreMutex, group: &Group) -> Result<StoreGuard<'a>> {
         loop {
             {
@@ -8720,6 +8727,7 @@ impl BranchStore {
     }
 
     /// Lock the store mutex on a fork path, timing the hold (see [`Counted`]).
+    #[track_caller]
     fn lock_counted(&self) -> Counted<impl std::ops::DerefMut<Target = StoreInner> + '_> {
         let guard = self.inner.lock();
         Counted {

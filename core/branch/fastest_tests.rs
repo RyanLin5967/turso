@@ -8764,6 +8764,152 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
 }
 
+/// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
+/// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
+/// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
+/// is recorded with the site that took it (`#[track_caller]` through `StoreMutex::lock` and its
+/// wrappers), its thread, and what it did, each counted for the holding thread
+/// (`budget_probe::HoldRec`: syscalls attributed by `attribute`, exact under feshim). Audited, at `n`
+/// live named branches of a D2 catalog store:
+/// - a reopen (the name filter's open seed, M4);
+/// - 20 named creates, unnamed forks, connects by name, first writes, disconnects and deletes;
+/// - 3 fuzzy checkpoints (capture and install);
+/// - a name-filter growth, and a rebuild after a forced overflow (the drain failpoint; MED-2).
+/// The claim lists every (operation, site) whose worst hold did any of the three, so each instance of
+/// the class is named where it lives.
+fn lifecycle_audit(n: u32) {
+    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_LOG, AUDIT_LOST};
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            AUDIT.store(false, Release);
+            super::budget_probe::arm(false);
+            super::store::FILTER_DRAIN_FAILS.store(false, Release);
+        }
+    }
+    let _d = Disarm;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..n {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.incarnation
+    };
+    {
+        let mut log = AUDIT_LOG.lock().unwrap();
+        log.clear();
+        log.reserve(1 << 20);
+    }
+    let mut marks: Vec<(&str, usize)> = Vec::new();
+    let mark = |marks: &mut Vec<(&'static str, usize)>, op: &'static str| marks.push((op, AUDIT_LOG.lock().unwrap().len()));
+    probe::prime();
+    probe::arm(true);
+    AUDIT.store(true, Release);
+    mark(&mut marks, "open");
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    for i in 0..20u32 {
+        let name = format!("a-{i:03}");
+        mark(&mut marks, "named_create");
+        trunk.create_branch(&name).unwrap();
+        mark(&mut marks, "unnamed_fork");
+        let _ = trunk.fork_branch().unwrap().into_id();
+        mark(&mut marks, "connect_named");
+        let c = db.connect_named(&name).unwrap();
+        mark(&mut marks, "first_write");
+        c.execute(&format!("UPDATE t SET v = 'a{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+        mark(&mut marks, "disconnect");
+        drop(c);
+        mark(&mut marks, "delete");
+        db.drop_branch(&name).unwrap();
+    }
+    for _ in 0..3 {
+        mark(&mut marks, "fuzzy_checkpoint");
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+    }
+    mark(&mut marks, "filter_growth");
+    let (_, entries0, _, builds0, _) = db.branches.name_filter_stats();
+    let mut k = 0u32;
+    while db.branches.name_filter_stats().3 == builds0 && k < 4 * n.max(1024) {
+        trunk.create_branch(&format!("g-{k:07}")).unwrap();
+        k += 1;
+    }
+    db.branch_wait_name_filter();
+    mark(&mut marks, "filter_rebuild");
+    super::store::FILTER_DRAIN_FAILS.store(true, Release);
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    let mut r = 0u32;
+    while db.branches.name_filter_state_for_test().1 == rebuilds0 && r < 8 * n.max(1024) {
+        trunk.create_branch(&format!("r-{r:07}")).unwrap();
+        r += 1;
+    }
+    super::store::FILTER_DRAIN_FAILS.store(false, Release);
+    trunk.create_branch("after-rebuild").unwrap();
+    db.branch_wait_name_filter();
+    mark(&mut marks, "end");
+    AUDIT.store(false, Release);
+    probe::arm(false);
+    let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
+    assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
+    assert!(db.branches.name_filter_stats().3 > builds0, "premise: no filter growth happened ({entries0} entries)");
+    assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the forced overflow never rebuilt the filter");
+    // Group each hold under the operation whose span it fell in.
+    let mut worst: std::collections::BTreeMap<(&str, String), (u64, u64, u64, u64, u64, bool)> = Default::default();
+    for (w, pair) in marks.windows(2).enumerate() {
+        let _ = w;
+        let (op, from) = pair[0];
+        let to = pair[1].1;
+        for h in &log[from..to] {
+            let site = format!("{}:{}", h.site.file().rsplit('/').next().unwrap_or(""), h.site.line());
+            let e = worst.entry((op, site)).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(h.syscalls.unwrap_or(0));
+            e.2 = e.2.max(h.allocs);
+            e.3 = e.3.max(h.alloc_bytes);
+            e.4 = e.4.max(h.cat_stmts);
+            e.5 |= h.syscalls.is_none();
+        }
+    }
+    let mut over = Vec::new();
+    for ((op, site), (holds, sys, allocs, bytes, stmts, unattributed)) in &worst {
+        let line = format!(
+            "{op} @ {site}: {holds} holds, worst {sys} syscalls{}, {allocs} allocs ({bytes} B), {stmts} catalog stmts",
+            if *unattributed { " (some unattributable)" } else { "" }
+        );
+        println!("audit n={n}: {line}");
+        if *sys > 0 || *allocs > 0 || *stmts > 0 {
+            over.push(line);
+        }
+    }
+    assert!(!worst.is_empty(), "premise: the audit recorded no hold");
+    assert!(
+        over.is_empty(),
+        "CLAIM: {} store-mutex sites on the create path did a syscall, an allocation or a catalog statement while held (n = {n}): {over:#?}",
+        over.len()
+    );
+}
+
+#[test]
+fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_statement() {
+    lifecycle_audit(10_000);
+}
+
+/// The audit at 10^6 live branches (the lead's second scale): long to populate in a debug build, so
+/// run by name.
+#[test]
+#[ignore = "class (e) audit at 10^6: run by name with --ignored"]
+fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_statement_at_a_million() {
+    lifecycle_audit(1_000_000);
+}
+
 /// Lead conditions on the name filter (DECISIONS, the acceptance of the one-state fix): the table
 /// listing the regrowth tests read (`per_branch_tables_for_test`) prices the filter's tables at their
 /// REAL bytes (8 per slot; 4cb167221 listed them at 0, which blinded the regrowth test), and a growth
