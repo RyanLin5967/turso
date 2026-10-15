@@ -829,8 +829,10 @@ mod tests {
     /// column got the plain comparison, not the type's operator, so a numeric column (stored
     /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
     /// as a literal of the type's value input type: passed to the operator as given (2fa04254c;
-    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is vestigial since then,
-    /// no operand being encoded, and stays as written. Mutant `param_skips_type_operator`.
+    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is not vestigial (engine
+    /// review 20 LOW 28): no comparison operand is encoded, but an index seek's key is, with the
+    /// column's typmod (1d8bf442e), and the column's own values are. Mutant
+    /// `param_skips_type_operator`.
     #[test]
     fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
         let conn = open();

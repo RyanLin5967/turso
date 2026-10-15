@@ -314,8 +314,11 @@ pub(crate) struct BranchStore {
     drain_parent: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
-    /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
-    /// (see `pause_at`), so a test can act on the store with the gate open.
+    /// Test hook (see `pause_at`): the stage it holds pauses the operation that reaches it, so a test
+    /// can act on the store meanwhile. `HOLD_TRUNK_DECIDED` (a trunk commit inside its commit gate),
+    /// `HOLD_TRUNK_BARRIER_DONE`, `HOLD_FORK_REGISTERING`, `HOLD_LOCKED_FLUSH`,
+    /// `HOLD_RELEASE_BUFFERED`, `HOLD_SCHEMA_PUBLISH`, `HOLD_DROP_LOOKED_UP` and
+    /// `HOLD_CONNECT_LOOKED_UP` (engine review 20 LOW 30: the doc named only the first).
     #[cfg(test)]
     pub(crate) trunk_commit_hold: Arc<AtomicU8>,
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
