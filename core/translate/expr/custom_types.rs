@@ -1946,7 +1946,7 @@ mod tests {
     /// from zero, and a value that rounds past the precision is PostgreSQL's 22003 "numeric field
     /// overflow". PG 18.6's answers for this exact SQL (artie raw frontier/fastest/lanes/engine/raw/
     /// pg18-numeric-typmod-round.txt b4512c63d5): 1.005, -1.005, 1.004, 2.675 into numeric(10, 2)
-    /// read 1.01, -1.01, 1.00, 2.68; CAST('-0.125' AS numeric(4, 2)) is -0.13; 99999999.995 into
+    /// read 1.01, -1.01, 1.00, 2.68; '-0.125' into numeric(4, 2) is -0.13; 99999999.995 into
     /// numeric(10, 2) overflows; 99999999.994 reads 99999999.99.
     #[test]
     fn a_numeric_typmod_rounds_half_away_from_zero_as_postgresql_does() {
@@ -1965,7 +1965,16 @@ mod tests {
             (table("(1, '2.675')", "SELECT CAST(x AS TEXT) FROM r"), Ok("2.68")),
             (table("(1, '99999999.994')", "SELECT CAST(x AS TEXT) FROM r"), Ok("99999999.99")),
             (table("(1, '99999999.995')", "SELECT CAST(x AS TEXT) FROM r"), Err("numeric field overflow")),
-            (vec!["SELECT CAST(CAST('-0.125' AS numeric(4, 2)) AS TEXT)".to_string()], Ok("-0.13")),
+            // Through a numeric(4, 2) column (PG 18.6: -0.13, raw acf4b78d7f): a CAST to numeric here
+            // yields its ENCODE's blob, not a decoded value, so the CAST form cannot be read back.
+            (
+                vec![
+                    "CREATE TABLE q(id INTEGER PRIMARY KEY, x numeric(4, 2)) STRICT".to_string(),
+                    "INSERT INTO q VALUES (1, '-0.125')".to_string(),
+                    "SELECT CAST(x AS TEXT) FROM q".to_string(),
+                ],
+                Ok("-0.13"),
+            ),
         ] {
             let got = run_bounded(steps.clone());
             let ok = match (&got, &want) {
