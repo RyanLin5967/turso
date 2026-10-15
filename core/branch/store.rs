@@ -5490,7 +5490,8 @@ impl BranchStore {
         ]
     }
 
-    /// Compactions the background writer led (DECISIONS c9c821dd8d; observation only).
+    /// Test builds: compactions the background writer led (DECISIONS c9c821dd8d; observation only).
+    #[cfg(test)]
     pub(crate) fn background_compactions(&self) -> u64 {
         self.group.lock().background_compactions
     }
