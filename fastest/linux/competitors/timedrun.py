@@ -342,7 +342,9 @@ def after_problems(nm, sm, cols):
         why.append(f"{nm} run has no skip_after record ({skip!r})")
     if why:
         return why
-    k = 0 if skip else na
+    # (na is a count here; the guard keeps the columns check from raising when the refusal above is deleted, so a
+    # timedrun_mutants.py mutant of it reads as a clean verdict -- a crash is not a kill)
+    k = 0 if skip or not _count(na) else na
     got = {c for c in cols if re.fullmatch(r"after\d+_ns", c)}
     want = {f"after{i + 1}_ns" for i in range(k)}
     if got != want:
