@@ -2540,7 +2540,7 @@ impl Journal {
     /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
     fn take_dirty_dir(&mut self, class: SyncClass) -> Result<Option<File>> {
         let d = self.dirty_dir_handle(class)?;
-        if d.is_some() {
+        if d.is_some() || (class.syncs() && !dirs_sync()) {
             self.dir_dirty = false;
         }
         Ok(d)
@@ -2552,6 +2552,12 @@ impl Journal {
         // rename made is never synced. Only a crash model that undoes an unsynced rename (C1b)
         // can see it; C1's power-loss simulation does not model renames.
         if !self.dir_dirty || !class.syncs() || super::store::fe_mutant("no_cut_dir_sync") {
+            return Ok(None);
+        }
+        // Off unix no directory is synced (`fsync_dir_of` is a no-op there), and opening one as a
+        // file fails (Windows wants FILE_FLAG_BACKUP_SEMANTICS), which poisoned a fresh D0 store at
+        // its first syncing flight (engine review 19 MED 4): no handle.
+        if !dirs_sync() {
             return Ok(None);
         }
         let dir = match self.files.log.parent() {
@@ -4361,6 +4367,13 @@ pub(crate) fn fail_next_barrier(errno: i32) {
 #[cfg(test)]
 pub(crate) fn barrier_errno_pending() -> i32 {
     BARRIER_ERRNO.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether this target makes a rename durable by syncing the directory (`fsync_dir_of`): unix only.
+/// Mutant `dir_opened_off_unix` (test builds only; engine review 19 MED 4): every target, so a
+/// flight off unix opens its log's directory as a file, as before.
+fn dirs_sync() -> bool {
+    cfg!(unix) || super::store::fe_mutant("dir_opened_off_unix")
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
