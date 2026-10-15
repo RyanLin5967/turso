@@ -1047,8 +1047,6 @@ impl Session {
         Ok(st.trunk.clone().expect("opened above"))
     }
 
-    /// ReadyForQuery's status, read from the session's state rather than inferred from the
-    /// statements it ran.
     /// A named portal's statement ran to completion without rows, or failed: it does not run again.
     fn portal_done(&self, name: &str) {
         if name != DEFAULT_NAME {
@@ -1098,8 +1096,8 @@ impl Session {
         Some(ParameterStatus::new("search_path".to_string(), shown))
     }
 
-    /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
-    /// a block is open (wire review 12 item 5).
+    /// The portals of a transaction that has ended, the unnamed one included, for `serve_session`
+    /// to drop: none while a block is open (wire review 12 item 5, review 15 item 16).
     fn ended_portals(&self) -> Vec<String> {
         if !matches!(self.transaction_status(), TransactionStatus::Idle) {
             return Vec::new();
@@ -1114,6 +1112,9 @@ impl Session {
         ended
     }
 
+    /// ReadyForQuery's status, read from the session's state rather than inferred from the
+    /// statements it ran (its doc sat on portal_done, inserted between them: wire review 15 item
+    /// 22).
     fn transaction_status(&self) -> TransactionStatus {
         let st = self.state();
         if st.aborted {
