@@ -74,6 +74,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -788,6 +789,38 @@ def _block_of(r):
         os.rmdir(d)
 
 
+def _measure_with(patches, env=None):
+    """measure() on a fake box (review 5 LOW 25, review 6 LOW 10): PATCHES replaces module functions (resolve_leaf,
+    disk_attr, sh) for one call and ENV sets variables; returns (the exception's text or None, whether OUT was made).
+    Both are restored, and the temp dir removed, whatever the call did."""
+    g, d = globals(), tempfile.mkdtemp(prefix="v3l-m-")
+    saved, env0 = {k: g[k] for k in patches}, {k: os.environ.get(k) for k in (env or {})}
+    out = os.path.join(d, "out")
+    try:
+        g.update(patches)
+        os.environ.update(env or {})
+        try:
+            measure(os.path.join(d, "dir"), out)
+            return None, os.path.exists(out)
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}", os.path.exists(out)
+    finally:
+        g.update(saved)
+        for k, v in env0.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _fake_box(iostats="1", chain=("nvme1n1",), disk="nvme1n1"):
+    """the module functions measure() reads the box through, faked: a drive under DIR, fio and strace present"""
+    return {"resolve_leaf": lambda d: (list(chain), disk, [d]),
+            "disk_attr": lambda dk, rel: {"queue/iostats": iostats, "queue/write_cache": "write back"}.get(rel, "x"),
+            "sh": lambda *a, **k: (0, {"fio": "fio-3.36\n", "strace": "strace -- version 6.8\n"}.get(a[0], ""), "")}
+
+
 def _plant(res, name):
     """The named plant's entry in plants()' results, or {} when it was never run."""
     return next((p for p in res if p.get("plant") == name), {})
@@ -1035,10 +1068,12 @@ def self_test():
          _ok(lambda: floor_kind(dict(_lab(rec(delta=20003), 20004), virtualization={"virtualized": "kvm"}))
              == "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence); "
                 "virtualized 'kvm': reach to media unknown")),
+        # TEST EDIT, flagged (review 5 LOW 23): the new VOID text joins the list; a strengthening
         ("item 19: the module docstring names every floor_kind text the code writes",
          all(s in " ".join((__doc__ or "").split()) for s in (
              "brd: no drive (dry runs only, never credited)",
              "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence)",
+             "write-back drive with flushes short (VOID)",
              "no volatile cache: no flush request sent (counter 0 checked in both runs)",
              "no volatile cache: no flush request sent (counter 0 checked in the timed run; no labelling count)",
              "write-through queue with flushes counted (VOID)",
@@ -1091,7 +1126,9 @@ def self_test():
         ("MED 2: a leaf with no iostats recorded VOIDs", _has(gates(rec(iostats=None)), "drive nvme1n1:", "iostats")),
         ("MED 2: a ram disk (brd) with no iostats recorded is VALID (exempt with the write rule)",
          gates(rec(wc="write through", delta=0, drive="none (RAM)", disk="ram0", iostats=None)) == []),
-        ("MED 2: measure() refuses iostats 0 and an unreadable iostats, before any run; 1 passes",
+        # TEST EDIT, flagged (review 6 LOW 10): renamed; it calls iostats_problem(), not measure(); the measure() case
+        # follows it. Its body is unchanged
+        ("MED 2: iostats_problem() names iostats 0 and an unreadable iostats; 1 passes",
          _ok(lambda: iostats_problem("1") is None and "iostats off" in (iostats_problem("0") or "")
              and "cannot read" in (iostats_problem(None) or ""))),
         # annex A24 (the lead's ruling): every run is preceded by a sync outside its window, and the record says it ran
@@ -1122,6 +1159,35 @@ def self_test():
          _ok(lambda: _has(gates(sync_mut(rec(layers=[{"name": "loop3", "write_cache": "write through",
                                                       "flush_ios_delta": 0}]), "labelling", lambda y: y["layers"].pop())),
                           "drive nvme1n1:", "the sync before the labelling fsync run", "filesystems"))),
+        # review 6 LOW 10: three checks each deletable with the self-test green
+        ("LOW 10: a record whose labelling sync failed (rc 1) VOIDs on the labelling run's text",
+         _ok(lambda: _has(gates(sync_mut(rec(), "labelling", lambda y: y.__setitem__("rc", 1))),
+                          "drive nvme1n1:", "the sync before the labelling fsync run did not run clean"))),
+        ("LOW 10: plant unsynced fires on a write-back record, on the timed run's sync text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:",
+                                                                  "the sync before the timed fsync run"))(
+             _plant(plants(rec(delta=20003))[0], "unsynced")))),
+        ("LOW 10: plant unsynced-lab fires on a write-back record, on the labelling run's sync text",
+         _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:",
+                                                                  "the sync before the labelling fsync run"))(
+             _plant(plants(rec(delta=20003))[0], "unsynced-lab")))),
+        ("LOW 10: measure() on a leaf with iostats 0 refuses before it makes OUT",
+         _ok(lambda: (lambda r: r[0] is not None and "iostats off" in r[0] and r[1] is False)(
+             _measure_with(_fake_box(iostats="0"), env={"V3L_REAL": ""})))),
+        # review 5 LOW 25: measure()'s real-mode refusal (V3L_REAL=1 needs a drive and the V3 leaf record)
+        ("LOW 25: measure() with V3L_REAL=1 and no leaf record refuses before it makes OUT",
+         _ok(lambda: (lambda r: r[0] is not None and "needs the V3 batch's leaf record" in r[0] and r[1] is False)(
+             _measure_with(_fake_box(), env={"V3L_REAL": "1"})))),
+        ("LOW 25: measure() with V3L_REAL=1 on a loop refuses before it makes OUT",
+         _ok(lambda: (lambda r: r[0] is not None and "dry-run only" in r[0] and r[1] is False)(
+             _measure_with(_fake_box(chain=("loop0", "sda1"), disk="sda"), env={"V3L_REAL": "1"})))),
+        # review 5 LOW 23: a write-back record whose flush counts VOID never reads as "flush requests completed"
+        ("LOW 23: floor_kind of a write-back record with 0 flushes is the VOID text",
+         _ok(lambda: floor_kind(rec(delta=0)) == "write-back drive with flushes short (VOID)")),
+        # review 5 LOW 24: a timed count that is not an int is unreadable and VOIDs, as a labelling one does (it raised
+        # TypeError, which block() reports as MISSING)
+        ("LOW 24: a write-back record whose timed count is the string '20003' VOIDs on the unreadable text",
+         _ok(lambda: _has(gates(rec(delta="20003")), "write-back drive nvme1n1:", "timed count unreadable"))),
         ("A24-AM1: plant unsynced-layer fires on a write-back record, on the failed filesystem's text",
          _ok(lambda: (lambda pl: pl.get("fired") is True and _has(pl["got"], "drive nvme1n1:",
                                                                   "the sync before the timed fsync run", "failed on"))(
