@@ -6209,6 +6209,24 @@ mod format_tests {
         );
     }
 
+    /// Engine review 16 MED 6's rule where the open no longer reaches it (the 2026-10-15 mutant
+    /// sweep: `reset_unsynced_rename_left_clean` survived the two tests around this one, since
+    /// 1f70dde48 an open replays an older snapshot-store log past its marker, here none, and
+    /// rewrites it (`rewrite_from_as`) instead of resetting it). A D0 compaction's own log reset
+    /// syncs nothing, so it leaves its renames, the snapshot's and the log's, to the next flight that
+    /// syncs. Mutant `reset_unsynced_rename_left_clean`.
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_compaction_leaves_its_renames_to_the_next_syncing_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+        journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
+        assert_eq!(journal.len, LOG_HEADER_LEN as u64, "premise: the compaction reset the log");
+        assert!(journal.dir_dirty, "CLAIM: a D0 compaction left its renames to no syncing flight");
+    }
+
     /// Engine review 19 LOW 18 (the review 16 MED 6 red asserted the flag, not the outcome): after
     /// the same D0 open that reset a log a compaction left stale, the first flight that syncs syncs
     /// the directory exactly once, on its thread (`DIR_SYNCS`). Mutant
@@ -6371,6 +6389,43 @@ mod format_tests {
         let synced = full() - before;
         assert!(!recovered.records.is_empty(), "premise: the whole log was kept");
         assert_eq!(synced, 1, "a FullFsync open of a whole log made {synced} FullFsync syncs, not one");
+    }
+
+    /// A log as a run before 82fa78c66 left it: its header's raised-class field says Off whatever
+    /// its flights were synced in (a D1 or D2 run wrote Off there), so only the flights' own tags
+    /// say what the records were made durable in. Since 82fa78c66 a run writes its own class there,
+    /// so the tag rules at open matter only for such logs (the 2026-10-15 mutant sweep: their mutants
+    /// survived every post-82fa78c66 fixture).
+    fn as_written_before_the_class_was_persisted(files: &BranchFiles) {
+        overwrite(&files.log, HEADER_RAISED_AT, &class_code(SyncClass::Off).to_le_bytes());
+    }
+
+    /// The tag rules at open over a pre-82fa78c66 log (`as_written_before_the_class_was_persisted`):
+    /// a D0 recovery of a log a D1 run synced syncs the kept log (the class comes from the flights'
+    /// tags; review 5 #9), and in Fsync, with no FullFsync (review 16 MED 7 (2)). Mutants
+    /// `d0_open_unsynced` (the tags ignored: nothing synced) and `decided_class_untagged` (any synced
+    /// tag taken as FullFsync).
+    #[cfg(unix)]
+    #[test]
+    fn a_d0_open_of_a_d1_log_from_before_the_class_was_persisted_syncs_it_in_fsync() {
+        let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Fsync);
+        as_written_before_the_class_was_persisted(&files);
+        let (fsyncs, fulls) = classes();
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let (fsyncs_after, fulls_after) = classes();
+        assert!(!recovered.records.is_empty(), "premise: the whole log was kept");
+        assert!(
+            fsyncs_after > fsyncs,
+            "CLAIM: a D0 recovery left a log a D1 run synced, from before the class was persisted, unsynced"
+        );
+        assert_eq!(
+            fulls_after - fulls,
+            0,
+            "CLAIM: a D0 open of a log a D1 run acknowledged at fsync, from before the class was persisted, synced in FullFsync"
+        );
     }
 
     /// Engine review 16 MED 7 (2): a D0 open promoted any log holding a synced flight to FullFsync,

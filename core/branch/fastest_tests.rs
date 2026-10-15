@@ -5653,6 +5653,38 @@ fn a_d0_cut_confirms_no_flight() {
     assert_eq!(word, 0, "a D0 cut confirmed a flight no sync proved");
 }
 
+/// Review 6 #1's rule where the second guard does not hide it (the 2026-10-15 mutant sweep:
+/// `cut_confirms_unsynced` survived `a_d0_cut_confirms_no_flight`, whose D0 flights are written
+/// unsynced, so `all_synced` refused the word anyway): on Apple a D1 cut's fsync(2) proves no stable
+/// storage, though every flight it keeps is tagged synced. The D1 cut leaves the last flight it
+/// keeps unconfirmed. Mutant `cut_confirms_unsynced`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d1_cut_on_apple_confirms_no_flight() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("d1cut.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let installed = db.branch_checkpoint_counters()[0];
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let _second = trunk.fork_branch().unwrap().into_id();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "premise: the checkpoint installed");
+    let (word, _, len) = log_confirmation(&db);
+    assert!(len > 40, "premise: the cut log keeps the flight after the capture");
+    assert_eq!(word, 0, "CLAIM: a D1 cut on Apple confirmed a flight its fsync(2) did not prove");
+}
+
 /// Engine review 7 #4: a snapshot store's open deep-copied the whole recovered snapshot state
 /// before its replay whenever the last flight was unconfirmed (every D0 open whose last flight
 /// names a slot), to replay again only if that flight's check failed. The copy is O(state) and
@@ -7862,6 +7894,66 @@ fn a_damaged_slot_of_an_ordered_last_flight_is_refused_when_read() {
         assert!(
             got.is_err(),
             "catalog={catalog}: a damaged slot of an ordered last flight was dropped silently, the child read {got:?}"
+        );
+    }
+}
+
+/// Review 6 #7's rule where the confirmation does not hide it (the 2026-10-15 mutant sweep:
+/// `ordered_tag_ignored` survived the test above, whose clean close writes the ordered flight's
+/// word, proved by the trunk's WAL flush since engine review 21 MEDs 7-8, so the open checks no slot
+/// whatever the tag). The same schedule, the word cleared from the log's header after the close, as
+/// a crash before the confirmation writer wrote it leaves it: the ordered tag alone keeps the open
+/// from dropping the flight on its damaged slot, and the read is refused. Mutant
+/// `ordered_tag_ignored`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_of_an_unconfirmed_ordered_last_flight_is_refused_when_read() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ordered-unconfirmed.db");
+        let (id, incarnation, log) = {
+            let db = open_at(&path, opts(catalog, SyncClass::FullFsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            let x = trunk.fork_branch().unwrap();
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            let barriers = sync_counts().barrier;
+            write_v(&trunk, 3, "new");
+            assert!(sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
+            let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the trunk commit kept one pre-image for x");
+            let arena = arena_path(&db);
+            let log = db.branch_log_path().expect("a durable store");
+            let id = x.into_id();
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&arena).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact_at(&mut byte, kept[0] as u64 * 4096 + 100).unwrap();
+            f.write_all_at(&[byte[0] ^ 0xFF], kept[0] as u64 * 4096 + 100).unwrap();
+            (id, incarnation, log)
+        };
+        // As a crash before the confirmation writer: no word in the header.
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+            f.write_all_at(&[0u8; 4], 36).unwrap();
+        }
+        assert_eq!(log_confirmation_at(&log).0, 0, "catalog={catalog}: premise: the log's last flight is unconfirmed");
+        let db = reopen(&path, opts(catalog, SyncClass::FullFsync), incarnation);
+        let got = db
+            .branch(id)
+            .unwrap()
+            .connect()
+            .and_then(|c| c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows()));
+        assert!(
+            got.is_err(),
+            "catalog={catalog}: CLAIM: a damaged slot of an unconfirmed ordered last flight was dropped silently, the child read {got:?}"
         );
     }
 }
