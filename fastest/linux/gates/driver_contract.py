@@ -108,14 +108,24 @@ def stamp_problems(j):
         if not (num(a) and num(b) and num(secs)):
             bad.append(f"window {name}: realtime bounds {a!r}, {b!r} and secs {secs!r} are not all numbers")
             prev = None
-            continue
-        if b < a:
-            bad.append(f"window {name}: closes at {b} before it opens at {a}")
-        elif abs((b - a) - secs) > STAMP_SLACK_S:
-            bad.append(f"window {name}: realtime span {b - a:.6f} s vs secs {secs} (over {STAMP_SLACK_S} s apart)")
-        if prev is not None and a < prev:
-            bad.append(f"window {name}: opens at {a} before the previous window closed at {prev}")
-        prev = b
+        else:
+            if b < a:
+                bad.append(f"window {name}: closes at {b} before it opens at {a}")
+            elif abs((b - a) - secs) > STAMP_SLACK_S:
+                bad.append(f"window {name}: realtime span {b - a:.6f} s vs secs {secs} (over {STAMP_SLACK_S} s apart)")
+            if prev is not None and a < prev:
+                bad.append(f"window {name}: opens at {a} before the previous window closed at {prev}")
+            prev = b
+        # the engine's four branch exception counters at the window's open and close (routing ruling 05:16:51Z)
+        ec = w.get("exception_counters") if isinstance(w, dict) else None
+        if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
+            bad.append(f"window {name}: no exception_counters {{before, after}} (Database::branch_exception_counters())")
+        else:
+            for k in EXC:
+                x, y = ec["before"].get(k), ec["after"].get(k)
+                if type(x) is not int or type(y) is not int or x < 0 or y < x:
+                    bad.append(f"window {name}: exception counter {k} before {x!r} after {y!r}: not two non-negative "
+                               "ints, never going back")
     first, last = wins[0], wins[-1]
     for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
                     ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):
