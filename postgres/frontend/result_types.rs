@@ -93,6 +93,31 @@ pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
         .collect()
 }
 
+/// The result columns of a plain SELECT (as [`expression_types`] lines them up) that are a bare
+/// `$n`: n for each, None for every other column (see [`StatementTypes::param_targets`]).
+pub fn param_targets(parse: &ParseResult) -> Vec<Option<u32>> {
+    if aggregate_targets(parse).is_empty() {
+        return Vec::new();
+    }
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    select
+        .target_list
+        .iter()
+        .map(|target| match target.node.as_ref() {
+            Some(Node::ResTarget(t)) => match t.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(Node::ParamRef(p)) => u32::try_from(p.number).ok(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// [`expression_types`] for one expression.
 fn expression_type(node: &PgNode) -> Option<u32> {
     use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind, SubLinkType};
@@ -247,6 +272,11 @@ pub struct StatementTypes {
     /// prerequisites), and the statement it returns is a no-op: the server answers it with its
     /// command tag alone, never as a query (the no-op's one column made it `SELECT 0`).
     pub performed: bool,
+    /// For each result column of a plain SELECT, the parameter number when the column is a bare
+    /// `$n`: the server announces such a column as that parameter's type, declared or inferred,
+    /// as PostgreSQL does (it was text; the PG 18 differential's finding (c)). Empty when the
+    /// statement is no such SELECT.
+    pub param_targets: Vec<Option<u32>>,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;

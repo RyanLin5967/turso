@@ -836,6 +836,7 @@ fn prepare_statement_checked(
         // The columns whose type PostgreSQL's grammar fixes (a boolean expression, a float4 cast),
         // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
         // 2026-10-15).
+        types.param_targets = crate::result_types::param_targets(&parse_result);
         let fixed = crate::result_types::expression_types(&parse_result);
         if fixed.len() == types.columns.len() {
             for (column, fixed) in types.columns.iter_mut().zip(fixed) {

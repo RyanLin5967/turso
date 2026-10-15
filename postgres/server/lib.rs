@@ -1705,10 +1705,15 @@ impl Session {
         }
     }
 
-    /// The result columns of the statement [`Session::describe_prepare`] kept.
-    fn described_fields(&self, format: &Format) -> SqlResult<Vec<FieldInfo>> {
+    /// The result columns of the statement [`Session::describe_prepare`] kept, a bare parameter's
+    /// typed by the parameter's type (`declared`, else inferred: [`result_column_types`]).
+    fn described_fields(
+        &self,
+        format: &Format,
+        declared: &[Option<Type>],
+    ) -> SqlResult<Vec<FieldInfo>> {
         self.state().described.as_ref().map_or(Ok(Vec::new()), |d| {
-            result_fields(&d.stmt, &d.types.columns, format)
+            result_fields(&d.stmt, &result_column_types(&d.types, declared), format)
         })
     }
 
@@ -1842,8 +1847,10 @@ impl Session {
             && stmt.num_columns() != 0
             && !is_pg_non_query(sql);
         let columns: Vec<Type> = if query {
+            let declared = portal.map_or(&[][..], |p| p.statement.parameter_types.as_slice());
+            let fixed = result_column_types(&types, declared);
             (0..stmt.num_columns())
-                .map(|i| column_type(&stmt, &types.columns, i))
+                .map(|i| column_type(&stmt, &fixed, i))
                 .collect()
         } else {
             Vec::new()
@@ -3529,7 +3536,7 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(sql)?;
         let fields = self
-            .described_fields(&Format::UnifiedText)
+            .described_fields(&Format::UnifiedText, &target.parameter_types)
             .map_err(PgWireError::UserError)?;
         let params = self
             .described_parameters(&target.parameter_types)
@@ -3572,7 +3579,10 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(sql)?;
         let fields = self
-            .described_fields(&portal.result_column_format)
+            .described_fields(
+                &portal.result_column_format,
+                &portal.statement.parameter_types,
+            )
             .map_err(PgWireError::UserError)?;
         // As do_describe_statement: the result types only, which a portal's Describe reports.
         if self.state().described.is_some() {
@@ -3676,6 +3686,27 @@ fn field_types(fields: &[FieldInfo]) -> Vec<(String, Type)> {
         .iter()
         .map(|f| (f.name().to_string(), f.datatype().clone()))
         .collect()
+}
+
+/// The result column types the parse gives (StatementTypes::columns), with each bare-parameter
+/// column (StatementTypes::param_targets) typed as its parameter: the declared type, else the one
+/// inferred ([`parameter_types`]), as PostgreSQL announces `SELECT $1` (it was text). Describe
+/// and Execute read the same list.
+fn result_column_types(types: &StatementTypes, declared: &[Option<Type>]) -> Vec<Option<u32>> {
+    let mut columns = types.columns.clone();
+    if types.param_targets.len() != columns.len() || types.param_targets.iter().all(Option::is_none)
+    {
+        return columns;
+    }
+    let Ok(params) = parameter_types(types, declared) else {
+        return columns;
+    };
+    for (column, target) in columns.iter_mut().zip(&types.param_targets) {
+        if let Some(t) = target.and_then(|n| params.get(n as usize - 1)) {
+            *column = Some(t.oid());
+        }
+    }
+    columns
 }
 
 /// A prepared statement's result columns, typed by [`column_type`]: what Describe reports and what
