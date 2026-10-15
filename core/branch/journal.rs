@@ -1004,10 +1004,10 @@ impl Scanned {
                     );
                     // The arena truncation clause (engine review 7 #1): when the class recovery
                     // decided syncs, the log is truncated IN PLACE at the first dropped or invalid
-                    // record and that is made durable — its directory synced in Fsync, then a full
-                    // sync of the log, whose device drain covers both (engine review 16 LOW 11;
-                    // review 20 LOW 15: in FullFsync whatever the decided class, so a D0 open of a
-                    // D1 log's torn tail pays one F_FULLFSYNC) — before anything is appended. The kept flights keep their bytes,
+                    // record and that is made durable — its directory synced in Fsync, then the
+                    // log in the decided class (engine review 16 LOW 11; lead ruling c32fad57d5
+                    // reverses review 20 LOW 15's FullFsync whatever the class: a D1 log's cut paid
+                    // an F_FULLFSYNC D1 never promised) — before anything is appended. The kept flights keep their bytes,
                     // nonce and tags, and the old bytes can never come back. Only a log nothing ever
                     // synced (the decided class does not sync) becomes a NEW incarnation instead (a
                     // fresh nonce; review 5 #7): its truncation would never reach the disk, so
@@ -1025,10 +1025,11 @@ impl Scanned {
                     if in_place {
                         set_file_len(&journal.file, whole as u64)?;
                         if class.syncs() {
-                            // The directory first, in Fsync: the log's full sync after it drains
-                            // the device, both writes included (engine review 16 LOW 11).
+                            // The directory first, in Fsync, then the log in the decided class: in
+                            // FullFsync its drain covers both writes (engine review 16 LOW 11); in
+                            // Fsync neither drains, as D1 promises (lead ruling c32fad57d5).
                             fsync_dir_of(&files.log, torn_cut_dir_class())?;
-                            fsync_file(&journal.file, SyncClass::FullFsync)?;
+                            fsync_file(&journal.file, torn_cut_log_class(class))?;
                             journal.prev_synced = true;
                         }
                     } else {
@@ -4533,10 +4534,17 @@ thread_local! {
     pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
 }
 
-/// The class an open syncs the log's directory in, before the log itself (engine review 16 LOW
-/// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
-/// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
-/// class, as before (two device flushes per syncing open).
+/// The class an open's in-place torn-tail cut syncs the log in: the class recovery decided (lead
+/// ruling c32fad57d5). Mutant `torn_cut_log_sync_full` (test builds only): FullFsync whatever the
+/// class, as before (one extra device flush per D1 cut).
+fn torn_cut_log_class(decided: SyncClass) -> SyncClass {
+    if super::store::fe_mutant("torn_cut_log_sync_full") {
+        SyncClass::FullFsync
+    } else {
+        decided
+    }
+}
+
 /// The class an open's in-place torn-tail cut syncs its directory in: Fsync, the log's F_FULLFSYNC
 /// after it draining the device (engine review 16 LOW 11). Its own mutant (engine review 20 LOW 14:
 /// `open_dir_sync_in_class` was killed by the whole-log arm alone): `torn_cut_dir_sync_in_class`
@@ -4549,6 +4557,10 @@ fn torn_cut_dir_class() -> SyncClass {
     }
 }
 
+/// The class an open syncs the log's directory in, before the log itself (engine review 16 LOW
+/// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
+/// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
+/// class, as before (two device flushes per syncing open).
 fn open_dir_class(class: SyncClass) -> SyncClass {
     if super::store::fe_mutant("open_dir_sync_in_class") {
         class
