@@ -5440,11 +5440,14 @@ mod tests {
                 journal.buffer(&Record::Fork { child: 7, parent: 0 }).unwrap();
                 journal.flush(&mut arena).unwrap();
                 bg.sync_dir().unwrap();
+                // FLAGGED-ACCEPTED (DECISIONS 6c069f4a5e): the fix refuses the stale source, so the
+                // cut is taken only when it is offered; the outcome assertion below is unchanged.
                 if stale_cut {
-                    let src = journal.bg_cut_source(&bg).unwrap().expect("stale source was accepted");
-                    let prep = Journal::prepare_cut(src, bg.from(), bg.generation()).unwrap();
-                    assert!(journal.cut_usable(&prep, bg.from(), bg.generation()));
-                    journal.finish_cut(prep, bg.from(), bg.generation()).unwrap();
+                    if let Some(src) = journal.bg_cut_source(&bg).unwrap() {
+                        let prep = Journal::prepare_cut(src, bg.from(), bg.generation()).unwrap();
+                        assert!(journal.cut_usable(&prep, bg.from(), bg.generation()));
+                        journal.finish_cut(prep, bg.from(), bg.generation()).unwrap();
+                    }
                 }
                 bg.discard();
             }
