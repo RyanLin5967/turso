@@ -10347,7 +10347,7 @@ impl StoreInner {
     /// out is dirty again and nothing else has changed.
     fn checkpoint_install(
         &mut self,
-        cap: Box<Captured>,
+        mut cap: Box<Captured>,
         written: Result<CkptFacts>,
         prepared: Option<super::journal::CutPrep>,
     ) -> Result<()> {
