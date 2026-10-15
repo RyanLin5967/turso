@@ -4578,34 +4578,42 @@ fn setting_scope_round_trip(setting: &str, value: &str, local: bool, end: &str, 
     assert_eq!(a.q(&show).single(&show), expected);
 }
 
-/// The settings whose effect a ROLLBACK would have to undo, foreign_keys and search_path, are
-/// refused (0A000) inside an explicit transaction block and as SET LOCAL, as this server keeps a
-/// SET past the block whatever ends it: `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off for
-/// the session, and `BEGIN; SET search_path TO s, public; ROLLBACK` sent later unqualified writes
-/// to s (wire review 16 item 18; review 17 folded search_path into it). Each refusal fails its
-/// block, as any error does; outside a block, and in a multi-statement query's implicit block,
-/// both still act.
+/// C41 lead ruling (2026-10-15T21:16:18Z): scope is now implemented. PostgreSQL 18.6's
+/// fresh recordings are in c41-pg18-scope.txt beside this test. foreign_keys is our extension;
+/// it follows the same assignment scope, and its original enforcement check is kept below.
 #[test]
-fn a_setting_a_rollback_cannot_undo_is_refused_in_a_block() {
+fn a_setting_in_a_block_is_restored_at_its_scope_boundary() {
     let dir = Scratch::new("setinblock");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
     a.q("CREATE TABLE c(x INT REFERENCES p(id))").ok("c");
-    for sql in ["SET foreign_keys = off", "SET search_path TO s, public"] {
+    for (sql, show, changed, original) in [
+        ("SET foreign_keys = off", "SHOW foreign_keys", "off", "on"),
+        ("SET search_path TO s, public", "SHOW search_path", "s, public", "\"$user\", public"),
+    ] {
+        assert_eq!(a.q(show).single(show), original);
         a.q("BEGIN").ok("begin");
-        let r = a.q(sql);
-        assert_eq!(r.err(sql).code, "0A000", "{sql} in a block");
-        assert_eq!(r.status, b'E', "{sql} fails the block");
+        assert_eq!(a.q(sql).ok(sql).status, b'T');
+        assert_eq!(a.q(show).single(show), changed);
         a.q("ROLLBACK").ok("end");
+        assert_eq!(a.q(show).single(show), original);
     }
     let orphan = "INSERT INTO c VALUES (5)";
     assert_eq!(a.q(orphan).err(orphan).code, "23503", "keys still on");
-    for sql in [
-        "SET LOCAL foreign_keys = off",
-        "SET LOCAL search_path TO public",
+    for (sql, show, changed, original) in [
+        ("SET LOCAL foreign_keys = off", "SHOW foreign_keys", "off", "on"),
+        ("SET LOCAL search_path TO public", "SHOW search_path", "public", "\"$user\", public"),
     ] {
-        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+        a.q("BEGIN").ok("begin local scope");
+        a.q(sql).ok(sql);
+        assert_eq!(a.q(show).single(show), changed);
+        a.q("COMMIT").ok("end local scope");
+        assert_eq!(a.q(show).single(show), original);
+        let outside = a.q(sql).ok("local outside a block");
+        assert_eq!(outside.notices.len(), 1);
+        assert_eq!(outside.notices[0].code, "25P01");
+        assert_eq!(a.q(show).single(show), original);
     }
     a.q("SET search_path TO public; SELECT 1")
         .ok("in a multi-statement query's implicit block");
