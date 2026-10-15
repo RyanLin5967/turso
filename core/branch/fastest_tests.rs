@@ -6362,6 +6362,12 @@ fn a_frameless_trunk_commit_that_ordered_a_release_stalls_no_waiter() {
         trunk.execute("PRAGMA synchronous = FULL").unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
         let x = trunk.fork_branch().unwrap();
+        // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): a FULL commit first
+        // leaves the WAL synced. The seed's commits ran before the PRAGMA, unsynced, so the WAL was
+        // dirty, and a commit with no frames still syncs a dirty WAL (pager WaitSync: frames or
+        // `wal.is_dirty()`, for write_frame_raw's barrier): the commit below took an F_FULLFSYNC and
+        // the test died on its premise at bb6af4d94 and 9d27592bf (artie raws l1-branch*).
+        write_v(&trunk, 1, "clean");
         let hold = db.branches.trunk_commit_hold.clone();
         hold.store(super::store::HOLD_RELEASE_BUFFERED, std::sync::atomic::Ordering::Release);
         let release = std::thread::spawn(move || x.reap().map(|_| ()));
@@ -9519,4 +9525,33 @@ fn a_raised_d0_cut_tail_is_copied_without_a_counted_sync() {
     assert!(db.branches.log_len_for_test() < len, "premise: the log was cut");
     assert_eq!(synced_under, 0, "CLAIM: the cut synced {synced_under} times under the store mutex for a tail of only-written flights");
     assert_eq!(after[3], base[3], "an operation was counted waiting behind the compaction: {base:?} -> {after:?}");
+}
+
+/// A commit's WAL fsync covers the frames it wrote, so the WAL is not left dirty after it: the WAL
+/// published the commit's frames AFTER its sync (`commit_prepared_frames` -> `complete_append_frame`
+/// set `dirty` again), so the next commit with no frames of its own at synchronous FULL synced the
+/// WAL once more for nothing (pager WaitSync: `need_fsync = frames || wal.is_dirty()`): one extra
+/// F_FULLFSYNC per frameless FULL commit. Two FULL commits in a row (the first leaves the WAL
+/// synced), then an UPDATE matching no row: it makes no sync. Trunk only, both stores.
+#[test]
+fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("frameless-clean.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        write_v(&trunk, 1, "a");
+        write_v(&trunk, 2, "b");
+        let before = sync_counts();
+        trunk.execute("UPDATE t SET v = v WHERE id = -1").unwrap();
+        let after = sync_counts();
+        assert_eq!(
+            (after.fsync - before.fsync, after.full_fsync - before.full_fsync),
+            (0, 0),
+            "catalog={catalog}: CLAIM: a commit with no frames after a synced one synced the WAL (fsync, full fsync)"
+        );
+    }
 }
