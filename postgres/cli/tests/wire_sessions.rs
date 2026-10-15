@@ -3311,9 +3311,17 @@ fn an_aggregate_is_typed_from_the_relation_the_engine_reads() {
     a.q("SET search_path TO s, public").ok("search path");
     let sql = "SELECT max(c) FROM t";
     let r = a.q(sql).ok(sql);
-    assert_eq!(r.rows, vec![vec![Some("x".to_string())]], "premise: s.t's rows");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("x".to_string())]],
+        "premise: s.t's rows"
+    );
     assert_eq!(r.oids, Some(vec![25]), "simple protocol");
-    assert_eq!(a.x(sql, &[]).ok(sql).oids, Some(vec![25]), "extended protocol");
+    assert_eq!(
+        a.x(sql, &[]).ok(sql).oids,
+        Some(vec![25]),
+        "extended protocol"
+    );
     let sql = "SELECT max(c) FROM public.t";
     assert_eq!(a.q(sql).ok(sql).oids, Some(vec![23]), "public.t");
 }
