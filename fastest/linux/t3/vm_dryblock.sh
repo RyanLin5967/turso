@@ -32,7 +32,8 @@ if ! limactl list -q 2>/dev/null | grep -qx "$VM"; then
   timeout 900 limactl create --name="$VM" --cpus="$CPUS" --memory="$MEM" --disk=40 --mount-none --tty=false \
     template://ubuntu-24.04 || { echo "vm_dryblock: limactl create failed"; exit 1; }
 fi
-limactl disk list -q 2>/dev/null | grep -qx "$DISK" ||
+# (limactl disk list has no -q: the name is the first column of its table, 2026-10-15)
+limactl disk list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "$DISK" ||
   { timeout 300 limactl disk create "$DISK" --size "${DATA}GiB" || { echo "vm_dryblock: disk create failed"; exit 1; }; }
 timeout 300 limactl stop "$VM" > /dev/null 2>&1 || true
 timeout 120 limactl edit "$VM" --set ".cpus=$CPUS | .memory=\"${MEM}GiB\" | .additionalDisks=[{\"name\":\"$DISK\",\"format\":false}]" ||
