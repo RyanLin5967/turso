@@ -3,20 +3,24 @@
 deletes or weakens one check, in a temp copy of v3l.py, and `v3l.py self-test` must fail on the copy.
 
   v3l_mutants.py [NAME...]   run every mutant (or the named ones); exit 0 iff each is KILLED, 1 if any SURVIVED or
-                             BROKE, 2 if refused (the unmutated self-test is not green, an unknown name, or a stale
-                             table: a target not found exactly once in v3l.py, an indented target not at a line start,
-                             or a mutated source that does not compile; review 5 MED 5), so nothing is run
+                             BROKE, 2 if refused (an unknown name; a stale table: a target not found exactly once in
+                             v3l.py, an indented target not at a line start, or a mutated source that does not
+                             compile, review 5 MED 5, checked first, so nothing runs; the unmutated self-test not
+                             green; or the unmutated copy in the mutants' temp layout not green with the in-place
+                             control's total, review 6 LOW 15, so no mutant runs)
   v3l_mutants.py self-test   the table guard on synthetic sources and on the real table
 
 KILLED means the copy's self-test exits 1 with at least one FAIL line. A copy that exits otherwise (a crash at import,
 a SyntaxError, a timeout) is BROKEN, not killed: a mutant that cannot load proves nothing about the check it removed.
-Each copy gets a `testdata` symlink beside it, because the self-test reads testdata/ next to v3l.py.
+Each copy gets a `testdata` symlink beside it, because the self-test reads testdata/ next to v3l.py; the unmutated
+copy runs in that layout first, so a layout difference cannot kill every mutant for the wrong reason.
 
 The last column is the last observed result and where it was observed. Entries marked UNRUN were written under QUIET
 (2026-10-09, no local runs) and are owed: the first run of this file is that run. The RUN entries were observed with
 the same logic from a scratchpad runner, before this file existed; this file itself has never been run.
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -233,33 +237,50 @@ def self_test():
     return 0 if not bad else 1
 
 
-def main(argv):
+def main(argv, src_path=SRC, table=None, testdata=None):
+    """SRC_PATH, TABLE and TESTDATA (default: the real v3l.py, MUTANTS, and the testdata/ beside SRC_PATH) are
+    parameters so the self-test drives main() on a temp copy (review 6 LOW 14)"""
     if argv[1:] == ["self-test"]:
         return self_test()
+    table = MUTANTS if table is None else table
+    testdata = testdata or os.path.join(os.path.dirname(os.path.abspath(src_path)), "testdata")
     names = argv[1:]
-    known = {m[0] for m in MUTANTS}
+    known = {m[0] for m in table}
     if [n for n in names if n not in known]:
         print(f"v3l_mutants: REFUSED: unknown mutant(s) {[n for n in names if n not in known]}")
         return 2
-    rc, fails, total, _ = selftest(SRC)
-    if rc != 0 or fails or not total or not total.endswith(" PASS"):
-        print(f"v3l_mutants: REFUSED: the unmutated self-test is not green (rc {rc}; {total}; {len(fails)} FAIL lines)")
-        return 2
-    print(f"control (unmutated): {total}")
-    src = open(SRC).read()
-    todo = [m for m in MUTANTS if not names or m[0] in names]
+    src = open(src_path).read()
+    todo = [m for m in table if not names or m[0] in names]
     stale = table_problems(src, todo)
     if stale:
         print(f"v3l_mutants: REFUSED: stale table: {stale}")
         return 2
+    rc, fails, total, _ = selftest(src_path)
+    if rc != 0 or fails or not total or not total.endswith(" PASS"):
+        print(f"v3l_mutants: REFUSED: the unmutated self-test is not green (rc {rc}; {total}; {len(fails)} FAIL lines)")
+        return 2
+    print(f"control (unmutated): {total}")
     d = tempfile.mkdtemp(prefix="v3lmut-")
-    bad = 0
-    for name, what, old, new, last in todo:
+
+    def layout(name, text):
         p = os.path.join(d, name)
         os.makedirs(p)
-        os.symlink(os.path.join(HERE, "testdata"), os.path.join(p, "testdata"))
+        os.symlink(testdata, os.path.join(p, "testdata"))
         with open(os.path.join(p, "v3l.py"), "w") as f:
-            f.write(src.replace(old, new))
+            f.write(text)
+        return os.path.join(p, "v3l.py")
+
+    # review 6 LOW 15: the unmutated copy in the temp layout, green with the in-place control's total, before any
+    # mutant: otherwise a layout difference would kill every mutant for the wrong reason
+    rc2, fails2, total2, err2 = selftest(layout("control-in-layout", src))
+    if rc2 != 0 or fails2 or total2 != total:
+        print(f"v3l_mutants: REFUSED: the unmutated copy in the temp layout is not the control (rc {rc2}; {total2} "
+              f"vs {total}; {len(fails2)} FAIL lines; stderr {err2[-200:]!r})")
+        shutil.rmtree(d, ignore_errors=True)
+        return 2
+    bad = 0
+    for name, what, old, new, last in todo:
+        p = os.path.dirname(layout(name, src.replace(old, new)))
         rc, fails, total, err = selftest(os.path.join(p, "v3l.py"))
         verdict = "KILLED" if rc == 1 and fails else "SURVIVED" if rc == 0 else "BROKEN"
         bad += verdict != "KILLED"
