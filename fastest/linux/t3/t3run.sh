@@ -53,11 +53,11 @@
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
 #   v3l-fsync-half      the BEFORE V3L's fio syncs every 2nd write (V3L_PLANT=fsync2: V1L and fio must VOID it)
-#   v3l-cache-lie       a write-cache lie under V3L BEFORE, on a write-back drive (a write-through draw is NOT-RUN:
-#                       the kernel will not let its queue claim write back, T3 runner review item 10): the block's
-#                       loop is set to write through (fsyncs stop reaching the drive, and the drive's flush counter
-#                       gate must VOID it). The original is saved, restored right after under an EXIT trap, and read
-#                       back.
+#   v3l-cache-lie       a write-cache lie under V3L BEFORE (--block loop): the block's loop queue is set to write
+#                       through, so no fsync reaches its backing file. Behind a write-back drive the flush-counter rule
+#                       must VOID it; behind a write-through drive the sectors-written rule must ("did not reach the
+#                       drive"; review 5 MED 4, review 6 LOW 12). The original is saved, restored right after under an
+#                       EXIT trap, and read back. A leaf that is not a loop fails the block (review 6 LOW 11).
 # A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
@@ -413,18 +413,17 @@ v3l() { # v3l bK MNT
     # the lie is the LOOP's queue claiming write through, so no fsync reaches the backing file and its data stays in the
     # page cache: behind a write-back drive the flush counter rule fires, behind a write-through drive (the runner's
     # sda class) the sectors-written rule does ("did not reach the drive"; review 5 MED 4: the old NOT-RUN for a
-    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). Only a
-    # leaf that is not a loop has no knob, and that draw is NOT-RUN.
+    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). The plant
+    # is refused off --block loop (preflight), so a leaf that is not a loop here is a fault, and fails the block
+    # (review 6 LOW 11: a NOT-RUN let a plant job pass having planted nothing).
     local lo disk wc
     lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
     disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
     wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
     case $wc:$lo in
       "write back:loop"*|"write through:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
-      "write back:"*|"write through:"*)
-        echo "plant v3l-cache-lie: NOT-RUN: $lo is not a loop, so there is no loop queue to make lie" |
-          tee "$o/plant.txt" "$OUT/plant-notrun.txt" ;;
-      *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
+      *) echo "plant v3l-cache-lie: no lie for $wc on $lo (not a loop under --block $BLOCK)" | tee "$o/plant.txt"
+        return 1 ;;
     esac
     if [ -n "$knob" ]; then
       orig=$(cat "$knob") || return 1
