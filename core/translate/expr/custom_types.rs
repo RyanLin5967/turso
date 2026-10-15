@@ -453,7 +453,8 @@ fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resol
     typed_operand_compatible(expr, value_input_type)
         || (value_input_type.eq_ignore_ascii_case("any")
             && !matches!(expr, ast::Expr::Literal(_) | ast::Expr::Collate(..))
-            && expr.is_constant(resolver))
+            && expr.is_constant(resolver)
+            && !crate::branch::store::fe_mutant("any_input_takes_no_constant"))
         || (crate::branch::store::fe_mutant("operand_any_constant")
             && !matches!(expr, ast::Expr::Literal(_))
             && expr.is_constant(resolver))
@@ -1192,6 +1193,47 @@ mod tests {
                 ("s = 40000", None, 0),
                 ("s = ?1", Some(Value::from_i64(40000)), 0),
             ],
+        );
+    }
+
+    /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
+    /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
+    /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
+    /// Mutant `any_input_takes_no_constant` (the arm off).
+    #[test]
+    fn a_numeric_column_compares_a_constant_expression_through_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2), (3, 7)").unwrap();
+        for (pred, want) in [("x = abs(-1.5)", 1), ("x = 1 + 1", 1), ("x = abs(-7) + 0", 1)] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {pred}"), None);
+            assert!(matches!(got, Ok(n) if n == want), "CLAIM: {pred} answered {got:?}, not {want}");
+        }
+    }
+
+    /// Engine review 20 LOW 27 (a): the optimizer half of 1d8bf442e (an equality on a column whose
+    /// type has a function '=' leaves its WHERE term to re-check each row the seek returns) had no
+    /// discriminating mutant. A TEXT join column against an indexed numeric column takes the plain
+    /// comparison in the WHERE, which the seek's encoded key does not decide: the indexed join
+    /// answers as the NOT INDEXED one. Mutant `seek_term_consumed`.
+    #[test]
+    fn a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2)").unwrap();
+        conn.execute("INSERT INTO u VALUES (1, '1.5'), (2, '1.50'), (3, '2'), (4, 'x')").unwrap();
+        let joined = count(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s", None);
+        let scanned = count(&conn, "SELECT count(*) FROM u JOIN t NOT INDEXED ON t.x = u.s", None);
+        assert!(scanned.is_ok(), "premise: the scan answers: {scanned:?}");
+        assert_eq!(
+            joined.ok(),
+            scanned.ok(),
+            "CLAIM: the indexed join answered differently from the scan ({:?})",
+            plan(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s")
         );
     }
 

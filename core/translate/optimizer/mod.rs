@@ -3208,7 +3208,11 @@ fn mark_seek_constraints_consumed(
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
                 continue;
             }
-            if seek_term_rechecked_by_type_eq(constraint, table, resolver) {
+            // Mutant `seek_term_consumed` (test builds only; engine review 20 LOW 27): consumed
+            // anyway, so no row the seek returns is re-checked.
+            if seek_term_rechecked_by_type_eq(constraint, table, resolver)
+                && !crate::branch::store::fe_mutant("seek_term_consumed")
+            {
                 continue;
             }
             where_term.consumed = true;
