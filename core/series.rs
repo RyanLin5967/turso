@@ -3,6 +3,7 @@ use crate::sync::Arc;
 use turso_ext::{
     Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtensionApi, IndexInfo,
     OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    ValueType,
 };
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
@@ -170,6 +171,16 @@ impl VTabCursor for GenerateSeriesCursor {
         // SQLite default for stop when it is omitted
         const DEFAULT_STOP_OMITTED: Option<i64> = Some(u32::MAX as i64);
 
+        // A non-finite float bound (an infinity: the engine has no NaN) saturated to i64::MAX or
+        // MIN, so an infinite stop generated ~10^18 rows and an infinite step one. Refused before
+        // any row, as PostgreSQL refuses it (22023; the crash batch, 2026-10-15). SQLite clamps
+        // instead; no series that bound gives is one a caller can read to its end.
+        if args
+            .iter()
+            .any(|v| v.value_type() == ValueType::Float && v.to_float().is_some_and(|f| !f.is_finite()))
+        {
+            return ResultCode::OutOfRange;
+        }
         if let Some((_, idx_num)) = idx_info {
             let mut arg_idx = 0;
             // For the semantics of `idx_num`, see the comment in the `best_index` method.
