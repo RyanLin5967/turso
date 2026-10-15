@@ -5648,27 +5648,62 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut c = MemClient::new();
         c.replies.reserve(64);
-        let mut wire = |sql: &str| {
+        let wire = |c: &mut MemClient, sql: &str| {
             let q = pgwire::messages::simplequery::Query::new(sql.to_string());
             c.replies.clear();
             c.info.state = PgWireConnectionState::ReadyForQuery;
             let a0 = n();
-            rt.block_on(s.on_query(&mut c, q)).unwrap();
+            rt.block_on(s.on_query(c, q)).unwrap();
             n() - a0
         };
+        // Every wire write must have happened, checked outside the counted window (Codex C35 MED 1:
+        // with the UPDATE answered as an empty query, the budget passed): its reply carries exactly
+        // the CommandComplete "UPDATE 1" and no ErrorResponse, and the committed row holds its new
+        // value, read by a connection of its own.
+        let written = |c: &MemClient, want: i64| {
+            let mut tags = Vec::new();
+            for m in &c.replies {
+                match m {
+                    PgWireBackendMessage::ErrorResponse(e) => panic!("the write failed: {e:?}"),
+                    PgWireBackendMessage::CommandComplete(cc) => tags.push(cc.tag.clone()),
+                    PgWireBackendMessage::Inline(m) if m.bytes().first() == Some(&b'C') => {
+                        let b = m.bytes();
+                        tags.push(String::from_utf8_lossy(&b[5..b.len() - 1]).into_owned());
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tags, ["UPDATE 1"], "the write's CommandComplete: {:?}", c.replies);
+            let rows = s
+                .shared
+                .db
+                .connect()
+                .unwrap()
+                .prepare("SELECT v FROM t WHERE id = 1")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::from_i64(want)]], "the row after the write");
+        };
         let sql = "UPDATE t SET v = v + 1 WHERE id = 1";
+        let mut want = 0;
         for _ in 0..3 {
-            wire(";");
-            wire(sql);
+            wire(&mut c, ";");
+            wire(&mut c, sql);
+            want += 1;
+            written(&c, want);
         }
-        let empty = wire(";");
+        let empty = wire(&mut c, ";");
         let own = s.current(&mut s.state()).unwrap();
         let a0 = n();
         let mut stmt = own.prepare(sql).unwrap();
         stmt.run_ignore_rows().unwrap();
         drop(stmt);
         let engine = n() - a0;
-        let write = wire(sql);
+        want += 1;
+        let write = wire(&mut c, sql);
+        want += 1;
+        written(&c, want);
         assert!(
             write.saturating_sub(engine) <= empty,
             "the write: wire {write}, engine {engine}, excess {} > the empty query's {empty}",
