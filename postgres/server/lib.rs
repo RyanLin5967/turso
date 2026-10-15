@@ -4719,8 +4719,14 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        // FLOAT4 is a real column's declaration. REAL stays float8: it is also the name the engine's
+        // get_column_type_info gives a computed expression of REAL affinity (`SELECT 2.5`,
+        // random()), which PostgreSQL types float8; an old REAL table column is typed float4 by
+        // the frontend's declared-type walk (catalog's sqlite_type_to_pg_oid) before this.
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "VARCHAR" | "CHARACTER VARYING" => Type::VARCHAR,
         "TEXT" | "CHAR" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
@@ -6056,9 +6062,11 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
-        // RULED TEST CHANGE (lead, 2026-10-15T07:40:59Z): REAL is PostgreSQL's real, float4; a
-        // declaration stored before the FLOAT4 / FLOAT8 split reads as float4 (COMPAT).
-        assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT4);
+        // REAL stays float8 here: it is also the engine's name for a computed expression of REAL
+        // affinity (float8 in PostgreSQL). FLAGGED: this row of the never-green red 0748936d4
+        // asserted FLOAT4 on a premise that failed when run (`SELECT 2.5` and random() announced
+        // 700); an old REAL column's float4 is pinned by catalog's an_old_real_declaration test.
+        assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
         assert_eq!(sqlite_type_to_pg_type("FLOAT4"), Type::FLOAT4);
         assert_eq!(sqlite_type_to_pg_type("FLOAT8"), Type::FLOAT8);
         assert_eq!(sqlite_type_to_pg_type("DOUBLE PRECISION"), Type::FLOAT8);

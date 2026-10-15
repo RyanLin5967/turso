@@ -5166,14 +5166,19 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                _ => Some(PgTypeMapping::scalar("REAL")),
+                // Stored FLOAT8, so it keeps the float8 it was announced as (a REAL declaration
+                // reads as float4).
+                _ => Some(PgTypeMapping::scalar("FLOAT8")),
             };
         }
 
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        // A float keeps its width (both are REAL affinity; core's built-in float4 / float8 types),
+        // so a real column reads as float4 and a double precision one as float8.
+        "REAL" | "FLOAT4" => "FLOAT4".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "FLOAT8".into(),
         // character(n) (libpg_query's bpchar with a length; `char` alone is char(1)); an unbounded
         // bpchar behaves as text.
         "BPCHAR" | "CHARACTER" if !params.is_empty() => {
@@ -5190,7 +5195,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "MACADDR8" => "macaddr8".into(),
         "POINT" | "LINE" | "LSEG" | "BOX" | "PATH" | "POLYGON" | "CIRCLE" => "TEXT".into(),
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
-        "MONEY" => "REAL".into(),
+        "MONEY" => "FLOAT8".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
         "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),

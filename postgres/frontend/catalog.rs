@@ -339,8 +339,10 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "TEXT" => 25,
         "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
         "BPCHAR" => 1042,
-        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
-        "FLOAT4" => 700,
+        // REAL is PostgreSQL's real, float4: a declaration stored before the FLOAT4 / FLOAT8
+        // split (both were REAL then) reads as float4 (lead ruling 2026-10-15T07:40:59Z).
+        "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
+        "REAL" | "FLOAT4" => 700,
         "BLOB" | "BYTEA" => 17,
         "NUMERIC" | "DECIMAL" => 1700,
         "BOOLEAN" | "BOOL" => 16,

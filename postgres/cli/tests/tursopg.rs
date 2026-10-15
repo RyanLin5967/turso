@@ -1564,9 +1564,12 @@ fn wire_cast_reports_target_type() {
 fn wire_table_columns_report_declared_type() {
     with_pg_client(|c| {
         c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (map_pg_type ruling, 2026-10-15T07:40:59Z): a real
+        // column is float4 (700) in PostgreSQL 18.6 (recorded pg18-types.out); this pinned float8,
+        // when real and double precision were both stored REAL.
         assert_eq!(
             c.query_column_oids("SELECT id, label, score FROM t"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+            vec![OID_INT4, OID_TEXT, OID_FLOAT4]
         );
     });
 }
