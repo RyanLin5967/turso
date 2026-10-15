@@ -316,6 +316,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Default partition | ❌ Not supported | |
 | Foreign key references for partitioned tables | ❌ Not supported | |
 | Foreign table inheritance | ❌ Not supported | |
+| Table inheritance (CREATE TABLE ... INHERITS) | ❌ Not supported | Refused 0A000, no table created (the clause was dropped, so the child lacked its parents' columns); PARTITION OF is refused the same way |
 | Partitioning by a hash key | ❌ Not supported | |
 | Partition pruning during query execution | ❌ Not supported | |
 | Support for PRIMARY KEY, FOREIGN KEY, indexes, and triggers on partitioned tables | ❌ Not supported | |

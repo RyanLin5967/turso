@@ -450,6 +450,15 @@ impl PostgreSQLTranslator {
 
         let tbl_name = self.qualified_name_from_range_var(relation);
 
+        // INHERITS (and PARTITION OF, which names its parent the same way) gives the table its
+        // parents' columns, which this translator does not do: dropped, the table had its own
+        // columns alone (PG 18.6 recorded, pg18-inherits.out).
+        if !create.inh_relations.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE TABLE ... INHERITS and PARTITION OF are not supported".into(),
+            ));
+        }
+
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
                 "CREATE TABLE with no columns is not yet supported".into(),
