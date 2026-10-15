@@ -7071,7 +7071,13 @@ fn cte_columns(cte: &pg_query::protobuf::CommonTableExpr) -> Option<Vec<String>>
     };
     if let Some(mut columns) = cte_output_names(select) {
         rename_columns(&mut columns, &cte.aliascolnames);
-        return Some(columns);
+        // Two columns of one name are both read as the first by the renaming subselect, which
+        // selects by name: `SELECT 1 AS x, 2 AS x` renamed answered 1|1 (fresh-context review).
+        let mut seen = std::collections::HashSet::new();
+        return columns
+            .iter()
+            .all(|c| seen.insert(c.to_ascii_lowercase()))
+            .then_some(columns);
     }
     let listed: Vec<String> = cte
         .aliascolnames

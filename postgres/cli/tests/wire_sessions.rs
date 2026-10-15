@@ -3190,6 +3190,20 @@ fn a_from_alias_column_list_on_a_cte_renames_the_ctes_columns() {
         .q("WITH c (p) AS (SELECT 1 + 1) SELECT * FROM c AS a (y)")
         .ok("a CTE whose own column list names an unnamed output");
     assert_eq!((r.names, r.rows), (names(&["y"]), vec![vec![t("2")]]));
+    let sql = "WITH c AS (SELECT 1 AS x, 2 AS x) SELECT * FROM c AS a (p, q)";
+    let r = a.q(sql);
+    assert!(
+        r.error.is_some() || r.rows == vec![vec![t("1"), t("2")]],
+        "{sql}: two outputs named x read as one: {:?}",
+        r.rows
+    );
+    let r = a
+        .q("WITH c (m, n) AS (SELECT 1 AS x, 2 AS x) SELECT * FROM c AS a (p, q)")
+        .ok("a CTE whose column list names its duplicate outputs");
+    assert_eq!(
+        (r.names, r.rows),
+        (names(&["p", "q"]), vec![vec![t("1"), t("2")]])
+    );
     let r = a
         .q("WITH v AS (VALUES (1, 2)) SELECT * FROM v AS a (p)")
         .ok("a VALUES CTE");

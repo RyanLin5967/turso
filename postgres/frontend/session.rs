@@ -2718,6 +2718,47 @@ mod tests {
         assert_eq!(rows("SELECT p, q FROM app.w"), ["3|4"]);
     }
 
+    /// With no search path, the attached databases are searched in ascending id order, as the
+    /// resolver's BitSet orders them, not the attached map's hash order; and a path entry is looked
+    /// up as written, as the resolver does: a quoted 'App' names no attached app (fresh-context
+    /// review of 46dcb4c25).
+    #[test]
+    fn the_positional_insert_lookup_takes_the_engines_order_and_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        for i in 0..12 {
+            run(&conn, &format!("CREATE SCHEMA s{i}"));
+        }
+        run(&conn, "CREATE TABLE s0.w (x int default 1, y int)");
+        for i in 1..12 {
+            run(&conn, &format!("CREATE TABLE s{i}.w (p{i} int, q int, r int default 9)"));
+        }
+        run(&conn, "INSERT INTO w VALUES (DEFAULT, 2)");
+        let rows = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|r| r.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join("|"))
+                .collect()
+        };
+        assert_eq!(rows("SELECT x, y FROM s0.w"), ["1|2"]);
+        run(&conn, "CREATE TABLE v (a int default 5, b int)");
+        run(&conn, "CREATE TABLE s1.v (c int, d int, e int default 6)");
+        run(&conn, "SET search_path TO 'S1', public");
+        run(&conn, "INSERT INTO v VALUES (DEFAULT, 4)");
+        assert_eq!(rows("SELECT a, b FROM main.v"), ["5|4"]);
+    }
+
     fn slow(sql: &str) -> Option<PgBranchCall> {
         try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
     }

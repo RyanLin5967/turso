@@ -3082,13 +3082,17 @@ impl Connection {
         if self.temp.database.read().is_some() && holds(crate::TEMP_DB_ID) {
             return columns(crate::TEMP_DB_ID);
         }
+        // Ascending ids, as the resolver's BitSet orders them (the map's own order is a hash's).
         let attached: Vec<usize> = if search_path.is_empty() {
-            self.attached_databases
+            let mut ids: Vec<usize> = self
+                .attached_databases
                 .read()
                 .index_to_data
                 .keys()
                 .copied()
-                .collect()
+                .collect();
+            ids.sort_unstable();
+            ids
         } else {
             let attached = self.attached_databases.read();
             search_path
@@ -3097,9 +3101,9 @@ impl Connection {
                     if entry.eq_ignore_ascii_case("public") {
                         Some(crate::MAIN_DB_ID)
                     } else {
-                        attached
-                            .get_database_by_name(&crate::util::normalize_ident(entry))
-                            .map(|(id, _)| id)
+                        // The entry as written, as the resolver looks it up: a quoted 'App'
+                        // names no attached app.
+                        attached.get_database_by_name(entry).map(|(id, _)| id)
                     }
                 })
                 .collect()

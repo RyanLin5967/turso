@@ -910,6 +910,32 @@ expect error {
     cannot store TEXT value in REAL
 }
 
+# However deep the domains: 17 nested over float8 (a walk that stopped at 16 left them unchecked).
+test deep-domain-array-rejects-a-text-element {
+    CREATE DOMAIN dd0 AS float8;
+    CREATE DOMAIN dd1 AS dd0;
+    CREATE DOMAIN dd2 AS dd1;
+    CREATE DOMAIN dd3 AS dd2;
+    CREATE DOMAIN dd4 AS dd3;
+    CREATE DOMAIN dd5 AS dd4;
+    CREATE DOMAIN dd6 AS dd5;
+    CREATE DOMAIN dd7 AS dd6;
+    CREATE DOMAIN dd8 AS dd7;
+    CREATE DOMAIN dd9 AS dd8;
+    CREATE DOMAIN dd10 AS dd9;
+    CREATE DOMAIN dd11 AS dd10;
+    CREATE DOMAIN dd12 AS dd11;
+    CREATE DOMAIN dd13 AS dd12;
+    CREATE DOMAIN dd14 AS dd13;
+    CREATE DOMAIN dd15 AS dd14;
+    CREATE DOMAIN dd16 AS dd15;
+    CREATE TABLE fa7 (id INTEGER PRIMARY KEY, vals dd16[]) STRICT;
+    INSERT INTO fa7 VALUES (1, '{1.5,abc}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
 # A bytea[] keeps what it took before: only integer and real bases are checked as their base.
 test bytea-array-keeps-a-text-element {
     CREATE TABLE fa6 (id INTEGER PRIMARY KEY, vals bytea[]) STRICT;

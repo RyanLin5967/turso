@@ -345,9 +345,10 @@ pub(super) fn numeric_base_without_encode<'a>(
     resolver: &'a Resolver,
     ty: &'a str,
 ) -> Option<&'a str> {
+    // A type is declared over an existing one and a cycle is refused at CREATE, so the chain
+    // ends, as resolve_base_type_chain's does.
     let mut ty = ty;
-    // A type is declared over an earlier one, so the chain ends; the bound only guards the loop.
-    for _ in 0..16 {
+    loop {
         let Some(type_def) = resolver.schema().get_type_def_unchecked(ty) else {
             return matches!(Affinity::affinity(ty), Affinity::Integer | Affinity::Real)
                 .then_some(ty);
@@ -357,5 +358,4 @@ pub(super) fn numeric_base_without_encode<'a>(
         }
         ty = type_def.base();
     }
-    None
 }
