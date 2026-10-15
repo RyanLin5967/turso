@@ -2339,7 +2339,9 @@ impl Journal {
         super::store::kill_point("compact.bg_renamed");
         self.generation = bg.generation;
         self.snapshot_len = bg.out.len() as u64;
-        self.snap_dirty = false;
+        // A D0 compaction's snapshot was written, not synced: the next flight that syncs syncs it
+        // (`snap_dirty`), as after an inline D0 compaction (engine review 19 MED 7).
+        self.snap_dirty = !bg.class.syncs();
         self.dir_dirty = true;
         Ok(true)
     }

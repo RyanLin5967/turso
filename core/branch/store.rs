@@ -5339,8 +5339,13 @@ impl BranchStore {
             // fell behind), with no writer running (it could not start; a fork(2) child), and in
             // a sharp catalog store it still runs here, and is counted (`inline_compaction_syncs`).
             // Mutant `compaction_on_ack_path` (test builds only): here always, as before.
+            // A D0 snapshot store's compaction syncs nothing, but it encodes a snapshot of every
+            // branch: O(N) allocation and time in the operation's own hold (budget
+            // create_allocates_no_table_of_every_branch_under_the_store_mutex: 2.2 MB at 33k
+            // branches). It is owed to the writer too. Mutant `d0_compaction_inline` (test builds
+            // only): run here, as before.
             let syncs = inner.journal.as_ref().is_some_and(|j| j.rewrite_class().syncs());
-            if syncs {
+            if syncs || !fe_mutant("d0_compaction_inline") {
                 let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
                 if inner.cat.is_none() && !past_hard && self.writer_runs() && !fe_mutant("compaction_on_ack_path") {
                     if self
@@ -5358,7 +5363,9 @@ impl BranchStore {
                     }
                     return;
                 }
-                self.group.lock().inline_compaction_syncs += 1;
+                if syncs {
+                    self.group.lock().inline_compaction_syncs += 1;
+                }
             }
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
