@@ -2448,7 +2448,10 @@ impl Journal {
             self.last_names_slots = false;
             flight.empty_end = true;
         }
-        Ok(flight)
+        // Returned ordered (engine review 21 LOW 27): the empty end frame's tag claims a barrier
+        // only an ordered flight writes, so a caller that forgot `Flight::ordered` cannot write
+        // one over an unbarriered arena.
+        Ok(flight.ordered())
     }
 
     /// A held-free upgrade (`BranchStore::sync_upgrade`; engine review 18 HIGH 1): a sync in
