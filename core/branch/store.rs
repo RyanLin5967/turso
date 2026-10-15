@@ -9552,7 +9552,13 @@ impl StoreInner {
         // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
         // unknown, never while a checkpoint is in the air).
         // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too
-        // (equivalent: `CatState::assert_facts_in_flight`).
+        // (equivalent: `CatState::assert_facts_in_flight`). Fire-check mutant
+        // `l4_flight_facts_stale_at_use` (test builds only): a known trunk-version fact made wrong
+        // here, inside a flight, after the oracle's last check and before this use site's assertion.
+        #[cfg(test)]
+        if cat.flight && fe_mutant("l4_flight_facts_stale_at_use") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
         #[cfg(test)]
         cat.assert_facts_in_flight()?;
         if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
