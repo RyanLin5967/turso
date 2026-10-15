@@ -895,6 +895,8 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
+    // Optimized recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
+    let _nest = crate::stack::NestGuard::enter("subqueries")?;
     if !plan
         .non_from_clause_subqueries
         .iter()

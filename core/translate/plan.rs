@@ -1011,6 +1011,65 @@ pub fn select_star(
     right_join_swapped: bool,
     long_names: bool,
 ) -> crate::Result<()> {
+    // A two-table RIGHT JOIN the planner swapped into a LEFT JOIN (`tables` = [right, left]): `*`
+    // lists the tables as written, left first. A USING column (which the swap put on the left
+    // table's join_info) stands at the LEFT table's place but holds the RIGHT table's value, the
+    // side every row has; the right table's own copy is left out. As PostgreSQL 18.6 and sqlite3
+    // 3.51.0 answer (the crash batch, 2026-10-15: it listed the swapped order, j, t, i, k for
+    // `j1 RIGHT JOIN j2 USING (i)`, where both list i, j, t, k).
+    if right_join_swapped && tables.len() == 2 {
+        let (right, left) = (&tables[0], &tables[1]);
+        let using: Vec<&str> = left
+            .join_info
+            .as_ref()
+            .map(|ji| ji.using.iter().map(|u| u.as_str()).collect())
+            .unwrap_or_default();
+        let in_using = |name: &Option<String>| {
+            name.as_ref()
+                .is_some_and(|n| using.iter().any(|u| u.eq_ignore_ascii_case(n)))
+        };
+        let column = |table: &JoinedTable, alias_table: &JoinedTable, i: usize| {
+            let col = &table.columns()[i];
+            let alias = col.name.as_ref().map(|col_name| {
+                if long_names {
+                    format!("{}.{}", alias_table.identifier, col_name)
+                } else {
+                    col_name.clone()
+                }
+            });
+            ResultSetColumn {
+                alias,
+                implicit_column_name: None,
+                expr: ast::Expr::Column {
+                    database: None,
+                    table: table.internal_id,
+                    column: i,
+                    is_rowid_alias: col.is_rowid_alias(),
+                },
+                contains_aggregates: false,
+            }
+        };
+        if left.identifier == right.identifier {
+            // A self-join: the general path below names its ambiguity.
+        } else {
+            for (i, col) in left.columns().iter().enumerate().filter(|(_, c)| !c.hidden()) {
+                let from_right = in_using(&col.name).then(|| {
+                    right.columns().iter().position(|rc| {
+                        !rc.hidden()
+                            && rc.name.as_ref().zip(col.name.as_ref()).is_some_and(|(r, l)| r.eq_ignore_ascii_case(l))
+                    })
+                });
+                match from_right.flatten() {
+                    Some(ri) => out_columns.push(column(right, left, ri)),
+                    None => out_columns.push(column(left, left, i)),
+                }
+            }
+            for (i, _) in right.columns().iter().enumerate().filter(|(_, c)| !c.hidden() && !in_using(&c.name)) {
+                out_columns.push(column(right, right, i));
+            }
+            return Ok(());
+        }
+    }
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
         tables.iter().rev().collect()
@@ -4669,5 +4728,70 @@ mod tests {
         assert!(a.get(ROWID_SENTINEL));
         assert_eq!(a.count(), 2);
         Ok(())
+    }
+}
+
+/// `SELECT *` over a RIGHT JOIN (lead, 2026-10-15; fastest-wire's red 76f6ed92a against the
+/// PostgreSQL 18 recording pg18-join2): the planner swaps a two-table RIGHT JOIN into a LEFT JOIN,
+/// and `*` listed the swapped tables' columns, so `j1 RIGHT JOIN j2 USING (i)` answered j, t, i, k
+/// where PostgreSQL 18.6 and sqlite3 3.51.0 both answer i, j, t, k (the USING column at the left
+/// table's place, holding the right table's value, then the rest of j1, then the rest of j2). A
+/// driver binding columns by position read a silent wrong answer.
+#[cfg(test)]
+mod right_join_star_tests {
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value, IO};
+    use std::sync::Arc;
+
+    fn open() -> Arc<crate::Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(io, ":memory:", OpenFlags::Create, DatabaseOpts::new(), None, Arc::new(SqliteDialect))
+            .unwrap();
+        let conn = db.connect().unwrap();
+        for sql in [
+            "CREATE TABLE j1 (i int, j int, t text)",
+            "CREATE TABLE j2 (i int, k int)",
+            "INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two'), (3, 2, 'three')",
+            "INSERT INTO j2 VALUES (1, -1), (2, 2), (5, -5)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        conn
+    }
+
+    /// The names and rows of `sql`, each value rendered (NULL as "-").
+    fn answer(conn: &Arc<crate::Connection>, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let names = (0..stmt.num_columns()).map(|i| stmt.get_column_name(i).to_string()).collect();
+        let rows = stmt
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.iter().map(|v| if matches!(v, Value::Null) { "-".to_string() } else { v.to_string() }).collect())
+            .collect();
+        (names, rows)
+    }
+
+    fn rows(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn select_star_over_a_right_join_lists_the_columns_as_written() {
+        let conn = open();
+        // Each expectation is pg18-join2's (PostgreSQL 18.6), which sqlite3 3.51.0 answers alike.
+        let ijtk = ["i", "j", "t", "k"].map(String::from).to_vec();
+        let want = rows(&[&["1", "4", "one", "-1"], &["2", "3", "two", "2"], &["5", "-", "-", "-5"]]);
+        for sql in [
+            "SELECT * FROM j1 RIGHT JOIN j2 USING (i) ORDER BY 1",
+            "SELECT * FROM j1 NATURAL RIGHT JOIN j2 ORDER BY 1",
+        ] {
+            assert_eq!(answer(&conn, sql), (ijtk.clone(), want.clone()), "{sql}");
+        }
+        let ikjt = ["i", "k", "j", "t"].map(String::from).to_vec();
+        let want = rows(&[&["1", "-1", "4", "one"], &["2", "2", "3", "two"], &["3", "-", "2", "three"]]);
+        assert_eq!(answer(&conn, "SELECT * FROM j2 RIGHT JOIN j1 USING (i) ORDER BY 1"), (ikjt, want));
+        // Without USING, every column of both tables, the left table's first.
+        let (names, _) = answer(&conn, "SELECT * FROM j1 RIGHT JOIN j2 ON j1.i = j2.i ORDER BY 1");
+        assert_eq!(names, ["i", "j", "t", "i", "k"]);
     }
 }

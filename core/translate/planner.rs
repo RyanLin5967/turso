@@ -1691,43 +1691,6 @@ fn parse_from_clause_table(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// The most views one statement may expand inside each other. Each level is a recursive descent
-/// through the planner (parse_table, parse_from_clause_table, the subquery's own planning); a
-/// 90-view chain overflowed a pg-session thread's 8 MiB stack in a debug build (raw artie
-/// lanes/wire/raw/loud-20261015/viewchain-probe), and this depth is planned within it with margin
-/// (crash_batch_tests). PostgreSQL bounds the same recursion by max_stack_depth.
-pub(crate) const MAX_VIEW_DEPTH: usize = 32;
-
-/// PostgreSQL's message for a statement nested past what its stack allows (SQLSTATE 54001, which
-/// the PostgreSQL frontend reads from this prefix).
-pub(crate) const STACK_DEPTH_EXCEEDED: &str = "stack depth limit exceeded";
-
-std::thread_local! {
-    static VIEW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// One view expansion in progress on this thread; leaving it, on every exit, pops it.
-struct ViewDepth;
-
-impl ViewDepth {
-    fn enter() -> Result<Self> {
-        let depth = VIEW_DEPTH.with(|d| d.get());
-        if depth >= MAX_VIEW_DEPTH {
-            crate::bail_parse_error!(
-                "{STACK_DEPTH_EXCEEDED}: views nested more than {MAX_VIEW_DEPTH} deep"
-            );
-        }
-        VIEW_DEPTH.with(|d| d.set(depth + 1));
-        Ok(Self)
-    }
-}
-
-impl Drop for ViewDepth {
-    fn drop(&mut self) {
-        VIEW_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
 fn parse_table(
     table_references: &mut TableReferences,
     resolver: &Resolver,
@@ -1918,9 +1881,9 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
-        // Each nested view is planned by a recursive call; past the limit, refused rather than
-        // overflowing the thread's stack (the crash batch, 2026-10-15).
-        let _depth = ViewDepth::enter()?;
+        // Each nested view is planned by a recursive call; with too little stack left for one more,
+        // refused rather than overflowing (the crash batch, 2026-10-15; `stack::NestGuard`).
+        let _depth = crate::stack::NestGuard::enter("views")?;
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
         let mut view_select = view.select_stmt.clone();
