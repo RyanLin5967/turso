@@ -2625,6 +2625,12 @@ struct NameFilter {
     /// claim needed its own counter). 0 by construction; the mutant `name_filter_grows_in_note`
     /// moves every entry.
     held_moved_max: u64,
+    /// The names a branch holds, an upper bound (review 3 #7 (a), churn): set to the entries of a
+    /// table a build installs, one more per note, one fewer per release. A table past half full
+    /// with fewer than a quarter of its entries held is rebuilt from the catalog, which holds only
+    /// the names held, rather than grown (`shrinks`): no table keeps every name ever held.
+    live: u64,
+    shrinks: u64,
     builds: u64,
     failed_scans: u64,
     rebuilds: u64,
@@ -2685,6 +2691,7 @@ impl NameFilter {
 
     fn note_inner(&mut self, name: &str) {
         let h = self.hash(name);
+        self.live = self.live.saturating_add(1);
         // Mutant `name_filter_grows_in_note` (test builds only): a table past half full is grown
         // here, under the store mutex, as a resizing set would.
         if fe_mutant("name_filter_grows_in_note") {
@@ -2703,6 +2710,13 @@ impl NameFilter {
             FilterState::Ready { table } => {
                 let fits = table.insert(h);
                 if fits && table.wants_room() && self.owed.is_none() {
+                    // Mutant `name_filter_never_shrinks` (test builds only): always grown.
+                    if self.live.saturating_mul(4) < table.len() as u64 && !fe_mutant("name_filter_never_shrinks") {
+                        self.live = self.live.saturating_add(1);
+                        self.shrinks += 1;
+                        self.overflow();
+                        return;
+                    }
                     self.owed = Some(FilterWork::Grow);
                 }
                 fits
@@ -2714,6 +2728,12 @@ impl NameFilter {
         if !fits {
             self.overflow();
         }
+    }
+
+    /// A held name was released (`live`). The table keeps its key: a filter only ever answers
+    /// "maybe held" for it, which asks the catalog.
+    fn released(&mut self) {
+        self.live = self.live.saturating_sub(1);
     }
 
     /// A table refused a key: stop answering, and owe one rebuild (never a growth per create).
@@ -8660,6 +8680,7 @@ impl BranchStore {
                         f.overflow();
                         return FilterBuild::Ended;
                     }
+                    f.live = (table.len() + pending.len()) as u64;
                     f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
                     f.builds += 1;
                     table
@@ -10195,6 +10216,7 @@ impl StoreInner {
                         for name in self.names.map.keys() {
                             table.insert(self.names.filter.hash(name));
                         }
+                        self.names.filter.live = table.len() as u64;
                         self.names.filter.state = FilterState::Ready { table: Arc::new(table) };
                     }
                 }
@@ -11118,6 +11140,7 @@ impl StoreInner {
             if self.names.fresh.get(&name) == Some(&id) {
                 self.names.fresh.remove(&name);
             }
+            self.names.filter.released();
             if self.cat.is_some() || self.catalog_mode {
                 self.names.releases += 1;
                 self.names.gone.insert(name, self.names.releases);
