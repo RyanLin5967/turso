@@ -326,12 +326,15 @@ expect {
 
 @requires strict "uses STRICT tables"
 test numeric-division {
+    -- FLAGGED TEST EDIT (engine review 21 MED 11, under the e52f01422 ruling; for the lead's
+    -- ruling): the expectation is PostgreSQL 18.6's output, verbatim (artie raw
+    -- lanes/engine/raw/rpgdiv-pg18.6.txt), as 4d31d483c's select_div_scale port answers.
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES ('10.00');
     SELECT val / val FROM t1;
 }
 expect {
-    1
+    1.00000000000000000000
 }
 
 @requires strict "uses STRICT tables"

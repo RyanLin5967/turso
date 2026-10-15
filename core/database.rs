@@ -874,6 +874,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// Branch page spaces and the copy-on-write bookkeeping between them. Empty (one allocation,
     /// no arena) until the first fork; see [`crate::branch`].
     pub(crate) branches: Arc<crate::branch::store::BranchStore>,
+    /// Test builds: the branch store this database's pagers report to, in place of `branches` (mutant
+    /// `vacuum_target_drains_into_source`, vdbe/vacuum.rs).
+    #[cfg(test)]
+    pub(crate) pager_store_for_test: std::sync::OnceLock<Arc<crate::branch::store::BranchStore>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1041,6 +1045,8 @@ impl Database {
 
             durable_storage: None,
             branches,
+            #[cfg(test)]
+            pager_store_for_test: std::sync::OnceLock::new(),
         };
 
         db.register_global_builtin_extensions()
@@ -3532,7 +3538,11 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;
-        pager.set_branch_store(self.branches.clone());
+        #[cfg(test)]
+        let store = self.pager_store_for_test.get().cloned().unwrap_or_else(|| self.branches.clone());
+        #[cfg(not(test))]
+        let store = self.branches.clone();
+        pager.set_branch_store(store);
         // The durability class governs the trunk as well as the branch store (see
         // `branch::SyncClass`): every pager of this database syncs its WAL and database file in it.
         if let Some(class) = self.opts.branch_durability.sync_class() {

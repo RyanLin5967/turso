@@ -236,14 +236,19 @@ pub(crate) fn set_update_stmt_journal_flags(
         program.set_multi_write(false);
     }
 
+    // A NOT NULL rowid alias (fastest-engine 4c) aborts a row whose new key is NULL, after earlier
+    // rows of the statement changed (engine review 20 LOW 24): SET rowid or SET <alias> counts
+    // then. Mutant `update_key_journal_skipped` (test builds only): it does not, as before.
+    let key_refuses_null =
+        btree_table.rowid_alias_refuses_null() && !crate::branch::store::fe_mutant("update_key_journal_skipped");
     let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
         if set_clause.column_index == crate::schema::ROWID_SENTINEL {
-            return false;
+            return key_refuses_null;
         }
         btree_table
             .columns()
             .get(set_clause.column_index)
-            .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
+            .is_some_and(|c| (c.notnull() && !c.is_rowid_alias()) || (c.is_rowid_alias() && key_refuses_null))
     });
     let has_check = !btree_table.check_constraints.is_empty();
     let has_unique =

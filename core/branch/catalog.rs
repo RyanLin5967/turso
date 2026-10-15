@@ -275,8 +275,11 @@ fn cur_key(branch: u64, page: u32) -> Result<i64> {
     Ok(((branch as i64) << 32) | page as i64)
 }
 
+/// One prepared catalog statement, boxed: a `Statement` is ~1.6 KB inline, so ~55 of them made
+/// `Catalog` 87 KB and every frame holding one (an open, a `CatState`) larger than clippy's
+/// `large_stack_frames` bound (lead order 6: turso_core's clippy errors blocked the wire's).
 struct Stmt {
-    stmt: Statement,
+    stmt: Box<Statement>,
 }
 
 impl Stmt {
@@ -449,10 +452,14 @@ mod census_tests {
     }
 }
 
-/// Test builds: the IO the next `Catalog::open` uses instead of a platform IO, taken once (engine
-/// review 17 MED 3: a catalog whose WAL sync fails).
+/// Test builds: the IO the next `Catalog::open` of a catalog whose path ends with the given one
+/// uses instead of a platform IO, taken once (engine review 17 MED 3: a catalog whose WAL sync
+/// fails). Keyed by that path (engine review 21 LOW 21): every test binary module shares this
+/// static and `serial()` orders only fastest_tests, so an open of any other catalog leaves it
+/// alone, and the setting test's "taken" premise can only be its own catalog's open.
 #[cfg(test)]
-pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<Arc<dyn IO>>> = std::sync::Mutex::new(None);
+pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<(std::path::PathBuf, Arc<dyn IO>)>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) struct Catalog {
     _db: Arc<Database>,
@@ -514,7 +521,14 @@ impl Catalog {
     /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
     pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
         #[cfg(test)]
-        let hooked = NEXT_CATALOG_IO.lock().unwrap().take();
+        let hooked = {
+            let mut next = NEXT_CATALOG_IO.lock().unwrap();
+            if next.as_ref().is_some_and(|(key, _)| path.ends_with(key)) {
+                next.take().map(|(_, io)| io)
+            } else {
+                None
+            }
+        };
         #[cfg(not(test))]
         let hooked: Option<Arc<dyn IO>> = None;
         let io: Arc<dyn IO> = match hooked {
@@ -559,7 +573,7 @@ impl Catalog {
             conn.execute("PRAGMA fullfsync = ON")?;
         }
         conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
-        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
+        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: Box::new(conn.prepare(sql)?) }) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
@@ -1000,6 +1014,15 @@ impl Catalog {
     /// its Database's own (volatile) branch store, which counts them (engine review 17 MED 3).
     pub(crate) fn sync_failures(&self) -> u64 {
         self._db.branches.sync_failures()
+    }
+
+    /// Have this catalog's failed syncs go, as they happen, to the at-risk decision of the store
+    /// whose catalog it is (`parent`, that store's group; engine review 21 MED 5). Every handle on
+    /// this catalog shares its Database, and so the link.
+    pub(crate) fn link_drain_parent(&self, parent: Option<crate::sync::Weak<super::store::Group>>) {
+        if let Some(parent) = parent {
+            self._db.branches.link_drain_parent(parent);
+        }
     }
 
     /// The class this handle's commits sync in (`set_commit_sync`).

@@ -261,7 +261,11 @@ pub(super) struct OperatorEncodeInfo {
 
 /// The column an operand meets, for mutant `operand_keeps_column_typmod` alone: built in test
 /// builds only (engine review 16 #22: a `Column` clone per prepare that production never read).
-fn encode_info(column: &Column, type_def: &Arc<TypeDef>, which: EncodeArg) -> Option<OperatorEncodeInfo> {
+fn encode_info(
+    column: &Column,
+    type_def: &Arc<TypeDef>,
+    which: EncodeArg,
+) -> Option<OperatorEncodeInfo> {
     cfg!(test).then(|| OperatorEncodeInfo {
         column: column.clone(),
         type_def: type_def.clone(),
@@ -399,6 +403,46 @@ pub(crate) fn type_eq_function(type_def: &TypeDef) -> Option<&str> {
 /// whose '=' is naked or absent: its seek keys by the encoding alone, as before. Mutant
 /// `seek_key_encodes_raising` (test builds only): None for every type, so the key is ENCODEd in
 /// place, raising and losing precision, and the term is consumed.
+/// The functions a BUILT-IN type's '=' may call and still agree with equality of the type's
+/// encodings, which an index compares (engine review 20 item 8): numeric_eq (numeric_encode is
+/// canonical at the column's scale) and the wire's bpchareq (its ENCODE drops the trailing blanks
+/// bpchareq ignores). An allowlist: a function not named here, or named by a user type whose ENCODE
+/// we did not read, is taken to disagree.
+const EQ_AGREES_WITH_ENCODING: [&str; 2] = ["numeric_eq", "bpchareq"];
+
+/// Whether an equality on a column of `type_def` may be answered from an index (engine review 20
+/// item 8): the type's '=' agrees with equality of the encodings, so the seek misses no row the
+/// '=' would find (the WHERE term's re-check can only remove rows). A type with no function '='
+/// compares with the plain comparison, which is that equality. Mutant `eq_index_ignores_coarse_eq`
+/// (test builds only): every type may, as before.
+pub(crate) fn eq_agrees_with_encoding(type_def: &TypeDef) -> bool {
+    if crate::branch::store::fe_mutant("eq_index_ignores_coarse_eq") {
+        return true;
+    }
+    match type_eq_function(type_def) {
+        None => true,
+        Some(func) => type_def.is_builtin && EQ_AGREES_WITH_ENCODING.iter().any(|f| func.eq_ignore_ascii_case(f)),
+    }
+}
+
+/// Whether an equality between a column of the custom type `type_name` (`type_def`) and the operand
+/// `key` compares through the type's operator (`find_custom_type_operator`): `key` is a column of
+/// the same type, or an operand the type takes (`operand_compatible`). Otherwise the equality takes
+/// the plain comparison, which never passes `key` to the type's '=' (a TEXT join column against
+/// numeric, `a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does`).
+pub(crate) fn key_takes_type_operator(
+    key: &ast::Expr,
+    type_name: &str,
+    type_def: &TypeDef,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> bool {
+    match expr_custom_type_info(key, referenced_tables, resolver) {
+        Some(info) => info.type_name.eq_ignore_ascii_case(type_name),
+        None => operand_compatible(key, type_def.value_input_type(), resolver),
+    }
+}
+
 pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
     let eq = type_eq_function(type_def);
     if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {
@@ -427,7 +471,8 @@ fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resol
     typed_operand_compatible(expr, value_input_type)
         || (value_input_type.eq_ignore_ascii_case("any")
             && !matches!(expr, ast::Expr::Literal(_) | ast::Expr::Collate(..))
-            && expr.is_constant(resolver))
+            && expr.is_constant(resolver)
+            && !crate::branch::store::fe_mutant("any_input_takes_no_constant"))
         || (crate::branch::store::fe_mutant("operand_any_constant")
             && !matches!(expr, ast::Expr::Literal(_))
             && expr.is_constant(resolver))
@@ -803,8 +848,10 @@ mod tests {
     /// column got the plain comparison, not the type's operator, so a numeric column (stored
     /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
     /// as a literal of the type's value input type: passed to the operator as given (2fa04254c;
-    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is vestigial since then,
-    /// no operand being encoded, and stays as written. Mutant `param_skips_type_operator`.
+    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is not vestigial (engine
+    /// review 20 LOW 28): no comparison operand is encoded, but an index seek's key is, with the
+    /// column's typmod (1d8bf442e), and the column's own values are. Mutant
+    /// `param_skips_type_operator`.
     #[test]
     fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
         let conn = open();
@@ -1041,6 +1088,37 @@ mod tests {
         }
     }
 
+    /// Each `(predicate, parameter, rows)` answers `rows` through the default plan, which does NOT
+    /// seek `index` (engine review 20 item 8: the type's '=' does not agree with equality of the
+    /// encodings, so the index is refused for the term), and through a scan (NOT INDEXED) of
+    /// `table`, each plan asserted as a premise.
+    fn answers_unindexed_by_both_plans(
+        conn: &Arc<crate::Connection>,
+        table: &str,
+        index: &str,
+        cases: &[(&str, Option<Value>, i64)],
+    ) {
+        for (pred, param, want) in cases {
+            let default = format!("SELECT count(*) FROM {table} WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM {table} NOT INDEXED WHERE {pred}");
+            assert!(
+                !seeks(conn, &default, table, index),
+                "premise: {default} does not seek index {index} (a coarser '='): {:?}",
+                plan(conn, &default)
+            );
+            let by_scan = count(conn, &scan, param.clone());
+            assert!(
+                matches!(by_scan, Ok(n) if n == *want),
+                "premise: the scan answers {want} for {pred} ({param:?}): {by_scan:?}"
+            );
+            let by_default = count(conn, &default, param.clone());
+            assert!(
+                matches!(by_default, Ok(n) if n == *want),
+                "the default plan answered {by_default:?} for {pred} ({param:?}), the scan {want}"
+            );
+        }
+    }
+
     /// Engine review 16 HIGH 2 (review 14 MED 6): the seek path ENCODEs an equality's key with the
     /// column's parameters and consumes the term, so the type's operator never re-checks a row the
     /// seek returns, while a scan passes the operand to the operator as given (2fa04254c). On
@@ -1068,6 +1146,112 @@ mod tests {
                 ("x = 1e9", None, 0),
                 ("x = ?1", Some(Value::from_f64(1e9)), 0),
             ],
+        );
+    }
+
+    /// Engine review 20 item 6: the seek's catch region (1d8bf442e) caught every refusal of the
+    /// key's ENCODE and answered an empty seek, so with an index `x = 'abc'` on numeric answered 0
+    /// where NOT INDEXED, like PostgreSQL, raises (invalid input), and so did a well-formed numeric
+    /// blob operand, which the type's operator refuses (94a5dc65c). A refused key is compared with
+    /// itself under the type's '=' outside the catch region: what raises there raises, as the scan
+    /// does. Both plans asserted as premises. Mutant `seek_refusal_swallowed`.
+    #[test]
+    fn an_indexed_seek_raises_where_the_scan_raises() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34)")
+            .unwrap();
+        for pred in ["x = 'abc'", "x = X'0100020000000000000001000000E8030000'"] {
+            let seek = format!("SELECT count(*) FROM t WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM t NOT INDEXED WHERE {pred}");
+            assert!(seeks(&conn, &seek, "t", "tx"), "premise: {seek} seeks tx: {:?}", plan(&conn, &seek));
+            assert!(scans(&conn, &scan, "t"), "premise: {scan} scans: {:?}", plan(&conn, &scan));
+            let by_scan = count(&conn, &scan, None);
+            assert!(by_scan.is_err(), "premise: the scan raises for {pred}: {by_scan:?}");
+            let by_seek = count(&conn, &seek, None);
+            assert!(
+                by_seek.is_err(),
+                "CLAIM: the seek answered {by_seek:?} for {pred}, where the scan raises {by_scan:?}"
+            );
+        }
+    }
+
+    /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
+    /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
+    /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)
+    /// raised 'value too long', `s = 40000` on smallint 'out of range', where a scan, and
+    /// PostgreSQL, answer 0 rows. Both through `answers_by_both_plans`. Mutant
+    /// `seek_key_encodes_raising_plain`.
+    #[test]
+    fn an_indexed_equality_on_a_length_or_range_checked_built_in_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(3), s smallint) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tv ON t(v)").unwrap();
+        conn.execute("CREATE INDEX ts ON t(s)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 7)").unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tv",
+            &[
+                ("v = 'abc'", None, 1),
+                ("v = 'abcdef'", None, 0),
+                ("v = ?1", Some(Value::build_text("abcdef")), 0),
+            ],
+        );
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "ts",
+            &[
+                ("s = 7", None, 1),
+                ("s = 40000", None, 0),
+                ("s = ?1", Some(Value::from_i64(40000)), 0),
+            ],
+        );
+    }
+
+    /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
+    /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
+    /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
+    /// Mutant `any_input_takes_no_constant` (the arm off).
+    #[test]
+    fn a_numeric_column_compares_a_constant_expression_through_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2), (3, 7)").unwrap();
+        for (pred, want) in [("x = abs(-1.5)", 1), ("x = 1 + 1", 1), ("x = abs(-7) + 0", 1)] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {pred}"), None);
+            assert!(matches!(got, Ok(n) if n == want), "CLAIM: {pred} answered {got:?}, not {want}");
+        }
+    }
+
+    /// Engine review 20 LOW 27 (a): the optimizer half of 1d8bf442e (an equality on a column whose
+    /// type has a function '=' leaves its WHERE term to re-check each row the seek returns) had no
+    /// discriminating mutant. A TEXT join column against an indexed numeric column takes the plain
+    /// comparison in the WHERE, which the seek's encoded key does not decide: the indexed join
+    /// answers as the NOT INDEXED one. Mutant `seek_term_consumed`.
+    #[test]
+    fn a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2)").unwrap();
+        conn.execute("INSERT INTO u VALUES (1, '1.5'), (2, '1.50'), (3, '2'), (4, 'x')").unwrap();
+        let joined = count(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s", None);
+        let scanned = count(&conn, "SELECT count(*) FROM u JOIN t NOT INDEXED ON t.x = u.s", None);
+        assert!(scanned.is_ok(), "premise: the scan answers: {scanned:?}");
+        assert_eq!(
+            joined.ok(),
+            scanned.ok(),
+            "CLAIM: the indexed join answered differently from the scan ({:?})",
+            plan(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s")
         );
     }
 
@@ -1100,6 +1284,15 @@ mod tests {
     /// MED 6 prescribed): both types gained a bare `OPERATOR '<'`, without which no index can be
     /// created on them (index.rs refuses it), so the test panicked at its CREATE INDEX at its
     /// parent and at its fix alike; the CREATE INDEX is now an asserted premise.
+    ///
+    /// FLAGGED TEST EDIT (engine review 20 item 8, a premise the fix changes; for the lead's
+    /// ruling): both types' '=' is instr, which does not agree with equality of the encodings, so
+    /// since aeb76c261 the index is refused for these equalities and the premise "the default plan
+    /// seeks the index" cannot hold. The arms assert the opposite premise and the same answers
+    /// (`answers_unindexed_by_both_plans`). The claim (an over-length operand compares, false, and
+    /// raises nothing) is unchanged; the seek-path RAISE half it exercised is now reachable in core
+    /// only through a type whose '=' is allowlisted (none of core's built-ins RAISEs in its ENCODE;
+    /// the wire's bpchar does, postgres/ tests).
     #[test]
     fn an_indexed_length_checked_type_compares_an_over_length_operand() {
         let conn = open();
@@ -1132,7 +1325,7 @@ mod tests {
                     .is_err(),
                 "premise: {ty}'s own length check refuses an over-length value"
             );
-            answers_by_both_plans(
+            answers_unindexed_by_both_plans(
                 &conn,
                 table,
                 index,
@@ -1408,14 +1601,87 @@ mod tests {
         );
     }
 
+    /// Engine review 20 item 7: after fa3f83cdc an IN list compares through the type's '=', but
+    /// with an index on the column the planner still chose an IN seek, which compares the raw
+    /// elements with the ENCODEd index keys: numeric's `x IN (7, 1.5)` found nothing where `x =
+    /// 1.5` finds the row, and tag's `w IN ('zz', 'b')` compared bytes where its '=' is instr. With
+    /// both columns indexed (tag given a bare `OPERATOR '<'`, without which no index is allowed),
+    /// each IN list answers as its elements' `=` do. Mutant `in_seek_on_custom_type`.
+    #[test]
+    fn an_indexed_in_list_answers_as_the_types_eq_does() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2), w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)")
+            .unwrap_or_else(|e| panic!("premise: numeric's column takes an index: {e}"));
+        conn.execute("CREATE INDEX tw ON t(w)")
+            .unwrap_or_else(|e| panic!("premise: tag's column takes an index: {e}"));
+        conn.execute("INSERT INTO t VALUES (1, 1.5, 'abc')").unwrap();
+        for (eq, in_list, param) in [
+            ("x = 1.5", "x IN (7, 1.5)", None),
+            ("x = ?1", "x IN (?1)", Some(Value::from_f64(1.5))),
+            ("w = 'b'", "w IN ('zz', 'b')", None),
+        ] {
+            let by_eq = count(&conn, &format!("SELECT count(*) FROM t WHERE {eq}"), param.clone());
+            let by_in = count(&conn, &format!("SELECT count(*) FROM t WHERE {in_list}"), param.clone());
+            assert!(matches!(by_eq, Ok(1)), "premise: {eq} finds the row: {by_eq:?}");
+            assert!(
+                matches!(by_in, Ok(1)),
+                "CLAIM: {in_list} answered {by_in:?} with the column indexed, where {eq} finds the row ({:?})",
+                plan(&conn, &format!("SELECT count(*) FROM t WHERE {in_list}"))
+            );
+        }
+    }
+
+    /// Engine review 20 item 8: an equality may use an index only where the type's '=' agrees with
+    /// equality of the encodings, which the index compares. tag's '=' is instr, coarser than byte
+    /// equality: with tag's column indexed, `w = 'b'` sought the key 'b', found nothing and the
+    /// re-check could only remove rows, while the scan (and the '=') finds 'abc'. The indexed
+    /// equality answers as the scan does. Mutant `eq_index_ignores_coarse_eq`.
+    #[test]
+    fn an_indexed_equality_under_a_coarser_eq_answers_as_the_scan_does() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, w tag(3)) STRICT").unwrap();
+        conn.execute("CREATE INDEX tw ON t(w)")
+            .unwrap_or_else(|e| panic!("premise: tag's column takes an index: {e}"));
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        for (pred, param) in [("w = 'b'", None), ("w = ?1", Some(Value::build_text("b")))] {
+            let by_scan = count(&conn, &format!("SELECT count(*) FROM t NOT INDEXED WHERE {pred}"), param.clone());
+            assert!(matches!(by_scan, Ok(1)), "premise: the scan finds 'abc' for {pred} (instr): {by_scan:?}");
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            let by_plan = count(&conn, &sql, param.clone());
+            assert!(
+                matches!(by_plan, Ok(1)),
+                "CLAIM: {pred} answered {by_plan:?} with the column indexed, where the scan finds the row ({:?})",
+                plan(&conn, &sql)
+            );
+        }
+    }
+
     /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
     /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
     /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
-    /// 3.00; and 100.00 / 10 is 10.00, not 10. The UPDATE arms of
-    /// `a_numeric_operand_keeps_its_own_precision` store into numeric(10, 2), which hides the
-    /// result's scale; this reads it in the SELECT list. Division keeps the dividend's scale here,
-    /// where PostgreSQL answers 10.0000000000000000: a known divergence (fastest DECISIONS).
-    /// Mutant `operand_keeps_column_typmod`.
+    /// 3.00. The UPDATE arms of `a_numeric_operand_keeps_its_own_precision` store into
+    /// numeric(10, 2), which hides the result's scale; this reads it in the SELECT list. Division
+    /// is `numeric_division_takes_postgresqls_result_scale`'s (its first row is this table's
+    /// 100.00 / 10). Mutant `operand_keeps_column_typmod`.
+    ///
+    /// FLAGGED TEST EDIT, ruled ACCEPTED (engine review 21 MED 12 option (a), fastest DECISIONS
+    /// 2026-10-15T04:28:01Z): the `x / 10` row is deleted. Since 4d31d483c it panicked on the
+    /// loop's third row, so `x - 2` and `x * ?1` never ran, and it failed with or without the
+    /// mutant, proving no kill.
     #[test]
     fn numeric_arithmetic_in_the_select_list_keeps_the_operands_scale() {
         let conn = open();
@@ -1426,7 +1692,6 @@ mod tests {
         for (sql, param, want) in [
             ("SELECT x * 3 FROM t WHERE id = 1", None, "30.00"),
             ("SELECT x * 3 FROM t WHERE id = 3", None, "-15.00"),
-            ("SELECT x / 10 FROM t WHERE id = 2", None, "10.00"),
             ("SELECT x - 2 FROM t WHERE id = 2", None, "98.00"),
             (
                 "SELECT x * ?1 FROM t WHERE id = 1",
@@ -1453,8 +1718,9 @@ mod tests {
     /// zero), not bigdecimal's. The expectations are DERIVED from PostgreSQL's select_div_scale by
     /// reading its source, not from our output (100.00 / 10: the first base-10000 digits give a
     /// quotient weight of 0, so 16 decimal places; 1.00 / 3: 1 <= 3 lowers the weight to -1, so
-    /// 20). LOUD-OWED: replace each expectation by PostgreSQL 18's output for the same query,
-    /// verbatim. Mutant `div_scale_bigdecimal`.
+    /// 20). CONFIRMED by PostgreSQL 18.6 for the same queries, verbatim (artie raw
+    /// lanes/engine/raw/rpgdiv-pg18.6.txt, 2026-10-15): every expectation below is its output.
+    /// Mutant `div_scale_bigdecimal`.
     #[test]
     fn numeric_division_takes_postgresqls_result_scale() {
         let conn = open();
@@ -1472,6 +1738,149 @@ mod tests {
             assert!(
                 matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
                 "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
+
+    /// Engine review 21 MED 13's rows that no in-tree regression file covered, from PostgreSQL 18.6
+    /// verbatim (artie raw lanes/engine/raw/rpgdiv-pg18.6.txt): an operand below 1 (the weight's
+    /// div_euclid), an exact quotient padded to the result scale, an operand of display scale 1, and
+    /// one of display scale above 16 (the result takes it). A display scale above 1000 has no row:
+    /// PostgreSQL refuses numeric(1200, 1100) ("precision 1200 must be between 1 and 1000"), so its
+    /// arm needs another construction. Mutant `div_scale_bigdecimal`.
+    #[test]
+    fn numeric_division_matches_postgresql_18() {
+        let conn = open();
+        // Each column holds the PostgreSQL query's dividend at its display scale (`0.5::numeric(10,
+        // 2)`, `1::numeric`, `2.5::numeric(10,1)`, `1.00000000000000000001::numeric`).
+        conn.execute(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a numeric(10, 2), b numeric(10, 0), c numeric(10, 1), \
+             e numeric(30, 20)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO d VALUES (1, '0.5', '1', '2.5', '1.00000000000000000001')")
+            .unwrap();
+        for (sql, want) in [
+            ("SELECT a / 3 FROM d", "0.16666666666666666667"),
+            ("SELECT b / 8 FROM d", "0.12500000000000000000"),
+            ("SELECT c / 2 FROM d", "1.25000000000000000000"),
+            ("SELECT e / 3 FROM d", "0.33333333333333333334"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "CLAIM: {sql} gave {got:?}, not PostgreSQL 18's {want}"
+            );
+        }
+    }
+
+    /// Engine review 21 MED 13: the division red's four rows never had equal first digits, a zero
+    /// dividend, a zero divisor or a quotient past 10^17, so several wrong ports passed it. These
+    /// rows' expectations are PostgreSQL's own output, copied verbatim from the in-tree regression
+    /// file postgres/conformance/upstream/numeric.out (the quot column at lines 737-754, and the
+    /// queries at 2781, 2829 and 2841; division by zero at 791), with the dividend's display scale
+    /// carried by the column's scale and the divisor given as text, as the literals are there. Not
+    /// covered by any row in that file, so owed to the PostgreSQL 18 run (rpgdiv): an operand below
+    /// 1 (the weight's div_euclid), an exact rounding tie, an operand display scale above 16 and
+    /// one above 1000. Mutant `div_scale_first_digit_strict` (test builds only).
+    #[test]
+    fn numeric_division_matches_postgresqls_regression_output() {
+        let conn = open();
+        conn.execute(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, i numeric(25, 0), f numeric(25, 1)) STRICT",
+        )
+        .unwrap();
+        conn.execute(
+            // The 21- and 20-digit dividends as text: as integer literals they would be read as reals.
+            "INSERT INTO d VALUES (1, 0, 4.2), (2, 1, 70.0), (3, -1, 4.2), \
+             (4, '999999999999999999999', 4.2), (5, '12345678901234567890', 4.2)",
+        )
+        .unwrap();
+        for (sql, want) in [
+            ("SELECT i / '1' FROM d WHERE id = 1", Some("0.00000000000000000000")),
+            ("SELECT i / '1' FROM d WHERE id = 2", Some("1.00000000000000000000")),
+            ("SELECT i / '1' FROM d WHERE id = 3", Some("-1.00000000000000000000")),
+            ("SELECT f / '1' FROM d WHERE id = 1", Some("4.2000000000000000")),
+            ("SELECT f / '-1' FROM d WHERE id = 1", Some("-4.2000000000000000")),
+            ("SELECT i / '4.2' FROM d WHERE id = 2", Some("0.23809523809523809524")),
+            ("SELECT i / '4.2' FROM d WHERE id = 3", Some("-0.23809523809523809524")),
+            ("SELECT f / '4.2' FROM d WHERE id = 1", Some("1.00000000000000000000")),
+            ("SELECT f / '70' FROM d WHERE id = 2", Some("1.00000000000000000000")),
+            ("SELECT i / '1000000000000000000000' FROM d WHERE id = 4", Some("1.00000000000000000000")),
+            ("SELECT i / '123' FROM d WHERE id = 5", Some("100371373180768845")),
+            ("SELECT i / '0' FROM d WHERE id = 1", None),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            match want {
+                Some(want) => assert!(
+                    matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                    "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+                ),
+                None => assert!(
+                    matches!(&got, Err(e) if e.to_string().contains("division by zero")),
+                    "CLAIM: {sql} gave {got:?}, not PostgreSQL's \"division by zero\""
+                ),
+            }
+        }
+    }
+
+    /// Engine review 21 LOW 24, a REGISTERED DIVERGENCE (fastest DECISIONS), red until fixed: a
+    /// real literal reaches numeric's operators as a REAL (SQLite's literal), and its decimal comes
+    /// from `f64::to_string`, which drops the literal's trailing zeros, so `1.50` takes display scale
+    /// 1, not PostgreSQL's 2. Multiplication shows it: PostgreSQL's numeric_mul gives the product
+    /// the sum of the operands' display scales (numeric.c, read, not run: rscale = var1.dscale +
+    /// var2.dscale), so numeric(10, 2) 10.00 * 1.50 is 15.0000, where this engine answers 15.000.
+    /// The text literal '1.50' is the control. LOUD-OWED: both rows from PostgreSQL 18 (rpgdiv).
+    #[test]
+    fn a_real_literal_operand_keeps_its_display_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        for (sql, want) in [
+            ("SELECT x * '1.50' FROM t WHERE id = 1", "15.0000"),
+            ("SELECT x * 1.50 FROM t WHERE id = 1", "15.0000"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "{sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
+
+    /// Engine review 21 MED 10: a numeric operand's scale was bounded only by i64, so
+    /// `x / '1e-2000000000'` built 10^(2*10^9) inside one division, with no interrupt point, and
+    /// `'1e9223372036854775807' / x` overflowed i64 (a panic in a debug build, a wrapped value in a
+    /// release one). An operand outside PostgreSQL's numeric range is refused as PostgreSQL
+    /// refuses it, "value overflows numeric format", within 10 s: a literal, a bound parameter,
+    /// either side. Each runs on a thread of its own: a run that never ends is the red.
+    #[test]
+    fn a_numeric_operand_outside_postgresqls_range_is_refused_at_once() {
+        for (sql, param) in [
+            ("SELECT x / '1e-2000000000' FROM t", None),
+            ("SELECT x / ?1 FROM t", Some("1e-5000000000")),
+            ("SELECT '1e9223372036854775807' / x FROM t", None),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (owned, param) = (sql.to_string(), param.map(str::to_string));
+            std::thread::spawn(move || {
+                let got = (|| -> crate::Result<()> {
+                    let conn = open();
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")?;
+                    conn.execute("INSERT INTO t VALUES (1, 100)")?;
+                    let mut stmt = conn.prepare(&owned)?;
+                    if let Some(p) = param {
+                        stmt.bind_at(1.try_into().unwrap(), Value::build_text(p))?;
+                    }
+                    stmt.run_collect_rows().map(|_| ())
+                })();
+                let _ = tx.send(got.map_err(|e| e.to_string()));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            assert!(
+                matches!(&got, Ok(Err(m)) if m.contains("value overflows numeric format")),
+                "CLAIM: {sql} gave {got:?} (a timeout: it never finished), not PostgreSQL's refusal"
             );
         }
     }

@@ -1788,9 +1788,12 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
 
 /// fastest-engine 4b (LEAD-ORDER 5; wire review 3 #10, engine half): a READ statement that fails
 /// at run time inside an explicit transaction ends only itself. The transaction, its writes and
-/// its savepoints survive, so ROLLBACK TO undoes only the work after the savepoint, as in
-/// PostgreSQL (Django's atomic and SQLAlchemy's begin_nested rely on it) and in SQLite, whose
-/// sqlite3VdbeHalt rolls a transaction back for a read only on an I/O, NOMEM or FULL error.
+/// its savepoints survive, so ROLLBACK TO undoes only the work after the savepoint, as in SQLite,
+/// whose sqlite3VdbeHalt rolls a transaction back for a read only on an I/O, NOMEM or FULL error.
+/// PostgreSQL instead aborts the block on any error until ROLLBACK or ROLLBACK TO (25P02), and a
+/// ROLLBACK TO then recovers it the same way (Django's atomic and SQLAlchemy's begin_nested rely
+/// on that); its COMMIT of an aborted block rolls back, which a PostgreSQL session over this
+/// engine emulates itself (engine review 19 LOW 17).
 /// Before the fix a read had no statement savepoint (`auto_txn_cleanup` None) and abort() rolled
 /// back the whole transaction, so ROLLBACK TO had no savepoint left and id=1 was lost. WAL and
 /// MVCC.
