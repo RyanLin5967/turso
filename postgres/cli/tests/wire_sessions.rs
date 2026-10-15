@@ -1656,9 +1656,11 @@ fn ddl_statements_report_their_command_tags() {
 }
 
 /// turso_branch_stats() reports the server process's own counters — unix system calls, mach
-/// traps, instructions retired, cycles — and the server's skipped CHECKPOINTs and the branch
-/// store's checkpoints, for the wire-versus-embedded budgets: one row of six int8 columns that
-/// never decrease, where a branch create between two reads costs system calls.
+/// traps, instructions retired, cycles — and the server's skipped CHECKPOINTs, the branch
+/// store's checkpoints and its four counted exceptions, for the wire-versus-embedded budgets: one
+/// row of ten int8 columns that never decrease, where a branch create between two reads costs
+/// system calls (ten from six: PRE-APPROVED spec change, artie DECISIONS 2026-10-15T05:16:51Z,
+/// the routing of Database::branch_exception_counters).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn branch_stats_reports_the_servers_counters() {
@@ -1669,8 +1671,8 @@ fn branch_stats_reports_the_servers_counters() {
         let r = a.q("SELECT turso_branch_stats()").ok("stats");
         assert_eq!(
             r.oids,
-            Some(vec![20, 20, 20, 20, 20, 20]),
-            "six int8 columns"
+            Some(vec![20, 20, 20, 20, 20, 20, 20, 20, 20, 20]),
+            "ten int8 columns"
         );
         assert_eq!(r.rows.len(), 1);
         r.rows[0]
@@ -2122,6 +2124,28 @@ fn a_busy_checkpoint_inside_a_block_says_it_was_skipped() {
         "the skip was not counted"
     );
     assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "4");
+}
+
+/// turso_branch_stats' last four columns are the engine's counted exceptions to "no create,
+/// connect, first write, delete or trunk commit waits on background work" (Database::
+/// branch_exception_counters: hardcap_upgrades, header_raise_exclusive, inline_compaction_syncs,
+/// compaction_waits), so every run can print them and label a window in which one moved
+/// (artie DECISIONS 2026-10-15T05:16:51Z). On every platform: present, never NULL, integers.
+#[test]
+fn branch_stats_reports_the_engines_counted_exceptions() {
+    let dir = Scratch::new("statsexc");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('e')").ok("create");
+    let r = a.q("SELECT turso_branch_stats()").ok("stats");
+    assert_eq!(r.rows.len(), 1);
+    let row = &r.rows[0];
+    assert_eq!(row.len(), 10, "columns {row:?}");
+    for (i, v) in row[6..].iter().enumerate() {
+        let v = v.as_deref().unwrap_or_else(|| panic!("exception counter {i} is NULL"));
+        v.parse::<u64>()
+            .unwrap_or_else(|e| panic!("exception counter {i} = {v:?}: {e}"));
+    }
 }
 
 /// The branch store's checkpoints since the server started (turso_branch_stats' sixth column,
