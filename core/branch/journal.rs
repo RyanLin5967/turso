@@ -997,8 +997,10 @@ impl Scanned {
                     );
                     // The arena truncation clause (engine review 7 #1): when the class recovery
                     // decided syncs, the log is truncated IN PLACE at the first dropped or invalid
-                    // record and that is made durable — a full sync of the log, then of its
-                    // directory — before anything is appended. The kept flights keep their bytes,
+                    // record and that is made durable — its directory synced in Fsync, then a full
+                    // sync of the log, whose device drain covers both (engine review 16 LOW 11;
+                    // review 20 LOW 15: in FullFsync whatever the decided class, so a D0 open of a
+                    // D1 log's torn tail pays one F_FULLFSYNC) — before anything is appended. The kept flights keep their bytes,
                     // nonce and tags, and the old bytes can never come back. Only a log nothing ever
                     // synced (the decided class does not sync) becomes a NEW incarnation instead (a
                     // fresh nonce; review 5 #7): its truncation would never reach the disk, so
