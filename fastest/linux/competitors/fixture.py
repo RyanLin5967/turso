@@ -245,17 +245,24 @@ def selftest():
             "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
             "readback": dict(rb), "expected_readback": dict(rb)}
 
-    # MED 10: each system's maintenance line as its seed writes it (seed.txt "maintenance: ..."), aged or not
+    # MED 10: each system's maintenance line as its seed writes it (seed.txt "maintenance: ..."), aged or not. Comp
+    # review 1 LOW 24: B1 checkpoints before the aging too (PREREG §7: "loaded, checkpointed, then aged"), and each
+    # system records its maintenance's OUTCOMES (maintenance_evidence), which compare checks, not the text alone
     maint_of = {"pg18-d2": "CHECKPOINT; aged 0; VACUUM ANALYZE; CHECKPOINT",
                 "dolt": "DOLT_COMMIT seed; aged 0; DOLT_COMMIT age; DOLT_GC",
                 "doltgres": "dolt_commit seed; aged 0; dolt_commit age; dolt_gc",
-                "b1": "journal_mode=WAL; load; aged 0; wal_checkpoint(TRUNCATE)"}
+                "b1": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged 0; wal_checkpoint(TRUNCATE)"}
+    ev_of = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
+             "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
+             "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0"}}
 
     def v(**kw):
         d = dict(base)
         d["maintenance"] = maint_of.get(kw.get("system", base["system"]), base["maintenance"])
+        d["maintenance_evidence"] = dict(ev_of.get(kw.get("system", base["system"]), {}))
         d.update(kw)
         return {k: x for k, x in d.items() if x is not KeyError}
+    ev = ev_of  # (the cases below change one outcome each)
 
     cases = [
         ("same parent on every system", [v(), v(system="dolt"), v(system="b1")], True),
@@ -292,6 +299,28 @@ def selftest():
         ("an unaged Doltgres parent without dolt_gc",
          [v(), v(system="doltgres", maintenance="dolt_commit seed; aged 0; dolt_commit age")], False),
         ("PG without its final CHECKPOINT", [v(maintenance="CHECKPOINT; aged 0; VACUUM ANALYZE")], False),
+        # LOW 24: the pre-aging step of every system, and each maintenance's outcome
+        ("PG without its pre-aging CHECKPOINT", [v(maintenance="aged 0; VACUUM ANALYZE; CHECKPOINT")], False),
+        ("B1 without its pre-aging checkpoint (the old feed)",
+         [v(), v(system="b1", maintenance="journal_mode=WAL; load; aged 0; wal_checkpoint(TRUNCATE)")], False),
+        ("Dolt without its seed commit before the aging",
+         [v(), v(system="dolt", maintenance="aged 0; DOLT_COMMIT age; DOLT_GC")], False),
+        ("a Dolt GC whose recorded verdict is not ok",
+         [v(), v(system="dolt", maintenance_evidence={"gc_verdict": "REFUSED: client rc 1"})], False),
+        ("a Doltgres parent with no maintenance evidence", [v(), v(system="doltgres", maintenance_evidence=KeyError)],
+         False),
+        ("PG whose VACUUM left no last_vacuum", [v(maintenance_evidence=dict(ev["pg18-d2"], last_vacuum="false"))],
+         False),
+        ("PG whose ANALYZE left no last_analyze", [v(maintenance_evidence=dict(ev["pg18-d2"], last_analyze="false"))],
+         False),
+        ("PG whose last checkpoint's redo point is before the VACUUM",
+         [v(maintenance_evidence=dict(ev["pg18-d2"], redo_after_vacuum="false"))], False),
+        ("a B1 parent whose header is not WAL (bytes 18-19 = 1,1)",
+         [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], header_18_19="1,1"))], False),
+        ("a B1 checkpoint that left frames (reply 0|5|5)",
+         [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], checkpoints="0|0|0;0|5|5"))], False),
+        ("a B1 parent with one checkpoint reply of two",
+         [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], checkpoints="0|0|0"))], False),
         ("a system with no registered maintenance", [v(), v(system="mystery", maintenance="none")], False),
         # MED 11: the schema line is compared by itself
         ("a system loaded another schema (INT PRIMARY KEY)", [v(), v(system="b1", schema_sha256="ee" * 32)], False),
