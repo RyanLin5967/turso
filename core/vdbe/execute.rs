@@ -245,8 +245,9 @@ fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
     // Within PostgreSQL's numeric range, or refused before any arithmetic (engine review 21 MED
     // 10: a scale bounded only by i64 made one division build billions of digits). Mutant
     // `numeric_range_unchecked` (test builds only): not checked, as before.
+    // A zero with a positive exponent is made a plain 0 here too (Codex C25 HIGH 3).
     if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
-        crate::numeric::decimal::check_numeric_range(&value)?;
+        return crate::numeric::decimal::numeric_operand_value(value);
     }
     Ok(value)
 }
@@ -10619,7 +10620,8 @@ pub fn op_function(
                         })?;
                         // PostgreSQL's range first: a rescale of an unbounded scale is as
                         // unbounded as a division (engine review 21 MED 10).
-                        crate::numeric::decimal::check_numeric_range(&bd)?;
+                        // A zero with a positive exponent stored as a plain 0 (Codex C25 HIGH 3).
+                        let bd = crate::numeric::decimal::numeric_operand_value(bd)?;
                         let validated = validate_precision_scale(&bd, precision, scale)?;
                         Value::from_blob(bigdecimal_to_blob(&validated))
                     }

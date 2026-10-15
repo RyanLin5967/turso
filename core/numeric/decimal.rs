@@ -147,10 +147,18 @@ const PG_MAX_FRACTION_DIGITS: i128 = 16_383;
 /// overflow the scale arithmetic. Checked where a value enters numeric arithmetic from text or a
 /// real (`value_to_bigdecimal`) and where numeric's INSERT parses one (`numeric_encode`). The digit
 /// count is bounded from the integer's bit length first, so an ordinary value pays no conversion.
+///
+/// A zero is bounded by its fraction digits alone, as PostgreSQL bounds it (Codex C25 HIGH 3: every
+/// zero passed, so `'0e-2000000000' / x` asked the division for 10^1999999000). A zero with a
+/// positive exponent is in range; `numeric_operand_value` makes it a plain 0 before arithmetic.
 pub fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
     let (int, scale) = v.as_bigint_and_exponent();
     if int.sign() == Sign::NoSign {
-        return Ok(());
+        // Mutant `numeric_zero_unbounded` (test builds only): every zero passes, as before.
+        if i128::from(scale) <= PG_MAX_FRACTION_DIGITS || crate::branch::store::fe_mutant("numeric_zero_unbounded") {
+            return Ok(());
+        }
+        return Err(LimboError::Constraint("value overflows numeric format".to_string()));
     }
     let scale = i128::from(scale);
     // At most this many decimal digits: bits * log10(2), rounded up.
@@ -160,6 +168,21 @@ pub fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
         return Ok(());
     }
     Err(LimboError::Constraint("value overflows numeric format".to_string()))
+}
+
+/// `v` entering numeric arithmetic: within PostgreSQL's range (`check_numeric_range`), and a zero
+/// with a positive exponent made a plain 0, as PostgreSQL's input makes it (`'0e1000000'::numeric`
+/// is 0; PG 18.6, artie raw frontier/fastest/lanes/engine/raw/pg18-numeric-zero-scale.txt). Kept,
+/// its negative scale carried into every scale-dependent result (`'0e1000000' * x` printed "0", not
+/// PostgreSQL's "0.00") and into the division's power of ten (Codex C25 HIGH 3). Mutant
+/// `numeric_zero_unbounded` (test builds only): the zero is kept as parsed, as before.
+pub fn numeric_operand_value(v: BigDecimal) -> crate::Result<BigDecimal> {
+    check_numeric_range(&v)?;
+    let (int, scale) = v.as_bigint_and_exponent();
+    if int.sign() == Sign::NoSign && scale < 0 && !crate::branch::store::fe_mutant("numeric_zero_unbounded") {
+        return Ok(BigDecimal::new(BigInt::from(0), 0));
+    }
+    Ok(v)
 }
 
 /// `a / b` as PostgreSQL computes it (numeric.c `select_div_scale`, then `div_var` rounding at
@@ -176,6 +199,11 @@ pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> crate::Result<BigDecima
         check_numeric_range(b)?;
     }
     let rscale = pg_div_scale(a, b);
+    // A zero dividend is zero at the result scale: no power of ten is formed for it, whatever
+    // exponent it carries (Codex C25 HIGH 3). Mutant `numeric_zero_unbounded`: divided as any value.
+    if a.as_bigint_and_exponent().0.sign() == Sign::NoSign && !crate::branch::store::fe_mutant("numeric_zero_unbounded") {
+        return Ok(BigDecimal::new(BigInt::from(0), rscale));
+    }
     let (ai, sa) = a.as_bigint_and_exponent();
     let (bi, sb) = b.as_bigint_and_exponent();
     // a / b = (ai / bi) * 10^(sb - sa); the result's integer at `rscale` is that times 10^rscale.
