@@ -190,6 +190,20 @@ def selftest():
         ok(f"shared_buffers_bytes: {name} -> {got!r}",
            got[0] == want[0] and (want[1] is None) == (got[1] is None) and (want[1] is None or want[1] in got[1]))
     ok("check-pg: no MemTotal refused", check_pg(good, "MemFree: 1 kB\n") != [])
+    # comp review 1 LOW 36: all five D2 settings read back from the running server, not two
+    d2 = "".join(f"{k}\t{v}\t\tconfiguration file\n" for k, v in (
+        ("wal_sync_method", "fdatasync"), ("file_copy_method", "clone"), ("fsync", "on"), ("synchronous_commit", "on"),
+        ("full_page_writes", "on")))
+    cd2 = globals().get("check_d2")
+    ok("check-d2: the five registered D2 settings accepted", cd2 is not None and cd2(d2) == [])
+    for k, bad_v in (("fsync", "off"), ("synchronous_commit", "local"), ("full_page_writes", "off"),
+                     ("wal_sync_method", "open_datasync"), ("file_copy_method", "copy")):
+        planted = "".join((f"{k}\t{bad_v}\t\tconfiguration file\n" if ln.startswith(k + "\t") else ln)
+                          for ln in d2.splitlines(True))
+        ok(f"check-d2: {k}={bad_v} refused", cd2 is not None and any(k in w for w in cd2(planted)))
+    ok("check-d2: a missing fsync row refused",
+       cd2 is not None and any("fsync" in w for w in cd2("".join(ln for ln in d2.splitlines(True)
+                                                                 if not ln.startswith("fsync\t")))))
     print(f"pins selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
