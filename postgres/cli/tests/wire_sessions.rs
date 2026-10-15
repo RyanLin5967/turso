@@ -2149,12 +2149,12 @@ fn branch_stats_reports_the_engines_counted_exceptions() {
 }
 
 /// The branch store's checkpoints since the server started (turso_branch_stats' sixth column,
-/// `store_checkpoints`).
+/// `store_checkpoints`, of ten since the engine's counted exceptions joined it).
 fn store_checkpoints(a: &mut Wire) -> i64 {
     let r = a.q("SELECT turso_branch_stats()").ok("stats");
     assert_eq!(
         r.oids.as_ref().map(Vec::len),
-        Some(6),
+        Some(10),
         "turso_branch_stats has no store_checkpoints column: {:?}",
         r.oids
     );
