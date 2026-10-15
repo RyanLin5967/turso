@@ -3391,7 +3391,7 @@ fn leap_l4_an_open_after_a_written_tail_asks_its_reused_slots_in_one_statement()
             if q > 2 {
                 let _ = writeln!(
                     failures,
-                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} slots asked, {} touched below the high-water mark)",
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probe statements, {} touched below the high-water mark)",
                     s["catalog_rows"],
                     f["free_probes"],
                     f["touched_below_hw"]
