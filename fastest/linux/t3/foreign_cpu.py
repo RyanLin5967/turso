@@ -179,6 +179,12 @@ def self_test():
                         f"while time.monotonic()-t<{dur}:\n"
                         f"    u=time.monotonic()\n    while time.monotonic()-u<{0.01 * duty}: pass\n"
                         f"    time.sleep({0.01 * (1 - duty)})\n")
+                if sut == "child":
+                    # a SUT parent (the marker in its environ) whose burning child has none: what a PostgreSQL
+                    # backend looks like (the server's ps display clobbers the environ area of every child it forks)
+                    env["FASTEST_CELL"] = "ST"
+                    code = ("import subprocess, sys\n"
+                            f"sys.exit(subprocess.call([sys.executable, '-c', {code!r}], env={{'PATH': '/usr/bin:/bin'}}))\n")
                 procs.append(subprocess.Popen([sys.executable, "-c", code], env=env))
             time.sleep(0.05)
         for p in procs:
@@ -192,6 +198,10 @@ def self_test():
         ("live: quiet window", [], "VALID"),
         ("live: SUT burners only (2 cores, whole window)", [(True, 1, 17), (True, 1, 17)], "VALID"),
         ("live: one foreign full-core burner for 9 s", [(False, 3, 9)], "VOID"),
+        # the first --dry-block run (2026-10-15): every pg18 attempt VOIDed on "foreign process (postgres) above 50%",
+        # its own backends, whose environ the server clobbers. A child of the system under test is the system under
+        # test (the marker inherited by ancestry), and a foreign process with no SUT ancestor stays foreign (above)
+        ("live: a SUT parent's child without the marker, a full core for 9 s, is the SUT", [("child", 3, 9)], "VALID"),
     ]
     bad = 0
     for label, burners, want in live:
