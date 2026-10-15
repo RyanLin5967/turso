@@ -379,5 +379,67 @@ check "measured span: a span ending after the process window gives sweeper_cpu_s
 j = json.load(open(\"$T/rec3/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"outside\" in (j[\"sweeper_refused\"] or \"\")))"'
 
+# CLASS: the host acts during a measured window (the second full --dry-block run, 2026-10-15, btrfs pg18: an
+# unattended-upgrade, started by apt-daily.timer, voided attempt 1 as foreign CPU; lima-guestagent's SyncTime stepped
+# CLOCK_REALTIME every 10-20 s, "drift was 117.942399ms" in its journal, and stracecount refused the windows). The one
+# design change: host_quiet stops every active systemd timer and every known clock adjuster before the first cell,
+# then MEASURES the outcome (CLOCK_REALTIME minus CLOCK_MONOTONIC must hold still over a watch) and refuses
+# otherwise; host_unquiet restarts what it stopped. Faked here: systemctl (T3_SYSTEMCTL) and the clock (T3_CLOCKDELTA)
+mkdir -p "$T/sc/active" "$T/sc/sticky"
+cat > "$T/systemctl" <<'SC'
+#!/bin/bash
+D=$(dirname "$0")/sc
+echo "$*" >> "$D/calls.txt"
+case $1 in
+  list-timers) [ -f "$D/timers.broken" ] && exit 1; cat "$D/timers.txt" ;;
+  is-active) if [ -e "$D/active/$2" ]; then echo active; else echo inactive; exit 3; fi ;;
+  stop) [ -e "$D/sticky/$2" ] || rm -f "$D/active/$2" ;;
+  start) touch "$D/active/$2" ;;
+  *) exit 2 ;;
+esac
+SC
+chmod +x "$T/systemctl"
+cat > "$T/clockdelta" <<'CD'
+#!/bin/bash
+f=$(dirname "$0")/clock.n; n=$(cat "$f" 2>/dev/null || echo 0); echo $((n + 1)) > "$f"
+sed -n "$((n + 1))p" "$(dirname "$0")/clock.txt"
+CD
+chmod +x "$T/clockdelta"
+quiet_setup() { # quiet_setup "ACTIVE UNITS" "STICKY UNITS" "CLOCK VALUES"
+  rm -rf "$T/sc/active" "$T/sc/sticky" "$T/sc/calls.txt" "$T/sc/timers.broken" "$T/clock.n" "$T/quiet.tsv"
+  mkdir -p "$T/sc/active" "$T/sc/sticky"
+  local u; for u in $1; do touch "$T/sc/active/$u"; done; for u in $2; do touch "$T/sc/sticky/$u"; done
+  printf '%s\n' $3 > "$T/clock.txt"
+  printf '%s\n' \
+    "Fri 2026-10-16 06:14:21 EDT 10h Thu 2026-10-15 09:29:18 EDT - apt-daily-upgrade.timer apt-daily-upgrade.service" \
+    "Fri 2026-10-16 16:06:44 EDT 20h Thu 2026-10-15 18:55:34 EDT 21min ago apt-daily.timer apt-daily.service" \
+    "- - - - snapd.snap-repair.timer snapd.snap-repair.service" > "$T/sc/timers.txt"
+}
+QENV='T3_SYSTEMCTL=$T/systemctl T3_CLOCKDELTA=$T/clockdelta T3_QUIET_WATCH_S=0'
+quiet_setup "apt-daily.timer apt-daily.service apt-daily-upgrade.timer systemd-timesyncd lima-guestagent" "" "0.5 0.5"
+check "host_quiet stops each active timer, its running service and each active clock adjuster, records them, rc 0" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ -z \"\$(ls \"$T/sc/active\")\" ] && grep -qx \"timer${TAB}apt-daily.timer\" \"$T/quiet.tsv\" &&
+   grep -qx \"service${TAB}apt-daily.service\" \"$T/quiet.tsv\" && grep -qx \"clock${TAB}lima-guestagent\" \"$T/quiet.tsv\" &&
+   grep -qx \"clock${TAB}systemd-timesyncd\" \"$T/quiet.tsv\" && ! grep -q snap-repair \"$T/quiet.tsv\""
+check "host_unquiet restarts exactly the timers and clock adjusters it stopped (a timer starts its service itself)" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_unquiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ \"\$(ls \"$T/sc/active\" | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
+quiet_setup "apt-daily.timer" "apt-daily.timer" "0.5 0.5"
+check "a timer still active after its stop refuses, naming it" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q 'apt-daily.timer' \"$T/out.txt\""
+quiet_setup "chrony" "chrony" "0.5 0.5"
+check "a clock adjuster still active after its stop refuses, naming it" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q chrony \"$T/out.txt\""
+quiet_setup "" "" "0.5 0.62"
+check "the outcome: CLOCK_REALTIME moving 0.12 s against MONOTONIC over the watch, every adjuster stopped, refuses" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q CLOCK_REALTIME \"$T/out.txt\""
+quiet_setup "" "" "0.5"
+check "an unreadable clock sample refuses (never a pass)" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+quiet_setup "" "" "0.5 0.5"; touch "$T/sc/timers.broken"
+check "systemctl list-timers failing refuses (the guard cannot read its input)" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A-on-$(uname -s | tr A-Z a-z))")"
 [ $fail = 0 ]
