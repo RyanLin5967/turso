@@ -1827,19 +1827,27 @@ impl Session {
         format: &Format,
     ) -> SqlResult<Response> {
         // A result format code other than 0 or 1, refused as PostgreSQL refuses it when it formats
-        // the row, which every branch call returns: before the call changes anything (wire review
-        // 13 item 10).
-        if let Some(code) = portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
-            return Err(error("22023", format!("unsupported format code: {code}")));
-        }
+        // the row, which every branch call returns: after what an engine statement checks first
+        // (the function's name and arity, 42883; the result-format count, 08P01) and before the
+        // call changes anything (wire review 13 item 10). It came first, so codes [0, 2] answered
+        // 22023 where an engine SELECT answers 08P01 (wire review 17 item 9).
+        let bad_code =
+            |st: &SessionState| match portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
+                Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
+                None => Ok(()),
+            };
         let f = call.function.as_str();
         if f == "turso_branch_current" {
             arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
             return one_text(f, name, format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
+            result_format(format, 0, STATS_COLUMNS.len())?;
+            bad_code(&*st)?;
             return stats_row(format, &self.shared.db);
         }
         if !matches!(
@@ -1855,6 +1863,7 @@ impl Session {
         // The result-format list is checked before the call changes anything: a create refused
         // after it ran would leave its branch behind (wire review 9 item 2).
         result_format(format, 0, 1)?;
+        bad_code(&*st)?;
         let name = text_arg(&call.args[0], portal)?;
         // As PostgreSQL refuses CREATE DATABASE and DROP DATABASE in a transaction block. The
         // engine refuses a fork there too; a switch would abandon the transaction.
