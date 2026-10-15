@@ -2289,6 +2289,24 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// A client's value never chooses its error's SQLSTATE: a SET refused for its value is 0A000
+/// whatever the value says, `'is ambiguous'` and `'specified more than once'` included. The
+/// mapping matched those words anywhere in the message, which embeds the value, so `SET
+/// bytea_output = 'is ambiguous'` answered 42702 (wire review 16 item 20).
+#[test]
+fn a_clients_value_never_chooses_the_sqlstate() {
+    let dir = Scratch::new("valuecode");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET bytea_output = 'is ambiguous'",
+        "SET bytea_output = 'specified more than once'",
+        "SET bytea_output = 'escape'",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+}
+
 /// SET reads every value it is given, as PostgreSQL does: a setting PostgreSQL reads as one value
 /// takes one, so `SET client_encoding TO UTF8, LATIN1` and `SET TimeZone TO UTC, GMT` are 22023
 /// "SET <name> takes only one argument" (its flatten_set_variable_args, guc_funcs.c:233, read),
