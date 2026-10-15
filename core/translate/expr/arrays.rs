@@ -341,7 +341,10 @@ pub(crate) fn emit_custom_type_decode_columns(
 
 /// The integer or real base `ty` stands for when neither it nor any type it is declared over has
 /// an ENCODE; None otherwise.
-pub(super) fn numeric_base_without_encode<'a>(resolver: &'a Resolver, ty: &'a str) -> Option<&'a str> {
+pub(super) fn numeric_base_without_encode<'a>(
+    resolver: &'a Resolver,
+    ty: &'a str,
+) -> Option<&'a str> {
     let mut ty = ty;
     // A type is declared over an earlier one, so the chain ends; the bound only guards the loop.
     for _ in 0..16 {

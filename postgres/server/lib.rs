@@ -7107,7 +7107,11 @@ mod tests {
             ),
             other => panic!("{} replies", other.len()),
         }
-        assert_eq!(count, vec![vec![Value::from_i64(1)]], "the write was not applied once");
+        assert_eq!(
+            count,
+            vec![vec![Value::from_i64(1)]],
+            "the write was not applied once"
+        );
     }
 
     /// A COMMIT that meets Busy at the trunk's commit is not run again: the failed COMMIT already

@@ -7061,22 +7061,40 @@ fn default_in_every_row(lists: &[pg_query::protobuf::Node]) -> bool {
 }
 
 /// A CTE's output column names, as the engine names them: its column list over its query's own
-/// names. None when its query has a column whose name the engine would derive from the
-/// expression (anything but a named target or a plain column reference), or a `*`.
+/// names, or its column list alone when it names every column of a query whose own names cannot
+/// be read. None when the names cannot be told: an output the engine would name from its
+/// expression and no column list covering it, or a `*`.
 fn cte_columns(cte: &pg_query::protobuf::CommonTableExpr) -> Option<Vec<String>> {
     use pg_query::protobuf::node::Node;
     let Some(Node::SelectStmt(select)) = cte.ctequery.as_ref().and_then(|q| q.node.as_ref()) else {
         return None;
     };
-    let mut columns = cte_output_names(select)?;
-    rename_columns(&mut columns, &cte.aliascolnames);
-    Some(columns)
+    if let Some(mut columns) = cte_output_names(select) {
+        rename_columns(&mut columns, &cte.aliascolnames);
+        return Some(columns);
+    }
+    let listed: Vec<String> = cte
+        .aliascolnames
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    (cte_output_width(select)? == listed.len()).then_some(listed)
 }
 
+/// A query's output names as the engine names them: a named target or a plain column reference's
+/// last name, `column1` .. `columnN` for a VALUES list (SQLite's and PostgreSQL's names for it);
+/// None for any other output or a `*`.
 fn cte_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
     use pg_query::protobuf::node::Node;
     if let Some(left) = &select.larg {
         return cte_output_names(left);
+    }
+    if select.target_list.is_empty() {
+        let width = cte_values_width(select)?;
+        return Some((1..=width).map(|i| format!("column{i}")).collect());
     }
     select
         .target_list
@@ -7097,6 +7115,32 @@ fn cte_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<Strin
             }
         })
         .collect()
+}
+
+/// How many columns a query returns, when no `*` hides it.
+fn cte_output_width(select: &pg_query::protobuf::SelectStmt) -> Option<usize> {
+    use pg_query::protobuf::node::Node;
+    if let Some(left) = &select.larg {
+        return cte_output_width(left);
+    }
+    if select.target_list.is_empty() {
+        return cte_values_width(select);
+    }
+    let star = select.target_list.iter().any(|target| {
+        matches!(&target.node, Some(Node::ResTarget(t))
+            if matches!(t.val.as_ref().and_then(|v| v.node.as_ref()),
+                Some(Node::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(Node::AStar(_))))))
+    });
+    (!star).then_some(select.target_list.len())
+}
+
+/// The width of a VALUES list's first row; None for a query that is no VALUES list.
+fn cte_values_width(select: &pg_query::protobuf::SelectStmt) -> Option<usize> {
+    use pg_query::protobuf::node::Node;
+    match select.values_lists.first()?.node.as_ref()? {
+        Node::List(row) => Some(row.items.len()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

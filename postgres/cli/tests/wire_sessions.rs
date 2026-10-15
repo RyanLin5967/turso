@@ -3187,6 +3187,17 @@ fn a_from_alias_column_list_on_a_cte_renames_the_ctes_columns() {
         (names(&["y", "q"]), vec![vec![t("10"), t("20")]])
     );
     let r = a
+        .q("WITH c (p) AS (SELECT 1 + 1) SELECT * FROM c AS a (y)")
+        .ok("a CTE whose own column list names an unnamed output");
+    assert_eq!((r.names, r.rows), (names(&["y"]), vec![vec![t("2")]]));
+    let r = a
+        .q("WITH v AS (VALUES (1, 2)) SELECT * FROM v AS a (p)")
+        .ok("a VALUES CTE");
+    assert_eq!(
+        (r.names, r.rows),
+        (names(&["p", "column2"]), vec![vec![t("1"), t("2")]])
+    );
+    let r = a
         .q("SELECT * FROM t AS a (x) WHERE EXISTS (WITH t AS (SELECT 1 AS k) SELECT 1 FROM t)")
         .ok("a CTE out of the FROM's scope");
     assert_eq!(
@@ -3465,7 +3476,11 @@ fn a_long_statement_stops_on_cancel_and_on_statement_timeout() {
     let started = Instant::now();
     let e = a.q(slow).err("statement_timeout");
     assert_eq!(e.code, "57014", "statement_timeout: {}", e.message);
-    assert!(started.elapsed() < Duration::from_secs(10), "timeout took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "timeout took {:?}",
+        started.elapsed()
+    );
     a.q("SET statement_timeout = 0").ok("statement_timeout off");
     a.q("SELECT 1").ok("the session after the timeout");
 }

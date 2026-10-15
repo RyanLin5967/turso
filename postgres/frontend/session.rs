@@ -2422,7 +2422,9 @@ fn resident_relation_columns(
         SchemaQualifier::Main => columns_in("main"),
         SchemaQualifier::Unqualified => {
             let path = pg_conn.session_state.lock().search_path.clone();
-            pg_conn.conn.resident_unqualified_table_columns(table, &path)
+            pg_conn
+                .conn
+                .resident_unqualified_table_columns(table, &path)
         }
         SchemaQualifier::Attached(database) => columns_in(database),
         _ => None,
@@ -2696,11 +2698,19 @@ mod tests {
             stmt.run_collect_rows()
                 .unwrap()
                 .iter()
-                .map(|r| r.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join("|"))
+                .map(|r| {
+                    r.iter()
+                        .map(|v| format!("{v}"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
                 .collect()
         };
         assert_eq!(rows("SELECT x, y FROM m"), ["7|1"]);
-        run(&conn, "CREATE TABLE w (a int, b int, c text default 'main')");
+        run(
+            &conn,
+            "CREATE TABLE w (a int, b int, c text default 'main')",
+        );
         run(&conn, "CREATE SCHEMA app");
         run(&conn, "CREATE TABLE app.w (p int default 3, q int)");
         run(&conn, "SET search_path TO main, app");
