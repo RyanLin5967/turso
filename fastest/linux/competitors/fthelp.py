@@ -296,7 +296,12 @@ def selftest():
             ("Doltgres's pg_settings rows, |-separated", "dolt_auto_gc_enabled|on\n", True),
             ("an empty record", "", False),
             ("a failed query", "ERROR 2013 (HY000): Lost connection\nrc=1 (not read)\n", False),
-            ("rows, none a GC setting", "max_connections\t1100\n", False)):
+            ("rows, none a GC setting", "max_connections\t1100\n", False),
+            # the probe (artie runs/loud-20261015/probe-dolt-gc): both binaries default dolt_auto_gc_enabled on, and the
+            # explicit config.yaml now pins it on; the record must show THAT setting at that value
+            ("GC rows without dolt_auto_gc_enabled", "dolt_stats_gc_enabled\tON\n", False),
+            ("auto GC off", "dolt_auto_gc_enabled\tOFF\n", False),
+            ("Doltgres's auto GC as SHOW reports it (1)", "dolt_auto_gc_enabled|1\n", True)):
         why = gs(text) if gs else "no gc_settings_problem() in fthelp.py"
         ok(f"gc settings record: {name} -> {'ok' if not why else why}", (not why) == want_ok)
     print(f"fthelp selftest: {n - bad}/{n}")
