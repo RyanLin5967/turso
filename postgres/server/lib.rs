@@ -1038,12 +1038,13 @@ struct SessionState {
     /// branch, so switching back to the trunk opens nothing.
     trunk: Option<PgConnection>,
     /// The named branch the session is on, with the branch's connection.
-    branch: Option<(String, PgConnection)>,
+    /// The name inline up to 24 bytes: a switch allocates nothing for it (L5).
+    branch: Option<(compact_str::CompactString, PgConnection)>,
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
-    left: Option<String>,
+    left: Option<compact_str::CompactString>,
     /// The session's connection is in the implicit transaction block PostgreSQL wraps a
     /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
     /// (see [`Session::begin_implicit`]).
@@ -1286,7 +1287,7 @@ impl Session {
         };
         let conn = PgConnection::new(conn);
         self.arm(conn.inner());
-        self.state().branch = Some((branch.to_string(), conn));
+        self.state().branch = Some((branch.into(), conn));
         Ok(())
     }
 
@@ -2172,7 +2173,7 @@ impl Session {
                         let next = PgConnection::new(opened);
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
-                        st.branch = Some((name.to_string(), next));
+                        st.branch = Some((name.as_ref().into(), next));
                     }
                     return branch_text(f, &name, portal.is_some(), format);
                 }
@@ -2197,7 +2198,7 @@ impl Session {
                     let next = PgConnection::new(opened);
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
-                    st.branch.replace((name.to_string(), next))
+                    st.branch.replace((name.as_ref().into(), next))
                 };
                 // The branch left is free for a delete once its connection is closed: `run`
                 // releases it after the statement's own handle on the connection goes.
