@@ -1122,6 +1122,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_setting_scope_follows_commit_rollback_and_savepoints() {
+        for expanded in [false, true] {
+            let (_io, db) =
+                open_database(":memory:", None, false, BranchDurability::default()).unwrap();
+            let conn = Connection::new(db.connect().unwrap());
+            let mut out = Vec::new();
+            for (sql, expected) in [
+                ("BEGIN; SET LOCAL lock_timeout='100ms'; COMMIT", 0),
+                ("BEGIN; SET lock_timeout='100ms'; ROLLBACK", 0),
+                ("BEGIN; SET lock_timeout='200ms'; SAVEPOINT a; SET LOCAL lock_timeout='300ms'; ROLLBACK TO a; RELEASE a; COMMIT", 200),
+            ] {
+                assert!(!execute_sql(
+                    &conn,
+                    sql,
+                    &TableConfig::default(),
+                    expanded,
+                    &mut out,
+                ), "{sql}: {}", String::from_utf8_lossy(&out));
+                assert_eq!(conn.lock_timeout_ms(), expected, "{sql}");
+            }
+        }
+    }
+
+    #[test]
     fn test_successful_exit_commands() {
         for command in [
             "exit", "quit", "EXIT", "QuIt", "exit;", "quit;", "EXIT;", "exit ;  ", "quit ;  ",
