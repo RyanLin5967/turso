@@ -317,7 +317,9 @@ fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
     db.branch_checkpoint_wait();
     let t = std::time::Instant::now();
     loop {
-        if settled(base) && writer_settled(db, std::time::Duration::ZERO) {
+        // The writer first, then the thread state (`writer_settled`'s order: the thread state is what
+        // sees the writer's final step into its kernel wait).
+        if writer_settled(db, std::time::Duration::ZERO) && settled(base) {
             return true;
         }
         if t.elapsed() > std::time::Duration::from_secs(5) {
@@ -391,22 +393,29 @@ fn absorb_confirm(db: &Arc<Database>, s0: &probe::Snapshot) -> (bool, bool) {
     (synced, writer_settled(db, std::time::Duration::from_secs(1)))
 }
 
-/// Review 2 L3: spin, with no syscall (the park state is read with a try-lock), until `db`'s
-/// confirmation writer is parked in one of its waits with nothing left to do, or the deadline;
-/// whether it got there. Held (`hold_word`), parked is enough: the word waits out a quiet period no
-/// run reaches. Unheld, no proved word may be pending either: the writer writes it after its quiet
-/// period. With no persistent thread live in the process (`probe::persistent_live`), there is no
-/// writer to wait for. BLIND SPOT: with another store's writer live and none of `db`'s own, this
-/// waits out its deadline and the window reads not quiet (a refusal, not a false pass).
+/// Review 2 L3, review C14: spin, never blocking (the park state is read with a try-lock), until
+/// `db`'s confirmation writer is parked with nothing left to do, or the deadline; whether it got
+/// there. Parked with nothing left to do: in its idle wait or its quiet-period wait (never its
+/// flight wait: a flight or a cut is in the air, or its landing's wake is still to be taken),
+/// entered after every notification it was sent (review C14: a held create's landing notifies a
+/// parked writer, and until it wakes its old wait still reads as parked), and, unheld, with no proved
+/// word pending (the writer writes it after its quiet period). Held (`hold_word`), a pending word is
+/// expected: it waits out a quiet period no run reaches. With no persistent thread live in the
+/// process (`probe::persistent_live`), there is no writer to wait for. The final step into the
+/// kernel wait is not seen here (the accessor's blind spot); every caller spins on the thread state
+/// afterwards (`spin_settled`, all other threads blocked), which sees it on Apple. BLIND SPOT: with
+/// another store's writer live and none of `db`'s own, this waits out its deadline and the window
+/// reads not quiet (a refusal, not a false pass).
 fn writer_settled(db: &Arc<Database>, deadline: std::time::Duration) -> bool {
+    use super::store::{CONFIRM_PARK_IDLE, CONFIRM_PARK_QUIET};
     if probe::persistent_live() <= 0 {
         return true;
     }
     let held = WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
     let t = std::time::Instant::now();
     loop {
-        if let Some((parked, pending, _)) = db.branches.confirm_park_for_test() {
-            if parked && (held || !pending) {
+        if let Some((wait, seen, pending, _)) = db.branches.confirm_park_for_test() {
+            if (wait == CONFIRM_PARK_IDLE || wait == CONFIRM_PARK_QUIET) && seen && (held || !pending) {
                 return true;
             }
         }
@@ -1634,6 +1643,17 @@ fn run_instruments(cell: &str) -> String {
             ]),
         );
     }
+    // Review C14: the settle check's own cost, uncontended: a thousand checks of a parked writer move
+    // no counter that a window charges (a try-lock the writer contends for meanwhile may: the
+    // accessor's named blind spot).
+    put(
+        "fc_writer_settled_cost",
+        &window(&mut || {
+            for _ in 0..1000 {
+                std::hint::black_box(writer_settled(&db, std::time::Duration::ZERO));
+            }
+        }),
+    );
     out
 }
 
@@ -2122,6 +2142,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_writer_stale_park", "landed_before_check"), 1, "premise: the held create landed while the writer was suspended");
         assert_eq!(get("fc_writer_stale_park", "settled_stale"), 0, "a held window accepted the writer's stale park: notified, not yet woken (review C14 MED)");
         assert_eq!(get("fc_writer_stale_park", "settled_resumed"), 1, "a resumed writer never parked again (review C14)");
+        assert_eq!(get("fc_writer_settled_cost", "syscalls"), 0, "1,000 settle checks of a parked writer made a syscall (review C14)");
+    }
+    for k in ["allocs", "locks", "fsync", "full_fsync", "barrier"] {
+        assert_eq!(get("fc_writer_settled_cost", k), 0, "1,000 settle checks of a parked writer moved {k} (review C14)");
     }
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
@@ -3021,10 +3045,13 @@ fn worst_diff(pairs: &[(&Map, &Map)], k: &str) -> i64 {
 /// to park again — and no sync, no store-mutex acquisition and no syscall under it, on any thread;
 /// in EVERY quiet round, paired by index (review 2 H6). CORRECTED before its first run (2026-10-15,
 /// a flagged change of this lane's own unrun budget): 18e98e977 said three and left out the timed
-/// wait. Four is the minimum for the ruled design (a background writer that waits out a quiet
-/// period after a landing wakes it): the wake, the quiet period's wait, the write and the park are
-/// each one call, and none of them can be another's. The window now ends only once the writer is
-/// parked with nothing pending (`writer_settled`, review 2 L3), so all four land inside it. A word that owns a duplicated descriptor adds its close (and std's
+/// wait. Four is the bound for this cell's schedule (an idle writer woken at the landing, under the
+/// ruled design: a background writer that waits out a quiet period after a landing wakes it): the
+/// wake, the quiet period's wait, the write and the park are each one call. It is an upper bound,
+/// not a minimum (review C14): a writer first scheduled after the quiet period has passed skips
+/// the timed wait. Spurious wake-ups, and the probe's own work, are not in the four. The window
+/// ends only once the writer is parked with nothing pending (`writer_settled`, review 2 L3 and
+/// C14), so all four land inside it. A word that owns a duplicated descriptor adds its close (and std's
 /// debug-build F_GETFD at that close): base13 read +4 against the held create, and an lldb trace of
 /// the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`; review 1 #14 /
 /// review 2 #6 (one shared descriptor, no dup per flight) remove the close. Mutant

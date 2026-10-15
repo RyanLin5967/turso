@@ -398,6 +398,10 @@ pub(crate) struct Group {
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
     confirm_hold: AtomicU8,
+    /// Test builds (fastest-budgets, review C14): notifications of `confirm_cv`, each counted under
+    /// the group's lock just before it is sent (`confirm_notified`).
+    #[cfg(test)]
+    confirm_notifies: AtomicU64,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -476,27 +480,33 @@ struct GroupState {
     /// proved confirmation pending and went back to waiting.
     #[cfg(test)]
     confirm_wakeups: u64,
-    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer is in one of its
-    /// condition-variable waits (set as it enters one, cleared as the wait returns, both under this
-    /// lock; `BranchStore::confirm_park_for_test`), and the waits it has entered.
+    /// Test builds (fastest-budgets, review 2 L3, review C14): which of its condition-variable waits
+    /// the confirmation writer is in (`CONFIRM_PARK_*`, 0 for none; set as it enters one, cleared as
+    /// the wait returns, both under this lock), the notifications of `confirm_cv` it had seen when it
+    /// entered it, and the waits it has entered (`BranchStore::confirm_park_for_test`).
     #[cfg(test)]
-    confirm_parked: bool,
+    confirm_parked: u8,
+    #[cfg(test)]
+    confirm_seen: u64,
     #[cfg(test)]
     confirm_parks: u64,
 }
 
-impl GroupState {
-    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer enters a wait.
-    #[cfg(test)]
-    fn confirm_wait_entered(&mut self) {
-        self.confirm_parked = true;
-        self.confirm_parks += 1;
-    }
+/// Test builds (fastest-budgets): the confirmation writer's waits (`GroupState::confirm_parked`).
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_IDLE: u8 = 1;
+/// Test builds: waiting on the group's condition variable for a flight or a cut in the air.
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_FLIGHT: u8 = 2;
+/// Test builds: waiting out the quiet period with a word pending.
+#[cfg(test)]
+pub(crate) const CONFIRM_PARK_QUIET: u8 = 3;
 
+impl GroupState {
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
     #[cfg(test)]
     fn confirm_wait_left(&mut self) {
-        self.confirm_parked = false;
+        self.confirm_parked = 0;
     }
 }
 
@@ -525,7 +535,26 @@ impl Group {
             upgrade_overdue: AtomicBool::new(false),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            confirm_notifies: AtomicU64::new(0),
         }
+    }
+
+    /// Test builds (fastest-budgets, review C14): `confirm_cv` is about to be notified; called
+    /// holding the group's lock.
+    #[cfg(test)]
+    fn confirm_notified(&self) {
+        self.confirm_notifies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test builds (fastest-budgets, review 2 L3, review C14): the confirmation writer enters a wait
+    /// of `kind` (`CONFIRM_PARK_*`), having seen every notification sent so far (all are counted
+    /// under the lock it holds).
+    #[cfg(test)]
+    fn confirm_wait_entered(&self, g: &mut GroupState, kind: u8) {
+        g.confirm_parked = kind;
+        g.confirm_seen = self.confirm_notifies.load(Ordering::Relaxed);
+        g.confirm_parks += 1;
     }
 
     /// Every journal byte below `end` is durable in class index `c` (called holding the lock, `g`).
@@ -641,6 +670,8 @@ impl Group {
                 let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
                 replaced = g.confirm.replace((Instant::now(), confirm));
                 if wake {
+                    #[cfg(test)]
+                    self.confirm_notified();
                     self.confirm_cv.notify_one();
                 }
             }
@@ -754,6 +785,8 @@ impl Group {
     fn stop_confirms(&self) -> Option<Confirm> {
         let mut g = self.lock();
         g.confirm_stop = true;
+        #[cfg(test)]
+        self.confirm_notified();
         self.confirm_cv.notify_all();
         // The writer may be waiting for a flight on the group's condition variable.
         self.cv.notify_all();
@@ -873,7 +906,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             Some((at, c)) if c.proved() && !group.poisoned() => *at,
             _ => {
                 #[cfg(test)]
-                g.confirm_wait_entered();
+                group.confirm_wait_entered(&mut g, CONFIRM_PARK_IDLE);
                 g = group.confirm_cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 #[cfg(test)]
                 g.confirm_wait_left();
@@ -887,7 +920,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         // (test builds only): every 100 us, as before.
         if (g.flushing || g.cutting) && !fe_mutant("confirm_poll_100us") {
             #[cfg(test)]
-            g.confirm_wait_entered();
+            group.confirm_wait_entered(&mut g, CONFIRM_PARK_FLIGHT);
             g = group.cv.wait(g).unwrap_or_else(|e| e.into_inner());
             #[cfg(test)]
             g.confirm_wait_left();
@@ -900,7 +933,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         if idle < confirm_quiet() || g.flushing || g.cutting {
             let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
             #[cfg(test)]
-            g.confirm_wait_entered();
+            group.confirm_wait_entered(&mut g, CONFIRM_PARK_QUIET);
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
             #[cfg(test)]
             g.confirm_wait_left();
@@ -4468,6 +4501,8 @@ impl BranchStore {
                 if inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP) {
                     self.group.upgrade_overdue.store(true, Ordering::Release);
                 }
+                #[cfg(test)]
+                self.group.confirm_notified();
                 self.group.confirm_cv.notify_all();
                 drop(g);
             }
@@ -7336,17 +7371,24 @@ impl BranchStore {
         self.group.lock().confirm_wakeups
     }
 
-    /// Test builds (fastest-budgets, review 2 L3): whether this store's confirmation writer is in
-    /// one of its waits, whether a proved word is pending, and the waits it has entered; `None` while
-    /// anyone holds the group's lock (a measuring thread spins on this: blocking on the lock would add
-    /// a syscall to its window). The writer sets the flag before it waits and clears it as the wait
-    /// returns, holding the lock, so while it reads true here the writer has finished its work and is
-    /// in the wait. BLIND SPOT: if the condition variable releases the lock in userspace before its
-    /// wait syscall, that one syscall can land just after a reader saw the flag.
+    /// Test builds (fastest-budgets, review 2 L3, review C14): which wait this store's confirmation
+    /// writer is in (`CONFIRM_PARK_*`, 0 for none), whether it has seen every notification of
+    /// `confirm_cv` sent since it entered that wait, whether a proved word is pending, and the waits
+    /// it has entered; `None` while anyone holds the group's lock (a measuring thread spins on this
+    /// rather than block on the lock). The writer sets the wait and its seen count as it enters the
+    /// wait and clears the wait as it returns, holding the lock, and every notification is counted
+    /// under the lock, so here a wait read with everything seen is one the writer entered after the
+    /// last notification: nothing it was sent is still to be processed. A notified wait (C14's
+    /// schedule: notified, not yet woken) reads as not seen. BLIND SPOTS: if the condition variable
+    /// releases the lock in userspace before its wait syscall, that syscall can land just after a
+    /// reader saw the wait (the suite's later thread-state spin covers it on Apple); and this
+    /// try-lock, though it never blocks, can make a writer that contends for the lock meanwhile
+    /// need waking at its unlock.
     #[cfg(test)]
-    pub(crate) fn confirm_park_for_test(&self) -> Option<(bool, bool, u64)> {
+    pub(crate) fn confirm_park_for_test(&self) -> Option<(u8, bool, bool, u64)> {
         let g = self.group.state.try_lock().ok()?;
-        Some((g.confirm_parked, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
+        let seen = g.confirm_seen == self.group.confirm_notifies.load(Ordering::Relaxed);
+        Some((g.confirm_parked, seen, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
