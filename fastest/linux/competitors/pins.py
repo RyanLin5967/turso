@@ -88,20 +88,27 @@ def shared_buffers_mb(meminfo_text):
     return kb // 4 // 1024
 
 
+def shared_buffers_bytes(settings_tsv_text):
+    """(bytes, None) of shared_buffers from a pg18.sh settings dump (name, setting, unit, source), or (None, why): the
+    setting is in 8kB pages, and any other or missing unit is refused rather than guessed (LOW 21: the old dump had no
+    unit column, and a dict keyed by the source column fell back to 8 kB for every value). The ONE reader: check_pg and
+    smoke_table.py (comp review 1 LOW 34: it multiplied by 8 kB whatever the unit)."""
+    row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
+    if row is None or len(row) < 2 or not row[1].isdigit():
+        return None, "no shared_buffers row in pg_settings"
+    if len(row) < 3 or row[2] != "8kB":
+        return None, f"shared_buffers unit {row[2] if len(row) > 2 else None!r} is not 8kB"
+    return int(row[1]) * 8 * 1024, None
+
+
 def check_pg(settings_tsv_text, meminfo_text):
     why = []
     if mem_total_kb(meminfo_text) is None:
         return ["no MemTotal in meminfo: 25% cannot be computed"]
     want_mb = shared_buffers_mb(meminfo_text)
-    row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
-    if row is None or len(row) < 2 or not row[1].isdigit():
-        return ["no shared_buffers row in pg_settings"]
-    # pg18.sh settings dumps (name, setting, unit, source) (LOW 21: the old dump had no unit column, and a dict keyed
-    # by the source column fell back to 8 kB for every value); shared_buffers is reported in 8kB pages, and any other
-    # or missing unit is refused rather than guessed
-    if len(row) < 3 or row[2] != "8kB":
-        return [f"shared_buffers unit {row[2] if len(row) > 2 else None!r} is not 8kB"]
-    got = int(row[1]) * 8 * 1024
+    got, w = shared_buffers_bytes(settings_tsv_text)
+    if w:
+        return [w]
     if got != want_mb << 20:
         why.append(f"shared_buffers {got >> 20} MB, not 25% of MemTotal = {want_mb} MB")
     return why

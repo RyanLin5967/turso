@@ -178,10 +178,10 @@ def main(rundir, c, table=pins.TABLE):
     vals = []
     for runner, fs, _ in COLS:
         p = os.path.join(rundir, f"competitors-pg18-d2-{runner}-{fs}", "run", "pg_settings.tsv")
-        try:
-            row = next(ln.rstrip("\n").split("\t") for ln in open(p) if ln.startswith("shared_buffers\t"))
-            vals.append(f"{row[1]} x 8 kB = {int(row[1]) * 8 // 1024} MB")
-        except (OSError, StopIteration, ValueError, IndexError):
+        try:  # comp review 1 LOW 34: pins.shared_buffers_bytes, the one reader (a unit other than 8kB is printed)
+            got, why = pins.shared_buffers_bytes(open(p).read())
+            vals.append(f"{got >> 20} MB" if why is None else f"unit ... ({why})")
+        except OSError:
             vals.append("MISSING")
     print("| pg18-d2 | " + " | ".join(vals) + " |")
     print(f"\n#### PostgreSQL 18 deferred flushes per cycle at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
