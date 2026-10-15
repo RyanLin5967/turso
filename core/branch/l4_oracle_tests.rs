@@ -41,7 +41,7 @@ impl Rng {
 
 /// One history of `steps` operations from `seed`; the facts checked after every one. Returns how
 /// often each fact was set at a check: (pages complete, all complete, free exhausted).
-fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
+fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("oracle.db");
     let mut db = open(&path);
@@ -62,7 +62,7 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
     // Connections on unnamed branches whose handle was dropped: released while held open.
     let mut held: Vec<Arc<crate::Connection>> = Vec::new();
     let mut made = 0u64;
-    let mut seen = (0u64, 0u64, 0u64, 0u64);
+    let mut seen = (0u64, 0u64, 0u64, 0u64, 0u64);
     for step in 0..steps {
         let op = rng.below(100);
         let what = if op < 24 {
@@ -114,6 +114,8 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
             drop(db);
             db = open(&path);
             assert_ne!(db.incarnation, incarnation, "seed {seed} step {step}: premise: not a reopen");
+            // The name mirror is built with the filter, off the mutex, after the open.
+            db.branch_wait_name_filter();
             trunk = db.connect().unwrap();
             "reopen"
         };
@@ -124,6 +126,7 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
         );
         match db.branches.l4_facts_check_for_test() {
             Ok((pages, all, exhausted, meta)) => {
+                seen.4 += u64::from(db.branches.name_mirror_built_for_test());
                 seen.0 += u64::from(pages > 0);
                 seen.1 += u64::from(all);
                 seen.2 += u64::from(exhausted);
@@ -147,21 +150,22 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
 /// run over a store made at the legacy 17 (`journal::CREATE_LEGACY`), opened by the older path.
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
-    let mut total = (0u64, 0u64, 0u64, 0u64);
+    let mut total = (0u64, 0u64, 0u64, 0u64, 0u64);
     for seed in [1u64, 7, 42, 1009, 65_537, 0xdead_beef] {
         let seen = history(seed, 300, false);
-        total = (total.0 + seen.0, total.1 + seen.1, total.2 + seen.2, total.3 + seen.3);
+        total = (total.0 + seen.0, total.1 + seen.1, total.2 + seen.2, total.3 + seen.3, total.4 + seen.4);
     }
     // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17.
     for seed in [3u64, 99] {
         history(seed, 200, true);
     }
     assert!(
-        total.0 > 0 && total.1 > 0 && total.2 > 0 && total.3 > 0,
-        "premise: every fact was set at some check (pages complete {}, all complete {}, free exhausted {}, a lease or held release in the meta row {})",
+        total.0 > 0 && total.1 > 0 && total.2 > 0 && total.3 > 0 && total.4 > 0,
+        "premise: every fact was set at some check (pages complete {}, all complete {}, free exhausted {}, a lease or held release in the meta row {}, the name mirror built {})",
         total.0,
         total.1,
         total.2,
-        total.3
+        total.3,
+        total.4
     );
 }

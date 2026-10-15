@@ -525,6 +525,8 @@ pub(crate) struct Catalog {
     free_put: Stmt,
     name_get: Stmt,
     name_all: Stmt,
+    /// LEAP L4 slice 4: every name with its branch, for the exact name mirror's build.
+    name_pairs: Stmt,
     name_of: Stmt,
     name_put: Stmt,
     name_del: Stmt,
@@ -666,6 +668,7 @@ impl Catalog {
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
             name_all: p("SELECT name FROM branch_name")?,
+            name_pairs: p("SELECT name, id FROM branch_name")?,
             name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
             name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
             name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
@@ -1080,6 +1083,12 @@ impl Catalog {
 
     /// One branch, whole: its row, its current map and its retained versions.
     pub(crate) fn load_branch(&mut self, id: u64) -> Result<Option<CatBranch>> {
+        self.load_branch_named(id, None)
+    }
+
+    /// `load_branch`, with the branch's name already known (`known`: the name a lookup just found
+    /// this id under; names and ids are each unique), so it is not read again (LEAP L4 slice 4).
+    pub(crate) fn load_branch_named(&mut self, id: u64, known: Option<&Arc<str>>) -> Result<Option<CatBranch>> {
         let rows = self.branch_get.rows(&[int(id)], &mut self.counters)?;
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -1134,7 +1143,10 @@ impl Catalog {
                 get(&row, 4)? as u32,
             ));
         }
-        b.name = self.name_of(id)?;
+        b.name = match known {
+            Some(name) => Some(name.to_string()),
+            None => self.name_of(id)?,
+        };
         Ok(Some(b))
     }
 
@@ -1159,6 +1171,32 @@ impl Catalog {
                     )))
                 }
             }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every `(name, id)` row of `branch_name`, read in one scan (LEAP L4 slice 4: the exact name
+    /// mirror's build, off the store mutex); `stop` interrupts it.
+    pub(crate) fn name_pairs(&mut self, stop: &std::sync::atomic::AtomicBool) -> Result<Vec<(Arc<str>, u64)>> {
+        let mut out = Vec::new();
+        self.name_pairs.each_row(&mut self.counters, |row| {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LimboError::Interrupt);
+            }
+            let name = match row.get_value(0) {
+                Value::Text(t) => Arc::<str>::from(t.as_str()),
+                other => {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog: a branch name is not text: {other:?}"
+                    )))
+                }
+            };
+            let Some(id) = row.get_value(1).as_int() else {
+                return Err(LimboError::Corrupt("branch catalog: a branch name's id is not an integer".to_string()));
+            };
+            let id = id as u64;
+            out.push((name, id));
             Ok(())
         })?;
         Ok(out)

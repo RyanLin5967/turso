@@ -2410,6 +2410,15 @@ struct BranchState {
 struct NameIndex {
     map: HashMap<Arc<str>, BranchId>,
     filter: NameFilter,
+    /// LEAP L4 slice 4, a catalog store: an exact mirror of the catalog's `branch_name` table as of
+    /// its last committed checkpoint, built off the mutex after open with the name filter
+    /// (`start_name_filter`) and kept by every install, which applies the names the checkpoint
+    /// wrote and deleted. Under the overlays (`map`, `gone`) it answers a lookup the catalog would,
+    /// asking nothing; `None` until built (the catalog answers). Oracle: `l4_facts_check_for_test`.
+    catalog: Option<HashMap<Arc<str>, BranchId>>,
+    /// The name the last lookup found, with its branch, so that branch's load reads no name (names
+    /// and ids are each unique, and an id's name never changes).
+    last_found: Option<(BranchId, Arc<str>)>,
     fresh: HashMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
@@ -7905,8 +7914,9 @@ impl BranchStore {
                 pending.insert(names.filter.hash(name));
             }
             names.filter.pending = Some(pending);
-            reader
+            (reader, cat.generation)
         };
+        let (reader, scan_generation) = reader;
         let hasher = self.inner.lock().names.filter.hasher.clone();
         #[cfg(test)]
         let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -7923,7 +7933,21 @@ impl BranchStore {
                 let scanned = if fail_scan {
                     Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
                 } else {
-                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                    reader.name_pairs(&stop)
+                };
+                // LEAP L4 slice 4: the exact mirror of `branch_name`, built here off the mutex from
+                // the same scan as the filter's hashes, and installed only if no checkpoint
+                // committed since the scan began (the install would apply its names to a mirror
+                // that predates them; one that committed before the scan read them is applied
+                // twice, which is idempotent).
+                let (scanned, mirror) = match scanned {
+                    Ok(pairs) => {
+                        let hashes: Vec<u64> = pairs.iter().map(|(name, _)| hasher.hash_one(&**name)).collect();
+                        let mirror: HashMap<Arc<str>, BranchId> =
+                            pairs.into_iter().map(|(name, id)| (name, BranchId(id))).collect();
+                        (Ok(hashes), Some(mirror))
+                    }
+                    Err(e) => (Err(e), None),
                 };
                 // The set of the scanned names is built here, off the store mutex: its one table of
                 // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
@@ -7952,6 +7976,11 @@ impl BranchStore {
                         _ => break inner,
                     }
                 };
+                if let Some(mirror) = mirror {
+                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation) {
+                        inner.names.catalog = Some(mirror);
+                    }
+                }
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
@@ -8339,6 +8368,20 @@ impl BranchStore {
                 ));
             }
         }
+        // (5) Slice 4: the name mirror, built and out of a flight, equals `branch_name`.
+        if let (Some(mirror), false) = (inner.names.catalog.as_ref(), cat.flight) {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let rows = cat.catalog.name_pairs(&stop).map_err(|e| format!("name_pairs: {e}"))?;
+            let asked: HashMap<Arc<str>, BranchId> = rows.into_iter().map(|(n, id)| (n, BranchId(id))).collect();
+            if *mirror != asked {
+                return Err(format!(
+                    "the name mirror holds {} names, the catalog {}; first difference: {:?}",
+                    mirror.len(),
+                    asked.len(),
+                    asked.iter().find(|(n, id)| mirror.get(*n) != Some(id)).or_else(|| mirror.iter().find(|(n, id)| asked.get(*n) != Some(id)))
+                ));
+            }
+        }
         // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
         // whether the catalog holds a trunk version, as known, equal their queries.
         if !cat.flight {
@@ -8370,6 +8413,12 @@ impl BranchStore {
             }
         }
         Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted, meta_set))
+    }
+
+    /// Test builds: whether the exact name mirror is built (LEAP L4 slice 4).
+    #[cfg(test)]
+    pub(crate) fn name_mirror_built_for_test(&self) -> bool {
+        self.inner.lock().names.catalog.is_some()
     }
 
     /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
@@ -8894,9 +8943,23 @@ impl StoreInner {
             if self.names.filter.says_absent(name) {
                 return Ok(None);
             }
+            // The catalog's names, mirrored exactly (LEAP L4 slice 4).
+            if let Some(mirror) = self.names.catalog.as_ref().filter(|_| !fe_mutant("l4_probe_always")) {
+                let found = mirror.get(name).copied();
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                return Ok(found);
+            }
         }
         match self.cat.as_mut() {
-            Some(cat) => Ok(cat.catalog.name_get(name)?.map(BranchId)),
+            Some(cat) => {
+                let found = cat.catalog.name_get(name)?.map(BranchId);
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                Ok(found)
+            }
             None => Ok(None),
         }
     }
@@ -8941,7 +9004,14 @@ impl StoreInner {
             let loaded = if cat.removed.contains(&next) {
                 None
             } else {
-                cat.catalog.load_branch(next.0)?
+                // The name a lookup just found this branch under, not read again (LEAP L4 slice 4).
+                let known = self
+                    .names
+                    .last_found
+                    .as_ref()
+                    .filter(|(found, _)| *found == next && !fe_mutant("l4_probe_always"))
+                    .map(|(_, name)| name.clone());
+                cat.catalog.load_branch_named(next.0, known.as_ref())?
             };
             let Some(b) = loaded else {
                 if chain.is_empty() {
@@ -9989,6 +10059,19 @@ impl StoreInner {
         };
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
+        // LEAP L4 slice 4: the mirror takes what the writer did to `branch_name` (its gone names
+        // deleted, then its fresh ones put). Mutant `l4_names_stale` (test builds only): the fresh
+        // names are not put (the oracle's plant).
+        if let Some(mirror) = self.names.catalog.as_mut() {
+            for name in cap.names_gone.keys() {
+                mirror.remove(name);
+            }
+            if !fe_mutant("l4_names_stale") {
+                for (name, id) in &cap.names_fresh {
+                    mirror.insert(name.clone(), *id);
+                }
+            }
+        }
         // The catalog holds the captured names now: drop each entry no release or create since
         // has moved (see `NameIndex`).
         for (name, release) in &cap.names_gone {
