@@ -5332,6 +5332,9 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
+    /// SET LOCAL: the setting is the transaction block's alone (wire review 16 item 18: dropped,
+    /// it acted as a SET).
+    pub is_local: bool,
 }
 
 #[derive(Clone)]
@@ -5430,6 +5433,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
         values,
+        is_local: set_stmt.is_local,
     })
 }
 

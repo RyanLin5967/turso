@@ -41,6 +41,10 @@ struct PgConnectionInner {
     /// A stamp of the last assignment to the search path, unique across connections, 0 before any
     /// ([`PgConnection::search_path_stamp`]).
     search_path_stamp: std::sync::atomic::AtomicU64,
+    /// The statement being prepared runs in a transaction block the client opened (BEGIN), as the
+    /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
+    /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
+    explicit_block: std::sync::atomic::AtomicBool,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -181,6 +185,7 @@ impl PgConnection {
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
+                explicit_block: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -217,6 +222,15 @@ impl PgConnection {
     /// The session's search path as SHOW search_path gives it.
     pub fn shown_search_path(&self) -> String {
         shown_search_path(&self.inner.session_state.lock().unwrap().search_path)
+    }
+
+    /// Whether the statements prepared next run in a transaction block the client opened (true)
+    /// or outside one or in an implicit block (false): the server, which alone tells the two
+    /// kinds of block apart, says so before each statement (see `PgConnectionInner::explicit_block`).
+    pub fn set_explicit_block(&self, explicit: bool) {
+        self.inner
+            .explicit_block
+            .store(explicit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
@@ -984,6 +998,28 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 /// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
+    // A ROLLBACK cannot undo these here: the search path and the engine's foreign_keys outlive the
+    // block whatever ends it, so `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off, and a
+    // rolled-back SET search_path sent later unqualified writes to another schema's table. So
+    // they are refused where PostgreSQL would undo them: in a block the client opened, and as SET
+    // LOCAL (wire review 16 item 18; review 17 folded search_path into it). An implicit block's
+    // SET (`SET search_path TO s; SELECT ..`) acts, as before.
+    if matches!(name.as_str(), "search_path" | "foreign_keys") {
+        if set_stmt.is_local {
+            return Err(LimboError::ParseError(format!(
+                "SET LOCAL {name} is not supported: this server cannot scope it to the block"
+            )));
+        }
+        if pg_conn
+            .explicit_block
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(LimboError::ParseError(format!(
+                "SET {name} is not supported inside a transaction block: a ROLLBACK could not \
+                 undo it here; set it before BEGIN"
+            )));
+        }
+    }
     if name == "search_path" {
         let path = set_stmt
             .values
