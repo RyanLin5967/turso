@@ -1178,6 +1178,29 @@ mod tests {
         }
     }
 
+    /// The crash batch, item 8 (lead, 2026-10-15; the wire's 4 reds at artie 512c7c17bb wait on it):
+    /// FLOAT4 and FLOAT8 are built-in types of a STRICT table, base real with REAL affinity, as
+    /// boolean and uuid are; `CREATE TABLE fw(r FLOAT4) STRICT` was refused "unknown datatype".
+    #[test]
+    fn float4_and_float8_are_builtin_types_of_a_strict_table() {
+        let conn = open();
+        conn.execute("CREATE TABLE fw(r FLOAT4, d float8) STRICT").unwrap();
+        conn.execute("INSERT INTO fw VALUES (1.5, 2.25)").unwrap();
+        conn.execute("INSERT INTO fw VALUES (3, 4)").unwrap();
+        let rows = conn
+            .prepare("SELECT r, d, typeof(r), typeof(d) FROM fw ORDER BY r")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_f64(1.5), Value::from_f64(2.25), Value::build_text("real"), Value::build_text("real")],
+                vec![Value::from_f64(3.0), Value::from_f64(4.0), Value::build_text("real"), Value::build_text("real")],
+            ]
+        );
+    }
+
     /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
     /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
     /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)

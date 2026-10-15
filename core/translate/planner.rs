@@ -1881,6 +1881,9 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
+        // Each nested view is planned by a recursive call; with too little stack left for one more,
+        // refused rather than overflowing (the crash batch, 2026-10-15; `stack::NestGuard`).
+        let _depth = crate::stack::NestGuard::enter("views")?;
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
         let mut view_select = view.select_stmt.clone();

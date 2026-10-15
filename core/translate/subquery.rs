@@ -1594,6 +1594,8 @@ pub fn emit_from_clause_subquery(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
+    // Emitted recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
+    let _nest = crate::stack::NestGuard::enter("subqueries")?;
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
 
