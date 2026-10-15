@@ -376,6 +376,9 @@ impl pgwire::api::cancel::CancelHandler for CancelSessions {
 /// 50 x 100 ms).
 const IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often a statement's in-use wait looks at its cancel and statement_timeout.
+const IN_USE_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchUse {
     Held,
@@ -411,34 +414,50 @@ impl Shared {
     }
 
     /// The map once `name` is in none of `states` there, or at the wait's end: what a closing session
-    /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
+    /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4). The wait
+    /// is its session's statement's: with `interrupts`, a cancel or statement_timeout ends it with
+    /// 57014, checked every IN_USE_SLICE (Claude C37 M1: both were ignored for the whole wait, the
+    /// class of ultrareview finding 9).
+    #[allow(clippy::type_complexity)]
     fn wait_while<'a>(
         &'a self,
         mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
         name: &str,
         states: &[BranchUse],
-    ) -> MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        interrupts: Option<&Interrupts>,
+    ) -> SqlResult<MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>>
+    {
         let held = |uses: &std::collections::HashMap<compact_str::CompactString, BranchUse>| {
             uses.get(name).is_some_and(|u| states.contains(u))
         };
         if !held(&uses) {
-            return uses;
+            return Ok(uses);
         }
+        let stopped = || interrupts.is_some_and(Interrupts::should_stop);
         self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + self.in_use_wait;
+        let mut interrupted = false;
         while held(&uses) {
+            if stopped() {
+                interrupted = true;
+                break;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 break;
             }
+            let slice = if interrupts.is_some() { left.min(IN_USE_SLICE) } else { left };
             uses = self
                 .in_use_freed
-                .wait_timeout(uses, left)
+                .wait_timeout(uses, slice)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
         self.in_use_waiters.fetch_sub(1, Ordering::SeqCst);
-        uses
+        if interrupted {
+            return Err(engine_info(&LimboError::Interrupt));
+        }
+        Ok(uses)
     }
 
     /// Claim `name` for a session about to connect to it. One session per branch: a branch another
@@ -447,7 +466,13 @@ impl Shared {
     /// whenever the closed session's thread had not yet released the branch (wire review 6 item
     /// 5); only a refusal pays the wait (lead ruling).
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
+        self.claim_for(name, severity, None)
+    }
+
+    /// [`Shared::claim`] for a statement: its cancel or statement_timeout ends the wait.
+    fn claim_for(&self, name: &str, severity: &str, interrupts: Option<&Interrupts>) -> SqlResult<()> {
+        let mut uses =
+            self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
             let mut e = in_use_error(name, *u);
             e.severity = severity.to_string();
@@ -469,7 +494,13 @@ impl Shared {
     /// Mark `name` as being deleted. A session on it is waited for (up to `in_use_wait`: one that is
     /// closing releases it within that), then refused with 55006.
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
-        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
+        self.begin_delete_for(name, None)
+    }
+
+    /// [`Shared::begin_delete`] for a statement: its cancel or statement_timeout ends the wait.
+    fn begin_delete_for(&self, name: &str, interrupts: Option<&Interrupts>) -> SqlResult<()> {
+        let mut uses =
+            self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
             return Err(in_use_error(name, *u));
         }
@@ -669,15 +700,36 @@ fn run_session(
     _slot: SessionSlot,
 ) {
     // A handle on the socket for the server's shutdown, which shuts it so a blocked read returns.
-    let registered = socket
+    // Given back by a guard, so a session that panics (an unwinding build) does not leak the dup
+    // (Claude C37 M3).
+    let _registered = socket
         .try_clone()
-        .map(|handle| shared.sessions.register(handle));
+        .ok()
+        .map(|handle| Registered::new(&shared.sessions, handle));
     let session = Arc::new(Session::new(shared.clone()));
     if let Err(e) = futures::executor::block_on(serve_session(socket, session)) {
         error!("Error processing connection from {}: {}", addr, e);
     }
-    if let Ok(id) = registered {
-        shared.sessions.deregister(id);
+}
+
+/// A session's socket held in [`SessionSockets`] until the guard drops, however the session ends.
+struct Registered<'a> {
+    sockets: &'a SessionSockets,
+    id: u64,
+}
+
+impl<'a> Registered<'a> {
+    fn new(sockets: &'a SessionSockets, socket: std::net::TcpStream) -> Self {
+        Self {
+            id: sockets.register(socket),
+            sockets,
+        }
+    }
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.sockets.deregister(self.id);
     }
 }
 
@@ -2348,7 +2400,7 @@ impl Session {
                     // Dropping the branch's connection closes the branch for connections.
                     st.branch.take()
                 } else {
-                    self.shared.claim(&name, "ERROR")?;
+                    self.shared.claim_for(&name, "ERROR", Some(&self.interrupts))?;
                     let opened = match self.waiting(|| self.shared.db.connect_named(&name)) {
                         Ok(opened) => opened,
                         Err(e) => {
@@ -2377,7 +2429,7 @@ impl Session {
                 ),
             )),
             _ => {
-                self.shared.begin_delete(&name)?;
+                self.shared.begin_delete_for(&name, Some(&self.interrupts))?;
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
@@ -5682,6 +5734,23 @@ mod tests {
         check("create", wire("SELECT turso_branch_create('c')"), engine_create);
         check("delete", wire("SELECT turso_branch_delete('c')"), engine_delete);
         assert!(over.is_empty(), "over the budget: {over:#?}");
+    }
+
+    /// A session's registered socket dup is given back however the session ends, a panic in an
+    /// unwinding build included (Claude C37 M3: the deregistration ran only on a normal return).
+    #[test]
+    fn a_panicking_session_gives_its_registered_socket_back() {
+        let sockets = SessionSockets::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _registered = Registered::new(&sockets, socket);
+            assert_eq!(sockets.open.lock().unwrap().len(), 1, "premise: registered");
+            panic!("the session panics");
+        }));
+        assert!(unwound.is_err(), "premise: the session panicked");
+        assert_eq!(sockets.open.lock().unwrap().len(), 0, "the dup leaked");
     }
 
     /// The startup deadline bounds a session's WRITES as well as its reads (C37 H1): a client that
