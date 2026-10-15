@@ -6309,6 +6309,14 @@ impl BranchStore {
                 stamp_due = true;
             }
         }
+        // The failpoint `BarrierFlightFails` (engine review 21 MED 14), armed only when this barrier
+        // will lead or ride a flight, so it is spent by exactly that flight.
+        if *failpoint == Some(BranchFailpoint::BarrierFlightFails)
+            && (stamp_due || self.group.durable(class) < required)
+        {
+            *failpoint = None;
+            journal.fail_next_write();
+        }
         if unsynced {
             journal.raise_pending_class(class);
         }

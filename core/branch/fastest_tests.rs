@@ -4617,9 +4617,13 @@ fn a_fuzzy_install_marks_its_commit_in_the_class_it_synced_in() {
 /// store, unraised at the capture, releases x (its Release at `r`); the fuzzy checkpoint is held
 /// after its catalog commit (synced in Off); a childless FULL trunk commit then leads the flight
 /// its barrier needs, raising the log (`take_flight` notes the class before the write) and failing
-/// (`GroupFlightFails`), which fail-stops the store. The install must mark its commit in the class
+/// (`BarrierFlightFails`), which fail-stops the store. The install must mark its commit in the class
 /// it synced in: durable(Fsync) stays below `r`, and the next childless FULL trunk commit, whose
 /// barrier covers `r`, leads a flight and is refused. Mutant `fuzzy_committed_class_at_install`.
+/// FLAGGED TEST EDIT (engine review 21 MED 14, a premise repair): it armed `GroupFlightFails`,
+/// which only buffer_records consumes, so the childless commit's barrier flight never failed and
+/// the "barrier's raised flight failed the commit" premise panicked at every sha (measured on
+/// Linux at 2da787db3); the new failpoint is consumed by that barrier's own flight.
 #[test]
 fn a_fuzzy_install_marks_its_commit_in_its_capture_class_after_a_failed_raised_flight() {
     let _s = serial();
@@ -4637,7 +4641,7 @@ fn a_fuzzy_install_marks_its_commit_in_its_capture_class_after_a_failed_raised_f
         db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED
     });
     trunk.execute("PRAGMA synchronous = FULL").unwrap();
-    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    db.branch_failpoint(Some(BranchFailpoint::BarrierFlightFails));
     let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
     assert!(failed.is_err(), "premise: the barrier's raised flight failed the commit");
     assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the failed flight's take raised the log");

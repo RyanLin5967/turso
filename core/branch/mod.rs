@@ -510,6 +510,10 @@ pub enum BranchFailpoint {
     /// The next held-free upgrade's sync (`BranchStore::sync_upgrade`) fails as an I/O error would
     /// (engine review 21 MED 4: nothing could fail it before).
     UpgradeSyncFails,
+    /// The next flight a trunk commit's durability barrier leads fails as an I/O error would
+    /// (engine review 21 MED 14: `GroupFlightFails` is consumed only where records are buffered,
+    /// which a childless trunk commit's barrier never reaches).
+    BarrierFlightFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
