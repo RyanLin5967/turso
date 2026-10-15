@@ -1220,8 +1220,10 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
@@ -1422,19 +1424,34 @@ fn wire_bitwise_ops_report_int4() {
     });
 }
 
-/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; tursopg's wire layer reports INT4 here. A future change
-/// could map these to BOOL OID, but for now stable + assertable.
+/// Comparison and logical operators return bool (16), as PostgreSQL 18.6 announces them
+/// (recorded, artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out). FLAGGED
+/// ORACLE-BACKED SPEC CHANGE (lead ruling, DECISIONS 9d8c1c38ef): this test pinned int4, the
+/// engine's integer 0/1, and was named `..._report_int4`; the logical rows are rewritten with
+/// PostgreSQL-valid boolean operands (PostgreSQL refuses `1 AND 0`). This server's acceptance of
+/// integer operands is pinned by wire_logical_operators_accept_integer_operands.
 #[test]
-fn wire_comparison_and_logical_report_int4() {
+fn wire_comparison_and_logical_report_bool() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1=1 AND 0=1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1=1 OR 0=1"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
-        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
+    });
+}
+
+/// A logical operator over integer operands (`1 AND 0`, `NOT 1`) is accepted here, the engine
+/// reading 0 as false and any other integer as true, and answers bool; PostgreSQL refuses them
+/// (42804, an argument of AND must be boolean). A recorded divergence (COMPAT's boolean row), pinned
+/// so a change to it is seen (lead ruling, DECISIONS 9d8c1c38ef).
+#[test]
+fn wire_logical_operators_accept_integer_operands() {
+    with_pg_client(|c| {
+        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_BOOL]);
     });
 }
 
@@ -1458,7 +1475,9 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (DECISIONS 9d8c1c38ef): NOT is bool in PostgreSQL;
+        // the row is rewritten with a boolean operand (`NOT 1` is pinned elsewhere).
+        assert_eq!(c.query_column_oids("SELECT NOT (1=1)"), vec![OID_BOOL]);
     });
 }
 
@@ -1475,9 +1494,11 @@ fn wire_cast_reports_target_type() {
             c.query_column_oids("SELECT CAST(42 AS TEXT)"),
             vec![OID_TEXT]
         );
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (DECISIONS 9d8c1c38ef): PostgreSQL's real is float4
+        // (700, recorded pg18-types.out); this pinned float8.
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
-            vec![OID_FLOAT8]
+            vec![OID_FLOAT4]
         );
     });
 }
