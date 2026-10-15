@@ -2289,6 +2289,49 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// A pg_dump -s header's settings each answer SET: those PostgreSQL 17 and 18 dumps write, one by
+/// one (the list is recalled from pg_dump's output, not recorded here; the owed run replays the
+/// BranchBench dump through psql). xmloption, transaction_timeout, default_tablespace and
+/// default_table_access_method answered 42704 since the SET allowlist (wire review 16 item 17).
+/// Each is accepted only at the value that changes nothing here, 0A000 at another; a name
+/// PostgreSQL knows that this server does not act on is 0A000 for SET and SHOW alike, not 42704
+/// "unrecognized" (the name list is PostgreSQL 18.6's settings table), and a name PostgreSQL does
+/// not know stays 42704.
+#[test]
+fn a_dump_headers_settings_are_accepted() {
+    let dir = Scratch::new("dumpheader");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        "SET idle_in_transaction_session_timeout = 0",
+        "SET transaction_timeout = 0",
+        "SET client_encoding = 'UTF8'",
+        "SET standard_conforming_strings = on",
+        "SET check_function_bodies = false",
+        "SET xmloption = content",
+        "SET client_min_messages = warning",
+        "SET row_security = off",
+        "SET default_tablespace = ''",
+        "SET default_table_access_method = heap",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    for (sql, code) in [
+        ("SET xmloption = document", "0A000"),
+        ("SET transaction_timeout = '5s'", "0A000"),
+        ("SET default_tablespace = 'fast'", "0A000"),
+        ("SET default_table_access_method = columnar", "0A000"),
+        ("SET geqo_threshold = 12", "0A000"),
+        ("SHOW geqo_threshold", "0A000"),
+        ("SET no_such_parameter = 1", "42704"),
+        ("SHOW no_such_parameter", "42704"),
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, code, "{sql}");
+    }
+}
+
 /// A client's value never chooses its error's SQLSTATE: a SET refused for its value is 0A000
 /// whatever the value says, `'is ambiguous'` and `'specified more than once'` included. The
 /// mapping matched those words anywhere in the message, which embeds the value, so `SET
