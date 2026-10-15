@@ -6591,13 +6591,14 @@ pub struct PgBranchCall {
 }
 
 /// The branch functions the server answers, their names as [`PgBranchCall::function`] borrows them.
-pub const BRANCH_FUNCTIONS: [&str; 6] = [
+pub const BRANCH_FUNCTIONS: [&str; 7] = [
     "turso_branch_create",
     "turso_branch_switch",
     "turso_branch_delete",
     "turso_branch_current",
     "turso_branch_stats",
     "turso_branch_allocations",
+    "turso_branch_work",
 ];
 
 /// `name` lower-cased, borrowed from [`BRANCH_FUNCTIONS`] when it is one of them.

@@ -2111,13 +2111,22 @@ impl Session {
             let n = counters::allocations().map(|n| n as i64);
             return one_row(f, Type::INT8, format, |e| e.encode_field(&n));
         }
+        // The work budget's one reading (budget.py work): unix system calls, instructions and
+        // allocations read together, so a window holds one reading statement, as its floor does
+        // (read as two calls, the allocations' call fell inside the next window's system calls).
+        if f == "turso_branch_work" {
+            arity(call, 0)?;
+            result_format(format, 0, WORK_COLUMNS.len())?;
+            bad_code(&*st)?;
+            return work_row(format);
+        }
         if !matches!(
             f,
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
                 "42883",
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats() and turso_branch_allocations()"),
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations() and turso_branch_work()"),
             ));
         }
         arity(call, 1)?;
@@ -2900,6 +2909,36 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[at..]
 }
 
+const WORK_COLUMNS: [&str; 3] = ["unix_syscalls", "instructions", "allocations"];
+
+/// turso_branch_work(): this process's system calls and instructions (counters::process_counters)
+/// and allocations (counters::allocations, NULL without the alloc-count feature), read at once.
+fn work_row(format: &Format) -> SqlResult<Response> {
+    let fields = WORK_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            Ok(FieldInfo::new(
+                name.to_string(),
+                None,
+                None,
+                Type::INT8,
+                result_format(format, i, WORK_COLUMNS.len())?,
+            ))
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    let header = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(header.clone());
+    let counters = counters::process_counters();
+    let allocations = counters::allocations();
+    let row = encoder
+        .encode_field(&counters.map(|c| c.unix_syscalls as i64))
+        .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
+        .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
+        .and_then(|()| encoder.finish());
+    Ok(Response::Query(QueryResponse::new(header, stream::iter(vec![row]))))
+}
+
 const STATS_COLUMNS: [&str; 10] = [
     "unix_syscalls",
     "mach_syscalls",
@@ -3014,6 +3053,21 @@ fn branch_call_types(call: &PgBranchCall) -> StatementTypes {
 fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<FieldInfo>> {
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
+    }
+    if call.function == "turso_branch_work" {
+        return WORK_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Ok(FieldInfo::new(
+                    name.to_string(),
+                    None,
+                    None,
+                    Type::INT8,
+                    result_format(format, i, WORK_COLUMNS.len())?,
+                ))
+            })
+            .collect();
     }
     let pg_type = if matches!(
         &*call.function,
