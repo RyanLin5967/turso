@@ -662,8 +662,29 @@ def summarize(out, sha, dry, manifest):
                                     "every ours run is refused (routing ruling 05:16:51Z)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
+    # the lead's --dry-block ruling (2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT (mode.txt stamp,
+    # OUT/STAMP). The only stamp there is; a DRY-VIRT stamp on a run that is not a dry run is a contradiction
+    stamp = mode.get("stamp") or None
+    mode_refusals = []
+    if stamp not in (None, "DRY-VIRT"):
+        mode_refusals.append(f"mode.txt names the stamp {stamp!r}; DRY-VIRT is the only stamp a run carries")
+    if stamp == "DRY-VIRT" and (dry != "1" or mode.get("dry") != "1"):
+        mode_refusals.append(f"a DRY-VIRT run says dry={mode.get('dry')!r} (package dry={dry!r}): a run on a virtual "
+                             "disk is a dry run, never a real one")
+    summary["stamp"], summary["mode_refusals"] = stamp, mode_refusals
+    # credit: every reason this package's numbers cannot be credited, so one field answers (False for any dry run)
+    credit = []
+    if dry == "1":
+        credit.append("a dry run is never credited")
+    if stamp == "DRY-VIRT":
+        credit.append("DRY-VIRT: a dry run on a VM's virtual disk, behind a hypervisor whose flush path is unknown")
+    for k in ("warmup_creditable", "sweeper_creditable", "counters_creditable"):
+        if summary.get(k) is not True:
+            credit.append(f"{k} is {summary.get(k)!r}")
+    summary["credit_refusals"], summary["creditable"] = credit, not credit
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
-        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet
+        and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet \
+        and not mode_refusals
     summary["ok"] = ok  # the one verdict the workflow reads (fourth lane review LOW 23)
     return summary, ok
 
@@ -847,7 +868,8 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
+             stamp=None, mode_dry="1"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -859,7 +881,8 @@ def self_test():
             rows.append(f"xfs\t{c}\t{system}\t1\t1\t{rc_}\t{v_}")
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + "\n".join(rows) + "\n")
         w(f"{out}/fslist.txt", fslist + "\n")
-        w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
+        w(f"{out}/mode.txt", f"dry={mode_dry}\nblock={block}\nplant=\nplp={plp}\n"
+          + (f"stamp={stamp}\n" if stamp is not None else ""))
         if rule is not None:
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
@@ -1147,6 +1170,20 @@ def self_test():
          lambda s: any("tm0_realtime_s" in x for x in s["parity_refusals"])),
         ("measured span: a measured span outside the wrapper's process window fails", {"ours_sweeper": "outside"},
          False, lambda s: any("outside" in x for x in s["parity_refusals"])),
+        # the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT, and
+        # summarize refuses it for credit; every dry run is uncreditable, and a DRY-VIRT stamp on a run that says it
+        # is real is a contradiction that fails the package
+        ("dry-block: a DRY-VIRT dry package passes as a dry run and is refused for credit, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT"}, True, lambda s: s.get("stamp") == "DRY-VIRT" and s.get("creditable") is False
+         and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: an ordinary dry package is refused for credit as a dry run", {}, True,
+         lambda s: s.get("creditable") is False and any("dry run" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: a DRY-VIRT stamp on a package whose mode says dry=0 fails it, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT", "mode_dry": "0"}, False,
+         lambda s: any("DRY-VIRT" in x for x in s.get("failed_stages", []) + s.get("parity_refusals", [])
+                       + s.get("fixture_refusals", []) + s.get("mode_refusals", []))),
+        ("dry-block: a stamp other than DRY-VIRT (an unknown label) fails the package", {"stamp": "DRY-VM"}, False,
+         lambda s: any("DRY-VM" in x for x in s.get("mode_refusals", []))),
         ("MED 12: ours with no timed.json fails, naming the sweeper", {"ours_sweeper": None}, False,
          lambda s: any("sweeper" in x and "timed.json" in x for x in s["parity_refusals"])),
         ("MED 12: ours with no timed.tracer.tsv fails, naming it", {"ours_sweeper": "notracer"}, False,

@@ -131,7 +131,18 @@ dev_unmoved() { # dev_unmoved PATH REAL
 t3_first_line() { [ -r "$1" ] && awk 'NR == 1 { gsub(/^[ \t]+|[ \t]+$/, ""); print }' "$1"; }
 
 dev_identity() { # dev_identity SYS DEV
-  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f
+  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f seq
+  # a DRY-VIRT run's virtual disk (t3run sets T3_IDENTITY_MODE=virtio in its --dry-block branch alone, and drops any
+  # inherited value first): virtio-blk exposes no wwid, model, serial or firmware, so it is identified by the diskseq
+  # the kernel gives each disk it attaches and does not reuse while it runs, beside its MAJ:MIN and the virtio vendor
+  if [ "${T3_IDENTITY_MODE:-}" = virtio ] && [[ $(t3_first_line "$d/modalias") == virtio:d00000002* ]]; then
+    seq=$(t3_first_line "$b/diskseq"); dev=$(t3_first_line "$b/dev")
+    [[ $seq =~ ^[0-9]+$ ]] || { echo "REFUSED: cannot read $2's diskseq under $1/block/$2 (a virtio disk's identity)" >&2; return 2; }
+    [ -n "$dev" ] || { echo "REFUSED: cannot read $2's dev under $1/block/$2" >&2; return 2; }
+    printf 'wwid=virtio-diskseq:%s\ndev=%s\nmodel=virtio-blk %s\nserial=diskseq-%s\nfirmware=virtio\n' "$seq" "$dev" \
+      "$(t3_first_line "$d/vendor")" "$seq"
+    return 0
+  fi
   wwid=$(t3_first_line "$b/wwid"); [ -n "$wwid" ] || wwid=$(t3_first_line "$d/wwid")
   dev=$(t3_first_line "$b/dev")
   model=$(t3_first_line "$d/model")
@@ -232,7 +243,13 @@ _device_make() { # _device_make PATH REAL SYS DEV ID PLP REG FS UUID MNT MADE
   t3_devguard "$real" || { echo "REFUSED: devguard refuses $real before mkfs"; return 2; }
   # after devguard, so whatever happened while it ran is seen before mkfs (review 6 LOW 4)
   dev_unchanged "$path" "$real" "$sys" "$dev" "$id" || return 2
-  registered_ok "$sys" "$reg" "$dev" "$plp" "$fs" || return 2
+  # REG = DRY-VIRT: a --dry-block run on a VM's virtual disk (never credited: stamped DRY-VIRT, which summarize refuses
+  # for credit); only the A17 registration is skipped, every other step and refusal stands
+  if [ "$reg" = DRY-VIRT ]; then
+    echo "DRY-VIRT: the A17 registration is not asked of a dry run on a virtual disk ($dev, $fs)"
+  else
+    registered_ok "$sys" "$reg" "$dev" "$plp" "$fs" || return 2
+  fi
   printf '%s %s\n' "$fs" "$uuid" > "$made" || { echo "cannot record what this block makes in $made"; return 1; }
   t3_mkfs "$fs" "$real" "$uuid" || { echo "mkfs.$fs failed on $real"; return 1; }
   fs_probe_is "$real" "$fs" "$uuid" || return 2
@@ -244,6 +261,24 @@ _device_make() { # _device_make PATH REAL SYS DEV ID PLP REG FS UUID MNT MADE
 }
 
 device_make() { t3_pinned "$2" _device_make "$@"; }
+
+virt_ok() { # virt_ok MODE VIRT: MODE real refuses any virtualization (gate-6 review 8: what a flush reaches behind a
+  # hypervisor is unknown, so a T3 box must be bare metal); MODE dryblock allows it (a --dry-block run on a VM's
+  # virtual disk, stamped DRY-VIRT). Any other mode refuses. Returns 2 on a refusal
+  case $1 in
+    real) [ "$2" = none ] || { echo "REFUSED: systemd-detect-virt says '${2:-unknown}': a T3 box must be bare metal"; return 2; } ;;
+    dryblock) return 0 ;;
+    *) echo "REFUSED: virt_ok mode '$1' is neither real nor dryblock"; return 2 ;;
+  esac
+}
+
+HOST_MIN_FREE_GB=35  # the lead's --dry-block ruling: no VM dry run builds while the Mac host has less free
+host_room_ok() { # host_room_ok FREE_KB [MIN_GB]: the host has at least MIN_GB (35) GiB free. Returns 2 otherwise
+  local free=$1 min=${2:-$HOST_MIN_FREE_GB}
+  [[ $free =~ ^[0-9]+$ ]] || { echo "REFUSED: the host's free space reads '$free', not a number of KiB"; return 2; }
+  [ "$free" -ge $((min * 1024 * 1024)) ] ||
+    { echo "REFUSED: the host has $((free / 1024 / 1024)) GiB free, under the $min GiB a VM dry run needs"; return 2; }
+}
 
 _device_wipe() { # _device_wipe PATH REAL SYS DEV ID FS UUID
   dev_unchanged "$1" "$2" "$3" "$4" "$5" || return 2

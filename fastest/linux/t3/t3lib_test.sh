@@ -113,6 +113,25 @@ echo "ST4000NM" > "$T/sys/block/sdc/device/model"; echo "SN04" > "$T/sys/block/s
 printf '\000\200\000\010ZC10XYZ9' > "$T/sys/block/sdc/device/vpd_pg80"
 check "MED 3: a SCSI disk's identity takes the device wwid, the printable vpd_pg80 serial and rev" \
   '[ "$(dev_identity "$T/sys" sdc)" = "wwid=naa.5000c500${NL}dev=8:32${NL}model=ST4000NM${NL}serial=ZC10XYZ9${NL}firmware=SN04" ]'
+# --dry-block on a VM (its first probe, 2026-10-15, lima vz): a virtio-blk disk has no wwid, model, serial or firmware
+# in sysfs (block/serial is empty), so dev_identity refuses it. Under T3_IDENTITY_MODE=virtio, which t3run sets only
+# for a DRY-VIRT run, a virtio-blk disk (device/modalias virtio:d00000002...) is identified by its diskseq, which the
+# kernel gives each disk it attaches and never reuses while it runs, plus its MAJ:MIN and the virtio vendor
+mkdir -p "$T/sys/block/vdb/device"; echo 253:16 > "$T/sys/block/vdb/dev"; echo 10 > "$T/sys/block/vdb/diskseq"
+: > "$T/sys/block/vdb/serial"; echo 0x1af4 > "$T/sys/block/vdb/device/vendor"
+echo "virtio:d00000002v00001AF4" > "$T/sys/block/vdb/device/modalias"
+check "dry-block: a virtio-blk disk with no wwid still refuses by default (rc 2, naming wwid): a real run is unchanged" \
+  'refuses2 dev_identity "$T/sys" vdb && grep -q wwid "$T/out.txt"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk is its diskseq, MAJ:MIN and vendor" \
+  '[ "$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb)" = "wwid=virtio-diskseq:10${NL}dev=253:16${NL}model=virtio-blk 0x1af4${NL}serial=diskseq-10${NL}firmware=virtio" ]'
+mkdir -p "$T/sys/block/sdz/device"; echo 8:96 > "$T/sys/block/sdz/dev"; echo 11 > "$T/sys/block/sdz/diskseq"
+check "dry-block: under T3_IDENTITY_MODE=virtio a disk that is not virtio-blk still refuses (rc 2)" \
+  'refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" sdz"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk with no diskseq refuses (rc 2)" \
+  'mv "$T/sys/block/vdb/diskseq" "$T/vdb-diskseq"; refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" vdb"; r=$?; mv "$T/vdb-diskseq" "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
+check "dry-block: a re-attached virtio disk (diskseq 10 -> 12) is not the recorded one: dev_unchanged's identity check refuses" \
+  'T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb > "$T/idv.txt" && echo 12 > "$T/sys/block/vdb/diskseq" &&
+   now=$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb) && [ "$now" != "$(cat "$T/idv.txt")" ]; r=$?; echo 10 > "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
 ident nvme6n1 "" 259:6 PM9A3 S2 GDC5
 check "MED 3: an empty wwid refuses (rc 2)" 'refuses2 dev_identity "$T/sys" nvme6n1 && grep -q wwid "$T/out.txt"'
 ident nvme7n1 eui.0007 259:7 PM9A3 "" GDC5
@@ -189,6 +208,30 @@ FAKE_MKFS_UUID=u-other
 check "LOW 6: a mkfs that did not take the given UUID refuses before mount, and the made record names what was asked" \
   'refuses2 dm && grep -q UUID "$T/out.txt" && [ "$(steps)" = "$P$G$M$U" ] && [ "$(cat "$T/made.txt")" = "xfs U-1" ]'
 FAKE_MKFS_UUID=""
+# the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk passes REG = DRY-VIRT, which
+# skips the A17 registration (a dry run is never credited; t3run passes it only under --dry-block, and the stamp is
+# refused for credit by summarize); every other step and refusal of device_make is unchanged
+echo "write back" > "$T/sys/block/nvme5n1/queue/write_cache"
+dmv() { : > "$HL"; rm -f "$T/made.txt"; FAKE_TYPE="" FAKE_UUID="" FAKE_MOUNTED=""
+        device_make "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" no DRY-VIRT xfs U-1 /mnt/t3-xfs "$T/made.txt"; }
+check "dry-block: device_make with REG DRY-VIRT on a write-back drive with nothing registered makes and mounts it, in order" \
+  'dmv && [ "$(steps)" = "$P$G${M}mount xfs $REAL5 /mnt/t3-xfs,$U" ] && grep -q "DRY-VIRT" "$T/out.txt"'
+ident nvme5n1 eui.0099 259:5 PM9A3 S1 GDC5
+check "dry-block: DRY-VIRT keeps the identity refusal (a changed wwid refuses, rc 2, no mkfs)" \
+  'refuses2 dmv && grep -q wwid "$T/out.txt" && [ "$(steps)" = "$P$G$U" ]'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+echo "write through" > "$T/sys/block/nvme5n1/queue/write_cache"
+# virt_ok MODE VIRT: a real run refuses any virtualization (gate-6 review 8, unchanged); --dry-block allows it
+check "dry-block: virt_ok real none passes" 'virt_ok real none'
+for v in apple kvm qemu microsoft vmware ""; do
+  check "dry-block: virt_ok real '$v' refuses (rc 2), naming bare metal" "refuses2 virt_ok real '$v' && grep -q 'bare metal' \"\$T/out.txt\""
+done
+check "dry-block: virt_ok dryblock apple passes (the VM is the point)" 'virt_ok dryblock apple'
+check "dry-block: virt_ok with an unknown mode refuses (rc 2)" 'refuses2 virt_ok frobnicate none'
+# host_room_ok FREE_KB [MIN_GB]: the Mac host must have at least 35 GiB free before a VM dry run builds
+check "dry-block: host_room_ok 35 GiB free passes" 'host_room_ok $((35 * 1024 * 1024))'
+check "dry-block: host_room_ok 1 KiB under 35 GiB refuses (rc 2), naming 35" 'refuses2 host_room_ok $((35 * 1024 * 1024 - 1)) && grep -q 35 "$T/out.txt"'
+check "dry-block: host_room_ok on a reading that is no number refuses (rc 2)" 'refuses2 host_room_ok "n/a"'
 FAKE_MKFS="ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5"
 check "MED 1: the drive changes between mkfs and mount: refuses (rc 2), no mount" 'refuses2 dm && [ "$(steps)" = "$P$G$M$U" ]'
 FAKE_MKFS=""; ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
