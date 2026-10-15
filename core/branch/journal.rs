@@ -1182,6 +1182,11 @@ pub(crate) struct Journal {
     /// (`Journal::shared_log`): made once, dropped when `file` is replaced, so taking a flight
     /// under the store mutex issues no dup(2) (budget create_issues_no_syscall_under_the_store_mutex).
     shared: Option<Arc<File>>,
+    /// A flight's frame buffer, handed back by the flight once written (`Flight`'s drop) and
+    /// taken as the next `pending` by `take_flight`, so buffering a record and taking a flight
+    /// allocate nothing under the store mutex in steady state (budget
+    /// create_allocates_at_most_once_under_the_store_mutex).
+    recycled: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
     /// run off the store mutex (`prepare_cut`, through its `CutSource`).
     fail_next_replacement_sync: AtomicBool,
@@ -1454,6 +1459,7 @@ impl Journal {
             fail_next_take: false,
             fail_next_confirm: false,
             shared: None,
+            recycled: Arc::new(std::sync::Mutex::new(None)),
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
@@ -1659,6 +1665,7 @@ impl Journal {
             fail_next_take: false,
             fail_next_confirm: false,
             shared: None,
+            recycled: Arc::new(std::sync::Mutex::new(None)),
             fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
@@ -2459,12 +2466,29 @@ impl Journal {
     /// Queue a record. It reaches the file only through [`Journal::flush`].
     pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
         self.check_live()?;
-        let mut payload = Vec::with_capacity(32);
-        record.encode(&mut payload);
-        put_u32(&mut self.pending, payload.len() as u32);
-        put_u32(&mut self.pending, crc32c::crc32c(&payload));
-        self.pending.extend_from_slice(&payload);
-        self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
+        // Encoded in place after its frame header, which is filled in once the payload's length and
+        // checksum are known; room for the flight's end frame is kept, so `take_flight` need not
+        // reallocate. Mutant `record_encoded_aside` (test builds only): through a Vec of its own,
+        // as before.
+        let at = self.pending.len();
+        if super::store::fe_mutant("record_encoded_aside") {
+            let mut payload = Vec::with_capacity(32);
+            record.encode(&mut payload);
+            put_u32(&mut self.pending, payload.len() as u32);
+            put_u32(&mut self.pending, crc32c::crc32c(&payload));
+            self.pending.extend_from_slice(&payload);
+        } else {
+            self.pending.extend_from_slice(&[0u8; FRAME_HEADER_LEN]);
+            record.encode(&mut self.pending);
+            let body = at + FRAME_HEADER_LEN;
+            let len = (self.pending.len() - body) as u32;
+            let crc = crc32c::crc32c(&self.pending[body..]);
+            self.pending[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            self.pending[at + 4..body].copy_from_slice(&crc.to_le_bytes());
+            self.pending.reserve(END_FRAME_LEN);
+        }
+        let payload_len = self.pending.len() - at - FRAME_HEADER_LEN;
+        self.lsn += (FRAME_HEADER_LEN + payload_len) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
             Record::Commit { pages, .. } => self.pending_slots.extend(pages.iter().map(|p| p.1)),
@@ -2638,6 +2662,7 @@ impl Journal {
         if self.pending.is_empty() && !upgrade {
             return Ok(Flight {
                 log: None,
+                recycle: None,
                 arena: None,
                 bytes: Vec::new(),
                 at: self.len,
@@ -2713,7 +2738,12 @@ impl Journal {
         };
         self.note_class(class);
         let header = self.take_header_patch();
-        let mut bytes = std::mem::take(&mut self.pending);
+        let next = if super::store::fe_mutant("flight_buffer_not_recycled") {
+            None
+        } else {
+            self.recycled.lock().ok().and_then(|mut slot| slot.take())
+        };
+        let mut bytes = std::mem::replace(&mut self.pending, next.unwrap_or_default());
         let names_slots = !self.pending_slots.is_empty();
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
@@ -2732,6 +2762,7 @@ impl Journal {
         self.len += bytes.len() as u64;
         Ok(Flight {
             log: Some(log),
+            recycle: Some(self.recycled.clone()),
             arena,
             bytes,
             at,
@@ -3436,6 +3467,8 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
 /// failed write must fail-stop it.
 pub(crate) struct Flight {
     log: Option<Arc<File>>,
+    /// Where the frame buffer goes back once the flight is done with it (`Journal::recycled`).
+    recycle: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
     arena: Option<File>,
     bytes: Vec<u8>,
     at: u64,
@@ -3470,6 +3503,21 @@ pub(crate) struct Flight {
     empty_end: bool,
 }
 
+impl Drop for Flight {
+    /// The frame buffer goes back to its journal, emptied, for the next flight to buffer into.
+    fn drop(&mut self) {
+        if let Some(slot) = self.recycle.take() {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            bytes.clear();
+            if let Ok(mut slot) = slot.lock() {
+                if slot.is_none() {
+                    *slot = Some(bytes);
+                }
+            }
+        }
+    }
+}
+
 impl Flight {
     /// Arena first, then the frames, then the log: the order `Journal::flush` keeps. Returns the
     /// flight's confirmation (`Confirm`) when its sync returned, for the store to write once the log
@@ -3487,7 +3535,7 @@ impl Flight {
                 "failpoint: a branch log write failed".to_string(),
             ));
         }
-        let Some(log) = self.log else {
+        let Some(log) = self.log.take() else {
             return Ok(None);
         };
         // Review R8's guard, holding no lock (it ran at the take, under the store mutex, before):

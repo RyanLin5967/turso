@@ -4509,7 +4509,7 @@ impl BranchStore {
     /// Buffer `records` for an early-released operation and return the log sequence number the
     /// caller must wait for (`wait_durable`) once it has released every lock, before acknowledging
     /// the operation. Nothing is flushed here; 0 when volatile (always durable).
-    fn buffer_records(&self, inner: &mut StoreInner, records: &[Record]) -> Result<u64> {
+    fn buffer_records<'r>(&self, inner: &mut StoreInner, records: impl IntoIterator<Item = &'r Record>) -> Result<u64> {
         let StoreInner {
             journal, failpoint, ..
         } = inner;
@@ -6056,7 +6056,7 @@ impl BranchStore {
         }
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         held_trace("fork.buffered");
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
         if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
@@ -6147,7 +6147,7 @@ impl BranchStore {
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
         if let Err(e) = inner.apply_fork(parent, id, schema, handle, name.map(Arc::from)) {
             return Err(inner.fatal(e));
@@ -8703,11 +8703,13 @@ impl StoreInner {
         parent: BranchId,
         now: u64,
         name: Option<&str>,
-    ) -> (Vec<Record>, Option<(u64, u64)>) {
+    ) -> ([Option<Record>; 2], Option<(u64, u64)>) {
         // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
         // trunk's child, whatever the parent was).
         let logged_parent = if fe_mutant("fork_without_parent") { 0 } else { parent.0 };
-        let mut records = vec![match name {
+        // In place, no Vec (budget create_allocates_at_most_once_under_the_store_mutex): a fork
+        // logs its record and at most a lease.
+        let mut records = [Some(match name {
             None => Record::Fork {
                 child: child.0,
                 parent: logged_parent,
@@ -8717,13 +8719,13 @@ impl StoreInner {
                 parent: logged_parent,
                 name: name.to_string(),
             },
-        }];
+        }), None];
         let lease = self
             .default_lease
             .filter(|_| name.is_none())
             .map(|ttl| (now.saturating_add(millis(ttl)), now));
         if let Some((deadline_ms, now_ms)) = lease {
-            records.push(Record::Lease {
+            records[1] = Some(Record::Lease {
                 branch: child.0,
                 deadline_ms,
                 now_ms,
