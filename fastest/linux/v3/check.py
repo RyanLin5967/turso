@@ -1292,6 +1292,27 @@ def self_test():
         # so `(got == []) is ok` passed every ok=False case at 167dd51be; an absent function now fails every case]
         chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), nnp is not None and ((got == []) is ok),
             got)
+    # V3 review 13 item 7: P_nest_modes' unrelated mounted loop (and nbx) must come through --teardown-nest untouched,
+    # and on a MOUNTED loop `losetup -d` changes neither the device, the backing file nor the mount: it only sets
+    # AUTOCLEAR. So the record is `losetup -n -O NAME,BACK-FILE,AUTOCLEAR` (xargs-joined) before and after, which must
+    # be equal with AUTOCLEAR 0, and the mount still there (expectations by hand)
+    npp = globals().get("nest_plant_problems")
+    b0 = "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 0"
+    for name, before, after, mounted, ok in (
+            ("untouched: same device, backing, AUTOCLEAR 0, still mounted", b0, b0, "yes", True),
+            ("`losetup -d` on the mounted loop (AUTOCLEAR set, all else the same)", b0,
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1", "yes", False),
+            ("detached (no line after)", b0, "", "yes", False),
+            ("unmounted", b0, b0, "", False),
+            ("no plant recorded before", "", b0, "yes", False),
+            ("AUTOCLEAR already set before", "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1",
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1", "yes", False),
+            ("a record without the AUTOCLEAR field (the NAME,BACK-FILE form)", "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img",
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img", "yes", False),
+            ("re-attached to another device", b0, "/dev/loop21 /mnt/v3fx/nb/teardown-plant.img 0", "yes", False)):
+        got = npp(before, after, mounted) if npp else ["(no nest_plant_problems in check.py)"]
+        chk("nest plant (review 13 item 7): %s -> %s" % (name, "pass" if ok else "fail"),
+            npp is not None and ((got == []) is ok), got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
     # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are; a level's files, nest_level_match) and a
