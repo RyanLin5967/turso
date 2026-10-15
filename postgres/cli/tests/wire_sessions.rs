@@ -11993,121 +11993,322 @@ macro_rules! replays_postgresql {
 replays_postgresql!(
     pg18_arrays_replays_as_postgresql_answered,
     "pg18-arrays.out",
-    []
+    [
+        (5, "value [wire]: Describe types $1 in `o = $1` as 1007 int4[] where PG says 1028 oid[]"),
+    ]
 );
 replays_postgresql!(
     pg18_arrres_replays_as_postgresql_answered,
     "pg18-arrres.out",
-    []
+    [
+        (1, "value [wire]: text-format bound text[] $1::text[] comes back as our internal array blob rendered as bytea hex '\\\\x030f0f6162' instead of '{a,b}' (oid 1009 agrees)"),
+        (2, "value [wire]: text-format bound int[] $1::int[] comes back as '\\\\x03090102' instead of '{1,2}' (oid 1007 agrees)"),
+        (3, "value [wire]: uncast $1 declared 1009 comes back as '\\\\x030f0f6162' instead of '{a,b}' (oid 1009 agrees)"),
+    ]
 );
-replays_postgresql!(pg18_audit1_lib_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered, "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out", []);
+replays_postgresql!(
+    pg18_audit1_lib_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE is a no-op for us, so CREATE SCHEMA public fails 'already exists'"),
+        (2, "protocol [wire]: bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first (same text)"),
+        (3, "protocol [wire]: bytea param \\xé: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
+        (4, "protocol [wire]: bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
+        (5, "protocol [wire]: bytea param \\xGG: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
+        (6, "protocol [wire]: bytea param \\x0 (odd digits): PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
+    ]
+);
 replays_postgresql!(
     pg18_audit1_lib_parameters_decode_at_postgresqls_edges_replays_as_postgresql_answered,
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE answers DROP SCHEMA without dropping, so CREATE SCHEMA public fails 42601 'schema \"public\" already exists'"),
+        (3, "protocol [wire]: real param 3.5e+38: PG refuses at Bind (no BindComplete); ours sends BindComplete+RowDescription then 22003, text also gains a leading 'value '"),
+        (4, "protocol [wire]: float8 param 1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
+        (5, "protocol [wire]: float8 param -1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
+        (6, "protocol [wire]: real param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
+        (12, "value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
+        (15, "protocol [wire]: int4 param '_100': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first (same code and text)"),
+        (16, "protocol [wire]: int4 param '0x_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+        (17, "protocol [wire]: int4 param '0b__1': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+        (18, "protocol [wire]: int4 param '0o_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+        (19, "protocol [wire]: int4 param '100_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+    ]
 );
-replays_postgresql!(pg18_audit1_ws_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered, "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us, CREATE SCHEMA public 'already exists'"),
+        (5, "protocol [wire]: INSERT bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
+        (7, "protocol [wire]: INSERT bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
+    ]
+);
 replays_postgresql!(
     pg18_audit1_ws_a_chained_or_read_only_transaction_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_chained_or_read_only_transaction_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+        (9, "ours-only [ours-only]: COMMIT AND CHAIN in a block refused 0A000 and aborts it (PG: COMMIT, Z T)"),
+        (11, "cascade [ours-only]: count(*) id=2 is 0 vs 1 because #9 refused the COMMIT AND CHAIN so #10 ROLLBACK discarded row 2 (cascade of #9)"),
+        (12, "ours-only [ours-only]: BEGIN READ ONLY refused 0A000 (PG: BEGIN, Z T)"),
+        (13, "ours-only [ours-only]: START TRANSACTION READ ONLY refused 0A000 (PG warns 25001 since #12 opened a block)"),
+        (14, "ours-only [ours-only]: BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY refused 0A000 (PG warns 25001, BEGIN)"),
+        (15, "cascade [ours-only]: BEGIN READ WRITE: PG warns 25001 already in a transaction (opened by #12); ours idle so no warning (cascade of #12)"),
+    ]
 );
-replays_postgresql!(pg18_audit1_ws_a_correlated_generate_series_column_is_scoped_to_its_select_replays_as_postgresql_answered, "pg18-audit1-ws-a_correlated_generate_series_column_is_scoped_to_its_select.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_a_correlated_generate_series_column_is_scoped_to_its_select_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_correlated_generate_series_column_is_scoped_to_its_select.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
+        (12, "value [wire]: bare function alias g referenced from a correlated EXISTS (w.k = g): ours errors 42703 'no such column: g' where PG answers 3 rows (g.g in #11 works)"),
+        (16, "value [wire]: (SELECT sum(g) FROM c) over a CTE typed 25 text in RowDescription; PG 20 int8 (rows agree)"),
+        (20, "error-text [wire]: 42702 both; ours prefixes 'Parse error: '"),
+    ]
+);
 replays_postgresql!(
     pg18_audit1_ws_a_dump_headers_settings_are_accepted_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_dump_headers_settings_are_accepted.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE: PG drops 4 leftover objects (NOTICE) and recreates; ours no-op then CREATE SCHEMA public 'already exists'"),
+        (14, "ours-only [ours-only]: SET xmloption = document refused 0A000 (PG: SET)"),
+        (15, "ours-only [ours-only]: SET transaction_timeout = '5s' refused 0A000 (PG: SET)"),
+        (16, "error-code [wire]: SET default_tablespace = 'fast': PG 22023 invalid value for parameter; ours 0A000 not supported"),
+        (17, "error-code [wire]: SET default_table_access_method = columnar: PG 22023 invalid value; ours 0A000 not supported"),
+        (18, "ours-only [ours-only]: SET geqo_threshold = 12 refused 0A000 (PG: SET)"),
+        (19, "ours-only [ours-only]: SHOW geqo_threshold refused 0A000 (PG: '12'; would also cascade from #18)"),
+        (20, "error-text [wire]: 42704 both; ours prefixes the message with 'Parse error: '"),
+        (21, "error-text [wire]: SHOW no_such_parameter 42704 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_a_parameter_is_typed_by_every_kind_of_from_item_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_parameter_is_typed_by_every_kind_of_from_item.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us, CREATE SCHEMA public 'already exists'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_a_parameter_over_the_simple_protocol_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_parameter_over_the_simple_protocol_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us, CREATE SCHEMA public 'already exists'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_a_read_only_begin_inside_a_block_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_read_only_begin_inside_a_block_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table p), CREATE SCHEMA public 'already exists'"),
+        (5, "ours-only [ours-only]: BEGIN READ ONLY inside a block: ours 0A000 aborts the block (Z E); PG warns 25001 and makes it read-only (Z T)"),
+        (6, "cascade [ours-only]: INSERT: PG 25006 read-only; ours 25P02 because #5 aborted the block (cascade of #5)"),
+        (8, "ours-only [ours-only]: multi-statement: BEGIN READ ONLY refused 0A000 (Z I) where PG opens it and INSERT fails 25006 (Z E)"),
+        (9, "cascade [ours-only]: PG is in an aborted block (25P02); ours idle and answers count 0 (cascade of #8)"),
+        (10, "cascade [ours-only]: ROLLBACK: ours warns 25P01 no transaction because #8 left us idle (cascade of #8)"),
+    ]
 );
-replays_postgresql!(pg18_audit1_ws_a_three_part_reference_resolves_through_its_schema_replays_as_postgresql_answered, "pg18-audit1-ws-a_three_part_reference_resolves_through_its_schema.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_a_three_part_reference_resolves_through_its_schema_replays_as_postgresql_answered,
+    "pg18-audit1-ws-a_three_part_reference_resolves_through_its_schema.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
+        (3, "value [wire]: Describe types $1 in pg_class.relname = $1 as 25 text; PG 19 name"),
+        (4, "value [wire]: Describe types $1 in pg_catalog.pg_class.relname = $1 as 25 text; PG 19 name"),
+        (5, "protocol [wire]: public.t.c with t aliased x: PG refuses at Parse (no ParseComplete) 'invalid reference to FROM-clause entry'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (same 42P01)"),
+    ]
+);
 replays_postgresql!(
     pg18_audit1_ws_aggregates_have_postgres_types_on_both_protocols_replays_as_postgresql_answered,
     "pg18-audit1-ws-aggregates_have_postgres_types_on_both_protocols.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
+        (6, "value [engine]: avg(int) over simple protocol is '1.5'; PG '1.5000000000000000' (numeric display scale 16)"),
+        (7, "value [engine]: avg(int) over extended protocol is '1.5'; PG '1.5000000000000000'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_checkpoint_inside_a_block_keeps_the_block_replays_as_postgresql_answered,
     "pg18-audit1-ws-checkpoint_inside_a_block_keeps_the_block.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_delete_using_deletes_only_the_joined_rows_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_deletes_only_the_joined_rows.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_delete_using_reads_one_namespace_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_reads_one_namespace.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+        (6, "error-text [wire]: 42702 both; ours 'Parse error: ambiguous column name: id' vs PG 'column reference \"id\" is ambiguous'"),
+        (8, "error-text [wire]: 42712 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_delete_using_returning_a_using_column_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_returning_a_using_column_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+        (6, "ours-only [ours-only]: DELETE ... USING k RETURNING k.flag refused 0A000; PG deletes row 2 and returns 't'"),
+        (7, "cascade [ours-only]: count(*) 2 vs 1 (cascade of #6)"),
+        (8, "ours-only [ours-only]: RETURNING d.v, j.* refused 0A000; PG DELETE 0"),
+        (9, "cascade [ours-only]: count(*) 2 vs 1 (cascade of #6)"),
+        (10, "ours-only [ours-only]: RETURNING * over DELETE ... USING refused 0A000; PG DELETE 0"),
+        (11, "cascade [ours-only]: count(*) 2 vs 1 (cascade of #6)"),
+        (12, "cascade [ours-only]: RETURNING d.id, v deletes row 2 (DELETE 1) where PG had already deleted it at #6 (DELETE 0); cascade of #6"),
+        (15, "ours-only [ours-only]: RETURNING d.v, j.* refused 0A000 inside a block (Z E)"),
+        (18, "ours-only [ours-only]: RETURNING * over DELETE ... USING refused 0A000 inside a block (Z E)"),
+    ]
 );
-replays_postgresql!(pg18_audit1_ws_delete_using_returning_resolves_a_bare_name_over_both_replays_as_postgresql_answered, "pg18-audit1-ws-delete_using_returning_resolves_a_bare_name_over_both.out", []);
+replays_postgresql!(
+    pg18_audit1_ws_delete_using_returning_resolves_a_bare_name_over_both_replays_as_postgresql_answered,
+    "pg18-audit1-ws-delete_using_returning_resolves_a_bare_name_over_both.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+        (6, "error-text [wire]: 42702 both; ours prefixes 'Parse error: '"),
+        (8, "ours-only [ours-only]: DELETE ... USING ... RETURNING flag (a USING column) refused 0A000; PG deletes 2 rows"),
+        (9, "cascade [ours-only]: count(*) 3 vs 1: #8 refused so rows 2,3 were not deleted (cascade of #8)"),
+        (10, "ours-only [ours-only]: RETURNING k (whole-row of a USING relation, PG composite oid 16566) refused 0A000; PG DELETE 0"),
+        (11, "cascade [ours-only]: count(*) 3 vs 1 (cascade of #8)"),
+        (12, "value [wire]: EXISTS(...) in RETURNING typed 25 text where PG 16 bool; the DELETE 1 vs DELETE 0 row count is a cascade of #8"),
+        (13, "cascade [ours-only]: count(*) 2 vs 1 (cascade of #8; #12 deleted row 2 that PG had already deleted)"),
+        (16, "ours-only [ours-only]: RETURNING flag (USING column) refused 0A000 inside a block, aborting it (Z E)"),
+        (19, "ours-only [ours-only]: RETURNING k (whole-row of USING relation) refused 0A000 inside a block (Z E)"),
+        (22, "value [wire]: SILENT: EXISTS(...) in RETURNING answers '1' typed 25 text; PG 't' typed 16 bool (row b and DELETE 1 agree)"),
+    ]
+);
 replays_postgresql!(
     pg18_audit1_ws_generate_series_may_read_the_row_it_joins_replays_as_postgresql_answered,
     "pg18-audit1-ws-generate_series_may_read_the_row_it_joins.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 2 objects), CREATE SCHEMA public 'already exists'"),
+        (6, "ours-only [ours-only]: generate_series(...) WITH ORDINALITY refused 0A000"),
+        (7, "error-code [wire]: AS g(a, b) over a 1-column function: PG 42P10 'table \"g\" has 1 columns available but 2 columns specified'; ours 42601 'too many column aliases'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_set_honours_or_refuses_each_parameter_replays_as_postgresql_answered,
     "pg18-audit1-ws-set_honours_or_refuses_each_parameter.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table s), CREATE SCHEMA public 'already exists'"),
+        (5, "ours-only [ours-only]: SET transaction_read_only = on in a block refused 0A000 and aborts it"),
+        (6, "cascade [ours-only]: INSERT: PG 25006 read-only; ours 25P02 because #5 aborted the block (cascade of #5)"),
+        (9, "ours-only [ours-only]: SET default_transaction_read_only = on refused 0A000"),
+        (10, "ours-only [ours-only]: SET LOCAL transaction_read_only TO true outside a block refused 0A000; PG warns 25P01 and answers SET"),
+        (15, "ours-only [ours-only]: SET client_encoding = 'LATIN1' refused 0A000"),
+        (16, "ours-only [ours-only]: SET standard_conforming_strings = off refused 0A000"),
+        (17, "error-text [wire]: SET synchronous: 42704 both; ours prefixes 'Parse error: '"),
+        (18, "error-text [wire]: SET no_such_parameter: 42704 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_set_operations_keep_their_grouping_and_clauses_replays_as_postgresql_answered,
     "pg18-audit1-ws-set_operations_keep_their_grouping_and_clauses.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
+        (13, "value [wire]: CTE column x in WITH ... UNION ALL typed 17 bytea; PG 23 int4 (rows agree)"),
+        (14, "value [wire]: CTE column id in WITH ... UNION ALL typed 17 bytea; PG 23 int4 (rows agree)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit1_ws_untyped_contexts_type_their_parameters_replays_as_postgresql_answered,
     "pg18-audit1-ws-untyped_contexts_type_their_parameters.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades 3 objects), CREATE SCHEMA public 'already exists'"),
+        (18, "value [wire]: Describe: derived-table column c = count(*) typed 17 bytea in RowDescription; PG 20 int8"),
+        (19, "value [wire]: derived-table count(*) column typed 17 bytea in RowDescription (row '3' agrees); PG 20"),
+        (26, "value [wire]: Describe: sum(n) OVER (PARTITION BY n > $1) typed 25 text in RowDescription; PG 20 int8 (param 23 agrees)"),
+        (44, "error-code [wire]: typeof(name) = $1: PG refuses at Parse 42883 'function typeof(text) does not exist'; ours ParseComplete then 42P18 (the SQLite typeof() leaks through)"),
+        (45, "protocol [wire]: no_such_typing(name) = $1: PG refuses at Parse (no ParseComplete); ours ParseComplete then 42883 'Parse error: no such function: no_such_typing'"),
+    ]
 );
 replays_postgresql!(pg18_audit2_a_create_table_with_a_serial_completes_as_create_table_replays_as_postgresql_answered, "pg18-audit2-a_create_table_with_a_serial_completes_as_create_table.out", []);
 replays_postgresql!(
     pg18_audit2_a_failed_commit_leaves_the_session_idle_replays_as_postgresql_answered,
     "pg18-audit2-a_failed_commit_leaves_the_session_idle.out",
-    []
+    [
+        (5, "error-text [wire]: deferred FK at COMMIT 23503 both; ours 'deferred foreign key constraint failed on commit' vs PG 'insert or update on table \"c\" violates foreign key constraint \"c_pid_fkey\"'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_a_refused_create_table_leaves_no_sequence_replays_as_postgresql_answered,
     "pg18-audit2-a_refused_create_table_leaves_no_sequence.out",
-    []
+    [
+        (3, "error-text [wire]: 42830 both; ours prefixes 'Parse error: '"),
+        (5, "error-code [wire]: CREATE TABLE of an existing name: PG 42P07 'relation \"p\" already exists'; ours 42601 'Parse error: table p already exists'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_aggregates_report_numeric_types_replays_as_postgresql_answered,
     "pg18-audit2-aggregates_report_numeric_types.out",
-    []
+    [
+        (4, "value [engine]: avg(int) is '1.5'; PG '1.5000000000000000' (numeric display scale)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_alter_table_add_constraint_is_validated_and_atomic_replays_as_postgresql_answered,
     "pg18-audit2-alter_table_add_constraint_is_validated_and_atomic.out",
-    []
+    [
+        (7, "value [wire]: NUMERIC(p,s) column n typed 701 float8 in RowDescription; PG 1700 (text '12.50' agrees)"),
+        (8, "error-text [wire]: ALTER TABLE ADD FOREIGN KEY 23503 both; ours 'violates the foreign key constraint it adds: a row's key (pid) is not present in table \"p\"' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
+        (10, "value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (same as #7, not a cascade)"),
+    ]
 );
-replays_postgresql!(pg18_audit2_alter_table_add_constraint_takes_effect_and_keeps_the_rows_replays_as_postgresql_answered, "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out", []);
-replays_postgresql!(pg18_audit2_alter_table_add_constraint_works_in_every_transaction_state_replays_as_postgresql_answered, "pg18-audit2-alter_table_add_constraint_works_in_every_transaction_state.out", []);
-replays_postgresql!(pg18_audit2_an_error_inside_a_transaction_aborts_it_as_in_postgres_replays_as_postgresql_answered, "pg18-audit2-an_error_inside_a_transaction_aborts_it_as_in_postgres.out", []);
+replays_postgresql!(
+    pg18_audit2_alter_table_add_constraint_takes_effect_and_keeps_the_rows_replays_as_postgresql_answered,
+    "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out",
+    [
+        (6, "value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
+        (10, "value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
+        (11, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: c.id' vs PG '... unique constraint \"c_pkey\"'"),
+        (12, "error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: c.id' vs PG 'null value in column \"id\" of relation \"c\" violates not-null constraint'"),
+        (13, "error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
+        (14, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: c.v' vs PG '... unique constraint \"c_v_key\"'"),
+    ]
+);
+replays_postgresql!(
+    pg18_audit2_alter_table_add_constraint_works_in_every_transaction_state_replays_as_postgresql_answered,
+    "pg18-audit2-alter_table_add_constraint_works_in_every_transaction_state.out",
+    [
+        (7, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.id\" vs PG \"duplicate key value violates unique constraint <table>_pkey\""),
+        (14, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.id\" vs PG \"duplicate key value violates unique constraint <table>_pkey\""),
+        (22, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.id\" vs PG \"duplicate key value violates unique constraint <table>_pkey\""),
+        (30, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.id\" vs PG \"duplicate key value violates unique constraint <table>_pkey\""),
+        (35, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.v\" vs PG \"... unique constraint <table>_v_key\""),
+        (42, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.v\" vs PG \"... unique constraint <table>_v_key\""),
+        (50, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.v\" vs PG \"... unique constraint <table>_v_key\""),
+        (58, "error-text [wire]: 23505 both; ours \"UNIQUE constraint failed: <table>.v\" vs PG \"... unique constraint <table>_v_key\""),
+        (63, "error-text [wire]: 23503 both; ours \"FOREIGN KEY constraint failed\" vs PG \"insert or update on table ... violates foreign key constraint <table>_p_fkey\""),
+        (70, "error-text [wire]: 23503 both; ours \"FOREIGN KEY constraint failed\" vs PG \"insert or update on table ... violates foreign key constraint <table>_p_fkey\""),
+        (78, "error-text [wire]: 23503 both; ours \"FOREIGN KEY constraint failed\" vs PG \"insert or update on table ... violates foreign key constraint <table>_p_fkey\""),
+        (86, "error-text [wire]: 23503 both; ours \"FOREIGN KEY constraint failed\" vs PG \"insert or update on table ... violates foreign key constraint <table>_p_fkey\""),
+        (91, "error-text [wire]: 23514 both; ours \"CHECK constraint failed: id > 0\" vs PG \"new row for relation ... violates check constraint <table>_id_check\""),
+        (98, "error-text [wire]: 23514 both; ours \"CHECK constraint failed: id > 0\" vs PG \"new row for relation ... violates check constraint <table>_id_check\""),
+        (106, "error-text [wire]: 23514 both; ours \"CHECK constraint failed: id > 0\" vs PG \"new row for relation ... violates check constraint <table>_id_check\""),
+        (114, "error-text [wire]: 23514 both; ours \"CHECK constraint failed: id > 0\" vs PG \"new row for relation ... violates check constraint <table>_id_check\""),
+        (117, "error-text [wire]: ALTER TABLE d ADD UNIQUE (v) over duplicates, 23505 both; ours \"UNIQUE constraint failed: d.v\" vs PG \"could not create unique index \\\"d_v_key\\\"\""),
+    ]
+);
+replays_postgresql!(
+    pg18_audit2_an_error_inside_a_transaction_aborts_it_as_in_postgres_replays_as_postgresql_answered,
+    "pg18-audit2-an_error_inside_a_transaction_aborts_it_as_in_postgres.out",
+    [
+        (5, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.id' vs PG 'duplicate key value violates unique constraint \"t_pkey\"'"),
+    ]
+);
 replays_postgresql!(
     pg18_audit2_char_n_is_blank_padded_as_in_postgres_replays_as_postgresql_answered,
     "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
-    []
+    [
+        (5, "value [wire]: length(char(n)) typed 25 text in RowDescription; PG 23 int4 (value 3 agrees)"),
+        (6, "error-code [wire]: char(6) overflow: PG 22001 'value too long for type character(6)'; ours XX000 'value too long for type character'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_ddl_statements_report_their_command_tags_replays_as_postgresql_answered,
@@ -12124,27 +12325,48 @@ replays_postgresql!(
     "pg18-audit2-end_and_abort_report_commit_and_rollback.out",
     []
 );
-replays_postgresql!(pg18_audit2_foreign_keys_are_enforced_on_the_trunk_and_on_a_branch_replays_as_postgresql_answered, "pg18-audit2-foreign_keys_are_enforced_on_the_trunk_and_on_a_branch.out", []);
+replays_postgresql!(
+    pg18_audit2_foreign_keys_are_enforced_on_the_trunk_and_on_a_branch_replays_as_postgresql_answered,
+    "pg18-audit2-foreign_keys_are_enforced_on_the_trunk_and_on_a_branch.out",
+    [
+        (5, "error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG 'insert or update on table \"c\" violates foreign key constraint \"c_pid_fkey\"'"),
+        (6, "error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG's table+constraint-named message"),
+    ]
+);
 replays_postgresql!(pg18_audit2_generate_series_in_from_names_its_column_after_the_alias_replays_as_postgresql_answered, "pg18-audit2-generate_series_in_from_names_its_column_after_the_alias.out", []);
 replays_postgresql!(
     pg18_audit2_information_schema_describes_tables_columns_and_keys_replays_as_postgresql_answered,
     "pg18-audit2-information_schema_describes_tables_columns_and_keys.out",
-    []
+    [
+        (3, "value [wire]: information_schema.columns: column_name/udt_name typed 25 (PG 19 name), is_nullable 25 (PG 1043 varchar); rows agree"),
+        (4, "value [wire]: key_column_usage.column_name typed 25; PG 19 name (rows agree)"),
+        (5, "value [wire]: information_schema.tables.table_name typed 25; PG 19 name (rows agree)"),
+        (6, "value [wire]: table_constraints: constraint_type typed 25 (PG 1043) and ours omits PG18's two NOT NULL constraints listed as CHECK (2 rows vs 4)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_pg_indexes_and_pg_database_size_answer_replays_as_postgresql_answered,
     "pg18-audit2-pg_indexes_and_pg_database_size_answer.out",
-    []
+    [
+        (3, "value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
+        (4, "value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
+        (5, "value [wire]: pg_database_size() typed 25 text; PG 20 int8 (the byte count 24728 vs 8443583 is cluster-dependent and cannot agree)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_pgbench_table_probe_runs_replays_as_postgresql_answered,
     "pg18-audit2-pgbench_table_probe_runs.out",
-    []
+    [
+        (2, "value [wire]: pgbench probe: o.n (array_position) typed 25 (PG 23) and partstrat typed 25 (PG 18 char); row agrees"),
+        (3, "value [wire]: current_schemas(false) typed 25 text; PG 1003 name[] (value '{public}' agrees)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_rollback_to_savepoint_recovers_a_failed_transaction_replays_as_postgresql_answered,
     "pg18-audit2-rollback_to_savepoint_recovers_a_failed_transaction.out",
-    []
+    [
+        (6, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.id' vs PG 'duplicate key value violates unique constraint \"t_pkey\"'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_row_value_comparisons_work_replays_as_postgresql_answered,
@@ -12159,216 +12381,572 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_audit2_set_reads_every_value_it_is_given_replays_as_postgresql_answered,
     "pg18-audit2-set_reads_every_value_it_is_given.out",
-    []
+    [
+        (3, "ours-only [ours-only]: SET DateStyle TO ISO, DMY refused 0A000"),
+        (5, "protocol [wire]: SHOW DateStyle completes with tag 'SELECT 1' where PG sends 'SHOW' (value 'ISO, MDY' agrees)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit2_show_answers_from_the_settings_set_keeps_replays_as_postgresql_answered,
     "pg18-audit2-show_answers_from_the_settings_set_keeps.out",
-    []
+    [
+        (1, "protocol [wire]: SHOW search_path completes with tag 'SELECT 1' where PG sends 'SHOW' (value agrees)"),
+        (3, "protocol [wire]: SHOW search_path tag 'SELECT 1' vs 'SHOW' (value 's, public' agrees)"),
+        (4, "protocol [wire]: SHOW client_encoding tag 'SELECT 1' vs 'SHOW'"),
+        (5, "protocol [wire]: SHOW standard_conforming_strings tag 'SELECT 1' vs 'SHOW'"),
+        (6, "cluster-state [cluster]: SHOW DateStyle: PG cluster's config file sets 'ISO, YMD', ours default 'ISO, MDY'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
+        (7, "protocol [wire]: SHOW IntervalStyle tag 'SELECT 1' vs 'SHOW'"),
+        (8, "cluster-state [cluster]: SHOW TimeZone: PG cluster's 'America/Toronto' vs ours 'UTC'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
+        (9, "protocol [wire]: SHOW bytea_output tag 'SELECT 1' vs 'SHOW'"),
+        (10, "protocol [wire]: SHOW transaction_read_only tag 'SELECT 1' vs 'SHOW'"),
+        (11, "error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
+        (12, "error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
+        (13, "error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
+        (14, "ours-only [ours-only]: SHOW ALL refused 0A000 (PG lists every GUC, many of them cluster paths and ports)"),
+        (15, "value [wire]: SELECT ... FROM pg_settings: ours errors 42601 'no such object: pg_settings' where PG answers 5 rows (and boot/reset values that are partly the cluster's config file)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_bare_numeric_division_by_zero_is_22012_replays_as_postgresql_answered,
     "pg18-audit3-a_bare_numeric_division_by_zero_is_22012.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s ...; DROP SCHEMA public: ours refuses the whole query 0A000 (schemas other than public)"),
+        (4, "value [engine]: SILENT: bare NUMERIC x / 0 answers one NULL row typed 701 float8; PG RowDescription 1700 then 22012 division by zero"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_branch_call_parameter_past_the_limit_is_refused_replays_as_postgresql_answered,
     "pg18-audit3-a_branch_call_parameter_past_the_limit_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "protocol [wire]: Describe of $18446744073709551615: PG refuses at Parse; ours ParseComplete then 42601 with 'Parse error: ' prefix"),
+        (6, "error-text [wire]: 42601 parameter number too large both; ours prefixes 'Parse error: '"),
+        (7, "error-code [ours-only]: Describe of turso_branch_create($65536): PG 42883 function turso_branch_create(unknown) does not exist (PG has no such function); ours ParseComplete then 42P02 there is no parameter $65536"),
+        (9, "error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (10, "protocol [wire]: Describe of $2147483647: PG refuses 42P02 at Parse; ours ParseComplete then 42P02 with 'Parse error: ' prefix"),
+        (12, "error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (13, "protocol [wire]: Describe of $2147483648: PG refuses at Parse; ours ParseComplete then 42601 with prefix"),
+        (15, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (16, "protocol [wire]: Describe of $4294967297: PG refuses at Parse; ours ParseComplete then 42601 with prefix"),
+        (18, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (19, "protocol [wire]: Describe of $99999999999999999999999: PG refuses at Parse; ours ParseComplete then 42601 with prefix"),
+        (21, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_deferred_foreign_key_is_checked_at_commit_replays_as_postgresql_answered,
     "pg18-audit3-a_deferred_foreign_key_is_checked_at_commit.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (7, "error-text [wire]: deferred FK at COMMIT 23503 both; ours 'deferred foreign key constraint failed on commit' vs PG naming table dc1 and constraint dc1_pid_fkey"),
+        (15, "error-text [wire]: deferred FK at COMMIT 23503 both; ours generic text vs PG naming dc2/dc2_pid_fkey"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_from_functions_arguments_read_the_items_before_it_replays_as_postgresql_answered,
     "pg18-audit3-a_from_functions_arguments_read_the_items_before_it.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_mistyped_commit_or_rollback_aborts_the_block_replays_as_postgresql_answered,
     "pg18-audit3-a_mistyped_commit_or_rollback_aborts_the_block.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (6, "error-text [wire]: 42601 both; ours prefixes 'Parse error: Invalid statement: '"),
+        (11, "error-text [wire]: 42601 both; ours prefixes 'Parse error: Invalid statement: '"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_multi_statement_query_is_one_implicit_transaction_replays_as_postgresql_answered,
     "pg18-audit3-a_multi_statement_query_is_one_implicit_transaction.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.id' vs PG 'duplicate key value violates unique constraint \"t_pkey\"'"),
+        (6, "error-code [ours-only]: turso_branch_create in a multi-statement query: PG 42883 function does not exist (no turso_* in PG); ours 25001 cannot run inside a transaction block"),
+        (8, "ours-only [ours-only]: VACUUM t after an INSERT in one query: ours 0A000 VACUUM is not supported; PG 25001 VACUUM cannot run inside a transaction block"),
+        (10, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.id' vs PG t_pkey message (COMMIT warning sequence agrees)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_numeric_division_by_zero_is_22012_replays_as_postgresql_answered,
     "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "protocol [wire]: x / 0 over NUMERIC: PG sends RowDescription 1700 then 22012; ours sends only the 22012 error (no RowDescription)"),
+    ]
 );
-replays_postgresql!(pg18_audit3_a_parameter_is_typed_from_the_relation_the_engine_writes_replays_as_postgresql_answered, "pg18-audit3-a_parameter_is_typed_from_the_relation_the_engine_writes.out", []);
+replays_postgresql!(
+    pg18_audit3_a_parameter_is_typed_from_the_relation_the_engine_writes_replays_as_postgresql_answered,
+    "pg18-audit3-a_parameter_is_typed_from_the_relation_the_engine_writes.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on a schema s)"),
+        (5, "cascade [cluster]: CREATE TABLE s.t fails because #4 made no schema s (cascade of #4); our code XX000 'no such database: s' is itself not PG's 3F000"),
+        (6, "cascade [cluster]: INSERT INTO s.t: XX000 no such database: s after BindComplete (cascade of #4)"),
+        (7, "cascade [cluster]: SELECT FROM s.t: XX000 no such database: s (cascade of #4)"),
+        (8, "cascade [cluster]: INSERT INTO s.t ON CONFLICT: XX000 (cascade of #4)"),
+        (9, "cascade [cluster]: UPDATE s.t: XX000 after BindComplete (cascade of #4)"),
+        (10, "cascade [cluster]: SELECT FROM s.t: XX000 (cascade of #4)"),
+        (11, "cascade [cluster]: INSERT ... ON CONFLICT DO UPDATE into s.t: XX000 (cascade of #4)"),
+        (12, "cascade [cluster]: SELECT FROM s.t: XX000 (cascade of #4)"),
+        (15, "cascade [cluster]: SELECT FROM s.t: XX000 (cascade of #4)"),
+        (18, "protocol [wire]: s.t.c with only t in FROM: PG refuses at Parse 'invalid reference to FROM-clause entry for table \"t\"'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (42P01 both)"),
+    ]
+);
 replays_postgresql!(
     pg18_audit3_a_parameter_number_past_the_limit_is_refused_replays_as_postgresql_answered,
     "pg18-audit3-a_parameter_number_past_the_limit_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s (PG had s.t) ...; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (5, "protocol [wire]: Describe of LIMIT $2147483647: PG refuses 42P02 at Parse; ours ParseComplete then 42P02 with prefix"),
+        (7, "error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (8, "error-code [wire]: Describe of id = $65536: PG refuses at Parse 42P18 'could not determine data type of parameter $1'; ours ParseComplete then 42P02 there is no parameter $65536"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_parameter_number_the_scanner_would_wrap_is_refused_replays_as_postgresql_answered,
     "pg18-audit3-a_parameter_number_the_scanner_would_wrap_is_refused.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "protocol [wire]: $4294967297 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601 with 'Parse error: ' prefix"),
+        (5, "error-code [ours-only]: turso_branch_switch('x'): PG 42883 function does not exist (PG has no turso_* functions); ours 3D000 branch \"x\" does not exist"),
+        (6, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (7, "protocol [wire]: $4294967297 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601"),
+        (9, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (10, "protocol [wire]: LIMIT $2147483648 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601"),
+        (12, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (13, "protocol [wire]: $4295032831 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_a_view_over_public_t_types_its_parameters_replays_as_postgresql_answered,
     "pg18-audit3-a_view_over_public_t_types_its_parameters.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_an_explicit_public_qualifier_names_public_replays_as_postgresql_answered,
     "pg18-audit3-an_explicit_public_qualifier_names_public.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (3, "cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
+        (4, "cascade [cluster]: CREATE TABLE s.t: XX000 no such database: s (cascade of #3)"),
+        (5, "cascade [cluster]: INSERT INTO s.t: XX000 (cascade of #3)"),
+        (11, "cascade [cluster]: SELECT ... FROM s.t: XX000 (cascade of #3)"),
+        (15, "error-text [wire]: SELECT * FROM public.t, 42P01 both; ours 'Parse error: no such table: main.t' (leaks SQLite schema name main) vs PG 'relation \"public.t\" does not exist'"),
+        (16, "cascade [cluster]: SELECT count(*) FROM s.t: XX000 (cascade of #3)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_an_index_on_a_qualified_table_is_that_tables_replays_as_postgresql_answered,
     "pg18-audit3-an_index_on_a_qualified_table_is_that_tables.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s (PG had s.t); DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (3, "cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
+        (4, "cascade [cluster]: CREATE TABLE s.t: XX000 no such database: s (cascade of #3; XX000 is not PG's 3F000)"),
+        (5, "cascade [cluster]: CREATE UNIQUE INDEX su ON s.t: XX000 (cascade of #3)"),
+        (6, "cascade [cluster]: INSERT INTO s.t: XX000 (cascade of #3)"),
+        (7, "cascade [cluster]: INSERT INTO s.t duplicate: XX000 instead of PG 23505 on su (cascade of #3)"),
+        (12, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.c' vs PG '... unique constraint \"pu\"'"),
+        (13, "cascade [cluster]: SELECT count(*) FROM s.t: XX000 (cascade of #3)"),
+    ]
 );
-replays_postgresql!(pg18_audit3_an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind_replays_as_postgresql_answered, "pg18-audit3-an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind.out", []);
-replays_postgresql!(pg18_audit3_an_unqualified_relation_is_resolved_as_the_engine_resolves_it_replays_as_postgresql_answered, "pg18-audit3-an_unqualified_relation_is_resolved_as_the_engine_resolves_it.out", []);
+replays_postgresql!(
+    pg18_audit3_an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind_replays_as_postgresql_answered,
+    "pg18-audit3-an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s (PG had s.t); DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (20, "protocol [wire]: Describe of id = $2 (no $1): PG refuses 42P18 at Parse; ours ParseComplete then the same 42P18"),
+        (25, "protocol [wire]: Parse SELECT 1 with one declared-0 param: PG refuses 42P18 at Parse; ours ParseComplete then the same 42P18"),
+    ]
+);
+replays_postgresql!(
+    pg18_audit3_an_unqualified_relation_is_resolved_as_the_engine_resolves_it_replays_as_postgresql_answered,
+    "pg18-audit3-an_unqualified_relation_is_resolved_as_the_engine_resolves_it.out",
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
+        (5, "cascade [cluster]: CREATE TABLE s.u: XX000 no such database: s (cascade of #4)"),
+        (6, "protocol [wire]: Describe UPDATE u (u only in s): PG refuses 42P01 at Parse 'relation \"u\" does not exist'; ours ParseComplete then 'Parse error: no such table: u'"),
+    ]
+);
 replays_postgresql!(
     pg18_audit3_copy_from_runs_inside_the_block_it_is_in_replays_as_postgresql_answered,
     "pg18-audit3-copy_from_runs_inside_the_block_it_is_in.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (15, "error-code [wire]: COPY of a non-integer into INT: PG 22P02 invalid input syntax for type integer: \"not-a-number\"; ours 23000 'cannot store TEXT value in INTEGER column cp.id (19)'"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_copy_refuses_an_option_it_does_not_implement_replays_as_postgresql_answered,
     "pg18-audit3-copy_refuses_an_option_it_does_not_implement.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (3, "error-text [wire]: COPY (QUOTE) in text mode 0A000 both; ours 'COPY option \"quote\" is not supported' vs PG 'COPY QUOTE requires CSV mode'"),
+        (5, "error-text [wire]: COPY (FORCE_NOT_NULL) in text mode 0A000 both; ours 'option \"force_not_null\" is not supported' vs PG 'requires CSV mode'"),
+        (7, "ours-only [ours-only]: COPY ... (DEFAULT 'x') refused 0A000; PG COPY 2"),
+        (8, "cascade [ours-only]: count 0 vs 2 (cascade of #7)"),
+        (9, "ours-only [ours-only]: COPY ... (ON_ERROR ignore) refused 0A000; PG COPY 2"),
+        (10, "cascade [ours-only]: count 0 vs 4 (cascade of #7 and #9)"),
+        (11, "ours-only [ours-only]: COPY ... (ENCODING 'LATIN1') refused 0A000; PG COPY 2"),
+        (12, "cascade [ours-only]: count 0 vs 6 (cascade of #7, #9, #11)"),
+        (13, "ours-only [ours-only]: COPY ... (HEADER MATCH) refused 0A000; PG 22P04 header mismatch (the file has no header)"),
+        (14, "cascade [ours-only]: count 0 vs 6 (cascade of #7, #9, #11)"),
+        (15, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (16, "cascade [ours-only]: count 0 vs 6 (cascade of #7, #9, #11)"),
+        (17, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (18, "cascade [ours-only]: count 0 vs 6 (cascade of #7, #9, #11)"),
+        (20, "cascade [ours-only]: count 2 vs 8: #19 loaded 2 rows on both; the 6 missing are #7/#9/#11 (cascade)"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_engine_errors_carry_postgres_sqlstates_replays_as_postgresql_answered,
     "pg18-audit3-engine_errors_carry_postgres_sqlstates.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (8, "error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.id' vs PG t_pkey message"),
+        (9, "error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG c_pid_fkey message"),
+        (10, "error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: n.v' vs PG not-null message"),
+        (11, "error-text [wire]: 23514 both; ours 'CHECK constraint failed: v > 0' vs PG 'new row for relation \"k\" violates check constraint \"k_v_check\"'"),
+        (12, "error-text [wire]: 42P01 both; ours 'Parse error: no such table: nope' vs PG 'relation \"nope\" does not exist'"),
+        (13, "error-text [wire]: 42703 both; ours 'Parse error: no such column: nope' vs PG 'column \"nope\" does not exist'"),
+        (14, "error-text [wire]: 42601 both; ours prefixes 'Parse error: Invalid statement: '"),
+        (15, "ours-only [ours-only]: generate_series WITH ORDINALITY refused 0A000"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_every_parameter_in_the_text_is_a_parameter_replays_as_postgresql_answered,
     "pg18-audit3-every_parameter_in_the_text_is_a_parameter.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_having_without_group_by_filters_the_aggregate_row_replays_as_postgresql_answered,
     "pg18-audit3-having_without_group_by_filters_the_aggregate_row.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_integer_division_by_zero_is_22012_replays_as_postgresql_answered,
     "pg18-audit3-integer_division_by_zero_is_22012.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (2, "value [engine]: SILENT: SELECT 1/0 answers one NULL row (int4); PG 22012 division by zero"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_integer_modulo_by_zero_is_22012_replays_as_postgresql_answered,
     "pg18-audit3-integer_modulo_by_zero_is_22012.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (2, "value [engine]: SILENT: SELECT 1 % 0 answers one NULL row (int4); PG 22012 division by zero"),
+    ]
 );
 replays_postgresql!(
     pg18_audit3_primary_key_columns_are_reported_not_null_replays_as_postgresql_answered,
     "pg18-audit3-primary_key_columns_are_reported_not_null.out",
-    []
+    [
+        (1, "cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (5, "error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: pk2.a (19)' vs PG 'null value in column \"a\" of relation \"pk2\" violates not-null constraint'"),
+        (6, "value [wire]: information_schema.columns: table_name/column_name typed 25 (PG 19), is_nullable 25 (PG 1043); rows agree"),
+        (7, "value [wire]: SILENT: pg_attribute.attnotnull typed 23 int answering '1'/'0' where PG 16 bool 't'/'f'; relname/attname 25 vs PG 19"),
+    ]
 );
 replays_postgresql!(
     pg18_bytea_replays_as_postgresql_answered,
     "pg18-bytea.out",
-    []
+    [
+        (5, "protocol [wire]: bytea param a\\qb: PG refuses 22P02 at Bind; ours BindComplete+NoData first (same text)"),
+        (6, "protocol [wire]: bytea param a\\1b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
+        (7, "protocol [wire]: bytea param a\\400b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
+    ]
 );
 replays_postgresql!(
     pg18_c33_engineerr_replays_as_postgresql_answered,
     "pg18-c33-engineerr.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS big: ours omits PG's NOTICE"),
+        (2, "protocol [wire]: DROP TABLE IF EXISTS t: ours omits PG's NOTICE"),
+        (7, "value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
+        (8, "value [engine]: SILENT: v + 1 past int8 answers '9.223372036854776e+18' typed 23; PG 20 then 22003"),
+        (9, "value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
+        (10, "value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
+        (11, "value [engine]: SILENT: abs(v - max - max - 2) answers '9.223372036854776e+18' typed 25; PG 20 then 22003"),
+        (14, "value [engine]: SILENT: v + 1 overflow inside a block answers a float row and leaves the block open (Z T); PG 22003 aborts it (Z E)"),
+        (15, "cascade [engine]: INSERT (3) succeeds; PG 25P02 because #14 aborted its block (cascade of #14)"),
+        (16, "cascade [engine]: COMMIT commits rows 2 and 3; PG answers ROLLBACK (cascade of #14)"),
+        (17, "cascade [engine]: count 2 vs 0: rows 2,3 committed because #14 did not abort (cascade of #14)"),
+        (19, "cascade [engine]: INSERT (2) 23505 because #16 committed row 2 (cascade of #14)"),
+        (20, "cascade [engine]: 25P02 because #19 aborted our block (cascade of #14); without it this would be the #10 silent abs"),
+        (23, "cascade [engine]: count 2 vs 0 (cascade of #14)"),
+        (25, "cascade [engine]: INSERT (2) 23505 duplicate (cascade of #14)"),
+        (26, "cascade [engine]: SAVEPOINT s refused 25P02 because #25 aborted our block (cascade of #14)"),
+        (27, "cascade [engine]: 25P02 in our aborted block (cascade of #14)"),
+        (28, "cascade [engine]: ROLLBACK TO s: 3B001 no such savepoint since #26 made none (cascade of #14)"),
+        (29, "cascade [engine]: SELECT 1: 25P02 in our still-aborted block (cascade of #14)"),
+        (30, "cascade [engine]: COMMIT answers ROLLBACK where PG commits (cascade of #14)"),
+    ]
 );
-replays_postgresql!(pg18_c33_replays_as_postgresql_answered, "pg18-c33.out", []);
+replays_postgresql!(
+    pg18_c33_replays_as_postgresql_answered,
+    "pg18-c33.out",
+    [
+        (1, "protocol [wire]: drop table if exists pd: ours omits PG's NOTICE"),
+        (13, "value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
+        (17, "value [engine]: SILENT: SELECT 9223372036854775808 answers '9.223372036854776e+18' typed 701; PG exact numeric 9223372036854775808"),
+        (19, "value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
+        (20, "value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
+        (22, "value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
+        (23, "protocol [wire]: drop table if exists rr: ours omits PG's NOTICE"),
+        (25, "value [engine]: SILENT: insert 1e39 into a real column succeeds (stored as Infinity); PG 22003 out of range for type real"),
+        (26, "value [engine]: SILENT: insert '1e39' into real succeeds (Infinity); PG 22003"),
+        (27, "value [engine]: SILENT: insert -1e39 into real succeeds (-Infinity); PG 22003"),
+        (28, "value [engine]: SILENT: insert 1e-50 into real succeeds (stored 0); PG 22003 underflow"),
+        (29, "cascade [engine]: select * from rr returns Infinity, Infinity, -Infinity, 0 where PG has 0 rows (cascade of #25-#28)"),
+        (30, "value [engine]: SILENT: CAST(1e39 AS real) answers 'Infinity'; PG 22003"),
+        (31, "value [engine]: SILENT: 1e39::real answers 'Infinity'; PG 22003"),
+        (32, "error-text [wire]: '1e39'::real 22003 both; ours prefixes 'Parse error: '"),
+    ]
+);
 replays_postgresql!(
     pg18_colnames_replays_as_postgresql_answered,
     "pg18-colnames.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 'table \"cn\" does not exist, skipping'"),
+        (4, "ours-only [ours-only]: 'nan'::numeric refused 0A000 (engine holds no NaN); PG answers the whole row"),
+        (5, "value [wire]: CASE WHEN true THEN a ELSE a END typed 25 text; PG 23 int4 (values agree)"),
+        (6, "value [wire]: SELECT ARRAY[1], ROW(1, 2), EXISTS ..., ...: ours errors 42601 'row value misused' where PG answers one row"),
+        (7, "value [wire]: numeric literal 1.5 typed 701 float8; PG 1700 numeric (text agrees)"),
+        (8, "value [wire]: 'x'::varchar(3) typed 25 text; PG 1043 varchar"),
+    ]
 );
 replays_postgresql!(
     pg18_derivedbool_replays_as_postgresql_answered,
     "pg18-derivedbool.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
+    ]
 );
 replays_postgresql!(
     pg18_float_replays_as_postgresql_answered,
     "pg18-float.out",
-    []
+    [
+        (21, "value [engine]: SILENT: INSERT of 1.7976931348623157e308 into a real column succeeds (stored Infinity); PG 22003 out of range for type real"),
+        (22, "value [engine]: SILENT: INSERT of 5e-324 into a real column succeeds (stored 0); PG 22003 out of range for type real"),
+        (27, "value [engine]: SILENT: row 25 (-0.0 numeric literal) reads '-0','-0' where PG stores '0','0'; extra rows 20 and 21 are a cascade of #21/#22"),
+    ]
 );
-replays_postgresql!(pg18_gs_replays_as_postgresql_answered, "pg18-gs.out", []);
+replays_postgresql!(
+    pg18_gs_replays_as_postgresql_answered,
+    "pg18-gs.out",
+    [
+        (7, "error-text [wire]: 42702 both; ours 'Parse error: ambiguous column name: g' vs PG 'column reference \"g\" is ambiguous'"),
+        (8, "value [wire]: scalar subquery (SELECT g FROM u) typed 25 text; PG 23 int4 (rows agree)"),
+        (9, "value [wire]: correlated scalar subquery reading the function alias g typed 25 text; PG 23 (rows agree)"),
+        (10, "error-text [wire]: 42702 both; ours 'Parse error: ambiguous column name: g'"),
+    ]
+);
 replays_postgresql!(
     pg18_gsinf_replays_as_postgresql_answered,
     "pg18-gsinf.out",
-    []
+    [
+        (1, "protocol [wire]: generate_series(numeric, 'inf'): PG sends RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
+        (2, "error-code [wire]: generate_series(int, float8, int): PG 42883 function does not exist; ours 22023 'Extension error: stop value cannot be infinity' (accepts a mixed-type call PG refuses)"),
+        (3, "protocol [wire]: generate_series step 'inf'::numeric: PG RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
+        (4, "protocol [wire]: generate_series start '-inf'::numeric: PG RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_gsstar_replays_as_postgresql_answered,
     "pg18-gsstar.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS gt: ours omits PG's NOTICE 'does not exist, skipping'"),
+    ]
 );
 replays_postgresql!(
     pg18_ident_replays_as_postgresql_answered,
     "pg18-ident.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS idt, idb, gv: ours omits PG's three NOTICEs"),
+        (6, "value [wire]: create table with b ... GENERATED ALWAYS AS (a * 2) VIRTUAL: ours errors 42601 syntax error at \"virtual\" where PG creates it (a refusal should be 0A000)"),
+        (7, "cascade [wire]: insert into gv: 42P01 no such table (cascade of #6)"),
+        (10, "cascade [wire]: select * from gv: 42P01 no such table (cascade of #6)"),
+    ]
 );
-replays_postgresql!(pg18_inf_replays_as_postgresql_answered, "pg18-inf.out", []);
+replays_postgresql!(
+    pg18_inf_replays_as_postgresql_answered,
+    "pg18-inf.out",
+    [
+        (1, "ours-only [ours-only]: SELECT with 'NaN'::float8 refused 0A000; PG answers Infinity, -Infinity, NaN, Infinity, -0"),
+    ]
+);
 replays_postgresql!(
     pg18_infcast_replays_as_postgresql_answered,
     "pg18-infcast.out",
-    []
+    [
+        (2, "ours-only [ours-only]: 'NaN'::float8 refused 0A000 (engine holds no NaN); PG answers t, t"),
+        (3, "error-text [wire]: 22P02 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_inherits_replays_as_postgresql_answered,
     "pg18-inherits.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS ich, ipa: ours omits PG's two NOTICEs 'does not exist, skipping'"),
+        (3, "ours-only [ours-only]: CREATE TABLE ... INHERITS refused 0A000"),
+        (4, "cascade [ours-only]: INSERT INTO ich: 42P01 no such table (cascade of #3)"),
+        (5, "cascade [ours-only]: SELECT FROM ich: 42P01 (cascade of #3)"),
+        (6, "cascade [ours-only]: SELECT FROM ipa: 0 rows vs PG's inherited row (cascade of #3)"),
+        (7, "cascade [ours-only]: DROP TABLE ich, ipa: 42P01 no such table ich (cascade of #3)"),
+    ]
 );
 replays_postgresql!(
     pg18_insdef_replays_as_postgresql_answered,
     "pg18-insdef.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS it: ours omits PG's NOTICE"),
+        (3, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (4, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (8, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_join1_replays_as_postgresql_answered,
     "pg18-join1.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
+    ]
 );
 replays_postgresql!(
     pg18_join1b_replays_as_postgresql_answered,
     "pg18-join1b.out",
-    []
+    [
+        (2, "error-text [wire]: 42P10 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_join2_replays_as_postgresql_answered,
     "pg18-join2.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
+        (8, "value [wire]: FULL JOIN ... USING (i): ours errors 42601 'FULL OUTER JOIN requires an equality condition in the ON clause' where PG answers 4 rows"),
+        (10, "value [wire]: SELECT i FROM j1 FULL JOIN j2 USING (i): ours errors 42601 where PG answers 4 rows"),
+        (12, "value [wire]: NATURAL FULL JOIN: ours errors 42601 where PG answers 4 rows"),
+    ]
 );
 replays_postgresql!(
     pg18_nullorder_replays_as_postgresql_answered,
     "pg18-nullorder.out",
-    []
+    [
+        (1, "protocol [wire]: drop table if exists nt: ours omits PG's NOTICE"),
+        (9, "value [wire]: row_number() OVER typed 25 text; PG 20 int8 (rows agree)"),
+    ]
 );
-replays_postgresql!(pg18_num_replays_as_postgresql_answered, "pg18-num.out", []);
-replays_postgresql!(pg18_r14_replays_as_postgresql_answered, "pg18-r14.out", []);
-replays_postgresql!(pg18_r15_replays_as_postgresql_answered, "pg18-r15.out", []);
+replays_postgresql!(
+    pg18_num_replays_as_postgresql_answered,
+    "pg18-num.out",
+    [
+        (4, "value [engine]: SILENT: SELECT 0x_7FFF_FFFF_FFFF_FFFF_F answers float '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 numeric"),
+    ]
+);
+replays_postgresql!(
+    pg18_r14_replays_as_postgresql_answered,
+    "pg18-r14.out",
+    [
+        (10, "error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+    ]
+);
+replays_postgresql!(
+    pg18_r15_replays_as_postgresql_answered,
+    "pg18-r15.out",
+    [
+        (27, "error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+        (33, "value [wire]: text[] param {\"NUL\\L\"} comes back as blob '\\\\x02154e554c4c' instead of '{\"NULL\"}'"),
+        (34, "value [wire]: text[] param {NULL} comes back as blob '\\\\x0200' instead of '{NULL}'"),
+        (35, "protocol [wire]: malformed text[] param {a}}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+        (36, "protocol [wire]: int[] param {1,x}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
+        (37, "value [wire]: text[] param {a,b} comes back as blob '\\\\x030f0f6162' instead of '{a,b}'"),
+    ]
+);
 replays_postgresql!(
     pg18_random_replays_as_postgresql_answered,
     "pg18-random.out",
-    []
+    [
+        (1, "value [wire]: pg_typeof(random()): ours 42883 'no such function: pg_typeof' where PG answers t, 'double precision'"),
+        (2, "harness [harness]: SELECT random() compares a random value ('0.14257649920542403' vs PG's '0.812971034057977') that can never agree; oid 701 agrees"),
+    ]
 );
 replays_postgresql!(
     pg18_short_replays_as_postgresql_answered,
     "pg18-short.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS s3: ours omits PG's NOTICE"),
+        (6, "error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+    ]
 );
 replays_postgresql!(
     pg18_tablestar_replays_as_postgresql_answered,
     "pg18-tablestar.out",
-    []
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
+    ]
 );
 replays_postgresql!(
     pg18_types_replays_as_postgresql_answered,
     "pg18-types.out",
     []
 );
-replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
-replays_postgresql!(pg18_c33_intrange_replays_as_postgresql_answered, "pg18-c33-intrange.out", []);
+replays_postgresql!(
+    pg18_replays_as_postgresql_answered,
+    "pg18.out",
+    [
+        (6, "cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
+        (7, "cascade [cluster]: CREATE TABLE s.t: XX000 no such database: s (cascade of #6)"),
+        (9, "protocol [wire]: Describe of id = $2 (no $1): PG refuses 42P18 at Parse; ours ParseComplete then the same error"),
+        (14, "value [engine]: sum(bigint) past int8 inside a savepoint block: ours 22003 'integer overflow' and aborts (Z E); PG answers numeric 9223372036854775808 (Z T)"),
+        (15, "cascade [engine]: SELECT 1/0: ours 25P02 because #14 aborted the block; PG 22012 (cascade of #14)"),
+        (20, "error-text [wire]: COPY ... WHERE v = $1 over Q: 42P02 both; ours prefixes 'Parse error: '"),
+        (21, "error-text [wire]: COPY ... WHERE v = $1 extended: message sequence agrees (Parse/Bind/NoData then 42P02); ours prefixes 'Parse error: '"),
+        (22, "protocol [wire]: COPY ... WHERE v = $1 with param type 0: PG refuses 42P18 at Parse; ours ParseComplete then the same error"),
+        (25, "protocol [wire]: s.t.c with only t in FROM: PG refuses at Parse 'invalid reference to FROM-clause entry'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (42P01 both)"),
+        (26, "protocol [wire]: $1::float8 param 1e-400: PG refuses at Bind (only ParseComplete); ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
+        (27, "protocol [wire]: $1::float4 param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
+        (31, "protocol [wire]: Describe of SELECT varchar $1: PG refuses 42601 at Parse; ours ParseComplete then 'Parse error: syntax error'"),
+        (32, "protocol [wire]: SELECT varchar $1 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601 with prefix"),
+        (37, "value [wire]: SILENT: EXISTS (SELECT 1 FROM k WHERE k.flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
+        (39, "value [wire]: SILENT: EXISTS (... AS j WHERE flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
+        (41, "value [wire]: SILENT: EXISTS (SELECT * FROM k) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
+        (42, "error-text [wire]: 42702 both; ours prefixes 'Parse error: '"),
+    ]
+);
+replays_postgresql!(
+    pg18_c33_intrange_replays_as_postgresql_answered,
+    "pg18-c33-intrange.out",
+    [
+        (1, "protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 00000 'table \"big\" does not exist, skipping'"),
+        (4, "value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
+        (5, "value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
+        (6, "value [engine]: SILENT: '9223372036854775808'::int8 clamps to 9223372036854775807 typed 23; PG 22003 out of range for type bigint"),
+        (7, "value [engine]: SILENT: 9223372036854775807 + 1 answers float '9.223372036854776e+18' typed 23; PG 22003 bigint out of range"),
+        (8, "value [engine]: SILENT: bigint column v + 1 answers '9.223372036854776e+18' typed 23; PG RowDescription 20 then 22003"),
+        (9, "value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
+        (10, "value [engine]: SILENT: -v - 2 answers '-9.223372036854776e+18' typed 23; PG 20 then 22003"),
+        (11, "value [engine]: SILENT: 2147483647::int4 + 1 answers 2147483648 typed 23; PG 22003 integer out of range"),
+        (12, "value [engine]: SILENT: int column i + 1 answers 2147483648; PG RowDescription 23 then 22003"),
+        (13, "value [engine]: SILENT: i * 2 answers 4294967294; PG 23 then 22003"),
+        (14, "value [engine]: SILENT: '2147483648'::int4 answers 2147483648; PG 22003 out of range for type integer"),
+        (15, "value [engine]: SILENT: 32767::int2 + 1::int2 answers 32768 typed 23; PG 22003 smallint out of range"),
+        (16, "value [engine]: SILENT: CAST(9.5e18 AS BIGINT) clamps to 9223372036854775807; PG 22003 bigint out of range"),
+        (17, "value [engine]: SILENT: CAST(3e9 AS INT) answers 3000000000; PG 22003 integer out of range"),
+        (18, "value [engine]: SILENT: INSERT of 2147483648 into an INT column succeeds; PG 22003 integer out of range"),
+        (19, "cascade [engine]: sum(i) 4294967296 vs 2147483648 because #18 stored the out-of-range row (cascade of #18)"),
+        (20, "value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
+    ]
+);
