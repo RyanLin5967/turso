@@ -8255,11 +8255,15 @@ impl BranchStore {
             ("names.fresh", inner.names.fresh.len(), 0),
             ("names.gone", inner.names.gone.len(), 0),
         ];
+        // The name filter's tables are listed at 0 bytes, as its B-trees were: no create grows them.
+        // They are fixed-size and grown by `grow_name_filter` on its own thread, off the mutex (a
+        // create's own allocations in the filter: `FILTER_NOTE_ALLOCS`, zero by construction), so a
+        // capacity rise seen between two creates is that thread's, not a create's.
         if let Some(built) = inner.names.filter.built.as_ref() {
-            out.push(("names.filter.built", built.cap(), built.cap() * 8));
+            out.push(("names.filter.built", built.cap(), 0));
         }
         if let Some(pending) = inner.names.filter.pending.as_ref() {
-            out.push(("names.filter.pending", pending.cap(), pending.cap() * 8));
+            out.push(("names.filter.pending", pending.cap(), 0));
         }
         if let Some(cat) = inner.cat.as_ref() {
             // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
