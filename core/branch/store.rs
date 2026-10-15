@@ -3342,6 +3342,8 @@ fn run_flight(
     match installed {
         Ok(()) if !catalog_wal_due(&writer.lock()) => {
             truncating.store(false, Ordering::Release);
+            // The phase's end, skipped (the instrument's last point either way).
+            ckpt_phase("truncated");
         }
         Ok(()) => {
             #[cfg(test)]
