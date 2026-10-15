@@ -194,7 +194,10 @@ fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     }
 
     if args.len() == 8 {
-        let offset_sec = ok_tri!(args[7].to_integer()) as i32;
+        // An offset past i32 is no offset (time-reviewer: `as i32` wrapped it): no date.
+        let Ok(offset_sec) = i32::try_from(ok_tri!(args[7].to_integer())) else {
+            return none();
+        };
         let Some(shifted) = seconds.checked_sub(offset_sec as i64) else {
             return none();
         };
@@ -438,7 +441,9 @@ fn time_unix_internal(args: &[Value]) -> Value {
         nano_sec = ok_tri!(args[1].to_integer());
     }
 
-    let dt = ok_tri!(DateTime::from_timestamp(seconds, nano_sec as u32));
+    // Nanoseconds past u32 are refused, never wrapped (time-reviewer: 2^32 + 1 read as 1).
+    let nano_sec = ok_tri!(u32::try_from(nano_sec).ok(), "2nd parameter: nanoseconds out of range");
+    let dt = ok_tri!(DateTime::from_timestamp(seconds, nano_sec));
 
     let t = Time::from_datetime(dt);
 
@@ -917,7 +922,8 @@ fn time_fmt_iso(args: &[Value]) -> Value {
                 ValueType::Integer,
                 "2nd parameter: should be an integer"
             );
-            ok_tri!(args[1].to_integer()) as i32
+            // An offset past i32 is refused, never wrapped (time-reviewer).
+            ok_tri!(i32::try_from(ok_tri!(args[1].to_integer())).ok(), "2nd parameter: offset out of range")
         } else {
             0
         }
@@ -944,7 +950,8 @@ fn time_fmt_datetime(args: &[Value]) -> Value {
                 ValueType::Integer,
                 "2nd parameter: should be an integer"
             );
-            ok_tri!(args[1].to_integer()) as i32
+            // An offset past i32 is refused, never wrapped (time-reviewer).
+            ok_tri!(i32::try_from(ok_tri!(args[1].to_integer())).ok(), "2nd parameter: offset out of range")
         } else {
             0
         }
@@ -971,7 +978,8 @@ fn time_fmt_date(args: &[Value]) -> Value {
                 ValueType::Integer,
                 "2nd parameter: should be an integer"
             );
-            ok_tri!(args[1].to_integer()) as i32
+            // An offset past i32 is refused, never wrapped (time-reviewer).
+            ok_tri!(i32::try_from(ok_tri!(args[1].to_integer())).ok(), "2nd parameter: offset out of range")
         } else {
             0
         }
@@ -998,7 +1006,8 @@ fn time_fmt_time(args: &[Value]) -> Value {
                 ValueType::Integer,
                 "2nd parameter: should be an integer"
             );
-            ok_tri!(args[1].to_integer()) as i32
+            // An offset past i32 is refused, never wrapped (time-reviewer).
+            ok_tri!(i32::try_from(ok_tri!(args[1].to_integer())).ok(), "2nd parameter: offset out of range")
         } else {
             0
         }

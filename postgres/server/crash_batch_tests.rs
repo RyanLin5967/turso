@@ -349,6 +349,10 @@ fn a_time_argument_past_its_type_is_refused_not_wrapped() {
         "SELECT time_date(2020, 1, 1, 0, 0, 0, 0, 4294971696)",
         "SELECT strftime('%Y-%m-%d', '2000-01-01', '-5000000 days')",
         "SELECT strftime('%s', '2000-01-01', '-5000000 days')",
+        // The shared range check's other user: sqlite3 3.51.0 answers NULL for each.
+        "SELECT timediff('-4713-11-23', '2000-01-01')",
+        "SELECT timediff('2000-01-01', '-4713-11-23')",
+        "SELECT julianday('-4713-11-23')",
     ] {
         match run(sql) {
             Ok(rows) if rows == vec![vec![Value::Null]] => {}

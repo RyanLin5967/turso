@@ -107,6 +107,13 @@ impl DateTime {
         }
     }
 
+    /// Whether this value is no date SQLite answers: an error, or a Julian day past the range
+    /// (0 to MAX_JD). The one range check every date function's result goes through (strftime
+    /// missed it: '2000-01-01', '-5000000 days' printed 2000-01-01, where sqlite3 answers NULL).
+    fn out_of_range(&self) -> bool {
+        self.is_error || (self.valid_jd && (self.i_jd < 0 || self.i_jd > MAX_JD))
+    }
+
     fn compute_ymd(&mut self) {
         if self.valid_ymd {
             return;
@@ -917,7 +924,7 @@ where
     }
 
     p.compute_jd();
-    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
+    if p.out_of_range() {
         return Value::Null;
     }
 
@@ -1105,7 +1112,7 @@ where
     d2.compute_jd();
 
     // Validate inputs after computation
-    if d1.is_error || d2.is_error {
+    if d1.out_of_range() || d2.out_of_range() {
         return Value::Null;
     }
 
@@ -1285,7 +1292,7 @@ where
     }
 
     p.compute_jd();
-    if p.is_error {
+    if p.out_of_range() {
         return Value::Null;
     }
 
