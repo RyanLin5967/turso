@@ -592,6 +592,15 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     s.foreign = foreign;
     s.syscalls = if foreign == 0 { syscalls } else { None };
     s.instructions = instructions();
+    // Diagnostics only (FE_BUDGET_FOREIGN_NAMES set): name the foreign threads on stderr, after every
+    // count of the window is taken.
+    if foreign > 0 && std::env::var_os("FE_BUDGET_FOREIGN_NAMES").is_some() {
+        WINDOW_T0.with(|t0| {
+            let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
+            let ran: Vec<_> = ran_between(&t0.borrow()[..], &t1, me).into_iter().map(|(_, n, ns)| format!("{n}:{ns}ns")).collect();
+            eprintln!("budget window foreign (owned {owned:?}): {ran:?}");
+        });
+    }
     s
 }
 
