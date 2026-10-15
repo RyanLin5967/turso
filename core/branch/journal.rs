@@ -5365,6 +5365,26 @@ mod tests {
         );
     }
 
+    /// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex): buffering a record
+    /// into a `pending` buffer with room allocates nothing, since the record is encoded in place
+    /// (adbf8b607). Counted with the test allocator (`budget_probe::thread_allocs`, exact per
+    /// thread), one Fork and one named fork. Mutant `record_encoded_aside` (a Vec of its own, as
+    /// before): one allocation each.
+    #[test]
+    fn buffering_a_record_into_room_allocates_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        journal.pending.reserve(4096);
+        let named = Record::ForkNamed { child: 2, parent: 0, name: Arc::from("room") };
+        for record in [Record::Fork { child: 1, parent: 0 }, named] {
+            let before = super::super::budget_probe::thread_allocs().0;
+            journal.buffer(&record).unwrap();
+            let allocs = super::super::budget_probe::thread_allocs().0 - before;
+            assert_eq!(allocs, 0, "CLAIM: buffering {record:?} into room allocated {allocs} times");
+        }
+    }
+
     /// R7 made a snapshot field mean deadline + 1. A log or snapshot of another format version
     /// must be REFUSED, not read with the wrong meaning — and not taken for a torn header, which
     /// would silently start an empty store over it.
