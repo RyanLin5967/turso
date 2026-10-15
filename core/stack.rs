@@ -276,8 +276,14 @@ mod tests {
             .stack_size(256 << 10)
             .spawn(|| {
                 let _outer = NestGuard::enter("outermost").unwrap();
-                assert!(!descend_to(100 << 10), "a nested step was admitted with ~100 KiB left");
-                assert!(descend_to(200 << 10), "premise: a nested step with ~200 KiB left runs");
+                assert!(
+                    !descend_to(100 << 10),
+                    "a nested step was admitted with ~100 KiB left"
+                );
+                assert!(
+                    descend_to(200 << 10),
+                    "premise: a nested step with ~200 KiB left runs"
+                );
             })
             .unwrap()
             .join()
