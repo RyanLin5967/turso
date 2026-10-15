@@ -9073,3 +9073,82 @@ fn creates_past_the_bound_do_not_rewake_the_writer_for_an_owed_upgrade() {
         assert_eq!(n, 0, "{what}: CLAIM: five creates past the bound, with the upgrade owed, notified the writer {n} times");
     }
 }
+
+/// Engine review 18 MED 3: a raised D0 catalog store's fuzzy checkpoint waits in `settle_ordered`
+/// for a FULL trunk commit T's WAL flush, while T, past its barrier and before that flush, waited
+/// in back-pressure for this checkpoint's install (`Backpressure`, the log past the hard limit):
+/// a cycle only the bound broke (`pending_full_wait`, 100 ms; set to 5 s here so it shows). The
+/// checkpoint then failed Busy, its install was lost for a threshold of log, and T stalled under
+/// the WAL write lock. Here the checkpoint is held before its settle with the log past the hard
+/// limit (a filler thread's creates; the one that crosses waits in back-pressure), T is held once
+/// its ordered barrier is done (its WAL flush to come), then both are released: T returns within
+/// 2 s, and the checkpoint installs.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_trunk_commit_does_not_wait_on_a_checkpoint_that_waits_on_its_flush() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::PENDING_FULL_WAIT_MS.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::PENDING_FULL_WAIT_MS.store(5_000, O::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("settle-cycle.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    let _x = trunk.fork_branch().unwrap().into_id();
+    write_v(&trunk, 3, "raised");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    // A D0 record past the last full flush, so the checkpoint's capture covers one an ordered
+    // flight's flush must make durable (`settle_ordered` waits only then).
+    let _y = trunk.fork_branch().unwrap().into_id();
+    assert!(
+        db.branches.durable_for_test(SyncClass::FullFsync) < db.branches.durable_for_test(SyncClass::Off),
+        "premise: a D0 record is written past the last full flush"
+    );
+    let _t = Threshold::set(8 << 10);
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_SETTLE);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("premise: the checkpoint never reached its settle", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_SETTLE | super::store::HOLD_ARRIVED
+    });
+    let filler = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while !db.branches.over_hard_for_test() && t.elapsed() < std::time::Duration::from_secs(30) {
+                let _ = db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id());
+            }
+        })
+    };
+    eventually("premise: the log never passed the hard limit with the checkpoint in flight", || {
+        db.branches.over_hard_for_test()
+    });
+    let installed = db.branch_checkpoint_counters()[0];
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_BARRIER_DONE, O::Release);
+    let committing = std::thread::spawn(move || trunk.execute("UPDATE t SET v = 'ordered' WHERE id = 40").map(|_| ()));
+    wait_hold(&hold, super::store::HOLD_TRUNK_BARRIER_DONE);
+    db.branch_checkpoint_hold(0);
+    let t = std::time::Instant::now();
+    hold.store(0, O::Release);
+    let got = committing.join().unwrap();
+    let took = t.elapsed();
+    db.branch_checkpoint_wait();
+    filler.join().unwrap();
+    assert!(got.is_ok(), "premise: the trunk commit committed: {got:?}");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "CLAIM: the trunk commit waited {took:?} past its barrier on the checkpoint that waited on its WAL flush"
+    );
+    assert!(
+        db.branch_checkpoint_counters()[0] > installed,
+        "the checkpoint never installed: it failed at the settle bound"
+    );
+}
