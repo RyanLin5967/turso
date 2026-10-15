@@ -592,7 +592,87 @@ def selftest():
         ("a live-branch count that is not a count", dict(tracer=clean, live={"label_before": LIVE, "label_after": "x",
                                                                              "timed_before": LIVE, "timed_after": LIVE}),
          False),
+        ("process trees unavailable", dict(tracer=trace_rec(roles="cmd=500 srv=100 tree=none")), False),
+        ("TracerPid in a sweep without a TRACED line",
+         dict(tracer=trace_rec(sw + [("end", 100.45, 0, 0, 12, 4242)])), False),
+        ("command start sweep found zero tasks",
+         dict(tracer=trace_rec([("start", 100.0, 0, 0, 12, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
+        ("roles present but no tracer sweeps", dict(tracer=trace_rec(sweeps=[])), False),
+        ("unreadable sweep line", dict(tracer=clean + "SWEEP mid bad cmd=x srv=12:0\n"), False),
     ]
+    refusal_reasons = {
+        "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
+        "a server task traced at its start": ("traced during the timed run", "a sweep saw a TracerPid"),
+        "no timed run: only the traced labelling run's latency file": ("no timed run (timed/summary.json",),
+        "no tracer samples": ("tracer record has no roles header",),
+        "no sample at the end": ("no end sweep of the server's tasks",),
+        "tracer record missing": ("tracer record timed.tracer.tsv missing or unreadable",),
+        "a tracer attached mid-run and detached before the end (seen by a mid sweep)":
+            ("traced during the timed run", "a sweep saw a TracerPid"),
+        "a TRACED line whose sweep line says 0 (the line alone refuses)": ("traced during the timed run",),
+        "a blind second mid-run (a gap longer than the 0.25 s allowed)": ("stretch with no sweep",),
+        "no sweep before the window opened": ("no sweep before the window opened",),
+        "no sweep after the window closed": ("no sweep after the window closed",),
+        "a server role whose start sweep found no task": ("no start sweep of the server's tasks",),
+        "no roles header": ("tracer record has no roles header",),
+        "the load generator itself traced at tm0 (its own record)": ("the load generator's own tracerpid_tm0",),
+        "no own tracer record in the timed summary":
+            ("the load generator's own tracerpid_tm0", "the load generator's own tracerpid_tm1"),
+        "timed run failed": ("timed run verdict fail rc 3", "timed run exit status 3"),
+        "timed run measured another N": ("timed run measured 150 ops, not N=200",),
+        "timed run warmed up by another rule": ("timed run warm-up rule '20:0:0', not the registered",),
+        "labelling run warmed up by another rule": ("labelling run warm-up rule '1000:10:60', not the registered",),
+        "no warm-up rule recorded":
+            ("labelling run warm-up rule None, not the registered", "timed run warm-up rule None, not the registered"),
+        "capped at 99 ok ops: failed, cause cap": ("timed run capped with 99 ok ops",),
+        "the labelling run capped at 99 ok ops": ("labelling run capped with 99 ok ops",),
+        "an uncapped run short of N": ("labelling run measured 1200 ops, not N=5000", "timed run measured 1500 ops, not N=5000"),
+        "no labelling run summary": ("no labelling run summary",),
+        "the labelling run measured another N": ("labelling run measured 150 ops, not N=200",),
+        "the timed run's raw.tsv missing (summary present)": ("no timed run (timed/summary.json",),
+        "the timed summary says fail with rc 0": ("timed run verdict fail rc 0",),
+        "the timed summary says ok with rc 3": ("timed run verdict ok rc 3",),
+        "the timed run's exit status file says 1": ("timed run exit status 1",),
+        "capped with 1200 ops but 50 ok (the tier counts ok ops)": ("timed run capped with 50 ok ops",),
+        "a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)": ("timed run left its warm-up early",),
+        "a warm-up that left before OPS and before MAX_S (500 ops, 12 s)": ("timed run left its warm-up early",),
+        "A23: a warm-up op claimed at or after MAX_S (500 ops, the last at 180.0 s)": ("at or after MAX_S",),
+        "A23: no warmup_capped in the record": ("timed run has no A23 warm-up record",),
+        "A23: says capped although OPS and S were met at the ending claim (done wins)": ("done wins",),
+        "A23: says done, but ended by MAX_S before OPS": ("timed run left its warm-up early",),
+        "A23: the warm-up should have ended at its last claim (OPS and S already met there)":
+            ("warm-up should have ended at its last claim",),
+        "A23: warmup_s is not the ending claim's time": ("is not its ending claim's time",),
+        "A23: the last warm-up claim after the ending claim (1000 ops, so OPS was not met at that claim)":
+            ("is after its ending claim",),
+        "A23: warm-up ops but no last claim time": ("warm-up record is inconsistent",),
+        "A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)":
+            ("with an older time than the claim judged before them",),
+        "A23: no warmup_backsteps in the record": ("has no warmup_backsteps record",),
+        "A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)":
+            ("with an older time than the claim judged before them",),
+        "A23: the same record in closed loop is refused": ("with an older time than the claim judged before them",),
+        "A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused":
+            ("with an older time than the claim judged before them", "is after its ending claim"),
+        "A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused":
+            ("is after its ending claim",),
+        "A23: no loop mode in the record": ("is neither closed nor open",),
+        "A23: a loop mode that is neither closed nor open": ("is neither closed nor open",),
+        "the labelling run's warm-up left early": ("labelling run left its warm-up early",),
+        "a window bound that is not the registered cap": ("is not the cap",),
+        "capped although the window was shorter than its bound": ("is shorter than its bound",),
+        "no warm-up record": ("timed run has no A23 warm-up record",),
+        "the labelling run at N=20, the timed run at N=1020": ("live-branch count not held at 21",),
+        "N grew by the run's creates inside the timed run (no delete)": ("live-branch count not held at 21",),
+        "no live-branch record": ("no live-branch record live.tsv",),
+        "a live-branch count missing": ("live-branch count not held at 21",),
+        "a live-branch count that is not a count": ("live-branch count not held at 21",),
+        "process trees unavailable": ("the process trees could not be walked",),
+        "TracerPid in a sweep without a TRACED line": ("a sweep saw a TracerPid",),
+        "command start sweep found zero tasks": ("no start sweep of the command's tasks",),
+        "roles present but no tracer sweeps": ("no tracer sweeps",),
+        "unreadable sweep line": ("unreadable sweep line",),
+    }
     bad = n = 0
 
     def ok(cond, line):  # counts its own cases (LOW 27: the total came from padding `cases` with None)
@@ -609,6 +689,10 @@ def selftest():
             why = check(d, n_check, RULE, LIVE, CAP)
             got = not why
             ok(got == want, f"{name} -> {'ok' if got else '; '.join(why)}")
+            if not want:
+                expected = refusal_reasons.get(name, ())
+                ok(bool(expected) and all(any(reason in line for line in why) for reason in expected),
+                   f"reason: {name} -> expected {expected!r}; got {why!r}")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
