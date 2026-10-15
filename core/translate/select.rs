@@ -290,6 +290,9 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
+    // A subquery's plan is prepared by a recursive call: refused with too little stack for one
+    // more level (`stack::NestGuard`; the crash batch, 2026-10-15).
+    let _nest = crate::stack::NestGuard::enter("subqueries")?;
     match select {
         ast::OneSelect::Select {
             columns,
