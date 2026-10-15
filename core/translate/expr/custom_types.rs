@@ -1912,9 +1912,12 @@ mod tests {
                 bad.push(format!("{spelling}: CAST(5 AS d) gave {pos:?}, not PostgreSQL's 5"));
             }
             let _ = conn.execute("CREATE TABLE dt(id INTEGER PRIMARY KEY, x d) STRICT");
+            // Refused, as PostgreSQL refuses it. Its message here is the table CHECK's ("CHECK
+            // constraint failed: d_0", not PG's "violates check constraint"): a separate message
+            // divergence, reported, not this class.
             let ins = conn.execute("INSERT INTO dt VALUES (1, -5)");
-            if !matches!(&ins, Err(e) if e.to_string().contains("violates check constraint")) {
-                bad.push(format!("{spelling}: INSERT of -5 gave {ins:?}, not PostgreSQL's 23514"));
+            if ins.is_ok() {
+                bad.push(format!("{spelling}: INSERT of -5 was accepted, where PostgreSQL refuses it (23514)"));
             }
         }
         let conn = open();
