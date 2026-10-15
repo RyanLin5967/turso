@@ -57,51 +57,60 @@ impl Server {
                 .local_addr()
                 .unwrap()
                 .port();
-            let addr = format!("127.0.0.1:{port}");
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tursopg"));
-            cmd.arg(db)
-                .arg("--server")
-                .arg(&addr)
-                .args(extra)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
-            // (`-t`), so a session the server ends without a word says why (lead: find the cause
-            // of "closed the connection during startup").
-            if let Some(trace_dir) = std::env::var_os("WIRE_SERVER_TRACE_DIR") {
-                cmd.arg("-t")
-                    .arg(std::path::Path::new(&trace_dir).join(format!("server-{port}.log")));
+            if let Some(server) = Self::start_on(db, extra, port) {
+                return server;
             }
-            // The server starts at macOS's default open-file soft limit (256) whatever this test
-            // process raised its own to, so a server that serves C + 16 sessions must raise it.
-            unsafe {
-                use std::os::unix::process::CommandExt;
-                cmd.pre_exec(|| {
-                    let mut lim = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
-                        lim.rlim_cur = lim.rlim_cur.min(256);
-                        libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-                    }
-                    Ok(())
-                });
-            }
-            let mut child = cmd.spawn().expect("failed to start tursopg server");
-            for _ in 0..100 {
-                if child.try_wait().unwrap().is_some() {
-                    break;
-                }
-                if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                    return Self { child, port };
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            child.kill().ok();
-            child.wait().ok();
         }
         panic!("tursopg server did not start");
+    }
+
+    /// One attempt on `port`: the server, once it is ready, or None when it is not (it exited, or
+    /// never became ready), the child reaped.
+    fn start_on(db: &Path, extra: &[&str], port: u16) -> Option<Self> {
+        let addr = format!("127.0.0.1:{port}");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tursopg"));
+        cmd.arg(db)
+            .arg("--server")
+            .arg(&addr)
+            .args(extra)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
+        // (`-t`), so a session the server ends without a word says why (lead: find the cause
+        // of "closed the connection during startup").
+        if let Some(trace_dir) = std::env::var_os("WIRE_SERVER_TRACE_DIR") {
+            cmd.arg("-t")
+                .arg(std::path::Path::new(&trace_dir).join(format!("server-{port}.log")));
+        }
+        // The server starts at macOS's default open-file soft limit (256) whatever this test
+        // process raised its own to, so a server that serves C + 16 sessions must raise it.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                let mut lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+                    lim.rlim_cur = lim.rlim_cur.min(256);
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("failed to start tursopg server");
+        for _ in 0..100 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
+                return Some(Self { child, port });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.kill().ok();
+        child.wait().ok();
+        None
     }
 
     fn connect(&self) -> Wire {
@@ -128,6 +137,25 @@ impl Drop for Server {
         self.child.kill().ok();
         self.child.wait().ok();
     }
+}
+
+/// The harness takes a server as ready only from the server itself, never from whatever accepts a
+/// connection on its port: a listener another process holds there must not pass for it. The
+/// connect probe did take one, so a server that lost the bind race (and exits) was handed out, and
+/// its sessions met the other listener: "closed the connection during startup" (the startup flake,
+/// raws artie lanes/wire/raw/loud-20261015/startup-flake/; lead: a real race, fix accepted
+/// 2026-10-15 as test infrastructure that changes no assertion).
+#[test]
+fn a_foreign_listener_on_the_port_is_not_taken_for_the_server() {
+    let dir = Scratch::new("foreignlistener");
+    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let server = Server::start_on(&dir.db(), &[], port);
+    assert!(
+        server.is_none(),
+        "a server that could not bind {port} was taken as ready"
+    );
+    drop(foreign);
 }
 
 // ---------------------------------------------------------------------------
