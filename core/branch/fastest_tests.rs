@@ -8956,3 +8956,37 @@ fn a_header_raising_upgrade_is_counted() {
         }
     }
 }
+
+/// Codex C15 MED 2: `branch_checkpoint_now`'s deadline bounds only its retries: when a fuzzy
+/// flight is already in the air, its failed start joined that flight before reading the clock, so
+/// with the flight held before its catalog commit a 1 ms request waited for as long as the hold.
+/// With an existing flight held, a request with a 1 ms deadline returns `Ok(false)` (the caller's
+/// Busy) within 2 s; released, the held flight installs.
+#[test]
+fn a_requested_checkpoint_does_not_wait_past_its_deadline_for_a_flight_in_the_air() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("checkpoint-now-deadline.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the existing flight started");
+    eventually("premise: the existing flight never reached its hold", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let request = {
+        let db = db.clone();
+        std::thread::spawn(move || db.branch_checkpoint_now(std::time::Duration::from_millis(1)))
+    };
+    let t = std::time::Instant::now();
+    while !request.is_finished() && t.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let returned = request.is_finished();
+    db.branch_checkpoint_hold(0);
+    let answer = request.join().unwrap();
+    db.branch_checkpoint_wait();
+    assert!(returned, "CLAIM: a 1 ms checkpoint request waited past 2 s for the flight in the air");
+    assert!(matches!(answer, Ok(false)), "the request past its deadline answered {answer:?}, not Ok(false)");
+}
