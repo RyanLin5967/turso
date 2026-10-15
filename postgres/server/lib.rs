@@ -4146,11 +4146,24 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 .trim_start_matches(['+', '-'])
                 .to_ascii_lowercase()
                 .starts_with("inf");
-            let past = match *pg_type {
-                Type::FLOAT4 => f.is_finite() && f.abs() > f64::from(f32::MAX),
-                _ => false,
+            // float4's range is read as float4in reads it, rounded to the nearest float4:
+            // '3.4028235e+38', float4out's own spelling of FLT_MAX, is above f32::MAX as an f64
+            // and was refused (wire review 16 item 23).
+            let in_type = match *pg_type {
+                Type::FLOAT4 => trimmed.parse::<f32>().map_or(f, f64::from),
+                _ => f,
             };
-            if (f.is_infinite() && !infinite_spelled) || past {
+            if in_type.is_infinite() && !infinite_spelled {
+                return Err(out_of_range(name));
+            }
+            // A spelling of a nonzero value that underflows the type to zero ('1e-400'), which
+            // float4in and float8in refuse (ERANGE with a zero result; recalled from their source,
+            // not re-read); numeric's range holds it. It bound 0 (wire review 16 item 23).
+            let mantissa = trimmed.split(['e', 'E']).next().unwrap_or("");
+            if in_type == 0.0
+                && *pg_type != Type::NUMERIC
+                && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
+            {
                 return Err(out_of_range(name));
             }
             Ok(Value::from_f64(f))
@@ -4274,7 +4287,8 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
 
 /// An integer as PostgreSQL's integer input functions read one (pg_strtoint64_safe, PostgreSQL 16
 /// and later): blanks around it, an optional sign, then decimal digits, or 0x / 0o / 0b and that
-/// base's digits, with one underscore allowed between two digits. `Some(None)` for a well-formed
+/// base's digits, with one underscore allowed between two digits, or between the prefix and the
+/// first digit. `Some(None)` for a well-formed
 /// integer past i64 (out of range), `None` for bad syntax.
 fn pg_integer(text: &str) -> Option<Option<i64>> {
     let s = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
@@ -4289,7 +4303,9 @@ fn pg_integer(text: &str) -> Option<Option<i64>> {
         Some("0b") => (2, &s[2..]),
         _ => (10, s),
     };
-    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+    // An underscore may follow a base prefix ('0b_10_0101' is 37), never begin a decimal
+    // (wire review 16 item 23: it was refused in every base).
+    if digits.is_empty() || (radix == 10 && digits.starts_with('_')) || digits.ends_with('_') {
         return None;
     }
     let mut magnitude: u128 = 0;
