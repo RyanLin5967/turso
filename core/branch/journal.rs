@@ -144,7 +144,8 @@ const LEGACY_SPLICE_FORMAT_VERSION: u32 = 18;
 pub(crate) fn format_version(splice: bool) -> u32 {
     #[cfg(test)]
     if CREATE_LEGACY.with(std::cell::Cell::get) {
-        return if splice { LEGACY_SPLICE_FORMAT_VERSION } else { LEGACY_FORMAT_VERSION };
+        let facts = if LEGACY_FACTS.with(std::cell::Cell::get) { 2 } else { 0 };
+        return facts + if splice { LEGACY_SPLICE_FORMAT_VERSION } else { LEGACY_FORMAT_VERSION };
     }
     if splice {
         SPLICE_FORMAT_VERSION
@@ -159,6 +160,9 @@ std::thread_local! {
     /// at the legacy version (17, 18), as an older build made them; cleared, this build then opens
     /// them by the older path (no meta facts) and keeps writing them at that version.
     pub(crate) static CREATE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// With `CREATE_LEGACY`: the older build stood in for is the L4 meta facts' (19, 20), not the
+    /// one before it (17, 18). Its catalog has the facts and no link columns, as that build made it.
+    pub(crate) static LEGACY_FACTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The older versions of `format`'s arm this build reads, to upgrade them (21: 19, 17; 22: 20, 18).

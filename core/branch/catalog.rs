@@ -832,6 +832,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Test builds (links adversary L2): add the link columns alone, committed, leaving the meta
+    /// row and every row's links as they are (a state no build writes).
+    #[cfg(test)]
+    pub(crate) fn add_link_columns_for_test(&mut self) -> Result<()> {
+        for sql in LINK_COLUMNS {
+            self.conn.execute(sql)?;
+        }
+        Ok(())
+    }
+
     fn set_links(&mut self, id: u64, l: Links) -> Result<()> {
         let Some(st) = self.link_stmts.as_mut() else {
             return Err(LimboError::InternalError("branch catalog: links set without the columns".to_string()));

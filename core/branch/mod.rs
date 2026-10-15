@@ -1780,6 +1780,10 @@ mod budget_tests;
 #[cfg(all(test, feature = "fs"))]
 mod l4_oracle_tests;
 
+// Links adversary H1 (DECISIONS 7e77068514): one authority for the format version.
+#[cfg(all(test, feature = "fs"))]
+mod format_authority_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8808,6 +8808,14 @@ impl BranchStore {
         (known, format)
     }
 
+    /// Test builds (links adversary L1): the child index's splice records, `moved` and `relinked`,
+    /// which only a catalog store's checkpoint consumes.
+    #[cfg(test)]
+    pub(crate) fn children_moved_relinked_for_test(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.children.moved.len(), inner.children.relinked.len())
+    }
+
     /// Test builds: whether this store's catalog has the link columns (format 21/22 or upgraded).
     #[cfg(test)]
     pub(crate) fn catalog_links_for_test(&self) -> bool {
