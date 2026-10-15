@@ -1854,6 +1854,18 @@ impl Session {
                 &conn.inner().current_schema(),
                 backoff,
             )
+            .map(|response| match response {
+                // INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag, as
+                // PostgreSQL answers them: the query path's default was SELECT n, and drivers read
+                // the affected count from the tag (found by the PG 18 differential, 2026-10-15).
+                Response::Query(mut results) => {
+                    if let Some(tag) = returning_tag(sql) {
+                        results.set_command_tag(tag);
+                    }
+                    Response::Query(results)
+                }
+                other => other,
+            })
         };
         r.map_err(|e| StatementFailure {
             prepared: true,
@@ -4508,6 +4520,24 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("ALTER")
         || upper.starts_with("SET ")
         || upper.starts_with("RESET ")
+}
+
+/// The completion tag, before its row count, of an INSERT, UPDATE or DELETE that returns rows
+/// (RETURNING), read from the statement's first token as [`command_tag`] reads it: `INSERT 0`,
+/// `UPDATE`, `DELETE`; None for any other statement, whose rows keep the query tag (SELECT n).
+/// Blind spot, as command_tag's: a data-modifying statement behind WITH keeps SELECT n.
+fn returning_tag(query: &str) -> Option<&'static str> {
+    let start = skip_blank(query.as_bytes(), 0)?;
+    let word: String = query[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    match word.to_ascii_uppercase().as_str() {
+        "INSERT" => Some("INSERT 0"),
+        "UPDATE" => Some("UPDATE"),
+        "DELETE" => Some("DELETE"),
+        _ => None,
+    }
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
