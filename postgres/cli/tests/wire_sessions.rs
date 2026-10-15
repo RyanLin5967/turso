@@ -3573,9 +3573,11 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
 }
 
 /// A column alias list over a `*` the walk cannot expand (a relation of another schema) leaves the
-/// columns unknown, so a parameter compared with one is refused 42P18: a CTE's column list, a FROM
-/// alias's and a view's. The alias list renamed the `*` marker away, so the relation read as having
-/// the aliased columns, untyped, and $1 fell to text (wire review 14 item 8).
+/// columns unknown, so a parameter compared with one is refused 42P18: a CTE's column list and a
+/// FROM alias's. The alias list renamed the `*` marker away, so the relation read as having the
+/// aliased columns, untyped, and $1 fell to text (wire review 14 item 8). A view's arm cannot be
+/// reached: the engine refuses a view over the attached table, and that refusal is pinned here
+/// (ruled c9c821dd8d, P4; COMPAT's views table).
 #[test]
 fn an_alias_list_over_an_unknown_star_stays_unknown() {
     let dir = Scratch::new("aliasstar");
@@ -3597,13 +3599,18 @@ fn an_alias_list_over_an_unknown_star_stays_unknown() {
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE VIEW vu(k, n) AS SELECT * FROM s.u")
-        .ok("premise: a view with a column list over s.u");
+    let view = "CREATE VIEW vu(k, n) AS SELECT * FROM s.u";
+    let refused = a.q(view).err(view);
+    assert!(
+        refused
+            .message
+            .contains("view cannot reference table in attached database"),
+        "a view over the attached table: {refused:?}, want the engine's refusal"
+    );
     let mut wrong = Vec::new();
     for sql in [
         "WITH w(k, n) AS (SELECT * FROM s.u) SELECT k FROM w WHERE n > $1",
         "SELECT k FROM (SELECT * FROM s.u) AS d(k, n) WHERE n > $1",
-        "SELECT k FROM vu WHERE n > $1",
     ] {
         let r = a.describe_statement(sql);
         if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
