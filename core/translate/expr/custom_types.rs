@@ -1475,4 +1475,40 @@ mod tests {
             );
         }
     }
+
+    /// Engine review 21 MED 10: a numeric operand's scale was bounded only by i64, so
+    /// `x / '1e-2000000000'` built 10^(2*10^9) inside one division, with no interrupt point, and
+    /// `'1e9223372036854775807' / x` overflowed i64 (a panic in a debug build, a wrapped value in a
+    /// release one). An operand outside PostgreSQL's numeric range is refused as PostgreSQL
+    /// refuses it, "value overflows numeric format", within 10 s: a literal, a bound parameter,
+    /// either side. Each runs on a thread of its own: a run that never ends is the red.
+    #[test]
+    fn a_numeric_operand_outside_postgresqls_range_is_refused_at_once() {
+        for (sql, param) in [
+            ("SELECT x / '1e-2000000000' FROM t", None),
+            ("SELECT x / ?1 FROM t", Some("1e-5000000000")),
+            ("SELECT '1e9223372036854775807' / x FROM t", None),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (owned, param) = (sql.to_string(), param.map(str::to_string));
+            std::thread::spawn(move || {
+                let got = (|| -> crate::Result<()> {
+                    let conn = open();
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")?;
+                    conn.execute("INSERT INTO t VALUES (1, 100)")?;
+                    let mut stmt = conn.prepare(&owned)?;
+                    if let Some(p) = param {
+                        stmt.bind_at(1.try_into().unwrap(), Value::build_text(p))?;
+                    }
+                    stmt.run_collect_rows().map(|_| ())
+                })();
+                let _ = tx.send(got.map_err(|e| e.to_string()));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            assert!(
+                matches!(&got, Ok(Err(m)) if m.contains("value overflows numeric format")),
+                "CLAIM: {sql} gave {got:?} (a timeout: it never finished), not PostgreSQL's refusal"
+            );
+        }
+    }
 }
