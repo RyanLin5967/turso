@@ -1,0 +1,37 @@
+# platforms.tsv -- every self-test entry point under fastest/linux, with the platform it runs on (lead order 2026-10-15,
+# Ryan's class rule: the class "a gate script or test silently inherits the host platform or layout"). One row per
+# entry point: path (relative to fastest/linux)<TAB>arguments<TAB>platform<TAB>why. run_everywhere.py runs every row
+# from the row's own directory and refuses an entry point that has no row (an allowlist: a new test must state its
+# platform). Platforms:
+#   any    must pass on every platform it is run on (macOS and Linux today); a case inside it that needs Linux says so
+#          itself and reports N/A-on-<platform> off Linux, never a pass
+#   linux  the whole file needs Linux (the why says what); off Linux it is reported N/A, never a pass
+competitors/drive.py	selftest	any	pure Python over records
+competitors/fixture.py	selftest	any	pure Python over records
+competitors/fthelp.py	selftest	any	pure Python over records
+competitors/gen_seed.py	selftest	any	pure Python over records
+competitors/pins.py	selftest	any	pure Python over records
+competitors/sched_check.py	selftest	any	pure Python over records
+competitors/smoke_table.py	selftest	any	pure Python over records
+competitors/spec_lint.py	selftest	any	pure Python over records
+competitors/stracecount.py	selftest	any	pure Python over strace text
+competitors/timedrun.py	selftest	any	pure Python over records
+competitors/timedrun_mutants.py	selftest	any	pure Python, timedrun.py mutated in memory
+gates/driver_contract.py	self-test	any	pure Python; its TracerPid cases name their platform (linux=True/False)
+gates/fixed_api_mutants.py	self-test	any	the table guard on the real files
+gates/sweeper_record.py	selftest	any	pure Python over sweeper records
+gates/warmup_conformance.py	self-test	any	pure Python with fake replayers
+profile/analyze.py	--self-test	any	pure Python over profile records
+t3/blockgate.py	self-test	any	pure Python over V3 records (testdata)
+t3/devguard.py	self-test	any	fake sysfs and lsblk; its fake device major is one the platform's dev_t keeps
+t3/foreign_cpu.py	self-test	linux	samples /proc for live processes
+t3/settle_test.sh		linux	settle.sh reads date +%s%N and Linux block-device stat layouts
+t3/summarize.py	self-test	any	pure Python over packages
+t3/t3lib_test.sh		any	fake sysfs and hooks; its Linux-only cases (/proc, mkfs.ext4, Linux device numbers) say so themselves
+t3/t3run_args_test.sh		any	t3run.sh's argument rules, run with GNU coreutils first on PATH where they exist
+t3/v3l.py	self-test	any	pure Python over V3L records
+t3/v3l_mutants.py	self-test	any	the table guard on the real files
+v3/batchgate.py	self-test testdata	any	pure Python over V3 batches (testdata)
+v3/blkflush.py	self-test	any	pure Python over blkflush traces
+v3/check.py	--self-test	any	pure Python over fire-check records; its nestloops.sh case is Linux-only and says so
+v3/nestloops.sh	--self-test	linux	GNU readlink -m, and a /var that is not a symlink (macOS's /var is /private/var)
