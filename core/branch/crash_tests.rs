@@ -1221,12 +1221,21 @@ fn verify_c1(db: &Arc<Database>, log: &C1Log, seed: &State) -> Vec<String> {
 
 /// One C1 trial. Returns (landed, violations, what was aimed, the operations that failed in the live
 /// child before the kill: its `ERR` lines).
+/// `seed_class`: the class the parent seeds the database in (`class` unless an arm reopens a log
+/// in another class, engine review 20 LOW 16); `power`: simulated power loss in the child whatever
+/// `FE_C1_POWER` says.
+#[allow(clippy::too_many_arguments)]
 fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: &str, n: u64, seed: u64, recover_kill: Option<u64>) -> (bool, Vec<String>, String, Vec<String>) {
+    c1_trial_from(exe, catalog, class, class, false, threads, point, n, seed, recover_kill)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn c1_trial_from(exe: &Path, catalog: bool, seed_class: SyncClass, class: SyncClass, power: bool, threads: usize, point: &str, n: u64, seed: u64, recover_kill: Option<u64>) -> (bool, Vec<String>, String, Vec<String>) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c1.db");
     let log_path = dir.path().join("c1.log");
     let base = {
-        let db = open_at(&path, opts(catalog, class));
+        let db = open_at(&path, opts(catalog, seed_class));
         let trunk = db.connect().unwrap();
         let base = seed_trunk(&trunk);
         let _ = trunk.fork_branch().unwrap().into_id();
@@ -1254,7 +1263,7 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
             cmd.env("FE_C1_RECOVER_ONLY", "1");
         }
         // Simulated power loss of the branch files' unsynced writes (journal.rs `lose_unsynced`).
-        if std::env::var("FE_C1_POWER").is_ok_and(|v| v == "1") {
+        if power || std::env::var("FE_C1_POWER").is_ok_and(|v| v == "1") {
             cmd.env("FE_LOSE_UNSYNCED", "1");
         }
         if let Ok(ms) = std::env::var("FE_KILL_DELAY_MS") {
@@ -1460,6 +1469,46 @@ fn c1_sigkill_at_aimed_points() {
         points.len()
     );
     assert!(landed > 0, "{summary}: no kill landed where it was aimed");
+}
+
+/// Engine review 20 LOW 16: the C1 arm a FE_LOSE_UNSYNCED run CAN discriminate at the cut windows
+/// (c6f40d8ca's "cannot discriminate" holds for cut.renamed, not for cut.dir_synced): a catalog store
+/// seeded in D1, its log reopened in D0 (raised: the D1 floor it inherited is what makes its cut and
+/// its flights sync), fuzzy checkpoints cutting the log, and a SIGKILL at `cut.dir_synced` (the
+/// syncing flight after a cut, between its directory sync and its log sync) under simulated power
+/// loss. Every acknowledged operation survives the recovery (I1-I7). Mutant `inherited_floor_dropped`
+/// (test builds only: the D0 open does not inherit D1's floor, so the cut's rewrite syncs nothing)
+/// must turn it red. Size: `FE_C1_TRIALS` (default 6).
+#[cfg(unix)]
+#[test]
+fn c1_d1_log_reopened_in_d0_survives_a_power_cut_at_cut_dir_synced() {
+    if std::env::var_os("FE_C1_CHILD").is_some() {
+        return;
+    }
+    let _s = serial();
+    let fuzzy = super::BranchCheckpoint::resolve(None, std::env::var_os("R11_SPLICE").is_some())
+        .is_ok_and(|m| m == super::BranchCheckpoint::Fuzzy);
+    assert!(fuzzy, "premise: catalog checkpoints are fuzzy in this build (the cut points are reachable)");
+    let exe = std::env::current_exe().unwrap();
+    let trials = env_u64("FE_C1_TRIALS", 6);
+    let mut rng = Rng(0x16 | 1);
+    let (mut landed, mut violations) = (0u64, Vec::new());
+    for trial in 0..trials {
+        let n = 1 + rng.below(4);
+        let (hit, bad, what, _) =
+            c1_trial_from(&exe, true, SyncClass::Fsync, SyncClass::Off, true, 4, "cut.dir_synced", n, 0x16 ^ trial, None);
+        landed += u64::from(hit);
+        for b in bad {
+            violations.push(format!("trial {trial} [{what}]: {b}"));
+        }
+    }
+    assert!(landed > 0, "premise: no kill landed at cut.dir_synced in {trials} trials");
+    assert!(
+        violations.is_empty(),
+        "CLAIM: a D1 log reopened in D0 lost acknowledged operations to a power cut at cut.dir_synced \
+         ({landed} of {trials} landed):\n{}",
+        violations.join("\n")
+    );
 }
 
 // ---- E3: create, kill -9, restart, connect by name from a new process (PREREG M1 exit 5) ----
