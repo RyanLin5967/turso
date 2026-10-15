@@ -364,6 +364,51 @@ def _self_test(d):
     cases.append(("MED 8: a live record whose claims go back in time is REFUSED (rc 2)",
                   _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": [0, 2 * S, S], "stop_at": None,
                                          "warm_ops": 3, "capped": None}) == 2), ""))
+    # review 6 MED 3: a record that cannot be written is a refusal (rc 2), never a mismatch's rc 1 or a traceback
+    cases.append(("MED 3: an unwritable --record path is REFUSED (rc 2)",
+                  _safe(lambda: run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good},
+                                    record=os.path.join(d, "no-such-dir", "record.json"))[0] == 2), ""))
+    # review 6 LOW 13: the verdict is about the bytes it hashed, so run() replays those bytes (the hashed realpath),
+    # refuses a bare name (hashed under the cwd, run through PATH), and re-hashes every role after its replays
+    def variant(name, extra):
+        """the correct fake with EXTRA python run first, each time it runs"""
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(open(good).read().replace("import sys\n", "import sys\n" + extra, 1))
+        os.chmod(p, 0o755)
+        return p
+    pathdir = os.path.join(d, "bin")
+    os.makedirs(pathdir)
+    shutil.copyfile(fake(d, "gt-onpath", cmp=">"), os.path.join(pathdir, "drv"))
+    os.chmod(os.path.join(pathdir, "drv"), 0o755)
+    shutil.copyfile(fake(d, "good-cwd"), os.path.join(d, "drv"))
+    os.chmod(os.path.join(d, "drv"), 0o755)
+    cwd, path0 = os.getcwd(), os.environ.get("PATH", "")
+    try:
+        os.chdir(d)
+        os.environ["PATH"] = pathdir + os.pathsep + path0
+        rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": "drv"})
+    finally:
+        os.chdir(cwd)
+        os.environ["PATH"] = path0
+    cases.append(("LOW 13: a bare driver name (./drv hashed, PATH's drv run) is REFUSED (rc 2)",
+                  rc == 2 and "bare name" in rep[-1], rep[-1]))
+    selfmod = variant("selfmod", "open(sys.argv[0], 'a').write('# ran\\n')\n")
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": selfmod})
+    cases.append(("LOW 13: a driver whose file changes between its hash and its replays is REFUSED (rc 2)",
+                  rc == 2 and "changed" in rep[-1], rep[-1]))
+    link = os.path.join(d, "fp-link")
+    swapper = variant("swapper", "import os\n"
+                      f"os.symlink({fake(d, 'gt-swapped', cmp='>')!r}, {link + '.tmp'!r}); os.replace({link + '.tmp'!r}, {link!r})\n")
+    os.symlink(swapper, link)
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": link})
+    cases.append(("LOW 13: a role given as a symlink is replayed at the realpath it was hashed at, not the link "
+                  "re-pointed mid-run (rc 0)", rc == 0, rep[-1]))
+    alias = os.path.join(d, "alias-of-bbload")
+    os.symlink(good_b, alias)
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": alias})
+    cases.append(("LOW 13: a symlink to another role's driver is REFUSED (rc 2, the same driver)",
+                  rc == 2 and "same" in rep[-1], rep[-1]))
     bad = [n for n, ok, _ in cases if not ok]
     for n, ok, last in cases:
         print(f"WARMUP-CONFORMANCE self-test {'PASS' if ok else 'FAIL'}: {n}" + ("" if ok else f" ({last})"))
