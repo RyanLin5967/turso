@@ -531,7 +531,7 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
         b.insert("quiet", u64::from(t0 == base && settled));
-        if cell.starts_with("wtail_") {
+        if cell.starts_with("wtail_") || cell.starts_with("wfresh_") {
             // The written tail's premise and its free-table probes, from the open's own stats.
             let st = opened.branch_open_stats();
             b.insert("touched_below_hw", st.touched_below_hw);
@@ -609,6 +609,33 @@ fn written_tail(built: &mut Built) {
         trunk.create_branch(&name).unwrap();
         let c = db.connect_named(&name).unwrap();
         exec(&c, &format!("UPDATE t SET v = 'n{i}' WHERE id = {}", 1 + i % 50));
+    }
+    built.incarnation = db.incarnation;
+}
+
+/// The fresh written tail (L4 2b, the case the first-touch rule settles with no probe): over a
+/// built database, first writes on `WTAIL` populated branches, then their deletes, checkpointed,
+/// so the checkpoint lists their pages' slots free; then, in the log only, `WTAIL` creates, each
+/// with a first write and a rewrite, which take those slots from the free list. No Commit of the
+/// tail is to a branch the open leaves on disk (none is parked). Closed when this returns.
+fn fresh_written_tail(built: &mut Built) {
+    let db = open_at(&built.path);
+    let trunk = db.connect().unwrap();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'p{i}' WHERE id = {}", 1 + i % 50));
+    }
+    for i in 0..WTAIL {
+        db.drop_branch(&format!("pop-{i}")).unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    for i in 0..WTAIL {
+        let name = format!("wnew-{i}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'n{i}' WHERE id = {}", 1 + i % 50));
+        exec(&c, &format!("UPDATE t SET v = 'm{i}' WHERE id = {}", 1 + i % 50));
     }
     built.incarnation = db.incarnation;
 }
@@ -2001,10 +2028,10 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "wtail_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "wtail_n10" | "wfresh_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
-            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" | "wtail_n1e4" => (N_LARGE, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" | "wtail_n1e4" | "wfresh_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -2020,6 +2047,8 @@ fn budget_child() {
         let mut built = build(&spec, n, large, named);
         if spec.starts_with("wtail_") {
             written_tail(&mut built);
+        } else if spec.starts_with("wfresh_") {
+            fresh_written_tail(&mut built);
         }
         // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
         // Mach traps per hold inside the measured mutex otherwise).
@@ -3335,6 +3364,42 @@ fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
         }
     }
     assert!(failures.is_empty(), "LEAP L4 not reached at a written tail's open (budget: 1 query, the meta row):\n{failures}");
+}
+
+/// LEAP L4 2b, the case its first-touch rule settles: an open over a tail of creates, first writes
+/// and rewrites that take slots the checkpoint lists free (`fresh_written_tail`; cells `wfresh_n10`,
+/// `wfresh_n1e4`) reads the catalog for its meta row only. Premise: the tail touched at least
+/// `WTAIL` slots below the checkpoint's high-water mark. Red at bcac1c6f2 (one probe per such slot)
+/// and under mutant `l4_free_probe_at_open`.
+#[test]
+fn leap_l4_an_open_after_a_fresh_written_tail_reads_only_the_catalog_meta_row() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wfresh_n10", "wfresh_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["recovery"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 1 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probes, {} touched slots below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 2b not reached at a fresh written tail's open (budget: 1 query, the meta row):\n{failures}");
 }
 
 /// The L4 memory ruling (DECISIONS.md 2026-10-06T02:55Z (i): "about 50-100 MB at 10^6 live branches
