@@ -2740,7 +2740,10 @@ mod tests {
         }
         run(&conn, "CREATE TABLE s0.w (x int default 1, y int)");
         for i in 1..12 {
-            run(&conn, &format!("CREATE TABLE s{i}.w (p{i} int, q int, r int default 9)"));
+            run(
+                &conn,
+                &format!("CREATE TABLE s{i}.w (p{i} int, q int, r int default 9)"),
+            );
         }
         run(&conn, "INSERT INTO w VALUES (DEFAULT, 2)");
         let rows = |sql: &str| -> Vec<String> {
@@ -2748,7 +2751,12 @@ mod tests {
             stmt.run_collect_rows()
                 .unwrap()
                 .iter()
-                .map(|r| r.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join("|"))
+                .map(|r| {
+                    r.iter()
+                        .map(|v| format!("{v}"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
                 .collect()
         };
         assert_eq!(rows("SELECT x, y FROM s0.w"), ["1|2"]);
