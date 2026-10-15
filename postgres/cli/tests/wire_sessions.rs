@@ -3169,6 +3169,22 @@ fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
     }
 }
 
+/// CASE, COALESCE, GREATEST, LEAST and NULLIF over integers are int4, as PostgreSQL 18.6 types
+/// them (recorded, artie raw loud-20261015/pg18-diff/pg18-colnames.out: oids 23); they were
+/// announced text (25), so a driver read a number as a string.
+#[test]
+fn conditional_expressions_over_integers_are_int4() {
+    let dir = Scratch::new("condint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let sql = "SELECT CASE WHEN true THEN 1 END, coalesce(1, 2), greatest(1, 2), least(1, 2), \
+               nullif(1, 2)";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23; 5]), "{sql}");
+    assert_eq!(r.rows, vec![vec![t("1"), t("1"), t("2"), t("1"), t("1")]], "{sql}");
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
