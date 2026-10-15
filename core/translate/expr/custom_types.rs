@@ -1885,6 +1885,105 @@ mod tests {
         }
     }
 
+    /// Runs `steps` in order on a fresh connection, on a thread of its own: the first error, the last
+    /// statement's first column as text, or `Err("timeout")` after 10 s (a red: it never finished).
+    fn run_bounded(steps: Vec<String>) -> Result<Option<String>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = (|| -> crate::Result<Option<String>> {
+                let conn = open();
+                let mut last = None;
+                for sql in &steps {
+                    let rows = conn.prepare(sql)?.run_collect_rows()?;
+                    last = rows.first().and_then(|r| r.first()).and_then(|v| v.to_text().map(str::to_string));
+                }
+                Ok(last)
+            })();
+            let _ = tx.send(got.map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| Err("timeout".to_string()))
+    }
+
+    /// Review 0e8b1cf18..0a4a127a1 numeric HIGH (DECISIONS d1a8dcb982): numeric(p, s) took any
+    /// precision and scale, and an insert rescaled to the scale BEFORE the precision check, so
+    /// numeric(2000000000, 2000000000) asked one rescale for 2*10^9 digits. PostgreSQL refuses p
+    /// outside 1..1000 and s outside -1000..1000, at CREATE TABLE and at a cast, with 22023 (PG 18.6's
+    /// messages for this exact SQL: artie raw frontier/fastest/lanes/engine/raw/
+    /// pg18-numeric-typmod-range.txt 7a1d98f8d2, never ours). Control: numeric(1000, 1000) holds 0.5.
+    #[test]
+    fn a_numeric_type_outside_postgresqls_typmod_range_is_refused() {
+        let table = |p: &str| {
+            vec![
+                format!("CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric({p})) STRICT"),
+                "INSERT INTO a VALUES (1, 1)".to_string(),
+            ]
+        };
+        let mut bad = Vec::new();
+        for (steps, want) in [
+            (table("1001, 0"), "NUMERIC precision 1001 must be between 1 and 1000"),
+            (table("0, 0"), "NUMERIC precision 0 must be between 1 and 1000"),
+            (table("1000, 1001"), "NUMERIC scale 1001 must be between -1000 and 1000"),
+            (table("2000000000, 2000000000"), "NUMERIC precision 2000000000 must be between 1 and 1000"),
+            (vec!["SELECT CAST(1 AS numeric(1001, 0))".to_string()], "NUMERIC precision 1001 must be between 1 and 1000"),
+            (vec!["SELECT CAST(1 AS numeric(1000, 1001))".to_string()], "NUMERIC scale 1001 must be between -1000 and 1000"),
+        ] {
+            let got = run_bounded(steps.clone());
+            if !matches!(&got, Err(m) if m.contains(want)) {
+                bad.push(format!("{steps:?} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        let control = run_bounded(vec![
+            "CREATE TABLE w(id INTEGER PRIMARY KEY, x numeric(1000, 1000)) STRICT".to_string(),
+            "INSERT INTO w VALUES (1, '0.5')".to_string(),
+            "SELECT count(*) FROM w".to_string(),
+        ]);
+        assert_eq!(control, Ok(Some("1".to_string())), "premise: numeric(1000, 1000) does not hold 0.5, as PostgreSQL's does");
+        assert!(bad.is_empty(), "CLAIM: a numeric typmod outside PostgreSQL's range was not refused as PostgreSQL refuses it: {bad:?}");
+    }
+
+    /// Review 0e8b1cf18..0a4a127a1 numeric MED 1 (DECISIONS d1a8dcb982): a product's scale was the sum
+    /// of the display scales uncapped (PostgreSQL caps it at 16383), and add, sub and mul did not
+    /// refuse a result past 131072 integer digits (PostgreSQL: 22003, "value overflows numeric
+    /// format"). Expected values are PG 18.6's for this exact SQL over these tables (artie raw
+    /// pg18-numeric-typmod-range.txt 7a1d98f8d2): t.x = 1, u.x = 10, both numeric(10, 2).
+    #[test]
+    fn a_numeric_result_outside_postgresqls_range_is_refused() {
+        let setup = || {
+            vec![
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                "INSERT INTO t VALUES (1, 1)".to_string(),
+                "CREATE TABLE u(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                "INSERT INTO u VALUES (1, 10)".to_string(),
+            ]
+        };
+        let overflow = "value overflows numeric format";
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT '0e-16383' * x FROM t", Ok(16385usize)),
+            ("SELECT '1e131070' * x FROM u", Ok(131075)),
+            ("SELECT '1e131071' * x FROM u", Err(overflow)),
+            ("SELECT ('9e131071' * x) + ('9e131071' * x) FROM t", Err(overflow)),
+            ("SELECT ('-9e131071' * x) - ('9e131071' * x) FROM t", Err(overflow)),
+        ] {
+            let mut steps = setup();
+            steps.push(sql.to_string());
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(Some(v)), Ok(len)) => v.len() == *len,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                let shown = match &got {
+                    Ok(Some(v)) => format!("a value of {} characters ({}...)", v.len(), v.chars().take(24).collect::<String>()),
+                    other => format!("{other:?}"),
+                };
+                bad.push(format!("{sql} gave {shown}, not PostgreSQL 18's {want:?} (a length, or an error)"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric result outside PostgreSQL's range diverged: {bad:?}");
+    }
+
     /// Found fixing Codex C25 HIGH 3: a numeric product's scale is the sum of its operands' DISPLAY
     /// scales in PostgreSQL (numeric.c `mul_var`'s rscale = dscale1 + dscale2, each at least 0), but
     /// bigdecimal's product of a zero is a plain 0 and a negative-scale operand subtracts from the
