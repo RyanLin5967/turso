@@ -193,6 +193,101 @@ struct Shared {
     /// How long a claim or a delete waits on `in_use`: IN_USE_WAIT (a field so a unit test can
     /// shorten it).
     in_use_wait: std::time::Duration,
+    /// Each live session's interrupt flags by its BackendKeyData (process id, secret key), for a
+    /// CancelRequest on another connection to stop its statement.
+    cancels: Mutex<std::collections::HashMap<(i32, i32), std::sync::Weak<Interrupts>>>,
+    /// The next session's process id.
+    next_pid: std::sync::atomic::AtomicI32,
+}
+
+/// A session's requests to stop its running statement: a CancelRequest, and SET statement_timeout's
+/// deadline. The engine reads them through each of the session's connections' progress handler
+/// (every PROGRESS_OPS virtual-machine steps), and stops the statement with an interrupt (57014).
+/// A cancel that arrives between statements is dropped, as PostgreSQL drops it.
+struct Interrupts {
+    cancel: std::sync::atomic::AtomicBool,
+    /// The running statement's deadline, in microseconds since `base`; 0 none.
+    deadline_us: AtomicU64,
+    base: std::time::Instant,
+}
+
+/// Virtual-machine steps between two reads of a session's [`Interrupts`].
+const PROGRESS_OPS: u64 = 1000;
+
+thread_local! {
+    /// Why this thread's last statement was interrupted: 1 a cancel, 2 statement_timeout (read by
+    /// `engine_info` for PostgreSQL's message).
+    static INTERRUPT_CAUSE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+impl Interrupts {
+    fn new() -> Self {
+        Self {
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            deadline_us: AtomicU64::new(0),
+            base: std::time::Instant::now(),
+        }
+    }
+
+    /// A statement starts: earlier cancels are dropped, and its deadline set (0 ms none).
+    fn begin(&self, timeout_ms: u64) -> InterruptsArmed<'_> {
+        self.cancel.store(false, Ordering::Relaxed);
+        let deadline = match timeout_ms {
+            0 => 0,
+            ms => (self.base.elapsed().as_micros() as u64)
+                .saturating_add(ms.saturating_mul(1000))
+                .max(1),
+        };
+        self.deadline_us.store(deadline, Ordering::Relaxed);
+        INTERRUPT_CAUSE.with(|c| c.set(0));
+        InterruptsArmed(self)
+    }
+
+    /// The progress handler's question: stop the running statement?
+    fn should_stop(&self) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            INTERRUPT_CAUSE.with(|c| c.set(1));
+            return true;
+        }
+        let deadline = self.deadline_us.load(Ordering::Relaxed);
+        if deadline != 0 && self.base.elapsed().as_micros() as u64 >= deadline {
+            INTERRUPT_CAUSE.with(|c| c.set(2));
+            return true;
+        }
+        false
+    }
+}
+
+/// The statement's span: its end drops a cancel that came too late and clears the deadline.
+struct InterruptsArmed<'a>(&'a Interrupts);
+
+impl Drop for InterruptsArmed<'_> {
+    fn drop(&mut self) {
+        self.0.deadline_us.store(0, Ordering::Relaxed);
+        self.0.cancel.store(false, Ordering::Relaxed);
+    }
+}
+
+/// pgwire's CancelRequest handler: the named session's statement is asked to stop.
+struct CancelSessions(Arc<Shared>);
+
+#[async_trait]
+impl pgwire::api::cancel::CancelHandler for CancelSessions {
+    async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        let Some(secret) = request.secret_key.as_i32() else {
+            return;
+        };
+        let target = self
+            .0
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(request.pid, secret))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(interrupts) = target {
+            interrupts.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// How long a delete waits for the session on its branch to go, and a switch for a delete of its
@@ -223,6 +318,8 @@ impl Shared {
             in_use_freed: std::sync::Condvar::new(),
             in_use_waiters: AtomicUsize::new(0),
             in_use_wait: IN_USE_WAIT,
+            cancels: Mutex::new(std::collections::HashMap::new()),
+            next_pid: std::sync::atomic::AtomicI32::new(1),
         }
     }
 
@@ -533,7 +630,7 @@ async fn serve_session(
     let simple_query_handler = session.clone();
     let extended_query_handler = session.clone();
     let copy_handler = Arc::new(NoopHandler);
-    let cancel_handler = Arc::new(NoopHandler);
+    let cancel_handler = Arc::new(CancelSessions(session.shared.clone()));
     let error_handler = NoopHandler;
     let result = loop {
         let msg = if matches!(
@@ -818,7 +915,12 @@ struct Session {
     /// read them without the session's lock (wire review 16 item 12).
     lock_timeout_ms: AtomicU64,
     min_messages: std::sync::atomic::AtomicU8,
+    /// The session's stop requests, which its connections' progress handlers read.
+    interrupts: Arc<Interrupts>,
+    /// The session's BackendKeyData: (process id, secret key).
+    key: (i32, i32),
 }
+
 
 /// A statement as Parse stored it: its text, and the branch call the text is, read once, at Parse
 /// ([`branch_call`]). Bind, Describe and Execute read the call from here: each read the text
@@ -996,13 +1098,32 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
+        use std::hash::BuildHasher;
+        let interrupts = Arc::new(Interrupts::new());
+        let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
+        // A secret from std's randomly seeded hasher (no syscall past the thread's first): only a
+        // client that read the BackendKeyData can cancel the session.
+        let secret = std::collections::hash_map::RandomState::new().hash_one(pid) as i32;
+        shared
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pid, secret), Arc::downgrade(&interrupts));
         Self {
             shared,
             state: Mutex::new(SessionState::default()),
             query_parser: Arc::new(ParsedQueryParser),
             lock_timeout_ms: AtomicU64::new(0),
             min_messages: std::sync::atomic::AtomicU8::new(7),
+            interrupts,
+            key: (pid, secret),
         }
+    }
+
+    /// A connection the session opened stops its statement when the session's [`Interrupts`] ask.
+    fn arm(&self, conn: &Arc<turso_core::Connection>) {
+        let interrupts = self.interrupts.clone();
+        conn.set_progress_handler(PROGRESS_OPS, Some(Box::new(move || interrupts.should_stop())));
     }
 
     /// How long a statement waits for a lock: the session's SET lock_timeout, else (unset, or 0,
@@ -1032,6 +1153,7 @@ impl Session {
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
         let conn = PgConnection::new(self.shared.db.connect().map_err(|e| engine_info(&e))?);
+        self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
     }
@@ -1150,7 +1272,9 @@ impl Session {
                 ));
             }
         };
-        self.state().branch = Some((branch.to_string(), PgConnection::new(conn)));
+        let conn = PgConnection::new(conn);
+        self.arm(conn.inner());
+        self.state().branch = Some((branch.to_string(), conn));
         Ok(())
     }
 
@@ -1373,6 +1497,8 @@ impl Session {
         // The session's lock wait and message level, as its last SET left them.
         self.lock_timeout_ms
             .store(conn.lock_timeout_ms(), Ordering::Relaxed);
+        // A CancelRequest or statement_timeout stops this statement (dropped at its end).
+        let _interrupts = self.interrupts.begin(conn.statement_timeout_ms());
         self.min_messages
             .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
@@ -2008,6 +2134,7 @@ impl Session {
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
                         let next = PgConnection::new(opened);
+                        self.arm(next.inner());
                         next.adopt_session_of(conn);
                         st.branch = Some((name.clone(), next));
                     }
@@ -2032,6 +2159,7 @@ impl Session {
                         }
                     };
                     let next = PgConnection::new(opened);
+                    self.arm(next.inner());
                     next.adopt_session_of(conn);
                     st.branch.replace((name.clone(), next))
                 };
@@ -2152,9 +2280,15 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// The session's branch is free once its connection is closed.
+    /// The session's branch is free once its connection is closed, and a CancelRequest can no
+    /// longer name it.
     fn drop(&mut self) {
         self.end();
+        self.shared
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -2845,6 +2979,13 @@ fn fatal(code: &str, message: &str) -> PgWireError {
 /// The SQLSTATE an engine error is reported with. Lock contention is PostgreSQL's
 /// lock_not_available, and a stale snapshot its serialization_failure: both tell a client to retry.
 fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
+    if let LimboError::Interrupt = e {
+        let message = match INTERRUPT_CAUSE.with(|c| c.get()) {
+            2 => "canceling statement due to statement timeout",
+            _ => "canceling statement due to user request",
+        };
+        return error("57014", message.to_string());
+    }
     error(sqlstate(e), e.to_string())
 }
 
@@ -3009,6 +3150,10 @@ impl NoopStartupHandler for Session {
         }
         provider.search_path = turso_pg::DEFAULT_SEARCH_PATH.to_string();
         provider
+    }
+
+    fn backend_key(&self) -> Option<(i32, pgwire::messages::startup::SecretKey)> {
+        Some((self.key.0, pgwire::messages::startup::SecretKey::I32(self.key.1)))
     }
 
     async fn post_startup<C>(
