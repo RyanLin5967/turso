@@ -8,3 +8,8 @@ definitions (mk_blk_testdata.py in the V3 successor's scratchpad, committed with
 F3 trace's wholly-in-window events carry the same fds per arm on all 12 cells of that run. Input to blkflush.py
 self-test (tenth review HIGH 1): report() on it must give nosync25 0 syncs and every gated window its own sync,
 and dropping one gated window's own sync, where a neighbour's event overlaps that window, must show.
+
+V3 review 11 LOW 1 (appended 2026-10-15): sync_fds.json gains `"sync_fds_overflow": false`, since blkflush's
+sync_fds_of now goes on only on an explicit false (it refused only `true`). It states that the DERIVED map is
+whole, which its derivation from the strace guarantees; it is not a record of that run's probe, which recorded no
+sync_fds. No other byte of the map changed.

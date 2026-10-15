@@ -22,6 +22,10 @@
 #              rc 0; fourth lane review LOW 14). That is the replay path only: the live loops' warm-ups are compared
 #              by live_check once the drivers record them (review 5 MED 8, LOUD-OWED; review 6 LOW 17), so rc 0 here
 #              does not yet mean an equal warm-up in the credited runs
+#              Every timed run, ours and the competitors', runs under the ONE shared tracer sweeper (gates/sweeper.sh,
+#              read by gates/sweeper_record.py; the lead's MED 12 ruling): ours through t3lib.sh ours_timed_exec, its
+#              timed.json recording sweeper_cpu_s over fastest_profile's whole process (its measured windows' realtime
+#              bounds are Rust, HELD: LOUD-OWED, and no ours-vs-competitor timed ratio credits until then)
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
@@ -130,6 +134,11 @@ L=$SRC/fastest/linux
 # drift_ok, fslist_ok, registered_ok, plp_listed, device_make, device_wipe: checks and the device branch only a real
 # run reaches, tested by t3lib_test.sh
 [ -f "$L/t3/t3lib.sh" ] && source "$L/t3/t3lib.sh"
+# the ONE tracer sweeper every timed run uses, ours and the competitors' alike (the lead's MED 12 ruling, DECISIONS
+# 2026-10-15T04:21:48Z: SAME INSTRUMENT FOR EVERY SYSTEM): sweeper_start / sweeper_wait, run by t3lib.sh
+# ours_timed_exec (which sources it again in the exec'd bash it runs ours under); NEEDS catches a missing file and
+# preflight refuses unless its functions are defined here
+[ -f "$L/gates/sweeper.sh" ] && source "$L/gates/sweeper.sh"
 SETTLE_DEV=""
 if [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
@@ -192,6 +201,7 @@ finish() {
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
 NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
   t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh t3/v3l_mutants.py gates/warmup_conformance.py
+  gates/sweeper.sh gates/sweeper_record.py
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -207,6 +217,10 @@ preflight() {
   head=$(git -C "$SRC" rev-parse HEAD) || { echo "REFUSED: $SRC is not a git checkout"; return 2; }
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
+  # the shared sweeper is loaded, not only committed (MED 12 ruling): every timed run, ours included, runs under it
+  declare -F sweeper_start sweeper_wait ours_timed_run ours_timed_exec ours_timed_record > /dev/null ||
+    { echo "REFUSED: the shared sweeper (gates/sweeper.sh: sweeper_start, sweeper_wait) or t3lib.sh's ours_timed_exec /"\
+           "ours_timed_record is not defined: ours' timed runs would go unswept (MED 12 ruling)"; return 2; }
   # each driver's source has the --warmup-replay path envchecks runs, so a SHA without a port refuses here, not after
   # deps and up to 2 h of build (review 6 LOW 18; envchecks stays the behavioural check)
   for f in fastest/linux/competitors/loadgen/bbload.c fastest/linux/competitors/baselines/clonebench.c \
@@ -603,9 +617,11 @@ run_cell() {
     export FASTEST_CELL=$id
     case $system in
       ours)
-        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
-        timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
-          --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
+        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3); the run
+        # goes under the shared sweeper, as every competitor timed run does (MED 12 ruling; t3lib.sh ours_timed_exec)
+        ours_timed_exec "$d" timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
+          --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
+          > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
@@ -620,6 +636,8 @@ run_cell() {
     esac
     rc=$?
     unset FASTEST_CELL
+    # its timed.json: sweeper_cpu_s by the one reader (summarize re-derives it; a refused record fails the package there)
+    [ "$system" = ours ] && { ours_timed_record "$d" "$L/gates/sweeper_record.py" >> "$d/adapter.txt" 2>&1 || true; }
     touch "$d/.stop"
     wait "$sampler"
     python3 -B "$L/t3/foreign_cpu.py" decide "$d/foreign.tsv" --json "$d/void.json" > /dev/null
@@ -647,6 +665,9 @@ selftests() {
   timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
   timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
     { echo "self-test warmup_conformance FAILED"; return 1; }
+  # the shared sweeper's one reader, every refusal planted (MED 12 ruling; t3lib_test.sh runs ours_timed_run on /proc)
+  timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest > "$OUT/sweeper-record-selftest.txt" 2>&1 ||
+    { echo "self-test sweeper_record FAILED"; return 1; }
   # v3l.py's mutant table: its own guard, then every mutant, each of which must be KILLED (review 5 MED 5: nothing ran it)
   timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test > "$OUT/v3l-mutants-selftest.txt" 2>&1 ||
     { echo "self-test v3l_mutants FAILED"; return 1; }

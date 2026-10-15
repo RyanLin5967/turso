@@ -163,7 +163,9 @@ teardown_nest() {
     # a stray), would hold the level busy: detach it first, mounted ones above were unmounted in the previous pass
     # the listing first, on its own: this script has no pipefail, so a pipe would hide a failing losetup
     if ll=$(loop_list); then
-      strays=$(printf '%s\n' "$ll" | awk -v b="$mp/" '{ d = $1; $1 = ""; sub(/^ +/, ""); if (index($0, b) == 1) print d }')
+      # nestloops.sh's (V3 review 13 item 20); a filter that fails is a failure, never "no stray" (item 10)
+      strays=$(printf '%s\n' "$ll" | nest_level_match "$mp") ||
+        { echo "teardown n$k: cannot filter the loops (the matcher failed)"; rc=1; strays=""; }
     else
       echo "teardown n$k: cannot list the loops (losetup failed)"; rc=1; strays=""
     fi

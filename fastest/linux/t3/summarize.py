@@ -22,6 +22,11 @@ three-driver conformance record (warmup-conformance.json, rc 0) naming this pack
 fastest_profile by sha256 (binaries.txt), and with no competitor warm-up claim judged out of time order
 (warmup_backsteps 0 in either loop mode; the loop is reported in runs[].warmup_loops): otherwise a parity refusal and
 a loud_owed line (review 5 MED 6; PREREG annex A23).
+The shared sweeper (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): every measured run's timed.json
+records sweeper_cpu_s (ours: t3lib.sh ours_timed_record, re-derived here from the run's own timed.tracer.tsv by
+gates/sweeper_record.py; a competitor: each timed.json timedrun.py wrote); a missing or refused one is a parity
+refusal. sweeper_creditable is true only when every measured run's sweeper window is its measured one: ours' is its
+whole process until fastest_profile stamps its windows (Rust, HELD), a loud_owed line until then.
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
 VOID fails), the A16 plants re-derived on its real BEFORE record all fire (blockgate-plants.json stored and
 re-run), the before-to-after drift was taken (batchgate.py drift; REFUSED fails; a VOID is published, not a gate on
@@ -215,12 +220,15 @@ def run_parity(d, system):
             j = json.load(open(os.path.join(d, "result", "summary.json")))
         except (OSError, ValueError):
             j = {}
+        cpu, win, sw = ours_sweeper(d)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
-                "ops_total_asked": j.get("ops_total_asked")}
+                "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
+                "sweeper_problems": sw}
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
     # the validated rule that also accepts a run ended by the registered cap with >= 1000 ok ops (PREREG :212,
     # "completed with reduced n"; fourth lane review MED 4); summarize compares the warm-up rule and N to the plan.
     rules, ops, verdicts, reduced, seen, backsteps, loops = [], [], [], {}, set(), [], []
+    sweepers, sw = [], []  # MED 12 ruling: each timed.json's sweeper_cpu_s (timedrun.py's, over its measured window)
     for t in sorted(glob.glob(os.path.join(d, "result", "cells", "*", "timed", "summary.json"))):
         cell = os.path.basename(os.path.dirname(os.path.dirname(t)))
         try:
@@ -237,6 +245,12 @@ def run_parity(d, system):
         loops.append(j.get("loop"))
         seen.add(cell)
         verdicts.append((cell, "no timed.json" if tj is None else tj.get("verdict")))
+        if tj is not None:
+            x = tj.get("sweeper_cpu_s")
+            sweepers.append(x)
+            if type(x) not in (int, float) or x < 0:
+                sw.append(f"timed run {cell}: timed.json sweeper_cpu_s {x!r}, not a CPU time (the shared sweeper's "
+                          "record)")
         if j.get("capped") and isinstance(j.get("measured_ops"), int):
             reduced[cell] = j["measured_ops"]
     # every cell the run said it would produce has its timed run (fourth lane review LOW 24): run_system.sh writes
@@ -249,7 +263,46 @@ def run_parity(d, system):
     except OSError:
         missing = ["no expected-cells.txt: the cells this run had to produce are unknown"]
     return {"warmup_rules": rules, "ops_measured": ops, "timed_verdicts": verdicts, "reduced_n": reduced or None,
-            "expected_missing": missing, "warmup_backsteps": backsteps, "warmup_loops": loops}
+            "expected_missing": missing, "warmup_backsteps": backsteps, "warmup_loops": loops,
+            "sweeper_cpu_s": sweepers, "sweeper_windows": ["measured"] * len(sweepers), "sweeper_problems": sw}
+
+
+GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
+
+
+def ours_sweeper(d):
+    """The lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z, SAME INSTRUMENT FOR EVERY SYSTEM): ours' timed.json
+    (t3lib.sh ours_timed_record), its sweeper_cpu_s RE-DERIVED from the run's own timed.tracer.tsv over the run's own
+    window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer).
+    Returns (sweeper_cpu_s or None, sweeper_window or None, the refusals)."""
+    try:
+        tj = json.load(open(os.path.join(d, "timed.json")))
+    except (OSError, ValueError):
+        return None, None, ["no readable timed.json: the shared sweeper's record of this timed run is missing"]
+    if not isinstance(tj, dict):
+        return None, None, ["timed.json is not a record: the shared sweeper's record is unreadable"]
+    win = tj.get("sweeper_window")
+    try:
+        sys.path.insert(0, GATES)
+        import sweeper_record  # noqa: E402
+    except ImportError:
+        return None, win, ["gates/sweeper_record.py cannot be imported: the sweeper's record cannot be re-derived"]
+    finally:
+        sys.path.remove(GATES)
+    try:
+        lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
+    except OSError:
+        return None, win, ["no timed.tracer.tsv: the shared sweeper's record of this timed run is missing"]
+    r, why = sweeper_record.sweeper_record(lines, tj.get("t0"), tj.get("t1"))
+    if r is None:
+        return None, win, ["the sweeper record is refused: " + "; ".join(why)]
+    bad = []
+    if tj.get("sweeper_cpu_s") != r["sweeper_cpu_s"]:
+        bad.append(f"timed.json says sweeper_cpu_s {tj.get('sweeper_cpu_s')!r}, its own record gives "
+                   f"{r['sweeper_cpu_s']!r}")
+    if win != "process":
+        bad.append(f"timed.json names the sweeper window {win!r}; ours' timed run sweeps its whole process ('process')")
+    return (r["sweeper_cpu_s"] if not bad else None), win, bad
 
 
 def conformance_problems(out):
@@ -344,6 +397,7 @@ def summarize(out, sha, dry, manifest):
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
     warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
+    sweeper_bad = []  # every sweeper refusal (MED 12 ruling): sweeper_creditable is derived from them and the windows
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -401,6 +455,10 @@ def summarize(out, sha, dry, manifest):
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
             for x in r.get("expected_missing") or []:
                 parity.append(f"{fs}/{cell}: {x}")
+            # MED 12 ruling: the shared sweeper's cost is known for every timed run (ours re-derived, theirs read)
+            for x in r.get("sweeper_problems") or []:
+                parity.append(f"{fs}/{cell}: sweeper (MED 12): {x}")
+                sweeper_bad.append(parity[-1])
             # A23: no claim judged out of time order, in either loop mode (the lead's ruling, DECISIONS 0be36a068b);
             # the loop is reported in runs[].warmup_loops, never used to excuse one
             for tcell, b in r.get("warmup_backsteps") or []:
@@ -460,6 +518,16 @@ def summarize(out, sha, dry, manifest):
     summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
+    # MED 12 ruling: an ours-vs-competitor timed ratio credits only when every measured run's sweeper_cpu_s is known
+    # over the same kind of window. Ours' spans fastest_profile's whole process until it stamps its measured windows'
+    # realtime bounds (Rust, HELD), so while any run's window is "process" nothing credits and the gap is loud
+    wins = [x for r in runs if r["measured"] for x in r.get("sweeper_windows") or [None]]
+    summary["sweeper_creditable"] = bool(wins) and not sweeper_bad and all(x == "measured" for x in wins)
+    if "process" in wins:
+        summary["loud_owed"].append("ours' sweeper_cpu_s spans fastest_profile's whole process (setup and warm-up "
+                                    "included), not its measured windows as the competitors' does: fastest_profile "
+                                    "must stamp those windows' realtime bounds (Rust, HELD) before an "
+                                    "ours-vs-competitor timed ratio credits (MED 12 ruling)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
@@ -550,6 +618,24 @@ def self_test():
 
     SHAS = {"bbload": "b" * 64, "clonebench": "c" * 64, "fastest_profile": "f" * 64}
 
+    def sweeper_files(a1, kind="ok"):
+        """ours' timed-run records under the shared sweeper (the lead's MED 12 ruling; t3lib.sh ours_timed_run and
+        ours_timed_record): timed.tracer.tsv in gates/sweeper.sh's format and timed.json. By hand: sweeps every 0.05 s
+        from 100.00 with cpu = index at clk_tck 100; the window [100.1, 100.3] is bracketed by the sweeps at 100.10
+        (cpu 2) and 100.30 (cpu 6): 4 ticks / 100 = 0.04 s. kind: ok, None (no timed.json), nice0 (the reader refuses
+        the record), stored (timed.json says 0.5, not the 0.04 its record gives), notracer (no timed.tracer.tsv)"""
+        if kind is None:
+            return
+        nice = 0 if kind == "nice0" else 19
+        if kind != "notracer":
+            w(f"{a1}/timed.tracer.tsv", f"roles cmd=500 srv=none tree=children\nsweeper pid=600 nice={nice} clk_tck=100\n"
+              + "".join(f"SWEEP {'start' if i == 0 else 'mid'} {100.0 + 0.05 * i:.6f} cmd=3:0 srv=0:0 cpu={i}\n"
+                        for i in range(10)))
+        w(f"{a1}/timed.json", json.dumps({"system": "ours", "sweeper_window": "process", "t0": 100.1, "t1": 100.3,
+                                          "rc": 0, "sweeper_cpu_s": 0.5 if kind == "stored" else 0.04,
+                                          "sweeper_cpu_span_s": [100.1, 100.3], "sweeper_nice": nice,
+                                          "sweeper_clk_tck": 100, "sweeper_refused": None}))
+
     def conformance_files(out, kind="match"):
         """what t3run's build and envchecks stages write: binaries.txt (sha256sum of the package's binaries) and
         warmup-conformance.json (warmup_conformance.py run --record, review 5 MED 6, 7). kind: match, None (no
@@ -570,7 +656,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -599,6 +685,9 @@ def self_test():
                                                            "ops_total_asked": ours_ops[1]}
                                                           | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
+                # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
+                # leaves the shared sweeper's record and timed.json; a new required record at its passing value
+                sweeper_files(a1, ours_sweeper)
             else:
                 verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail"
                                            else "PASS F1\nVERDICT PASS\n")
@@ -616,8 +705,12 @@ def self_test():
                       json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}
                                  | ({"warmup_backsteps": backsteps} if backsteps is not None else {})
                                  | ({"loop": loop} if loop is not None else {})))
+                    # TEST EDIT, flagged (MED 12 ruling): timedrun.py's timed.json carries sweeper_cpu_s (comp
+                    # 44f272499); a new required field at its passing value (None: the field absent)
                     if tv is not None:
-                        w(f"{a1}/result/cells/{cc}/timed.json", json.dumps({"verdict": tv, "ops": comp_ops}))
+                        w(f"{a1}/result/cells/{cc}/timed.json", json.dumps(
+                            {"verdict": tv, "ops": comp_ops}
+                            | ({"sweeper_cpu_s": comp_sweeper} if comp_sweeper != "absent" else {})))
                 w(f"{a1}/adapter.txt", "")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
@@ -828,6 +921,30 @@ def self_test():
          False, lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a clean competitor run (closed loop, 0 backsteps) passes and reports its loop", {"cell": "comp"}, True,
          lambda s: s["runs"][0].get("warmup_loops") == ["closed", "closed"]),
+        # the lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z): SAME INSTRUMENT FOR EVERY SYSTEM. Every measured
+        # run's timed.json records sweeper_cpu_s; ours' is re-derived from its own tracer record over its own window by
+        # the one reader (gates/sweeper_record.py), never read from the stored value. Ours' window is its whole process
+        # until fastest_profile stamps its measured windows (Rust, HELD), so no ratio credits: sweeper_creditable false
+        ("MED 12: ours with its sweeper record passes, carries sweeper_cpu_s 0.04 over the process window, not creditable",
+         {}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04] and s["runs"][0].get("sweeper_windows")
+         == ["process"] and s.get("sweeper_creditable") is False
+         and any("sweeper" in x and "process" in x for x in s.get("loud_owed") or [])),
+        ("MED 12: ours with no timed.json fails, naming the sweeper", {"ours_sweeper": None}, False,
+         lambda s: any("sweeper" in x and "timed.json" in x for x in s["parity_refusals"])),
+        ("MED 12: ours with no timed.tracer.tsv fails, naming it", {"ours_sweeper": "notracer"}, False,
+         lambda s: any("timed.tracer.tsv" in x for x in s["parity_refusals"])),
+        ("MED 12: ours whose sweeper ran at nice 0 fails on the reader's refusal", {"ours_sweeper": "nice0"}, False,
+         lambda s: any("nice 0" in x for x in s["parity_refusals"])),
+        ("MED 12: ours whose timed.json says 0.5 where its record gives 0.04 fails on the re-derivation",
+         {"ours_sweeper": "stored"}, False, lambda s: any("0.5" in x and "0.04" in x for x in s["parity_refusals"])),
+        ("MED 12: a competitor timed.json without sweeper_cpu_s fails, naming it", {"cell": "comp",
+                                                                                     "comp_sweeper": "absent"},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        ("MED 12: a competitor timed.json with sweeper_cpu_s null fails", {"cell": "comp", "comp_sweeper": None},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        ("MED 12: a clean competitor run carries each timed run's sweeper_cpu_s over its measured window",
+         {"cell": "comp"}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04, 0.04]
+         and s["runs"][0].get("sweeper_windows") == ["measured", "measured"]),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:
@@ -849,7 +966,8 @@ def self_test():
         w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300,
                                                                          "warmup_backsteps": 0, "loop": "closed"}))
         # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
-        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300}))
+        # TEST EDIT, flagged (MED 12 ruling): timed.json carries sweeper_cpu_s, at its passing value
+        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300, "sweeper_cpu_s": 0.04}))
         w(f"{a1}/result/expected-cells.txt", "c1-create\n")
         s, ok = summarize(out, "sha", "1", "m")
         # TEST EDIT, flagged (fourth lane review HIGH 2): this case pinned the withdrawn cross-system rule (it
@@ -879,12 +997,14 @@ def self_test():
                 if system == "ours":
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
                                                                "ops_total_asked": int(ops)}))
+                    sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
                     w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
                                                                               "measured_ops": int(ops),
                                                                               "warmup_backsteps": 0, "loop": "closed"}))
-                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops)}))
+                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops),
+                                                                      "sweeper_cpu_s": 0.04}))  # TEST EDIT, flagged
                     w(f"{a1}/result/expected-cells.txt", "c1\n")
         w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
         s, _ = summarize(out, "sha", "1", "m")
