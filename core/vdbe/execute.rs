@@ -10660,7 +10660,21 @@ pub fn op_function(
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
+                            ScalarFunc::NumericMul => {
+                                // PostgreSQL's product scale: the operands' display scales (each
+                                // at least 0) summed (numeric.c `mul_var`). bigdecimal's product of
+                                // a zero is a plain 0, and a negative operand scale lowers it; the
+                                // rescale only appends zeros, so it is exact. Mutant
+                                // `mul_scale_bigdecimal` (test builds only): bigdecimal's own.
+                                let display = |v: &bigdecimal::BigDecimal| v.as_bigint_and_exponent().1.max(0);
+                                let scale = display(&a) + display(&b);
+                                let product = &a * &b;
+                                if crate::branch::store::fe_mutant("mul_scale_bigdecimal") {
+                                    product
+                                } else {
+                                    product.with_scale(scale)
+                                }
+                            }
                             ScalarFunc::NumericDiv => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
