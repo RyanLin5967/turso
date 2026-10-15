@@ -8609,6 +8609,43 @@ fn no_per_branch_table_regrows_past_64_kib_inside_a_create() {
     assert!(over.is_empty(), "CLAIM: a create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
 }
 
+/// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex: 7 held allocations per
+/// create in every cell, budget 1): a steady create's allocations under a store mutex, attributed to
+/// its steps by the `held_trace` points (fork_trunk's hold and the flight lead's hold), for both
+/// modes and D0/D2. The message lists each step's share, so the fix is aimed.
+#[test]
+fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for (catalog, class) in [(false, SyncClass::FullFsync), (true, SyncClass::FullFsync), (false, SyncClass::Off)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("held.db"), opts(catalog, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for _ in 0..20 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        let before = super::budget_probe::thread_allocs().2;
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        let _ = trunk.fork_branch().unwrap().into_id();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let total = super::budget_probe::thread_allocs().2 - before;
+        let mut last = before;
+        let steps: Vec<String> = trace
+            .iter()
+            .map(|(label, n)| {
+                let d = n - last;
+                last = *n;
+                format!("{label}+{d}")
+            })
+            .collect();
+        if total > 1 {
+            over.push(format!("catalog={catalog} {class:?}: {total} held allocations [{}], {} after the last point", steps.join(" "), total - (last - before)));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
+}
+
 /// L2 slope (budget create_allocates_no_table_of_every_branch_under_the_store_mutex): the create
 /// that allocates the most under the store mutex as a D0 snapshot store grows past 2^15 branches,
 /// and whether it compacted the log inline (a D0 compaction syncs nothing, so `maybe_compact` runs it

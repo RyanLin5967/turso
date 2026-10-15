@@ -3523,6 +3523,30 @@ pub(crate) fn fe_mutant(name: &str) -> bool {
     }
 }
 
+// Test builds (L2 slice, budget create_allocates_at_most_once_under_the_store_mutex): while armed
+// (`HELD_TRACE` holds a Vec with spare capacity), each `held_trace(label)` records this thread's
+// allocations under a store mutex so far, so a test can attribute a create's held allocations to
+// its steps. Pushing never allocates: the Vec is reserved before it is armed, and a full one stops
+// recording. Observation only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HELD_TRACE: std::cell::RefCell<Option<Vec<(&'static str, u64)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn held_trace(label: &'static str) {
+    #[cfg(test)]
+    HELD_TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            if v.len() < v.capacity() {
+                v.push((label, super::budget_probe::thread_allocs().2));
+            }
+        }
+    });
+    #[cfg(not(test))]
+    let _ = label;
+}
+
 /// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
 /// can aim a kill at. TEST BUILDS ONLY, and inert unless `FE_KILL_AT=<point>:<n>` is set: the n-th
 /// time this process reaches `point`, it appends `KILL-AT <point> <n>` to the file `FE_CRASH_LOG`
@@ -4670,6 +4694,7 @@ impl BranchStore {
                     guard: store.lock(),
                     since: Instant::now(),
                 };
+                held_trace("lead.locked");
                 let mut g = group.lock();
                 if g.durable[need] >= lsn {
                     #[cfg(test)]
@@ -4693,7 +4718,9 @@ impl BranchStore {
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
                 let upgrade = g.durable[0] >= lsn;
-                match Self::take_flight(&mut inner, class, upgrade) {
+                let taken = Self::take_flight(&mut inner, class, upgrade);
+                held_trace("lead.taken");
+                match taken {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
@@ -5966,7 +5993,9 @@ impl BranchStore {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
+        held_trace("fork.locked");
         self.mature(&mut inner);
+        held_trace("fork.matured");
         let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
         if restart {
             // `ensure_backing` may start an empty store over (a compaction or checkpoint that
@@ -5983,7 +6012,9 @@ impl BranchStore {
                 self.group.mark_durable(journal.lsn(), rewrite_class_marked(restart_class, journal));
             }
         }
+        held_trace("fork.backed");
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        held_trace("fork.expired");
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
         let mut schema = schema;
@@ -6017,20 +6048,25 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
+        held_trace("fork.named");
         let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        held_trace("fork.records");
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
         let lsn = self.buffer_records(&mut inner, &records)?;
+        held_trace("fork.buffered");
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
         if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
             return Err(inner.fatal(e));
         }
+        held_trace("fork.applied");
         inner.apply_fork_lease(id, lease);
         inner.note_fork_lsn(id, lsn);
         self.sync_trunk_children(&inner);
+        held_trace("fork.children_synced");
         kill_point("fork.applied");
         let work = &mut inner.work;
         work.trunk_forks += 1;
@@ -6041,6 +6077,7 @@ impl BranchStore {
         }
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
+        held_trace("fork.done");
         Ok(TrunkFork::Forked { id, lsn, after })
     }
 
