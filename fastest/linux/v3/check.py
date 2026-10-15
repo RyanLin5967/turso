@@ -174,6 +174,7 @@ POST_COND = {"R_post_layerflush": lambda cell, leaf: v3cell.is_loop(cell) or lea
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
            "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "REGISTERED.tsv",
            "statfs_shim.c", "noop_shim.c",
+           "nestloops.sh",  # V3 review 13 item 9: the one nest matcher, sourced by firecheck.sh and mkfixtures.sh
            "../fs/mkloop.sh",
            "../../../.github/workflows/fastest-v3.yml"]
 
