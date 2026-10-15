@@ -487,6 +487,11 @@ pub(crate) const HOLD_COMPACT_LOCKED: u8 = HOLD_COMPACT_TAKEN;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut is prepared off the
+/// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
+
 #[derive(Default)]
 struct GroupState {
     /// A flight is being written.
@@ -1163,6 +1168,22 @@ pub(crate) static COMPACT_CATCH_UPS_OFF: AtomicBool = AtomicBool::new(false);
 /// it cuts the log, as a crash there would leave it (DECISIONS bd0d845f97's recovery rule).
 #[cfg(test)]
 pub(crate) static COMPACT_STOP_BEFORE_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: no catch-up pass, nothing else changed: what flights wrote after the prep reaches
+/// the last pass, under the mutex.
+#[cfg(test)]
+pub(crate) static COMPACT_NO_CATCH_UP: AtomicBool = AtomicBool::new(false);
+
+fn compact_no_catch_up() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_NO_CATCH_UP.load(Ordering::Acquire) || COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
 
 fn compact_catch_ups_off() -> bool {
     #[cfg(test)]
@@ -5664,7 +5685,7 @@ impl BranchStore {
             group.lock().background_compactions += 1;
         }
         let landed = (|| -> Result<()> {
-            Self::wait_durable_on(store, group, None, bg.from(), SyncClass::Off)?;
+            Self::wait_durable_on(store, group, None, bg.lsn(), SyncClass::Off)?;
             #[cfg(test)]
             pause_at(hold, HOLD_COMPACT_TAKEN);
             bg.sync_snapshot()?;
@@ -5676,7 +5697,7 @@ impl BranchStore {
                 return Ok(());
             }
             bg.sync_dir()?;
-            group.mark_committed(bg.from(), bg.class());
+            group.mark_committed(bg.lsn(), bg.class());
             // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
             // would (`COMPACT_STOP_BEFORE_CUT`).
             #[cfg(test)]
@@ -5705,12 +5726,20 @@ impl BranchStore {
             }
         };
         let mut prep = Journal::prepare_cut(source, from, generation)?;
-        let passes = if compact_catch_ups_off() { 0 } else { COMPACT_CATCH_UPS };
-        for pass in 0..=passes {
-            let last = pass == passes;
-            // The last pass copies and syncs under the mutex whatever is left: counted from before
-            // it locks to after it unlocks (`Compacting`; dropped after `inner`).
-            let _counted = last.then(|| Compacting::begin(store));
+        #[cfg(test)]
+        pause_at(hold, HOLD_COMPACT_PREPARED);
+        let passes = if compact_no_catch_up() { 0 } else { COMPACT_CATCH_UPS };
+        // The last pass copies under the mutex whatever is left. When that copy must be synced (a
+        // flight left in it claimed a sync), the hold is counted from before it locks to after it
+        // unlocks (`Compacting`, declared before `inner`, so dropped after it): the pass locks
+        // again counted. Under `COMPACT_CATCH_UPS_OFF` (the plant) it is counted every time.
+        let mut counted: Option<Compacting<'_>> = None;
+        let mut pass = 0;
+        loop {
+            let last = pass >= passes;
+            if last && compact_catch_ups_off() && counted.is_none() {
+                counted = Some(Compacting::begin(store));
+            }
             let mut inner = Self::lock_quiesced(store, group)?;
             let Some(journal) = inner.journal.as_mut() else {
                 break;
@@ -5723,10 +5752,16 @@ impl BranchStore {
                 let fail = journal.take_replacement_sync_failure();
                 drop(inner);
                 Journal::extend_cut(&mut prep, to, fail)?;
+                pass += 1;
+                continue;
+            }
+            if counted.is_none() && journal.cut_tail_syncs(&prep)? {
+                drop(inner);
+                counted = Some(Compacting::begin(store));
                 continue;
             }
             #[cfg(test)]
-            if last {
+            if counted.is_some() {
                 pause_at(hold, HOLD_COMPACT_TAIL);
             }
             journal.finish_cut(prep, from, generation)?;
@@ -5738,6 +5773,8 @@ impl BranchStore {
             group.mark_durable(written, class);
             let durable = group.durable(inner.free_class());
             inner.mature_frees(durable);
+            drop(inner);
+            drop(counted);
             return Ok(());
         }
         // The log changed under the cut: the snapshot stays installed, the older log is replayed

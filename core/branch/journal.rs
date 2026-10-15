@@ -1302,6 +1302,10 @@ impl CutSource {
 pub(crate) struct BgCompaction {
     out: Vec<u8>,
     generation: u64,
+    /// The log sequence number past the marker (`Journal::lsn`): what the snapshot makes durable.
+    lsn: u64,
+    /// The log position past the marker (`Journal::mark`, a frame boundary): where the cut keeps
+    /// from.
     from: u64,
     class: SyncClass,
     arena: Option<File>,
@@ -1316,7 +1320,12 @@ pub(crate) struct BgCompaction {
 }
 
 impl BgCompaction {
-    /// Where the marker ends in the log: everything below it is in the snapshot.
+    /// The log sequence number past the marker: every record below it is in the snapshot.
+    pub(crate) fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
+    /// The log position past the marker, where the cut keeps from.
     pub(crate) fn from(&self) -> u64 {
         self.from
     }
@@ -2161,10 +2170,14 @@ impl Journal {
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
                 write_cut_word(&prep.file, class, prep.all_synced && delta_synced, last_crc, len + frames.len() as u64)?;
-                if class.syncs() {
+                // Synced only when a delta flight claimed a sync (DECISIONS bd0d845f97): the copy of
+                // flights that were only written (a D0 store's, raised or not) promises no more than
+                // they did, and is tagged so (`reframe_tagged`); the next flight that syncs syncs it.
+                let syncs = delta_claims_sync(&delta, self.nonce, prep.nonce, class)?;
+                if syncs {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
-                synced &= class.syncs();
+                synced &= syncs;
                 len += frames.len() as u64;
             }
         }
@@ -2195,6 +2208,17 @@ impl Journal {
         Ok(())
     }
 
+    /// Whether `finish_cut` would sync under the store mutex: the old log holds, past what `prep`
+    /// copied, a flight that claimed a sync (DECISIONS bd0d845f97).
+    pub(crate) fn cut_tail_syncs(&self, prep: &CutPrep) -> Result<bool> {
+        if self.len <= prep.upto {
+            return Ok(false);
+        }
+        let mut delta = vec![0u8; (self.len - prep.upto) as usize];
+        read_at(&self.file, &mut delta, prep.upto)?;
+        delta_claims_sync(&delta, self.nonce, prep.nonce, self.rewrite_class())
+    }
+
     /// Whether `prep` still matches this log (`finish_cut`): no rewrite since, the same incarnation,
     /// the same cut, and the log no shorter than what it copied.
     pub(crate) fn cut_usable(&self, prep: &CutPrep, from: u64, generation: u64) -> bool {
@@ -2222,8 +2246,10 @@ impl Journal {
             write_at(&prep.file, &frames, at)?;
             prep.all_synced &= delta_synced;
             write_cut_word(&prep.file, prep.class, prep.all_synced, last_crc, at + frames.len() as u64)?;
-            if prep.class.syncs() {
+            if delta_claims_sync(&delta, prep.old_nonce, prep.nonce, prep.class)? {
                 sync_replacement(&prep.file, prep.class, fail_sync, &prep.poisoned)?;
+            } else {
+                prep.synced = false;
             }
             prep.written += frames.len() as u64;
         }
@@ -2244,7 +2270,7 @@ impl Journal {
         let class = self.rewrite_class();
         let generation = self.generation + 1;
         self.buffer(&Record::Checkpoint { generation })?;
-        let from = self.lsn();
+        let (lsn, from) = (self.lsn(), self.mark());
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(SNAP_MAGIC);
         put_u32(&mut out, self.format);
@@ -2257,6 +2283,7 @@ impl Journal {
         Ok(BgCompaction {
             out,
             generation,
+            lsn,
             from,
             class,
             arena,
@@ -3823,6 +3850,23 @@ fn synced_flight_over(
 #[cfg(test)]
 fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
     reframe_tagged(kept, old, new, synced).map(|(out, last_crc, _)| (out, last_crc))
+}
+
+/// Whether any flight of `delta` keeps a synced tag when it is re-framed in a rewrite of `class`
+/// (`reframe_tagged`): only then must the copy be synced before it replaces the old log (DECISIONS
+/// bd0d845f97). The same frames re-framed as unsynced are byte-for-byte the frames re-framed in
+/// `class` exactly when no flight is tagged synced. Mutant `cut_tail_always_synced` (test builds
+/// only): every delta in a syncing class, as before.
+fn delta_claims_sync(delta: &[u8], old: u32, new: u32, class: SyncClass) -> Result<bool> {
+    if !class.syncs() {
+        return Ok(false);
+    }
+    if super::store::fe_mutant("cut_tail_always_synced") {
+        return Ok(true);
+    }
+    let (tagged, _, _) = reframe_tagged(delta, old, new, true)?;
+    let (unsynced, _, _) = reframe_tagged(delta, old, new, false)?;
+    Ok(tagged != unsynced)
 }
 
 /// `reframe`, also saying whether every kept flight is tagged synced in the result: only then may

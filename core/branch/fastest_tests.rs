@@ -9425,3 +9425,50 @@ fn a_background_compaction_stopped_before_its_cut_loses_nothing() {
         "CLAIM: the write made after the stopped compaction was lost"
     );
 }
+
+/// DECISIONS bd0d845f97: the cut's last pass copies under the mutex what flights wrote after its
+/// catch-ups, and syncs it only when a flight there claimed a sync. A raised D0 store's flights are
+/// only written, so that copy syncs nothing, and no operation is counted waiting behind it. With no
+/// catch-up pass (`COMPACT_NO_CATCH_UP`), the writer held once its cut is prepared
+/// (`HOLD_COMPACT_PREPARED`), one create's flight lands in the old log; released, the compaction
+/// completes with that tail, having synced nothing under the store mutex
+/// (`syncs_under_store_mutex`), and `compaction_waits` has not moved. Mutant
+/// `cut_tail_always_synced` (the tail synced whatever it claims).
+#[test]
+fn a_raised_d0_cut_tail_is_copied_without_a_counted_sync() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_NO_CATCH_UP.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_NO_CATCH_UP.store(true, O::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-tail.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_PREPARED);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never prepared its cut", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_PREPARED | super::store::HOLD_ARRIVED
+    });
+    let len = db.branches.log_len_for_test();
+    let _ = trunk.fork_branch().unwrap().into_id();
+    assert!(db.branches.log_len_for_test() > len, "premise: a create's flight wrote past the prepared cut");
+    let under = super::store::syncs_under_store_mutex();
+    db.branches.confirm_hold_for_test(0);
+    eventually("the background compaction never completed", || !db.branches.compaction_owed_for_test());
+    let synced_under = super::store::syncs_under_store_mutex() - under;
+    let after = db.branch_exception_counters();
+    assert!(db.branches.log_len_for_test() < len, "premise: the log was cut");
+    assert_eq!(synced_under, 0, "CLAIM: the cut synced {synced_under} times under the store mutex for a tail of only-written flights");
+    assert_eq!(after[3], base[3], "an operation was counted waiting behind the compaction: {base:?} -> {after:?}");
+}
