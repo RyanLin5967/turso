@@ -3105,6 +3105,28 @@ fn a_tables_star_beside_a_derived_boolean_keeps_it_boolean() {
     }
 }
 
+/// KNOWN RED (ENGINE; known-red.txt): generate_series with an infinite start, stop or step is
+/// 22023, as PostgreSQL 18.6 refuses it ("stop value cannot be infinity"; recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-gsinf.out). Since the crash batch reads 'inf' text as the
+/// infinity, the engine's series to an infinite stop never ends: the session's thread spins and
+/// answers nothing more (the regress corpus's numeric.sql statement 867 stopped the script). The
+/// client gives up after 5 s here, so the red fails rather than hangs.
+#[test]
+fn generate_series_refuses_infinite_bounds() {
+    let dir = Scratch::new("gsinf");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for sql in [
+        "select * from generate_series(1, 3, 'inf'::numeric)",
+        "select * from generate_series('-inf'::numeric, 0, 10)",
+        "select * from generate_series(0::numeric, 'inf'::numeric, 10::numeric)",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "22023", "{sql}: {}", e.message);
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
