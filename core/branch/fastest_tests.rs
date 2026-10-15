@@ -9271,3 +9271,39 @@ fn a_raised_d0_fuzzy_checkpoint_fails_at_the_settle_bound_and_counts_it() {
     assert_eq!(after_installed, installed, "a checkpoint installed over an ordered flight whose flush was still to come");
     assert_eq!(after_timeouts, timeouts + 1, "CLAIM: the settle bound's Busy was not counted once");
 }
+
+/// Engine review 20 item 4: `connect_named`'s error path mapped any open error to NoSuchBranch once
+/// the branch read as gone or released in memory (`is_gone_or_released`), which neither waits for
+/// the drop's Release to be durable nor applies the fail-stop rule. A connect parked between its
+/// lookup and its open while a drop's Release flight FAILS (the store fail-stops; the drop returns
+/// Err, so the name was never freed): the connect fails, and not as NoSuchBranch, whose promise is
+/// that no unreleased branch has the name. Both stores. Mutant `connect_race_maps_released`.
+#[test]
+fn a_connect_racing_a_failed_drop_is_not_refused_as_no_such_branch() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("connect-failed-drop.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("kept").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_CONNECT_LOOKED_UP, std::sync::atomic::Ordering::Release);
+        let connector = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect_named("kept").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_CONNECT_LOOKED_UP);
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        let dropped = db.drop_branch("kept");
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let connected = connector.join().unwrap();
+        assert!(dropped.is_err(), "{what}: premise: the drop's failed Release flight failed the drop: {dropped:?}");
+        assert!(
+            connected.is_err() && !matches!(connected, Err(LimboError::NoSuchBranch(_))),
+            "{what}: CLAIM: a connect racing a drop whose Release failed was answered {connected:?}: \
+             the name was never freed, so it is not NoSuchBranch"
+        );
+    }
+}
