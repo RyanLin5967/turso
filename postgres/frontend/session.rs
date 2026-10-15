@@ -2,7 +2,6 @@ use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
 
-use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
 use crate::result_types::StatementTypes;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
@@ -176,7 +175,6 @@ pub fn open_database_with_io(
 
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
-        aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
         Self {

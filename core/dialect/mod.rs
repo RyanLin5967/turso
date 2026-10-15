@@ -175,6 +175,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn cast_text_to_float(&self, _text: &str) -> Option<crate::Result<f64>> {
         None
     }
+
+    /// Statically linked functions this dialect adds to every Database it opens, registered once
+    /// per Database into its built-in symbols (`Database::register_static_extension`), which each
+    /// connection copies at connect, instead of on each connection. None by default; PostgreSQL's
+    /// time aliases are the first.
+    fn static_extensions(&self) -> &'static [fn(&mut turso_ext::ExtensionApi)] {
+        &[]
+    }
 }
 
 #[cfg(test)]

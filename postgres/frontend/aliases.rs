@@ -1,10 +1,5 @@
 use chrono::Utc;
-use turso_core::Connection;
 use turso_ext::{scalar, ExtensionApi, Value as ExtValue};
-
-pub fn install(conn: &Connection) {
-    conn.register_static_extension(register_pg_functions);
-}
 
 /// How many times the PostgreSQL time aliases were registered in this process (each a set of
 /// symbol-table inserts, 13 allocations): observation for the once-per-Database registration test.
@@ -15,7 +10,8 @@ pub fn registrations() -> u64 {
     REGISTRATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn register_pg_functions(ext_api: &mut ExtensionApi) {
+/// Registered once per Database by `PostgresDialect::static_extensions`.
+pub(crate) fn register_pg_functions(ext_api: &mut ExtensionApi) {
     REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         register_alias(ext_api, c"now".as_ptr());
