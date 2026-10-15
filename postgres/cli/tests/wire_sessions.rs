@@ -6113,6 +6113,41 @@ fn an_array_parameter_is_read_by_its_element_type() {
     }
 }
 
+/// A view libpg_query cannot reread types a parameter only from columns the engine traced to a
+/// table column; a computed one (count(*), max(id) + 1) or one read through an inner view the
+/// engine gives a placeholder TEXT, so a parameter compared with it is refused 42P18 (or typed as
+/// PostgreSQL types it), never text: typed text, `n = $1` bound '1' as a string and the row went
+/// missing silently, where the base refused it (wire review 18 item 4).
+#[test]
+fn a_view_libpg_query_cannot_reread_never_types_a_computed_column_text() {
+    let dir = Scratch::new("viewcomputed");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE vt(id INT PRIMARY KEY, flag BOOLEAN)",
+        "INSERT INTO vt VALUES (1, true), (2, false)",
+        "CREATE VIEW vc AS SELECT count(*) AS n, max(id) + 1 AS m FROM vt WHERE flag IS TRUE",
+        "CREATE VIEW vinner AS SELECT id, flag FROM vt",
+        "CREATE VIEW vouter AS SELECT id FROM vinner WHERE flag IS TRUE",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    for (sql, typed) in [
+        ("SELECT 1 FROM vc WHERE n = $1", 20),
+        ("SELECT 1 FROM vc WHERE m = $1", 23),
+        ("SELECT 1 FROM vouter WHERE id = $1", 23),
+    ] {
+        let r = a.describe_statement(sql);
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "42P18");
+        assert!(
+            refused || r.params == Some(vec![typed]),
+            "{sql}: {:?} {:?}, want [{typed}] or 42P18, never [25]",
+            r.params,
+            r.error
+        );
+    }
+}
+
 /// A view whose stored text libpg_query cannot read (the engine stores a view as SQLite text, and
 /// `IS TRUE` becomes `IS 1`) is typed from the engine's own columns for the view: `id = $1` over
 /// it is int4, not refused 42P18 (wire review 14 item 10).
