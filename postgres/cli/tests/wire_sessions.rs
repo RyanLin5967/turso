@@ -6987,6 +6987,30 @@ fn an_empty_named_portal_runs_twice_as_an_empty_query() {
     );
 }
 
+/// A wrong-length result-format list is refused before the statement runs, shown by a statement
+/// that would FAIL if it ran: `INSERT ... RETURNING` of a key that exists answers 08P01 (the format
+/// list), never 23505 (the key). a_wrong_result_format_list_is_refused_before_the_side_effect's
+/// INSERT leg cannot tell the orders apart: the implicit rollback hides its row whichever runs
+/// first (wire review 15 item 21).
+#[test]
+fn a_wrong_result_format_list_is_refused_before_a_failing_insert_runs() {
+    let dir = Scratch::new("formatdup");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "INSERT INTO t VALUES (1, 'dup') RETURNING id, v";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(&[0, 0, 0]);
+    a.send(b'P', &parse);
+    a.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0]);
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.err(sql).code, "08P01", "the format list is checked first");
+    let r = a.xt(sql, &[]);
+    assert_eq!(r.err(sql).code, "23505", "control: run, the key refuses it");
+}
+
 /// A wrong-length result-format list is refused BEFORE a statement with a side effect runs: a branch
 /// create, switch or delete changes nothing, and an `INSERT ... RETURNING` writes no row; the
 /// refusals are worded as PostgreSQL words them. No test pinned the order: the earlier rows change
