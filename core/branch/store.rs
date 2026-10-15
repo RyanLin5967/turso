@@ -12279,6 +12279,26 @@ mod sota_tree_tests {
 mod group_tests {
     use super::*;
 
+    /// Budget create_allocates_no_table_of_every_branch_under_the_store_mutex (64 KiB per create
+    /// under the store mutex) measured one create allocating 2,195,727 bytes as the live branches
+    /// reached 33,056 (artie raw l5-branch_b88c38329.txt): a new chunk of the branch table
+    /// (table.rs: CHUNK entries, allocated whole under the mutex). The chunk's own size must fit
+    /// the budget; the message prints the entry's size, so the fix can be sized from it.
+    #[test]
+    fn a_branch_table_chunk_fits_the_create_allocation_budget() {
+        let entry = std::mem::size_of::<Option<(BranchId, BranchState)>>();
+        let chunk = entry * super::super::table::CHUNK;
+        assert!(
+            chunk <= 64 << 10,
+            "CLAIM: a branch table chunk is {chunk} bytes ({} entries of {entry}; BranchState {}, Lineage {}, \
+             PageMap {}), over the 64 KiB a create may allocate under the store mutex",
+            super::super::table::CHUNK,
+            std::mem::size_of::<BranchState>(),
+            std::mem::size_of::<Lineage>(),
+            std::mem::size_of::<PageMap>()
+        );
+    }
+
     /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
     /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
     /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
