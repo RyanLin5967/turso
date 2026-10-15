@@ -4413,20 +4413,19 @@ fn every_zero_budgeted_counter_is_seen_moving() {
     }
     let src = include_str!("budget_tests.rs");
     let mut keys = std::collections::BTreeSet::new();
-    let marker = ", Want::Exactly(0)";
+    // Spelled in two halves, so this test's own text holds no instance of it.
+    let marker = concat!(", Want::", "Exactly(0)");
     for (at, _) in src.match_indices(marker) {
         let open = src[..at].rfind("every(").unwrap_or_else(|| panic!("a zero budget at byte {at} is not an every(..)"));
         let arg = src[open + "every(".len()..at].trim();
-        let key = if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
-            lit
-        } else {
-            match arg {
+        let ident = |k: &str| !k.is_empty() && k.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let key = match arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            Some(lit) if ident(lit) => lit,
+            _ => match arg {
                 "FULL" => FULL,
                 "NOT_FULL" => NOT_FULL,
-                // This test's own text, in the marker's definition above.
-                _ if arg.contains("marker") || arg.contains('\n') => continue,
                 other => panic!("a zero budget names a key this test cannot read: {other:?}"),
-            }
+            },
         };
         keys.insert(key);
     }
