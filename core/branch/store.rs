@@ -5926,7 +5926,10 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
-        match self.start_flight(inner) {
+        held_trace("compact.flight_starting");
+        let started = self.start_flight(inner);
+        held_trace("compact.flight_start_returned");
+        match started {
             // A start that failed (settle, capture or spawn) backs off as a failed write does
             // (review 4 #2): not retried, under this mutex, by every operation until another
             // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
@@ -6649,6 +6652,7 @@ impl BranchStore {
             work.trunk_forks_locked += 1;
         }
         self.sync_lease_flag(&inner);
+        held_trace("fork.lease_synced");
         self.maybe_compact(&mut inner);
         held_trace("fork.done");
         let work = inner.names.filter.take_owed();
