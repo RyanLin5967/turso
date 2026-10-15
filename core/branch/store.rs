@@ -8394,11 +8394,14 @@ impl BranchStore {
                 // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
                 // scanned names are inserted under the mutex, as before.
                 let under = fe_mutant("name_filter_built_under_mutex");
-                // Sized for the scanned names and half as many again (at most half full then), so
-                // a growth is owed only after the store has grown by a third or more; the table is
-                // 16-32 bytes per name (`for_keys`: a power of two of at least 2n slots).
+                // Sized for the scanned names AND the pending ones (names held but not yet in the
+                // catalog, and those noted since; it is copied in after the install), half as many
+                // again: a growth is owed only after the store has grown by a third or more; 16-32
+                // bytes per name (`for_keys`: a power of two of at least 2n slots).
+                let pending_len = shared.lock().names.filter.pending.as_ref().map_or(0, |p| p.len());
                 let scanned = scanned.map(|hashes| {
-                    let table = FilterTable::for_keys(hashes.len().saturating_add(hashes.len() / 2));
+                    let n = hashes.len().saturating_add(pending_len);
+                    let table = FilterTable::for_keys(n.saturating_add(n / 2));
                     if under {
                         (table, hashes)
                     } else {
