@@ -7316,6 +7316,30 @@ impl BranchStore {
         self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
     }
 
+    /// Test builds (engine review 18 MED 7): whether `slot` is free in the arena or the catalog,
+    /// PASSIVELY: unlike `slot_is_free` it neither matures held frees nor applies parked commits, so
+    /// an observer polling it cannot arm or wake the upgrade it is waiting for (review 18 LOW 8).
+    #[cfg(test)]
+    pub(crate) fn slot_is_free_passive_for_test(&self, slot: u32) -> bool {
+        let mut inner = self.inner.lock();
+        let StoreInner { arena, cat, .. } = &mut *inner;
+        if arena.as_ref().is_some_and(|a| a.is_free(slot)) {
+            return true;
+        }
+        cat.as_mut().is_some_and(|cat| {
+            !cat.taken.contains(&slot)
+                && cat.free_cursor.is_none_or(|c| slot > c)
+                && cat.catalog.free_has(slot).unwrap_or(false)
+        })
+    }
+
+    /// Test builds (engine review 18 MED 7): notifications of the background writer's condition
+    /// variable so far (fastest-budgets' `confirm_notifies`).
+    #[cfg(test)]
+    pub(crate) fn confirm_notifies_for_test(&self) -> u64 {
+        self.group.confirm_notifies.load(Ordering::Relaxed)
+    }
+
     /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
     /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
     #[cfg(test)]

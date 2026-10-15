@@ -8996,3 +8996,80 @@ fn a_requested_checkpoint_does_not_wait_past_its_deadline_for_a_flight_in_the_ai
     assert!(returned, "CLAIM: a 1 ms checkpoint request waited past 2 s for the flight in the air");
     assert!(matches!(answer, Ok(false)), "the request past its deadline answered {answer:?}, not Ok(false)");
 }
+
+/// Engine review 18 MED 7: after a held-free upgrade lands, nothing re-armed one while more than
+/// the bound was still held: `mature` arms only when none is in the air, and the writer leads once.
+/// Frees made while an upgrade is in the air (y's, after its take) stayed held until some later
+/// operation's `mature`. Held once taken (`HOLD_FLIGHT_TAKEN`), y is reaped and a fork matures
+/// past the bound; released, the upgrade lands (x's slots come free) and, with no other operation,
+/// y's slots come free too. Observed passively (`slot_is_free_passive_for_test`: no `mature`, which
+/// would arm it; review 18 LOW 8). Both modes. Mutant `writer_upgrades_once`.
+#[test]
+fn a_held_free_upgrade_is_rearmed_when_frees_stay_past_the_bound() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, xs) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-rearm.db"), catalog, true);
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 20, "y");
+        write_v(&y.connect().unwrap(), 45, "y");
+        let ys = y.owned_slots();
+        assert!(ys.len() >= 2, "{what}: premise: y's writes took two slots, past the bound");
+        let free = |s: &u32| db.branches.slot_is_free_passive_for_test(*s);
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        db.branches.confirm_hold_for_test(super::store::HOLD_FLIGHT_TAKEN);
+        eventually(&format!("{what}: premise: the background writer never took the upgrade"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+        });
+        y.reap().unwrap();
+        let _past = trunk.fork_branch().unwrap().into_id();
+        assert!(!ys.iter().any(free), "{what}: premise: y's slots are held while the upgrade is in the air");
+        db.branches.confirm_hold_for_test(0);
+        eventually(&format!("{what}: premise: the first upgrade never freed x's slots"), || xs.iter().all(free));
+        eventually(
+            &format!("{what}: CLAIM: y's frees, past the bound when the upgrade landed, never came free: nothing re-armed it"),
+            || ys.iter().all(free),
+        );
+    }
+}
+
+/// Engine review 18 MED 7: every `mature` past the bound took the group's lock and notified the
+/// background writer, even with the upgrade already owed or in the air: inside the store mutex, on
+/// every create, first write and trunk commit, where one notification per crossing is enough. The
+/// writer held where it found the upgrade due (so it stays owed), five forks past the bound notify
+/// it not at all. Both modes.
+#[test]
+fn creates_past_the_bound_do_not_rewake_the_writer_for_an_owed_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-rewake.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        assert!(
+            slots.iter().all(|s| !db.branches.slot_is_free_passive_for_test(*s)),
+            "{what}: premise: x's slots are held, past the bound, with the upgrade owed"
+        );
+        let n0 = db.branches.confirm_notifies_for_test();
+        for _ in 0..5 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        let n = db.branches.confirm_notifies_for_test() - n0;
+        db.branches.confirm_hold_for_test(0);
+        assert_eq!(n, 0, "{what}: CLAIM: five creates past the bound, with the upgrade owed, notified the writer {n} times");
+    }
+}
