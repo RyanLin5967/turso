@@ -7453,6 +7453,46 @@ fn a_query_with_a_part_that_is_no_statement_runs_nothing() {
     );
 }
 
+/// A simple Query is parsed whole before any of it runs even when its malformed part holds a
+/// keyword (`SELEC * FROM t`, FROM being reserved; `ROLBACK WORK`, WORK unreserved): 42601, and
+/// nothing of it runs, neither the INSERT and COMMIT before it nor a CHECKPOINT (the store's
+/// checkpoint count does not move). The scanner split emitted every stretch holding a keyword as a
+/// part, so the parts before ran and committed, and only then was the malformed one refused (wire
+/// review 18 item 6; 16a9ff5bc refused only stretches holding no keyword).
+#[test]
+fn a_query_with_a_malformed_part_runs_nothing() {
+    let dir = Scratch::new("malformedpart");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('b0')")
+        .ok("a branch, so the store has a log");
+    let store_checkpoints = |a: &mut Wire| {
+        a.q("SELECT turso_branch_stats()").ok("stats").rows[0][5]
+            .clone()
+            .expect("the store checkpoint count")
+    };
+    let before = store_checkpoints(&mut a);
+    for sql in [
+        "INSERT INTO t VALUES (2, 'two'); COMMIT; SELEC * FROM t",
+        "INSERT INTO t VALUES (3, 'three'); COMMIT; ROLBACK WORK",
+        "CHECKPOINT; SELEC * FROM t",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "42601", "{sql:?}");
+        assert_eq!(r.status, b'I', "{sql:?}");
+    }
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("rows"),
+        "1",
+        "a part before the malformed one ran"
+    );
+    assert_eq!(
+        store_checkpoints(&mut a),
+        before,
+        "the CHECKPOINT before the malformed part ran"
+    );
+}
+
 /// An implicit block (a multi-statement query, or a pipeline up to Sync) lives as long as the
 /// engine's transaction does, whatever the statements' text says: a statement that ends the
 /// engine's transaction ends the block, and a failure after it cannot be committed by the next
