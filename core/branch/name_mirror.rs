@@ -125,6 +125,7 @@ impl NameMirror {
         Ok(m)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -196,7 +197,8 @@ impl NameMirror {
         })
     }
 
-    /// Whether this mirror holds exactly `other`'s names and branches.
+    /// Whether this mirror holds exactly `other`'s names and branches (the oracle's check).
+    #[cfg(test)]
     pub(crate) fn same_as(&self, other: &HashMap<std::sync::Arc<str>, BranchId>) -> bool {
         self.len == other.len() && self.iter().all(|(n, id)| other.get(n) == Some(&id))
     }

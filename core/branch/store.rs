@@ -8594,7 +8594,6 @@ impl BranchStore {
     /// the store's own reader connection, as the skipped queries would read it. `Err` names the
     /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
     /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
-    #[cfg(test)]
     /// Test builds (LEAP L4 2b): the touched slots whose checkpoint state the last open inferred and
     /// checked against the free table (`CHECK_FREE_INFERENCE`).
     #[cfg(test)]
@@ -8602,6 +8601,7 @@ impl BranchStore {
         self.inner.lock().cat.as_ref().map_or(0, |cat| cat.free_inferred_at_open)
     }
 
+    #[cfg(test)]
     pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
