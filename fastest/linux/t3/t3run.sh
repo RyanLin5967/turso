@@ -692,6 +692,15 @@ selftests() {
     if grep -qF "cannot read" "$OUT/devguard-root-$d.txt"; then
       cat "$OUT/devguard-root-$d.txt"; echo "selftests: devguard could not read something on /dev/$d"; return 1
     fi
+    # the production pin on a real disk (review 6 LOW 4): it must hold and release, here, before any block needs it
+    t3_pin "/dev/$d" > "$OUT/pin-root-$d.txt" 2>&1 && t3_unpin ||
+      { cat "$OUT/pin-root-$d.txt"; echo "selftests: t3_pin cannot hold /dev/$d"; return 1; }
+    # this box's sysfs gives a whole identity (review 6 MED 1): on a T3 box a disk without one would refuse the spare
+    # at preflight too. Recorded on a dry run (a VM's virtual disk may carry no wwid or serial), required on a real one
+    dev_identity /sys "$d" > "$OUT/device-id-root-$d.txt" 2>&1; rc=$?
+    echo "dev_identity $d rc=$rc" >> "$OUT/device-id-root.txt"
+    [ $rc = 0 ] || [ $DRY = 1 ] ||
+      { cat "$OUT/device-id-root-$d.txt"; echo "selftests: dev_identity cannot read /dev/$d's identity"; return 1; }
   done
 }
 stage preflight preflight

@@ -80,7 +80,12 @@ check "the block's own filesystem (type and UUID) on the unmoved device may be w
 check "another filesystem refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" btrfs u-1'
 check "MED 3: the same type with another UUID (another drive under the name, re-made) refuses, naming the UUID" \
   'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-2 && grep -q UUID "$T/out.txt"'
-check "MED 3: an empty recorded UUID refuses" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs "" && grep -q UUID "$T/out.txt"'
+# TEST EDIT, flagged (review 6 LOW 7): the probe's UUID is empty too, so only the empty-UUID guard can refuse; with u-1
+# set, the UUID-mismatch guard refused instead and its text also says UUID, so deleting the guard stayed green
+FAKE_UUID=""
+check "MED 3: an empty recorded UUID refuses (the probe's empty as well: only the guard refuses)" \
+  'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs "" && grep -q "no UUID recorded" "$T/out.txt"'
+FAKE_UUID=u-1
 FAKE_TYPE=""
 check "no signature at all refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-1'
 FAKE_TYPE=xfs
@@ -122,6 +127,96 @@ check "MED 3: an empty identity record refuses" \
   'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id-empty.txt"'
 check "MED 3: a moved path refuses before the identity is read" \
   'refuses2 dev_unchanged "$T/dev/by-id-x" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt"'
+
+# review 6 MED 1: the device branch is one t3lib function each for make and wipe, taking every input as a parameter,
+# with the root commands as hooks (t3_pin, t3_devguard, t3_mkfs, t3_mount, t3_mounted, t3_wipe; t3_blkid above) that
+# log here, so its order and every refusal fire on test input before a paid box. A refusal is rc 2 with no later
+# step run, a failed command rc 1, and the pin is always released. The order (review 6 LOW 4): pin, devguard, the
+# drive re-read, mkfs with the UUID it is given (LOW 6), the probe, the re-read, mount -t, the mount checked, unpin.
+HL=$T/hooks.log
+hl() { echo "$*" >> "$HL"; }
+t3_pin() { hl pin "$1"; }
+t3_unpin() { hl unpin; }
+t3_devguard() { hl devguard "$1"; ${FAKE_DEVGUARD:-true}; }
+t3_mkfs() { hl mkfs "$@"; ${FAKE_MKFS:-true} || return 1; FAKE_TYPE=$1 FAKE_UUID=${FAKE_MKFS_UUID:-$3}; }
+t3_mount() { hl mount "$@"; FAKE_MOUNTED="${FAKE_MOUNT_SRC:-$2} $1"; }
+t3_mounted() { echo "$FAKE_MOUNTED"; }
+t3_wipe() { hl wipe "$1"; FAKE_TYPE="" FAKE_UUID=""; }
+FAKE_DEVGUARD="" FAKE_MKFS="" FAKE_MKFS_UUID="" FAKE_MOUNT_SRC="" FAKE_MOUNTED=""
+mkdir -p "$T/sys/block/nvme5n1/queue"; echo "write through" > "$T/sys/block/nvme5n1/queue/write_cache"
+reg "frame_arm${TAB}ow4k${TAB}DECISIONS x"
+dm() { : > "$HL"; rm -f "$T/made.txt"; FAKE_TYPE="" FAKE_UUID="" FAKE_MOUNTED=""
+       device_make "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" no "$T/reg.tsv" xfs U-1 /mnt/t3-xfs "$T/made.txt"; }
+dw() { : > "$HL"; device_wipe "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" xfs U-1; }
+steps() { tr '\n' ',' < "$HL"; }
+P="pin $REAL5," G="devguard $REAL5," M="mkfs xfs $REAL5 U-1," U="unpin,"
+check "MED 1: device_make on the recorded drive: pin, devguard, mkfs with the UUID, mount -t, unpin, in that order" \
+  'dm && [ "$(steps)" = "$P$G${M}mount xfs $REAL5 /mnt/t3-xfs,$U" ] && [ "$(cat "$T/made.txt")" = "xfs U-1" ]'
+ident nvme5n1 eui.0099 259:5 PM9A3 S1 GDC5
+check "MED 1 (review 5's scenario): a plain node whose wwid changed refuses (rc 2): no mkfs, nothing made, pin released" \
+  'refuses2 dm && grep -q wwid "$T/out.txt" && [ "$(steps)" = "$P$G$U" ] && [ ! -e "$T/made.txt" ]'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+FAKE_DEVGUARD="ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5"
+check "LOW 4: the drive changes while devguard runs: the re-read between devguard and mkfs refuses (rc 2), no mkfs" \
+  'refuses2 dm && [ "$(steps)" = "$P$G$U" ]'
+FAKE_DEVGUARD=""; ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+FAKE_DEVGUARD=false
+check "MED 1: devguard refusing stops before mkfs (rc 2), pin released" 'refuses2 dm && [ "$(steps)" = "$P$G$U" ]'
+FAKE_DEVGUARD=""
+echo "write back" > "$T/sys/block/nvme5n1/queue/write_cache"
+check "MED 1: write_cache flipped to write back since preflight, no threshold registered: refuses before mkfs" \
+  'refuses2 dm && grep -q "d0_threshold/xfs/wb/bare" "$T/out.txt" && [ "$(steps)" = "$P$G$U" ]'
+echo "write through" > "$T/sys/block/nvme5n1/queue/write_cache"
+FAKE_MKFS_UUID=u-other
+check "LOW 6: a mkfs that did not take the given UUID refuses before mount, and the made record names what was asked" \
+  'refuses2 dm && grep -q UUID "$T/out.txt" && [ "$(steps)" = "$P$G$M$U" ] && [ "$(cat "$T/made.txt")" = "xfs U-1" ]'
+FAKE_MKFS_UUID=""
+FAKE_MKFS="ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5"
+check "MED 1: the drive changes between mkfs and mount: refuses (rc 2), no mount" 'refuses2 dm && [ "$(steps)" = "$P$G$M$U" ]'
+FAKE_MKFS=""; ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+FAKE_MKFS=false
+check "MED 1: a failed mkfs is rc 1 (a failure, not a refusal): no mount, pin released" \
+  'dm; [ $? = 1 ] && [ "$(steps)" = "$P$G$M$U" ]'
+FAKE_MKFS=""
+FAKE_MOUNT_SRC=/dev/sdz
+check "LOW 4: findmnt naming another source after the mount refuses (rc 2)" \
+  'refuses2 dm && grep -q /dev/sdz "$T/out.txt" && [ "$(steps)" = "$P$G${M}mount xfs $REAL5 /mnt/t3-xfs,$U" ]'
+FAKE_MOUNT_SRC=""
+FAKE_TYPE=xfs FAKE_UUID=U-1
+check "MED 1: device_wipe on the recorded drive carrying the block's filesystem: pin, wipe, unpin" \
+  'dw && [ "$(steps)" = "${P}wipe $REAL5,$U" ]'
+FAKE_TYPE=xfs FAKE_UUID=U-1; ident nvme5n1 eui.0099 259:5 PM9A3 S1 GDC5
+check "MED 1: device_wipe when the drive changed refuses (rc 2): no wipe, pin released" \
+  'refuses2 dw && grep -q wwid "$T/out.txt" && [ "$(steps)" = "$P$U" ]'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+FAKE_TYPE=xfs FAKE_UUID=U-2
+check "MED 1: device_wipe when the probe finds another UUID refuses (rc 2): no wipe" 'refuses2 dw && [ "$(steps)" = "$P$U" ]'
+FAKE_TYPE=xfs FAKE_UUID=u-1
+
+# the production hook bodies (review 6 MED 1 and LOW 6): t3lib.sh re-sourced in a subshell, sudo a stub recording argv
+check "LOW 6: production t3_blkid runs sudo -n blkid -p -o value -s TAG DEV for each TAG, and ignores T3_BLKID" \
+  '( source "$HERE/t3lib.sh"; sudo() { printf "%s\n" "$*" >> "$T/argv1.txt"; echo got; }; : > "$T/argv1.txt"
+     export T3_BLKID=false; [ "$(t3_blkid TYPE /dev/x)" = got ] && [ "$(t3_blkid UUID /dev/x)" = got ] &&
+     [ "$(cat "$T/argv1.txt")" = "-n blkid -p -o value -s TYPE /dev/x${NL}-n blkid -p -o value -s UUID /dev/x" ] )'
+check "LOW 6: production t3_mkfs gives each filesystem the UUID it is passed (xfs -m uuid=, btrfs -U, ext4 -U)" \
+  '( source "$HERE/t3lib.sh"; sudo() { printf "%s\n" "$*" >> "$T/argv2.txt"; }; : > "$T/argv2.txt"
+     t3_mkfs xfs /dev/x U && t3_mkfs btrfs /dev/x U && t3_mkfs ext4 /dev/x U && ! t3_mkfs zfs /dev/x U &&
+     [ "$(cat "$T/argv2.txt")" = "mkfs.xfs -f -m reflink=1,uuid=U /dev/x${NL}mkfs.btrfs -f -U U /dev/x${NL}mkfs.ext4 -F -U U -E lazy_itable_init=0,lazy_journal_init=0 /dev/x" ] )'
+check "LOW 4: production t3_mount names the filesystem type (-t), and btrfs mounts nodiscard" \
+  '( source "$HERE/t3lib.sh"; sudo() { printf "%s\n" "$*" >> "$T/argv3.txt"; }; : > "$T/argv3.txt"
+     t3_mount xfs /dev/x /mnt/a && t3_mount btrfs /dev/x /mnt/b &&
+     [ "$(cat "$T/argv3.txt")" = "mkdir -p /mnt/a${NL}mount -t xfs /dev/x /mnt/a${NL}mkdir -p /mnt/b${NL}mount -t btrfs -o nodiscard /dev/x /mnt/b" ] )'
+check "LOW 4: production t3_pin holds the node open until t3_unpin (sudo stubbed to run as this user)" \
+  '( source "$HERE/t3lib.sh"; sudo() { shift; "$@"; }; : > "$T/pinme"
+     t3_pin "$T/pinme" && p=$T3PIN_PID && kill -0 "$p" && t3_unpin && ! kill -0 "$p" 2>/dev/null )'
+check "LOW 4: production t3_pin on a node it cannot open refuses (rc 2) and leaves no helper" \
+  '( source "$HERE/t3lib.sh"; sudo() { shift; "$@"; }; t3_pin "$T/no-such-node"; [ $? = 2 ] && [ -z "${T3PIN_PID:-}" ] )'
+# the real probe on a real filesystem (review 6 LOW 6: the test replaced t3_blkid outright, so its body never ran)
+U6=0b9e2d6c-3f1a-4c7e-9a55-0d3c6a1f2e47
+check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
+  '( source "$HERE/t3lib.sh"; command -v mkfs.ext4 > /dev/null || { echo "mkfs.ext4 missing"; exit 1; }
+     truncate -s 8M "$T/img" && mkfs.ext4 -q -F -U "$U6" "$T/img" &&
+     [ "$(t3_blkid TYPE "$T/img")" = ext4 ] && [ "$(t3_blkid UUID "$T/img")" = "$U6" ] )'
 
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]
