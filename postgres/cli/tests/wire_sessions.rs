@@ -2739,6 +2739,23 @@ fn an_index_on_a_qualified_table_is_that_tables() {
     );
 }
 
+/// A view over `public.t` (pg_dump's form) types the parameters compared with its columns: the
+/// view is stored with the engine's name for public, `main.t`, which the parameter-type walk
+/// now reads as public's t, so `c = $1` is int4 (23), as at 0823803c1 and in PostgreSQL. Since
+/// 594edd413 translated public to main, the walk read `main` as another schema it cannot open and
+/// refused every such parameter 42P18 (wire review 18 item 5).
+#[test]
+fn a_view_over_public_t_types_its_parameters() {
+    let dir = Scratch::new("publicview");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY, c INT)").ok("t");
+    a.q("CREATE VIEW v AS SELECT id, c FROM public.t")
+        .ok("a view over public.t");
+    let r = a.describe_statement("SELECT id FROM v WHERE c = $1");
+    assert_eq!(r.params, Some(vec![23]), "{:?}", r.error);
+}
+
 /// An unqualified relation is typed from the relation the engine resolves along the search path:
 /// an entry that names no attached schema (`"$user"`, PostgreSQL's default, or `nosuch`) is
 /// skipped, and an attached schema that does not hold the name is passed over, so under `"$user",
