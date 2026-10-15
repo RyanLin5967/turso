@@ -898,6 +898,31 @@ const CONFIRM_LOAD_ARMS: [(u64, u64); 4] = [(1, 0), (8, 0), (64, 0), (8, 20)];
 /// together half-way through their creates.
 const LOAD_GAPPED: &str = "load_c8_gapped";
 
+/// The load cell's reachability arm (lead, DECISIONS 2026-10-15: the writer's poll and its slot hold
+/// were unreachable at the shipped schedule, and are not equivalent): 8 clients whose every syncing
+/// flight stays in the air `SLOW_FLIGHT_US` past its sync (`journal::FLIGHT_SYNC_DELAY_US`, a test
+/// hook), longer than the 5 ms quiet period.
+const LOAD_SLOW: &str = "load_c8_slow_flights";
+
+/// The slow arm's added time in the air per flight: 8 ms, past the 5 ms quiet period.
+const SLOW_FLIGHT_US: u64 = 8_000;
+
+/// Sets the engine's flight-sync delay; restores 0 when dropped, on every exit of the arm.
+struct FlightDelay;
+
+impl FlightDelay {
+    fn set(us: u64) -> Self {
+        super::journal::FLIGHT_SYNC_DELAY_US.store(us, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for FlightDelay {
+    fn drop(&mut self) {
+        super::journal::FLIGHT_SYNC_DELAY_US.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The line name of a load arm.
 fn load_arm(c: u64, delay_ms: u64) -> String {
     if delay_ms == 0 {
@@ -930,12 +955,19 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     };
     // The population's own tail word is written before the first burst starts.
     settle();
-    let gapped = (8, 0, true);
-    for (c, delay_ms, gap) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false)).chain([gapped]) {
+    let gapped = (8, 0, true, false);
+    let slow = (8, 0, false, true);
+    for (c, delay_ms, gap, slow) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false, false)).chain([gapped, slow]) {
         let rounds = shared_rounds(c);
         // The arm's line, and its creates' name prefix: three arms run at C = 8 on one database, so a
         // prefix by C alone made the second arm's first create NameTaken (base16 at fb31e6153).
-        let arm = if gap { LOAD_GAPPED.to_string() } else { load_arm(c, delay_ms) };
+        let arm = if slow {
+            LOAD_SLOW.to_string()
+        } else if gap {
+            LOAD_GAPPED.to_string()
+        } else {
+            load_arm(c, delay_ms)
+        };
         let arm = arm.as_str();
         let e0 = exceptions(db);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
@@ -944,6 +976,8 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         // releases them all, so no create is in progress for those 20 ms (an idle hole on purpose).
         // Atomics, not a Barrier: a client that failed to start must not leave the others waiting.
         let (arrived, released) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicBool::new(false));
+        // The slow arm's flights stay in the air past the quiet period (the engine's test hook).
+        let _slow = slow.then(|| FlightDelay::set(SLOW_FLIGHT_US));
         let spans: Vec<Vec<(std::time::Instant, std::time::Instant)>> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             for t in 0..c {
@@ -984,6 +1018,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
             go.store(true, std::sync::atomic::Ordering::Release);
             clients.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        drop(_slow);
         // The delayed arm's parent, descheduled on purpose (review C08 #1's schedule).
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
@@ -1007,6 +1042,13 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         m.insert("tail_settled", u64::from(settled));
         m.insert("idle_holes", idle_holes(&spans, std::time::Duration::from_millis(CONFIRM_QUIET_MS_SHIPPED)));
         m.insert("wakeups_burst", delta(k0, k1));
+        // The burst's wall time, from the first create's call to the last one's return (wall time only
+        // for the slow arm's premise; no budget reads a time).
+        let first = spans.iter().flatten().map(|s| s.0).min();
+        let last = spans.iter().flatten().map(|s| s.1).max();
+        if let (Some(a), Some(b)) = (first, last) {
+            m.insert("burst_us", (b - a).as_micros() as u64);
+        }
         line(out, cell, arm, 0, &m);
     }
     hold_word(true);
@@ -3838,6 +3880,72 @@ fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
     if wakes > 2 * flights {
         let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
     }
+}
+
+/// The reachability arm (lead, DECISIONS 2026-10-15): with every flight in the air past the quiet
+/// period (`load_c8_slow_flights`), the writer still writes no word while flights overlap, exactly one
+/// in the tail, and wakes at most twice per flight. A writer that polls while a flight is in the air
+/// (env mutant `confirm_poll_100us`) wakes many times per flight here, where the shipped schedule's
+/// short flights hid it. PREMISE: the flights did outlast the quiet period (the burst's wall time over
+/// its flights, at least 5 ms each), or the arm proves nothing and is refused. WRITTEN NOT RUN.
+#[test]
+fn the_confirmation_writer_wakes_at_most_twice_per_flight_when_flights_outlast_the_quiet_period() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let s = data.ops.get(LOAD_SLOW).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {LOAD_SLOW} line"));
+    let per_flight_us = s["burst_us"] / s["flights"].max(1);
+    assert!(
+        per_flight_us >= CONFIRM_QUIET_MS_SHIPPED * 1000,
+        "premise refused: {LOAD_SLOW}'s flights took {per_flight_us} us each, not past the {CONFIRM_QUIET_MS_SHIPPED} ms quiet period"
+    );
+    let mut failures = String::new();
+    judge_load_arm(8, LOAD_SLOW, s, &mut failures);
+    assert!(
+        failures.is_empty(),
+        "the confirmation writer with flights longer than the quiet period ({} acks, {} flights, {per_flight_us} us each, {} wake-ups, words {} burst / {} tail):\n{failures}",
+        s["acks"],
+        s["flights"],
+        s["wakeups_burst"],
+        s["confirms_burst"],
+        s["confirms_tail"]
+    );
+}
+
+/// The reachability arm for the confirmation writer's slot hold (lead, DECISIONS 2026-10-15): the
+/// writer is held mid-word (`HOLD_CONFIRM_WRITE`, after it took a word and before it writes it), and a
+/// create meanwhile must finish: on unix the writer takes no flight slot, so nothing waits on its word.
+/// The env mutant `confirm_holds_slot` holds the slot across the write, so the create waits until the
+/// writer is released (the load arms never reach it: the burst writes no word). Run here, in the test
+/// process, on a database of its own (no counter is read). WRITTEN NOT RUN.
+#[test]
+fn a_create_does_not_wait_for_a_confirmation_word_being_written() {
+    if in_child() {
+        return;
+    }
+    use super::store::{HOLD_ARRIVED, HOLD_CONFIRM_WRITE};
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("hold.db"));
+    let trunk = db.connect().unwrap();
+    seed(&trunk, false);
+    hold_word(false);
+    db.branches.confirm_hold_for_test(HOLD_CONFIRM_WRITE);
+    trunk.create_branch("held-0").unwrap();
+    let t = std::time::Instant::now();
+    while db.branches.confirm_held_for_test() != (HOLD_CONFIRM_WRITE | HOLD_ARRIVED) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "premise: the writer never reached its held word");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let db2 = db.clone();
+    let create = std::thread::spawn(move || db2.connect().unwrap().create_branch("held-1").map_err(|e| e.to_string()));
+    let finished = finished_within(&create, std::time::Duration::from_secs(5));
+    let still_held = db.branches.confirm_held_for_test() == (HOLD_CONFIRM_WRITE | HOLD_ARRIVED);
+    db.branches.confirm_hold_for_test(0);
+    create.join().unwrap().unwrap();
+    hold_word(true);
+    assert!(still_held, "premise: the writer was released before the create was judged");
+    assert!(finished, "a create waited (5 s) for the confirmation writer's word being written: the writer held the flight slot");
 }
 
 /// DECISIONS 6d491917d2 (proposal 1): a `confirm_load` arm whose burst had an idle hole (a gap of

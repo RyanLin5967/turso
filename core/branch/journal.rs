@@ -3313,6 +3313,20 @@ impl Confirm {
     }
 }
 
+/// Test builds (fastest-budgets, the reachability arm of DECISIONS 2026-10-15): microseconds each
+/// syncing flight sleeps after its log's sync returns, still in the air (`flushing`), so a load arm
+/// can make flights outlast the confirmation writer's quiet period. 0 (the default): none.
+#[cfg(test)]
+pub(crate) static FLIGHT_SYNC_DELAY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn flight_sync_delay() {
+    let us = FLIGHT_SYNC_DELAY_US.load(std::sync::atomic::Ordering::Acquire);
+    if us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
+}
+
 fn class_code(class: SyncClass) -> u32 {
     match class {
         SyncClass::Off => 0,
@@ -3527,6 +3541,8 @@ impl Flight {
         let mut confirm = None;
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
+            #[cfg(test)]
+            flight_sync_delay();
             // The flush returned: the flight's confirmation (`HEADER_CONFIRM_AT`), for the store's
             // writer. Mutant `no_flight_confirm`: none. Mutant `confirm_in_ack_window` (test builds
             // only): written here, inside the acknowledgement window, as before (review 6 #1).
