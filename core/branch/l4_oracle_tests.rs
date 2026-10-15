@@ -41,7 +41,7 @@ impl Rng {
 
 /// One history of `steps` operations from `seed`; the facts checked after every one. Returns how
 /// often each fact was set at a check: (pages complete, all complete, free exhausted).
-fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
+fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("oracle.db");
     let mut db = open(&path);
@@ -58,16 +58,37 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
     super::journal::CREATE_LEGACY.with(|c| c.set(false));
     let want_format = if legacy { 17 } else { 19 };
     let mut live: Vec<String> = vec!["first".to_string()];
+    let mut ids: Vec<BranchId> = Vec::new();
+    // Connections on unnamed branches whose handle was dropped: released while held open.
+    let mut held: Vec<Arc<crate::Connection>> = Vec::new();
     let mut made = 0u64;
-    let mut seen = (0u64, 0u64, 0u64);
+    let mut seen = (0u64, 0u64, 0u64, 0u64);
     for step in 0..steps {
         let op = rng.below(100);
-        let what = if op < 30 {
+        let what = if op < 24 {
             let name = format!("b{made}");
             made += 1;
-            trunk.create_branch(&name).unwrap();
+            ids.push(trunk.create_branch(&name).unwrap());
             live.push(name);
             "create"
+        } else if op < 30 && !ids.is_empty() {
+            // A lease on a named branch (its deadline in the catalog's lease index); one dropped
+            // since is refused by `branch`, and skipped.
+            let id = ids[rng.below(ids.len() as u64) as usize];
+            if let Ok(b) = db.branch(id) {
+                b.lease(std::time::Duration::from_secs(3_600 + rng.below(10_000))).unwrap();
+                b.into_id();
+            }
+            "lease"
+        } else if op < 35 {
+            // An unnamed branch released while a connection holds it open.
+            let b = trunk.fork_branch().unwrap();
+            held.push(b.connect().unwrap());
+            drop(b);
+            "release held open"
+        } else if op < 38 && !held.is_empty() {
+            held.swap_remove(rng.below(held.len() as u64) as usize);
+            "close a held branch"
         } else if op < 50 {
             let id = 1 + rng.below(40);
             trunk.execute(&format!("UPDATE t SET v = 'trunk-{step}' WHERE id = {id}")).unwrap();
@@ -87,6 +108,7 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
             db.branch_checkpoint_wait();
             "checkpoint"
         } else {
+            held.clear();
             drop(trunk);
             let incarnation = db.incarnation;
             drop(db);
@@ -101,10 +123,11 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
             "seed {seed} step {step} ({what}): the store writes another format than it was made at"
         );
         match db.branches.l4_facts_check_for_test() {
-            Ok((pages, all, exhausted)) => {
+            Ok((pages, all, exhausted, meta)) => {
                 seen.0 += u64::from(pages > 0);
                 seen.1 += u64::from(all);
                 seen.2 += u64::from(exhausted);
+                seen.3 += u64::from(meta);
             }
             Err(e) => panic!("seed {seed} step {step} ({what}): an L4 fact disagrees with the catalog: {e}"),
         }
@@ -124,20 +147,21 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64) {
 /// run over a store made at the legacy 17 (`journal::CREATE_LEGACY`), opened by the older path.
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
-    let mut total = (0u64, 0u64, 0u64);
+    let mut total = (0u64, 0u64, 0u64, 0u64);
     for seed in [1u64, 7, 42, 1009, 65_537, 0xdead_beef] {
         let seen = history(seed, 300, false);
-        total = (total.0 + seen.0, total.1 + seen.1, total.2 + seen.2);
+        total = (total.0 + seen.0, total.1 + seen.1, total.2 + seen.2, total.3 + seen.3);
     }
     // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17.
     for seed in [3u64, 99] {
         history(seed, 200, true);
     }
     assert!(
-        total.0 > 0 && total.1 > 0 && total.2 > 0,
-        "premise: every fact was set at some check (pages complete {}, all complete {}, free exhausted {})",
+        total.0 > 0 && total.1 > 0 && total.2 > 0 && total.3 > 0,
+        "premise: every fact was set at some check (pages complete {}, all complete {}, free exhausted {}, a lease or held release in the meta row {})",
         total.0,
         total.1,
-        total.2
+        total.2,
+        total.3
     );
 }

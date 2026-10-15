@@ -8259,13 +8259,13 @@ impl BranchStore {
     /// `free_exhausted`, the catalog has no free slot above `free_cursor`. The catalog is read by
     /// the store's own reader connection, as the skipped queries would read it. `Err` names the
     /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
-    /// free exhausted), so a test can show they were exercised.
+    /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
     #[cfg(test)]
-    pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool), String> {
+    pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let Some(cat) = inner.cat.as_mut() else {
-            return Ok((0, false, false));
+            return Ok((0, false, false, false));
         };
         let rows = cat
             .catalog
@@ -8298,7 +8298,9 @@ impl BranchStore {
         }
         // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
         let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
+        let mut meta_set = false;
         if let Some(m) = meta.filter(|m| super::journal::meta_carries_facts(m.format)) {
+            meta_set = matches!(m.lease_min, Some(Some(_))) || m.held_released.is_some_and(|h| h > 0);
             let lease_min = cat.catalog.lease_min().map_err(|e| format!("lease_min: {e}"))?;
             let held = cat.catalog.released_ids().map_err(|e| format!("released_ids: {e}"))?.len() as u64;
             if m.lease_min != Some(lease_min) || m.held_released != Some(held) {
@@ -8308,7 +8310,7 @@ impl BranchStore {
                 ));
             }
         }
-        Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted))
+        Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted, meta_set))
     }
 
     /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
