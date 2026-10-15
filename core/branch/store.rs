@@ -2431,6 +2431,12 @@ struct NameIndex {
     releases: u64,
 }
 
+/// Test builds: allocations made inside `NameFilter::note`, by any store (lead ruling 2026-10-15:
+/// a create allocates nothing under the store mutex by construction; the filter's B-tree split a
+/// node in 37-39 of 40 creates, raws l35-diag-alloc).
+#[cfg(test)]
+pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
 /// held, so a create of a NEW name — every successful server create — is answered "free" without a
 /// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
@@ -2460,6 +2466,14 @@ impl NameFilter {
 
     /// `name` is held by a branch from now on.
     fn note(&mut self, name: &str) {
+        #[cfg(test)]
+        let allocs0 = super::budget_probe::thread_allocs().0;
+        self.note_inner(name);
+        #[cfg(test)]
+        FILTER_NOTE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+    }
+
+    fn note_inner(&mut self, name: &str) {
         if self.built.is_none() && self.pending.is_none() {
             return;
         }

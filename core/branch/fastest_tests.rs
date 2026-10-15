@@ -8711,6 +8711,51 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
     assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
 }
 
+/// Lead ruling (DECISIONS 2026-10-15, after the attribution: the n1e4 create's extra allocation is
+/// the name filter's B-tree splitting a full leaf, raws l35-diag-alloc): a create allocates NOTHING
+/// in the name filter, by construction, also while the filter grows. A catalog store with 10,000
+/// named branches, reopened so the filter is built from the catalog as the budgets' n1e4 cell
+/// builds it, then 8,000 more named creates (past any doubling of a table sized for 10,000): no
+/// allocation inside `NameFilter::note` (`FILTER_NOTE_ALLOCS`). Then, every name a branch holds is
+/// still refused to a second create, and the filter grew rather than stopped answering.
+#[test]
+fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-grow.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000 {
+            trunk.create_branch(&format!("pre-{i:05}")).unwrap();
+        }
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    let (built, entries0, _, builds0, _) = db.branches.name_filter_stats();
+    assert!(built && entries0 >= 10_000, "premise: the reopened store's name filter was built from its 10,000 names ({entries0})");
+    let trunk = db.connect().unwrap();
+    let before = super::store::FILTER_NOTE_ALLOCS.load(Relaxed);
+    for i in 0..8_000 {
+        trunk.create_branch(&format!("new-{i:05}")).unwrap();
+    }
+    let allocs = super::store::FILTER_NOTE_ALLOCS.load(Relaxed) - before;
+    assert_eq!(allocs, 0, "CLAIM: 8,000 named creates allocated {allocs} times inside the name filter (under the store mutex)");
+    db.branch_wait_name_filter();
+    for i in (0..10_000).step_by(97) {
+        assert!(trunk.create_branch(&format!("pre-{i:05}")).is_err(), "a held name pre-{i:05} was created twice");
+    }
+    for i in (0..8_000).step_by(89) {
+        assert!(trunk.create_branch(&format!("new-{i:05}")).is_err(), "a held name new-{i:05} was created twice");
+    }
+    let (built, entries, _, builds, _) = db.branches.name_filter_stats();
+    assert!(built && entries >= 18_000, "the name filter stopped answering, or lost names, as it grew: built {built}, {entries} entries");
+    assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
+}
+
 /// Lead order (2026-10-15, attribution item 1): `a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_
 /// the_store_mutex` fails about 3 runs in 10 at one sha (raws l28-ckpt-r*), its extra syscalls in
 /// the capture spans. Its instrument is the TASK's syscall count, so a span counts every thread's.
