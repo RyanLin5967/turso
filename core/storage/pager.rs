@@ -4958,12 +4958,14 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(()));
                     }
-                    // Submit all WAL writes
+                    // Submit all WAL writes. The WAL is dirty from their submission until a sync
+                    // covers them (`Wal::note_frames_written`).
                     let wal_file = wal.wal_file()?;
                     let mut batch = WriteBatch::new(wal_file);
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
+                    wal.note_frames_written();
                     commit_info.completions = batch.submit()?;
                     commit_info.completion_group = None;
                     commit_info.state = CommitState::WaitWrites;

@@ -801,6 +801,11 @@ pub trait Wal: Debug + Send + Sync {
     /// may be reported durable, even when the committer itself has no dirty
     /// pages to write (e.g. frames inserted through [Wal::write_frame_raw]).
     fn is_dirty(&self) -> bool;
+    /// Frames were written into the WAL that no fsync covers yet: it is dirty from here until a
+    /// successful WAL sync (fastest-engine: a commit's prepared frames are marked when their writes
+    /// are submitted, not when they are published after the commit's own sync, which left a synced
+    /// WAL dirty and cost the next frameless FULL commit one more sync).
+    fn note_frames_written(&self) {}
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
@@ -4177,6 +4182,10 @@ impl Wal for WalFile {
         self.dirty.load(Ordering::Acquire)
     }
 
+    fn note_frames_written(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
     fn get_max_frame_in_wal(&self) -> u64 {
         self.load_coordination_snapshot().max_frame
     }
@@ -4598,8 +4607,16 @@ impl Wal for WalFile {
     fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
         for batch in batches {
             for (page, frame_id, checksum) in &batch.metadata {
-                // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                // Update WAL index mapping page -> frame. Not `complete_append_frame`: these
+                // frames' writes marked the WAL dirty when they were submitted
+                // (`note_frames_written`), and a commit's sync, which may have covered them since,
+                // must not be undone by their publication. Mutant `publish_marks_wal_dirty`
+                // (test builds only): marked again here, as before.
+                if crate::branch::store::fe_mutant("publish_marks_wal_dirty") {
+                    self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                } else {
+                    self.publish_frame(page.get().id as u64, *frame_id, *checksum);
+                }
             }
             // Update rolling checksum
             *self.last_checksum.write() = batch.final_checksum;
@@ -4889,6 +4906,11 @@ impl WalFile {
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         self.dirty.store(true, Ordering::Release);
+        self.publish_frame(page_id, frame_id, checksums);
+    }
+
+    /// A written frame made visible: the rolling checksum, `max_frame` and the frame cache.
+    fn publish_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
