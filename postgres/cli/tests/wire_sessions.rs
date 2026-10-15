@@ -2343,6 +2343,74 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// A result column whose expression is boolean in PostgreSQL's grammar (a boolean literal, a
+/// comparison, AND / OR / NOT, IS [NOT] NULL, IN, BETWEEN, LIKE, EXISTS, a cast to bool, a CASE
+/// whose every result is boolean) is announced bool (16) and sent as t / f, and a cast to float4 or
+/// real is announced float4 (700), on both protocols, as PostgreSQL 18 announces them (expected
+/// values from its recording, artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out, never
+/// from this server). They went out as int4 or text holding 1 and 0, and float4 casts as float8: a
+/// driver read a boolean as a number or a string (found by the PG 18 differential; the lead ruled
+/// them FIXED, 2026-10-15T06:03:10Z).
+#[test]
+fn boolean_and_float4_results_are_typed_as_postgresql_types_them() {
+    let dir = Scratch::new("resulttypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN, r REAL, d DOUBLE PRECISION)")
+        .ok("k");
+    a.q("INSERT INTO k VALUES (2, true, 1.5, 2.5)").ok("row");
+    let t = |s: &str| Some(s.to_string());
+    for (sql, oids, row) in [
+        ("SELECT true, false", vec![16, 16], vec![t("t"), t("f")]),
+        (
+            "SELECT 1 = 1, 1 <> 1, 1 < 2, 2 >= 3",
+            vec![16, 16, 16, 16],
+            vec![t("t"), t("f"), t("t"), t("f")],
+        ),
+        (
+            "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1)",
+            vec![16, 16],
+            vec![t("t"), t("f")],
+        ),
+        (
+            "SELECT NOT true, true AND false, true OR false",
+            vec![16, 16, 16],
+            vec![t("f"), t("f"), t("t")],
+        ),
+        (
+            "SELECT id > 1, flag, flag = true, id IS NULL, id IS NOT NULL FROM k",
+            vec![16, 16, 16, 16, 16],
+            vec![t("t"), t("t"), t("t"), t("f"), t("t")],
+        ),
+        (
+            "SELECT id IN (1, 2), id BETWEEN 1 AND 3, 'a' LIKE 'a%' FROM k",
+            vec![16, 16, 16],
+            vec![t("t"), t("t"), t("t")],
+        ),
+        (
+            "SELECT CASE WHEN id > 1 THEN true ELSE false END FROM k",
+            vec![16],
+            vec![t("t")],
+        ),
+        (
+            "SELECT d::float4, 1.5::float4, 1.5::real, 2.5::float8 FROM k",
+            vec![700, 700, 700, 701],
+            vec![t("2.5"), t("1.5"), t("1.5"), t("2.5")],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(oids.clone()), "{sql}: simple");
+        assert_eq!(r.rows, vec![row.clone()], "{sql}: simple");
+        let r = a.xt(sql, &[]).ok(sql);
+        assert_eq!(r.oids, Some(oids), "{sql}: extended");
+        assert_eq!(r.rows, vec![row], "{sql}: extended");
+    }
+    let r = a.xt("SELECT $1::bool", &[(16, 0, b"true")]).ok("$1::bool");
+    assert_eq!((r.oids, r.rows), (Some(vec![16]), vec![vec![t("t")]]));
+    let r = a.describe_statement("SELECT id > $1 FROM k").ok("describe");
+    assert_eq!(r.oids, Some(vec![16]), "a comparison over a parameter");
+}
+
 /// INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag and row count, as
 /// PostgreSQL 18 answers them (`INSERT 0 n`, `UPDATE n`, `DELETE n`; recorded in artie
 /// lanes/wire/raw/loud-20261015/pg18-diff), on both protocols: drivers read the affected count from
