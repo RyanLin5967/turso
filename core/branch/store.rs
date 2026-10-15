@@ -3381,7 +3381,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // facts read before the rows are written (the oracle's plant).
         let mut meta = cap.meta;
         let lease_min = catalog.lease_min()?;
-        if super::journal::meta_carries_facts(meta.format) {
+        // One write path (DECISIONS e977c1d010): the meta row is at this build's format, which
+        // carries the facts. Only a test's legacy store (CREATE_LEGACY, an older build's stand-in)
+        // writes one without them.
+        #[cfg(test)]
+        let legacy = !super::journal::meta_carries_facts(meta.format);
+        #[cfg(not(test))]
+        let legacy = false;
+        if !legacy {
             meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { lease_min });
             meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
         }
