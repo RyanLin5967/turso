@@ -8212,3 +8212,81 @@ fn a_damaged_slot_a_trunk_flush_made_durable_is_refused_after_a_kill_settled_fli
         Unconfirmed::SettledFlight,
     );
 }
+
+/// Engine review 21 MED 9: a rewrite of the log dropped 84e7826f9's empty ordered end frame (an end
+/// frame that closes no record was skipped), so the kept flight it closed came back tagged from its
+/// own unsynced end frame, with no cut word, and was slot-checked at open: a damaged slot of the
+/// acknowledged TrunkRetain dropped it silently and x read the trunk's newer page. Here a fuzzy
+/// checkpoint captured before the trunk commit's decision installs after the trunk's ordered
+/// upgrade, so its cut keeps z's flight and the empty end frame after it. Catalog mode (a cut).
+/// Mutant `reframe_drops_empty_end`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_an_ordered_upgrade_made_durable_is_refused_after_a_cut() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ordered-upgrade-cut.db");
+    let (id, kept, arena, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let x = trunk.fork_branch().unwrap();
+        let z = trunk.fork_branch().unwrap();
+        let zc = z.connect().unwrap();
+        let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        // Captured before the trunk commit decides: its cut keeps every record written after.
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        eventually("premise: the checkpoint never reached its commit", || {
+            db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+        });
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_TRUNK_DECIDED, O::Release);
+        let committing = std::thread::spawn(move || {
+            write_v(&trunk, 3, "new");
+            trunk
+        });
+        eventually("premise: the trunk commit never decided", || {
+            hold.load(O::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED
+        });
+        // z's commit leads a D0 flight in the window: it carries the trunk commit's TrunkRetain.
+        write_v(&zc, 40, "z");
+        let barriers = sync_counts().barrier;
+        let len = db.branches.log_len_for_test();
+        hold.store(0, O::Release);
+        let trunk = committing.join().unwrap();
+        assert!(sync_counts().barrier > barriers, "premise: the trunk commit's barrier was ordered");
+        assert!(
+            db.branches.log_len_for_test() > len,
+            "premise: the ordered upgrade closed z's flight with an empty end frame"
+        );
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint's install cut the log");
+        let z_slots: std::collections::HashSet<u32> = z.owned_slots().into_iter().collect();
+        let kept: Vec<u32> = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !before.contains(s) && !z_slots.contains(s))
+            .collect();
+        assert_eq!(kept.len(), 1, "premise: the trunk commit kept one pre-image for x");
+        let arena = arena_path(&db);
+        let id = x.into_id();
+        let _z = z.into_id();
+        drop(zc);
+        let incarnation = db.incarnation;
+        drop(trunk);
+        drop(db);
+        (id, kept[0], arena, incarnation)
+    };
+    flip_slot_byte(&arena, kept);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    let got = read_row_of(&db, id, 3);
+    assert!(
+        got.is_err(),
+        "a damaged slot an ordered upgrade made durable was dropped silently after a cut, x read {got:?}"
+    );
+}
