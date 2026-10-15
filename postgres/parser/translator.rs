@@ -4138,6 +4138,38 @@ impl PostgreSQLTranslator {
             }
         }
 
+        // PostgreSQL's random() is a float8 in [0, 1); the engine's is SQLite's, a 64-bit integer
+        // in [-2^63, 2^63), so it is scaled: >> 11 keeps 53 bits, [-2^52, 2^52), which / 2^53 maps
+        // exactly into [-0.5, 0.5) and + 0.5 into [0, 1) (/ 2^64 rounded the largest draws to 1.0).
+        if func_name.eq_ignore_ascii_case("random") && args.is_empty() && func_call.over.is_none()
+        {
+            let call = ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness,
+                args,
+                order_by: vec![],
+                within_group: vec![],
+                filter_over,
+            };
+            let bits = ast::Expr::Binary(
+                Box::new(call),
+                ast::Operator::RightShift,
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("11".to_string()))),
+            );
+            let scaled = ast::Expr::Binary(
+                Box::new(ast::Expr::Parenthesized(vec![Box::new(bits)])),
+                ast::Operator::Divide,
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                    "9007199254740992.0".to_string(),
+                ))),
+            );
+            return Ok(ast::Expr::Parenthesized(vec![Box::new(ast::Expr::Binary(
+                Box::new(scaled),
+                ast::Operator::Add,
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("0.5".to_string()))),
+            ))]));
+        }
+
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
             distinctness,

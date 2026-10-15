@@ -519,9 +519,9 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
         // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
-        // float by the engine (random() is not here: the engine's is SQLite's 64-bit integer).
+        // float by the engine (random() as the translator scales it).
         "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
-        | "atan2" | "degrees" | "radians" | "pi" => FLOAT8,
+        | "atan2" | "degrees" | "radians" | "pi" | "random" => FLOAT8,
         "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp" => 1184,
         _ => return None,
     })
