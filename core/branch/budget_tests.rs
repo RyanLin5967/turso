@@ -531,6 +531,14 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
         b.insert("quiet", u64::from(t0 == base && settled));
+        if cell.starts_with("wtail_") {
+            // The written tail's premise and its free-table probes, from the open's own stats.
+            let st = opened.branch_open_stats();
+            b.insert("touched_below_hw", st.touched_below_hw);
+            b.insert("free_probes", st.free_probes);
+            b.insert("touched_slots", st.touched_slots);
+            b.insert("records", st.records);
+        }
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
@@ -2024,18 +2032,6 @@ fn budget_child() {
             return;
         }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if spec.starts_with("wtail_") {
-            let s = db.branch_open_stats();
-            let facts: Sample = [
-                ("touched_below_hw", s.touched_below_hw),
-                ("free_probes", s.free_probes),
-                ("touched_slots", s.touched_slots),
-                ("records", s.records),
-            ]
-            .into_iter()
-            .collect();
-            line(&mut text, &spec, "open_facts", 0, &facts);
-        }
         if spec == "confirm_load" {
             confirm_load(&spec, &db, &mut text);
         } else if spec == "confirm_n10" {
@@ -3318,7 +3314,7 @@ fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
     let mut failures = String::new();
     for spec in ["wtail_n10", "wtail_n1e4"] {
         let c = cell(spec);
-        let f = &c.ops["open_facts"][0];
+        let f = &c.ops["recovery"][0];
         assert!(
             f["touched_below_hw"] >= WTAIL && f["records"] > 0,
             "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
