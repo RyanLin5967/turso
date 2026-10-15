@@ -1775,7 +1775,7 @@ struct CatState {
     /// Branches whose catalog rows are stale, and which of their rows (`DIRTY_*`): at the next
     /// checkpoint only those are rewritten (fix v3, PREREG A9: a commit rewrites the branch's `cur`
     /// rows and never its `branch` row, so its secondary indexes are not touched).
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     /// Branches removed since the last checkpoint: deleted from the catalog at the next one, and
     /// never loaded from it again.
     removed: HashSet<BranchId>,
@@ -2093,7 +2093,7 @@ impl CatState {
             flight: false,
             ckpt: CkptCounters::default(),
             catalog,
-            dirty: HashMap::new(),
+            dirty: BTreeMap::new(),
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
@@ -2887,7 +2887,7 @@ impl Lineage {
 
 /// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
 /// resident branch's row, current page map and retained versions, with what changed in it.
-fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
         .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
@@ -2955,7 +2955,7 @@ struct Captured {
     log_from: u64,
     rows: Vec<(CatBranch, u8)>,
     /// The dirty map the capture swapped out: merged back if the write fails.
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     removed: Vec<BranchId>,
     trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
     trunk_gone: Vec<(u32, u64)>,
@@ -7745,7 +7745,8 @@ impl BranchStore {
             map("names.gone", &inner.names.gone),
         ];
         if let Some(cat) = inner.cat.as_ref() {
-            out.push(map("cat.dirty", &cat.dirty));
+            // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
+            out.push(("cat.dirty", cat.dirty.len(), 0));
             out.push(set("cat.removed", &cat.removed));
         }
         out
