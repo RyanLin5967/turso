@@ -110,3 +110,60 @@ fn diag_stack_needed_per_nesting_level() {
         println!("FE_STACK_DIAG {kib} KiB: {}", row.join(" "));
     }
 }
+
+/// Each nesting shape this class knows, `depth` levels deep.
+fn shapes(depth: usize) -> Vec<(&'static str, String)> {
+    let wrap = |inner: &str, f: &dyn Fn(&str) -> String| {
+        let mut s = inner.to_string();
+        for _ in 0..depth {
+            s = f(&s);
+        }
+        s
+    };
+    let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_string()];
+    for i in 1..depth {
+        ctes.push(format!("c{i} AS (SELECT x FROM c{})", i - 1));
+    }
+    vec![
+        ("scalar subqueries", nested_scalar_subqueries(depth)),
+        ("parentheses", format!("SELECT {}", wrap("1", &|s| format!("({s})")))),
+        ("right-nested sums", format!("SELECT {}", wrap("1", &|s| format!("1 + ({s})")))),
+        ("function calls", format!("SELECT {}", wrap("1", &|s| format!("abs({s})")))),
+        ("CASE", format!("SELECT {}", wrap("1", &|s| format!("CASE WHEN 1 THEN {s} END")))),
+        ("IN subqueries", format!("SELECT {}", wrap("1", &|s| format!("1 IN (SELECT {s})")))),
+        ("EXISTS", format!("SELECT {}", wrap("1", &|s| format!("EXISTS (SELECT {s})")))),
+        ("derived tables", wrap("SELECT 1 AS x", &|s| format!("SELECT x FROM ({s})"))),
+        ("parenthesised FROM", format!("SELECT 1 FROM {}", wrap("(SELECT 1)", &|s| format!("({s})")))),
+        ("CTE chain", format!("WITH {} SELECT x FROM c{}", ctes.join(", "), depth.saturating_sub(1))),
+    ]
+}
+
+/// The class (lead order): client SQL must never crash the server. Every nesting shape above, 60
+/// levels deep, on threads of 128 KiB to 1 MiB: each outcome is an answer or a refusal, never a
+/// dead process. Premise: each shape answers, or is refused by a fixed depth bound, on 8 MiB at
+/// depth 3 (so the shapes are valid SQL, and the guard has a case it must pass).
+#[test]
+fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::no_nesting_shape_kills_the_process_on_any_thread_stack";
+    for (shape, sql) in shapes(3) {
+        let got = in_child(test, 8 * 1024, &sql);
+        assert!(got.starts_with("ok"), "premise: {shape} at depth 3 on 8 MiB did not answer: {got} ({sql})");
+    }
+    let mut died = Vec::new();
+    let mut refused = 0;
+    for kib in [128usize, 256, 512, 1024] {
+        for (shape, sql) in shapes(60) {
+            let got = in_child(test, kib, &sql);
+            if got.starts_with("died") {
+                died.push(format!("{shape} on {kib} KiB: {got}"));
+            } else if got.starts_with("err StackDepthLimitExceeded") {
+                refused += 1;
+            }
+        }
+    }
+    assert!(died.is_empty(), "CLAIM: client SQL killed the process ({} cases): {died:?}", died.len());
+    assert!(refused > 0, "premise: no case reached the stack guard, so nothing here tested it");
+}

@@ -553,6 +553,8 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
@@ -885,6 +887,8 @@ struct SubqueryPlanCache {
  */
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let mut cache = SubqueryPlanCache::default();
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }

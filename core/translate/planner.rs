@@ -2127,6 +2127,8 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 

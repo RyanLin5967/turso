@@ -38,6 +38,8 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     plan: SelectPlan,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     emit_program_for_select_with_resolver(program, resolver.fork(), plan)
 }
 
@@ -80,6 +82,8 @@ pub fn emit_query<'a>(
     plan: &'a mut SelectPlan,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 

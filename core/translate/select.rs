@@ -42,6 +42,8 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -168,6 +170,8 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,

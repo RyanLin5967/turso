@@ -161,6 +161,8 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }

@@ -237,6 +237,8 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -1594,6 +1596,8 @@ pub fn emit_from_clause_subquery(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
 
@@ -1897,6 +1901,8 @@ pub fn emit_non_from_clause_subquery(
     is_correlated: bool,
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
+    crate::error::check_stack()?;
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {

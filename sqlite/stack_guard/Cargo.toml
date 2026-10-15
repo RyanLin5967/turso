@@ -1,0 +1,17 @@
+[package]
+name = "turso_stack_guard"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The stack check every recursive entry of the Turso parser and engine makes"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_stack_guard"
+
+[dependencies]
+stacker = "0.1"
