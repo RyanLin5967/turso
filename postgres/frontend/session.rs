@@ -571,6 +571,11 @@ fn prepare_statement_checked(
         None
     };
     if let Some(types) = types.as_deref_mut() {
+        // The schema the compile below will use: it adopts the database's newest (another
+        // session's DDL) in compile_cmd, after this; read before that, the types came from the
+        // session's older snapshot, were fixed at the first Describe, and every later Execute was
+        // refused 0A000 against the schema it then saw (wire review 18 item 8).
+        pg_conn.conn.maybe_update_schema();
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
         if !used.is_empty() {
