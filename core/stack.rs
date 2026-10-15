@@ -188,9 +188,7 @@ impl NestGuard {
     pub(crate) fn enter(what: &'static str) -> crate::Result<Self> {
         let depth = DEPTH.with(|d| d.get());
         let refuse = match remaining_stack() {
-            Some(left) => {
-                (depth > 0 || EXECUTING.with(|e| e.get()) > 0) && left < margin()
-            }
+            Some(left) => (depth > 0 || EXECUTING.with(|e| e.get()) > 0) && left < margin(),
             None => depth >= FALLBACK_DEPTH,
         };
         if refuse {
@@ -233,6 +231,12 @@ pub(crate) mod level_cost {
     std::thread_local! {
         static LEFT_AT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
         static WORST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static REENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Outermost steps entered while a statement stepped on this thread, since the last take.
+    pub(crate) fn take_reentered() -> usize {
+        REENTERED.with(|r| r.replace(0))
     }
 
     pub(super) fn record(depth: usize) {
@@ -242,6 +246,9 @@ pub(crate) mod level_cost {
         LEFT_AT.with(|at| {
             let mut at = at.borrow_mut();
             at.truncate(depth);
+            if depth == 0 && super::EXECUTING.with(|e| e.get()) > 0 {
+                REENTERED.with(|r| r.set(r.get() + 1));
+            }
             if let Some(&outer) = at.last() {
                 WORST.with(|w| w.set(w.get().max(outer.saturating_sub(left))));
             }
@@ -346,7 +353,8 @@ mod tests {
 
     /// The stack between two consecutive nested checks, over views, FROM subqueries, WHERE and
     /// scalar subqueries and a mix of them, stays under LEVEL_COST (measured in debug on an 8 MiB
-    /// thread: 73,584 B at most). A WHERE or scalar subquery's emission was not checked, so two
+    /// thread: 73,584 B at most). A lower bound on a level's cost: what the innermost level uses
+    /// below its own check is not measured. A WHERE or scalar subquery's emission was not checked, so two
     /// checks were 481,216 B apart on the mix (fastest-engine, on the NestGuard margin). Not
     /// covered: the parser, which recurses with no check (debug: 211 KB for a flat SELECT,
     /// about 180 KB per scalar subquery level), and release frames (no release build here).
@@ -355,8 +363,7 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(8 << 20)
             .spawn(|| {
-                let io: std::sync::Arc<dyn crate::IO> =
-                    std::sync::Arc::new(crate::MemoryIO::new());
+                let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
                 let db = crate::Database::open_file(
                     io,
                     ":memory:",
@@ -416,12 +423,39 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(256 << 10)
             .spawn(|| {
-                assert!(at(100 << 10, false), "premise: a quiet thread's outermost step runs");
-                assert!(!at(100 << 10, true), "a re-entered prepare's first step was exempt");
+                assert!(
+                    at(100 << 10, false),
+                    "premise: a quiet thread's outermost step runs"
+                );
+                assert!(
+                    !at(100 << 10, true),
+                    "a re-entered prepare's first step was exempt"
+                );
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside
+    /// `Program::step` (op_parse_schema), and that statement's outermost step is seen as entered
+    /// while a statement steps. Without `Executing` held by `Program::step` it is seen as a quiet
+    /// thread's, exempt (fresh-context review of bace2e9d0: the earlier test held `Executing` by
+    /// hand, so it passed with the line in `step` deleted).
+    #[test]
+    fn a_schema_reparse_inside_a_step_is_a_reentered_prepare() {
+        let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect))
+            .unwrap();
+        let conn = db.connect().unwrap();
+        level_cost::take_reentered();
+        conn.execute("CREATE TABLE r(a INTEGER)").unwrap();
+        assert!(
+            level_cost::take_reentered() > 0,
+            "the schema reparse's prepare was not seen inside a step"
+        );
+        conn.execute("SELECT a FROM r").unwrap();
+        assert_eq!(level_cost::take_reentered(), 0, "a flat SELECT counted as re-entered");
     }
 
     /// On an 8 MiB thread the margin is the full STACK_MARGIN, as before.
