@@ -8841,6 +8841,87 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
     assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
 }
 
+/// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
+/// it installed its snapshot and before it takes its cut (`HOLD_COMPACT_INSTALLED`, store mutex
+/// free), creates go on past the hard limit until one compacts the log INLINE (counted,
+/// `branch_exception_counters()[2]`). Then creates pad the NEW log to exactly the held cut's offset
+/// (`held_cut_from_for_test`), the last one named so its length fits, as Codex's equal-length frames
+/// did: the stale offset is then a record boundary of the new log, which is what lets the old cut
+/// copy it (without the alignment its re-framing fails and nothing is lost, so the arm would not
+/// discriminate). Then one more create, the victim. The writer released, its compaction finishes;
+/// the store closed and reopened: EVERY create acknowledged since the hold is a live branch. Before
+/// the fix the stale cut installed the older generation over the inline one. Mutant
+/// `bg_cut_identity_unchecked`.
+#[test]
+fn a_create_after_an_inline_compaction_survives_a_stale_background_cut() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stale-cut.db");
+    let (made, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_INSTALLED);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.confirm_held_for_test() != super::store::HOLD_COMPACT_INSTALLED | super::store::HOLD_ARRIVED {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction reached its install");
+        }
+        let from = db.branches.held_cut_from_for_test();
+        let mut made = Vec::new();
+        let inline = db.branch_exception_counters()[2];
+        while db.branch_exception_counters()[2] == inline {
+            made.push(trunk.fork_branch().unwrap().into_id());
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: no create compacted inline past the hard limit");
+        }
+        let inline = db.branch_exception_counters()[2];
+        let len = || db.branches.log_len_for_test();
+        assert!(len() < from, "premise: the inline log ({}) is already past the held cut's offset {from}", len());
+        // One unnamed and one named create measure the two frame lengths: a named create's grows by
+        // one byte per byte of name (names stay under 128 bytes, so no length prefix widens).
+        let l0 = len();
+        made.push(trunk.fork_branch().unwrap().into_id());
+        let unnamed = len() - l0;
+        let l1 = len();
+        made.push(trunk.create_branch("pad-measure").unwrap());
+        let named_fixed = (len() - l1).checked_sub(11).expect("premise: a named create's frame holds its name");
+        assert!(unnamed < 58, "premise: an unnamed create's frame ({unnamed} bytes) fits the padding's slack");
+        let mut pads = 0u32;
+        loop {
+            let at = len();
+            assert!(at <= from, "premise: the padding overshot the held cut's offset {from} (at {at})");
+            let rem = from - at;
+            if rem == 0 {
+                break;
+            }
+            if rem > named_fixed + 64 {
+                made.push(trunk.fork_branch().unwrap().into_id());
+            } else {
+                let n = rem.checked_sub(named_fixed).filter(|n| *n >= 6).expect("premise: the padding left room for a named create") as usize;
+                pads += 1;
+                let name = format!("p{pads}-{}", "x".repeat(n));
+                made.push(trunk.create_branch(&name[..n]).unwrap());
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(90), "premise: the padding never reached the held cut's offset");
+        }
+        assert_eq!(db.branch_exception_counters()[2], inline, "premise: the padding compacted the log inline again");
+        made.push(trunk.fork_branch().unwrap().into_id());
+        db.branches.confirm_hold_for_test(0);
+        eventually("premise: the held background compaction never finished", || !db.branches.compaction_owed_for_test());
+        (made, db.incarnation)
+    };
+    let db = reopen(&path, opts(false, SyncClass::Fsync), incarnation);
+    let live = db.branch_ids().unwrap();
+    let lost: Vec<_> = made.iter().filter(|id| !live.contains(id)).collect();
+    assert!(
+        lost.is_empty(),
+        "CLAIM: {} of {} creates acknowledged after an inline compaction were lost to the stale background cut: {lost:?}",
+        lost.len(),
+        made.len()
+    );
+}
+
 /// L2 slope (budget create_allocates_no_table_of_every_branch_under_the_store_mutex): the create
 /// that allocates the most under the store mutex as a D0 snapshot store grows past 2^15 branches,
 /// and whether it compacted the log inline (a D0 compaction syncs nothing, so `maybe_compact` runs it

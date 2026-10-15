@@ -432,6 +432,10 @@ pub(crate) struct Group {
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
     confirm_hold: AtomicU8,
+    /// Test builds: the cut offset (`BgCompaction::from`) of the background compaction last held
+    /// at `HOLD_COMPACT_INSTALLED`, so a test can line a later log up with it (Codex C25 HIGH 1).
+    #[cfg(test)]
+    held_cut_from: AtomicU64,
     /// This group, for a branch catalog's own store to forward its catalog's failed syncs to as
     /// they happen (`BranchStore::link_drain_parent`; engine review 21 MED 5). Set by
     /// `Group::shared`.
@@ -502,6 +506,11 @@ pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 /// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's snapshot is installed and
+/// its directory synced, its cut not yet taken, and the store mutex free (Codex C25 HIGH 1's window).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
 
 #[derive(Default)]
 struct GroupState {
@@ -637,6 +646,8 @@ impl Group {
             writer_pid: crate::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            held_cut_from: AtomicU64::new(0),
             me: crate::sync::OnceLock::new(),
             #[cfg(test)]
             confirm_notifies: AtomicU64::new(0),
@@ -5948,6 +5959,11 @@ impl BranchStore {
             }
             bg.sync_dir()?;
             group.mark_committed(bg.lsn(), bg.class());
+            #[cfg(test)]
+            {
+                group.held_cut_from.store(bg.from(), Ordering::Release);
+                pause_at(hold, HOLD_COMPACT_INSTALLED);
+            }
             // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
             // would (`COMPACT_STOP_BEFORE_CUT`).
             #[cfg(test)]
@@ -8514,6 +8530,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn confirm_held_for_test(&self) -> u8 {
         self.group.confirm_hold.load(Ordering::Acquire)
+    }
+
+    /// Test builds: the cut offset of the background compaction last held at
+    /// `HOLD_COMPACT_INSTALLED` (`Group::held_cut_from`).
+    #[cfg(test)]
+    pub(crate) fn held_cut_from_for_test(&self) -> u64 {
+        self.group.held_cut_from.load(Ordering::Acquire)
     }
 
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
