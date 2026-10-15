@@ -379,15 +379,22 @@ def gates(head, base, budget, baseline, cpu=None, base_ok=True, identity=None):
             "never reached: " + ("no such head arm" if BASELINE_ARM not in head else "the arm was cut short (rows above)"),
             "NOT-RUN", "regression")
     ins = budget["instructions"]
+
+    def ir_base(arm):
+        """(base Ir/create, its source, the refusal) for ARM: an in-job base outranks the artifact, which stands in for
+        an arm only when it holds that arm's count (the baseline arm: always tried) and artifact_refusal() passes it"""
+        if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
+            return base[arm]["ir_per_op"]["create"], "base built in this job", None
+        if baseline is not None and (arm == BASELINE_ARM or art_value(baseline, arm, "ir_create")):
+            refused = artifact_refusal(baseline, cpu, "ir_create", arm, identity)
+            if refused is None:
+                return art_value(baseline, arm, "ir_create"), f"baseline artifact of {baseline['sha']}", None
+            return None, None, refused
+        return None, None, None
+
     arm = BASELINE_ARM
     h = head.get(arm, {}).get("ir_per_op", {}).get("create")
-    b = src = why = None
-    if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
-        b, src = base[arm]["ir_per_op"]["create"], "base built in this job"
-    elif baseline is not None:
-        why = artifact_refusal(baseline, cpu, "ir_create", BASELINE_ARM, identity)
-        if why is None:
-            b, src = art_value(baseline, BASELINE_ARM, "ir_create"), f"baseline artifact of {baseline['sha']}"
+    b, src, why = ir_base(arm)
     # instructions/create is always emitted and always regression-kind: INFO (first run) blocks regression_green too
     if h is None:
         row("instructions/create", "a callgrind count", "none", "FAIL", "regression")
@@ -401,6 +408,31 @@ def gates(head, base, budget, baseline, cpu=None, base_ok=True, identity=None):
         g = h / b - 1
         row("instructions/create", f"growth <= {ins['create_growth_max']:.0%} vs {src}",
             f"head {h} base {b} growth {g:+.2%}", "PASS" if g <= ins["create_growth_max"] else "FAIL", "regression")
+    # review 7 / C21 finding 1: every other C=1 arm with an Ir count on either side, by the same rules (review 5 MED 10
+    # asks for both comparisons on every artifact C=1 arm); an arm the head lost already FAILs on its syscalls-vs-base
+    # row, and an arm with no count on either side has nothing to compare
+    others = {a for a, x in head.items() if a != BASELINE_ARM and (x or {}).get("clients", 1) == 1}
+    if base:
+        others |= {a for a, x in base.items() if a != BASELINE_ARM and (x or {}).get("clients", 1) == 1}
+    elif baseline is not None:
+        others |= {a for a in art_arms(baseline) if a != BASELINE_ARM and art_value(baseline, a, "ir_create")}
+    for a in sorted(others & set(head)):
+        h = (head.get(a) or {}).get("ir_per_op", {}).get("create")
+        b, src, why = ir_base(a)
+        gid = f"instructions/create/{a}"
+        if h is None and b is None and not why:
+            continue
+        if h is None:
+            row(gid, "a callgrind count, as the base has one", "none", "FAIL", "regression")
+        elif why:
+            row(gid, f"growth <= {ins['create_growth_max']:.0%} vs an in-job base or the baseline artifact of this cpu",
+                f"refused: {why}", "FAIL", "regression")
+        elif b is None:
+            row(gid, "a base to compare against", f"head {h} Ir/op; no base holds this arm (a new arm)", "INFO", "info")
+        else:
+            g = h / b - 1
+            row(gid, f"growth <= {ins['create_growth_max']:.0%} vs {src}", f"head {h} base {b} growth {g:+.2%}",
+                "PASS" if g <= ins["create_growth_max"] else "FAIL", "regression")
     return rows
 
 
