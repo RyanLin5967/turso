@@ -876,7 +876,25 @@ def self_test():
                 f.write("%s\t%d\t%d\t%d\n" % (a, i, t1 - t0, t0))
         sfp = os.path.join(rd_, "sync_fds.json")  # [tenth review HIGH 1] report() takes the probe's fd map
         with open(sfp, "w") as f:
-            json.dump({"n": 2, "sync_fds": {"append25": {"3": 2}, "nosync25": {}}}, f)
+            # [V3 review 11 LOW 1, disclosed: the planted summary carries sync_fds_overflow false, as every summary the
+            # probe writes does (v3floor.c prints it always); sync_fds_of now goes on only on an explicit false]
+            json.dump({"n": 2, "sync_fds_overflow": False, "sync_fds": {"append25": {"3": 2}, "nosync25": {}}}, f)
+        # V3 review 11 LOW 1: sync_fds_of refused only `sync_fds_overflow is True`, so a summary whose overflow flag is
+        # missing, null or not a bool was trusted; only an explicit False goes on (expectations by hand)
+        ov_got = {}
+        for tag, extra in (("absent", {}), ("null", {"sync_fds_overflow": None}), ("a string", {"sync_fds_overflow": "false"}),
+                           ("true", {"sync_fds_overflow": True}), ("false", {"sync_fds_overflow": False})):
+            op = os.path.join(rd_, "ov-%s.json" % tag.replace(" ", "_"))
+            with open(op, "w") as f:
+                json.dump(dict({"n": 2, "sync_fds": {"append25": {"3": 2}, "nosync25": {}}}, **extra), f)
+            try:
+                sync_fds_of(op)
+                ov_got[tag] = "accepted"
+            except Refuse:
+                ov_got[tag] = "refused"
+        chk("sync_fds_of (review 11 LOW 1): overflow absent, null, a string or true -> refused; only False -> accepted",
+            ov_got == {"absent": "refused", "null": "refused", "a string": "refused", "true": "refused", "false": "accepted"},
+            ov_got)
         # [V3 review 12 item 16: the red commit's `except TypeError` shims are gone from here on: an API break is a crash]
         r = report(rec, None, wt, 99, sfp)
         sa = (r.get("syscalls") or {}).get("arms") or {}
