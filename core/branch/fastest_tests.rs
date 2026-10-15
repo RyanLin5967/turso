@@ -8609,6 +8609,39 @@ fn no_per_branch_table_regrows_past_64_kib_inside_a_create() {
     assert!(over.is_empty(), "CLAIM: a create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
 }
 
+/// L2 slope (budget create_allocates_no_table_of_every_branch_under_the_store_mutex): the create
+/// that allocates the most under the store mutex as a D0 snapshot store grows past 2^15 branches,
+/// and whether it compacted the log inline (a D0 compaction syncs nothing, so `maybe_compact` runs it
+/// in the create's own hold, encoding a snapshot of every branch: O(N) bytes). Per create: this
+/// thread's bytes allocated under a store mutex (`budget_probe::thread_allocs`, exact per thread)
+/// and the log's length before and after (a compaction shortens it). Budget: 64 KiB per create.
+#[test]
+fn a_d0_create_allocates_at_most_64_kib_under_the_store_mutex_as_branches_grow() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("growth-d0.db"), opts(false, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let (mut worst, mut worst_at, mut worst_compacted, mut compactions) = (0u64, 0u64, false, 0u64);
+    for n in 0..34_000u64 {
+        let len0 = db.branches.log_len_for_test();
+        let held0 = super::budget_probe::thread_allocs().3;
+        let _ = trunk.fork_branch().unwrap().into_id();
+        let held = super::budget_probe::thread_allocs().3 - held0;
+        let compacted = db.branches.log_len_for_test() < len0;
+        compactions += u64::from(compacted);
+        if held > worst {
+            (worst, worst_at, worst_compacted) = (held, n, compacted);
+        }
+    }
+    assert!(compactions > 0, "premise: the log was compacted while the store grew");
+    assert!(
+        worst <= 64 << 10,
+        "CLAIM: create {worst_at} allocated {worst} bytes under the store mutex (it compacted the log inline: \
+         {worst_compacted}; {compactions} compacting creates in 34,000); budget 64 KiB"
+    );
+}
+
 /// Lead order (2026-10-15T08:22:05Z, from the wire's default-stack raws; debug, lldb): the create
 /// path's frames were ensure_backing 797 KB, open_resolved 831 KB and start_name_filter at least
 /// 422 KB, so a create overflowed a 2 MiB thread (Rust's default spawn stack). On a 2 MiB thread, in
