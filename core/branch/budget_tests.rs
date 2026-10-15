@@ -1079,6 +1079,9 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         let arm = arm.as_str();
         let e0 = exceptions(db);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
+        // DECISIONS 994f7d41e0's instrument: the writer's own log of each word (taken at, time since
+        // its flight landed), from here.
+        db.branches.take_confirm_word_log_for_test();
         let go = std::sync::atomic::AtomicBool::new(false);
         // The gapped control's pause: every client meets half-way, the last to arrive sleeps 20 ms and
         // releases them all, so no create is in progress for those 20 ms (an idle hole on purpose).
@@ -1135,6 +1138,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         // read them. The tail's are the last landed flight's own (`confirm_tail_words_for_test`,
         // counted by the writer as it writes them); every other word written was a burst's.
         let (w2, tail) = (words(), db.branches.confirm_tail_words_for_test());
+        let logged = db.branches.take_confirm_word_log_for_test();
         let e1 = exceptions(db);
         let total = delta(w0, w2);
         let mut m = Sample::new();
@@ -1156,6 +1160,19 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         let last = spans.iter().flatten().map(|s| s.1).max();
         if let (Some(a), Some(b)) = (first, last) {
             m.insert("burst_us", (b - a).as_micros() as u64);
+        }
+        // Each word the writer took before the burst's last create returned: how long since its
+        // flight landed (the quiet gap it waited out), and how many creates were in progress then.
+        // `logged_words` must equal `confirms_total` (the instrument saw every word, or the cell is
+        // refused).
+        m.insert("logged_words", logged.len() as u64);
+        let in_burst: Vec<&(std::time::Instant, std::time::Duration)> =
+            logged.iter().filter(|(at, _)| last.is_some_and(|l| *at <= l)).collect();
+        m.insert("burst_logged", in_burst.len() as u64);
+        if !in_burst.is_empty() {
+            m.insert("burst_word_gap_min_us", in_burst.iter().map(|(_, gap)| gap.as_micros() as u64).min().unwrap());
+            let in_progress = |at: std::time::Instant| spans.iter().flatten().filter(|(s, e)| *s <= at && at <= *e).count() as u64;
+            m.insert("burst_word_creates_min", in_burst.iter().map(|(at, _)| in_progress(*at)).min().unwrap());
         }
         line(out, cell, arm, 0, &m);
     }
@@ -4097,7 +4114,18 @@ fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
     if c >= 8 && s["idle_holes"] > 0 {
         let _ = writeln!(failures, "  {op}: {} idle_holes (gaps of 5 ms or more with no create in progress); premise refused: back-to-back flights", s["idle_holes"]);
     } else if c >= 8 && burst != 0 {
-        let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
+        // The writer's own log says what kind of gap each burst word was written in.
+        let kind = match (s.get("burst_word_gap_min_us"), s.get("burst_word_creates_min")) {
+            (Some(gap), Some(creates)) => format!(
+                " (by the writer's log: each in a gap of at least {gap} us since its flight landed, with no flight in the air, while at least {creates} creates were in progress: the creates' flights stalled)"
+            ),
+            _ => " (no burst word in the writer's log)".to_string(),
+        };
+        let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0{kind}");
+    }
+    // DECISIONS 994f7d41e0: an instrument that did not see a word the counters saw refuses the cell.
+    if s["logged_words"] != s["confirms_total"] {
+        let _ = writeln!(failures, "  {op}: the writer's log holds {} words, the counters {}: the instrument is broken", s["logged_words"], s["confirms_total"]);
     }
     // DECISIONS 6d491917d2 (proposal 3): exactly one; with the tail settled (unheld, nothing pending)
     // a tail with no word is a word lost.

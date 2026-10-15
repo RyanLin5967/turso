@@ -447,6 +447,12 @@ pub(crate) struct Group {
     confirm_last_landed: std::sync::atomic::AtomicU32,
     #[cfg(test)]
     confirm_last_landed_writes: AtomicU64,
+    /// Test builds (fastest-budgets, DECISIONS 994f7d41e0's instrument): every word the background
+    /// writer wrote, as (when it took the word, how long since the flight it confirms landed with
+    /// it), pushed after the write, off the group's lock, so a cell can tell a word written in a
+    /// quiet gap of the flights from one written while they overlapped.
+    #[cfg(test)]
+    confirm_word_log: std::sync::Mutex<Vec<(Instant, Duration)>>,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -642,6 +648,8 @@ impl Group {
             confirm_last_landed: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_last_landed_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            confirm_word_log: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1168,6 +1176,8 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
         g.confirm_taken = g.confirm_taken.max(confirm.key());
+        #[cfg(test)]
+        let took = (Instant::now(), idle);
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
@@ -1185,6 +1195,8 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
             group.write_confirm(&confirm, false);
         }
+        #[cfg(test)]
+        group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()).push(took);
         drop(confirm);
         g = group.lock();
     }
@@ -8479,6 +8491,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn confirm_wakeups_for_test(&self) -> u64 {
         self.group.lock().confirm_wakeups
+    }
+
+    /// Test builds: the background writer's words since the last call, as (taken at, time since its
+    /// flight landed) (`Group::confirm_word_log`).
+    #[cfg(test)]
+    pub(crate) fn take_confirm_word_log_for_test(&self) -> Vec<(Instant, Duration)> {
+        std::mem::take(&mut *self.group.confirm_word_log.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Test builds (fastest-budgets, review C08 #1): the words written since the last landing that
