@@ -339,6 +339,7 @@ impl Database {
                 builtin_vfs_count: 0,
             },
         };
+        self.static_extension_registrations.fetch_add(1, Ordering::Relaxed);
         // Exclusive access to the built-in symbols while the extension registers into them.
         let _guard = self.builtin_syms.write();
         register(&mut ext_api);
@@ -354,6 +355,7 @@ impl Connection {
     where
         F: FnOnce(&mut ExtensionApi),
     {
+        self.db.static_extension_registrations.fetch_add(1, Ordering::Relaxed);
         unsafe {
             let mut ext_api = self._build_turso_ext();
             register(&mut ext_api);

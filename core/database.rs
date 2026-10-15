@@ -852,6 +852,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
     pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
+    /// Static extensions registered for this database, at the Database level or on any of its
+    /// connections (`register_static_extension`): an instrument, so a test can count this
+    /// database's registrations while other databases register in parallel.
+    pub(crate) static_extension_registrations: AtomicU64,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
     /// SQL rows. Passed explicitly by every open path, fixed at open time,
     /// and shared by all connections because the parsed [`Schema`] is
@@ -1041,6 +1045,7 @@ impl Database {
 
             durable_storage: None,
             branches,
+            static_extension_registrations: AtomicU64::new(0),
         };
 
         db.register_global_builtin_extensions()
@@ -3652,6 +3657,13 @@ impl Database {
     }
 
     /// The SQL dialect this database was opened with.
+    /// Static extensions registered for this database so far, at the Database level or on any of
+    /// its connections (instrument).
+    #[doc(hidden)]
+    pub fn static_extension_registrations(&self) -> u64 {
+        self.static_extension_registrations.load(Ordering::Relaxed)
+    }
+
     pub fn dialect(&self) -> Arc<dyn Dialect> {
         self.dialect.clone()
     }
