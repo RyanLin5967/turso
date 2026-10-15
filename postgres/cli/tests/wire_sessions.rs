@@ -3868,8 +3868,8 @@ fn describe_statement_reports_undeclared_parameters() {
 }
 
 /// Wire review 18 item 14, the deep arm: over v1..v1000, each reading the one before, a Describe
-/// of `SELECT * FROM v1000 WHERE x = $1` types `$1` int4, cold and again, and the server still
-/// answers after (a stack overflow on a session thread aborts the whole process). The
+/// of `SELECT * FROM v1000 WHERE x = $1` is refused 54001, cold and again, and the session and the
+/// server still answer after (a stack overflow on a session thread aborts the whole process). The
 /// parameter-type walk cut every view nested 32 deep, so the cold Describe was 42P18. The engine's
 /// own reading of the chain, at CREATE VIEW and at prepare, is core's and has not been run at this
 /// depth: if this arm dies there, the finding is the engine's.
@@ -3887,11 +3887,20 @@ fn a_thousand_view_chain_is_typed_and_the_server_survives() {
         .collect::<Vec<_>>()
         .join("; ");
     a.q(&views).ok("the chain");
+    // FLAGGED RULED SPEC CHANGE (lead, view cap ruling, 2026-10-15): the engine bounds a view
+    // chain by the stack it has, so a chain this deep is refused 54001 (PostgreSQL's stack depth
+    // limit), cleanly, and the session and the server live on; this asserted `$1` int4.
     let sql = "SELECT * FROM v1000 WHERE x = $1";
     for round in ["cold", "warm"] {
-        let r = a.describe_statement(sql).ok(sql);
-        assert_eq!(r.params, Some(vec![23]), "{round}");
+        let r = a.describe_statement(sql);
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("54001"),
+            "{round}: {:?}",
+            r.params
+        );
     }
+    a.q("SELECT 1").ok("the session still answers");
     server
         .connect()
         .q("SELECT 1")
