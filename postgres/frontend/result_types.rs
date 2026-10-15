@@ -243,6 +243,10 @@ pub struct StatementTypes {
     /// whole at prepare, keys resolved, because it has prerequisites (a SERIAL column's sequence;
     /// wire review 16 item 15).
     pub new_table_keys: Option<String>,
+    /// The frontend performed the statement while preparing it (a CREATE TABLE with SERIAL
+    /// prerequisites), and the statement it returns is a no-op: the server answers it with its
+    /// command tag alone, never as a query (the no-op's one column made it `SELECT 0`).
+    pub performed: bool,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;

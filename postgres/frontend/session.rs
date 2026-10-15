@@ -868,6 +868,7 @@ fn prepare_statement_checked(
         } else {
             new_table_keys.clone()
         };
+        types.performed = performs;
         types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
         types.rolls_back = matches!(
             translated.cmd.stmt(),

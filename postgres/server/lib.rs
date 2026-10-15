@@ -1837,8 +1837,10 @@ impl Session {
         if types.commits || types.rolls_back {
             *backoff = Backoff::never();
         }
-        let query =
-            types.new_table_keys.is_none() && stmt.num_columns() != 0 && !is_pg_non_query(sql);
+        let query = types.new_table_keys.is_none()
+            && !types.performed
+            && stmt.num_columns() != 0
+            && !is_pg_non_query(sql);
         let columns: Vec<Type> = if query {
             (0..stmt.num_columns())
                 .map(|i| column_type(&stmt, &types.columns, i))
