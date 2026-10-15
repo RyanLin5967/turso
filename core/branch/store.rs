@@ -7721,6 +7721,35 @@ impl BranchStore {
         self.group.confirm_notifies.load(Ordering::Relaxed)
     }
 
+    /// Test builds (L2 slice, budget create_allocates_no_table_of_every_branch_under_the_store_mutex):
+    /// the per-branch tables a create can grow under the store mutex, as (name, capacity, bytes a
+    /// regrowth to that capacity allocates, estimated as capacity x (entry + 1 control byte); the
+    /// branch table: its chunks, each allocated whole).
+    #[cfg(test)]
+    pub(crate) fn per_branch_tables_for_test(&self) -> Vec<(&'static str, usize, usize)> {
+        fn map<K, V, S>(name: &'static str, m: &HashMap<K, V, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<(K, V)>() + 1))
+        }
+        fn set<K, S>(name: &'static str, m: &HashSet<K, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<K>() + 1))
+        }
+        let inner = self.inner.lock_uncounted();
+        let chunk = std::mem::size_of::<Option<(BranchId, BranchState)>>() * super::table::CHUNK;
+        let mut out = vec![
+            ("branches.chunks", inner.branches.chunks_for_test(), chunk),
+            map("parked", &inner.parked),
+            set("pending_holders", &inner.pending_holders),
+            map("names.map", &inner.names.map),
+            map("names.fresh", &inner.names.fresh),
+            map("names.gone", &inner.names.gone),
+        ];
+        if let Some(cat) = inner.cat.as_ref() {
+            out.push(map("cat.dirty", &cat.dirty));
+            out.push(set("cat.removed", &cat.removed));
+        }
+        out
+    }
+
     /// Test builds (lead ruling f329b0d2a8): the group's `confirm_done` key.
     #[cfg(test)]
     pub(crate) fn confirm_done_for_test(&self) -> u64 {

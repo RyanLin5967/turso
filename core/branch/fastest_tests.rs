@@ -8571,6 +8571,44 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     }
 }
 
+/// L2 slice (budget create_allocates_no_table_of_every_branch_under_the_store_mutex, 64 KiB under
+/// the store mutex per create; budgets measured 2,195,727 bytes as the live branches reached
+/// 33,056): no per-branch table regrows, or allocates a chunk, of more than 64 KiB inside a create.
+/// Unnamed creates in D0 from 0 past 2^15 live branches, both modes; after each create the tables'
+/// capacities (`per_branch_tables_for_test`) are compared with the last ones, and every growth is
+/// priced at the bytes its new allocation takes. The message names the tables, so the fix is aimed.
+#[test]
+fn no_per_branch_table_regrows_past_64_kib_inside_a_create() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("growth.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut last = db.branches.per_branch_tables_for_test();
+        let mut worst: std::collections::BTreeMap<&str, usize> = Default::default();
+        for _ in 0..34_000 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            let now = db.branches.per_branch_tables_for_test();
+            for (name, cap, bytes) in &now {
+                let grew = last.iter().find(|(m, ..)| m == name).is_none_or(|(_, c, _)| cap > c);
+                if grew && *bytes > 0 {
+                    let e = worst.entry(name).or_default();
+                    *e = (*e).max(*bytes);
+                }
+            }
+            last = now;
+        }
+        for (name, bytes) in worst {
+            if bytes > 64 << 10 {
+                over.push(format!("catalog={catalog} {name}: {bytes} bytes"));
+            }
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
+}
+
 /// Lead order (2026-10-15T08:22:05Z, from the wire's default-stack raws; debug, lldb): the create
 /// path's frames were ensure_backing 797 KB, open_resolved 831 KB and start_name_filter at least
 /// 422 KB, so a create overflowed a 2 MiB thread (Rust's default spawn stack). On a 2 MiB thread, in

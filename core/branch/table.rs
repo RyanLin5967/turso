@@ -124,6 +124,12 @@ impl<T> BranchTable<T> {
     }
 
     /// `(directory reallocations, chunk pointers they moved)` since the table was made.
+    /// Test builds: chunks allocated now.
+    #[cfg(test)]
+    pub(crate) fn chunks_for_test(&self) -> usize {
+        self.chunks
+    }
+
     pub(crate) fn growth(&self) -> (u64, u64) {
         (self.dir_grows, self.dir_moved)
     }
