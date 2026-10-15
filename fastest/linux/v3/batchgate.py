@@ -721,6 +721,8 @@ def _post_batch(d, sha, mod):
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
     if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
         rep["syscalls"]["arms"]["append25"].update(windows_over=1)
+    if mod == "no-n":  # V3 review 13 item 22: a probe summary without n
+        sj.pop("n", None)
     if mod == "ungated-over":  # V3 review 13 item 17: an UNGATED arm (nosync25 here) with windows_over 1
         rep["syscalls"]["arms"]["nosync25"].update(windows_over=1)
     if mod == "nosync-norec":  # V3 review 13 item 15: the batch ran nosync25 but the report has no nosync25 record
@@ -863,6 +865,20 @@ def post_selftest(chk):
         g = load(os.path.join(d, "gate.json"))
         chk("post() (review 12 item 7 / review 11 LOW 2): %s -> rc 3 with exactly %s" % (name, want_voids),
             rc == 3 and g.get("refusals") == [] and g.get("voids") == want_voids, (rc, g.get("voids"), g.get("refusals")))
+    # V3 review 13 item 22: a probe summary without n crashed post inside sync_fds_def_problems (None * per_op), so
+    # it wrote no gate.json and gave no reason; it must refuse (rc 2, cannot judge), writing gate.json with a refusal
+    # that names n (expectation by hand)
+    d = os.path.join(td, "no-n")
+    _post_batch(d, sha, "no-n")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc22, crash22 = post(d, "ext4", sha, "smoke", None), None
+    except Exception as e:  # noqa: BLE001 -- the crash is this case's FAIL, recorded
+        rc22, crash22 = None, repr(e)
+    g22 = load(os.path.join(d, "gate.json")) if os.path.exists(os.path.join(d, "gate.json")) else {}
+    nref22 = [r for r in (g22.get("refusals") or []) if str(r).startswith("fsync: the probe summary's n")]
+    chk("post() (review 13 item 22): a probe summary without n -> rc 2, gate.json written, a refusal naming n",
+        crash22 is None and rc22 == 2 and bool(nref22), (crash22, rc22, g22.get("refusals"), g22.get("voids")))
     # gate-6 MED 6: the start-to-end drift
     for name, ea, ok_rc in (("4 us", 1004.0, 0), ("61 us", 1061.0, 3)):
         sd, ed = os.path.join(td, "drift-s-" + name.split()[0]), os.path.join(td, "drift-e-" + name.split()[0])
