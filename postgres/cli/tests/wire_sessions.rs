@@ -2869,7 +2869,10 @@ fn an_extended_copy_from_loads_its_rows_once() {
 /// after ParseComplete, BindComplete, the Describe reply, CommandComplete and ReadyForQuery, five
 /// writes against one (wire review 1 item 12). The statement is a branch call that touches no
 /// storage; the five messages arrive in one write; the least of 7 rounds per protocol is compared,
-/// counted by the server itself (turso_branch_stats' unix_syscalls).
+/// counted by the server itself (turso_branch_stats' unix_syscalls), which only an Apple build
+/// counts, so the test is Apple's alone, as branch_stats_reports_the_servers_counters is (ruled
+/// c9c821dd8d, P5).
+#[cfg(target_vendor = "apple")]
 #[test]
 fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
     let dir = Scratch::new("extsyscalls");
