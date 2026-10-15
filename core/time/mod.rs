@@ -734,7 +734,7 @@ fn time_add(args: &[Value]) -> Value {
 
     let d = Duration::from(d);
 
-    t.add_duration(d).into_blob()
+    tri!(t.add_duration(d)).into_blob()
 }
 
 #[scalar(name = "time_add_date")]
@@ -776,7 +776,7 @@ fn time_add_date(args: &[Value]) -> Value {
         days = ok_tri!(args[3].to_integer());
     }
 
-    let t: Time = tri!(t.time_add_date(years as i32, months as i32, days));
+    let t: Time = tri!(t.time_add_date(years, months, days));
 
     t.into_blob()
 }
