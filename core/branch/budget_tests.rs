@@ -3661,9 +3661,10 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
 /// period does not move the idle tail's honest word into the burst; `load_c8_delayed` is that
 /// schedule, a control that must read like `load_c8` (red at a46f64caf, which read the words when
 /// the parent did). The burst's idle holes (`idle_holes`: gaps of 5 ms or more with no create in
-/// progress) are reported beside it: the C >= 8 clause assumes the creates kept a flight in the air,
-/// which a scheduler can break. Mutants `confirm_quiet_zero`, env `confirm_poll_100us` and
-/// `confirm_holds_slot`. WRITTEN NOT RUN.
+/// progress) are judged beside it: the C >= 8 clause assumes the creates kept a flight in the air, so
+/// an arm with an idle hole is REFUSED as a premise failure naming `idle_holes` (DECISIONS
+/// 6d491917d2; control `load_c8_gapped`, judged by its own test). Mutants `confirm_quiet_zero`, env
+/// `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
 #[test]
 fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     if in_child() {
@@ -3700,7 +3701,12 @@ fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
     if s["tail_settled"] != 1 {
         let _ = writeln!(failures, "  {op}: the writer never settled in the idle tail (1 s); premise refused: the tail's words are all counted");
     }
-    if c >= 8 && burst != 0 {
+    // DECISIONS 6d491917d2 (proposal 1): the C >= 8 clause assumes the creates kept a flight in the
+    // air; a burst with an idle hole is refused, never judged by its words (no allowance per hole: a
+    // stall can cause the hole). Refusing often is a finding about the load or a stall.
+    if c >= 8 && s["idle_holes"] > 0 {
+        let _ = writeln!(failures, "  {op}: {} idle_holes (gaps of 5 ms or more with no create in progress); premise refused: back-to-back flights", s["idle_holes"]);
+    } else if c >= 8 && burst != 0 {
         let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
     }
     if tail > 1 {
