@@ -465,6 +465,40 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
         .map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
+/// What a schema qualifier names in this frontend: the one rule every reader of a relation's or a
+/// column's qualifier uses. It was spelled seven ways, and a three-part column reference and COPY
+/// missed it (wire review 18 items 21 and 22). Case-insensitive, as every spelling of it was. A
+/// search path's entries follow the engine's own rule instead (public alone is main there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaQualifier<'a> {
+    /// No qualifier: the search path decides.
+    Unqualified,
+    /// The main database: public, PostgreSQL's schema for it, whatever the search path (wire
+    /// review 17 item 1), and main, the engine's name for it, which stored view text holds.
+    Main,
+    /// pg_catalog, whose relations the engine finds unqualified.
+    PgCatalog,
+    /// information_schema, whose views the engine names `information_schema_<view>`.
+    InformationSchema,
+    /// Any other schema: the attached database of that name.
+    Attached(&'a str),
+}
+
+/// [`SchemaQualifier`] of `schema` ("" for none).
+pub fn schema_qualifier(schema: &str) -> SchemaQualifier<'_> {
+    if schema.is_empty() {
+        SchemaQualifier::Unqualified
+    } else if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") {
+        SchemaQualifier::Main
+    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+        SchemaQualifier::PgCatalog
+    } else if schema.eq_ignore_ascii_case("information_schema") {
+        SchemaQualifier::InformationSchema
+    } else {
+        SchemaQualifier::Attached(schema)
+    }
+}
+
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
 /// rules: return it bare only when it is all lower-case ASCII letters,
 /// digits, and underscores, does not start with a digit, and is not a

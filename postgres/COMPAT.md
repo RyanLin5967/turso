@@ -50,7 +50,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
+| CREATE SCHEMA / DROP SCHEMA | 🟡 Partial | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased. A `public` qualifier names the main database wherever it is read (a relation, an index, DROP, a `public.t.c` column reference, COPY), whatever the search path. Under `tursopg --server` both are refused with 0A000 for any schema but public (the branch server is single-schema: each session attaches the schema files present when it opens, so a schema created or dropped while sessions run would leave them disagreeing, and a branch would not cover it); a schema file that predates the server is still attached at session open |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
@@ -347,7 +347,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows) |
+| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows). The table is found as any statement's: `public.t` is the main database's whatever the search path, and an unqualified name goes through the search path (42P01 when no entry holds it) |
 | COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
 | COPY FROM ... WHERE | ❌ Not supported | |
 | COPY ... ON_ERROR | ❌ Not supported | |

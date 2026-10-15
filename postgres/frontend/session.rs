@@ -710,12 +710,8 @@ fn prepare_statement_checked(
                 if let Some(held) = probed.borrow().get(&key) {
                     return *held;
                 }
-                let held = get_table_columns(
-                    &pg_conn.conn,
-                    &name.replace('\'', "''"),
-                    Some(&schema.replace('"', "\"\"")),
-                )
-                .is_ok_and(|columns| !columns.is_empty());
+                let held = get_table_columns(&pg_conn.conn, name, Some(schema))
+                    .is_ok_and(|columns| !columns.is_empty());
                 probed.borrow_mut().insert(key, held);
                 held
             };
@@ -1233,11 +1229,9 @@ fn handle_pg_add_constraints(
     add: &PgAddConstraints,
 ) -> Result<()> {
     let conn = &pg_conn.conn;
-    if add
-        .schema
-        .as_deref()
-        .is_some_and(|s| !s.eq_ignore_ascii_case("public"))
-    {
+    if add.schema.as_deref().is_some_and(|s| {
+        turso_pg_parser::schema_qualifier(s) != turso_pg_parser::SchemaQualifier::Main
+    }) {
         return Err(LimboError::ParseError(
             "ALTER TABLE ADD CONSTRAINT is supported only for tables in schema public".to_string(),
         ));
@@ -1393,9 +1387,10 @@ fn handle_pg_add_constraints(
         .collect();
     // A parent in another schema, as precheck_create_keys refuses one (wire review 16 item 11).
     if keys.iter().any(|k| {
-        !k.parent_schema.is_empty()
-            && !k.parent_schema.eq_ignore_ascii_case("public")
-            && !k.parent_schema.eq_ignore_ascii_case("main")
+        !matches!(
+            turso_pg_parser::schema_qualifier(&k.parent_schema),
+            turso_pg_parser::SchemaQualifier::Unqualified | turso_pg_parser::SchemaQualifier::Main
+        )
     }) {
         return Err(LimboError::ParseError(
             "foreign keys in a schema other than public are not supported".to_string(),
@@ -1627,9 +1622,10 @@ fn precheck_create_keys(
     // CONSTRAINT refuses outside public (DECISIONS: a schema is branched or refused; wire review
     // 16 item 11).
     let elsewhere = |schema: &str| {
-        !schema.is_empty()
-            && !schema.eq_ignore_ascii_case("public")
-            && !schema.eq_ignore_ascii_case("main")
+        !matches!(
+            turso_pg_parser::schema_qualifier(schema),
+            turso_pg_parser::SchemaQualifier::Unqualified | turso_pg_parser::SchemaQualifier::Main
+        )
     };
     if elsewhere(&relation.schemaname) || keys.iter().any(|k| elsewhere(&k.parent_schema)) {
         return Err(LimboError::ParseError(
@@ -1873,11 +1869,19 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
 
-    let table_name = match &stmt.schema_name {
-        Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
-        None => format!("\"{}\"", stmt.table_name),
+    // An unqualified table is found through the search path, as the engine finds every other
+    // statement's; COPY's INSERT was prepared with no path, so `COPY t` under `search_path TO s,
+    // public` filled public.t (wire review 18 item 22).
+    let schema = match &stmt.schema_name {
+        Some(schema) => Some(schema.clone()),
+        None => schema_on_search_path(pg_conn, &stmt.table_name)?,
     };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let table_name = match &schema {
+        Some(schema) => format!("{}.{}", quoted(schema), quoted(&stmt.table_name)),
+        None => quoted(&stmt.table_name),
+    };
+    let column_names = get_table_columns(conn, &stmt.table_name, schema.as_deref())?;
     if column_names.is_empty() {
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
@@ -1980,6 +1984,33 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     }
 }
 
+/// The database holding `table` on the session's search path, as the engine resolves an
+/// unqualified name (core's resolve_search_path_database_id): public is main, any other entry the
+/// attached schema of its name, skipped when there is none ("$user", a schema not created), the
+/// first entry holding the table wins, and none holding it is 42P01. None with no path set, where
+/// the engine's default order (main, then the attached schemas) applies.
+fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Result<Option<String>> {
+    let path = pg_conn.session_state.lock().unwrap().search_path.clone();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    for entry in &path {
+        let database = if entry.eq_ignore_ascii_case("public") {
+            "main"
+        } else {
+            entry.as_str()
+        };
+        let holds = get_table_columns(&pg_conn.conn, table, Some(database))
+            .is_ok_and(|columns| !columns.is_empty());
+        if holds {
+            return Ok(Some(database.to_string()));
+        }
+    }
+    Err(LimboError::ParseError(format!(
+        "relation \"{table}\" does not exist"
+    )))
+}
+
 /// Whether `parse` is one DELETE ... USING (its rewrite reads the relations' declared columns).
 fn is_delete_using(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;
@@ -1996,18 +2027,15 @@ fn is_delete_using(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
 /// attached schema's table_info otherwise; None for a relation it cannot read (a view, one that
 /// does not exist).
 fn relation_columns(conn: &Arc<Connection>, schema: &str, table: &str) -> Option<Vec<String>> {
-    match schema {
-        "" | "public" => conn
+    use turso_pg_parser::SchemaQualifier;
+    match turso_pg_parser::schema_qualifier(schema) {
+        SchemaQualifier::Unqualified | SchemaQualifier::Main => conn
             .current_schema()
             .get_btree_table(table)
             .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect()),
-        schema => get_table_columns(
-            conn,
-            &table.replace('\'', "''"),
-            Some(&schema.replace('"', "\"\"")),
-        )
-        .ok()
-        .filter(|columns| !columns.is_empty()),
+        _ => get_table_columns(conn, table, Some(schema))
+            .ok()
+            .filter(|columns| !columns.is_empty()),
     }
 }
 
@@ -2016,8 +2044,14 @@ fn get_table_columns(
     table_name: &str,
     schema_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    // The names quoted here, once, for every caller: COPY passed its table's name as written, so
+    // a quote in it broke the PRAGMA's text.
+    let table_name = table_name.replace('\'', "''");
     let sql = match schema_name {
-        Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
+        Some(schema) => format!(
+            "PRAGMA \"{}\".table_info('{table_name}')",
+            schema.replace('"', "\"\"")
+        ),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
     let mut stmt = conn.prepare_internal(&sql)?;

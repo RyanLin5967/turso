@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::ParseError;
+use crate::{schema_qualifier, ParseError, SchemaQualifier};
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
@@ -234,21 +234,20 @@ impl PostgreSQLTranslator {
         } else {
             name
         };
-        let mut qn = if range_var.schemaname.is_empty()
-            || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "information_schema"
-            ) {
-            ast::QualifiedName::single(name)
-        } else if range_var.schemaname.eq_ignore_ascii_case("public") {
-            // An explicit public is the main database's relation whatever the search path: read as
-            // unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into s.t
-            // (wire review 17 item 1). pg_catalog's relations stay unqualified, as the engine
-            // finds its catalog tables.
-            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
-        } else {
-            let schema = ast::Name::from_string(range_var.schemaname.clone());
-            ast::QualifiedName::fullname(schema, name)
+        let mut qn = match schema_qualifier(&range_var.schemaname) {
+            // pg_catalog's relations stay unqualified, as the engine finds its catalog tables.
+            SchemaQualifier::Unqualified
+            | SchemaQualifier::PgCatalog
+            | SchemaQualifier::InformationSchema => ast::QualifiedName::single(name),
+            // An explicit public is the main database's relation whatever the search path: read
+            // as unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into
+            // s.t (wire review 17 item 1).
+            SchemaQualifier::Main => {
+                ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+            }
+            SchemaQualifier::Attached(schema) => {
+                ast::QualifiedName::fullname(ast::Name::from_string(schema), name)
+            }
         };
         qn.alias = alias;
         qn
@@ -1127,13 +1126,16 @@ impl PostgreSQLTranslator {
         // bare name found, enforcing on the wrong table. public is the main database, as in
         // qualified_name_from_range_var (wire review 17 item 1).
         let index_name = ast::Name::from_string(&idx.idxname);
-        let idx_name = match relation.schemaname.to_lowercase().as_str() {
-            "" | "pg_catalog" | "information_schema" => ast::QualifiedName::single(index_name),
-            "public" => ast::QualifiedName::fullname(ast::Name::from_string("main"), index_name),
-            _ => ast::QualifiedName::fullname(
-                ast::Name::from_string(relation.schemaname.clone()),
-                index_name,
-            ),
+        let idx_name = match schema_qualifier(&relation.schemaname) {
+            SchemaQualifier::Unqualified
+            | SchemaQualifier::PgCatalog
+            | SchemaQualifier::InformationSchema => ast::QualifiedName::single(index_name),
+            SchemaQualifier::Main => {
+                ast::QualifiedName::fullname(ast::Name::from_string("main"), index_name)
+            }
+            SchemaQualifier::Attached(schema) => {
+                ast::QualifiedName::fullname(ast::Name::from_string(schema), index_name)
+            }
         };
 
         let mut columns = Vec::new();
@@ -1214,11 +1216,12 @@ impl PostgreSQLTranslator {
                     1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
                     // public is the main database (as in qualified_name_from_range_var): DROP
                     // TABLE public.t answered "no such database: public" (wire review 17 item 1).
+                    // A catalog schema keeps its name, so DROP of one of its relations is refused
+                    // by the engine (no such database) rather than dropping a table of the name.
                     _ => ast::QualifiedName::fullname(
-                        ast::Name::from_string(if names[0].eq_ignore_ascii_case("public") {
-                            "main".to_string()
-                        } else {
-                            names[0].clone()
+                        ast::Name::from_string(match schema_qualifier(&names[0]) {
+                            SchemaQualifier::Main => "main".to_string(),
+                            _ => names[0].clone(),
                         }),
                         ast::Name::from_string(names[1].clone()),
                     ),
@@ -2935,14 +2938,27 @@ impl PostgreSQLTranslator {
                                     }
                                 }
                                 match parts.len() {
-                                    3 => {
-                                        // schema.table.column
-                                        Ok(ast::Expr::DoublyQualified(
+                                    // schema.table.column, its schema read as a relation's is:
+                                    // public is main, which the engine resolves as a database,
+                                    // and pg_catalog's relations are unqualified. public was kept
+                                    // as a database name, so `public.t.c` was "no such column"
+                                    // (wire review 18 item 21).
+                                    3 => Ok(match schema_qualifier(&parts[0]) {
+                                        SchemaQualifier::Main => ast::Expr::DoublyQualified(
+                                            ast::Name::from_string("main"),
+                                            ast::Name::from_string(parts[1].clone()),
+                                            ast::Name::from_string(parts[2].clone()),
+                                        ),
+                                        SchemaQualifier::PgCatalog => ast::Expr::Qualified(
+                                            ast::Name::from_string(parts[1].clone()),
+                                            ast::Name::from_string(parts[2].clone()),
+                                        ),
+                                        _ => ast::Expr::DoublyQualified(
                                             ast::Name::from_string(parts[0].clone()),
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
-                                        ))
-                                    }
+                                        ),
+                                    }),
                                     2 => match self.lateral_column(&parts[0], &parts[1]) {
                                         // An inlined LATERAL column (see `inline_lateral`).
                                         Some(inlined) => {
@@ -5576,14 +5592,14 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
 
     let relation = copy.relation.as_ref()?;
     let table_name = relation.relname.clone();
-    let schema_name = if relation.schemaname.is_empty()
-        || matches!(
-            relation.schemaname.to_lowercase().as_str(),
-            "public" | "pg_catalog"
-        ) {
-        None
-    } else {
-        Some(relation.schemaname.clone())
+    // public names the main database whatever the search path; it was dropped, so `COPY public.t`
+    // reached the main database's t only because COPY ignored the path (wire review 18 item 22).
+    let schema_name = match schema_qualifier(&relation.schemaname) {
+        SchemaQualifier::Unqualified | SchemaQualifier::PgCatalog => None,
+        SchemaQualifier::Main => Some("main".to_string()),
+        SchemaQualifier::InformationSchema | SchemaQualifier::Attached(_) => {
+            Some(relation.schemaname.clone())
+        }
     };
 
     let columns = if copy.attlist.is_empty() {

@@ -145,9 +145,11 @@ fn from_items(items: &[PgNode]) -> Vec<(String, String)> {
     fn walk(node: &PgNode, out: &mut Vec<(String, String)>) {
         match node.node.as_ref() {
             Some(Node::RangeVar(rv))
-                if rv.schemaname.is_empty()
-                    || rv.schemaname == "public"
-                    || rv.schemaname == "main" =>
+                if matches!(
+                    turso_pg_parser::schema_qualifier(&rv.schemaname),
+                    turso_pg_parser::SchemaQualifier::Unqualified
+                        | turso_pg_parser::SchemaQualifier::Main
+                ) =>
             {
                 let name = rv
                     .alias
@@ -668,12 +670,15 @@ impl Infer<'_> {
     /// an attached schema counts as a cut: its answer can change with no new main snapshot, so a
     /// view read through it is not kept for the snapshot ([`ViewCache`]).
     fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
-        match schemaname.to_lowercase().as_str() {
+        use turso_pg_parser::SchemaQualifier;
+        match turso_pg_parser::schema_qualifier(schemaname) {
             // main is the engine's name for public, which a view's stored text holds since the
             // translator names public's relations so (wire review 17 item 1, review 18 item 5).
-            "public" | "main" | "pg_catalog" => Some(relname.to_string()),
-            "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
-            "" => {
+            SchemaQualifier::Main | SchemaQualifier::PgCatalog => Some(relname.to_string()),
+            SchemaQualifier::InformationSchema => {
+                Some(format!("information_schema_{}", relname.to_lowercase()))
+            }
+            SchemaQualifier::Unqualified => {
                 let in_main = || {
                     self.schema.get_table(relname).is_some()
                         || self.schema.get_view(relname).is_some()
@@ -709,7 +714,7 @@ impl Infer<'_> {
                 }
                 None
             }
-            _ => None,
+            SchemaQualifier::Attached(_) => None,
         }
     }
 
@@ -1485,9 +1490,11 @@ impl Infer<'_> {
                     .iter()
                     .rev()
                     .find_map(|level| level.iter().find(|rel| rel.name() == *table));
-                let main = ["public", "main", "pg_catalog"]
-                    .iter()
-                    .any(|m| schema.eq_ignore_ascii_case(m));
+                let main = matches!(
+                    turso_pg_parser::schema_qualifier(schema),
+                    turso_pg_parser::SchemaQualifier::Main
+                        | turso_pg_parser::SchemaQualifier::PgCatalog
+                );
                 match found {
                     Some(rel) if main => of(rel, column),
                     Some(Rel::Unknown { .. }) => Some(None),
