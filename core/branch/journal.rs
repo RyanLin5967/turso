@@ -961,6 +961,15 @@ impl Scanned {
                 } else {
                     class.max(synced_class)
                 };
+                // The class those records were made durable in outlives this process (engine review
+                // 18 MED 2: it lived in this open's memory only, so a second process in a weaker
+                // class over the compacted log, or over a header-only one, freed at written): noted
+                // as a raise, so every rewrite of this log, the open's own below included, and the
+                // next flight write it into the header (`header_class`). Mutant
+                // `synced_open_unpersisted` (test builds only): not noted, as before.
+                if class.syncs() && !super::store::fe_mutant("synced_open_unpersisted") {
+                    journal.note_class(class);
+                }
                 if let Some(at) = marker {
                     // F-FZ crash state S1: the catalog holds everything up to its checkpoint's
                     // marker. What follows it is replayed, and becomes the log of the catalog's
@@ -1861,7 +1870,7 @@ impl Journal {
             // the rename finds this lock, as it found the old one.
             lock_exclusive(&f, &tmp)?;
             // r13-compose S-3: the header carries THIS log's format (a splice-arm log stays 6).
-            write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.raised), 0)?;
+            write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.header_class()), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
                 // Synced with the rest below: the kept last flight is confirmed, when that sync
@@ -1936,7 +1945,7 @@ impl Journal {
             rewrites: self.rewrites,
             format: self.format,
             page_size: self.page_size,
-            raised: self.raised,
+            raised: self.header_class(),
             class: self.rewrite_class(),
             tmp: self.files.log_tmp(),
             nonce: self.nonce,
@@ -2014,8 +2023,8 @@ impl Journal {
         // A raise since the prep (review 5 #11) reaches the new header; one always comes with a
         // flight's frames, so the delta's sync below covers it. Mutant `cut_drops_raise` (test
         // builds only).
-        if self.raised > prep.raised && !super::store::fe_mutant("cut_drops_raise") {
-            write_at(&prep.file, &class_code(self.raised).to_le_bytes(), HEADER_RAISED_AT)?;
+        if self.header_class() > prep.raised && !super::store::fe_mutant("cut_drops_raise") {
+            write_at(&prep.file, &class_code(self.header_class()).to_le_bytes(), HEADER_RAISED_AT)?;
         }
         if self.len > prep.upto {
             let mut delta = vec![0u8; (self.len - prep.upto) as usize];
@@ -2113,7 +2122,22 @@ impl Journal {
 
     /// The header's raised-class field, if it must be rewritten by the write being prepared.
     fn take_header_patch(&mut self) -> Option<[u8; 4]> {
-        std::mem::take(&mut self.header_stale).then(|| (class_code(self.raised)).to_le_bytes())
+        std::mem::take(&mut self.header_stale).then(|| (class_code(self.header_class())).to_le_bytes())
+    }
+
+    /// What the header's raised-class field says (engine review 18 MED 2): the strongest class a
+    /// record of this log was made durable in, the store's own included, so a later process in a
+    /// weaker class, whatever the log then holds (a header-only log, a compacted one), reads that
+    /// the snapshot or catalog it inherits was synced in it, and holds its frees for it
+    /// (`StoreInner::free_class`). Written by every rewrite and every raise, and carried through
+    /// rewrites that sync nothing. Mutant `header_raised_only` (test builds only): the raised class
+    /// alone, as before (a D1 or D2 run wrote Off there).
+    fn header_class(&self) -> SyncClass {
+        if super::store::fe_mutant("header_raised_only") {
+            self.raised
+        } else {
+            self.raised.max(self.sync)
+        }
     }
 
     pub(crate) fn check_live(&self) -> Result<()> {
@@ -2650,7 +2674,7 @@ impl Journal {
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let class = self.rewrite_class();
         let nonce = fresh_nonce(self.nonce);
-        let header = log_header(self.format, self.page_size, generation, nonce, self.raised);
+        let header = log_header(self.format, self.page_size, generation, nonce, self.header_class());
         self.rewrites += 1;
         self.compact_after = 0;
         if cfg!(unix) && !super::store::fe_mutant("reset_in_place") {

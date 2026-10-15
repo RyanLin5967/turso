@@ -4409,7 +4409,9 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
         };
         let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
         db.branch_compact_now().unwrap();
-        assert!(!db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the log is not raised once the first rewrite landed");
+        // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the first rewrite cleared the
+        // class; now the class outlives it (written into the header), which this premise states.
+        assert!(db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the synced class outlives the first rewrite");
         let trunk = db.connect().unwrap();
         db.branch(id).unwrap().reap().unwrap();
         let took = reused_by_a_new_branch(&trunk, &slots);
@@ -5169,7 +5171,9 @@ fn a_compaction_over_an_inherited_floor_marks_what_it_synced() {
         assert!(db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the open inherited the D2 run's class");
         db.branch(id).unwrap().reap().unwrap();
         db.branch_compact_now().unwrap();
-        assert!(!db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the rewrite cleared the inherited floor");
+        // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the rewrite cleared the inherited
+        // floor; now the D2 run's class outlives it (written into the header), which this premise states.
+        assert_eq!(db.branches.rewrite_class_for_test(), SyncClass::FullFsync, "catalog={catalog}: premise: the D2 run's class outlives the rewrite");
         let trunk = db.connect().unwrap();
         trunk.execute("PRAGMA synchronous = FULL").unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
