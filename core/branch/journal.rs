@@ -2431,7 +2431,11 @@ impl Journal {
     /// that last flight's slot check, as for any ordered last flight, and a damaged slot is refused
     /// when read rather than dropped with the flight whose records the upgrade made durable (engine
     /// review 17 MED 5; its room is reserved here). One pwrite, no sync. Mutant
-    /// `ordered_upgrade_writes_no_end` (test builds only): no end frame, as before.
+    /// `ordered_upgrade_writes_no_end` (test builds only): no end frame, as before. With no arena to
+    /// barrier (a D1 flight, or a fuzzy checkpoint's settle, took the arena's mark and synced it),
+    /// it writes no end frame: its confirmation of the last flight, proved by the trunk commit's
+    /// flush, covers that flight instead (`Flight::write`; engine review 21 MED 7, which corrects
+    /// c8b12518d's message: the end frame does not cover the D1 route it claimed).
     pub(crate) fn take_ordered_flight(&mut self, arena: &mut Arena, class: SyncClass, upgrade: bool) -> Result<Flight> {
         let mut flight = self.take_flight(arena, class, upgrade)?;
         if flight.bytes.is_empty()
@@ -2820,11 +2824,24 @@ pub(crate) struct Confirm {
     fail: bool,
 }
 
+/// The confirmation of a flight whose frames, its end frame last, are `bytes`, written at `at`
+/// (review 6 #1): bound to its end frame's checksum and to where it ends, the flight ending at `lsn`.
+fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
+    let crc = end_frame_crc(bytes[bytes.len() - END_FRAME_LEN..].try_into().unwrap());
+    Confirm {
+        word: confirm_word(crc, at + bytes.len() as u64),
+        lsn,
+        proved,
+        fail,
+        log,
+    }
+}
+
 /// The confirmation of the log's last flight, for a sync that wrote no frame of its own (engine
-/// review 21 MED 6: a zero-byte upgrade flight, a held-free upgrade): read from `log`, which ends at
-/// `at`, where that flight's end frame ends (its checksum is the log's last 4 bytes, as
-/// `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log holds no flight, or
-/// the read fails: the word's absence proves nothing.
+/// review 21 MED 6: a zero-byte upgrade flight, a held-free upgrade; MED 7: an ordered one): read
+/// from `log`, which ends at `at`, where that flight's end frame ends (its checksum is the log's
+/// last 4 bytes, as `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log
+/// holds no flight, or the read fails: the word's absence proves nothing.
 fn confirm_last(log: File, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
     if at < (LOG_HEADER_LEN + END_FRAME_LEN) as u64 {
         return None;
@@ -2881,6 +2898,19 @@ impl Confirm {
     /// already have replaced (engine review 21 MED 6).
     pub(crate) fn supersedes(&self, held: &Confirm) -> bool {
         self.lsn > held.lsn || (self.lsn == held.lsn && self.proved && !held.proved)
+    }
+
+    /// A trunk commit's WAL F_FULLFSYNC on the branch files' device returned, issued once every
+    /// journal byte below `frontier` was synced or ordered (`BranchStore::trunk_wal_synced`): it
+    /// drained the device after this flight's own sync or barrier returned, so its word may now be
+    /// written as proved, when the flight ends at or below `frontier` (engine review 21 MEDs 7 and
+    /// 8). Returns whether this proved it.
+    pub(crate) fn prove_below(&mut self, frontier: u64) -> bool {
+        if self.proved || self.lsn > frontier {
+            return false;
+        }
+        self.proved = true;
+        true
     }
 
     /// Write the word (unsynced: its absence proves nothing, its presence that the sync returned).
@@ -3068,6 +3098,9 @@ impl Flight {
         if let Some(raised) = &self.header {
             write_at(&log, raised, HEADER_RAISED_AT)?;
         }
+        // Whether the log's last flight, once this one is written, is closed by an ordered end
+        // frame (this flight's own, or an empty one): open then skips its slot check.
+        let mut tagged_ordered = false;
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
             // An ordered flight says so (review 6 #7): recovery takes its slots as there whenever
@@ -3079,7 +3112,8 @@ impl Flight {
             // synced flight, as before review 6 #7) and `ordered_tag_without_barrier` (tagged
             // ordered whatever the arena, as before review 17 MED 4).
             let barriered = self.arena.is_some() || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
-            let kind = if self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored") {
+            tagged_ordered = self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored");
+            let kind = if tagged_ordered {
                 EndKind::ordered_by(self.base_syncs)
             } else {
                 EndKind::of_class(self.class, self.base_syncs)
@@ -3090,6 +3124,7 @@ impl Flight {
         } else if self.empty_end {
             // A zero-byte ordered upgrade's empty end frame (`Journal::take_ordered_flight`): its
             // own arena barrier above covers the slots the last flight's records name.
+            tagged_ordered = true;
             write_at(&log, &end_frame(self.nonce, EndKind::ordered_by(self.base_syncs), &[]), self.at)?;
         }
         super::store::kill_point("flight.log_written");
@@ -3107,14 +3142,7 @@ impl Flight {
             // writer. Mutant `no_flight_confirm`: none. Mutant `confirm_in_ack_window` (test builds
             // only): written here, inside the acknowledgement window, as before (review 6 #1).
             if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
-                let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
-                let c = Confirm {
-                    word: confirm_word(crc, self.at + self.bytes.len() as u64),
-                    lsn: self.end_lsn,
-                    proved: proves_stable(self.class),
-                    fail: self.fail_confirm,
-                    log,
-                };
+                let c = flight_confirm(log, &self.bytes, self.at, self.end_lsn, proves_stable(self.class), self.fail_confirm);
                 if super::store::fe_mutant("confirm_in_ack_window") {
                     c.write()?;
                 } else {
@@ -3133,6 +3161,19 @@ impl Flight {
         // log and the trunk's WAL removed. Caught by C1b.
         else if syncs && self.ordered && !super::store::fe_mutant("no_log_barrier") {
             barrier_file(&log, self.class)?;
+            // Barriered, not synced: durable once the trunk commit's WAL F_FULLFSYNC returns. A
+            // last flight its own ordered end frame does not close (one tagged as a synced flight
+            // for want of an arena barrier, or a zero-byte upgrade with no arena to barrier) is
+            // slot-checked at open, so it gets a confirmation, unproved until that flush proves it
+            // (`BranchStore::trunk_wal_synced`; engine review 21 MEDs 7 and 8). Mutant
+            // `ordered_confirms_nothing` (test builds only): none, as before.
+            if !tagged_ordered && !super::store::fe_mutant("ordered_confirms_nothing") {
+                confirm = if self.bytes.is_empty() {
+                    confirm_last(log, self.at, self.end_lsn, false, self.fail_confirm)
+                } else {
+                    Some(flight_confirm(log, &self.bytes, self.at, self.end_lsn, false, self.fail_confirm))
+                };
+            }
         }
         super::store::kill_point("flight.log_synced");
         Ok(confirm)
