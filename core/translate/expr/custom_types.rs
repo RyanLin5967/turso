@@ -425,6 +425,24 @@ pub(crate) fn eq_agrees_with_encoding(type_def: &TypeDef) -> bool {
     }
 }
 
+/// Whether an equality between a column of the custom type `type_name` (`type_def`) and the operand
+/// `key` compares through the type's operator (`find_custom_type_operator`): `key` is a column of
+/// the same type, or an operand the type takes (`operand_compatible`). Otherwise the equality takes
+/// the plain comparison, which never passes `key` to the type's '=' (a TEXT join column against
+/// numeric, `a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does`).
+pub(crate) fn key_takes_type_operator(
+    key: &ast::Expr,
+    type_name: &str,
+    type_def: &TypeDef,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> bool {
+    match expr_custom_type_info(key, referenced_tables, resolver) {
+        Some(info) => info.type_name.eq_ignore_ascii_case(type_name),
+        None => operand_compatible(key, type_def.value_input_type(), resolver),
+    }
+}
+
 pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
     let eq = type_eq_function(type_def);
     if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {

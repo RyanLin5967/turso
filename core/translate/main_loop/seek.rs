@@ -29,6 +29,7 @@ fn encode_seek_keys_for_custom_types(
     start_reg: usize,
     num_keys: usize,
     idx_col_offset: usize,
+    keys: &[Option<&turso_parser::ast::Expr>],
     loop_end: BranchOffset,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
@@ -76,6 +77,15 @@ fn encode_seek_keys_for_custom_types(
                     column: table_col,
                     type_def: &**type_def,
                     eq_func,
+                    key_takes_operator: keys.get(i).copied().flatten().is_none_or(|k| {
+                        crate::translate::expr::key_takes_type_operator(
+                            k,
+                            &table_col.ty_str,
+                            type_def,
+                            Some(tables),
+                            resolver,
+                        )
+                    }),
                     loop_end,
                     done: skip_label,
                 },
@@ -107,6 +117,9 @@ struct SeekKeyEncode<'a> {
     column: &'a crate::schema::Column,
     type_def: &'a crate::schema::TypeDef,
     eq_func: &'a str,
+    /// Whether the equality the key comes from compares through the type's operator
+    /// (`key_takes_type_operator`), so a scan passes the key to `eq_func`.
+    key_takes_operator: bool,
     /// The seek's loop end: an empty seek.
     loop_end: BranchOffset,
     /// Past the key's encoding.
@@ -134,7 +147,8 @@ struct SeekKeyEncode<'a> {
 ///   Goto done
 /// refused:
 ///   CatchEnd
-///   equal   = eq_func(key, key)    ; raises as the scan would (engine review 20 item 6)
+///   equal   = eq_func(key, key)    ; raises as the scan would (engine review 20 item 6),
+///                                  ; for a key the type's operator takes only
 ///   Goto loop_end
 /// ```
 fn emit_seek_key_encode_or_empty(
@@ -217,8 +231,13 @@ fn emit_seek_key_encode_or_empty(
     // compared with itself under that '=', outside the catch region: what raises there raises, as
     // the scan's first comparison would; a key it accepts equals no stored value (its ENCODE
     // refused it), so the seek is empty. Mutant `seek_refusal_swallowed` (test builds only): no
-    // comparison, as before.
-    if !crate::branch::store::fe_mutant("seek_refusal_swallowed") {
+    // comparison, as before. A key the type's operator does not take (a TEXT join column against
+    // numeric) meets the plain comparison in a scan, which never raises on it, so it is not
+    // compared (b36ed9367's red: the item-6 comparison raised on 'x' where the scan answered).
+    // Mutant `refusal_compares_any_key` (test builds only): every key is compared, as 3481755a6.
+    if !crate::branch::store::fe_mutant("seek_refusal_swallowed")
+        && (key.key_takes_operator || crate::branch::store::fe_mutant("refusal_compares_any_key"))
+    {
         program.emit_insn(Insn::Copy {
             src_reg: key.reg,
             dst_reg: args,
@@ -425,6 +444,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
+            let keys: Vec<Option<&Expr>> = self
+                .seek_def
+                .iter(&self.seek_def.start)
+                .map(|key| match key {
+                    SeekKeyComponent::Expr(expr) => Some(expr),
+                    _ => None,
+                })
+                .collect();
             encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
@@ -432,6 +459,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 self.start_reg,
                 num_regs,
                 0,
+                &keys,
                 self.loop_end,
                 &self.t_ctx.resolver,
             )?;
@@ -560,6 +588,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         last_reg,
                         1,
                         self.seek_def.prefix.len(),
+                        &[Some(expr)],
                         self.loop_end,
                         &self.t_ctx.resolver,
                     )?;
