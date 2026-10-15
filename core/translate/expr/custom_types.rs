@@ -1415,11 +1415,15 @@ mod tests {
     /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
     /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
     /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
-    /// 3.00; and 100.00 / 10 is 10.00, not 10. The UPDATE arms of
-    /// `a_numeric_operand_keeps_its_own_precision` store into numeric(10, 2), which hides the
-    /// result's scale; this reads it in the SELECT list. Division keeps the dividend's scale here,
-    /// where PostgreSQL answers 10.0000000000000000: a known divergence (fastest DECISIONS).
-    /// Mutant `operand_keeps_column_typmod`.
+    /// 3.00. The UPDATE arms of `a_numeric_operand_keeps_its_own_precision` store into
+    /// numeric(10, 2), which hides the result's scale; this reads it in the SELECT list. Division
+    /// is `numeric_division_takes_postgresqls_result_scale`'s (its first row is this table's
+    /// 100.00 / 10). Mutant `operand_keeps_column_typmod`.
+    ///
+    /// FLAGGED TEST EDIT, ruled ACCEPTED (engine review 21 MED 12 option (a), fastest DECISIONS
+    /// 2026-10-15T04:28:01Z): the `x / 10` row is deleted. Since 4d31d483c it panicked on the
+    /// loop's third row, so `x - 2` and `x * ?1` never ran, and it failed with or without the
+    /// mutant, proving no kill.
     #[test]
     fn numeric_arithmetic_in_the_select_list_keeps_the_operands_scale() {
         let conn = open();
@@ -1430,7 +1434,6 @@ mod tests {
         for (sql, param, want) in [
             ("SELECT x * 3 FROM t WHERE id = 1", None, "30.00"),
             ("SELECT x * 3 FROM t WHERE id = 3", None, "-15.00"),
-            ("SELECT x / 10 FROM t WHERE id = 2", None, "10.00"),
             ("SELECT x - 2 FROM t WHERE id = 2", None, "98.00"),
             (
                 "SELECT x * ?1 FROM t WHERE id = 1",
