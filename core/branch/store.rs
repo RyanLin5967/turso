@@ -2731,6 +2731,18 @@ impl BranchState {
 #[derive(Default)]
 struct ChildIndex {
     map: BTreeMap<(u64, u64), BranchId>,
+    /// LEAP L4 (the MCTS deletes), a catalog store: an exact mirror of the catalog's
+    /// `(parent, fork_epoch)` child rows as of its last committed checkpoint, built off the mutex
+    /// after open with the name mirror (`start_name_filter`) and kept by every install (its
+    /// `child_keys` put, its `child_removed` and `child_moved` deleted). When built, `below`,
+    /// `above` and `lowest` read it instead of the catalog's `branch_children` index: the same
+    /// rows, so the removal links resolve over it exactly as over the catalog. `None` until built.
+    /// Oracle: `l4_facts_check_for_test` (7).
+    catalog_rows: Option<std::collections::BTreeSet<(u64, u64)>>,
+    /// Keys a splice re-keyed away (`relink`: the child's catalog row still names the spliced-out
+    /// parent until the next checkpoint rewrites it): deleted from `catalog_rows` by the install
+    /// of the checkpoint that captured them.
+    moved: Vec<(u64, u64)>,
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
@@ -2776,6 +2788,12 @@ impl ChildIndex {
         Ok((listed || fresh, lo, hi))
     }
 
+    /// The catalog child rows' mirror, when built. Mutant `l4_probe_always` (test builds only): never
+    /// (the catalog is asked, as before).
+    fn rows(&self) -> Option<&std::collections::BTreeSet<(u64, u64)>> {
+        self.catalog_rows.as_ref().filter(|_| !fe_mutant("l4_probe_always"))
+    }
+
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
         while let Some(x) = e {
@@ -2794,7 +2812,10 @@ impl ChildIndex {
         let Some(cat) = cat else {
             return Ok(mem);
         };
-        let row = cat.children_below(p, f, 1)?.into_iter().next();
+        let row = match self.rows() {
+            Some(rows) => rows.range((p, 0)..(p, f)).next_back().map(|&(_, e)| e),
+            None => cat.children_below(p, f, 1)?.into_iter().next(),
+        };
         Ok(mem.max(self.resolve(p, row, true)))
     }
 
@@ -2809,7 +2830,10 @@ impl ChildIndex {
         let Some(cat) = cat else {
             return Ok(mem);
         };
-        let row = cat.children_above(p, f, 1)?.into_iter().next();
+        let row = match self.rows() {
+            Some(rows) => rows.range((p, f.saturating_add(1))..=(p, u64::MAX)).next().map(|&(_, e)| e),
+            None => cat.children_above(p, f, 1)?.into_iter().next(),
+        };
         Ok(match (mem, self.resolve(p, row, false)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -2825,7 +2849,10 @@ impl ChildIndex {
         let Some(cat) = cat else {
             return Ok(mem);
         };
-        let row = cat.children_in(p, 0, u64::MAX, 1)?.into_iter().next();
+        let row = match self.rows() {
+            Some(rows) => rows.range((p, 0)..=(p, u64::MAX)).next().map(|&(_, e)| e),
+            None => cat.children_in(p, 0, u64::MAX, 1)?.into_iter().next(),
+        };
         Ok(match (mem, self.resolve(p, row, false)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -2853,6 +2880,7 @@ impl ChildIndex {
     /// since no query names it as a parent again.
     fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
         self.map.remove(&(zombie.0, f));
+        self.moved.push((zombie.0, f));
         self.map.insert((parent.0, zf), child);
         let links: Vec<(u64, u64)> = self
             .removed
@@ -3171,6 +3199,8 @@ struct Captured {
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
+    /// The child index's `moved` keys at the capture (see `ChildIndex::moved`).
+    child_moved: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<std::fs::File>,
@@ -8155,6 +8185,13 @@ impl BranchStore {
                     }
                     Err(e) => (Err(e), None),
                 };
+                // LEAP L4 (the MCTS deletes): the child rows' mirror, from the same reader, in the
+                // index's order (built in bulk off the mutex); installed with the names, under the
+                // same generation rule. A failed read leaves it unbuilt (the catalog answers).
+                let child_rows: Option<std::collections::BTreeSet<(u64, u64)>> = match mirror {
+                    Some(_) => reader.child_rows(&stop).ok().map(|rows| rows.into_iter().collect()),
+                    None => None,
+                };
                 #[cfg(test)]
                 if let Some(hold) = install_hold.as_ref() {
                     use std::sync::atomic::Ordering as O;
@@ -8196,14 +8233,21 @@ impl BranchStore {
                 // dropped (its N frees are not a hold). Mutant `l4_mirror_ignores_generation` (test
                 // builds only): installed whatever committed meanwhile (the oracle's plant).
                 let mut discarded = None;
+                let mut discarded_rows = None;
+                let current = inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation);
                 if let Some(mirror) = mirror {
-                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation)
-                        || fe_mutant("l4_mirror_ignores_generation")
-                    {
+                    if current || fe_mutant("l4_mirror_ignores_generation") {
                         inner.names.catalog = Some(mirror);
                     } else {
                         inner.names.mirror_misses += 1;
                         discarded = Some(mirror);
+                    }
+                }
+                if let Some(rows) = child_rows {
+                    if current {
+                        inner.children.catalog_rows = Some(rows);
+                    } else {
+                        discarded_rows = Some(rows);
                     }
                 }
                 let filter = &mut inner.names.filter;
@@ -8222,6 +8266,7 @@ impl BranchStore {
                 }
                 drop(inner);
                 drop(discarded);
+                drop(discarded_rows);
             });
         match spawned {
             Ok(handle) => *self.name_filter_build.lock() = Some(handle),
@@ -8632,6 +8677,20 @@ impl BranchStore {
                 ));
             }
         }
+        // (7) The child rows' mirror, built and out of a flight, equals the catalog's child rows.
+        if let (Some(rows), false) = (inner.children.catalog_rows.as_ref(), cat.flight && !in_flight_too) {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let asked: std::collections::BTreeSet<(u64, u64)> =
+                cat.catalog.child_rows(&stop).map_err(|e| format!("child_rows: {e}"))?.into_iter().collect();
+            if *rows != asked {
+                return Err(format!(
+                    "the child rows' mirror holds {} rows, the catalog {}; first difference: {:?}",
+                    rows.len(),
+                    asked.len(),
+                    rows.symmetric_difference(&asked).next()
+                ));
+            }
+        }
         // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
         // whether the catalog holds a trunk version, as known, equal their queries.
         if !cat.flight || in_flight_too {
@@ -8669,6 +8728,12 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn name_mirror_built_for_test(&self) -> bool {
         self.inner.lock().names.catalog.is_some()
+    }
+
+    /// Test builds (LEAP L4): whether the child rows' mirror is built.
+    #[cfg(test)]
+    pub(crate) fn child_rows_built_for_test(&self) -> bool {
+        self.inner.lock().children.catalog_rows.is_some()
     }
 
     /// Test builds (review L4): name mirrors discarded because a checkpoint committed during their
@@ -9817,6 +9882,10 @@ impl StoreInner {
                     if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
                         self.names.catalog = Some(NameMirror::default());
                     }
+                    // And no child row.
+                    if self.children.catalog_rows.is_none() {
+                        self.children.catalog_rows = Some(std::collections::BTreeSet::new());
+                    }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
                         let mut built = HashSet::default();
@@ -10286,6 +10355,7 @@ impl StoreInner {
             meta,
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
+            child_moved: self.children.moved.clone(),
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
@@ -10424,6 +10494,19 @@ impl StoreInner {
         }
         // Children forked before the capture have rows now; links of children removed before it
         // pointed at rows that are deleted now.
+        // LEAP L4: the child rows' mirror takes what the writer did to `branch` (re-keyed and
+        // removed children's rows gone, the captured children's rows put). Mutant
+        // `l4_child_rows_stale` (test builds only): the captured children are not put (the
+        // oracle's plant).
+        if let Some(rows) = self.children.catalog_rows.as_mut() {
+            for key in cap.child_moved.iter().chain(&cap.child_removed) {
+                rows.remove(key);
+            }
+            if !fe_mutant("l4_child_rows_stale") {
+                rows.extend(cap.child_keys.iter().copied());
+            }
+        }
+        self.children.moved.drain(..cap.child_moved.len().min(self.children.moved.len()));
         for key in &cap.child_keys {
             self.children.map.remove(key);
         }

@@ -55,6 +55,8 @@ struct Seen {
     /// Review L4 M1: fact use sites reached under a held flight, each asserting the facts equal
     /// their queries (counted for the last store of a history).
     site_checks: u64,
+    /// LEAP L4 (the MCTS deletes): checks at which the child rows' mirror was built.
+    child_rows_built: u64,
 }
 
 impl Seen {
@@ -71,6 +73,7 @@ impl Seen {
         self.flight_ops += o.flight_ops;
         self.facts_in_flight += o.facts_in_flight;
         self.site_checks += o.site_checks;
+        self.child_rows_built += o.child_rows_built;
     }
 }
 
@@ -255,6 +258,7 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
         match db.branches.l4_facts_check_for_test() {
             Ok((pages, all, exhausted, meta)) => {
                 seen.mirror_built += u64::from(db.branches.name_mirror_built_for_test());
+                seen.child_rows_built += u64::from(db.branches.child_rows_built_for_test());
                 seen.pages_complete += u64::from(pages > 0);
                 seen.all_complete += u64::from(all);
                 seen.free_exhausted += u64::from(exhausted);
@@ -286,7 +290,9 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
 /// Review L4 (DECISIONS df1a954ddb): M1, steps under a fuzzy checkpoint held in flight and reopens
 /// whose name scan is held past a checkpoint (plants `l4_child_facts_in_flight`,
 /// `l4_mirror_ignores_generation`); M2, two histories under a resident cap of 2 that trim the
-/// trunk-version cache (plant `l4_trim_keeps_complete`); L4, the legacy histories' premise.
+/// trunk-version cache (plant `l4_trim_keeps_complete`); L4, the legacy histories' premise. The
+/// MCTS deletes: the child rows' mirror equals the catalog's child rows at every step out of a
+/// flight (plant `l4_child_rows_stale`).
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     let mut total = Seen::default();
@@ -295,7 +301,12 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     }
     let premise = |what: &str, s: &Seen| {
         assert!(
-            s.pages_complete > 0 && s.all_complete > 0 && s.free_exhausted > 0 && s.meta_facts > 0 && s.mirror_built > 0,
+            s.pages_complete > 0
+                && s.all_complete > 0
+                && s.free_exhausted > 0
+                && s.meta_facts > 0
+                && s.mirror_built > 0
+                && s.child_rows_built > 0,
             "premise ({what}): every fact was set at some check: {s:?}"
         );
     };

@@ -532,6 +532,7 @@ pub(crate) struct Catalog {
     name_all: Stmt,
     /// LEAP L4 slice 4: every name with its branch, for the exact name mirror's build.
     name_pairs: Stmt,
+    child_rows: Stmt,
     name_of: Stmt,
     name_put: Stmt,
     name_del: Stmt,
@@ -678,6 +679,8 @@ impl Catalog {
             name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
             name_all: p("SELECT name FROM branch_name")?,
             name_pairs: p("SELECT name, id FROM branch_name")?,
+            // In `branch_children`'s order, so the mirror is built from a sorted run.
+            child_rows: p("SELECT parent, fork_epoch FROM branch ORDER BY parent, fork_epoch")?,
             name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
             name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
             name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
@@ -1206,6 +1209,23 @@ impl Catalog {
             };
             let id = id as u64;
             out.push((name, id));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every branch row's `(parent, fork_epoch)`, in that order: the child index's catalog mirror
+    /// (LEAP L4, the MCTS deletes), read with the names off the store mutex.
+    pub(crate) fn child_rows(&mut self, stop: &std::sync::atomic::AtomicBool) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        self.child_rows.each_row(&mut self.counters, |row| {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LimboError::Interrupt);
+            }
+            match (row.get_value(0).as_int(), row.get_value(1).as_int()) {
+                (Some(p), Some(f)) => out.push((p as u64, f as u64)),
+                _ => return Err(LimboError::Corrupt("branch catalog: a child row is not two integers".to_string())),
+            }
             Ok(())
         })?;
         Ok(out)
