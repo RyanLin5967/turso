@@ -2412,7 +2412,12 @@ impl Program {
         }
         match applied? {
             IOResult::IO(io) => {
-                if matches!(program_state.commit_state, CommitState::Ready) {
+                // Mutant `view_yield_unrecorded` (test builds only; engine review 19 LOW 16): the
+                // yield left unrecorded, so the re-entry judges the COMMIT anew, as before engine
+                // review 16 HIGH 1 (i); killed by a_busy_commit_whose_view_merge_yielded_commits_once.
+                if matches!(program_state.commit_state, CommitState::Ready)
+                    && !crate::branch::store::fe_mutant("view_yield_unrecorded")
+                {
                     program_state.commit_state = CommitState::ApplyingViewDeltas;
                 }
                 return Ok(IOResult::IO(io));
