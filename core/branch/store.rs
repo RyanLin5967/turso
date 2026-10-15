@@ -6789,6 +6789,20 @@ impl BranchStore {
     /// was abandoned, and frees the branch if it was released meanwhile.
     pub(crate) fn close(&self, id: BranchId) {
         let mut inner = self.inner.lock();
+        // Fire-check plants of the class (e) hold audit (lead order 2026-10-15; test builds only):
+        // one syscall (`audit_plant_syscall_disconnect`), or one allocation
+        // (`audit_plant_alloc_disconnect`), in this hold, which is clean today. The audit must go
+        // red naming this site.
+        #[cfg(test)]
+        {
+            if fe_mutant("audit_plant_syscall_disconnect") {
+                // getppid(2) traps into the kernel (getpid does not: the shim excludes it).
+                std::hint::black_box(unsafe { libc::getppid() });
+            }
+            if fe_mutant("audit_plant_alloc_disconnect") {
+                std::hint::black_box(Box::new(0u64));
+            }
+        }
         let mut freed = Vec::new();
         // A released branch is collected (and possibly spliced) here, outside any other logged
         // operation, so the close is logged: replay collects it at this same point (F7 durable
