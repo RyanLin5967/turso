@@ -312,10 +312,10 @@ def after_problems(nm, sm, cols):
     no after-step (skip_after); and it names what its tput_* count (tput_unit): 'cycle' -- an op plus its untimed
     after-steps, which run inside the client's loop before its next claim -- when after-steps ran, else 'op'.
     clonebench (mode b1, b0) runs no after-step and has no after record; any other mode is record_problems' refusal."""
-    if sm.get("mode") not in ("closed", "open"):
-        return []
-    na, skip = sm.get("after_steps"), sm.get("skip_after")
     why = []
+    if sm.get("mode") not in ("closed", "open"):
+        return why  # (not a literal []: timedrun_mutants.py reads a returned list literal as a refusal to delete)
+    na, skip = sm.get("after_steps"), sm.get("skip_after")
     if not _count(na):
         why.append(f"{nm} run has no after_steps record ({na!r})")
     if not isinstance(skip, bool):
@@ -820,6 +820,10 @@ def selftest():
               timed_extra=dict(OPEN, pool_late_us={"p50": 5.0, "p99": 101.0, "max": 300.0})), False),
         ("open loop with no lateness record", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, send_late_us=None)),
          False),
+        ("open loop with no max_send_late_us bound", dict(tracer=clean, lab_extra=OPEN,
+                                                          timed_extra=dict(OPEN, max_send_late_us=None)), False),
+        ("a mode that is neither bbload's nor clonebench's (both runs)",
+         dict(tracer=clean, lab_extra={"mode": "x"}, timed_extra={"mode": "x"}), False),
         # comp review 1 MED 9: a bbload run with after-steps times each one apart (after<k>_ns, the macOS columns) and
         # says its throughput is per CYCLE; --skip-after runs none (BB: a create spec's bbload summary)
         ("control: a bbload cycle run with after1_ns and after2_ns and tput_unit cycle",
@@ -953,6 +957,10 @@ def selftest():
         "open loop, a p99 pool lateness over max_send_late_us":
             ("timed run's pool_late_us p99 101.0 us is over its bound 100.0 us: VOID",),
         "open loop with no lateness record": ("timed run is open loop with no send_late_us p99",),
+        "open loop with no max_send_late_us bound": ("timed run is open loop with no max_send_late_us",),
+        "a mode that is neither bbload's nor clonebench's (both runs)":
+            ("labelling run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)",
+             "timed run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)"),
         "a bbload run with after-steps but no after<k>_ns columns":
             ("timed run ran 2 after-step(s) (after_steps 2, skip_after False) but its raw.tsv's after columns are none",),
         "a bbload run with after-steps and only after1_ns of 2": ("after columns are ['after1_ns'], not",),
@@ -1020,21 +1028,35 @@ def selftest():
     # The warm-up of one run dir, as run_system.sh's live plants judge it (timedrun.py warm-check OUTDIR RULE: the A23
     # record, the record's own fields and its raw rows)
     wc = globals().get("warm_check")
+    # (raw: raw_tsv's kwargs, or the raw.tsv text itself, or None for none; reason: the refusal's own text, pinned as
+    # C01 pins the cell cases -- and raw_problems' early refusals, which no cell case reaches alone, are here)
     with tempfile.TemporaryDirectory() as root:
-        for name, sm_extra, raw_kw, want in (
-                ("warm-check: a clean run", {}, {}, True),
-                ("warm-check: raw warm-up rows one short of warmup_ops", {}, {"drop_warm": 1}, False),
-                ("warm-check: a backstep", {"warmup_backsteps": 1}, {}, False),
-                ("warm-check: a clock that steps back", {"clock": "CLOCK_TAI"}, {}, False)):
+        for name, sm_extra, raw_kw, want, reason in (
+                ("warm-check: a clean run", {}, {}, True, None),
+                ("warm-check: raw warm-up rows one short of warmup_ops", {}, {"drop_warm": 1}, False,
+                 "run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500"),
+                ("warm-check: a backstep", {"warmup_backsteps": 1}, {}, False,
+                 "with an older time than the claim judged before them"),
+                ("warm-check: a clock that steps back", {"clock": "CLOCK_TAI"}, {}, False,
+                 "run's clock 'CLOCK_TAI' is not one that never steps back"),
+                ("warm-check: no raw.tsv", {}, None, False, "run has no raw.tsv"),
+                ("warm-check: a raw.tsv with no phase column", {}, "client\tseq\n0\t0\n", False,
+                 "run's raw.tsv has no phase or intended_ns column"),
+                ("warm-check: an intended_ns that is not a count", {},
+                 "client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns\n0\t0\tmeasure\t1\t0\tx\t1000\n", False,
+                 "run's raw.tsv has an intended_ns that is not a count")):
             dd = os.path.join(root, name.replace(" ", "_").replace(":", ""))
             os.makedirs(dd)
             sm = dict(RUN, measured_ops=50, warmup_rule=RULE, **sm_extra)
             with open(os.path.join(dd, "summary.json"), "w") as f:
                 json.dump(sm, f)
-            with open(os.path.join(dd, "raw.tsv"), "w") as f:
-                f.write(raw_tsv(sm, **raw_kw))
+            if raw_kw is not None:
+                with open(os.path.join(dd, "raw.tsv"), "w") as f:
+                    f.write(raw_kw if isinstance(raw_kw, str) else raw_tsv(sm, **raw_kw))
             why = wc(dd, RULE) if wc else ["no warm_check() in timedrun.py"]
             ok((not why) == want, f"{name} -> {'ok' if not why else '; '.join(why)}")
+            if reason is not None:
+                ok(any(reason in line for line in why), f"reason: {name} -> expected {reason!r}; got {why!r}")
     # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
     for ok_ops, capped, want in ((1000, True, "complete"), (999, True, "p50_only"), (100, True, "p50_only"),
                                  (99, True, None), (0, True, None), (200, False, "complete")):
