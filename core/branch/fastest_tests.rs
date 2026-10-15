@@ -4420,6 +4420,80 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
     }
 }
 
+/// Engine review 18 MED 2 (a): the class an earlier run synced the log in (`synced_base`) lived only
+/// in the memory of the process that opened over it. A second D0 process, opening the log the first
+/// D0 process compacted, found no synced flight and no raised header, so it freed at written while
+/// the snapshot or catalog the first one synced still named the slots. Three runs: D1 writes x; D0
+/// opens, compacts and closes; D0 opens and reaps x: a new branch reuses none of x's slots. Both
+/// stores.
+#[test]
+fn a_second_d0_process_over_a_synced_log_still_holds_frees() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("second-d0.db");
+        let (id, slots, first) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            let slots = x.owned_slots();
+            assert!(!slots.is_empty(), "{what}: premise: x's write took a slot");
+            (x.into_id(), slots, db.incarnation)
+        };
+        let second = {
+            let db = reopen(&path, opts(catalog, SyncClass::Off), first);
+            db.branch_compact_now().unwrap();
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), second);
+        let trunk = db.connect().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(
+            took.is_empty(),
+            "{what}: slots {took:?} were reused before a sync covered the Release, over records a D1 run made durable two processes ago"
+        );
+    }
+}
+
+/// Engine review 18 MED 2 (a), the header-only arm: a D1 or D2 run whose last write came before its
+/// checkpoint leaves a log holding no flight, so a D0 open decided no synced class from any tag,
+/// and the header said nothing either: it freed at written while the synced catalog or snapshot
+/// still named the slots. D1 or D2 writes x, compacts and closes (premise: the reopened log holds no
+/// flight); D0 reopens and reaps x: a new branch reuses none of x's slots. Both stores, both classes.
+#[test]
+fn a_d0_open_of_a_header_only_synced_log_holds_frees() {
+    let _s = serial();
+    for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
+        let what = format!("catalog={catalog} written={written:?}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("header-only.db");
+        let (id, slots, incarnation) = {
+            let db = open_at(&path, opts(catalog, written));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            let slots = x.owned_slots();
+            assert!(!slots.is_empty(), "{what}: premise: x's write took a slot");
+            db.branch_compact_now().unwrap();
+            (x.into_id(), slots, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        assert_eq!(db.branches.log_len_for_test(), 40, "{what}: premise: the reopened log holds no flight");
+        let trunk = db.connect().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(
+            took.is_empty(),
+            "{what}: slots {took:?} were reused before a sync covered the Release, over a log a {written:?} run synced"
+        );
+    }
+}
+
 /// Engine review 8 #7: in a catalog store, a held free (above) was in no list a checkpoint writes:
 /// the capture took only `pending_free` as deferred, so the slot stayed counted in use, no free
 /// table row named it, and the cut dropped its Release. A catalog open has no reachability sweep,
