@@ -4478,7 +4478,9 @@ impl BranchStore {
                 .filter(|&s| s < meta.arena_hw && touched.now.contains_key(&s))
                 .collect();
             ask.sort_unstable();
-            stats.free_probes += ask.len() as u64;
+            // Probe STATEMENTS, as at 17/18 (one per chunk here): `cat_queries - free_probes` is
+            // the open's own reads (catalog_tests).
+            stats.free_probes += ask.len().div_ceil(super::catalog::FREE_HAS_CHUNK) as u64;
             Some(cat.catalog.free_has_many(&ask)?)
         } else {
             None
