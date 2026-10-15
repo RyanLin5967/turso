@@ -497,16 +497,21 @@ RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
 
 
-def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children"):
-    """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX" line per
-    sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every 0.05 s
-    to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]."""
+def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children", sweeper="pid=600 nice=19 clk_tck=100",
+              cpu=True):
+    """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX cpu=T"
+    line per sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every
+    0.05 s to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]. Comp review 1 MED 12: the
+    sweeper's own header (SWEEPER; None: none) and, per sweep, its own utime+stime in clock ticks (cpu=T: a sweep
+    tuple's 7th element, else the sweep's index, one tick per sweep; CPU false: no cpu= field)."""
     if sweeps is None:
         sweeps = ([("start", 100.0, 3, 0, 12, 0)] + [("mid", round(100.05 + 0.05 * k, 2), 3, 0, 12, 0) for k in range(8)]
                   + [("end", 100.45, 0, 0, 12, 0)])
-    out = [f"roles {roles}\n"]
-    for ph, t, cn, cm, sn, sm in sweeps:
-        out.append(f"SWEEP {ph} {t:.6f} cmd={cn}:{cm} srv={sn}:{sm}\n")
+    out = [f"roles {roles}\n"] + ([f"sweeper {sweeper}\n"] if sweeper is not None else [])
+    for i, s in enumerate(sweeps):
+        ph, t, cn, cm, sn, sm = s[:6]
+        c = f" cpu={s[6] if len(s) > 6 else i}" if cpu else ""
+        out.append(f"SWEEP {ph} {t:.6f} cmd={cn}:{cm} srv={sn}:{sm}{c}\n")
     for tr in traced:
         out.append("TRACED " + " ".join(str(x) for x in tr) + "\n")
     return "".join(out)
@@ -824,6 +829,14 @@ def selftest():
                                                           timed_extra=dict(OPEN, max_send_late_us=None)), False),
         ("a mode that is neither bbload's nor clonebench's (both runs)",
          dict(tracer=clean, lab_extra={"mode": "x"}, timed_extra={"mode": "x"}), False),
+        # comp review 1 MED 12: the sweeper is a cost beside the competitors' timed runs only, so its own CPU is part of
+        # the record (timed.json sweeper_cpu_s, below), and it runs at nice 19
+        ("the sweep lines carry no sweeper CPU", dict(tracer=trace_rec(cpu=False)), False),
+        ("no sweeper header", dict(tracer=trace_rec(sweeper=None)), False),
+        ("the sweeper ran at nice 0", dict(tracer=trace_rec(sweeper="pid=600 nice=0 clk_tck=100")), False),
+        ("the sweeper's CPU went backwards",
+         dict(tracer=trace_rec(sw[:3] + [("mid", 100.15, 3, 0, 12, 0, 0)] + sw[4:] + [("end", 100.45, 0, 0, 12, 0)])),
+         False),
         # comp review 1 MED 9: a bbload run with after-steps times each one apart (after<k>_ns, the macOS columns) and
         # says its throughput is per CYCLE; --skip-after runs none (BB: a create spec's bbload summary)
         ("control: a bbload cycle run with after1_ns and after2_ns and tput_unit cycle",
@@ -958,6 +971,10 @@ def selftest():
             ("timed run's pool_late_us p99 101.0 us is over its bound 100.0 us: VOID",),
         "open loop with no lateness record": ("timed run is open loop with no send_late_us p99",),
         "open loop with no max_send_late_us bound": ("timed run is open loop with no max_send_late_us",),
+        "the sweep lines carry no sweeper CPU": ("has no sweeper CPU (cpu=)",),
+        "no sweeper header": ("tracer record has no sweeper header",),
+        "the sweeper ran at nice 0": ("the sweeper ran at nice 0, not 19",),
+        "the sweeper's CPU went backwards": ("the sweeper's CPU went backwards",),
         "a mode that is neither bbload's nor clonebench's (both runs)":
             ("labelling run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)",
              "timed run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)"),
@@ -995,6 +1012,14 @@ def selftest():
                 expected = refusal_reasons.get(name, ())
                 ok(bool(expected) and all(any(reason in line for line in why) for reason in expected),
                    f"reason: {name} -> expected {expected!r}; got {why!r}")
+    # comp review 1 MED 12: timed.json records the sweeper's own CPU between the sweeps bracketing the window: in the
+    # clean record the last sweep at or before tm0 (100.1) is 100.10 with cpu=2 ticks and the first at or after tm1
+    # (100.3) is 100.30 with cpu=6, so (6 - 2) / clk_tck 100 = 0.04 s over [100.1, 100.3] (by hand, not by the subject)
+    with tempfile.TemporaryDirectory() as root:
+        tj = write_verdict(fixture(root, "sweeper", tracer=clean), 200, [], RULE, CAP, "1")
+        got = (tj.get("sweeper_cpu_s"), tj.get("sweeper_cpu_span_s"), tj.get("sweeper_nice"))
+        ok(isinstance(got[0], float) and abs(got[0] - 0.04) < 1e-12 and got[1] == [100.1, 100.3] and got[2] == 19,
+           f"timed.json sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice = {got!r}, want (0.04, [100.1, 100.3], 19)")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None),
