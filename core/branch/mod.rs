@@ -1784,6 +1784,10 @@ mod l4_oracle_tests;
 #[cfg(all(test, feature = "fs"))]
 mod format_authority_tests;
 
+// Links adversary M1 (DECISIONS 7e77068514): nested histories, known links against the query path.
+#[cfg(all(test, feature = "fs"))]
+mod l4_nested_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2805,6 +2805,16 @@ impl ChildIndex {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
+            // Test builds, with `links_crosscheck::ON` (links adversary M1): the known answer
+            // against the catalog query path it replaces, on the same state.
+            #[cfg(test)]
+            if links_crosscheck::on() {
+                if let Some(c) = cat.as_deref_mut() {
+                    let q_lo = self.below(Some(c), parent, f)?;
+                    let q_hi = self.above(cat.as_deref_mut(), parent, f)?;
+                    links_crosscheck::note(p, f, (lo, hi), (q_lo, q_hi), (row_lo, row_hi));
+                }
+            }
             self.removed.insert((p, f), (lo, hi));
             return Ok((listed || fresh, lo, hi));
         }
@@ -3341,6 +3351,12 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             catalog.upgrade_links()?;
             upgraded = true;
         } else if catalog.links_valid() && !fe_mutant("l4_stale_sibling_link") {
+            // Mutant `l4_unlinked_committed_first` (test builds only): the removals committed before
+            // their siblings are relinked (the `ckpt.unlinked` kill test's plant, links adversary).
+            if fe_mutant("l4_unlinked_committed_first") {
+                catalog.commit()?;
+                catalog.begin()?;
+            }
             kill_point("ckpt.unlinked");
             let mut rows: BTreeSet<(u64, u64)> = BTreeSet::new();
             let mut parents: BTreeSet<u64> = BTreeSet::new();
@@ -11114,7 +11130,9 @@ impl StoreInner {
                     self.branches.get(&parent).and_then(|p| p.links).map(|l| (l.child_max, None))
                 }
             } else {
-                st.links.map(|l| (l.lo, l.hi))
+                // Mutant `l4_known_drops_hi` (test builds only): the row's upper link dropped (the
+                // nested crosscheck's plant, links adversary M1).
+                st.links.map(|l| (l.lo, if fe_mutant("l4_known_drops_hi") { None } else { l.hi }))
             };
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
             let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest, known)?;
@@ -13314,3 +13332,34 @@ mod fail_stop_tests {
     }
 }
 
+/// Test builds (links adversary M1): every delete that took its neighbours from known links,
+/// compared with the catalog query path it replaces, on the thread that set `ON` (the nested
+/// histories of `l4_nested_tests`). Off, a delete issues no extra query, so no budget sees it.
+#[cfg(test)]
+pub(crate) mod links_crosscheck {
+    use std::cell::{Cell, RefCell};
+    std::thread_local! {
+        pub(crate) static ON: Cell<bool> = const { Cell::new(false) };
+        /// Known-path deletes checked, and those of a branch's child (not the trunk's).
+        pub(crate) static CHECKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        pub(crate) static MISMATCHES: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static FIRST: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn on() -> bool {
+        ON.with(Cell::get)
+    }
+    pub(crate) fn note(p: u64, f: u64, got: (Option<u64>, Option<u64>), want: (Option<u64>, Option<u64>), row: (Option<u64>, Option<u64>)) {
+        CHECKS.with(|c| {
+            let (n, b) = c.get();
+            c.set((n + 1, b + u64::from(p != 0)));
+        });
+        if got != want {
+            MISMATCHES.with(|m| m.set(m.get() + 1));
+            FIRST.with(|first| {
+                first.borrow_mut().get_or_insert_with(|| {
+                    format!("delete of ({p}, {f}): known path {got:?}, query path {want:?}, row links {row:?}")
+                });
+            });
+        }
+    }
+}
