@@ -147,6 +147,7 @@ mod tests {
                 for sql in ["SELECT a FROM v11".to_string(), from, scalar, mixed] {
                     conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
                     let (worst, at) = test_hooks::take_worst_at();
+                    println!("FE_LEVEL_GAP {worst} B {:?}: {}", at.map(|(o, i)| format!("{o} -> {i}")), &sql[..sql.len().min(40)]);
                     if worst == 0 || worst >= turso_stack_guard::LEVEL_COST {
                         let at = at.map(|(o, i)| format!("{o} -> {i}"));
                         over.push(format!("{worst} B between two checks {at:?}: {}", &sql[..sql.len().min(60)]));
@@ -158,6 +159,40 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// Lead order (ultrareview instance (ii), artie reviews/ULTRAREVIEW-1-wire.md): under INSERT,
+    /// UPDATE and DELETE the first subquery's planning and emission held no outer guard, so its
+    /// guard was a statement's outermost step, exempt from the check: one level ran unchecked on
+    /// whatever stack was left. Each statement's prepare must enter exactly its two outermost steps
+    /// (the parser's `parse_stmt` and `translate_inner`), so every subquery step is nested and
+    /// checked. Mutant `nest_statement_unguarded` (no guard in translate_inner) must turn it red.
+    #[test]
+    fn a_dml_statements_first_subquery_is_a_nested_step() {
+        let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+        let mut bad = Vec::new();
+        test_hooks::arm(true);
+        for sql in [
+            "SELECT (SELECT 1)",
+            "INSERT INTO t SELECT (SELECT 1)",
+            "INSERT INTO t VALUES ((SELECT 1))",
+            "UPDATE t SET a = (SELECT 1)",
+            "UPDATE t SET a = 1 WHERE a IN (SELECT 1)",
+            "DELETE FROM t WHERE a IN (SELECT 1)",
+            "DELETE FROM t WHERE a = (SELECT (SELECT 1))",
+        ] {
+            test_hooks::take_outermost();
+            let prepared = conn.prepare(sql).map(|_| ());
+            let outermost = test_hooks::take_outermost();
+            if prepared.is_err() || outermost != 2 {
+                bad.push(format!("{sql}: {outermost} outermost steps ({prepared:?})"));
+            }
+        }
+        test_hooks::arm(false);
+        assert!(bad.is_empty(), "CLAIM: a statement's subquery step was entered as an outermost, unchecked step: {bad:?}");
     }
 
     /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside

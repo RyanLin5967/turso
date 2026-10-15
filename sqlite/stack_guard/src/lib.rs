@@ -26,18 +26,32 @@
 //! (5) [`with_stack`] sizes a segment from a bound its caller states; a wrong bound is an overflow
 //! the class tests must find.
 
-/// The stack a recursive step may still need below a check: one level of each phase, the deepest
-/// of which (a debug build's view expansion) takes about 93 KiB (a 90-view chain overflowed 8 MiB),
-/// with margin (crash batch; measured by postgres/server
-/// `every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`). A thread whose whole stack
-/// is under 4 times this keeps a quarter of its stack instead (a fixed 512 KiB refused every
-/// statement on a 512 KiB thread, Apple's GCD and NSThread default).
+/// The stack a recursive step may still need below a check: one level of each phase, with margin,
+/// and a thread whose whole stack is under 4 times this keeps a quarter of its stack instead (a
+/// fixed 512 KiB refused every statement on a 512 KiB thread, Apple's GCD and NSThread default).
+/// Debug: 512 KiB, from the crash batch (a debug build's view expansion took about 93 KiB a level;
+/// a 90-view chain overflowed 8 MiB). Release: 128 KiB, sized as debug's is, at 4 times
+/// [`LEVEL_COST`].
+#[cfg(debug_assertions)]
 pub const STACK_MARGIN: usize = 512 << 10;
+#[cfg(not(debug_assertions))]
+pub const STACK_MARGIN: usize = 128 << 10;
 
-/// One level of the deepest phase, with slack: the least a nested step is ever entered with,
-/// however small the thread. A thread that cannot afford one level refuses every nested step and
-/// still runs flat statements.
-pub const LEVEL_COST: usize = 128 << 10;
+/// One level of the deepest phase, with slack: the least a checked step is ever entered with,
+/// however small the thread, and the floor of a statement prepared inside a step (a DDL's schema
+/// reparse, lead's ultrareview instance (i)). A thread that cannot afford one level refuses every
+/// nested step and still runs flat statements. Sized from what was measured (core
+/// `stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart` and
+/// `stack_guard_tests::diag_schema_reparse_stack_cost`, raw artie l86):
+/// - debug: the widest gap between two consecutive checks is 117,200 B, and a schema reparse uses
+///   250,127 B (a CREATE TABLE) to 496,367 B (an 8-level view) in all, each level checked: 192 KiB;
+/// - release: the widest gap is 6,816 B, and a reparse uses 23,743 B to 36,839 B in all: 32 KiB,
+///   so a DDL re-entered with under 128 KiB left (the debug floor, applied to release before) runs
+///   instead of being refused.
+#[cfg(debug_assertions)]
+pub const LEVEL_COST: usize = 192 << 10;
+#[cfg(not(debug_assertions))]
+pub const LEVEL_COST: usize = 32 << 10;
 
 /// PostgreSQL's message for 54001, without its hint about `max_stack_depth`.
 pub const MESSAGE: &str = "stack depth limit exceeded";
@@ -186,6 +200,19 @@ pub mod test_hooks {
         static WORST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static WORST_AT: std::cell::Cell<Option<(&'static std::panic::Location<'static>, &'static std::panic::Location<'static>)>> = const { std::cell::Cell::new(None) };
         static REENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static OUTERMOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static REENTERED_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The stack left at the first outermost step entered while a statement stepped, since the
+    /// last take (a schema reparse's prepare, for its stack cost).
+    pub fn take_reentered_left() -> Option<usize> {
+        REENTERED_LEFT.with(|r| r.replace(None))
+    }
+
+    /// Outermost steps entered on a quiet thread (exempt from the check), since the last take.
+    pub fn take_outermost() -> usize {
+        OUTERMOST.with(|o| o.replace(0))
     }
 
     /// Record on this thread from now on (`take_worst`, `take_reentered`).
@@ -229,6 +256,13 @@ pub mod test_hooks {
             at.truncate(depth);
             if depth == 0 && super::EXECUTING.with(|e| e.get()) > 0 {
                 REENTERED.with(|r| r.set(r.get() + 1));
+                REENTERED_LEFT.with(|r| {
+                    if r.get().is_none() {
+                        r.set(Some(left));
+                    }
+                });
+            } else if depth == 0 {
+                OUTERMOST.with(|o| o.set(o.get() + 1));
             }
             if let Some(&(outer, outer_site)) = at.last() {
                 let gap = outer.saturating_sub(left);
@@ -300,7 +334,8 @@ mod tests {
     fn a_small_thread_refuses_a_nested_step_it_cannot_afford_one_level_for() {
         #[inline(never)]
         fn one_level() {
-            let mut frame = [0u8; 120 << 10];
+            // One level just under LEVEL_COST (the wire's test used 120 KiB, debug's then 128 KiB).
+            let mut frame = [0u8; LEVEL_COST - (8 << 10)];
             std::hint::black_box(&mut frame);
         }
         #[inline(never)]
@@ -322,8 +357,9 @@ mod tests {
             .stack_size(256 << 10)
             .spawn(|| {
                 let _outer = NestGuard::enter().unwrap();
-                assert!(!descend_to(100 << 10), "a nested step was admitted with ~100 KiB left");
-                assert!(descend_to(200 << 10), "premise: a nested step with ~200 KiB left runs");
+                let short = LEVEL_COST - (24 << 10);
+                assert!(!descend_to(short), "a nested step was admitted with {short} B left");
+                assert!(descend_to(LEVEL_COST + (24 << 10)), "premise: a nested step with one level's stack left runs");
             })
             .unwrap()
             .join()
@@ -348,8 +384,9 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(256 << 10)
             .spawn(|| {
-                assert!(at(100 << 10, false), "premise: a quiet thread's outermost step runs");
-                assert!(!at(100 << 10, true), "a re-entered step's first step was exempt");
+                let short = LEVEL_COST - (16 << 10);
+                assert!(at(short, false), "premise: a quiet thread's outermost step runs");
+                assert!(!at(short, true), "a re-entered step's first step was exempt");
             })
             .unwrap()
             .join()
