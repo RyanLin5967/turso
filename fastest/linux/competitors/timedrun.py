@@ -63,49 +63,18 @@ def load(path):
 
 
 GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.1 s)
-SWEEPER_NICE = 19  # comp review 1 MED 12: trace.sh's sweeper runs at nice 19, beside the competitors' timed runs only
+# comp review 1 MED 12, the lead's ruling: one sweeper (gates/sweeper.sh) and ONE reader of its record
+# (gates/sweeper_record.py, shared with t3run.sh), whose own selftest plants every refusal
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates"))
+import sweeper_record as _sweeper  # noqa: E402
+
+SWEEPER_NICE = _sweeper.SWEEPER_NICE
 
 
 def sweeper_record(lines, summary):
-    """Comp review 1 MED 12: the tracer sweeper's own record in trace.sh's timed.tracer.tsv -- its header ("sweeper
-    pid=P nice=N clk_tck=K") and, per sweep, the utime+stime ticks it read from its own /proc stat (cpu=T) -- and its
-    CPU between the sweeps bracketing the measured window [tm0, tm1] (the last at or before tm0, the first at or after
-    tm1), the cost the competitors' timed runs carry and ours does not (t3run.sh has no such sweeper). Returns
-    ({"sweeper_cpu_s", "sweeper_cpu_span_s", "sweeper_nice", "sweeper_clk_tck"} or None, the reasons it is unknown or
-    refused): no header, a nice other than SWEEPER_NICE, a sweep with no cpu=, CPU that went backwards, no bracket."""
-    hdr = next((ln.split()[1:] for ln in lines if ln.startswith("sweeper ")), None)
-    kv = dict(x.split("=", 1) for x in hdr or [] if "=" in x)
-    nice, clk = kv.get("nice", ""), kv.get("clk_tck", "")
-    if hdr is None or not nice.lstrip("-").isdigit() or not clk.isdigit() or int(clk) <= 0:
-        return None, [f"the tracer record has no sweeper header with its nice and clk_tck ({hdr!r})"]
-    why = []
-    if int(nice) != SWEEPER_NICE:
-        why.append(f"the sweeper ran at nice {int(nice)}, not {SWEEPER_NICE}")
-    pts = []
-    for ln in lines:
-        p = ln.split()
-        if p and p[0] == "SWEEP":
-            c = next((x[4:] for x in p[5:] if x.startswith("cpu=")), None)
-            if c is None or not c.isdigit():
-                return None, why + [f"sweep line {ln!r} has no sweeper CPU (cpu=)"]
-            try:
-                pts.append((float(p[2]), int(c)))
-            except (IndexError, ValueError):
-                return None, why + [f"unreadable sweep line {ln!r}"]
-    if any(b[1] < a[1] for a, b in zip(pts, pts[1:])):  # file order is sweep order (the record is append-only)
-        why.append(f"the sweeper's CPU went backwards between sweeps: {pts[:12]}")
+    """The shared reader over this run's measured window (the summary's tm0_realtime_s, tm1_realtime_s)."""
     sm = summary or {}
-    t0, t1 = sm.get("tm0_realtime_s"), sm.get("tm1_realtime_s")
-    num = all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in (t0, t1))
-    before = [q for q in pts if num and q[0] <= t0]
-    after = [q for q in pts if num and q[0] >= t1]
-    if not before or not after:
-        why.append("no sweeps bracket the measured window, so the sweeper's CPU over it is unknown")
-    if why:
-        return None, why
-    a, b, k = max(before), min(after), int(clk)
-    return {"sweeper_cpu_s": (b[1] - a[1]) / k, "sweeper_cpu_span_s": [a[0], b[0]], "sweeper_nice": int(nice),
-            "sweeper_clk_tck": k}, []
+    return _sweeper.sweeper_record(lines, sm.get("tm0_realtime_s"), sm.get("tm1_realtime_s"))
 
 
 def tracer_problems(path, summary):
