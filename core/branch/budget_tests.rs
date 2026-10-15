@@ -243,8 +243,14 @@ impl Outside {
 
 fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outside) -> Sample {
     let mut s = Sample::new();
-    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+    // Class (b): the window's OWN syscalls (`probe::end_owning`'s attribution: the kernel's count
+    // with no other thread running, or the per-thread counter's where it covered the window), or
+    // no count at all; the task's raw delta is kept apart for the fire-checks.
+    if let Some(d) = s1.attributed_syscalls {
         s.insert("syscalls", d);
+    }
+    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+        s.insert("syscalls_task", d);
     }
     if let (Some(a), Some(b)) = (s0.instructions, s1.instructions) {
         s.insert("instructions", delta(a, b));
@@ -372,7 +378,7 @@ fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: i
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let attributed = s1.foreign == 0 && s1.held_unattributed == s0.held_unattributed;
+    let attributed = s1.attributed_syscalls.is_some() && s1.held_unattributed == s0.held_unattributed;
     let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
 
     s.insert("writer_parked", u64::from(parked));
@@ -518,10 +524,10 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
         // Class (b): a recovery window is the opening thread's and the threads the open spawned;
         // another thread that ran inside it makes it unattributable (`probe::end`).
-        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.foreign == 0));
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some()));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled && s_all.foreign == 0));
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.attributed_syscalls.is_some()));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
@@ -1476,6 +1482,9 @@ fn run_instruments(cell: &str) -> String {
         sample_of(&s0, &s1, &Outside::zero(None), &Outside::zero(None))
     };
     put("fc_nothing", &window(&mut || {}));
+    let mut loaded = Sample::new();
+    loaded.insert("loaded", u64::from(probe::per_thread_counter_loaded()));
+    put("fc_shim_loaded", &loaded);
     // Class (b)'s attribution by thread, forced both ways. A helper thread that exists before the
     // window waits on an atomic, then makes 10 syscalls; the window must refuse its count.
     let helper = |declared: bool, closes: usize| {
@@ -2367,18 +2376,24 @@ fn the_budget_syscall_counts_are_attributed_by_thread() {
     }
     let c = cell("instruments");
     let row = |op: &str| c.ops.get(op).and_then(|s| s.first()).unwrap_or_else(|| panic!("{op}: no sample")).clone();
+    // Two modes: the per-thread counter (`feshim`) loaded, which attributes a window another thread
+    // ran in exactly (here the window's own 0, the helper's 10 excluded), or not, which refuses it.
+    let shim = row("fc_shim_loaded")["loaded"] == 1;
     let foreign = row("fc_foreign_window");
-    assert!(
-        foreign.get("syscalls").is_none() && foreign["foreign_threads"] >= 1,
-        "CLAIM: a window another thread made syscalls in kept a syscall count: {foreign:?}"
-    );
+    assert!(foreign["foreign_threads"] >= 1, "premise: the helper thread did not run inside the window: {foreign:?}");
+    if shim {
+        assert_eq!(foreign.get("syscalls").copied(), Some(0), "CLAIM: the per-thread counter charged the helper's syscalls to the window: {foreign:?}");
+    } else {
+        assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count: {foreign:?}");
+    }
     let spinner = row("fc_spinner_window");
     assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
     let spawned = row("fc_spawned_window");
     assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
     assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
     let hold = row("fc_foreign_hold");
-    assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread ran in was not marked unattributable: {hold:?}");
+    let want_unattributed = if shim { 0 } else { 1 };
+    assert_eq!(hold["held_unattributed"], want_unattributed, "CLAIM: a hold another thread ran in was attributed wrongly (counter loaded: {shim}): {hold:?}");
     assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
     let nothing = row("fc_nothing");
     assert_eq!((nothing["foreign_threads"], nothing["held_unattributed"]), (0, 0), "CLAIM: an empty window was not attributed: {nothing:?}");

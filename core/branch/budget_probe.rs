@@ -91,6 +91,11 @@ thread_local! {
     /// (`store_locked`), for the attribution by exclusion.
     static WINDOW_T0: std::cell::RefCell<[ThreadCpu; 48]> = const { std::cell::RefCell::new([ThreadCpu::EMPTY; 48]) };
     static HOLD_T0: std::cell::RefCell<[ThreadCpu; 48]> = const { std::cell::RefCell::new([ThreadCpu::EMPTY; 48]) };
+    /// The per-thread shim counts (`feshim`) of the threads in `WINDOW_T0` / `HOLD_T0`, and the
+    /// kernel's count read with them.
+    static WINDOW_C0: Cell<[u64; 48]> = const { Cell::new([0; 48]) };
+    static WINDOW_S0: Cell<Option<u64>> = const { Cell::new(None) };
+    static HOLD_C0: Cell<[u64; 48]> = const { Cell::new([0; 48]) };
     /// Store-mutex guards this thread holds now.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     /// The task's syscall count when this thread took its first store mutex (while armed).
@@ -412,6 +417,7 @@ pub(crate) fn store_locked() {
                 if let Ok(mut t) = t.try_borrow_mut() {
                     *t = [ThreadCpu::EMPTY; 48];
                     let _ = thread_table(&mut t[..]);
+                    HOLD_C0.with(|c| c.set(shim_counts(&t[..])));
                 }
             });
             HELD_SINCE.with(|s| s.set(unix_syscalls()));
@@ -445,9 +451,18 @@ pub(crate) fn store_unlocked() {
             if let Some(now) = unix_syscalls() {
                 let held = now.wrapping_sub(since) & u64::from(u32::MAX);
                 let mut t1 = [ThreadCpu::EMPTY; 48];
-                let attributed = thread_table(&mut t1).is_some()
-                    && HOLD_T0.with(|t0| t0.try_borrow().map(|t0| foreign_threads(&t0[..], &t1, &[], true) == 0).unwrap_or(false));
-                if attributed {
+                let listed = thread_table(&mut t1).is_some();
+                let c1 = shim_counts(&t1);
+                let attributed = if listed {
+                    HOLD_T0.with(|t0| {
+                        t0.try_borrow()
+                            .ok()
+                            .and_then(|t0| attribute(held, &t0[..], &HOLD_C0.with(|c| c.get()), &t1, &c1, &[], false).0)
+                    })
+                } else {
+                    None
+                };
+                if let Some(held) = attributed {
                     HELD_SYSCALLS.fetch_add(held, Relaxed);
                     bump(&T_HELD_SYSCALLS, held);
                 } else {
@@ -541,6 +556,9 @@ pub(crate) struct Snapshot {
     /// Threads other than this one, its spinners, and those the window owns, that ran inside the
     /// window (`end_owning`): when not 0, `syscalls` is `None`.
     pub(crate) foreign: u64,
+    /// The window's own syscalls (`attribute`), or `None` when they cannot be attributed: the only
+    /// syscall count a budget reads (the task's raw count is `syscalls`, for the fire-checks).
+    pub(crate) attributed_syscalls: Option<u64>,
     /// Syncs issued by a thread while it held a store mutex (the engine's own
     /// `store::syncs_under_store_mutex`: attributed to the holder, so exact with other threads
     /// running, unlike `held_syscalls`).
@@ -554,6 +572,7 @@ pub(crate) struct Snapshot {
 /// Take a snapshot to open a window (see [`Snapshot`]): every thread's CPU time is read just
 /// before the syscall count (class (b): `end_owning` attributes the window by exclusion).
 pub(crate) fn begin() -> Snapshot {
+    prime();
     let instructions = instructions();
     let mut s = user_counts();
     s.instructions = instructions;
@@ -561,9 +580,89 @@ pub(crate) fn begin() -> Snapshot {
         let mut t = t.borrow_mut();
         *t = [ThreadCpu::EMPTY; 48];
         let _ = thread_table(&mut t[..]);
+        WINDOW_C0.with(|c| c.set(shim_counts(&t[..])));
     });
     s.syscalls = unix_syscalls();
+    WINDOW_S0.with(|c| c.set(s.syscalls));
     s
+}
+
+/// The engine lane's per-thread syscall counter (`feshim`, artie frontier/fastest/lanes/engine/feshim:
+/// a DYLD_INSERT_LIBRARIES shim over libsystem_kernel's wrappers, derived from the wire lane's scshim),
+/// when the process was started with it: `feshim_syscalls_of(thread id)`. Looked up once; `prime`
+/// does it before any count is read, so the lookup's own cost is in no window.
+fn shim() -> Option<unsafe extern "C" fn(u64) -> u64> {
+    static SHIM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    #[cfg(target_vendor = "apple")]
+    let addr = *SHIM.get_or_init(|| {
+        // SAFETY: a symbol lookup by a NUL-terminated name in every loaded image.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"feshim_syscalls_of\0".as_ptr().cast()) as usize }
+    });
+    #[cfg(not(target_vendor = "apple"))]
+    let addr = *SHIM.get_or_init(|| 0);
+    // SAFETY: the shim exports `uint64_t feshim_syscalls_of(uint64_t)`.
+    (addr != 0).then(|| unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(u64) -> u64>(addr) })
+}
+
+/// Look the shim up now (see `shim`), outside any window.
+pub(crate) fn prime() {
+    let _ = shim();
+}
+
+/// Whether the per-thread counter is loaded (budgets that cannot be attributed by exclusion need it).
+pub(crate) fn per_thread_counter_loaded() -> bool {
+    shim().is_some()
+}
+
+/// The shim's count of each thread in `t`, in `t`'s order; all 0 without the shim.
+fn shim_counts(t: &[ThreadCpu]) -> [u64; 48] {
+    let mut out = [0; 48];
+    if let Some(f) = shim() {
+        for (o, x) in out.iter_mut().zip(t) {
+            if x.id != 0 {
+                // SAFETY: the shim's read-only lookup.
+                *o = unsafe { f(x.id) };
+            }
+        }
+    }
+    out
+}
+
+/// Class (b)'s attribution, one rule for windows and holds: `kernel` is the task's count over the
+/// span; `(t0, c0)` and `(t1, c1)` every thread's CPU time and shim count at its two ends. With no
+/// other thread running (`foreign` 0), the kernel count is the span's own. With some, the shim's
+/// per-thread deltas decide, and only where the shim saw every call the kernel counted (the sum of
+/// every listed thread's shim delta equals `kernel`): then the span's count is the shim delta of
+/// its own threads (`own`: the reading thread, plus, for a window, the threads it spawned and those
+/// named in `owned`). Otherwise `None`: unattributable, a refusal.
+fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], owned: &[&str], window: bool) -> (Option<u64>, u64) {
+    let foreign = foreign_threads(t0, t1, owned, !window);
+    if foreign == 0 {
+        return (Some(kernel), 0);
+    }
+    if shim().is_none() {
+        return (None, foreign);
+    }
+    let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
+    let owned_name = |t: &ThreadCpu| {
+        let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
+        owned.iter().any(|o| o.as_bytes() == &t.name[..end])
+    };
+    let (mut all, mut own) = (0u64, 0u64);
+    for (i, t) in t1.iter().enumerate().filter(|(_, t)| t.id != 0) {
+        let before = t0.iter().position(|x| x.id == t.id);
+        let d = c1[i].wrapping_sub(before.map_or(0, |j| c0[j]));
+        all = all.wrapping_add(d);
+        let mine = t.id == me || (window && (before.is_none() || owned_name(t)));
+        if mine {
+            own = own.wrapping_add(d);
+        }
+    }
+    if all == kernel {
+        (Some(own), foreign)
+    } else {
+        (None, foreign)
+    }
 }
 
 /// `end_owning` owning no other thread.
@@ -583,14 +682,18 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     let syscalls = unix_syscalls();
     let mut t1 = [ThreadCpu::EMPTY; 48];
     let listed = thread_table(&mut t1).is_some();
-    let foreign = if listed {
-        WINDOW_T0.with(|t0| foreign_threads(&t0.borrow()[..], &t1, owned, false))
-    } else {
-        1
+    let c1 = shim_counts(&t1);
+    let (attributed, foreign) = match (listed, WINDOW_S0.with(|c| c.get()), syscalls) {
+        (true, Some(s0), Some(s1)) => {
+            let kernel = s1.wrapping_sub(s0) & u64::from(u32::MAX);
+            WINDOW_T0.with(|t0| attribute(kernel, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, owned, true))
+        }
+        _ => (None, 1),
     };
     let mut s = user_counts();
     s.foreign = foreign;
-    s.syscalls = if foreign == 0 { syscalls } else { None };
+    s.syscalls = syscalls;
+    s.attributed_syscalls = attributed;
     s.instructions = instructions();
     // Diagnostics only (FE_BUDGET_FOREIGN_NAMES set): name the foreign threads on stderr, after every
     // count of the window is taken.
@@ -598,7 +701,7 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
         WINDOW_T0.with(|t0| {
             let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
             let ran: Vec<_> = ran_between(&t0.borrow()[..], &t1, me).into_iter().map(|(_, n, ns)| format!("{n}:{ns}ns")).collect();
-            eprintln!("budget window foreign (owned {owned:?}): {ran:?}");
+            eprintln!("budget window foreign (owned {owned:?}, attributed {attributed:?}): {ran:?}");
         });
     }
     s
@@ -687,6 +790,7 @@ fn user_counts() -> Snapshot {
         t_held_syscalls: get(&T_HELD_SYSCALLS),
         held_unattributed: HELD_UNATTRIBUTED.load(Relaxed),
         foreign: 0,
+        attributed_syscalls: None,
         held_syncs: crate::branch::store::syncs_under_store_mutex(),
         fsync: syncs.fsync,
         full_fsync: syncs.full_fsync,
