@@ -315,7 +315,8 @@ mod tests {
             .stack_size(480 << 10)
             .spawn(|| {
                 let size = stack_size();
-                assert!(size.is_some_and(|size| size < STACK_MARGIN), "premise: a known stack under 512 KiB, got {size:?}");
+                // The quarter-stack rule applies (in debug, the thread is under 512 KiB).
+                assert!(size.is_some_and(|size| size / 4 < STACK_MARGIN), "premise: a known stack under 4 x STACK_MARGIN, got {size:?}");
                 let outer = NestGuard::enter();
                 assert!(outer.is_ok(), "the outermost step was refused on a {size:?} B thread");
                 let levels = nest_until_refused(1);
@@ -359,7 +360,8 @@ mod tests {
                 let _outer = NestGuard::enter().unwrap();
                 let short = LEVEL_COST - (24 << 10);
                 assert!(!descend_to(short), "a nested step was admitted with {short} B left");
-                assert!(descend_to(LEVEL_COST + (24 << 10)), "premise: a nested step with one level's stack left runs");
+                let enough = margin() + (16 << 10);
+                assert!(descend_to(enough), "premise: a nested step with {enough} B left (margin and one level's slack) runs");
             })
             .unwrap()
             .join()

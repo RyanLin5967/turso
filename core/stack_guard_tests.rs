@@ -92,6 +92,16 @@ fn a_statement_too_deep_for_its_stack_is_refused_with_54001_not_a_crash() {
     let control = in_child(test, 8 * 1024, &sql);
     assert!(control.starts_with("ok [[Numeric(Integer(1))]]") || control.contains("Integer(1)"), "premise: {sql} on 8 MiB gave {control}");
     let small = in_child(test, 256, &sql);
+    // A debug build's frames need about 128-256 KiB a level (diag_stack_needed_per_nesting_level),
+    // so this is refused there; a release build's levels fit 256 KiB, and it answers. Either way it
+    // never kills the process (FLAGGED: the lead's red was measured in debug; release asserts the
+    // class, not the refusal).
+    #[cfg(not(debug_assertions))]
+    assert!(
+        small.starts_with("ok") || small.starts_with("err StackDepthLimitExceeded"),
+        "CLAIM: {sql} on a 256 KiB thread neither answered nor was refused with 54001: {small}"
+    );
+    #[cfg(debug_assertions)]
     assert!(
         small.starts_with("err StackDepthLimitExceeded"),
         "CLAIM: {sql} on a 256 KiB thread was not refused with 54001 (stack_depth_limit_exceeded): {small}"
