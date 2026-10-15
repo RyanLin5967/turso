@@ -3399,7 +3399,8 @@ type CkptJob = Box<dyn FnOnce() + Send>;
 /// The fuzzy checkpoints' persistent thread (`BranchStore::dispatch_flight`): runs each checkpoint
 /// handed to it in turn (only one is ever in flight), counting it finished even if it panicked, and
 /// exits when its channel closes (the store's `Drop`). Counted a persistent store thread for the
-/// budgets' probe, as the confirmation writer is.
+/// budgets' probe while it is parked, as the confirmation writer is, and a live one while it runs
+/// a checkpoint.
 struct CkptWorker {
     pid: u32,
     tx: std::sync::mpsc::Sender<CkptJob>,
@@ -3413,9 +3414,17 @@ impl CkptWorker {
         super::budget_probe::persistent_started();
         let spawned = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
             while let Ok(job) = rx.recv() {
+                // While it runs a checkpoint the worker is NOT parked: the budgets' probe counts it
+                // a live thread then, as it counted the per-checkpoint thread this replaced, so a
+                // measured window still waits out the checkpoint (budgets' ckpt cells: "at least
+                // three checkpoints installed (0)" at 4fbc6de65 without this).
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
                     tracing::warn!("a branch catalog checkpoint panicked");
                 }
+                #[cfg(test)]
+                super::budget_probe::persistent_started();
                 Self::finished(&jobs);
             }
             #[cfg(test)]
