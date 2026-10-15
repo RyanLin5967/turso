@@ -92,6 +92,12 @@ FAKE_TYPE=xfs
 ln -sfn "$T/dev/nvme2n1" "$T/dev/by-id-x"
 check "a moved device refuses the wipe" 'refuses2 fs_is_ours "$T/dev/by-id-x" "$REAL1" xfs u-1'
 
+# review 6 LOW 5: dev_unchanged also compares the node's own MAJ:MIN (st_rdev, t3lib.sh t3_rdev) with the recorded
+# dev=, so a node elsewhere carrying another disk's numbers is not taken for the drive. The fake node files here are
+# regular files, so t3_rdev is redefined: it answers FAKE_RDEV, nvme5n1's 259:5 unless a case sets another. TEST EDIT,
+# flagged: a new fixture line the MED 3 cases below now depend on; their expectations are unchanged
+t3_rdev() { echo "${FAKE_RDEV:-259:5}"; }
+FAKE_RDEV=""
 # review 5 MED 3: dev_unmoved compares path text, a tautology for a plain /dev/nvmeXnY, so the drive itself is what
 # preflight records (device-id.txt) and every mkfs, mount and wipefs re-reads: wwid, MAJ:MIN, model, serial, firmware
 ident() { # ident NAME WWID DEV MODEL SERIAL FW: a fake NVMe namespace (wwid on the block, the rest on its controller)
@@ -127,6 +133,18 @@ check "MED 3: an empty identity record refuses" \
   'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id-empty.txt"'
 check "MED 3: a moved path refuses before the identity is read" \
   'refuses2 dev_unchanged "$T/dev/by-id-x" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt"'
+FAKE_RDEV=259:9
+check "LOW 5: the node's own MAJ:MIN (259:9) is not the recorded dev=259:5: refuses (rc 2), naming dev=" \
+  'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" && grep -q "dev=259:5" "$T/out.txt"'
+FAKE_RDEV=""
+check "LOW 5: production t3_rdev reads a real node's MAJ:MIN in decimal (/dev/null is 1:3)" \
+  '( source "$HERE/t3lib.sh"; [ "$(t3_rdev /dev/null)" = 1:3 ] )'
+# review 6 LOW 21: vpd_pg80's 4-byte header (its length byte is printable for a 32-126 byte serial) is not the serial
+mkdir -p "$T/sys/block/sdd/device"; echo 8:48 > "$T/sys/block/sdd/dev"; echo "naa.5000c501" > "$T/sys/block/sdd/device/wwid"
+echo "ST8000NM" > "$T/sys/block/sdd/device/model"; echo "SN05" > "$T/sys/block/sdd/device/rev"
+printf '\000\200\000\050ZC20ABC1%32s' "" > "$T/sys/block/sdd/device/vpd_pg80"
+check "LOW 21: a vpd_pg80 with a printable length byte (0x28, 40 bytes) gives the serial without it" \
+  '[ "$(dev_identity "$T/sys" sdd | grep "^serial=")" = "serial=ZC20ABC1" ]'
 
 # review 6 MED 1: the device branch is one t3lib function each for make and wipe, taking every input as a parameter,
 # with the root commands as hooks (t3_pin, t3_devguard, t3_mkfs, t3_mount, t3_mounted, t3_wipe; t3_blkid above) that
