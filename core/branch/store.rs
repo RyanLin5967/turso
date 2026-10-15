@@ -4443,8 +4443,9 @@ impl BranchStore {
     /// Free what an operation that logged its Release through `log_all` freed (an expiry pass, a
     /// due reap, a close's collection of a branch released while a connection was open): held
     /// until its Release is durable in the free class, as an early-released Release's frees are
-    /// (engine review 8 #8). In D1 and D2 `log_all`'s flush already made it durable, and an
-    /// unraised D0 store frees what is written, so those free at once as before. Mutant
+    /// (engine review 8 #8). In D2, and in D1 over nothing stronger, `log_all`'s flush already made
+    /// it durable, and an unraised D0 store frees what is written, so those free at once as before;
+    /// a D1 store over a D2 log holds them for a full flush (engine review 20 MED 5). Mutant
     /// `expiry_frees_at_once` (test builds only): at once on every path.
     fn free_after_log(&self, inner: &mut StoreInner, freed: Vec<Slot>) {
         if fe_mutant("expiry_frees_at_once") {
@@ -8981,7 +8982,21 @@ impl StoreInner {
             self.journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
         };
         let held = rewrite.max(base);
-        if !self.sync.syncs() && held.syncs() && !fe_mutant("d0_frees_at_written") {
+        // Not only in D0 (engine review 20 MED 5, RULED (a) at DECISIONS afd0e67f81): whenever the
+        // held class is stronger than the store's. A D1 process over a log a D2 run wrote freed what
+        // its own Release, only fsynced, made durable; on Apple a power cut can lose that Release
+        // while the D2 records naming the slot survive, so a reused slot came back under a
+        // D2-acknowledged branch. The FullFsync upgrade those frees then owe is led by the
+        // background writer, off every acknowledgement path (`mature`, `lead_upgrade`): one
+        // F_FULLFSYNC per `HOLD_BOUND` frees in a D1 process over a D2 log (or under a fullfsync
+        // trunk), none otherwise. Mutant `free_hold_d0_only` (test builds only): only in D0, as
+        // before.
+        let holds = if fe_mutant("free_hold_d0_only") {
+            !self.sync.syncs() && held.syncs()
+        } else {
+            held > self.sync
+        };
+        if holds && !fe_mutant("d0_frees_at_written") {
             held
         } else {
             self.sync

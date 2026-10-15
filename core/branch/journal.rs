@@ -1046,7 +1046,9 @@ impl Scanned {
                 }
                 // Sticky for this open (engine review 13 MED 4): those records stay durable in a
                 // snapshot or the catalog after that rewrite, so a free a later Release makes is
-                // held until a sync covers the Release (`StoreInner::free_class`).
+                // held until a sync in this class covers the Release, whenever it is stronger than
+                // the store's own: in D0, and in D1 over a D2 log (`StoreInner::free_class`; engine
+                // review 20 MED 5, which corrected 3f0dadba0's claim that D1 held already).
                 if class.syncs() {
                     journal.synced_base = journal.synced_base.max(class);
                 }
