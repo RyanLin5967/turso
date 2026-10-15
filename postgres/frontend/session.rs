@@ -177,33 +177,36 @@ fn setting_ms(text: &str) -> Option<u64> {
 
 impl PgConnectionInner {
     /// Store the settings' effective values where the server reads them, lock-free.
-    fn publish(&self, gucs: Gucs) {
+    fn publish(&self, gucs: &Gucs) {
         use std::sync::atomic::Ordering::Relaxed;
         self.lock_timeout_ms.store(gucs.lock_timeout_ms, Relaxed);
         self.statement_timeout_ms.store(gucs.statement_timeout_ms, Relaxed);
         self.min_messages.store(gucs.min_messages, Relaxed);
+        self.conn.set_foreign_keys_enabled(gucs.foreign_keys);
+        let mut state = self.session_state.lock();
+        if state.search_path != gucs.search_path {
+            state.search_path.clone_from(&gucs.search_path);
+            self.search_path_stamp
+                .store(SEARCH_PATH_ASSIGNMENTS.fetch_add(1, Relaxed), Relaxed);
+        }
     }
 
-    fn set_search_path(&self, path: Vec<String>) {
-        let mut state = self.session_state.lock();
-        state.search_path = path;
-        use std::sync::atomic::Ordering::Relaxed;
-        self.search_path_stamp
-            .store(SEARCH_PATH_ASSIGNMENTS.fetch_add(1, Relaxed), Relaxed);
-    }
 }
 
 #[derive(Default)]
 struct SessionState {
+    /// Effective search-path cache for planning; all assignments come from GucScope::effective.
     search_path: Vec<String>,
     /// The settings this server acts on, scoped as PostgreSQL scopes a GUC (see [`GucScope`]).
     gucs: GucScope,
 }
 
-/// The values of the settings this server acts on: lock_timeout and statement_timeout in
-/// milliseconds (0 none), client_min_messages as its rank ([`message_rank`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Every mutable session setting. GucScope snapshots these values together; publish installs
+/// their effective values in the engine and in the server's read caches.
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct Gucs {
+    search_path: Vec<String>,
+    foreign_keys: bool,
     lock_timeout_ms: u64,
     statement_timeout_ms: u64,
     min_messages: u8,
@@ -212,6 +215,8 @@ struct Gucs {
 impl Default for Gucs {
     fn default() -> Self {
         Self {
+            search_path: Vec::new(),
+            foreign_keys: true,
             lock_timeout_ms: 0,
             statement_timeout_ms: 0,
             min_messages: 7,
@@ -220,8 +225,10 @@ impl Default for Gucs {
 }
 
 /// A SET LOCAL's values, each until its block ends.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 struct Locals {
+    search_path: Option<Vec<String>>,
+    foreign_keys: Option<bool>,
     lock_timeout_ms: Option<u64>,
     statement_timeout_ms: Option<u64>,
     min_messages: Option<u8>,
@@ -248,6 +255,13 @@ struct GucScope {
 impl GucScope {
     fn effective(&self) -> Gucs {
         Gucs {
+            search_path: self
+                .local
+                .search_path
+                .as_ref()
+                .unwrap_or(&self.session.search_path)
+                .clone(),
+            foreign_keys: self.local.foreign_keys.unwrap_or(self.session.foreign_keys),
             lock_timeout_ms: self.local.lock_timeout_ms.unwrap_or(self.session.lock_timeout_ms),
             statement_timeout_ms: self
                 .local
@@ -506,19 +520,15 @@ impl PgConnection {
         if Arc::ptr_eq(&self.inner, &from.inner) {
             return;
         }
-        let (path, gucs) = {
-            let state = from.inner.session_state.lock();
-            (state.search_path.clone(), state.gucs.effective())
-        };
-        self.inner.set_search_path(path);
+        let gucs = from.inner.session_state.lock().gucs.effective();
         {
             let mut state = self.inner.session_state.lock();
             state.gucs = GucScope {
-                session: gucs,
+                session: gucs.clone(),
                 ..GucScope::default()
             };
         }
-        self.inner.publish(gucs);
+        self.inner.publish(&gucs);
     }
 
     /// A transaction-control event of the session's ([`TxEvent`]), for the acted-on settings'
@@ -529,7 +539,7 @@ impl PgConnection {
         let gucs = &mut state.gucs;
         match event {
             TxEvent::Ended { committed } => {
-                if let (false, Some(start)) = (committed, gucs.block_start) {
+                if let (false, Some(start)) = (committed, gucs.block_start.take()) {
                     gucs.session = start;
                 }
                 gucs.local = Locals::default();
@@ -542,9 +552,10 @@ impl PgConnection {
                 };
                 if event == TxEvent::Savepoint {
                     if gucs.block_start.is_none() {
-                        gucs.block_start = Some(gucs.session);
+                        gucs.block_start = Some(gucs.session.clone());
                     }
-                    gucs.savepoints.push((name, gucs.session, gucs.local));
+                    gucs.savepoints
+                        .push((name, gucs.session.clone(), gucs.local.clone()));
                 } else if let Some(at) = gucs.savepoints.iter().rposition(|(n, ..)| *n == name) {
                     if event == TxEvent::RollbackTo {
                         let (_, session, local) = gucs.savepoints[at].clone();
@@ -559,7 +570,7 @@ impl PgConnection {
         }
         let effective = gucs.effective();
         drop(state);
-        self.inner.publish(effective);
+        self.inner.publish(&effective);
     }
 
     /// The warnings the last statements raised for the client, as (SQLSTATE, message).
@@ -1353,54 +1364,26 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 /// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
-    // The acted-on settings are scoped as PostgreSQL scopes them (GucScope); SET LOCAL outside a
-    // block warns and changes nothing, as PostgreSQL 18.6 answers it (recorded,
-    // pg18-settings.out). Their values are read below.
-    let scoped = matches!(
-        name.as_str(),
-        "lock_timeout" | "statement_timeout" | "client_min_messages"
-    );
     let in_block = !pg_conn.conn.get_auto_commit();
-    if scoped && set_stmt.is_local && !in_block {
-        pg_conn.warnings.lock().push((
-            "25P01",
-            "SET LOCAL can only be used in transaction blocks".to_string(),
-        ));
-        return noop_statement(&pg_conn.conn);
-    }
+    // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
     let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+        if set_stmt.is_local && !in_block {
+            pg_conn.warnings.lock().push((
+                "25P01",
+                "SET LOCAL can only be used in transaction blocks".to_string(),
+            ));
+            return;
+        }
         let mut state = pg_conn.session_state.lock();
         let gucs = &mut state.gucs;
         if in_block && gucs.block_start.is_none() {
-            gucs.block_start = Some(gucs.session);
+            gucs.block_start = Some(gucs.session.clone());
         }
         apply(&mut gucs.session, &mut gucs.local, set_stmt.is_local);
         let effective = gucs.effective();
         drop(state);
-        pg_conn.publish(effective);
+        pg_conn.publish(&effective);
     };
-    // A ROLLBACK cannot undo these here: the search path and the engine's foreign_keys outlive the
-    // block whatever ends it, so `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off, and a
-    // rolled-back SET search_path sent later unqualified writes to another schema's table. So
-    // they are refused where PostgreSQL would undo them: in a block the client opened, and as SET
-    // LOCAL (wire review 16 item 18; review 17 folded search_path into it). An implicit block's
-    // SET (`SET search_path TO s; SELECT ..`) acts, as before.
-    if matches!(name.as_str(), "search_path" | "foreign_keys") {
-        if set_stmt.is_local {
-            return Err(LimboError::ParseError(format!(
-                "SET LOCAL {name} is not supported: this server cannot scope it to the block"
-            )));
-        }
-        if pg_conn
-            .explicit_block
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(LimboError::ParseError(format!(
-                "SET {name} is not supported inside a transaction block: a ROLLBACK could not \
-                 undo it here; set it before BEGIN"
-            )));
-        }
-    }
     if name == "search_path" {
         let path = set_stmt
             .values
@@ -1408,7 +1391,14 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             .map(|value| value.as_search_path_name().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
+        assign(&|session, local, is_local| {
+            if is_local {
+                local.search_path = Some(path.clone());
+            } else {
+                session.search_path.clone_from(&path);
+                local.search_path = None;
+            }
+        });
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
@@ -1422,11 +1412,6 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         return Err(LimboError::InvalidArgument(format!(
             "SET {name} takes only one argument"
         )));
-    }
-    if name == "foreign_keys" {
-        return pg_conn
-            .conn
-            .prepare(format!("PRAGMA foreign_keys = {}", value.to_sql_string()));
     }
     let value_text = |value: &PgSetValue| match value {
         PgSetValue::Identifier(v)
@@ -1458,6 +1443,20 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         )))
     };
     let accepted = match name.as_str() {
+        "foreign_keys" => {
+            let Some(on) = pg_bool(&lower) else {
+                return invalid();
+            };
+            assign(&|session, local, is_local| {
+                if is_local {
+                    local.foreign_keys = Some(on);
+                } else {
+                    session.foreign_keys = on;
+                    local.foreign_keys = None;
+                }
+            });
+            true
+        }
         // These change answers PostgreSQL gives, so they act, or are refused, rather than being
         // accepted as no-ops (wire review 16 item 12): lock_timeout is the session's lock wait
         // (0 the server's), client_min_messages filters the messages sent, and the two timeouts
