@@ -227,11 +227,12 @@ def run_parity(d, system, adapter_rc=None):
             j = json.load(open(os.path.join(d, "result", "summary.json")))
         except (OSError, ValueError):
             j = {}
-        exc, exc_bad = exception_deltas(j)
+        exc, exc_bad, exc_absent = exception_deltas(j)
         j = j if isinstance(j, dict) else {}  # a non-object summary.json is refused above, never read as one
         cpu, win, sw = ours_sweeper(d, adapter_rc)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
                 "exception_counter_deltas": exc, "exception_counter_problems": exc_bad,
+                "exception_counters_absent": exc_absent,
                 "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
                 "sweeper_problems": sw}
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
@@ -290,26 +291,27 @@ RUNNER_MODE, RUNNER_PHASES = "phases", len(PHASES)
 
 
 def exception_deltas(j):
-    """({window: {counter: after - before}} or None, the refusals) from ours' result/summary.json: every window carries
+    """({window: {counter: after - before}} or None, the refusals, absent) from ours' result/summary.json: every window carries
     exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
     deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED). The windows
     listed must be exactly, in order, the ones t3run asked for (RUNNER_MODE with RUNNER_PHASES phases, which the run's
     own mode and phases_run must also say: a run's claim alone never narrows the coverage), each named, and no counter
     may fall between one window's close and the next one's open. A rise between windows is not refused: the ruling
     credits a cell on zero INSIDE its windows, and the gaps hold unmeasured work (the branch connections closing
-    before the delete window opens)."""
+    before the delete window opens). ABSENT is true when the record is not there at all (no windows, or a window
+    with no exception_counters): what fastest_profile owes until it emits them (Rust, HELD), set LOUD-OWED."""
     if not isinstance(j, dict):
-        return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"]
+        return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"], False
     wins = j.get("windows")
     if not isinstance(wins, list) or not wins:
         return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
-                      "(fastest_profile must record them per window: Rust, HELD)"]
+                      "(fastest_profile must record them per window: Rust, HELD)"], True
     pr = j.get("phases_run")
     if j.get("mode") != RUNNER_MODE or type(pr) is not int or pr != RUNNER_PHASES:
         return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} are not what t3run asked for "
-                      f"({RUNNER_MODE!r}, {RUNNER_PHASES}), so the exception counters' coverage cannot be judged"]
+                      f"({RUNNER_MODE!r}, {RUNNER_PHASES}), so the exception counters' coverage cannot be judged"], False
     want = list(PHASES[:RUNNER_PHASES])
-    out, bad, prev = {}, [], None
+    out, bad, prev, absent = {}, [], None, False
     names = [w.get("window") if isinstance(w, dict) else None for w in wins]
     if names != want:
         bad += [f"window {x}: measured (mode {j.get('mode')}) but not listed" for x in want if x not in names]
@@ -327,7 +329,7 @@ def exception_deltas(j):
         if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
             bad.append(f"window {name}: no exception_counters {{before, after}} (the engine's branch exception "
                        "counters; fastest_profile must record them: Rust, HELD)")
-            prev = None
+            prev, absent = None, True
             continue
         d = {}
         for k in EXCEPTION_COUNTERS:
@@ -345,7 +347,7 @@ def exception_deltas(j):
         if name in out:
             bad.append(f"window {name}: named twice")
         out[name] = d
-    return (None, bad) if bad else (out, [])
+    return (None, bad, absent) if bad else (out, [], False)
 
 
 COMPETITORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "competitors")
@@ -642,6 +644,12 @@ def summarize(out, sha, dry, manifest):
                                     "included), not its measured windows as the competitors' does: fastest_profile "
                                     "must stamp those windows' realtime bounds (Rust, HELD) before an "
                                     "ours-vs-competitor timed ratio credits (MED 12 ruling)")
+    # the lead's ruling on f2abbc8cb: until fastest_profile emits the counters every ours run is refused above, and the
+    # gap is owed here, beside the window stamps, from the record's absence (a structural flag, not the refusal text)
+    if any(r.get("exception_counters_absent") for r in runs if r["measured"]):
+        summary["loud_owed"].append("fastest_profile must emit exception_counters {before, after} in every window "
+                                    "(Database::branch_exception_counters() read at each window's open and close; "
+                                    "Rust, HELD): until then every ours run is refused (routing ruling 05:16:51Z)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
@@ -1176,6 +1184,14 @@ def self_test():
          lambda s: any("header_raise_exclusive" in x for x in s["parity_refusals"])),
         ("exception counters: ours whose summary.json has no windows fails", {"ours_counters": "nowindows"}, False,
          lambda s: any("windows" in x for x in s["parity_refusals"])),
+        # the lead's ruling on f2abbc8cb (fail closed until fastest_profile emits the counters; Rust HELD): the gap is
+        # LOUD-OWED in summary.json next to the sweeper window stamps, and only while some run lacks the record
+        ("exception counters: no windows puts the fastest_profile emission on loud_owed", {"ours_counters": "nowindows"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a window without exception_counters puts it on loud_owed", {"ours_counters": "missing"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a complete record owes nothing", {}, True,
+         lambda s: not any("exception_counters" in x for x in s.get("loud_owed") or [])),
         ("exception counters: a competitor run (not the turso engine) carries none and is not refused for it",
          {"cell": "comp"}, True, lambda s: s["runs"][0].get("exception_counter_deltas") is None
          and s.get("uncredited_cells") == []),
