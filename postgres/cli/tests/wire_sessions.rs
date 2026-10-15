@@ -3433,6 +3433,78 @@ fn a_long_statement_stops_on_cancel_and_on_statement_timeout() {
     a.q("SELECT 1").ok("the session after the timeout");
 }
 
+/// A statement waiting on a lock another session holds is stopped by its statement_timeout and by
+/// a cancel, as one that is running is: 57014 within the timeout, not 55P03 once the server's lock
+/// wait (60 s) is spent. An INSERT stopped on both before; a CHECKPOINT, whose wait is the
+/// server's own (Session::waiting) with no statement stepping, waited until the holder committed
+/// whatever its timeout, and ignored a cancel (ultrareview of fastest-wire, finding 9).
+#[test]
+fn a_statement_waiting_on_a_lock_stops_on_statement_timeout_and_on_cancel() {
+    let dir = Scratch::new("cancelwait");
+    let server = Server::start(&dir.db(), &[]);
+    let mut holder = server.connect();
+    holder.q("CREATE TABLE t(id INTEGER)").ok("create");
+    holder.q("BEGIN").ok("begin");
+    holder.q("INSERT INTO t VALUES (1)").ok("the held write");
+    let mut b = server.connect();
+    b.s.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
+    b.q("SET statement_timeout = 500").ok("statement_timeout");
+    let started = Instant::now();
+    let e = b.q("INSERT INTO t VALUES (2)").err("statement_timeout during a lock wait");
+    assert_eq!(
+        e.code,
+        "57014",
+        "statement_timeout during a lock wait: {} after {:?}",
+        e.message,
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "timeout took {:?}", started.elapsed());
+    b.q("SET statement_timeout = 0").ok("statement_timeout off");
+    let key = b.key.clone().expect("BackendKeyData at startup");
+    for sql in ["INSERT INTO t VALUES (3)", "CHECKPOINT"] {
+        let mut q = vec![b'Q'];
+        q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+        q.extend_from_slice(sql.as_bytes());
+        q.push(0);
+        let started = Instant::now();
+        b.s.write_all(&q).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let mut cancel = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+        m.extend_from_slice(&80877102i32.to_be_bytes());
+        m.extend_from_slice(&key);
+        cancel.write_all(&m).unwrap();
+        drop(cancel);
+        let r = b.read_reply();
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("57014"),
+            "cancel of {sql} during a lock wait: {:?} after {:?}",
+            r.error,
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel of {sql} took {:?}",
+            started.elapsed()
+        );
+    }
+    b.q("SET statement_timeout = 500").ok("statement_timeout");
+    let started = Instant::now();
+    let e = b.q("CHECKPOINT").err("statement_timeout during CHECKPOINT's lock wait");
+    assert_eq!(
+        e.code,
+        "57014",
+        "statement_timeout during CHECKPOINT's lock wait: {} after {:?}",
+        e.message,
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "timeout took {:?}", started.elapsed());
+    b.q("SET statement_timeout = 0").ok("statement_timeout off");
+    holder.q("COMMIT").ok("commit");
+    b.q("INSERT INTO t VALUES (4)").ok("the lock is free again");
+}
+
 /// A CancelRequest stops a statement only when it names the session's process id AND its secret
 /// key: one with a wrong secret, or with the right process id and a wrong secret, or another
 /// session's key, cancels nothing (the statement ran on until the right key came, 1.5 s later);
