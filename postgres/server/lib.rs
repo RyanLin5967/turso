@@ -5099,6 +5099,12 @@ fn is_create_table_as(upper: &str) -> bool {
 #[cfg(test)]
 mod crash_batch_tests;
 
+/// This crate's tests count allocations per thread (the per-statement allocation budget's
+/// in-process tests).
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: counters::CountingAlloc = counters::CountingAlloc;
+
 #[cfg(test)]
 mod tests {
     use super::*;

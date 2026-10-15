@@ -95,19 +95,36 @@ pub struct CountingAlloc;
 
 static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    /// The allocations served to this thread (a const-initialized Cell: reading it allocates
+    /// nothing, and it has no destructor to run while the thread ends).
+    static THREAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count() {
+    ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = THREAD_ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+}
+
+/// The allocations [`CountingAlloc`] has served to this thread (0 when it is not the allocator):
+/// for an in-process test of one statement's allocations, which other threads cannot disturb.
+pub fn thread_allocations() -> u64 {
+    THREAD_ALLOCATIONS.try_with(|n| n.get()).unwrap_or(0)
+}
+
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count();
         unsafe { std::alloc::System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count();
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count();
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
 
