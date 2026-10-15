@@ -827,11 +827,28 @@ b1_main() {
   # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
   # MED 12 plant: a 1e6-row parent (about 110 MB of SQL) built under a 300 MB virtual-memory limit must succeed, since
   # the stream is piped and never held (the old feed held it about three times over, which this limit refuses)
-  local mp="$ROOT/plant-1e6.noindex.db" mrc=0
-  ( ulimit -v 300000; exec python3 -B "$HERE/fixture.py" sqlite "$mp" --rows 1000000 --age 0 --sqlite3 "$SQ3" ) \
+  local mp="$ROOT/plant-1e6.noindex.db" mrc=0 mem_kb=300000
+  ( ulimit -v "$mem_kb"; exec python3 -B "$HERE/fixture.py" sqlite "$mp" --rows 1000000 --age 0 --sqlite3 "$SQ3" ) \
     >"$RAW/plant-stream-1e6.txt" 2>&1 || mrc=$?
-  expect "stream plant: a 1e6-row SQLite parent under ulimit -v 300000 (rc)" "$mrc" 0
+  expect "stream plant: a 1e6-row SQLite parent under ulimit -v $mem_kb (rc)" "$mrc" 0
   rm -f "$mp" "$mp-wal" "$mp-shm"
+  # Comp review 1 MED 11: the limit must refuse a feed that holds the SQL just ONCE, or the plant above cannot tell a
+  # streamed feed from a held one. The mutant builds the same 1e6-row stream into one bytearray (one copy, no list of
+  # lines beside it) before writing it out; under the same limit it must die of MemoryError (the reason is checked,
+  # so a feed that fails for another cause is not counted as the limit firing)
+  local hrc=0
+  ( ulimit -v "$mem_kb"; exec python3 -B -c 'import sys
+sys.path.insert(0, sys.argv[1])
+import gen_seed
+held = bytearray()
+for ln in gen_seed.sql_lines(int(sys.argv[2])):
+    held += (ln + "\n").encode()
+sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1e6.err" || hrc=$?
+  if [ "$hrc" != 0 ] && grep -q MemoryError "$RAW/plant-held-1e6.err"; then
+    pass "stream plant control: one held copy of the 1e6-row SQL under ulimit -v $mem_kb dies of MemoryError (rc $hrc)"
+  else
+    fail "stream plant control: one held copy of the 1e6-row SQL under ulimit -v $mem_kb: rc $hrc, $(tail -1 "$RAW/plant-held-1e6.err") (want MemoryError: the limit cannot tell a held feed from a streamed one)"
+  fi
   python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
     tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
   # MED 3: the parent as SQLite reads it back (count, sum, row hash), which fixture.py write below compares with what
