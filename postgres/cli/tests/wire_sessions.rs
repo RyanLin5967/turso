@@ -2630,6 +2630,27 @@ fn floats_are_written_as_postgresql_writes_them() {
     );
 }
 
+/// A string literal cast to a float type is read as PostgreSQL's float8in / float4in reads it
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-infcast.out): `'Infinity'`, `'-Infinity'`,
+/// `'inf'`, `'+INF'` and `' infinity '` are the infinities, and `'infinityx'` is 22P02. The engine
+/// cast them by affinity, to 0, so `'Infinity'::float8 > 1e308` was false. NaN, which the engine
+/// cannot hold, is refused 0A000 (PostgreSQL has it: a divergence).
+#[test]
+fn a_float_literal_cast_reads_infinity() {
+    let dir = Scratch::new("infcast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a
+        .q("SELECT 'Infinity'::float8 > 1e308, '-Infinity'::float8 < -1e308, 'inf'::float8 > 1e308, \
+            '+INF'::float8 > 1e308, ' infinity '::float8 > 1e308, 'Infinity'::float4 > 1e38")
+        .ok("infinities");
+    assert_eq!(r.rows, vec![vec![Some("t".to_string()); 6]]);
+    let sql = "SELECT 'infinityx'::float8";
+    assert_eq!(a.q(sql).err(sql).code, "22P02", "{sql}");
+    let sql = "SELECT 'NaN'::float8";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+}
+
 /// KNOWN RED (known-red.txt; ruling asked): PostgreSQL 18.6 writes the infinities `Infinity` and
 /// `-Infinity` and a negative zero `-0` (recorded, artie raw loud-20261015/pg18-diff/pg18-inf.out);
 /// the vendored pgwire writes `inf`, `-inf` and `0`, and its own unit test (test_format) asserts
