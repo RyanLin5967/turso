@@ -311,12 +311,13 @@ fn spin_settled(base: Option<u64>, deadline: std::time::Duration) -> bool {
 }
 
 /// Wait out every background thread before a window: the checkpoint threads joined, then settled
-/// (a joined thread can still be exiting). `false` if it never settled.
+/// (a joined thread can still be exiting), and the confirmation writer parked with nothing to do
+/// (`writer_settled`). `false` if it never settled.
 fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
     db.branch_checkpoint_wait();
     let t = std::time::Instant::now();
     loop {
-        if settled(base) {
+        if settled(base) && writer_settled(db, std::time::Duration::ZERO) {
             return true;
         }
         if t.elapsed() > std::time::Duration::from_secs(5) {
@@ -338,7 +339,7 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     let s0 = probe::begin();
     let r = f();
     let left = probe::threads() != base;
-    let synced = absorb_confirm(&s0);
+    let (synced, parked) = absorb_confirm(db, &s0);
     let back = spin_settled(base, std::time::Duration::from_secs(30));
     // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
@@ -352,7 +353,8 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && absorbed && (left || s["allocs_process"] == s["allocs"]);
+    let quiet = settled && back && parked && absorbed && (left || s["allocs_process"] == s["allocs"]);
+    s.insert("writer_parked", u64::from(parked));
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
     (r, s)
@@ -378,19 +380,41 @@ fn hold_word(held: bool) {
 
 /// The confirmation word (review 6 #1): after a flight whose sync proved stable storage, the
 /// store's confirmation thread writes the word once the group has been idle `confirm_quiet()`
-/// (5 ms), on its own thread. If the work since `s0` synced, wait that out (with no syscall), so
-/// the window that caused the write counts it, as it counted the inline write before review 6 #1
-/// (base10). Whether it synced.
-fn absorb_confirm(s0: &probe::Snapshot) -> bool {
+/// (5 ms), on its own thread. Wait until that writer is parked with nothing left to do
+/// (`writer_settled`, within 1 s, with no syscall), so the window that caused the write counts it,
+/// as it counted the inline write before review 6 #1 (base10). Review 2 L3: this replaces a fixed
+/// 25 ms spin, and a thread state that read "waiting" mid-pwrite. Whether the work since `s0`
+/// synced, and whether the writer settled.
+fn absorb_confirm(db: &Arc<Database>, s0: &probe::Snapshot) -> (bool, bool) {
     let now = sync_counts();
     let synced = now.full_fsync != s0.full_fsync || now.fsync != s0.fsync;
-    if synced && !WORD_HELD.load(std::sync::atomic::Ordering::Acquire) {
-        let t = std::time::Instant::now();
-        while t.elapsed() < std::time::Duration::from_millis(25) {
-            std::hint::spin_loop();
-        }
+    (synced, writer_settled(db, std::time::Duration::from_secs(1)))
+}
+
+/// Review 2 L3: spin, with no syscall (the park state is read with a try-lock), until `db`'s
+/// confirmation writer is parked in one of its waits with nothing left to do, or the deadline;
+/// whether it got there. Held (`hold_word`), parked is enough: the word waits out a quiet period no
+/// run reaches. Unheld, no proved word may be pending either: the writer writes it after its quiet
+/// period. With no persistent thread live in the process (`probe::persistent_live`), there is no
+/// writer to wait for. BLIND SPOT: with another store's writer live and none of `db`'s own, this
+/// waits out its deadline and the window reads not quiet (a refusal, not a false pass).
+fn writer_settled(db: &Arc<Database>, deadline: std::time::Duration) -> bool {
+    if probe::persistent_live() <= 0 {
+        return true;
     }
-    synced
+    let held = WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
+    let t = std::time::Instant::now();
+    loop {
+        if let Some((parked, pending, _)) = db.branches.confirm_park_for_test() {
+            if parked && (held || !pending) {
+                return true;
+            }
+        }
+        if t.elapsed() >= deadline {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
 }
 
 fn line(out: &mut String, cell: &str, op: &str, i: u64, s: &Sample) {
@@ -455,8 +479,8 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         built.incarnation = opened.incarnation;
         // The background threads are waited out by spinning (no syscall), not by joining them: a
         // join that blocks issues syscalls of its own, as many as the timing makes.
-        absorb_confirm(&s0);
-        let settled = spin_settled(base, std::time::Duration::from_secs(30));
+        let (_, parked) = absorb_confirm(&opened, &s0);
+        let settled = parked && spin_settled(base, std::time::Duration::from_secs(30));
         let s_all = probe::end();
         opened.branch_wait_name_filter();
         let settled = settled && quiesce(&opened, base);
@@ -1546,6 +1570,33 @@ fn run_instruments(cell: &str) -> String {
             probe::store_unlocked();
         }),
     );
+    // Review 2 L3: the confirmation writer's park state, forced both ways. Unheld, with the pending
+    // word taken away first (a checkpoint, as the confirm arm does: a landing on a pending word wakes
+    // no one), a create's word sends the writer to its own test hold mid-write
+    // (`HOLD_CONFIRM_WRITE`): there it is not parked, and `writer_settled` must say so; released, it
+    // writes the word and parks with nothing pending.
+    hold_word(false);
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    db.branches.confirm_hold_for_test(super::store::HOLD_CONFIRM_WRITE);
+    trunk.create_branch("fc-park").unwrap();
+    let t = std::time::Instant::now();
+    while db.branches.confirm_held_for_test() != (super::store::HOLD_CONFIRM_WRITE | super::store::HOLD_ARRIVED) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the confirmation writer never reached its write");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mid_write = writer_settled(&db, std::time::Duration::from_millis(50));
+    db.branches.confirm_hold_for_test(0);
+    let after = writer_settled(&db, std::time::Duration::from_secs(5));
+    hold_word(true);
+    put(
+        "fc_writer_park",
+        &Sample::from([
+            ("live", u64::try_from(probe::persistent_live()).unwrap_or(0)),
+            ("settled_mid_write", u64::from(mid_write)),
+            ("settled_after", u64::from(after)),
+        ]),
+    );
     out
 }
 
@@ -2024,6 +2075,9 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_sql_rollback", "rolled_back"), 1, "premise: the ROLLBACK undid the INSERT");
     assert_eq!(get("fc_sql_held_prepare", "prepares"), 2, "two statements prepared");
     assert_eq!(get("fc_sql_held_prepare", "held_prepares"), 1, "one statement prepared under a store mutex, one outside (review 2 L6)");
+    assert!(get("fc_writer_park", "live") >= 1, "premise: the instruments store runs a confirmation writer");
+    assert_eq!(get("fc_writer_park", "settled_mid_write"), 0, "a confirmation writer held mid-write read as parked (review 2 L3)");
+    assert_eq!(get("fc_writer_park", "settled_after"), 1, "a released confirmation writer never parked with nothing pending (review 2 L3)");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
@@ -2916,10 +2970,16 @@ fn worst_diff(pairs: &[(&Map, &Map)], k: &str) -> i64 {
 /// Review 6 #1's ruling: the flight's confirmation word leaves the create path for a background
 /// writer, which writes it with ONE unsynced pwrite once the group is idle, under no store mutex.
 /// An idle-tail create whose word is written costs, beyond the reference create that lands on a
-/// pending word (review 2 H2), at most three syscalls — the landing's wake of the parked writer
-/// (`confirm_cv.notify_one`), the pwrite, and the writer's one wait to park again — and no sync, no
-/// store-mutex acquisition and no syscall under it, on any thread; in EVERY quiet round, paired by
-/// index (review 2 H6). A word that owns a duplicated descriptor adds its close (and std's
+/// pending word (review 2 H2), at most four syscalls — the landing's wake of the parked writer
+/// (`confirm_cv.notify_one`), the writer's one timed wait out of the quiet period (woken at the
+/// landing, it finds the group idle for less than `confirm_quiet()`), the pwrite, and its one wait
+/// to park again — and no sync, no store-mutex acquisition and no syscall under it, on any thread;
+/// in EVERY quiet round, paired by index (review 2 H6). CORRECTED before its first run (2026-10-15,
+/// a flagged change of this lane's own unrun budget): 18e98e977 said three and left out the timed
+/// wait. Four is the minimum for the ruled design (a background writer that waits out a quiet
+/// period after a landing wakes it): the wake, the quiet period's wait, the write and the park are
+/// each one call, and none of them can be another's. The window now ends only once the writer is
+/// parked with nothing pending (`writer_settled`, review 2 L3), so all four land inside it. A word that owns a duplicated descriptor adds its close (and std's
 /// debug-build F_GETFD at that close): base13 read +4 against the held create, and an lldb trace of
 /// the confirm cell put the writer's pwrite, close and F_GETFD on `branch-confirm`; review 1 #14 /
 /// review 2 #6 (one shared descriptor, no dup per flight) remove the close. Mutant
@@ -2942,8 +3002,8 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
         }
     }
     let d = worst_diff(&pairs, "syscalls");
-    if d > 3 {
-        let _ = writeln!(failures, "  syscalls: written - reference reached {d} in a round; budget <= 3 (the landing's wake, one pwrite, one wait)");
+    if d > 4 {
+        let _ = writeln!(failures, "  syscalls: written - reference reached {d} in a round; budget <= 4 (the landing's wake, the quiet period's one timed wait, one pwrite, one wait to park)");
     }
     // Review 2 L14: the held per-op cells leave the word out, so the figure to quote for one idle-tail
     // create against PostgreSQL 18 is the written window's own total, word included.
@@ -2960,9 +3020,11 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
 /// Review 2 H2 (an engine SHAVE, filed by the lead): an idle-tail create whose flight lands with no
 /// proved word pending wakes the parked confirmation writer on its own acknowledging thread
 /// (`confirm_cv.notify_one` under the group lock, before the create returns): one BSD syscall that
-/// no held per-op cell sees, since a word is always pending there. Budget: the acknowledgement wakes
-/// no thread — held minus reference is 0 syscalls in every quiet round. Expected RED today (+1, the
-/// notify); the SHAVE moves the wake off the acknowledgement path. WRITTEN NOT RUN.
+/// no held per-op cell sees, since a word is always pending there, and the writer it woke waits
+/// again (its quiet period, held: a second syscall, inside the window since review 2 L3's
+/// `writer_settled`). Budget: the acknowledgement wakes no thread — held minus reference is 0
+/// syscalls in every quiet round. Expected RED today (+2: the notify and the woken writer's wait);
+/// the SHAVE moves the wake off the acknowledgement path. WRITTEN NOT RUN.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_idle_tail_create_wakes_no_thread_on_its_acknowledgement() {

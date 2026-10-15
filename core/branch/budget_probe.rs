@@ -612,6 +612,11 @@ pub(crate) fn persistent_ended() {
     PERSISTENT_LIVE.fetch_sub(1, Relaxed);
 }
 
+/// The persistent store threads live now (started and not yet ended).
+pub(crate) fn persistent_live() -> i64 {
+    PERSISTENT_LIVE.load(Relaxed)
+}
+
 /// The threads of this process, each as `(is_self, blocked)`, given to `each`; `None` when they cannot
 /// be listed (off Apple). Mach traps and userspace only (the port list is given back with
 /// `mach_port_deallocate` and `vm_deallocate`), so it can run inside a measured window without moving

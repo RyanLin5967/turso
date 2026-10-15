@@ -11,6 +11,20 @@
 #                      first image, on whatever directory, " (deleted)" or not).
 #   nest_loops BASE    loop_list | nest_match BASE; returns 2 when loop_list fails.
 # BLIND SPOT, stated: a backing path holding runs of spaces is compared with single spaces (awk rebuilds the field).
+cell_nest_dir() {
+  local mnt src backing
+  mnt=$(readlink -m "${1:?cell_nest_dir MNT}") || return 2
+  src=$(findmnt -n -o SOURCE -T "$mnt") || return 2
+  case $src in
+    /dev/loop*)
+      backing=$(losetup -n -O BACK-FILE "$src") || return 2
+      case $backing in /*) ;; *) echo "cell_nest_dir: no absolute loop backing file" >&2; return 2 ;; esac
+      readlink -m "$(dirname "$backing")" ;;
+    /*) printf '%s\n' "$mnt" ;;
+    *) echo "cell_nest_dir: no mount source" >&2; return 2 ;;
+  esac
+}
+
 loop_list() {
   local err out rc
   err=$(mktemp) || return 2
@@ -59,6 +73,10 @@ nestloops_self_test() {
   t "canned: nbx's backing /mnt/v3fx/nb/x.img alone matches nothing" \
     "$(printf '/dev/loop0 /mnt/v3fx/nb/x.img\n' | nest_match /mnt/v3fx | xargs)" ""
   t "canned: an empty listing matches nothing" "$(printf '' | nest_match /mnt/v3fx | xargs)" ""
+  t "root ext4 keeps the supplied cell directory" \
+    "$(findmnt() { echo /dev/sda1; }; cell_nest_dir /mnt/fastest-v3-ext4)" /mnt/fastest-v3-ext4
+  t "loop cell uses its backing directory" \
+    "$(findmnt() { echo /dev/loop0; }; losetup() { echo /var/tmp/cell.img; }; cell_nest_dir /mnt/cell)" /var/tmp
   td=$(mktemp -d) || { echo "FAIL mktemp"; return 1; }
   printf '#!/bin/sh\necho "losetup: cannot open /dev/loop-control" >&2\nexit 1\n' > "$td/losetup"
   chmod +x "$td/losetup"
