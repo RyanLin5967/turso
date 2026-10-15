@@ -958,6 +958,11 @@ impl Drop for Branch {
 pub(crate) struct BranchBinding {
     pub(crate) store: Arc<BranchStore>,
     pub(crate) id: BranchId,
+    /// This connection's reservations in its open write transaction, page -> where its commit
+    /// writes it (`BranchStore::first_write_branch`), so the commit writes its slots before it
+    /// takes the store mutex (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex).
+    /// One writer per branch: only this connection's thread touches it.
+    pub(crate) reserved: std::sync::Mutex<std::collections::HashMap<u32, store::Reserved>>,
 }
 
 impl Drop for BranchBinding {
@@ -1606,6 +1611,7 @@ impl Database {
         let binding = BranchBinding {
             store: self.branches.clone(),
             id,
+            reserved: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let pager = self._init(None, None)?;
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may

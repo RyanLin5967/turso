@@ -3610,6 +3610,14 @@ fn held_trace(label: &'static str) {
     let _ = label;
 }
 
+/// A branch page's reservation (`BranchStore::first_write_branch`): its slot and, for a file arena,
+/// where the commit writes it, so `commit_pages` can write it before it takes the store mutex.
+#[derive(Clone)]
+pub(crate) struct Reserved {
+    slot: Slot,
+    io: Option<(Arc<std::fs::File>, u64)>,
+}
+
 /// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
 /// can aim a kill at. TEST BUILDS ONLY, and inert unless `FE_KILL_AT=<point>:<n>` is set: the n-th
 /// time this process reaches `point`, it appends `KILL-AT <point> <n>` to the file `FE_CRASH_LOG`
@@ -6775,8 +6783,9 @@ impl BranchStore {
     }
 
     /// The copy decision for a branch's first write to `page` in a transaction: reserve the fresh
-    /// slot the commit will write the page into. Nothing is published until then.
-    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
+    /// slot the commit will write the page into. Nothing is published until then. Returns the
+    /// reservation, for the commit to write holding no lock (`Reserved`).
+    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<Reserved> {
         let mut inner = self.inner.lock();
         // Covered deferred frees first, so this reservation can reuse them (group commit).
         self.mature(&mut inner);
@@ -6799,12 +6808,15 @@ impl BranchStore {
                 id.0
             )));
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
-            e.insert(arena.alloc());
-            // F-W2: this branch may hold a reserved slot at the next checkpoint.
-            pending_holders.insert(id);
-        }
-        Ok(())
+        let slot = match st.pending.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // F-W2: this branch may hold a reserved slot at the next checkpoint.
+                pending_holders.insert(id);
+                *e.insert(arena.alloc())
+            }
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        };
+        Ok(Reserved { slot, io: arena.slot_io(slot) })
     }
 
     /// The copy decisions of one trunk commit, taken at its serialization point: after its frames
@@ -7408,6 +7420,36 @@ impl BranchStore {
     /// A commit whose wait fails leaves the branch in doubt: refused from then on (lead review 1
     /// item 11).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        self.commit_pages_reserved(id, pages, &HashMap::new())
+    }
+
+    /// `commit_pages`, with the connection's reservations (`BranchBinding::reserved`): when every
+    /// page has a file-arena reservation, the pages are written into their slots BEFORE the store
+    /// mutex is taken (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex: the
+    /// slot pwrite was a syscall under it). Safe: a reservation is this writer's until its commit
+    /// or abort, both on this connection, so nothing frees or reuses the slot meanwhile; the arena
+    /// is marked dirty in the same hold that buffers the Commit record, so the flight that carries
+    /// the record syncs the slots first, as before. Mutant `commit_slots_under_mutex` (test builds
+    /// only): written under the mutex, as before.
+    pub(crate) fn commit_pages_reserved(&self, id: BranchId, pages: &[PageRef], reserved: &HashMap<u32, Reserved>) -> Result<()> {
+        let prewritten = !pages.is_empty()
+            && !fe_mutant("commit_slots_under_mutex")
+            && !self.group.poisoned()
+            && pages
+                .iter()
+                .all(|p| reserved.get(&(p.get().id as u32)).is_some_and(|r| r.io.is_some()));
+        // Made before the mutex too: no allocation under it for the entries.
+        let mut entries: Vec<(u32, Slot, u32)> = Vec::with_capacity(pages.len());
+        if prewritten {
+            for page in pages {
+                let no = page.get().id as u32;
+                let r = &reserved[&no];
+                let (file, offset) = r.io.as_ref().expect("checked above");
+                let bytes = page.get_contents().as_slice();
+                super::journal::write_at(file, bytes, *offset)?;
+                entries.push((no, r.slot, crc32c::crc32c(bytes)));
+            }
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -7431,8 +7473,7 @@ impl BranchStore {
                 return Err(reaped(id));
             }
             let arena = arena.as_mut().expect("a branch exists, so the arena does");
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
+            for (i, page) in pages.iter().enumerate() {
                 let no = page.get().id as u32;
                 let slot = st.pending.remove(&no).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -7440,9 +7481,23 @@ impl BranchStore {
                         id.0
                     ))
                 })?;
-                let bytes = page.get_contents().as_slice();
-                arena.write_slot(slot, bytes)?;
-                entries.push((no, slot, crc32c::crc32c(bytes)));
+                if prewritten {
+                    if entries[i].1 != slot {
+                        return Err(LimboError::InternalError(format!(
+                            "branch {} page {no}: written into slot {} off the mutex, reserved {slot}",
+                            id.0, entries[i].1
+                        )));
+                    }
+                } else {
+                    let bytes = page.get_contents().as_slice();
+                    arena.write_slot(slot, bytes)?;
+                    entries.push((no, slot, crc32c::crc32c(bytes)));
+                }
+            }
+            if prewritten {
+                // The slots were written off the mutex: the flight that carries this record syncs
+                // them (rule 1), as a write_slot under it marked them.
+                arena.mark_unsynced();
             }
             // A reservation whose page is not dirty at commit was never written: free it.
             for (_, slot) in st.pending.drain() {

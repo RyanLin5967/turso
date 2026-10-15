@@ -395,6 +395,16 @@ impl Arena {
         &mut chunks[chunk][offset..offset + page_size]
     }
 
+    /// Where `slot` lives in the arena file, and a handle on it (`None` for the memory backing), for
+    /// a commit that writes the slot holding no lock (`BranchStore::commit_pages`).
+    pub(crate) fn slot_io(&self, slot: Slot) -> Option<(std::sync::Arc<File>, u64)> {
+        let offset = self.check(slot) as u64 * self.page_size as u64;
+        match &self.backing {
+            Backing::File { file, .. } => Some((file.clone(), offset)),
+            Backing::Memory { .. } => None,
+        }
+    }
+
     fn check(&self, slot: Slot) -> Slot {
         turso_assert!(slot < self.high_water, "arena slot out of range");
         turso_assert!(!self.is_free(slot), "access to a free arena slot");
