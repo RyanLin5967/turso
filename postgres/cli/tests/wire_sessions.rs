@@ -2691,6 +2691,33 @@ fn dml_returning_is_tagged_by_its_verb() {
     }
 }
 
+/// An integer literal in base 2, 8 or 16, or with underscores, past int4 (PostgreSQL 16 and later)
+/// is its value, as PostgreSQL 18.6 answers (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-num.out), and never ends the session: `SELECT 0b10000000000000000000000000000000` reached
+/// the engine as that text, whose literal parser assumes SQLite's grammar checked it and hit
+/// unreachable!(), closing the connection (found by the PostgreSQL regression corpus,
+/// numerology.sql, 2026-10-15). A literal past i64 still answers and the session serves on (its
+/// value is a numeric in PostgreSQL, a float here: the bare-NUMERIC divergence).
+#[test]
+fn a_non_decimal_integer_literal_is_its_value() {
+    let dir = Scratch::new("numlit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, want) in [
+        ("SELECT 0b10000000000000000000000000000000", "2147483648"),
+        ("SELECT 0o20000000000", "2147483648"),
+        ("SELECT 0x80000000", "2147483648"),
+        ("SELECT -0x8000000000000000", "-9223372036854775808"),
+        ("SELECT 1_000_000", "1000000"),
+        ("SELECT 0b1_0", "2"),
+    ] {
+        assert_eq!(a.q(sql).single(sql), want, "{sql}");
+    }
+    let sql = "SELECT 0x_7FFF_FFFF_FFFF_FFFF_F";
+    let _ = a.q(sql);
+    assert_eq!(a.q("SELECT 1").single("the session serves on"), "1");
+}
+
 /// A CREATE TABLE with a SERIAL column completes as CREATE TABLE, with no row description, on both
 /// protocols, as PostgreSQL answers it. Since 0693b6c6d performs such a CREATE at prepare (with its
 /// sequence, in one transaction) and steps a no-op, the no-op's one column made the server answer it
