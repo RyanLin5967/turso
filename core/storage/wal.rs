@@ -616,6 +616,12 @@ trait WalCoordination: Debug + Send + Sync {
     }
 }
 
+/// Test builds (fastest-engine, engine review 19 LOW 9's auto-checkpoint arm): the auto-checkpoint
+/// threshold in frames when set (0: the WAL's own, 1000). `PRAGMA wal_autocheckpoint` is not
+/// implemented here, so a test cannot lower it otherwise.
+#[cfg(test)]
+pub(crate) static AUTO_CHECKPOINT_FRAMES_FOR_TEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 thread_local! {
     /// Test builds: the trunk WAL sync site this thread issued a sync at last (engine review 10 #5:
@@ -4053,7 +4059,14 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
         let snapshot = self.load_coordination_snapshot();
-        snapshot.max_frame as usize > self.checkpoint_threshold + snapshot.nbackfills as usize
+        #[cfg(test)]
+        let threshold = match AUTO_CHECKPOINT_FRAMES_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+            0 => self.checkpoint_threshold,
+            n => n,
+        };
+        #[cfg(not(test))]
+        let threshold = self.checkpoint_threshold;
+        snapshot.max_frame as usize > threshold + snapshot.nbackfills as usize
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

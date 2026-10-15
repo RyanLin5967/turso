@@ -8654,6 +8654,19 @@ fn a_failed_truncate_wal_sync_at_issue_fail_stops_a_d0_store() {
 fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): `PRAGMA
+    // wal_autocheckpoint = 1` below is accepted and does nothing here (the WAL's threshold is a
+    // fixed 1000 frames), so no auto-checkpoint ran (red at bb6af4d94 and 9d27592bf on the premise
+    // "the auto-checkpoint's WAL sync was reached", artie raws l1-branch*). The threshold is set
+    // through the test seam `AUTO_CHECKPOINT_FRAMES_FOR_TEST`, restored by a guard; the PRAGMA stays.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::storage::wal::AUTO_CHECKPOINT_FRAMES_FOR_TEST.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    crate::storage::wal::AUTO_CHECKPOINT_FRAMES_FOR_TEST.store(1, O::Release);
     for catalog in [false, true] {
         let what = format!("catalog={catalog}");
         let dir = tempfile::TempDir::new().unwrap();
