@@ -288,6 +288,10 @@ check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in it
 check "MED 12: ours_timed_exec with no gates/sweeper.sh beside t3lib.sh refuses (rc 2), the command never ran" \
   'mkdir -p "$T/lib7/t3" "$T/sw7" && cp "$HERE/t3lib.sh" "$T/lib7/t3/" &&
    ( source "$T/lib7/t3/t3lib.sh"; ours_timed_exec "$T/sw7" touch "$T/sw7/ran" ); [ $? = 2 ] && [ ! -e "$T/sw7/ran" ]'
+check "MED 12 fix 7: ours_timed_exec whose gates/sweeper.sh fails to source refuses (rc 2, not 1), the command never ran" \
+  'mkdir -p "$T/lib8/t3" "$T/lib8/gates" "$T/sw8" && cp "$HERE/t3lib.sh" "$T/lib8/t3/" &&
+   echo "return 1" > "$T/lib8/gates/sweeper.sh" &&
+   ( source "$T/lib8/t3/t3lib.sh"; ours_timed_exec "$T/sw8" touch "$T/sw8/ran" ); [ $? = 2 ] && [ ! -e "$T/sw8/ran" ]'
 check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
   'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
