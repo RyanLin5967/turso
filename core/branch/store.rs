@@ -1831,6 +1831,8 @@ struct CatState {
     /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
     /// no trunk version when it was made. Cleared with the cache.
     trunk_all_complete: bool,
+    /// Trims of `trunk_cache` past the resident cap, which clear the complete marks (instrument).
+    trunk_trims: u64,
     /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
     /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
     /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
@@ -2069,6 +2071,15 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds (review L4 M1): a name filter builder STARTED on this thread waits, after its
+    /// scan and before its install, while this holds 1 (it stores `1 | HOLD_ARRIVED` on arrival;
+    /// the test stores 0 to release it). Per opening thread, so no other test's builder waits.
+    pub(crate) static NAME_INSTALL_HOLD: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
     #[cfg(test)]
@@ -2160,6 +2171,7 @@ impl CatState {
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
             trunk_complete: HashSet::new(),
+            trunk_trims: 0,
             // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
@@ -2469,6 +2481,9 @@ struct NameIndex {
     /// later release of the same name moved it.
     gone: HashMap<Arc<str>, u64>,
     releases: u64,
+    /// Mirrors built and discarded, a checkpoint having committed while their scan ran (review L4
+    /// L1): the mirror then stays unbuilt and the catalog answers lookups (instrument).
+    mirror_misses: u64,
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -8011,6 +8026,8 @@ impl BranchStore {
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
+        #[cfg(test)]
+        let install_hold = NAME_INSTALL_HOLD.with(|h| h.borrow().clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
@@ -8036,6 +8053,16 @@ impl BranchStore {
                     }
                     Err(e) => (Err(e), None),
                 };
+                #[cfg(test)]
+                if let Some(hold) = install_hold.as_ref() {
+                    use std::sync::atomic::Ordering as O;
+                    let arrived = 1 | HOLD_ARRIVED;
+                    if hold.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+                        while hold.load(O::Acquire) == arrived {
+                            crate::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
                 // The set of the scanned names is built here, off the store mutex: its one table of
                 // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
                 // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
@@ -8063,9 +8090,18 @@ impl BranchStore {
                         _ => break inner,
                     }
                 };
+                // Review L4 L1: a mirror a checkpoint outdated is counted and freed after the mutex is
+                // dropped (its N frees are not a hold). Mutant `l4_mirror_ignores_generation` (test
+                // builds only): installed whatever committed meanwhile (the oracle's plant).
+                let mut discarded = None;
                 if let Some(mirror) = mirror {
-                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation) {
+                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation)
+                        || fe_mutant("l4_mirror_ignores_generation")
+                    {
                         inner.names.catalog = Some(mirror);
+                    } else {
+                        inner.names.mirror_misses += 1;
+                        discarded = Some(mirror);
                     }
                 }
                 let filter = &mut inner.names.filter;
@@ -8082,6 +8118,8 @@ impl BranchStore {
                         tracing::debug!("branch name filter not built: {e}")
                     }
                 }
+                drop(inner);
+                drop(discarded);
             });
         match spawned {
             Ok(handle) => *self.name_filter_build.lock() = Some(handle),
@@ -8519,6 +8557,14 @@ impl BranchStore {
         self.inner.lock().names.catalog.is_some()
     }
 
+    /// Test builds (review L4): name mirrors discarded because a checkpoint committed during their
+    /// scan, and trims of the trunk-version cache past the resident cap.
+    #[cfg(test)]
+    pub(crate) fn mirror_misses_and_trims_for_test(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.names.mirror_misses, inner.cat.as_ref().map_or(0, |c| c.trunk_trims))
+    }
+
     /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
     #[cfg(test)]
     pub(crate) fn format_for_test(&self) -> Option<u32> {
@@ -8935,9 +8981,13 @@ impl StoreInner {
         let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
         if cached > cap {
             cat.trunk_cache.clear();
-            // What the cache held is no longer in memory (LEAP L4).
-            cat.trunk_complete.clear();
-            cat.trunk_all_complete = false;
+            cat.trunk_trims += 1;
+            // What the cache held is no longer in memory (LEAP L4). Mutant `l4_trim_keeps_complete`
+            // (test builds only): the complete marks outlive the cache (the oracle's plant).
+            if !fe_mutant("l4_trim_keeps_complete") {
+                cat.trunk_complete.clear();
+                cat.trunk_all_complete = false;
+            }
         }
     }
 
@@ -9409,7 +9459,8 @@ impl StoreInner {
         };
         // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
         // unknown, never while a checkpoint is in the air).
-        if !cat.flight && !fe_mutant("l4_probe_always") {
+        // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too.
+        if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
             if cat.trunk_versions.is_none() {
                 cat.trunk_versions = Some(!cat.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty());
             }
@@ -10657,7 +10708,11 @@ impl StoreInner {
             // LEAP L4 slice 3: the trunk's newest child row in the catalog, known (asked once while
             // unknown) whenever no checkpoint is in the air.
             let newest = match self.cat.as_mut() {
-                Some(cat) if parent.is_trunk() && !cat.flight && !fe_mutant("l4_probe_always") => {
+                Some(cat)
+                    if parent.is_trunk()
+                        && (!cat.flight || fe_mutant("l4_child_facts_in_flight"))
+                        && !fe_mutant("l4_probe_always") =>
+                {
                     if cat.trunk_child_max.is_none() {
                         cat.trunk_child_max = Some(cat.catalog.children_below(0, u64::MAX, 1)?.first().copied());
                     }

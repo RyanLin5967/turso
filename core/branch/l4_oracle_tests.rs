@@ -23,6 +23,47 @@ fn open(path: &std::path::Path) -> Arc<Database> {
     .unwrap()
 }
 
+/// Spin until `f` holds, for at most 30 s.
+fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !f() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "timed out waiting: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// What a history counts at its checks (each must be set at some check: an oracle over facts never
+/// set checks nothing).
+#[derive(Default, Debug, Clone, Copy)]
+struct Seen {
+    pages_complete: u64,
+    all_complete: u64,
+    free_exhausted: u64,
+    meta_facts: u64,
+    mirror_built: u64,
+    free_inferred: u64,
+    /// Review L4 M1: steps run with a fuzzy checkpoint held in flight, and reopens whose name scan
+    /// was held across a checkpoint (its mirror discarded).
+    in_flight: u64,
+    mirror_held: u64,
+    /// Review L4 M2: trims of the trunk-version cache past the resident cap.
+    trims: u64,
+}
+
+impl Seen {
+    fn add(&mut self, o: Seen) {
+        self.pages_complete += o.pages_complete;
+        self.all_complete += o.all_complete;
+        self.free_exhausted += o.free_exhausted;
+        self.meta_facts += o.meta_facts;
+        self.mirror_built += o.mirror_built;
+        self.free_inferred += o.free_inferred;
+        self.in_flight += o.in_flight;
+        self.mirror_held += o.mirror_held;
+        self.trims += o.trims;
+    }
+}
+
 /// xorshift64*: a deterministic history from its seed.
 struct Rng(u64);
 
@@ -40,11 +81,13 @@ impl Rng {
 }
 
 /// One history of `steps` operations from `seed`; the facts checked after every one. Returns how
-/// often each fact was set at a check: (pages complete, all complete, free exhausted).
-fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64, u64) {
+/// often each fact was set at a check. `cap`: the store's resident cap, set at every open (review
+/// L4 M2: the trunk-version cache is trimmed past it).
+fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("oracle.db");
     let mut db = open(&path);
+    db.branch_set_resident_cap(cap);
     let mut trunk = db.connect().unwrap();
     trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
     for id in 1..=40 {
@@ -65,7 +108,7 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64, u64
     // Connections on unnamed branches whose handle was dropped: released while held open.
     let mut held: Vec<Arc<crate::Connection>> = Vec::new();
     let mut made = 0u64;
-    let mut seen = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut seen = Seen::default();
     for step in 0..steps {
         let op = rng.below(100);
         let what = if op < 24 {
@@ -106,21 +149,80 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64, u64
             let name = live.swap_remove(rng.below(live.len() as u64) as usize);
             db.drop_branch(&name).unwrap();
             "delete"
-        } else if op < 94 {
+        } else if op < 88 {
             db.branch_compact_now().unwrap();
             db.branch_checkpoint_wait();
             "checkpoint"
+        } else if op < 94 {
+            // Review L4 M1: a fuzzy checkpoint held in flight before its commit, with creates,
+            // deletes and named connects (and writes) under it; checked once it has landed.
+            db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+            if db.branch_checkpoint_fuzzy_now().unwrap() {
+                until(&format!("seed {seed} step {step}: the flight never held"), || {
+                    db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+                });
+                seen.in_flight += 1;
+                for _ in 0..1 + rng.below(4) {
+                    match rng.below(3) {
+                        0 => {
+                            let name = format!("b{made}");
+                            made += 1;
+                            ids.push(trunk.create_branch(&name).unwrap());
+                            live.push(name);
+                        }
+                        1 if !live.is_empty() => {
+                            let name = live.swap_remove(rng.below(live.len() as u64) as usize);
+                            db.drop_branch(&name).unwrap();
+                        }
+                        _ if !live.is_empty() => {
+                            let name = live[rng.below(live.len() as u64) as usize].clone();
+                            let c = db.connect_named(&name).unwrap();
+                            let id = 1 + rng.below(40);
+                            c.execute(&format!("UPDATE t SET v = 'flight-{step}' WHERE id = {id}")).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            db.branch_checkpoint_hold(0);
+            db.branch_checkpoint_wait();
+            "checkpoint in flight"
         } else {
             held.clear();
             drop(trunk);
             let incarnation = db.incarnation;
             drop(db);
+            // Review L4 M1: every other reopen holds its name scan's install across a checkpoint
+            // that commits fresh names, so the scan's mirror is out of date (and discarded).
+            let hold_install = rng.below(2) == 0;
+            let hold = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(hold_install)));
+            super::store::NAME_INSTALL_HOLD.with(|h| *h.borrow_mut() = Some(hold.clone()));
             db = open(&path);
+            super::store::NAME_INSTALL_HOLD.with(|h| *h.borrow_mut() = None);
             assert_ne!(db.incarnation, incarnation, "seed {seed} step {step}: premise: not a reopen");
+            db.branch_set_resident_cap(cap);
+            seen.free_inferred += db.branches.free_inferred_for_test();
+            trunk = db.connect().unwrap();
+            if hold_install {
+                use std::sync::atomic::Ordering as O;
+                let arrived = 1 | super::store::HOLD_ARRIVED;
+                until(&format!("seed {seed} step {step}: the name scan never held"), || hold.load(O::Acquire) == arrived);
+                for _ in 0..2 {
+                    let name = format!("b{made}");
+                    made += 1;
+                    ids.push(trunk.create_branch(&name).unwrap());
+                    live.push(name);
+                }
+                db.branch_compact_now().unwrap();
+                db.branch_checkpoint_wait();
+                hold.store(0, O::Release);
+            }
             // The name mirror is built with the filter, off the mutex, after the open.
             db.branch_wait_name_filter();
-            seen.5 += db.branches.free_inferred_for_test();
-            trunk = db.connect().unwrap();
+            if hold_install {
+                let (misses, _) = db.branches.mirror_misses_and_trims_for_test();
+                seen.mirror_held += misses;
+            }
             "reopen"
         };
         assert_eq!(
@@ -130,16 +232,18 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64, u64
         );
         match db.branches.l4_facts_check_for_test() {
             Ok((pages, all, exhausted, meta)) => {
-                seen.4 += u64::from(db.branches.name_mirror_built_for_test());
-                seen.0 += u64::from(pages > 0);
-                seen.1 += u64::from(all);
-                seen.2 += u64::from(exhausted);
-                seen.3 += u64::from(meta);
+                seen.mirror_built += u64::from(db.branches.name_mirror_built_for_test());
+                seen.pages_complete += u64::from(pages > 0);
+                seen.all_complete += u64::from(all);
+                seen.free_exhausted += u64::from(exhausted);
+                seen.meta_facts += u64::from(meta);
             }
             Err(e) => panic!("seed {seed} step {step} ({what}): an L4 fact disagrees with the catalog: {e}"),
         }
     }
     super::store::CHECK_FREE_INFERENCE.with(|c| c.set(false));
+    // Trims are counted per process lifetime of the store; the last one's count is read here.
+    seen.trims += db.branches.mirror_misses_and_trims_for_test().1;
     seen
 }
 
@@ -155,32 +259,42 @@ fn history(seed: u64, steps: u32, legacy: bool) -> (u64, u64, u64, u64, u64, u64
 /// run over a store made at the legacy 17 (`journal::CREATE_LEGACY`), opened by the older path.
 /// 2b: at every reopen, each touched slot's checkpoint state inferred from its first touch in the
 /// tail equals the free table's answer (plant `l4_free_first_touch_inverted`), and some open inferred one.
+/// Review L4 (DECISIONS df1a954ddb): M1, steps under a fuzzy checkpoint held in flight and reopens
+/// whose name scan is held past a checkpoint (plants `l4_child_facts_in_flight`,
+/// `l4_mirror_ignores_generation`); M2, two histories under a resident cap of 2 that trim the
+/// trunk-version cache (plant `l4_trim_keeps_complete`); L4, the legacy histories' premise.
 #[test]
 fn every_l4_fact_equals_the_catalog_query_it_replaces() {
-    let mut total = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut total = Seen::default();
     for seed in [1u64, 7, 42, 1009, 65_537, 0xdead_beef] {
-        let seen = history(seed, 300, false);
-        total = (
-            total.0 + seen.0,
-            total.1 + seen.1,
-            total.2 + seen.2,
-            total.3 + seen.3,
-            total.4 + seen.4,
-            total.5 + seen.5,
-        );
+        total.add(history(seed, 300, false, None));
     }
-    // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17.
+    let premise = |what: &str, s: &Seen| {
+        assert!(
+            s.pages_complete > 0 && s.all_complete > 0 && s.free_exhausted > 0 && s.meta_facts > 0 && s.mirror_built > 0,
+            "premise ({what}): every fact was set at some check: {s:?}"
+        );
+    };
+    premise("format 19", &total);
+    assert!(
+        total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0,
+        "premise: an open inferred a slot's state, a step ran under a held flight, and a held name scan's mirror was discarded: {total:?}"
+    );
+    // Review L4 M2: with a small resident cap the trunk-version cache is trimmed, and the facts
+    // still hold after every trim.
+    let mut capped = Seen::default();
+    for seed in [5u64, 77] {
+        capped.add(history(seed, 300, false, Some(2)));
+    }
+    assert!(capped.trims > 0, "premise: the resident cap trimmed the trunk-version cache: {capped:?}");
+    // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17;
+    // review L4 L4: the same premise over it (its meta row carries no facts, so that one is not asked).
+    let mut legacy = Seen::default();
     for seed in [3u64, 99] {
-        history(seed, 200, true);
+        legacy.add(history(seed, 200, true, None));
     }
     assert!(
-        total.0 > 0 && total.1 > 0 && total.2 > 0 && total.3 > 0 && total.4 > 0 && total.5 > 0,
-        "premise: every fact was set at some check (pages complete {}, all complete {}, free exhausted {}, a lease or held release in the meta row {}, the name mirror built {}, slots whose checkpoint state an open inferred {})",
-        total.0,
-        total.1,
-        total.2,
-        total.3,
-        total.4,
-        total.5
+        legacy.pages_complete > 0 && legacy.all_complete > 0 && legacy.free_exhausted > 0 && legacy.mirror_built > 0,
+        "premise (legacy 17): every fact was set at some check: {legacy:?}"
     );
 }
