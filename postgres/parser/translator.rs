@@ -8270,6 +8270,27 @@ mod tests {
         }
     }
 
+    /// Wire review 16 item 21 (a): a translator that cannot read the target's columns (no lookup
+    /// installed: core's dialect parse, catalog.rs) refuses DELETE ... USING, 0A000, rather than
+    /// name the target's row by a bare rowid, which a declared rowid column shadows on both sides
+    /// of the rewrite (review 13 item 5's bug, back through this path).
+    #[test]
+    fn delete_using_without_a_column_lookup_is_refused() {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse("DELETE FROM d USING k WHERE d.id = k.id").unwrap();
+        let err = translator.translate_with_prereqs(&parsed).err();
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.to_string().contains("not supported")),
+            "translated without the target's columns: {err:?}"
+        );
+        let parsed = crate::parse("DELETE FROM d WHERE id = 1").unwrap();
+        assert!(
+            translator.translate_with_prereqs(&parsed).is_ok(),
+            "control: a DELETE without USING needs no lookup"
+        );
+    }
+
     #[test]
     fn test_simple_explain_translates_to_query_plan() {
         let translator = PostgreSQLTranslator::new();

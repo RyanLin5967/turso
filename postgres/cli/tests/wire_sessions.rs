@@ -7751,6 +7751,93 @@ fn delete_using_returning_resolves_a_bare_name_over_both() {
     assert_eq!(count(&mut a), "2");
 }
 
+/// A subquery in DELETE ... USING ... RETURNING reads its own FROM: a qualified USING name, a bare
+/// name only a USING table has, and `*` inside it are the subquery's, never refused as the
+/// RETURNING's own references to the USING items (wire review 16 item 21 (d): the existing arm
+/// passed at its base and under a mutant that walks into subqueries). Expected values: PostgreSQL's
+/// by these fixtures' semantics, recorded against PostgreSQL 18 (LOUD-OWED).
+#[test]
+fn delete_using_returning_subqueries_read_their_own_from() {
+    let dir = Scratch::new("deleteusingsub");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE k(id INT, flag BOOLEAN)").ok("k");
+    a.q("INSERT INTO k VALUES (2, true), (3, false)")
+        .ok("k rows");
+    for returning in [
+        "v, EXISTS (SELECT 1 FROM k WHERE k.flag)",
+        "v, EXISTS (SELECT 1 FROM k AS j WHERE flag)",
+        "v, EXISTS (SELECT * FROM k)",
+    ] {
+        a.q("DROP TABLE IF EXISTS d").ok("drop");
+        a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+        a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .ok("d rows");
+        let sql = format!("DELETE FROM d USING k WHERE d.id = k.id AND k.flag RETURNING {returning}");
+        let r = a.q(&sql).ok(&sql);
+        assert_eq!(r.rows.len(), 1, "{sql}: {:?}", r.rows);
+        assert_eq!(r.rows[0][0].as_deref(), Some("b"), "{sql}");
+        assert_eq!(
+            a.q("SELECT count(*) FROM d").single("count"),
+            "2",
+            "{sql}"
+        );
+    }
+}
+
+/// DELETE ... USING names the target's row, and resolves RETURNING's bare names, by the columns of
+/// the table the engine deletes from: under `search_path TO s, public` an unqualified r1 is s.r1,
+/// which declares a rowid column where public.r1 does not, so the rewrite must name its row
+/// `_rowid_`, deleting exactly the two joined rows. The column lookup read public's r1 whatever
+/// the path, so it chose the bare rowid, which s.r1's column shadows on both sides (review 13
+/// item 5's bug; wire review 16 item 21 (b)). Schema s is made by the non-server CLI.
+#[test]
+fn delete_using_reads_the_target_on_the_search_path() {
+    let dir = Scratch::new("deleteusingpath");
+    cli_script(
+        &dir,
+        b"CREATE TABLE u(k INT);\n\
+          INSERT INTO u VALUES (1), (3);\n\
+          CREATE TABLE r1(id INT PRIMARY KEY);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.r1(id INT PRIMARY KEY, rowid INT);\n\
+          INSERT INTO s.r1 VALUES (1, 7), (2, 7), (3, NULL);\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path TO s, public").ok("path");
+    let r = a
+        .q("DELETE FROM r1 USING u WHERE r1.id = u.k")
+        .ok("delete");
+    assert_eq!(r.tags, vec!["DELETE 2".to_string()]);
+    assert_eq!(
+        a.q("SELECT id FROM s.r1").single("the row that joined nothing"),
+        "2"
+    );
+}
+
+/// A USING subquery's output named by a cast (`SELECT id::int`) is named as PostgreSQL names it,
+/// after the cast's argument, so `RETURNING id` over both is 42702 and nothing is deleted. Every
+/// output that was not a column reference, a function call or aliased was named `?column?`, so
+/// the bare id was the target's alone and the DELETE ran (wire review 16 item 21 (c)).
+#[test]
+fn delete_using_names_a_cast_output_as_postgresql_does() {
+    let dir = Scratch::new("deleteusingcast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE d(id INT PRIMARY KEY, v TEXT)").ok("d");
+    a.q("INSERT INTO d VALUES (1, 'a'), (2, 'b')").ok("d rows");
+    a.q("CREATE TABLE k(id INT)").ok("k");
+    a.q("INSERT INTO k VALUES (2)").ok("k row");
+    let sql = "DELETE FROM d USING (SELECT id::int FROM k) s WHERE d.id = s.id RETURNING id";
+    assert_eq!(a.q(sql).err(sql).code, "42702", "{sql}");
+    assert_eq!(
+        a.q("SELECT count(*) FROM d").single("count"),
+        "2",
+        "nothing deleted"
+    );
+}
+
 /// DELETE ... USING deletes only the rows its join condition matches, as in PostgreSQL. The USING
 /// clause was dropped, so the WHERE ran against the target alone: every row whose columns made it
 /// true was deleted, and a WHERE over the USING table's columns failed or deleted everything (wire
