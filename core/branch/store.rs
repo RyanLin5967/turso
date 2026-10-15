@@ -12231,6 +12231,36 @@ mod sota_tree_tests {
 mod group_tests {
     use super::*;
 
+    /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
+    /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
+    /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
+    /// held-free upgrade's landing, `mark_upgraded`, with no flight since; a proved ordered flight
+    /// upgraded) was queued again and written a second time: one extra pwrite. Here flight N lands
+    /// proved, the writer's step is done by hand (take, write), and the upgrade re-offers N's word:
+    /// nothing is queued, and the word was written once. Mutant `reoffer_written_word`.
+    #[test]
+    fn a_reoffer_of_a_written_word_writes_it_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log(), true))), "premise: flight N landed");
+        let (_, taken) = group.lock().confirm.take().expect("premise: N's proved word is queued");
+        group.write_confirm(&taken, false);
+        drop(taken);
+        assert_eq!(group.confirms_written.load(Ordering::Relaxed), 1, "premise: N's word was written");
+        let left = group.mark_upgraded(10, SyncClass::FullFsync, Some(Confirm::for_test(log(), true)));
+        if let Some((_, again)) = group.lock().confirm.take() {
+            group.write_confirm(&again, false);
+        }
+        drop(left);
+        assert_eq!(
+            group.confirms_written.load(Ordering::Relaxed),
+            1,
+            "CLAIM: a re-offer of the word already written was queued and written again"
+        );
+    }
+
     /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
     /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
     /// of its own, and the log's last flight is now it: the earlier word, written into page 0 by
