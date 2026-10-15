@@ -382,10 +382,11 @@ fn crash_after_commits_to_old_branches(legacy: bool) {
     {
         let db = open_at(&path, catalog()).unwrap();
         seed(&db.connect().unwrap());
-        // The store (and its catalog) is made at the first fork: at 17 when asked.
+        // The store (and its catalog) is made at the first fork: at 17 when asked, and the whole
+        // history before the crash is the legacy build's (DECISIONS e977c1d010: this build would
+        // upgrade the store at its first checkpoint, so the older build checkpoints it here).
         super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
         ids = grow(&db, 60);
-        super::journal::CREATE_LEGACY.with(|c| c.set(false));
         // A child of every tenth branch, so some committing branches retain versions for a child.
         for &id in ids.iter().step_by(10) {
             let b = db.branch(id).unwrap();
@@ -406,6 +407,7 @@ fn crash_after_commits_to_old_branches(legacy: bool) {
         }
         slots_before = db.branch_stats().unwrap().arena_slots_in_use;
         image = crash_image(&path, dir.path());
+        super::journal::CREATE_LEGACY.with(|c| c.set(false));
     }
     let db = open_at(&image, catalog()).unwrap();
     let s = db.branch_open_stats();
@@ -436,8 +438,12 @@ fn crash_after_commits_to_old_branches(legacy: bool) {
         let _ = b.into_id();
     }
     db.branch_compact_now().unwrap();
+    // The upgrade claim (DECISIONS e977c1d010): this build's first checkpoint made the store 21.
+    assert_eq!(db.branches.links_known_and_catalog_format_for_test().1, Some(21), "legacy {legacy}: not upgraded by the checkpoint");
     drop(db);
     let db = open_at(&image, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!((s.cat_rows_read, s.cat_queries - s.free_probes), (11, 1), "legacy {legacy}: the upgraded store's open reads only its meta row: {s:?}");
     assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, slots_before, "after a checkpoint and reopen");
     for (i, &id) in ids.iter().enumerate().step_by(3) {
         let b = db.branch(id).unwrap();
@@ -1651,10 +1657,12 @@ fn catalog_shape_closes_its_ledger(legacy: bool) {
     let path = dir.path().join("c.db");
     let db = open_at(&path, catalog()).unwrap();
     seed(&db.connect().unwrap());
+    // The legacy build makes and checkpoints the store (this build would upgrade it: DECISIONS
+    // e977c1d010).
     super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
     let ids = grow(&db, 300);
-    super::journal::CREATE_LEGACY.with(|c| c.set(false));
     db.branch_compact_now().unwrap();
+    super::journal::CREATE_LEGACY.with(|c| c.set(false));
     let grown = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
     assert_eq!(grown.unaccounted, 0, "the ledger does not close: {grown:?}");
     let rows = |s: &CatalogShape, t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n);
@@ -1672,5 +1680,7 @@ fn catalog_shape_closes_its_ledger(legacy: bool) {
     assert_eq!(reaped.unaccounted, 0, "the ledger does not close: {reaped:?}");
     assert_eq!(rows(&reaped, "branch"), Some(0), "{reaped:?}");
     assert!(reaped.freelist_count > 0, "a mass delete freed no page: {reaped:?}");
+    // The upgrade claim (DECISIONS e977c1d010): this build's first checkpoint made the meta row 21's.
+    assert_eq!(rows(&reaped, "meta"), Some(11), "legacy {legacy}: not upgraded by this build's checkpoint: {reaped:?}");
     assert_eq!(reaped.page_count, grown.page_count, "the file shrank without a vacuum: {reaped:?}");
 }
