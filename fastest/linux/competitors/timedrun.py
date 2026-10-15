@@ -606,13 +606,26 @@ OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5
 BB = {"spec": "pg18-m1c.spec", "after_steps": 2, "skip_after": False, "tput_unit": "cycle"}
 
 
-def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None):
+def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
     """A raw.tsv agreeing with summary SM: warmup_ops warm-up rows intended from t0 on, measured_ops measured rows
     intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out;
-    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them)."""
+    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them).
+    CLAIMED_ROWS (a list, possibly empty) adds a claim_ns column, each row claimed at its intended time, then those
+    rows (phase, claim_ns, intended_ns) (the lead's claim_ns ruling: one meaning per field)."""
     if after_cols is None:
         na = sm.get("after_steps")
         after_cols = na if isinstance(na, int) and sm.get("skip_after") is not True else 0
+    if claimed_rows is not None:
+        base = raw_tsv(sm, extra_rows, drop_warm, after_cols).splitlines()
+        tail = "".join("\t10" for _ in range(after_cols))
+        out = [base[0].replace("\tintended_ns", "\tclaim_ns\tintended_ns") + "\n"]
+        for ln in base[1:]:
+            f = ln.split("\t")
+            out.append("\t".join(f[:5] + [f[5]] + f[5:]) + "\n")
+        n = len(base) - 1
+        for i, (ph, c, t) in enumerate(claimed_rows):
+            out.append(f"0\t{n + i}\t{ph}\t1\t{n + i}\t{c}\t{t}\t1000{tail}\n")
+        return "".join(out)
     out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns" + "".join(f"\tafter{k + 1}_ns" for k in range(after_cols))
            + "\n"]
     tail = "".join("\t10" for _ in range(after_cols))
@@ -861,6 +874,12 @@ def selftest():
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("measure", tm1)])), False),
         ("control: a drain row intended after tm1 is not a measured one",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("drain", tm1 + 5)])), True),
+        # the lead's claim_ns ruling (comp lane's find): closed loop at C > 1, intended_ns is the op's START, so a measured
+        # op CLAIMED before tm1 can start after it; the window is judged at the claim (claim_ns), when the raw has one
+        ("claim_ns: a measured row claimed before tm1 that started after it (closed loop at C > 1) is in the window",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1 - 1, tm1 + 900)])), True),
+        ("claim_ns: a measured row claimed at tm1 (the window is closed at the claim)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 + 900)])), False),
         ("no tm1_ns in the timed summary", dict(tracer=clean, timed_extra={"tm1_ns": None}), False),
         ("the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), drop_warm=1)), False),
@@ -1023,6 +1042,8 @@ def selftest():
             ("labelling run's loop mode 'b1' is neither closed nor open", "timed run's loop mode 'b1' is neither closed nor open"),
         "a measured row intended at tm1 (the window is closed in intended time at tm1)":
             ("timed run measured 1 op(s) intended at or after tm1",),
+        "claim_ns: a measured row claimed at tm1 (the window is closed at the claim)":
+            ("timed run measured 1 op(s) claimed at or after tm1",),
         "no tm1_ns in the timed summary": ("timed run has no tm1_ns",),
         "the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)":
             ("timed run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500",),
