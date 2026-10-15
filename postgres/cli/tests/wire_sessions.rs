@@ -3209,6 +3209,23 @@ fn a_star_over_a_correlated_series_names_its_column() {
     }
 }
 
+/// CREATE TABLE ... INHERITS is refused 0A000, with no table created. PostgreSQL gives the child
+/// its parents' columns too and shows its rows through the parent (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-inherits.out); the clause was dropped, so the child had its own
+/// columns alone and an INSERT of the parents' values went into the wrong columns or failed (the
+/// regress corpus's truncate.sql and returning.sql).
+#[test]
+fn create_table_inherits_is_refused_not_dropped() {
+    let dir = Scratch::new("inherits");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ipa (a int)").ok("parent");
+    let sql = "CREATE TABLE ich (b text) INHERITS (ipa)";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    let probe = "SELECT * FROM ich";
+    assert_eq!(a.q(probe).err(probe).code, "42P01", "the child was created");
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
