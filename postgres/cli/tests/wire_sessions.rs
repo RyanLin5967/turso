@@ -2694,6 +2694,30 @@ fn infinities_and_negative_zero_are_written_without_nan() {
     assert_eq!(r.rows, vec![vec![t("-0")]]);
 }
 
+/// A real (float4) column and a double precision (float8) column keep their declared width: their
+/// results are announced 700 and 701, a parameter compared with one takes its type, and their text
+/// and arithmetic are a float's (REAL affinity, so 2 / 4 is 0.5), as PostgreSQL 18.6 answers
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-types.out: `SELECT r, d FROM k` is
+/// [700, 701]). Both were stored as REAL and announced float8 (the PG 18 differential's finding
+/// (b); lead ruling 2026-10-15T07:40:59Z: the declarations keep FLOAT4 / FLOAT8, REAL affinity).
+#[test]
+fn float_columns_keep_their_declared_width() {
+    let dir = Scratch::new("floatwidth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE fw(r REAL, f4 FLOAT4, d DOUBLE PRECISION, f8 FLOAT8, f FLOAT)")
+        .ok("fw");
+    a.q("INSERT INTO fw VALUES (2, 2, 2, 2, 2)").ok("row");
+    let r = a.q("SELECT r, f4, d, f8, f FROM fw").ok("select");
+    assert_eq!(r.oids, Some(vec![700, 700, 701, 701, 701]));
+    assert_eq!(r.rows, vec![vec![t("2"); 5]]);
+    let r = a.q("SELECT r / 4, f4 / 4, d / 4, f8 / 4, f / 4 FROM fw").ok("affinity");
+    assert_eq!(r.rows, vec![vec![t("0.5"); 5]], "REAL affinity: a float divides as a float");
+    let r = a.describe_statement("SELECT 1 FROM fw WHERE r = $1 AND d = $2").ok("params");
+    assert_eq!(r.params, Some(vec![700, 701]));
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the

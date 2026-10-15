@@ -3715,6 +3715,46 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
 
+    /// COMPAT: a column declared REAL before the FLOAT4 / FLOAT8 split (both real and double
+    /// precision were stored REAL then; here, engine DDL with no translator) reads as PostgreSQL's
+    /// real, float4 (700), and a DOUBLE one as float8 (701) (lead ruling 2026-10-15T07:40:59Z).
+    #[test]
+    fn an_old_real_declaration_reads_as_float4() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = crate::session::open_database_with_io(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE old_real (r_old REAL, d_old DOUBLE)")
+            .unwrap();
+        let conn = crate::Connection::new(conn);
+        for (column, oid) in [("r_old", 700), ("d_old", 701)] {
+            let mut stmt = conn
+                .prepare(format!(
+                    "SELECT atttypid FROM pg_attribute WHERE attname = '{column}'"
+                ))
+                .unwrap();
+            let StepResult::Row = stmt.step().unwrap() else {
+                panic!("{column} not found in pg_attribute");
+            };
+            let row = stmt.row().unwrap();
+            assert_eq!(
+                row.get_value(0),
+                &Value::from_i64(oid),
+                "{column}'s atttypid"
+            );
+        }
+        assert_eq!(sqlite_type_to_pg_oid("REAL"), 700);
+        assert_eq!(sqlite_type_to_pg_oid("FLOAT4"), 700);
+        assert_eq!(sqlite_type_to_pg_oid("FLOAT8"), 701);
+    }
+
     #[test]
 
     fn test_pg_namespace_query() {

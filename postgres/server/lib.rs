@@ -6048,7 +6048,12 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
-        assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
+        // RULED TEST CHANGE (lead, 2026-10-15T07:40:59Z): REAL is PostgreSQL's real, float4; a
+        // declaration stored before the FLOAT4 / FLOAT8 split reads as float4 (COMPAT).
+        assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT4);
+        assert_eq!(sqlite_type_to_pg_type("FLOAT4"), Type::FLOAT4);
+        assert_eq!(sqlite_type_to_pg_type("FLOAT8"), Type::FLOAT8);
+        assert_eq!(sqlite_type_to_pg_type("DOUBLE PRECISION"), Type::FLOAT8);
         assert_eq!(sqlite_type_to_pg_type("TEXT"), Type::TEXT);
         assert_eq!(sqlite_type_to_pg_type("BLOB"), Type::BYTEA);
         assert_eq!(sqlite_type_to_pg_type("BOOLEAN"), Type::BOOL);

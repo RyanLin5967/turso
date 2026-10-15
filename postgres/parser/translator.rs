@@ -6579,7 +6579,12 @@ mod tests {
         // Base types (no Turso custom type)
         assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
         assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        // RULED TEST CHANGE (lead, 2026-10-15T07:40:59Z): a float declaration keeps its width,
+        // FLOAT4 or FLOAT8 (both REAL affinity); both were REAL, read back as float8.
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("FLOAT4")));
+        assert_eq!(map_pg_type("FLOAT4", no_params), Some(s("FLOAT4")));
+        assert_eq!(map_pg_type("FLOAT8", no_params), Some(s("FLOAT8")));
+        assert_eq!(map_pg_type("DOUBLE PRECISION", no_params), Some(s("FLOAT8")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 
@@ -6614,7 +6619,9 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        // RULED TEST CHANGE (2026-10-15T07:40:59Z): a bare numeric is stored FLOAT8, so it keeps
+        // the float8 it was announced as (a REAL declaration now reads float4).
+        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("FLOAT8")));
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
