@@ -1220,6 +1220,16 @@ fn handle_pg_add_constraints(
         .iter()
         .filter_map(added_foreign_key)
         .collect();
+    // A parent in another schema, as precheck_create_keys refuses one (wire review 16 item 11).
+    if keys.iter().any(|k| {
+        !k.parent_schema.is_empty()
+            && !k.parent_schema.eq_ignore_ascii_case("public")
+            && !k.parent_schema.eq_ignore_ascii_case("main")
+    }) {
+        return Err(LimboError::ParseError(
+            "foreign keys in a schema other than public are not supported".to_string(),
+        ));
+    }
     let child_columns: Vec<String> = conn
         .current_schema()
         .get_btree_table(table)
@@ -1334,6 +1344,8 @@ fn handle_pg_add_constraints(
 /// parent's primary key).
 struct AddedForeignKey {
     columns: Vec<String>,
+    /// The parent's schema as written, empty when unqualified.
+    parent_schema: String,
     parent: String,
     parent_columns: Vec<String>,
 }
@@ -1357,6 +1369,7 @@ fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option
     };
     Some(AddedForeignKey {
         columns: names(&c.fk_attrs),
+        parent_schema: c.pktable.as_ref()?.schemaname.clone(),
         parent: c.pktable.as_ref()?.relname.clone(),
         parent_columns: names(&c.pk_attrs),
     })
@@ -1436,6 +1449,21 @@ fn precheck_create_keys(
         || (create.if_not_exists && conn.current_schema().get_table(&relation.relname).is_some())
     {
         return Ok(None);
+    }
+    // A table, or a parent, in another schema (an attached database): these checks read public's
+    // catalog alone, so such a key was refused for a parent public lacks, or checked against
+    // public's table of the name and never against its own; refused, as ALTER TABLE ADD
+    // CONSTRAINT refuses outside public (DECISIONS: a schema is branched or refused; wire review
+    // 16 item 11).
+    let elsewhere = |schema: &str| {
+        !schema.is_empty()
+            && !schema.eq_ignore_ascii_case("public")
+            && !schema.eq_ignore_ascii_case("main")
+    };
+    if elsewhere(&relation.schemaname) || keys.iter().any(|k| elsewhere(&k.parent_schema)) {
+        return Err(LimboError::ParseError(
+            "foreign keys in a schema other than public are not supported".to_string(),
+        ));
     }
     let child_columns: Vec<String> = create
         .table_elts
