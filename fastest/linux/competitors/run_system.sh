@@ -518,12 +518,72 @@ cap_plants() {
   # A23 open loop (the macOS claim_op's one run-wide arrival stream, drawn under the claim lock): four clients at
   # 100 ops/s judge their claims in arrival order, so the record says loop open and 0 backsteps. A regression check
   # on the live binary, not a deterministic red (per-client schedules stepped back only through wake-up jitter).
+  # Lateness is not this plant's question, so its VOID bound is lifted (--max-send-late-us); every other check stands.
+  local open_args=(--mode open --set port="$PORT" --set rows="$ROWS" --stall-s 60 --max-send-late-us 1000000)
   d="$RAW/plants/warmup-open" rc=0
-  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 4 --mode open --rate 100 --duration-s 2 \
-    --set port="$PORT" --set rows="$ROWS" --stall-s 60 --warmup 20:0.2:60 >"$d.txt" 2>&1 || rc=$?
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 4 --rate 100 --duration-s 2 \
+    --warmup 20:0.2:60 "${open_args[@]}" >"$d.txt" 2>&1 || rc=$?
   expect "warm-up plant open loop --warmup 20:0.2:60: rc|loop|warmup_backsteps|warmup_ops >= 20" \
     "$rc|$(jf "$d/summary.json" loop)|$(jf "$d/summary.json" warmup_backsteps)|$(python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get("warmup_ops", -1) >= 20)' "$d/summary.json" 2>/dev/null)" \
     "0|open|0|True"
+  # Competitors review 2 item 2: the arrivals themselves, against sched_check.py's model written from the macOS text
+  # (seed 1, the default, at 100/s): every warm-up and measured arrival, the recorded seed, count and schedule_hash
+  expect "open-loop plant: the arrivals are the macOS claim_op's stream (sched_check.py raw)" \
+    "$(python3 -B "$HERE/sched_check.py" raw "$d" 1 100 2>&1 | tail -1)" ok
+  # ... and the warm-up depends on the arrivals alone: the same seed and rate at C=1 decide it identically
+  local d1="$RAW/plants/warmup-open-c1"
+  rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d1" --clients 1 --rate 100 --duration-s 2 \
+    --warmup 20:0.2:60 "${open_args[@]}" >"$d1.txt" 2>&1 || rc=$?
+  expect "open-loop plant: C=1 and C=4 at one seed decide the warm-up identically (warmup_ops|end_ns|last_claim_ns)" \
+    "$rc|$(jf "$d1/summary.json" warmup_ops)|$(jf "$d1/summary.json" warmup_end_ns)|$(jf "$d1/summary.json" warmup_last_claim_ns)" \
+    "0|$(jf "$d/summary.json" warmup_ops)|$(jf "$d/summary.json" warmup_end_ns)|$(jf "$d/summary.json" warmup_last_claim_ns)"
+  # Competitors review 2 item 1: the window is defined in intended time, decided at the claims (claim_op). A slow
+  # system (5 ms ops at C=1 against 300 arrivals/s: a growing backlog) must measure exactly the arrivals a fast one
+  # does, and no measured row may be intended at or after tm1. Both run 200 measured arrivals (--min-ops 200,
+  # --duration-s 0) after the same warm-up.
+  local wf="$RAW/plants/window-fast" ws="$RAW/plants/window-slow" rcf=0 rcs=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$wf" --clients 1 --rate 300 --seed 3 --min-ops 200 \
+    --duration-s 0 --warmup 20:0.2:60 "${open_args[@]}" >"$wf.txt" 2>&1 || rcf=$?
+  timeout 120 "$BB" --spec "$SPECS/pg18-sleep5.spec" --out "$ws" --clients 1 --rate 300 --seed 3 --min-ops 200 \
+    --duration-s 0 --warmup 20:0.2:60 "${open_args[@]}" >"$ws.txt" 2>&1 || rcs=$?
+  expect "open-loop window plant: rc fast|rc slow|the same measured arrivals (sched_check.py same)" \
+    "$rcf|$rcs|$(python3 -B "$HERE/sched_check.py" same "$wf" "$ws" 2>&1 | tail -1)" "0|0|ok"
+  expect "open-loop window plant: no measured row intended at or after tm1 (slow|fast)" \
+    "$(python3 -B "$HERE/sched_check.py" after-tm1 "$ws" 2>&1 | tail -1)|$(python3 -B "$HERE/sched_check.py" after-tm1 "$wf" 2>&1 | tail -1)" \
+    "ok|ok"
+  # Comp review 1 LOW 14: a live claim path where OPS binds (C=4 clients, 5 ms ops: 300 warm-up ops take longer than
+  # S 0.2 s), so a mutant dropping OPS from the live decision cannot pass; the record must pass timedrun.py's A23 check
+  d="$RAW/plants/warmup-ops-binding" rc=0
+  timeout 120 "$BB" --spec "$SPECS/pg18-sleep5.spec" --out "$d" --clients 4 --max-ops 50 --set port="$PORT" \
+    --set rows="$ROWS" --stall-s 60 --warmup 300:0.2:60 >"$d.txt" 2>&1 || rc=$?
+  expect "warm-up plant OPS-binding (C=4, 300:0.2:60): rc|warmup_ops|loop|warmup_backsteps|timedrun warm-check" \
+    "$rc|$(jf "$d/summary.json" warmup_ops)|$(jf "$d/summary.json" loop)|$(jf "$d/summary.json" warmup_backsteps)|$(python3 -B "$HERE/timedrun.py" warm-check "$d" 300:0.2:60 2>&1 | tail -1)" \
+    "0|300|closed|0|ok"
+  # Competitors review 2 item 4: the backstep counter made to fire. bbload-plant-claim-early (build.sh, the same source
+  # with -DPLANT_CLAIM_TIME_EARLY) reads the claim's time BEFORE the claim lock and sleeps 20-200 us on odd clients, the
+  # defect fixed at 0138d2128; at C=8 its record must count backsteps and timedrun.py must refuse it, while the real
+  # binary, same arguments, records 0 and passes.
+  local bbp v
+  bbp="$(dirname "$BB")/bbload-plant-claim-early"
+  for v in real plant; do
+    local bin=$BB
+    [ $v = plant ] && bin=$bbp
+    d="$RAW/plants/claim-time-$v" rc=0
+    if [ ! -x "$bin" ]; then fail "claim-time plant: no $bin"; continue; fi
+    timeout 120 "$bin" --spec "$SPECS/pg18-sleep5.spec" --out "$d" --clients 8 --max-ops 50 --set port="$PORT" \
+      --set rows="$ROWS" --stall-s 60 --warmup 200:0.5:60 >"$d.txt" 2>&1 || rc=$?
+    local bs chk
+    bs=$(jf "$d/summary.json" warmup_backsteps)
+    chk=$(python3 -B "$HERE/timedrun.py" warm-check "$d" 200:0.5:60 2>&1 | tail -1)
+    if [ $v = real ]; then
+      expect "claim-time plant, the real binary at C=8: rc|warmup_backsteps|timedrun warm-check" "$rc|$bs|$chk" "0|0|ok"
+    elif [ "$rc" = 0 ] && [[ $bs =~ ^[1-9][0-9]*$ ]] && [[ $chk == REFUSED* ]]; then
+      pass "claim-time plant, the early-clock mutant at C=8: $bs backsteps, timedrun refused it"
+    else
+      fail "claim-time plant, the early-clock mutant at C=8: rc $rc, warmup_backsteps [$bs], warm-check [$chk] (want >0 and REFUSED)"
+    fi
+  done
   # MED 7: --warmup with a legacy flag is refused (rc 2), and the recorded rule is the EFFECTIVE one
   d="$RAW/plants/warmup-mixed" rc=0
   timeout 120 "$BB" --spec "$SPECS/pg18-select1.spec" --out "$d" --clients 1 --max-ops 10 --set port="$PORT" \
@@ -770,6 +830,14 @@ b1_main() {
     --clients 1 --max-ops 5 --rows "$ROWS" --warmup 1000:1:0 --drop --out "$wpz" >"$wpz.txt" 2>&1 || rcz=$?
   expect "warm-up plant b1 --warmup 1000:1:0 (A23: MAX_S 0 ends at the first claim): rc|warmup_ops|warmup_capped" \
     "$rcz|$(jf "$wpz/summary.json" warmup_ops)|$(jf "$wpz/summary.json" warmup_capped)" "0|0|True"
+  # Comp review 1 LOW 14: clonebench's live claim path where OPS binds (C=4, S 0: only OPS can end it done), and the
+  # record through timedrun.py's A23 check; review 2 item 4's twin for clonebench: C=4 records loop closed, 0 backsteps
+  local wpo="$RAW/plants/warmup-b1-ops" rco=0
+  timeout 120 "$CB" run --mode b1 --op m1c --sync d0 --parent "$ROOT/parent.db" --dir "$ROOT/branches/warmup-plant" \
+    --clients 4 --max-ops 20 --rows "$ROWS" --warmup 300:0:60 --drop --out "$wpo" >"$wpo.txt" 2>&1 || rco=$?
+  expect "warm-up plant b1 OPS-binding (C=4, 300:0:60): rc|warmup_ops|loop|warmup_backsteps|timedrun warm-check" \
+    "$rco|$(jf "$wpo/summary.json" warmup_ops)|$(jf "$wpo/summary.json" loop)|$(jf "$wpo/summary.json" warmup_backsteps)|$(python3 -B "$HERE/timedrun.py" warm-check "$wpo" 300:0:60 2>&1 | tail -1)" \
+    "0|300|closed|0|ok"
   expect "warm-up plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \

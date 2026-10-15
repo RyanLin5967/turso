@@ -42,6 +42,7 @@ on:
     branches: [fastest-branching, fastest-linux-comp]
     paths:
       - "fastest/linux/competitors/**"
+      - "fastest/linux/gates/**"
       - "fastest/linux/hw/**"
       - "fastest/linux/fs/**"
       - ".github/workflows/fastest-competitors.yml"
@@ -121,6 +122,13 @@ jobs:
           timeout 300 python3 -B fastest/linux/gates/warmup_conformance.py run --bbload dist/bbload \
             --clonebench dist/clonebench || rc=$?
           [ "$rc" = 3 ] || { echo "warm-up conformance rc=$rc, want 3 (both drivers match every case)"; exit 1; }
+      # Competitors review 2 (f6c2dbb2f..12f79726b) items 2, 4, 5 and 7: the built binaries' refusals (open loop with
+      # after-steps or a branch connection; strict --rate, --seed and the other numbers) and the live decision replayed
+      # with a step back (--warmup-decide), no server needed; sched_check.py's model of the open-loop arrival stream
+      - name: Binary plants (refusals, --warmup-decide) and sched_check.py selftest
+        run: |
+          timeout 120 python3 -B fastest/linux/competitors/sched_check.py selftest | tail -1
+          timeout 600 bash fastest/linux/competitors/bin_plants.sh dist "$RUNNER_TEMP/bin-plants"
       - uses: actions/upload-artifact@v4
         with:
           name: competitor-tools-${{ matrix.runner }}
@@ -203,7 +211,7 @@ jobs:
       - name: Run info
         run: |
           mkdir -p "$RAW"
-          chmod +x dist/bbload dist/clonebench dist/sqlite3
+          chmod +x dist/bbload dist/clonebench dist/sqlite3 dist/bbload-plant-claim-early
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP dry=$FT_DRY (smoke, uncredited) age=$FT_AGE prebranch=$FT_PREBRANCH";

@@ -49,6 +49,13 @@ clang "${CF[@]}" -I"$W/hdr/include" $(pkg-config --cflags libpq) $(mariadb_confi
   -o "$OUT/bbload.tmp.$$" "$HERE/loadgen/bbload.c" "$HDRLIB" \
   $(pkg-config --libs libpq) $(mariadb_config --libs) -lpthread -lm
 mv -f "$OUT/bbload.tmp.$$" "$OUT/bbload"
+# A PLANT build, never a measuring one (competitors review 2 f6c2dbb2f..12f79726b item 4): the same source with the
+# claim's time read BEFORE the claim lock and a 20-200 us sleep on odd clients, the defect 0138d2128 fixed, so
+# run_system.sh's claim-time plant can show the backstep counter fire and timedrun.py refuse the record.
+clang "${CF[@]}" -DPLANT_CLAIM_TIME_EARLY -I"$W/hdr/include" $(pkg-config --cflags libpq) $(mariadb_config --cflags) \
+  -o "$OUT/bbload-plant-claim-early.tmp.$$" "$HERE/loadgen/bbload.c" "$HDRLIB" \
+  $(pkg-config --libs libpq) $(mariadb_config --libs) -lpthread -lm
+mv -f "$OUT/bbload-plant-claim-early.tmp.$$" "$OUT/bbload-plant-claim-early"
 clang "${CF[@]}" -I"$W/hdr/include" -I"$W/sqlite/include" \
   -o "$OUT/clonebench.tmp.$$" "$HERE/baselines/clonebench.c" "$W/sqlite/lib/libsqlite3.a" "$HDRLIB" -lpthread -ldl -lm
 mv -f "$OUT/clonebench.tmp.$$" "$OUT/clonebench"
@@ -67,6 +74,6 @@ if ldd "$OUT/sqlite3" | grep -q libsqlite3; then echo "REFUSED: the sqlite3 CLI 
   echo "hdrhistogram_c=0.11.10 static=$HDRLIB"
   echo "## ldd bbload"; ldd "$OUT/bbload"
   echo "## ldd clonebench"; ldd "$OUT/clonebench"
-  (cd "$OUT" && sha256sum bbload clonebench sqlite3)
+  (cd "$OUT" && sha256sum bbload clonebench sqlite3 bbload-plant-claim-early)
 } | tee "$OUT/build-info.txt"
 rm -rf "$W"
