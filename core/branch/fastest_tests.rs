@@ -9572,6 +9572,56 @@ fn a_background_compaction_stopped_before_its_cut_loses_nothing() {
     );
 }
 
+/// Lead order 1 (2026-10-15T07:29:43Z; gates ultrareview row 1): 1f70dde48 made recovery replay a
+/// snapshot store's OLDER log past the marker of the snapshot's generation. A binary from before
+/// it resets that log and loses every record past the marker (1f70dde48's own disclosed blind
+/// spot), so it must REFUSE such a store, never reset it: the format version moves with the
+/// replay. The crash image of `a_background_compaction_stopped_before_its_cut_loses_nothing`,
+/// read at the last default-arm format before the replay (15), is refused; read at this build's
+/// own, it recovers (the control).
+#[test]
+fn a_store_needing_the_older_log_replay_is_refused_by_an_older_format() {
+    use std::sync::atomic::Ordering as O;
+    const BEFORE_OLDER_LOG_REPLAY: u32 = 15;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("compact-format.db");
+    {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        super::store::COMPACT_STOP_BEFORE_CUT.store(true, O::Release);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.background_compactions() == 0 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction ran");
+        }
+        eventually("premise: the background compaction never stopped", || !db.branches.compaction_owed_for_test());
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 3, "after");
+    }
+    super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+    let files = super::journal::BranchFiles::for_db(path.to_str().unwrap());
+    assert!(files.snap.exists(), "premise: the stopped compaction installed no snapshot");
+    let old = super::journal::Journal::recover_as(&files, SyncClass::Fsync, BEFORE_OLDER_LOG_REPLAY);
+    assert!(
+        old.is_err(),
+        "CLAIM: a reader of format {BEFORE_OLDER_LOG_REPLAY}, which resets an older log, read a store \
+         whose records past the marker only the older-log replay keeps"
+    );
+    drop(old);
+    let own = super::journal::Journal::recover_as(&files, SyncClass::Fsync, super::journal::format_version(false));
+    assert!(matches!(own, Ok(Some(_))), "premise: this build does not recover the store: {:?}", own.err());
+}
+
 /// DECISIONS bd0d845f97: the cut's last pass copies under the mutex what flights wrote after its
 /// catch-ups, and syncs it only when a flight there claimed a sync. A raised D0 store's flights are
 /// only written, so that copy syncs nothing, and no operation is counted waiting behind it. With no
