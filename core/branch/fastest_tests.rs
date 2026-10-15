@@ -8430,3 +8430,57 @@ fn a_fresh_d0_stores_first_syncing_flight_off_unix_does_not_fail_stop_it() {
         assert_eq!(read_v(&x.connect().unwrap(), 3), "trunk-3", "{what}: x reads its fork point");
     }
 }
+
+/// Engine review 19 MED 7: a D0 compaction writes its snapshot and syncs nothing, and nothing synced
+/// it later. A reopen in a class that syncs, or a raised flight in the same process, then made
+/// records durable on top of it (the log's reset, a create's flight), so a power cut after their
+/// acknowledgement could leave the snapshot every branch lives in torn, and the next open refuses
+/// the whole store as Corrupt. The snapshot is synced before anything syncs on top of it: (a) at an
+/// open in FullFsync over a D0 compaction's snapshot, (b) by the first syncing flight after a D0
+/// compaction in the same process. Counted on the syncing thread (`journal::SNAP_SYNCS`). Snapshot
+/// mode: a catalog store has no snapshot. Mutants `snapshot_left_unsynced_at_open` (a) and
+/// `snapshot_left_unsynced_by_flight` (b).
+#[test]
+fn a_d0_compactions_snapshot_is_synced_before_anything_syncs_on_top_of_it() {
+    let _s = serial();
+    let snaps = || super::journal::SNAP_SYNCS.with(|c| c.get());
+    let dir = tempfile::TempDir::new().unwrap();
+    // (a) a reopen in FullFsync.
+    let path = dir.path().join("snap-open.db");
+    let incarnation = {
+        let db = open_at(&path, opts(false, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 40, "x");
+        let _x = x.into_id();
+        db.branch_compact_now().unwrap();
+        assert!(
+            std::path::PathBuf::from(format!("{}-branch-snap", path.display())).exists(),
+            "(a) premise: the D0 compaction wrote a snapshot"
+        );
+        db.incarnation
+    };
+    let before = snaps();
+    let db = reopen(&path, opts(false, SyncClass::FullFsync), incarnation);
+    assert_eq!(snaps() - before, 1, "(a) a FullFsync open over a D0 compaction's snapshot synced it {} times, not once", snaps() - before);
+    drop(db);
+    // (b) the first syncing flight after a D0 compaction.
+    let path = dir.path().join("snap-flight.db");
+    let db = open_at(&path, opts(false, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let x = trunk.fork_branch().unwrap();
+    db.branch_compact_now().unwrap();
+    assert!(
+        std::path::PathBuf::from(format!("{}-branch-snap", path.display())).exists(),
+        "(b) premise: the D0 compaction wrote a snapshot"
+    );
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    let before = snaps();
+    // Keeps x a pre-image in a raised flight, which syncs.
+    write_v(&trunk, 3, "new");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "(b) premise: the trunk commit's flight synced (it raised the log)");
+    assert_eq!(snaps() - before, 1, "(b) the first syncing flight after a D0 compaction synced its snapshot {} times, not once", snaps() - before);
+    drop(x);
+}

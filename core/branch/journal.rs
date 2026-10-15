@@ -4117,6 +4117,9 @@ thread_local! {
     /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
     /// durable once before the next acknowledgement, never once per flight).
     pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test builds: syncs of a snapshot no rewrite synced (a D0 compaction's), made on this thread
+    /// (engine review 19 MED 7).
+    pub(crate) static SNAP_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Test builds: branch-file syncs this thread asked for, by class (`[Fsync, FullFsync]`),
     /// whatever the platform makes of them (engine review 16 MED 7: off Apple both are fsync(2)).
     pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
