@@ -1647,20 +1647,72 @@ impl PostgreSQLTranslator {
         // Extract SET assignments from target_list
         // Each ResTarget has name (column) and val (expression)
         let mut sets = Vec::new();
-        for target_node in &update.target_list {
+        for (i, target_node) in update.target_list.iter().enumerate() {
             match &target_node.node {
                 Some(Node::ResTarget(res_target)) => {
                     let col_name = ast::Name::from_string(&res_target.name);
-                    let expr = if let Some(val) = &res_target.val {
-                        Box::new(self.translate_expr(val)?)
-                    } else {
+                    let Some(val) = &res_target.val else {
                         return Err(ParseError::ParseError(
                             "SET assignment missing value".into(),
                         ));
                     };
+                    // `SET (a, b) = source`: libpg_query gives each column a MultiAssignRef, its
+                    // place in the list (colno, from 1) and the list's length, each with the
+                    // source. A row's element goes to its column; any other source (a
+                    // subquery) is one assignment of every column of the list, at its first.
+                    // It was "Unsupported expression type" (0A000), so the statement could not run
+                    // and its Describe failed (found by the cloud run of
+                    // untyped_contexts_type_their_parameters, 2026-10-10).
+                    if let Some(Node::MultiAssignRef(m)) = val.node.as_ref() {
+                        let source = m.source.as_deref().ok_or_else(|| {
+                            ParseError::ParseError("SET assignment missing value".into())
+                        })?;
+                        let columns = usize::try_from(m.ncolumns).unwrap_or(0);
+                        if let Some(Node::RowExpr(row)) = source.node.as_ref() {
+                            if row.args.len() != columns {
+                                return Err(ParseError::ParseError(
+                                    "number of columns does not match number of values".into(),
+                                ));
+                            }
+                            let item = usize::try_from(m.colno - 1)
+                                .ok()
+                                .and_then(|k| row.args.get(k))
+                                .ok_or_else(|| {
+                                    ParseError::ParseError(
+                                        "number of columns does not match number of values".into(),
+                                    )
+                                })?;
+                            sets.push(ast::Set {
+                                col_names: vec![col_name],
+                                expr: Box::new(self.translate_expr(item)?),
+                            });
+                        } else if m.colno == 1 {
+                            let col_names = update
+                                .target_list
+                                .get(i..i + columns)
+                                .ok_or_else(|| {
+                                    ParseError::ParseError(
+                                        "number of columns does not match number of values".into(),
+                                    )
+                                })?
+                                .iter()
+                                .map(|t| match &t.node {
+                                    Some(Node::ResTarget(r)) => Ok(ast::Name::from_string(&r.name)),
+                                    _ => Err(ParseError::ParseError(
+                                        "Unexpected node in UPDATE SET clause".into(),
+                                    )),
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            sets.push(ast::Set {
+                                col_names,
+                                expr: Box::new(self.translate_expr(source)?),
+                            });
+                        }
+                        continue;
+                    }
                     sets.push(ast::Set {
                         col_names: vec![col_name],
-                        expr,
+                        expr: Box::new(self.translate_expr(val)?),
                     });
                 }
                 _ => {
