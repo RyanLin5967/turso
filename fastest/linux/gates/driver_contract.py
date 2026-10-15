@@ -167,6 +167,9 @@ def self_test():
         return r
 
     EC = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+    # rec()'s warm-up as its live record: 5000 warm-up claims, then the stop's claim at 2.02 s, capped
+    LIVE = {"rule": "1000000:0:2", "claims_ns": [i * 400_000 for i in range(5000)] + [2_020_000_000], "stop_at": 5000,
+            "warm_ops": 5000, "capped": 1}
     W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5, "exception_counters": EC}
 
     cases = [
@@ -257,6 +260,18 @@ def self_test():
          check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
                                                       "after": EC["after"] | {"compaction_waits": 9}}}]), 33, 4,
                "1000000:0:2") == []),
+        # fresh read of 7a8c3a817..0802dd739, finding 2: the live record shares warm_ends with the replay, so replaying it
+        # alone can only catch a claim-handling split; it must also be the run's own warm-up (summary.json warmup):
+        # one claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, its last claim at stop_secs, capped
+        ("tie: a live record that is the summary's warm-up keeps the contract", tie(rec(), LIVE) == []),
+        ("tie: a live record missing a claim (5000 claims for stop_at 5000) fails",
+         tie(rec(), LIVE | {"claims_ns": LIVE["claims_ns"][1:]}) != []),
+        ("tie: a live stop_at other than ops_at_stop fails", tie(rec(), LIVE | {"stop_at": 4999, "warm_ops": 4999}) != []),
+        ("tie: a live last claim at 2.5 s beside stop_secs 2.02 fails",
+         tie(rec(), LIVE | {"claims_ns": LIVE["claims_ns"][:-1] + [2_500_000_000]}) != []),
+        ("tie: a live capped 0 beside the summary's capped true fails", tie(rec(), LIVE | {"capped": 0}) != []),
+        ("tie: a live rule other than the summary's fails", tie(rec(), LIVE | {"rule": "10:0:30"}) != []),
+        ("tie: no live record (None) fails", tie(rec(), None) != []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
