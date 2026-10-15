@@ -884,6 +884,14 @@ def selftest():
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1 - 1, tm1 + 900)])), True),
         ("claim_ns: a measured row claimed at tm1 (the window is closed at the claim)",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 + 900)])), False),
+        # open loop: claim_op stamps tm1 at the claimed ARRIVAL's intended time, not at the claim's clock reading, so the
+        # window is in intended time there whatever claim_ns says (a backlogged client claims late; a free one early)
+        ("claim_ns, open loop: a measured row intended before tm1 and claimed after it (a backlog) is in the window",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 + 900, tm1 - 1)])), True),
+        ("claim_ns, open loop: a measured row intended at tm1 and claimed before it",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 - 900, tm1)])), False),
         ("no tm1_ns in the timed summary", dict(tracer=clean, timed_extra={"tm1_ns": None}), False),
         ("the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), drop_warm=1)), False),
@@ -1048,6 +1056,8 @@ def selftest():
             ("timed run measured 1 op(s) intended at or after tm1",),
         "claim_ns: a measured row claimed at tm1 (the window is closed at the claim)":
             ("timed run measured 1 op(s) claimed at or after tm1",),
+        "claim_ns, open loop: a measured row intended at tm1 and claimed before it":
+            ("timed run measured 1 op(s) intended at or after tm1",),
         "no tm1_ns in the timed summary": ("timed run has no tm1_ns",),
         "the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)":
             ("timed run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500",),
