@@ -633,9 +633,10 @@ def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None):
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
             lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3), lab=True, raw=True,
-            rc_file=None, lab_extra=None, timed_extra=None, timed_raw=None):
+            rc_file=None, lab_extra=None, timed_extra=None, timed_raw=None, prebranch="prebranch=20 prebranch_c=4 prebranch_s=1800"):
     """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case). Each run's
-    raw.tsv agrees with its summary (raw_tsv) unless TIMED_RAW gives the timed one's text (one defect per case)."""
+    raw.tsv agrees with its summary (raw_tsv) unless TIMED_RAW gives the timed one's text (one defect per case).
+    PREBRANCH: run_system.sh's prebranch.txt for the cell (the lead's LOW 21 ruling; None: no record)."""
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     if live == "held":
@@ -643,6 +644,9 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
     if live is not None:  # None: no live.tsv at all
         with open(os.path.join(d, "live.tsv"), "w") as f:
             f.write("".join(f"{k}\t{v}\n" for k, v in live.items()))
+    if prebranch is not None:
+        with open(os.path.join(d, "prebranch.txt"), "w") as f:
+            f.write(prebranch + "\n")
     lo = n if lab_ops is None else lab_ops
     run = dict(RUN, window_s=1800.0 if capped else RUN["window_s"])
     if lab:
@@ -898,6 +902,9 @@ def selftest():
         ("a cell run with --no-drain (both runs)", dict(tracer=clean, lab_extra={"no_drain": True},
                                                         timed_extra={"no_drain": True}), False),
         ("a cell with no no_drain record", dict(tracer=clean, timed_extra={"no_drain": None}), False),
+        # the lead's LOW 21 ruling: the prebranch (N, its clients and its bound) is recorded for every cell
+        ("a cell with no prebranch record", dict(tracer=clean, prebranch=None), False),
+        ("a cell whose prebranch record is not counts", dict(tracer=clean, prebranch="prebranch=x"), False),
         # comp review 1 MED 12: the sweeper is a cost beside the competitors' timed runs only, so its own CPU is part of
         # the record (timed.json sweeper_cpu_s, below), and it runs at nice 19
         ("the sweep lines carry no sweeper CPU", dict(tracer=trace_rec(cpu=False)), False),
@@ -1043,6 +1050,8 @@ def selftest():
         "a cell run with --no-drain (both runs)":
             ("labelling run ran with --no-drain", "timed run ran with --no-drain"),
         "a cell with no no_drain record": ("timed run has no no_drain record",),
+        "a cell with no prebranch record": ("no prebranch record prebranch.txt",),
+        "a cell whose prebranch record is not counts": ("prebranch record",),
         "the sweep lines carry no sweeper CPU": ("has no sweeper CPU (cpu=)",),
         "no sweeper header": ("tracer record has no sweeper header",),
         "the sweeper ran at nice 0": ("the sweeper ran at nice 0, not 19",),
@@ -1092,6 +1101,17 @@ def selftest():
         got = (tj.get("sweeper_cpu_s"), tj.get("sweeper_cpu_span_s"), tj.get("sweeper_nice"))
         ok(isinstance(got[0], float) and abs(got[0] - 0.04) < 1e-12 and got[1] == [100.1, 100.3] and got[2] == 19,
            f"timed.json sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice = {got!r}, want (0.04, [100.1, 100.3], 19)")
+    # The lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers, so a real cell whose prebranch is beyond 1,000
+    # is exploratory, never credited ('ok-exploratory-n', not 'ok'); timed.json records the prebranch's N, clients and
+    # bound. A smoke cell stays 'ok-smoke'.
+    for pre, dry_in, want in ((1000, "0", "ok"), (1001, "0", "ok-exploratory-n"), (100000, "0", "ok-exploratory-n"),
+                              (100000, "1", "ok-smoke")):
+        with tempfile.TemporaryDirectory() as root:
+            dd = fixture(root, "pre", tracer=clean, prebranch=f"prebranch={pre} prebranch_c=8 prebranch_s=3600")
+            tj = write_verdict(dd, 200, [], RULE, str(CAP), dry_in)
+            got = (tj.get("verdict"), tj.get("prebranch"))
+            ok(got == (want, {"prebranch": pre, "prebranch_c": 8, "prebranch_s": 3600}),
+               f"timed.json at prebranch {pre}, dry {dry_in}: {got!r}, want ({want!r}, the record)")
     # ... and the bracket guard alone (in a cell, tracer_problems' own "no sweep before the window" refuses first)
     rec, why = sweeper_record(clean.splitlines(), {"tm0_realtime_s": 99.0, "tm1_realtime_s": 100.3})
     ok(rec is None and any("no sweeps bracket the measured window" in w for w in why),
