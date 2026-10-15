@@ -433,6 +433,23 @@ def warm_check(d, warm_rule):
     return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm)
 
 
+REGISTERED_PREBRANCH_MAX = 1000  # the lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers
+
+
+def prebranch_record(celldir):
+    """CELLDIR/prebranch.txt (run_system.sh: 'prebranch=N prebranch_c=C prebranch_s=S'), as {key: int}; (None, why)
+    when it is missing or not three counts."""
+    p = os.path.join(celldir, "prebranch.txt")
+    try:
+        kv = dict(re.findall(r"(\w+)=(\S+)", open(p).read()))
+    except OSError:
+        return None, "no prebranch record prebranch.txt: the cell's N, its clients and its bound are unknown"
+    keys = ("prebranch", "prebranch_c", "prebranch_s")
+    if not all(str(kv.get(k, "")).isdigit() for k in keys):
+        return None, f"prebranch record {kv} is not three counts ({', '.join(keys)})"
+    return {k: int(kv[k]) for k in keys}, None
+
+
 def check(celldir, n, warm_rule=None, live=None, cap=None):
     """The reasons CELLDIR's timed run cannot supply a latency ([] = it can)."""
     why = []
@@ -478,6 +495,9 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     if lab and t:
         why += pair_problems(lab, t)
     why += tracer_problems(os.path.join(celldir, "timed.tracer.tsv"), t)  # MED 4
+    pre, pwhy = prebranch_record(celldir)  # the lead's LOW 21 ruling: every cell records its prebranch
+    if pwhy:
+        why.append(pwhy)
     if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
         got = {}
         try:
@@ -525,6 +545,12 @@ def write_verdict(celldir, n, why, warm_rule, cap, dry):
            "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)},
            # MED 5: a capped timed run with 100-999 ok ops is complete with p50 only (PREREG FINAL-CANDIDATE :214)
            "tier": tier(t) if t else None, "p50_only": tier(t) == "p50_only" if t else None}
+    # The lead's LOW 21 ruling: the prebranch (N, clients, bound) is recorded; a real cell beyond the registered 1,000
+    # is exploratory and never credited until an annex row registers it
+    pre, _ = prebranch_record(celldir)
+    out["prebranch"] = pre
+    if out["verdict"] == "ok" and pre and pre["prebranch"] > REGISTERED_PREBRANCH_MAX:
+        out["verdict"] = "ok-exploratory-n"
     try:  # the live-branch counts around both runs, as run_system.sh read them (HIGH 1)
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
     except OSError:

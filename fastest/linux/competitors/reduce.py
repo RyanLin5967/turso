@@ -233,7 +233,10 @@ def main(argv):
             # gives a clean smoke cell that verdict whatever its rule, so it can never read 'ok'), a real job (dry=0)
             # only with 'ok'
             want_tv = {"1": "ok-smoke", "0": "ok"}.get(run_param(a, "dry"))
-            if tv != want_tv:
+            if tv == "ok-exploratory-n" and want_tv == "ok":
+                # the lead's LOW 21 ruling: a prebranch beyond the registered 1,000 is exploratory, never credited
+                print(f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N beyond the registered 1,000, NOT CREDITED)")
+            elif tv != want_tv:
                 print(f"TIMED\t{name}\t{cell}\t{tv} (want {want_tv!r} for run-info dry={run_param(a, 'dry')!r})")
                 bad += 1
     # MED 7: one cap, one warm-up rule and (comp review 1 LOW 15) one dry value for every job of the run (each job's

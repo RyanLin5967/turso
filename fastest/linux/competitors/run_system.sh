@@ -363,6 +363,9 @@ ops_line_ok() {
 # timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
 # N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
 timedrun_check() {
+  # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
+  # exploratory, never credited
+  echo "prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S" >"$1/prebranch.txt"
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" "$DRY" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" 1 >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
