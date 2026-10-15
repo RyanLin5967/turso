@@ -3313,8 +3313,12 @@ impl Program {
                         // savepoint cannot be undone alone, so its error rolls back the
                         // transaction, unless the statement never began writing (a read, or a
                         // writer refused before its first write): it changed nothing, so its
-                        // error ends only itself, as PostgreSQL's statement does and SQLite's
-                        // read-only one does (fastest-engine 4b). Errors that may have damaged
+                        // error ends only itself, as SQLite's read-only statement's does
+                        // (sqlite3VdbeHalt rolls back only on an I/O, NOMEM or FULL error;
+                        // fastest-engine 4b). PostgreSQL differs: any error aborts the block until
+                        // ROLLBACK or ROLLBACK TO (25P02), and COMMIT then rolls it back, which a
+                        // PostgreSQL session over this engine must emulate itself (engine review 19
+                        // LOW 17; the wire lane). Errors that may have damaged
                         // the engine's own state still roll back
                         // (`error_ends_the_transaction`). Mutant `read_error_rolls_back_txn`
                         // (test builds only): every error rolls back, as before.
