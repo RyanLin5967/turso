@@ -467,6 +467,10 @@ thread_local! {
     /// commit on this thread makes yield IO first, as a `merge_delta` that meets an uncached page
     /// would. Thread-local, so a parallel test is never affected.
     pub(crate) static VIEW_MERGE_YIELDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test instrument (engine review 19 LOW 15): at 1, the next materialized-view merge a commit on
+    /// this thread makes returns `Busy` instead; at n > 1, the n-th from now does (each merge counts
+    /// it down).
+    pub(crate) static VIEW_MERGE_BUSY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `err` ends an explicit transaction even when the failing statement wrote nothing. The
@@ -2336,9 +2340,26 @@ impl Program {
                                 crate::io::Completion::new_yield(),
                             )));
                         }
+                        // Test instrument (engine review 19 LOW 15): this merge returns Busy.
+                        #[cfg(test)]
+                        if VIEW_MERGE_BUSY.with(|n| {
+                            let left = n.get();
+                            n.set(left.saturating_sub(1));
+                            left == 1
+                        }) {
+                            return Err(LimboError::Busy);
+                        }
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(_) => {
+                                // Its delta is in the view's pages now, in this transaction: a
+                                // commit that starts over after a later view's merge fails merges
+                                // it no more (engine review 19 LOW 15), and a write made meanwhile
+                                // starts it a fresh delta. Mutant `view_merge_restarts_merged`
+                                // (test builds only): kept, as before.
+                                if !crate::branch::store::fe_mutant("view_merge_restarts_merged") {
+                                    self.connection.view_transaction_states.remove(view_name);
+                                }
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),
@@ -2380,9 +2401,23 @@ impl Program {
         // Apply view deltas with I/O handling. A yield is recorded in `commit_state`, so the
         // statement's re-entry resumes this commit rather than judging it a new one (an explicit
         // COMMIT has already made its transition; engine review 16 HIGH 1).
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        let applied = self.apply_view_deltas(program_state, rollback, &pager);
+        // A merge that failed part-way: the commit, if re-entered, starts its view merges over
+        // from the connection's view states, where each view already merged no longer has a delta
+        // (engine review 19 LOW 15: resumed at the failed view, the views before it never saw a
+        // write made in between). Mutant `view_merge_restarts_merged` (test builds only): resumed
+        // where it stopped, as before.
+        if applied.is_err() && !crate::branch::store::fe_mutant("view_merge_restarts_merged") {
+            program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        }
+        match applied? {
             IOResult::IO(io) => {
-                if matches!(program_state.commit_state, CommitState::Ready) {
+                // Mutant `view_yield_unrecorded` (test builds only; engine review 19 LOW 16): the
+                // yield left unrecorded, so the re-entry judges the COMMIT anew, as before engine
+                // review 16 HIGH 1 (i); killed by a_busy_commit_whose_view_merge_yielded_commits_once.
+                if matches!(program_state.commit_state, CommitState::Ready)
+                    && !crate::branch::store::fe_mutant("view_yield_unrecorded")
+                {
                     program_state.commit_state = CommitState::ApplyingViewDeltas;
                 }
                 return Ok(IOResult::IO(io));
@@ -2745,6 +2780,19 @@ impl Program {
             Ok(IOResult::Done(()))
         };
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
+        // The main pager's commit refused Busy: its copy-decision pass refused before its first
+        // frame, so no commit has begun, even when it is re-entered after a yield inside that commit
+        // (a spill's wait), which left Committing. Back to Ready, so the statement's Busy handling
+        // restores the open transaction as for a first attempt (`undo_commit_transition_after_busy`;
+        // engine review 19 MED 3). Mutant `busy_after_yield_keeps_committing` (test builds only):
+        // left Committing, as before.
+        if matches!(txn_finish_result, Err(LimboError::Busy))
+            && !rollback
+            && !program_state.commit_published
+            && !crate::branch::store::fe_mutant("busy_after_yield_keeps_committing")
+        {
+            *commit_state = CommitState::Ready;
+        }
         match txn_finish_result? {
             IOResult::Done(_) => {
                 // Main pager commit done, now commit attached database pagers. Main's half is
@@ -3265,8 +3313,12 @@ impl Program {
                         // savepoint cannot be undone alone, so its error rolls back the
                         // transaction, unless the statement never began writing (a read, or a
                         // writer refused before its first write): it changed nothing, so its
-                        // error ends only itself, as PostgreSQL's statement does and SQLite's
-                        // read-only one does (fastest-engine 4b). Errors that may have damaged
+                        // error ends only itself, as SQLite's read-only statement's does
+                        // (sqlite3VdbeHalt rolls back only on an I/O, NOMEM or FULL error;
+                        // fastest-engine 4b). PostgreSQL differs: any error aborts the block until
+                        // ROLLBACK or ROLLBACK TO (25P02), and COMMIT then rolls it back, which a
+                        // PostgreSQL session over this engine must emulate itself (engine review 19
+                        // LOW 17; the wire lane). Errors that may have damaged
                         // the engine's own state still roll back
                         // (`error_ends_the_transaction`). Mutant `read_error_rolls_back_txn`
                         // (test builds only): every error rolls back, as before.

@@ -175,6 +175,11 @@ impl AllViewsTxState {
         self.states.borrow_mut().clear();
     }
 
+    /// Drop one view's transaction state: its delta was merged into the view's storage.
+    pub fn remove(&self, view_name: &str) {
+        self.states.borrow_mut().remove(view_name);
+    }
+
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
         self.states.borrow().is_empty()
