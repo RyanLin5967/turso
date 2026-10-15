@@ -101,6 +101,16 @@ def shared_buffers_bytes(settings_tsv_text):
     return int(row[1]) * 8 * 1024, None
 
 
+D2_SETTINGS = {"wal_sync_method": "fdatasync", "file_copy_method": "clone", "fsync": "on", "synchronous_commit": "on",
+               "full_page_writes": "on"}  # pg18.sh init's MODE d2 (comp review 1 LOW 36: all five, read back)
+
+
+def check_d2(settings_tsv_text):
+    """Why the running server's pg_settings dump is not the registered D2 configuration ([] = it is)."""
+    got = {ln.split("\t")[0]: (ln.split("\t") + [""])[1] for ln in settings_tsv_text.splitlines() if "\t" in ln}
+    return [f"{k} is {got.get(k)!r}, not {v!r}" for k, v in D2_SETTINGS.items() if got.get(k) != v]
+
+
 def check_pg(settings_tsv_text, meminfo_text):
     why = []
     if mem_total_kb(meminfo_text) is None:
@@ -224,6 +234,10 @@ if __name__ == "__main__":
             sys.exit(f"pins.py: no version for {a[1]}")
         print(v)
         sys.exit(0)
+    if len(a) == 2 and a[0] == "check-d2":  # TSV: the running server's five D2 settings (comp review 1 LOW 36)
+        why = check_d2(open(a[1], errors="replace").read())
+        print("ok: " + " ".join(f"{k}={v}" for k, v in D2_SETTINGS.items()) if not why else "REFUSED: " + "; ".join(why))
+        sys.exit(0 if not why else 1)
     if len(a) == 3 and a[0] == "check-version":
         t = open(a[2], errors="replace").read()
         if check_version(a[1], t):
