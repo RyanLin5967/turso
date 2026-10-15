@@ -4829,9 +4829,14 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
         };
         let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
         let trunk = db.connect().unwrap();
-        // No premise that the slots are held here: the background writer may already have led the
-        // upgrade (a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite shows the hold).
         db.branch(id).unwrap().reap().unwrap();
+        // FLAGGED TEST EDIT (engine review 19 LOW 10, a premise added): the slots are held after the
+        // reap, deterministically: a release never matures frees, so nothing arms the upgrade
+        // until the create below. Without it a free class regressed to Off armed nothing and the
+        // test still passed (mutant `free_class_ignores_synced_open`).
+        for &s in &slots {
+            assert!(!db.branch_slot_is_free(s), "{what}: premise: slot {s} is held after x's reap");
+        }
         let syncs = super::store::thread_syncs();
         let _y = trunk.fork_branch().unwrap().into_id();
         assert_eq!(
