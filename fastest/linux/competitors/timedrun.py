@@ -505,12 +505,20 @@ RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_
 # 100 us bound; a fixture puts these in BOTH runs of a cell
 OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0},
         "pool_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0}}
+# A bbload summary of a create spec with two after-steps (close, then the delete): comp review 1 MED 9's fields
+BB = {"spec": "pg18-m1c.spec", "after_steps": 2, "skip_after": False, "tput_unit": "cycle"}
 
 
-def raw_tsv(sm, extra_rows=(), drop_warm=0):
+def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None):
     """A raw.tsv agreeing with summary SM: warmup_ops warm-up rows intended from t0 on, measured_ops measured rows
-    intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out."""
-    out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns\n"]
+    intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out;
+    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them)."""
+    if after_cols is None:
+        na = sm.get("after_steps")
+        after_cols = na if isinstance(na, int) and sm.get("skip_after") is not True else 0
+    out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns" + "".join(f"\tafter{k + 1}_ns" for k in range(after_cols))
+           + "\n"]
+    tail = "".join("\t10" for _ in range(after_cols))
     wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
     rows = []
     if isinstance(wo, int) and isinstance(t0, int):
@@ -519,7 +527,7 @@ def raw_tsv(sm, extra_rows=(), drop_warm=0):
         rows += [("measure", tm0 + i) for i in range(mo)]
     rows += list(extra_rows)
     for i, (ph, t) in enumerate(rows):
-        out.append(f"0\t{i}\t{ph}\t1\t{i}\t{t}\t1000\n")
+        out.append(f"0\t{i}\t{ph}\t1\t{i}\t{t}\t1000{tail}\n")
     return "".join(out)
 
 
@@ -771,6 +779,22 @@ def selftest():
               timed_extra=dict(OPEN, pool_late_us={"p50": 5.0, "p99": 101.0, "max": 300.0})), False),
         ("open loop with no lateness record", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, send_late_us=None)),
          False),
+        # comp review 1 MED 9: a bbload run with after-steps times each one apart (after<k>_ns, the macOS columns) and
+        # says its throughput is per CYCLE; --skip-after runs none (BB: a create spec's bbload summary)
+        ("control: a bbload cycle run with after1_ns and after2_ns and tput_unit cycle",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB), True),
+        ("a bbload run with after-steps but no after<k>_ns columns",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=0)), False),
+        ("a bbload run with after-steps and only after1_ns of 2",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=1)), False),
+        ("a bbload run with no tput_unit", dict(tracer=clean, lab_extra=BB, timed_extra=dict(BB, tput_unit=None)), False),
+        ("a bbload cycle run that says tput_unit op", dict(tracer=clean, lab_extra=BB, timed_extra=dict(BB, tput_unit="op")),
+         False),
+        ("control: --skip-after needs no after columns and is per op",
+         dict(tracer=clean, lab_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_extra=dict(BB, skip_after=True, tput_unit="op")), True),
     ]
     bad = n = 0
 
