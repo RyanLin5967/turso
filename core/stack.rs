@@ -119,6 +119,8 @@ std::thread_local! {
     static STACK_BOUNDS: Option<(usize, usize)> = stack_bounds();
     /// Nested steps in progress on this thread, for the fallback bound.
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Statements stepping on this thread ([`Executing`]).
+    static EXECUTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(target_vendor = "apple")]
@@ -176,20 +178,26 @@ fn margin() -> usize {
 /// what the thread's stack allows is refused, as PostgreSQL's check_stack_depth refuses it
 /// (54001), instead of overflowing (the crash batch, 2026-10-15). The outermost step is never
 /// refused: a statement with no nesting runs on whatever stack it was called with, as before the
-/// check. Where the stack is unknown, the bound is `FALLBACK_DEPTH` nested steps. Leaving it, on
-/// every exit, pops it.
+/// check, unless a statement is stepping on the thread ([`Executing`]): one prepared then (a
+/// schema reparse, a callback running SQL) starts deep in the stack, and is checked like a nested
+/// step (fastest-engine, on the NestGuard margin). Where the stack is unknown, the bound is
+/// `FALLBACK_DEPTH` nested steps. Leaving it, on every exit, pops it.
 pub(crate) struct NestGuard;
 
 impl NestGuard {
     pub(crate) fn enter(what: &'static str) -> crate::Result<Self> {
         let depth = DEPTH.with(|d| d.get());
         let refuse = match remaining_stack() {
-            Some(left) => depth > 0 && left < margin(),
+            Some(left) => {
+                (depth > 0 || EXECUTING.with(|e| e.get()) > 0) && left < margin()
+            }
             None => depth >= FALLBACK_DEPTH,
         };
         if refuse {
             crate::bail_parse_error!("{STACK_DEPTH_EXCEEDED}: {what} nested too deep for this thread's stack");
         }
+        #[cfg(test)]
+        level_cost::record(depth);
         DEPTH.with(|d| d.set(depth + 1));
         Ok(Self)
     }
@@ -198,6 +206,52 @@ impl NestGuard {
 impl Drop for NestGuard {
     fn drop(&mut self) {
         DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// A statement stepping on this thread (`Program::step`), so a statement prepared meanwhile is no
+/// outermost step. Leaving it, on every exit, pops it.
+pub(crate) struct Executing;
+
+impl Executing {
+    pub(crate) fn enter() -> Self {
+        EXECUTING.with(|e| e.set(e.get() + 1));
+        Self
+    }
+}
+
+impl Drop for Executing {
+    fn drop(&mut self) {
+        EXECUTING.with(|e| e.set(e.get() - 1));
+    }
+}
+
+/// The stack used between two consecutive nested checks on this thread, the largest seen: what
+/// one level costs, which the margin must cover (tests only).
+#[cfg(test)]
+pub(crate) mod level_cost {
+    std::thread_local! {
+        static LEFT_AT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+        static WORST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record(depth: usize) {
+        let Some(left) = super::remaining_stack() else {
+            return;
+        };
+        LEFT_AT.with(|at| {
+            let mut at = at.borrow_mut();
+            at.truncate(depth);
+            if let Some(&outer) = at.last() {
+                WORST.with(|w| w.set(w.get().max(outer.saturating_sub(left))));
+            }
+            at.push(left);
+        });
+    }
+
+    pub(crate) fn take_worst() -> usize {
+        LEFT_AT.with(|at| at.borrow_mut().clear());
+        WORST.with(|w| w.replace(0))
     }
 }
 
@@ -284,6 +338,86 @@ mod tests {
                     descend_to(200 << 10),
                     "premise: a nested step with ~200 KiB left runs"
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The stack between two consecutive nested checks, over views, FROM subqueries, WHERE and
+    /// scalar subqueries and a mix of them, stays under LEVEL_COST (measured in debug on an 8 MiB
+    /// thread: 73,584 B at most). A WHERE or scalar subquery's emission was not checked, so two
+    /// checks were 481,216 B apart on the mix (fastest-engine, on the NestGuard margin). Not
+    /// covered: the parser, which recurses with no check (debug: 211 KB for a flat SELECT,
+    /// about 180 KB per scalar subquery level), and release frames (no release build here).
+    #[test]
+    fn two_consecutive_nested_checks_are_less_than_one_level_cost_apart() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let io: std::sync::Arc<dyn crate::IO> =
+                    std::sync::Arc::new(crate::MemoryIO::new());
+                let db = crate::Database::open_file(
+                    io,
+                    ":memory:",
+                    std::sync::Arc::new(crate::SqliteDialect),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1)").unwrap();
+                conn.execute("CREATE VIEW v0 AS SELECT a FROM t").unwrap();
+                for i in 1..12 {
+                    conn.execute(format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1))
+                        .unwrap();
+                }
+                let mut from = "SELECT a FROM t".to_string();
+                let mut scalar = "SELECT a FROM t".to_string();
+                let mut mixed = "SELECT a FROM v3".to_string();
+                for _ in 0..12 {
+                    from = format!("SELECT a FROM ({from})");
+                    scalar = format!("SELECT a FROM t WHERE a = ({scalar})");
+                    mixed = format!(
+                        "SELECT a FROM ({mixed}) WHERE a IN (SELECT a FROM v2 WHERE a = ({mixed}))"
+                    );
+                }
+                level_cost::take_worst();
+                for sql in ["SELECT a FROM v11".to_string(), from, scalar, mixed] {
+                    conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+                    let worst = level_cost::take_worst();
+                    assert!(
+                        worst > 0 && worst < LEVEL_COST,
+                        "{worst} B between two checks (LEVEL_COST {LEVEL_COST}): {sql}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A statement prepared while another steps on the thread is checked from its outermost step:
+    /// with ~100 KiB left (under LEVEL_COST) it is refused, where a flat statement on a quiet
+    /// thread is not. It was exempt, so a prepare re-entered deep in the stack went unchecked
+    /// (fastest-engine, on the NestGuard margin).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_prepare_reentered_while_a_statement_steps_is_checked_from_its_first_step() {
+        #[inline(never)]
+        fn at(left: usize, executing: bool) -> bool {
+            if remaining_stack().unwrap() > left {
+                let mut frame = [0u8; 1 << 10];
+                std::hint::black_box(&mut frame);
+                return at(left, executing);
+            }
+            let _executing = executing.then(Executing::enter);
+            NestGuard::enter("reentered").is_ok()
+        }
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                assert!(at(100 << 10, false), "premise: a quiet thread's outermost step runs");
+                assert!(!at(100 << 10, true), "a re-entered prepare's first step was exempt");
             })
             .unwrap()
             .join()
