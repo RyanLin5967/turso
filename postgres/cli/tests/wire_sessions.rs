@@ -12360,3 +12360,49 @@ replays_postgresql!(
     []
 );
 replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
+
+// PG 18.6 card-row recordings: c44-pg18-errors.txt beside these tests.
+#[test]
+fn c44_numeric_overflow_is_22003() {
+    let dir = Scratch::new("c44-numeric-overflow");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT '1e131072'::numeric";
+    assert_eq!(a.q(sql).err(sql).code, "22003");
+}
+
+#[test]
+fn c44_missing_referenced_primary_key_is_42704() {
+    let dir = Scratch::new("c44-reference-key");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "CREATE TABLE c44_n(id INT, up INT REFERENCES c44_n)";
+    assert_eq!(a.q(sql).err(sql).code, "42704");
+}
+
+#[test]
+fn c44_lock_timeout_above_int32_is_22023() {
+    let dir = Scratch::new("c44-timeout-int32");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SET lock_timeout=2147483648";
+    assert_eq!(a.q(sql).err(sql).code, "22023");
+}
+
+#[test]
+fn c44_lock_timeout_u64_max_is_22023() {
+    let dir = Scratch::new("c44-timeout-u64");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SET lock_timeout='18446744073709551615ms'";
+    assert_eq!(a.q(sql).err(sql).code, "22023");
+}
+
+#[test]
+fn c44_lock_timeout_int32_max_is_accepted() {
+    let dir = Scratch::new("c44-timeout-boundary");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET lock_timeout=2147483647").ok("maximum accepted timeout");
+    assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
+}
