@@ -22,6 +22,8 @@ swaps S and MAX_S, stops at once, or splits T into T+1 ops fails the job, not on
 import json
 import sys
 
+# Database::branch_exception_counters(), in its order (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z)
+EXC = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
 SLACK = 0.5  # seconds past MAX_S a stop may land: the next claim after a cycle in flight, plus a loaded runner's delay
 
 
@@ -133,8 +135,13 @@ def self_test():
         # warm-up's start after the last client was ready (t0_after_ready_ns) and each window's realtime bounds with
         # the run's measured span (tm0/tm1_realtime_s), new required fields at passing values; no expectation changes
         if wins == "auto":
-            wins = [{"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5},
-                    {"window": "connect", "secs": 0.25, "t0_realtime_s": 1000.6, "t1_realtime_s": 1000.85}]
+            # TEST EDIT, flagged (the lead's routing ruling 05:16:51Z): each window also carries the engine's four
+            # branch exception counters read at its open and close, at passing values
+            ec = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+            wins = [{"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5,
+                     "exception_counters": ec},
+                    {"window": "connect", "secs": 0.25, "t0_realtime_s": 1000.6, "t1_realtime_s": 1000.85,
+                     "exception_counters": ec}]
         r = {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
              "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
              "warmup_per_client": wpc, "warmup_rule": rule,
@@ -149,7 +156,8 @@ def self_test():
                 r[k] = v
         return r
 
-    W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5}
+    EC = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+    W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5, "exception_counters": EC}
 
     cases = [
         ("a run to MAX_S with T=33 over 4 clients keeps the contract", check(rec(), 33, 4, "1000000:0:2") == []),
@@ -219,6 +227,26 @@ def self_test():
         ("stamps: no tm1_realtime_s fails", check(rec(tm=("auto", None)), 33, 4, "1000000:0:2") != []),
         ("stamps: a window whose realtime span (0.5 s) disagrees with its secs (0.2) by over 0.05 s fails",
          check(rec(wins=[W0 | {"secs": 0.2}]), 33, 4, "1000000:0:2") != []),
+        # the lead's routing ruling (DECISIONS 2026-10-15T05:16:51Z): every run records the engine's four branch exception
+        # counters (Database::branch_exception_counters()) at each window's open and close, as non-negative ints; the
+        # record is the driver's contract, a nonzero delta is summarize's to label (here a moved counter still keeps it)
+        ("counters: a window without exception_counters fails",
+         check(rec(wins=[{k: v for k, v in W0.items() if k != "exception_counters"}]), 33, 4, "1000000:0:2") != []),
+        ("counters: a window whose after lacks compaction_waits fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": {k: 7 for k in EXC[:3]}}}]), 33, 4, "1000000:0:2") != []),
+        ("counters: a counter that is a string fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"hardcap_upgrades": "7"}}}]), 33, 4,
+               "1000000:0:2") != []),
+        ("counters: a counter that went backwards (7 -> 6) fails",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"compaction_waits": 6}}}]), 33, 4,
+               "1000000:0:2") != []),
+        ("counters: a counter that moved (7 -> 9) keeps the contract (summarize labels the cell)",
+         check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
+                                                      "after": EC["after"] | {"compaction_waits": 9}}}]), 33, 4,
+               "1000000:0:2") == []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
