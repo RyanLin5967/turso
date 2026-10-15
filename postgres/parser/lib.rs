@@ -47,27 +47,15 @@ pub const MAX_PARAMETER: u32 = 65535;
 
 /// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
 /// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
-/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
-/// it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is serialized
-/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N,"location":L`
-/// read off it, a pattern a string value in the tree cannot hold, since its quotes are escaped.
-/// The numbers are libpg_query's, which wrap above i32::MAX: [`checked_param_numbers`] reads them
-/// as PostgreSQL 18 does. Only for a statement whose text holds a '$'.
-pub fn param_numbers(parse: &ParseResult) -> Vec<i32> {
-    let mut numbers: Vec<i32> = param_refs(parse)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(number, _)| number)
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
-}
-
-/// [`param_numbers`], each number read again from `sql` (the text `parse` parsed) at its ParamRef's
-/// location, as PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit
-/// int (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound
-/// the wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
+/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a
+/// clause it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is
+/// serialized (pg_query's protobuf types derive Serialize) and each
+/// `"ParamRef":{"number":N,"location":L` read off it, a pattern a string value in the tree cannot
+/// hold, since its quotes are escaped. The numbers are libpg_query's, which wrap above i32::MAX: so
+/// each number is read again from `sql` (the text `parse` parsed) at its ParamRef's location, as
+/// PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit int
+/// (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound the
+/// wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
 /// PostgreSQL 18's "parameter number too large" (42601); a tree number that is not the text's, or a
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
@@ -108,7 +96,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
 }
 
 /// Each ParamRef's number and byte location in a parse tree, read off its serialization (see
-/// [`param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
+/// [`checked_param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
 fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
     const KEY: &str = "\"ParamRef\":{\"number\":";
     const LOCATION: &str = ",\"location\":";
@@ -588,11 +576,12 @@ mod tests {
         }
     }
 
-    /// param_numbers finds every $n in the tree, in clauses the engine folds away or the translator
-    /// never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a comment, a
-    /// quoted identifier or a dollar-quoted string that looks like one (wire review 8 item 5).
+    /// checked_param_numbers finds every $n in the tree, in clauses the engine folds away or the
+    /// translator never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a
+    /// comment, a quoted identifier or a dollar-quoted string that looks like one (wire review 8
+    /// item 5). It read param_numbers, deleted as dead (wire review 14 item 24).
     #[test]
-    fn param_numbers_reads_the_whole_tree() {
+    fn checked_param_numbers_reads_the_whole_tree() {
         for (sql, want) in [
             ("SELECT 1", vec![]),
             ("SELECT v FROM t WHERE false AND id = $1", vec![1]),
@@ -609,7 +598,7 @@ mod tests {
             ("SELECT 1 LIMIT $2147483647", vec![2147483647]),
         ] {
             let parsed = parse(sql).unwrap();
-            assert_eq!(param_numbers(&parsed), want, "{sql}");
+            assert_eq!(checked_param_numbers(&parsed, sql).ok(), Some(want), "{sql}");
         }
     }
 }

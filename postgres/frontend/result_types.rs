@@ -106,8 +106,9 @@ pub struct StatementTypes {
     /// nothing (wire review 8 item 3).
     pub params: std::collections::BTreeMap<u32, u32>,
     /// Every $n the statement's parse tree holds, sorted, each in 1..=MAX_PARAMETER (see
-    /// turso_pg_parser::param_numbers): the parameter count and the gaps are read from this, not
-    /// from the engine's slots, which a clause it folds away does not get (wire review 8 item 5).
+    /// turso_pg_parser::checked_param_numbers): the parameter count and the gaps are read from
+    /// this, not from the engine's slots, which a clause it folds away does not get (wire review 8
+    /// item 5).
     pub used: Vec<u32>,
     /// Every $n compared with an expression no context types: refused (42P18) unless the client
     /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
