@@ -1039,8 +1039,9 @@ fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: st
 ///   writer grandchild (`open_writer_d2`) builds it and is SIGKILLed before it closes, so no close
 ///   writes the word; one reopen measured per sample, 3 samples;
 /// * `open_d2_confirmed`, `open_cat_d2`, `open_d1`: built in this process and closed cleanly (the
-///   close writes the word where the class proves stable storage: D2 on Apple, never D1), then
-///   reopened 5 times, each reopen closed cleanly again.
+///   close writes the word: at once where the class proves stable storage, D2 on Apple, and at D1
+///   after a full flush of the log of its own, `Confirm::write_at_close`, a81058160), then reopened 5
+///   times, each reopen closed cleanly again.
 /// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
 /// by the class asked (`journal::CLASS_SYNCS`) and directory syncs (`journal::DIR_SYNCS`), and the
 /// premises: the log's inode and length unchanged across the open (it was kept: no rewrite, no
@@ -3958,10 +3959,13 @@ fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
 /// them, so it must first make durable (a) the log's bytes, whose last flight the previous process may
 /// never have synced, and (b) the log's name, whose rename it may never have synced. POSIX:
 /// fsync(file) does not make the file's directory entry durable, and fsync(dir) does not make the
-/// file's data durable, so these are two syncs. At D1 on Apple nothing proves (a): the confirmation
-/// word is written only for a class that proves stable storage (`journal::proves_stable`: only
-/// FullFsync on Apple), so a D1 log's tail is never confirmed. Minimum 2; the engine issues 2.
-/// Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
+/// file's data durable, so these are two syncs. At D1 on Apple the open proves nothing of (a) from
+/// its class: its own syncs do not prove stable storage (`journal::proves_stable`: only FullFsync on
+/// Apple), and the open's arm is chosen by that class, not by the header's word. The word IS there:
+/// the clean close that built the cell wrote it after a full flush of its own
+/// (`Confirm::write_at_close`, a81058160), so the premise is `confirmed` 1 (DECISIONS ba515419c3:
+/// a premise repair, the budget unchanged; it read "never confirmed", 0, before).
+/// Minimum 2; the engine issues 2. Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d1_open_makes_two_plain_fsyncs() {
@@ -3970,7 +3974,7 @@ fn a_d1_open_makes_two_plain_fsyncs() {
     }
     let c = cell("open_d1");
     let mut failures = String::new();
-    let v = open_premises(&c, Some(0), &mut failures);
+    let v = open_premises(&c, Some(1), &mut failures);
     open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
     assert!(failures.is_empty(), "a D1 open:\n{failures}");
 }
