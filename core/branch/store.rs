@@ -1413,6 +1413,12 @@ impl StoreMutex {
         if self.compacting.load(Ordering::Acquire) & 1 == 1 {
             self.compaction_waits.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(test)]
+        AFTER_PRECHECK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         self.lock_uncounted()
     }
 
@@ -1455,6 +1461,13 @@ impl Drop for StoreGuard<'_> {
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
     static STORE_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (Codex C25 MED 1): run on this thread inside `StoreMutex::lock`, after its
+    /// compaction precheck and before it takes the mutex.
+    static AFTER_PRECHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Syncs of any file (`io::count_sync`, `io::count_barrier`) issued while the issuing thread held a
@@ -12724,6 +12737,80 @@ mod group_tests {
             group.lock().confirm.is_some(),
             "a frameless ordered upgrade dropped the last flight's confirmation"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_wait_tests {
+    use super::*;
+
+    /// Codex C25 MED 1 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
+    /// `StoreMutex::lock` read `compacting` only before it tried the mutex, so a requester that
+    /// read it even, then found a background compaction's counted hold begun and holding the mutex,
+    /// waited behind it uncounted, and a zero counter could not show A29's exclusion. Three
+    /// schedules on a real StoreMutex and Compacting, no disk: uncontended (counter +0), a
+    /// compaction marked before the precheck (+1, the control), and one begun after the precheck
+    /// (`AFTER_PRECHECK`) and holding the mutex when the requester locks: it must be counted too.
+    #[test]
+    fn a_lock_behind_a_compaction_begun_after_its_precheck_is_counted() {
+        let m = StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None));
+        let waits = |m: &StoreMutex| m.compaction_waits.load(Ordering::Relaxed);
+        let w0 = waits(&m);
+        drop(m.lock());
+        assert_eq!(waits(&m), w0, "premise: an uncontended lock was counted as waiting behind a compaction");
+        // Holds the mutex in a counted compaction hold until told to let go; `marked` is sent once
+        // it holds it.
+        let compactor = |m: &StoreMutex, marked: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>| {
+            let counted = Compacting::begin(m);
+            let guard = m.lock_uncounted();
+            marked.send(()).unwrap();
+            release.recv().unwrap();
+            drop(guard);
+            drop(counted);
+        };
+        for race in [false, true] {
+            let before = waits(&m);
+            let (marked_tx, marked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocked = std::thread::scope(|s| {
+                let mref = &m;
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                s.spawn(move || {
+                    go_rx.recv().unwrap();
+                    compactor(mref, marked_tx, release_rx)
+                });
+                if race {
+                    // After the precheck: the compaction begins and takes the mutex first.
+                    let mut once = Some((go_tx, marked_rx));
+                    AFTER_PRECHECK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            if let Some((go, marked)) = once.take() {
+                                go.send(()).unwrap();
+                                marked.recv().unwrap();
+                            }
+                        }))
+                    });
+                } else {
+                    go_tx.send(()).unwrap();
+                    marked_rx.recv().unwrap();
+                }
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    release_tx.send(()).unwrap();
+                });
+                let t = std::time::Instant::now();
+                drop(m.lock());
+                AFTER_PRECHECK.with(|h| *h.borrow_mut() = None);
+                release.join().unwrap();
+                t.elapsed() >= std::time::Duration::from_millis(50)
+            });
+            assert!(blocked, "premise: race={race}: the requester did not wait behind the compaction's hold");
+            assert_eq!(
+                waits(&m) - before,
+                1,
+                "CLAIM: race={race}: a lock that waited behind a background compaction's counted hold was not counted"
+            );
+        }
     }
 }
 
