@@ -8518,3 +8518,79 @@ fn a_busy_commit_after_a_yield_leaves_the_connection_out_of_autocommit() {
         assert_eq!(read_wide(&db.connect().unwrap(), 3), "new", "{what}: the re-step committed the transaction");
     }
 }
+
+// ---- engine review 19 LOW 9: the WAL-internal sync coverage the 49ecca580 set lacks ----
+
+/// The two (catalog, site) pairs of the `api` way the Apple set had no arm for.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_api_checkpoint_wal_sync_fail_stops_a_catalog_store() {
+    a_wal_internal_sync_failure_fail_stops(true, "checkpoint", "api");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_api_truncate_wal_sync_fail_stops_a_snapshot_store() {
+    a_wal_internal_sync_failure_fail_stops(false, "truncate", "api");
+}
+
+/// Every target (the Apple set's D1 fork is drained by its own fsync off Apple, so those arms have no
+/// undrained record there): the checkpoint's and the truncate's WAL sync failing AT ISSUE (mode 1)
+/// over a D0 store, whose fork is written and never drained, through the PRAGMA and the API, both
+/// modes. The site mutants `checkpoint_sync_unwatched` and `truncate_sync_unwatched` get a killer
+/// on Linux.
+#[test]
+fn a_failed_checkpoint_wal_sync_at_issue_fail_stops_a_d0_store() {
+    for catalog in [false, true] {
+        for way in ["pragma", "api"] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "checkpoint", way, 1);
+        }
+    }
+}
+
+#[test]
+fn a_failed_truncate_wal_sync_at_issue_fail_stops_a_d0_store() {
+    for catalog in [false, true] {
+        for way in ["pragma", "api"] {
+            a_yielded_wal_internal_sync_failure_fail_stops(catalog, "truncate", way, 1);
+        }
+    }
+}
+
+/// The auto-checkpoint arm: a trunk commit at synchronous NORMAL (no WAL sync of its own) over a D0
+/// store whose Release is written and not drained, the WAL's auto-checkpoint threshold at 1 page, so
+/// the commit runs the checkpoint, whose sync of the WAL before its backfill (the first WAL sync
+/// issued) fails at issue. The commit returns Ok (an auto-checkpoint's failure is logged, not
+/// returned), so only the watched sync can act on it: the next fork is refused. Every target, both
+/// modes. Mutant `checkpoint_sync_unwatched`.
+#[test]
+fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("walauto.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.execute("PRAGMA wal_autocheckpoint = 1").unwrap();
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+        armed.store(1, O::Release);
+        let committed = trunk.execute("UPDATE t SET v = 'auto' WHERE id = 9");
+        assert!(committed.is_ok(), "{what}: premise: the commit returned Ok: {committed:?}");
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the auto-checkpoint's WAL sync was reached");
+        assert_eq!(
+            crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+            "checkpoint",
+            "{what}: premise: the failure reached the checkpoint's site"
+        );
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a failed auto-checkpoint drain with an undrained Release"),
+        );
+    }
+}
