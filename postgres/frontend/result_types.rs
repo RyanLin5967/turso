@@ -144,7 +144,11 @@ fn from_tables(select: &SelectStmt) -> Vec<(String, String)> {
 fn from_items(items: &[PgNode]) -> Vec<(String, String)> {
     fn walk(node: &PgNode, out: &mut Vec<(String, String)>) {
         match node.node.as_ref() {
-            Some(Node::RangeVar(rv)) if rv.schemaname.is_empty() || rv.schemaname == "public" => {
+            Some(Node::RangeVar(rv))
+                if rv.schemaname.is_empty()
+                    || rv.schemaname == "public"
+                    || rv.schemaname == "main" =>
+            {
                 let name = rv
                     .alias
                     .as_ref()
@@ -653,7 +657,9 @@ impl Infer<'_> {
     /// view read through it is not kept for the snapshot ([`ViewCache`]).
     fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
         match schemaname.to_lowercase().as_str() {
-            "public" | "pg_catalog" => Some(relname.to_string()),
+            // main is the engine's name for public, which a view's stored text holds since the
+            // translator names public's relations so (wire review 17 item 1, review 18 item 5).
+            "public" | "main" | "pg_catalog" => Some(relname.to_string()),
             "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
             "" => {
                 let in_main = || {
@@ -1442,10 +1448,13 @@ impl Infer<'_> {
                 }
                 None
             }
-            // `public.t.c` is t's c; a reference through any other schema (or deeper) names a
-            // relation this walk cannot read: found, untyped, so a parameter compared with it is
-            // refused (42P18). It was not found, which fell to text (wire review 14 item 3).
-            [schema, table, column] if schema.eq_ignore_ascii_case("public") => {
+            // `public.t.c` (or `main.t.c`, a view's stored spelling) is t's c; a reference
+            // through any other schema (or deeper) names a relation this walk cannot read: found,
+            // untyped, so a parameter compared with it is refused (42P18). It was not found, which
+            // fell to text (wire review 14 item 3, review 18 item 5).
+            [schema, table, column]
+                if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") =>
+            {
                 for level in scope.iter().rev() {
                     if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
                         return of(rel, column);
