@@ -3155,11 +3155,6 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
     }
 }
 
-/// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
-/// store mutex; phase 4 only the writer again. No path takes the writer while waiting for the store
-/// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
-/// is in flight, so the two cannot deadlock.
-#[allow(clippy::too_many_arguments)]
 /// Test builds (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3 checkpoints,
 /// budget 3 each): the process's sync counters (`super::sync_counts`: fsync, F_FULLFSYNC) at each
 /// phase of a fuzzy checkpoint's thread, so a test can attribute its flushes. Observation only; the
@@ -3177,6 +3172,11 @@ fn ckpt_phase(label: &'static str) {
     let _ = label;
 }
 
+/// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
+/// store mutex; phase 4 only the writer again. No path takes the writer while waiting for the store
+/// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
+/// is in flight, so the two cannot deadlock.
+#[allow(clippy::too_many_arguments)]
 fn run_flight(
     inner: Arc<StoreMutex>,
     group: Arc<Group>,
