@@ -50,3 +50,11 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    the handler overrides it; `on_startup` used that default unconditionally, so the server could
    not announce the settings SHOW answers (`ISO, YMD` against `ISO, MDY`, `Etc/UTC` against `UTC`,
    `public` against `"$user", public`; wire review 18 item 19).
+5. `types/format/float_digits.rs`: at extra_float_digits >= 1 (the default, 1) a float's text is
+   PostgreSQL's float8out / float4out layout (`postgres_shortest`): the shortest exact digits (Rust's
+   `{:e}`), fixed notation while the decimal exponent is in [-4, 15) (float8) or [-4, 6) (float4),
+   else `d.ddde+XX`. ryu's text was `1.0`, `100.0`, `1e16`, `0.00001` (PostgreSQL 18.6 recorded,
+   artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-float.out). The infinities are still `inf` /
+   `-inf` (PostgreSQL: `Infinity`): this crate's own test_format asserts `inf`, so that waits on a
+   ruling. This crate's tests do not build alone here (rustc 1.88 is below its MSRV); test_format's
+   PI rows were checked by reading: `{:e}` of PI is `3.141592653589793e0`, written `3.141592653589793`.

@@ -4654,6 +4654,11 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
+        // A float4 column is written as float4 (float4out's digits and its exponent threshold,
+        // both protocols), a float8 as float8.
+        Value::Numeric(turso_core::Numeric::Float(f)) if *pg_type == Type::FLOAT4 => encoder
+            .encode_field(&(f64::from(*f) as f32))
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),

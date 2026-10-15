@@ -2618,16 +2618,38 @@ fn floats_are_written_as_postgresql_writes_them() {
     let want: Vec<String> = cases.iter().map(|(_, w)| w.to_string()).collect();
     assert_eq!(got, want);
     let r = a
-        .q("SELECT 1234567::float4, 123456::float4, 1e-5::float4, 'Infinity'::float8, '-Infinity'::float8")
-        .ok("float4 and infinities");
+        .q("SELECT 1234567::float4, 123456::float4, 1e-5::float4")
+        .ok("float4");
     assert_eq!(
         r.rows,
         vec![vec![
             Some("1.234567e+06".to_string()),
             Some("123456".to_string()),
             Some("1e-05".to_string()),
+        ]]
+    );
+}
+
+/// KNOWN RED (known-red.txt; ruling asked): PostgreSQL 18.6 writes the infinities `Infinity` and
+/// `-Infinity` and a negative zero `-0` (recorded, artie raw loud-20261015/pg18-diff/pg18-inf.out);
+/// the vendored pgwire writes `inf`, `-inf` and `0`, and its own unit test (test_format) asserts
+/// `inf`, so the change waits on a ruling for that test. Split out of
+/// floats_are_written_as_postgresql_writes_them, its expectations unchanged.
+#[test]
+fn infinities_and_negative_zero_are_written_as_postgresql_writes_them() {
+    let dir = Scratch::new("floatinf");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a
+        .q("SELECT 'Infinity'::float8, '-Infinity'::float8, 'NaN'::float8, '-0'::float8")
+        .ok("specials");
+    assert_eq!(
+        r.rows,
+        vec![vec![
             Some("Infinity".to_string()),
             Some("-Infinity".to_string()),
+            Some("NaN".to_string()),
+            Some("-0".to_string()),
         ]]
     );
 }
