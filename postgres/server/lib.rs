@@ -953,6 +953,10 @@ struct SessionState {
     /// The named portals that ran to completion without rows, or failed: a second Execute of one
     /// is 55000, never a second run (wire review 12 item 5).
     done_portals: std::collections::HashSet<String>,
+    /// The completion tag of each query portal that returned all its rows (its verb's, `SELECT`,
+    /// `INSERT 0`, ...), which a further Execute answers with 0 rows, as PostgreSQL does (wire
+    /// review 15 item 17: it answered SELECT 0 for every portal).
+    finished_tags: std::collections::HashMap<String, String>,
     /// The first result format code other than 0 or 1 each portal was bound with: refused
     /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
     /// so a statement that returns no row succeeds (wire review 13 item 10).
@@ -1105,6 +1109,7 @@ impl Session {
         let ended = std::mem::take(&mut st.portals);
         for name in &ended {
             st.bad_result_codes.remove(name);
+            st.finished_tags.remove(name);
         }
         ended
     }
@@ -3207,6 +3212,17 @@ impl ExtendedQueryHandler for Session {
         }
         check_parameter_codes(&message).map_err(PgWireError::UserError)?;
         let portal = Portal::try_new(&message, statement)?;
+        // A named portal lives until its Close or its transaction's end: binding the name again
+        // is 42P03, as PostgreSQL's CreatePortal refuses it. It replaced the portal silently, a
+        // suspended one included (wire review 15 item 20). The unnamed portal is replaced, as
+        // there.
+        if portal.name != DEFAULT_NAME && client.portal_store().get_portal(&portal.name).is_some()
+        {
+            return Err(PgWireError::UserError(error(
+                "42P03",
+                format!("cursor \"{}\" already exists", portal.name),
+            )));
+        }
         {
             let mut st = self.state();
             match message
@@ -3222,11 +3238,14 @@ impl ExtendedQueryHandler for Session {
                     st.bad_result_codes.remove(&portal.name);
                 }
             }
+            st.finished_tags.remove(&portal.name);
             if portal.name != DEFAULT_NAME {
                 st.done_portals.remove(&portal.name);
-                if !st.portals.contains(&portal.name) {
-                    st.portals.push(portal.name.clone());
-                }
+            }
+            // The unnamed portal too ends with its transaction (it may outlive a Sync, suspended
+            // in a block: wire review 15 item 16).
+            if !st.portals.contains(&portal.name) {
+                st.portals.push(portal.name.clone());
             }
         }
         client.portal_store().put_portal(Arc::new(portal));
@@ -3332,9 +3351,11 @@ impl ExtendedQueryHandler for Session {
                 match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
                     Response::Query(mut results) => {
                         let refuse = self.state().bad_result_codes.get(name).copied();
+                        let tag = results.command_tag().to_owned();
                         *state = if feed_rows(client, &mut results, max_rows, refuse).await? {
                             PortalExecutionState::Suspended(results)
                         } else {
+                            self.state().finished_tags.insert(name.to_string(), tag);
                             PortalExecutionState::Finished
                         };
                     }
@@ -3369,23 +3390,38 @@ impl ExtendedQueryHandler for Session {
                 }
             }
             PortalExecutionState::Suspended(results) => {
+                let tag = results.command_tag().to_owned();
                 if !feed_rows(client, results, max_rows, None).await? {
+                    self.state().finished_tags.insert(name.to_string(), tag);
                     *state = PortalExecutionState::Finished;
                 }
             }
-            // A query portal that returned all its rows returns none more: "SELECT 0", as in
-            // PostgreSQL (it answered NoData; wire review 12 item 5).
+            // A query portal that returned all its rows returns none more: its own tag with 0
+            // rows (`SELECT 0`, `INSERT 0 0`, ...), as PostgreSQL copies the portal's tag (it
+            // answered NoData, wire review 12 item 5; then SELECT 0 for every verb, review 15
+            // item 17).
             PortalExecutionState::Finished => {
+                let tag = self
+                    .state()
+                    .finished_tags
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| "SELECT".to_string());
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new("SELECT").with_rows(0).into(),
+                        Tag::new(&tag).with_rows(0).into(),
                     ))
                     .await?;
             }
         }
+        let suspended = matches!(&*state, PortalExecutionState::Suspended(_));
+        drop(state);
         client.set_state(PgWireConnectionState::ReadyForQuery);
-        // As pgwire does: the unnamed portal goes with its execution.
-        if name == DEFAULT_NAME {
+        // As pgwire does: the unnamed portal goes with its execution, unless a row limit
+        // suspended it, when it continues at the next Execute until its transaction ends or the
+        // next unnamed Bind replaces it, as in PostgreSQL (it was removed, so the next Execute was
+        // 34000: wire review 15 item 16).
+        if name == DEFAULT_NAME && !suspended {
             client.portal_store().rm_portal(name);
         }
         Ok(())
