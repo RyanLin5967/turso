@@ -55,6 +55,9 @@ CLIENTS=${FT_CLIENTS:-1 4}
 # comp review 1 MED 8: the PG kept arm's creates per C=1 cell (kept_arm), a count or nothing runs
 KEPT_K=${FT_KEPT_K:-10}
 [[ $KEPT_K =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_KEPT_K [$KEPT_K] is not a positive count" >&2; exit 2; }
+# Comp review 1 LOW 21: the prebranch runs at FT_PREBRANCH_C clients (C=1 cannot reach N = 1e5 or 1e6 within CAP_S)
+PREBRANCH_C=${FT_PREBRANCH_C:-4}
+[[ $PREBRANCH_C =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_PREBRANCH_C [$PREBRANCH_C] is not a positive count" >&2; exit 2; }
 # The warm-up of every timed and labelling run (gate-6 review, t3run item 3): PREREG :210's one rule,
 # min(max(1000 ops, 10 s), 10% of the cap), as bbload/clonebench --warmup OPS:S:MAX_S; FT_WARMUP overrides it only
 # with the same OPS:S:MAX_S form (the T3 driver passes the value it gives fastest_profile). FT_CAP_S is the
@@ -668,7 +671,7 @@ prebranch_server() {
   [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
   if [ "$PREBRANCH" -gt 0 ]; then
     case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
-    bb_args "$sp" 1 "$PREBRANCH" "$RAW/prebranch" nowarm
+    bb_args "$sp" "$PREBRANCH_C" "$PREBRANCH" "$RAW/prebranch" nowarm  # LOW 21: at C>1, exactly PREBRANCH
     "${BBA[@]}" --skip-after >"$RAW/prebranch.txt" 2>&1 || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
     if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
   fi
@@ -869,7 +872,7 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
   if [ "$PREBRANCH" -gt 0 ]; then
     mkdir -p "$ROOT/branches/prebranch"
     timeout "$OUTER_S" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" \
-      --clients 1 --max-ops "$PREBRANCH" --rows "$ROWS" --max-window-s "$CAP_S" --out "$RAW/prebranch" \
+      --clients "$PREBRANCH_C" --max-ops "$PREBRANCH" --rows "$ROWS" --max-window-s "$CAP_S" --out "$RAW/prebranch" \
       >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
   fi
   LIVE0=$(count_branches)

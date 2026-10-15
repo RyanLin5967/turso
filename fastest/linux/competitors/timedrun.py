@@ -592,7 +592,8 @@ RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_
        "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
        "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
        "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
-       "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op"}
+       "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op",
+       "no_drain": False}
 # (comp review 1 MED 9: a bbload run's after record -- its spec's after-step count, whether --skip-after ran none, and
 # what its tput_* count: "op", or "cycle" when every op's untimed after-steps ran inside the client's loop)
 # An open-loop run's own fields (bbload --mode open --rate 100): its mode and loop, and its lateness record within the
@@ -887,6 +888,11 @@ def selftest():
                                                           timed_extra=dict(OPEN, max_send_late_us=None)), False),
         ("a mode that is neither bbload's nor clonebench's (both runs)",
          dict(tracer=clean, lab_extra={"mode": "x"}, timed_extra={"mode": "x"}), False),
+        # comp review 1 LOW 21: --no-drain (claims stop at the window's end) is the prebranch's, which must create
+        # exactly N at C>1; a measured cell keeps the drain load on (LOW 40), so a cell run with it is refused
+        ("a cell run with --no-drain (both runs)", dict(tracer=clean, lab_extra={"no_drain": True},
+                                                        timed_extra={"no_drain": True}), False),
+        ("a cell with no no_drain record", dict(tracer=clean, timed_extra={"no_drain": None}), False),
         # comp review 1 MED 12: the sweeper is a cost beside the competitors' timed runs only, so its own CPU is part of
         # the record (timed.json sweeper_cpu_s, below), and it runs at nice 19
         ("the sweep lines carry no sweeper CPU", dict(tracer=trace_rec(cpu=False)), False),
@@ -1029,6 +1035,9 @@ def selftest():
             ("timed run's pool_late_us p99 101.0 us is over its bound 100.0 us: VOID",),
         "open loop with no lateness record": ("timed run is open loop with no send_late_us p99",),
         "open loop with no max_send_late_us bound": ("timed run is open loop with no max_send_late_us",),
+        "a cell run with --no-drain (both runs)":
+            ("labelling run ran with --no-drain", "timed run ran with --no-drain"),
+        "a cell with no no_drain record": ("timed run has no no_drain record",),
         "the sweep lines carry no sweeper CPU": ("has no sweeper CPU (cpu=)",),
         "no sweeper header": ("tracer record has no sweeper header",),
         "the sweeper ran at nice 0": ("the sweeper ran at nice 0, not 19",),
