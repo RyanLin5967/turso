@@ -5,8 +5,9 @@
 //!
 //! A stack overflow aborts the whole process, so each statement runs in a CHILD process: this test
 //! binary re-run on one test by name, with `FE_STACK_CHILD` = "<stack KiB>|<sql>". The child runs
-//! the statement on a thread of that stack size and prints `FE_STACK_RESULT <outcome>`. The parent
-//! judges the child's exit and its line.
+//! the statement on a thread of that stack size and writes its outcome to the file `FE_STACK_OUT`
+//! names (a file, not stdout: libtest joins a child's printed line to its own "test ..." line). The
+//! parent judges the child's exit and that file.
 
 use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
 use std::sync::Arc;
@@ -43,20 +44,22 @@ fn run_child() -> bool {
         .unwrap()
         .join()
         .unwrap();
-    println!("FE_STACK_RESULT {outcome}");
+    std::fs::write(std::env::var("FE_STACK_OUT").expect("FE_STACK_OUT names the outcome file"), outcome).unwrap();
     true
 }
 
 /// In the parent: the child's outcome line, or how it died.
 fn in_child(test: &str, kib: usize, sql: &str) -> String {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("outcome");
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, format!("{kib}|{sql}"))
+        .env("FE_STACK_OUT", &file)
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    match stdout.lines().find_map(|l| l.strip_prefix("FE_STACK_RESULT ")) {
-        Some(line) if out.status.success() => line.to_string(),
+    match std::fs::read_to_string(&file) {
+        Ok(line) if out.status.success() => line,
         _ => {
             use std::os::unix::process::ExitStatusExt;
             format!("died ({:?}, signal {:?})", out.status.code(), out.status.signal())
