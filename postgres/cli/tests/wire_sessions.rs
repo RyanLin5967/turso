@@ -714,6 +714,113 @@ fn each_session_runs_on_its_own_thread() {
     );
 }
 
+/// Wait up to `limit` for the server's threads to fall back to `want` or fewer; the last count.
+fn threads_settle(server: &Server, want: usize, limit: Duration) -> usize {
+    let deadline = Instant::now() + limit;
+    let mut now = thread_count(server.pid());
+    while now > want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        now = thread_count(server.pid());
+    }
+    now
+}
+
+/// A socket cannot hold a session thread once its client is gone or never starts: a connection
+/// that sends nothing ends at the authentication timeout (here 1 s), one whose client half-closes
+/// it ends at the stream's end, and one reset by its client ends at the reset. Each thread goes
+/// (L5 step 3(a), lead 2026-10-15: the session's blocking socket must not leak a thread).
+#[test]
+fn an_idle_or_half_closed_socket_does_not_keep_its_session_thread() {
+    let dir = Scratch::new("socketleak");
+    let server = Server::start(&dir.db(), &["--authentication-timeout", "1"]);
+    let mut first = server.connect();
+    first.q("SELECT 1").ok("select 1");
+    let before = thread_count(server.pid());
+    // Never starts: no byte is sent.
+    let mut silent = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    // Half-closed after its startup.
+    let half = server.connect();
+    // Reset after its startup: SO_LINGER 0, so the close sends RST.
+    let reset = server.connect();
+    let during = thread_count(server.pid());
+    assert!(during >= before + 3, "premise: 3 more sessions, threads {before} -> {during}");
+    half.s.shutdown(std::net::Shutdown::Write).unwrap();
+    unsafe {
+        use std::os::fd::AsRawFd;
+        let l = libc::linger { l_onoff: 1, l_linger: 0 };
+        assert_eq!(
+            libc::setsockopt(
+                reset.s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &l as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            ),
+            0
+        );
+    }
+    drop(reset);
+    let after = threads_settle(&server, before, Duration::from_secs(10));
+    assert!(
+        after <= before,
+        "3 sockets gone or never started, but threads went {before} -> {during} -> {after}"
+    );
+    // The silent connection was ended by the server: its read sees the stream's end.
+    silent.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut b = [0u8; 1];
+    assert_eq!(silent.read(&mut b).unwrap_or(1), 0, "the silent socket was not closed");
+    drop(half);
+    first.q("SELECT 1").ok("the first session is unaffected");
+}
+
+/// Shutting the server down (SIGINT) ends every session and joins its thread before the process
+/// exits: idle sessions, one inside a transaction, and one running a long statement, which is
+/// cancelled. The server says how many it shut and joined, and exits 0 (lead 2026-10-15).
+#[test]
+fn shutdown_joins_every_session_thread() {
+    let dir = Scratch::new("shutdownjoin");
+    let mut server = Server::start(&dir.db(), &[]);
+    let mut idle: Vec<Wire> = (0..3).map(|_| server.connect()).collect();
+    for w in &mut idle {
+        w.q("SELECT 1").ok("select 1");
+    }
+    let mut block = server.connect();
+    block.q("BEGIN").ok("begin");
+    let mut busy = server.connect();
+    let slow = "SELECT count(*) FROM generate_series(1, 1000000000000000)";
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((slow.len() + 5) as i32).to_be_bytes());
+    q.extend_from_slice(slow.as_bytes());
+    q.push(0);
+    busy.s.write_all(&q).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    assert_eq!(unsafe { libc::kill(server.pid() as i32, libc::SIGINT) }, 0);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the server did not exit within 20 s of SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "the server exited {status:?}");
+    let log = std::fs::read_to_string(server_log_dir().join(format!("server-{}.stdout", server.port)))
+        .unwrap();
+    assert!(
+        log.contains("PostgreSQL server stopped: 5 sessions shut, 5 session threads joined, 0 still running"),
+        "the server's stop line: {log}"
+    );
+    // Every client sees its session end.
+    for mut w in idle.into_iter().chain([block, busy]) {
+        w.s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut rest = Vec::new();
+        let _ = w.s.read_to_end(&mut rest);
+    }
+}
+
 /// An open transaction belongs to its session: another session neither sees its uncommitted rows
 /// nor runs inside it.
 #[test]
