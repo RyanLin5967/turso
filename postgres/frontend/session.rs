@@ -2594,6 +2594,28 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn setting_scope_owned_transaction_uses_the_same_value_stack() {
+        let (_io, db) = open_database(
+            ":memory:", None, crate::OpenFlags::default(), crate::DatabaseOpts::new(),
+        ).unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        conn.in_own_transaction("settings", "setting scope", || {
+            conn.execute("SET LOCAL lock_timeout='100ms'")
+        }).unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 0, "LOCAL ends with the owned block");
+
+        conn.execute("BEGIN; SET lock_timeout='200ms'").unwrap();
+        let result: Result<()> = conn.in_own_transaction("settings", "setting scope", || {
+            conn.execute("SET lock_timeout='300ms'")?;
+            Err(LimboError::InvalidArgument("rollback this savepoint".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(conn.lock_timeout_ms(), 200, "owned savepoint rollback restores SET");
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 200);
+    }
+
     fn run(conn: &crate::Connection, sql: &str) {
         let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         stmt.run_ignore_rows().unwrap_or_else(|e| panic!("{sql}: {e}"));
