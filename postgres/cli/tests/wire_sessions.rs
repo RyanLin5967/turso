@@ -12968,3 +12968,4 @@ replays_postgresql!(
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
+replays_postgresql!(pg18_c53_dropnotice_replays_as_postgresql_answered, "pg18-c53-dropnotice.out", []);
