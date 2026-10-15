@@ -2978,6 +2978,13 @@ impl Journal {
 }
 
 impl Confirm {
+    /// Test builds (fastest-budgets, review C08 #1): the word this confirmation writes, which names
+    /// its flight (bound to the flight's end frame and where it ends).
+    #[cfg(test)]
+    pub(crate) fn word_for_test(&self) -> u32 {
+        self.word
+    }
+
     /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
     /// the group, engine review 8 #9).
     #[cfg(test)]
