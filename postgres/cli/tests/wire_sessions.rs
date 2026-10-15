@@ -3158,6 +3158,33 @@ fn a_from_alias_column_list_renames_the_columns() {
     assert_eq!(a.q(sql).err(sql).code, "42P10", "{sql}");
 }
 
+/// A FROM alias column list on a CTE renames the CTE's columns, as PostgreSQL does, also when a
+/// table has the CTE's name: the table's columns were read, so `WITH t AS (SELECT 1 AS k, 2 AS m)
+/// SELECT * FROM t AS a (x)` asked the CTE for the table's columns (42703), and with no such table
+/// the list was refused (ultrareview of fastest-wire, finding 8).
+#[test]
+fn a_from_alias_column_list_on_a_cte_renames_the_ctes_columns() {
+    let dir = Scratch::new("aliascolscte");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE t (id int, v int)").ok("t");
+    a.q("INSERT INTO t VALUES (10, 20)").ok("t row");
+    let r = a
+        .q("WITH t AS (SELECT 1 AS k, 2 AS m) SELECT * FROM t AS a (x)")
+        .ok("a CTE named like a table");
+    assert_eq!((r.names, r.rows), (names(&["x", "m"]), vec![vec![t("1"), t("2")]]));
+    let r = a
+        .q("WITH c (p, q) AS (SELECT id, v FROM t) SELECT a.y, q FROM c a (y)")
+        .ok("a CTE with no table of its name, its own column list");
+    assert_eq!((r.names, r.rows), (names(&["y", "q"]), vec![vec![t("10"), t("20")]]));
+    let r = a
+        .q("SELECT * FROM t AS a (x) WHERE EXISTS (WITH t AS (SELECT 1 AS k) SELECT 1 FROM t)")
+        .ok("a CTE out of the FROM's scope");
+    assert_eq!((r.names, r.rows), (names(&["x", "v"]), vec![vec![t("10"), t("20")]]));
+}
+
 /// KNOWN RED (ENGINE; known-red.txt): `SELECT *` over a RIGHT JOIN ... USING or a NATURAL RIGHT
 /// JOIN puts the merged join column first, then the left table's other columns, then the right's,
 /// as PostgreSQL 18.6 does (recorded, artie raw loud-20261015/pg18-diff/pg18-join2.out). The
