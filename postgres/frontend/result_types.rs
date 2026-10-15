@@ -781,11 +781,19 @@ impl Infer<'_> {
         view: &turso_core::schema::View,
         relname: &str,
     ) -> Option<Vec<(String, Option<u32>)>> {
+        // The engine's columns carry a table column's type only where it traced the column to a
+        // table (view_columns_traced); every other one it types with a placeholder TEXT, which
+        // typed a parameter compared with a computed column as text and bound it as a string
+        // (wire review 18 item 4). Untyped, such a parameter is refused (42P18).
         let engine_columns = || {
+            let traced = view_columns_traced(self.schema, &view.select_stmt);
             Some(
                 view.columns
                     .iter()
-                    .map(|c| (c.name.clone().unwrap_or_default(), column_oid(c)))
+                    .map(|c| {
+                        let ty = if traced { column_oid(c) } else { None };
+                        (c.name.clone().unwrap_or_default(), ty)
+                    })
                     .collect(),
             )
         };
@@ -1688,6 +1696,47 @@ fn declared_type(schema: &Schema, relname: &str, column: &str) -> Option<u32> {
     let table = schema.get_btree_table(relname)?;
     let (_, col) = table.get_column(column)?;
     column_oid(col)
+}
+
+/// Whether the engine's columns for the view whose query (as the engine parsed it) is `select`
+/// carry real types: core types a view column from its table column only when the column is a
+/// bare reference into a table (core util.rs, extract_view_columns), and gives every other one, a
+/// computed column or one read through an inner view, a subquery or a table function, a
+/// placeholder TEXT. So the types are kept only for a plain SELECT (no WITH, no compound) whose
+/// every FROM item is a table and whose every result column is `*`, `t.*` or a bare column
+/// reference; for any other view none is, all or nothing (the view's columns cannot be matched to
+/// its result columns one by one once a `*` expands).
+fn view_columns_traced(schema: &Schema, select: &turso_parser::ast::Select) -> bool {
+    use turso_parser::ast::{Expr, OneSelect, ResultColumn, SelectTable};
+    if select.with.is_some() || !select.body.compounds.is_empty() {
+        return false;
+    }
+    let OneSelect::Select {
+        columns,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    let a_table = |item: &SelectTable| match item {
+        SelectTable::Table(name, _, _) => {
+            name.db_name
+                .as_ref()
+                .is_none_or(|db| db.as_str().eq_ignore_ascii_case("main"))
+                && schema.get_btree_table(name.name.as_str()).is_some()
+        }
+        _ => false,
+    };
+    a_table(&from.select)
+        && from.joins.iter().all(|join| a_table(&join.table))
+        && columns.iter().all(|column| match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => true,
+            ResultColumn::Expr(expr, _) => matches!(
+                expr.as_ref(),
+                Expr::Id(_) | Expr::Qualified(_, _) | Expr::DoublyQualified(_, _, _)
+            ),
+        })
 }
 
 /// The type OID of a table column as declared: its type name's, or for an array column the array
