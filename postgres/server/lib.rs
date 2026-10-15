@@ -4331,7 +4331,11 @@ fn is_pg_non_query(sql: &str) -> bool {
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
+    // From the statement's first token, as PostgreSQL's lexer reads it: whitespace, comments and
+    // empty statements before it are skipped (skip_blank, the verb reader's helper), so `;COMMIT`
+    // in an open block is tagged COMMIT, not OK (wire review 17 item 7's pin found it).
+    let start = skip_blank(query.as_bytes(), 0).unwrap_or(query.len());
+    let upper = query[start..].trim().to_uppercase();
     if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
