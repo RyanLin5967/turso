@@ -811,13 +811,15 @@ impl Infer<'_> {
                 });
             }
             Some(Node::RangeFunction(f)) => {
-                for item in &f.functions {
-                    self.expr(item, scope);
-                }
                 // A function in FROM reads the items before it (PostgreSQL's functions in FROM are
-                // implicitly LATERAL).
+                // implicitly LATERAL), its arguments too: they were walked in the enclosing scope
+                // alone, so a bare name bound to an outer relation's column (wire review 16 item
+                // 24).
                 let mut inner = scope.clone();
                 inner.push(level.clone());
+                for item in &f.functions {
+                    self.expr(item, &inner);
+                }
                 level.push(self.range_function(f, &inner));
             }
             _ => {}
