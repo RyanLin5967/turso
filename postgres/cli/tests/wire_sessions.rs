@@ -773,6 +773,52 @@ fn an_idle_or_half_closed_socket_does_not_keep_its_session_thread() {
     first.q("SELECT 1").ok("the first session is unaffected");
 }
 
+/// The authentication timeout bounds the whole startup, not each read: a client that sends its
+/// startup packet one byte at a time, each byte well inside the timeout (here 1 s), is still ended
+/// once the timeout has passed since it connected. Bounding each read alone let such a client hold
+/// a session thread and its max_connections slot for as long as it kept trickling (ultrareview of
+/// fastest-wire, finding 4).
+#[test]
+fn a_trickled_startup_ends_at_the_authentication_timeout() {
+    let dir = Scratch::new("startuptrickle");
+    let server = Server::start(&dir.db(), &["--authentication-timeout", "1"]);
+    let mut slow = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&1024i32.to_be_bytes());
+    startup.extend_from_slice(&196608i32.to_be_bytes());
+    startup.resize(1024, b'u');
+    let connected = Instant::now();
+    let mut closed_after = None;
+    for byte in &startup {
+        if slow.write_all(std::slice::from_ref(byte)).is_err() {
+            closed_after = Some(connected.elapsed());
+            break;
+        }
+        let mut b = [0u8; 64];
+        let ended = match slow.read(&mut b) {
+            Ok(n) => n == 0,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        };
+        if ended {
+            closed_after = Some(connected.elapsed());
+            break;
+        }
+        if connected.elapsed() > Duration::from_secs(6) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let closed_after = closed_after.expect("a startup trickled for 6 s was never ended");
+    assert!(
+        closed_after < Duration::from_secs(3),
+        "the trickled startup was ended only after {closed_after:?}"
+    );
+}
+
 /// Shutting the server down (SIGINT) ends every session and joins its thread before the process
 /// exits: idle sessions, one inside a transaction, and one running a long statement, which is
 /// cancelled. The server says how many it shut and joined, and exits 0 (lead 2026-10-15).
