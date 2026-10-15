@@ -85,9 +85,12 @@ fn opts() -> DatabaseOpts {
     } else {
         BranchDurability::Catalog { sync }
     };
+    // The plant `exc_sharp` (DECISIONS bd0d845f97): a sharp catalog store, whose compactions sync
+    // inline on the operation and are counted as an exception.
+    let checkpoint = if spec == "exc_sharp" { BranchCheckpoint::Sharp } else { BranchCheckpoint::Fuzzy };
     DatabaseOpts::new()
         .with_branch_durability(durability)
-        .with_branch_checkpoint(BranchCheckpoint::Fuzzy)
+        .with_branch_checkpoint(checkpoint)
 }
 
 fn open_at(path: &Path) -> Arc<Database> {
@@ -219,6 +222,8 @@ struct Outside {
     cat: (u64, u64, u64, u64),
     ckpt: [u64; 9],
     reads: (u64, u64),
+    /// The counted exceptions (`exceptions`); `None` where no database is read (the instruments).
+    exc: Option<[u64; 4]>,
 }
 
 impl Outside {
@@ -228,16 +233,40 @@ impl Outside {
             cat: db.branch_catalog_counters(),
             ckpt: db.branch_checkpoint_counters(),
             reads: db.branch_read_counters(),
+            exc: Some(exceptions(db)),
         }
     }
 
+    /// A database's counters at its open, all 0 (they count since the open).
     fn zero(log: Option<u64>) -> Self {
         Self {
             log,
             cat: (0, 0, 0, 0),
             ckpt: [0; 9],
             reads: (0, 0),
+            exc: Some([0; 4]),
         }
+    }
+
+    /// No database: the instruments' windows, which record no counted exception.
+    fn none() -> Self {
+        Self {
+            exc: None,
+            ..Self::zero(None)
+        }
+    }
+}
+
+/// The counted exceptions (DECISIONS bd0d845f97; `Database::branch_exception_counters`, keys
+/// `EXC_KEYS`): read outside a window, as it takes the group's lock.
+fn exceptions(db: &Arc<Database>) -> [u64; 4] {
+    db.branch_exception_counters()
+}
+
+/// Record the counted exceptions' deltas from `a` to `b` in `s` (every key, a zero included).
+fn put_exceptions(s: &mut Sample, a: [u64; 4], b: [u64; 4]) {
+    for (key, (x, y)) in EXC_KEYS.into_iter().zip(a.into_iter().zip(b)) {
+        s.insert(key, delta(x, y));
     }
 }
 
@@ -282,6 +311,9 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
         if b >= a {
             s.insert("log_bytes", b - a);
         }
+    }
+    if let (Some(a), Some(b)) = (o0.exc, o1.exc) {
+        put_exceptions(&mut s, a, b);
     }
     s
 }
@@ -542,7 +574,7 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
 /// and the checkpoints started meanwhile (by any thread).
 fn growth(cell: &str, db: &Arc<Database>, out: &mut String) {
     const THREADS: u64 = 16;
-    let ck0 = db.branch_checkpoint_counters();
+    let (ck0, e0) = (db.branch_checkpoint_counters(), exceptions(db));
     let lines: Vec<Sample> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -573,14 +605,17 @@ fn growth(cell: &str, db: &Arc<Database>, out: &mut String) {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     db.branch_checkpoint_wait();
-    let ck1 = db.branch_checkpoint_counters();
+    let (ck1, e1) = (db.branch_checkpoint_counters(), exceptions(db));
+    // The arm is one window: every line carries its counted exceptions.
     for (t, mut s) in lines.into_iter().enumerate() {
         s.insert("ckpt_started", ck1[1] - ck0[1]);
+        put_exceptions(&mut s, e0, e1);
         line(out, cell, "growth_thread", t as u64, &s);
     }
     let live = db.branch_ids().unwrap().len() as u64;
     let mut s = Sample::new();
     s.insert("live", live);
+    put_exceptions(&mut s, e0, e1);
     line(out, cell, "growth_live", 0, &s);
 }
 
@@ -648,6 +683,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // A start flag, not a Barrier: a thread that fails to start, or panics before the start,
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
+        let e0 = exceptions(db);
         let s0 = sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
@@ -746,7 +782,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             per
         });
         let s1 = sync_counts();
+        let e1 = exceptions(db);
         let mut m = Sample::new();
+        put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
         m.insert("acks", c * rounds * if cfw { 2 } else { 1 });
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
@@ -791,6 +829,9 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let ((hold_bytes, hold_rows), (bg_bytes, bg_rows)) = (maxima.all, maxima.background);
     probe::mark_foreground(false);
     let foot1 = probe::phys_footprint();
+    // Counted since this open (`Outside::zero`), read once its background work settled and every
+    // count above was taken.
+    let exc = exceptions(&db);
     let mut s = Sample::new();
     // A negative delta (the open freed more than it kept) is recorded as such, never clamped: the
     // test refuses it.
@@ -810,6 +851,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_fg_hold_catalog_rows", maxima.foreground.1);
     // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
     s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
+    put_exceptions(&mut s, [0; 4], exc);
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
 }
@@ -891,6 +933,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     let gapped = (8, 0, true);
     for (c, delay_ms, gap) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false)).chain([gapped]) {
         let rounds = shared_rounds(c);
+        let e0 = exceptions(db);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
         // The gapped control's pause: every client meets half-way, the last to arrive sleeps 20 ms and
@@ -945,8 +988,10 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         // read them. The tail's are the last landed flight's own (`confirm_tail_words_for_test`,
         // counted by the writer as it writes them); every other word written was a burst's.
         let (w2, tail) = (words(), db.branches.confirm_tail_words_for_test());
+        let e1 = exceptions(db);
         let total = delta(w0, w2);
         let mut m = Sample::new();
+        put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
         m.insert("acks", c * rounds);
         m.insert("flights", delta(f0, f1));
@@ -1074,8 +1119,10 @@ fn open_once(path: &Path, log: &Path) -> Sample {
     let db = open_at(path);
     let (s1, c1, d1) = (sync_counts(), classes(), dirs());
     let m1 = std::fs::metadata(log).unwrap();
+    // Counted since this open (`Outside::zero`).
+    let exc = exceptions(&db);
     drop(db);
-    Sample::from([
+    let mut s = Sample::from([
         ("full_fsync", s1.full_fsync - s0.full_fsync),
         ("fsync", s1.fsync - s0.fsync),
         ("barrier", s1.barrier - s0.barrier),
@@ -1085,7 +1132,9 @@ fn open_once(path: &Path, log: &Path) -> Sample {
         ("same_inode", u64::from(m0.ino() == m1.ino())),
         ("same_len", u64::from(m0.len() == m1.len())),
         ("confirmed", confirmed),
-    ])
+    ]);
+    put_exceptions(&mut s, [0; 4], exc);
+    s
 }
 
 /// Kills a writer grandchild when dropped, so no test failure leaves it running.
@@ -1250,6 +1299,8 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     forker.create_branch("anchor").unwrap();
                 }
                 let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7";
+                // The sample's window for the counted exceptions: from here to the joins below.
+                let e0 = exceptions(&db);
                 let hold = db.branches.trunk_commit_hold.clone();
                 let _disarm = SchemaHoldDisarm(hold.clone());
                 let parked = if window {
@@ -1318,6 +1369,7 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                 made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed (waited for the DDL: {waited}): {e}"));
                 let (branch, c) = connect.unwrap_or_else(spawn_connect).join().unwrap();
                 let branch = branch.unwrap_or_else(|e| panic!("{cell}: {op}: the child's first connection failed: {e}"));
+                put_exceptions(&mut s, e0, exceptions(&db));
                 s.extend(c);
                 s.insert("connect_waited_for_ddl", u64::from(connect_waited));
                 // The branch has the schema its pages need (the engine's own test's check).
@@ -1366,10 +1418,12 @@ fn first_create(cell: &str, out: &mut String) {
                 db
             };
             let trunk = db.connect().unwrap();
+            let e0 = exceptions(&db);
             let (c0, f0) = (probe::sql_counts(), sync_counts());
             trunk.create_branch("m-0000").unwrap();
             let (c1, f1) = (probe::sql_counts(), sync_counts());
             let mut s = sql_sample(&c0, &c1);
+            put_exceptions(&mut s, e0, exceptions(&db));
             s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
             s.insert("fsync", f1.fsync - f0.fsync);
             line(out, cell, op, i, &s);
@@ -1404,7 +1458,7 @@ fn run_instruments(cell: &str) -> String {
         let s0 = probe::begin();
         f();
         let s1 = probe::end();
-        sample_of(&s0, &s1, &Outside::zero(None), &Outside::zero(None))
+        sample_of(&s0, &s1, &Outside::none(), &Outside::none())
     };
     put("fc_nothing", &window(&mut || {}));
     put(
@@ -1818,7 +1872,7 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
@@ -1854,7 +1908,7 @@ fn budget_child() {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
-        } else if spec.starts_with("ckpt") {
+        } else if spec.starts_with("ckpt") || spec == "exc_sharp" {
             checkpoints(&spec, &db, base, &mut text);
         } else if named {
             rounds(&spec, &db, base, k, &mut text);
@@ -1939,8 +1993,43 @@ fn cell(spec: &str) -> Arc<CellData> {
         std::sync::OnceLock::new();
     let cells = CELLS.get_or_init(Default::default);
     // Held while the child runs: two tests needing one cell run it once.
-    let mut cells = cells.lock().unwrap_or_else(|e| e.into_inner());
-    cells.entry(spec.to_string()).or_insert_with(|| Arc::new(run_child(spec))).clone()
+    let data = {
+        let mut cells = cells.lock().unwrap_or_else(|e| e.into_inner());
+        cells.entry(spec.to_string()).or_insert_with(|| Arc::new(run_child(spec))).clone()
+    };
+    // DECISIONS bd0d845f97: a credited cell has all four counted exceptions at 0 inside every
+    // window; one that moved one, or a window that did not record them, is refused before any budget
+    // reads the cell. The instruments' cell reads no database (its fire-checks are of the probes).
+    if spec != "instruments" {
+        let bad = uncredited(&data);
+        assert!(
+            bad.is_empty(),
+            "budget cell {spec}: not credited (DECISIONS bd0d845f97: a credited cell needs {EXC_KEYS:?} at 0 inside every window):\n{bad}"
+        );
+    }
+    data
+}
+
+/// The windows of `c` that moved a counted exception (`{key} moved by {n}`) or did not record one
+/// (`no {key} recorded`: a counter not read is not a zero), one line each.
+fn uncredited(c: &CellData) -> String {
+    let mut bad = String::new();
+    for (op, samples) in &c.ops {
+        for (i, s) in samples.iter().enumerate() {
+            for key in EXC_KEYS {
+                match s.get(key) {
+                    None => {
+                        let _ = writeln!(bad, "  {op} #{i}: no {key} recorded");
+                    }
+                    Some(&0) => {}
+                    Some(n) => {
+                        let _ = writeln!(bad, "  {op} #{i}: {key} moved by {n}");
+                    }
+                }
+            }
+        }
+    }
+    bad
 }
 
 /// Whether this process is a budget child (whose parent tests must not run: they would spawn
