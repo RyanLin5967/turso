@@ -48,6 +48,10 @@ struct Seen {
     mirror_held: u64,
     /// Review L4 M2: trims of the trunk-version cache past the resident cap.
     trims: u64,
+    /// Operations run under a held flight, and (mutant `l4_child_facts_in_flight` only) slice 3's
+    /// facts used in a flight.
+    flight_ops: u64,
+    facts_in_flight: u64,
 }
 
 impl Seen {
@@ -61,6 +65,8 @@ impl Seen {
         self.in_flight += o.in_flight;
         self.mirror_held += o.mirror_held;
         self.trims += o.trims;
+        self.flight_ops += o.flight_ops;
+        self.facts_in_flight += o.facts_in_flight;
     }
 }
 
@@ -182,6 +188,7 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
                         }
                         _ => {}
                     }
+                    seen.flight_ops += 1;
                     // The facts a flight keeps the store from using, checked in the flight anyway
                     // (does the guard protect anything?).
                     super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(true));
@@ -252,6 +259,7 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
     super::store::CHECK_FREE_INFERENCE.with(|c| c.set(false));
     // Trims are counted per process lifetime of the store; the last one's count is read here.
     seen.trims += db.branches.mirror_misses_and_trims_for_test().1;
+    seen.facts_in_flight += db.branches.facts_used_in_flight_for_test();
     seen
 }
 
@@ -284,6 +292,7 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
         );
     };
     premise("format 19", &total);
+    println!("L4 oracle, format 19: {total:?}");
     assert!(
         total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0,
         "premise: an open inferred a slot's state, a step ran under a held flight, and a held name scan's mirror was discarded: {total:?}"
@@ -294,6 +303,7 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     for seed in [5u64, 77] {
         capped.add(history(seed, 300, false, Some(2)));
     }
+    println!("L4 oracle, resident cap 2: {capped:?}");
     assert!(capped.trims > 0, "premise: the resident cap trimmed the trunk-version cache: {capped:?}");
     // LEAP L4 slice 2: a store made at the legacy format 17 opens by the older path and stays 17;
     // review L4 L4: the same premise over it (its meta row carries no facts, so that one is not asked).
@@ -301,6 +311,7 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     for seed in [3u64, 99] {
         legacy.add(history(seed, 200, true, None));
     }
+    println!("L4 oracle, legacy 17: {legacy:?}");
     assert!(
         legacy.pages_complete > 0 && legacy.all_complete > 0 && legacy.free_exhausted > 0 && legacy.mirror_built > 0,
         "premise (legacy 17): every fact was set at some check: {legacy:?}"

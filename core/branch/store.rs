@@ -1841,6 +1841,9 @@ struct CatState {
     trunk_all_complete: bool,
     /// Trims of `trunk_cache` past the resident cap, which clear the complete marks (instrument).
     trunk_trims: u64,
+    /// Slice 3's facts used while a checkpoint was in flight (only under mutant
+    /// `l4_child_facts_in_flight`; instrument).
+    facts_used_in_flight: u64,
     /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
     /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
     /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
@@ -2180,6 +2183,7 @@ impl CatState {
             trunk_cache: HashMap::new(),
             trunk_complete: HashSet::new(),
             trunk_trims: 0,
+            facts_used_in_flight: 0,
             // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
@@ -8574,6 +8578,12 @@ impl BranchStore {
         (inner.names.mirror_misses, inner.cat.as_ref().map_or(0, |c| c.trunk_trims))
     }
 
+    /// Test builds (review L4 M1): slice 3's facts used while a checkpoint was in flight.
+    #[cfg(test)]
+    pub(crate) fn facts_used_in_flight_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.facts_used_in_flight)
+    }
+
     /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
     #[cfg(test)]
     pub(crate) fn format_for_test(&self) -> Option<u32> {
@@ -9470,6 +9480,7 @@ impl StoreInner {
         // unknown, never while a checkpoint is in the air).
         // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too.
         if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
+            cat.facts_used_in_flight += u64::from(cat.flight);
             if cat.trunk_versions.is_none() {
                 cat.trunk_versions = Some(!cat.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty());
             }
@@ -10722,6 +10733,7 @@ impl StoreInner {
                         && (!cat.flight || fe_mutant("l4_child_facts_in_flight"))
                         && !fe_mutant("l4_probe_always") =>
                 {
+                    cat.facts_used_in_flight += u64::from(cat.flight);
                     if cat.trunk_child_max.is_none() {
                         cat.trunk_child_max = Some(cat.catalog.children_below(0, u64::MAX, 1)?.first().copied());
                     }
