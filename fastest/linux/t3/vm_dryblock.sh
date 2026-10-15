@@ -1,0 +1,64 @@
+#!/bin/bash
+# vm_dryblock.sh SHA OUTDIR [FS...] -- T3 gate item 6's dry run as amended by the lead (DECISIONS 2026-10-15): t3run
+# --dry-block on a lima VM's real non-loop virtual disk, on this Mac, for each FS (default: xfs btrfs). Every output is
+# stamped DRY-VIRT, which summarize refuses for credit. Item 6 is MET only when this passes end to end on xfs AND btrfs.
+#
+# Refuses (exit 2), before anything is created or started:
+#   - the Mac host has under 35 GiB free (t3lib.sh host_room_ok; the lead's floor);
+#   - the VM asks for more than 8 GiB of memory or 4 CPUs (the ruled ceiling);
+#   - limactl is missing.
+# Then: the VM fl-t3 (Ubuntu 24.04, made if absent) gets the data disk t3data (qcow2, sparse, DATA_GIB, made if
+# absent, never formatted by lima), starts, and runs t3run.sh from a clone of the fork at SHA with --dry-block on the
+# one unmounted virtio disk of DATA_GIB. The VM's own root must have ROOT_MIN_GIB free for the build. The package
+# (<out>.tar.gz and its sha256) is copied to OUTDIR. The VM is stopped afterwards; nothing is deleted.
+# Environment (bounded, never above the ruling): VM_CPUS (default 4), VM_MEM_GIB (8), DATA_GIB (60), ROOT_MIN_GIB (25).
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+source "$HERE/t3lib.sh"
+SHA=${1:?SHA} OUTDIR=${2:?OUTDIR}; shift 2
+FSL=${*:-xfs btrfs}
+VM=fl-t3 DISK=t3data
+CPUS=${VM_CPUS:-4} MEM=${VM_MEM_GIB:-8} DATA=${DATA_GIB:-60} ROOT_MIN=${ROOT_MIN_GIB:-25}
+command -v limactl > /dev/null || { echo "vm_dryblock: REFUSED: limactl is not installed"; exit 2; }
+[[ $CPUS =~ ^[0-9]+$ && $MEM =~ ^[0-9]+$ ]] && [ "$CPUS" -le 4 ] && [ "$MEM" -le 8 ] ||
+  { echo "vm_dryblock: REFUSED: the VM may have at most 4 CPUs and 8 GiB (asked $CPUS CPUs, $MEM GiB)"; exit 2; }
+free_kb=$(df -k / | awk 'NR == 2 { print $4 }')
+host_room_ok "$free_kb" || exit 2
+mkdir -p "$OUTDIR" || exit 2
+log=$OUTDIR/vm_dryblock.log
+exec > >(tee -a "$log") 2>&1
+echo "# vm_dryblock sha=$SHA fs=[$FSL] cpus=$CPUS mem=${MEM}GiB data=${DATA}GiB host_free_kb=$free_kb start=$(date -u +%FT%TZ)"
+if ! limactl list -q 2>/dev/null | grep -qx "$VM"; then
+  timeout 900 limactl create --name="$VM" --cpus="$CPUS" --memory="$MEM" --disk=40 --mount-none --tty=false \
+    template://ubuntu-24.04 || { echo "vm_dryblock: limactl create failed"; exit 1; }
+fi
+limactl disk list -q 2>/dev/null | grep -qx "$DISK" ||
+  { timeout 300 limactl disk create "$DISK" --size "${DATA}GiB" || { echo "vm_dryblock: disk create failed"; exit 1; }; }
+timeout 300 limactl stop "$VM" > /dev/null 2>&1 || true
+timeout 120 limactl edit "$VM" --set ".cpus=$CPUS | .memory=\"${MEM}GiB\" | .additionalDisks=[{\"name\":\"$DISK\",\"format\":false}]" ||
+  { echo "vm_dryblock: cannot configure $VM"; exit 1; }
+timeout 900 limactl start "$VM" || { echo "vm_dryblock: $VM did not start"; exit 1; }
+rc=0
+timeout 43200 limactl shell "$VM" -- bash -s "$SHA" "$FSL" "$DATA" "$ROOT_MIN" << 'VMEOF' || rc=$?
+set -uo pipefail
+SHA=$1 FSL=$2 DATA=$3 ROOT_MIN=$4
+root_free=$(df -k / | awk 'NR == 2 { print $4 }')
+[ "$root_free" -ge $((ROOT_MIN * 1024 * 1024)) ] ||
+  { echo "vm_dryblock (VM): REFUSED: the VM's root has $((root_free / 1024 / 1024)) GiB free, under $ROOT_MIN"; exit 2; }
+# the data disk: the one virtio disk of DATA GiB with no partition and nothing mounted (devguard re-checks it)
+want=$((DATA * 1024 * 1024 * 1024))
+mapfile -t cand < <(lsblk -bdn -o NAME,SIZE,TYPE | awk -v w="$want" '$3 == "disk" && $2 == w && $1 ~ /^vd/ { print $1 }')
+[ ${#cand[@]} = 1 ] || { echo "vm_dryblock (VM): REFUSED: ${#cand[@]} virtio disks of $DATA GiB (${cand[*]:-none}), want 1"; exit 2; }
+dev=/dev/${cand[0]}
+command -v git > /dev/null || { sudo apt-get update -q && sudo apt-get install -y -q git; } || exit 1
+rm -rf ~/t3-out ~/t3-out.src ~/t3-out.tar.gz ~/t3-out.tar.gz.sha256
+git clone -q --filter=blob:none https://github.com/RyanLin5967/turso ~/t3-out.src && git -C ~/t3-out.src checkout -q --detach "$SHA" ||
+  { echo "vm_dryblock (VM): cannot check out $SHA"; exit 2; }
+T3RUN_INSIDE=1 bash ~/t3-out.src/fastest/linux/t3/t3run.sh --sha "$SHA" --out ~/t3-out --dry-block "$dev" --fs "$FSL"
+VMEOF
+echo "vm_dryblock: t3run in $VM rc=$rc"
+timeout 600 limactl copy "$VM:t3-out.tar.gz" "$OUTDIR/" && timeout 60 limactl copy "$VM:t3-out.tar.gz.sha256" "$OUTDIR/" ||
+  echo "vm_dryblock: no package to copy back"
+timeout 300 limactl stop "$VM" > /dev/null 2>&1 || true
+echo "# vm_dryblock done rc=$rc end=$(date -u +%FT%TZ)"
+exit "$rc"
