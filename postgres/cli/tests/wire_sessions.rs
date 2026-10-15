@@ -3127,6 +3127,48 @@ fn generate_series_refuses_infinite_bounds() {
     }
 }
 
+/// A result column with no alias is named as PostgreSQL's FigureColname names it (recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-colnames.out): a column reference or a cast of one by the
+/// column, a cast of anything else by the type, a function, CASE, COALESCE, GREATEST, LEAST,
+/// NULLIF, ARRAY and EXISTS by their keyword, a scalar subquery by its one column, and an operator
+/// or a literal `?column?`. They were named by the engine's text of the translated expression
+/// (`CAST (9e999 AS REAL)`, `MAX (1, 2)`, `'abc'`): the regress corpus's numeric.sql and others,
+/// and a client reading a row by column name.
+#[test]
+fn an_unaliased_result_column_is_named_as_postgresql_names_it() {
+    let dir = Scratch::new("colnames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cn (a int, b text)").ok("cn");
+    a.q("INSERT INTO cn VALUES (1, 'x')").ok("row");
+    let q = "?column?";
+    for (sql, names) in [
+        (
+            "SELECT 1 + 1, 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn",
+            vec![q, "numeric", "numeric", "a", "b"],
+        ),
+        (
+            "SELECT CASE WHEN true THEN 1 END, CASE WHEN true THEN a ELSE a END, coalesce(1, 2), \
+             greatest(1, 2), least(1, 2), nullif(1, 2) FROM cn",
+            vec!["case", "a", "coalesce", "greatest", "least", "nullif"],
+        ),
+        (
+            "SELECT ARRAY[1], EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), \
+             round(1.5) = 2, -1, NOT true, 1 IS NULL",
+            vec!["array", "exists", "q", "a", q, q, q, q],
+        ),
+        ("SELECT 'abc', 42, 1.5, true, NULL, $$d$$", vec![q; 6]),
+        (
+            "SELECT current_date IS NOT NULL, 'x'::varchar(3), CAST(1 AS integer), a + 0 FROM cn",
+            vec![q, "varchar", "int4", q],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        let want: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        assert_eq!(r.names, Some(want), "{sql}");
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
