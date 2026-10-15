@@ -6181,10 +6181,24 @@ fn a_bind_counts_parameters_as_the_lexer_reads_them() {
     // Control: a query's own $1 with one value runs.
     let r = round(&mut a, "SELECT $1::int + 1", &[], &[b"41"]);
     assert_eq!(r.rows, vec![vec![Some("42".to_string())]], "{:?}", r.error);
+    // In a failed block: the statement is parsed BEFORE the failure (named "two"), since a Parse in
+    // a failed block is itself 25P02, as PostgreSQL 18's exec_parse_message refuses it (recorded,
+    // artie raw loud-20261015/pg18-diff); then its Bind with two values is 08P01, the count coming
+    // first (ruled 2026-10-15T06:03:10Z: the Parse moved ahead of the failure, this expectation
+    // unchanged; and the Parse refusal asserted on its own below).
+    a.send(b'P', b"two\0SELECT $1\0\0\0");
+    a.send(b'S', &[]);
+    a.read_reply().ok("Parse of two, before the block");
     a.q("BEGIN").ok("begin");
     assert_eq!(a.q("SELECT * FROM nosuch").status, b'E');
-    let r = round(&mut a, "SELECT $1", &[], &[b"1", b"2"]);
+    a.send(b'B', b"\0two\0\0\0\0\x02\0\0\0\x011\0\0\0\x012\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
     assert_eq!(r.err("two values in a failed block").code, "08P01");
+    assert_eq!(r.status, b'E', "the block is still failed");
+    let r = round(&mut a, "SELECT $1", &[], &[b"1"]);
+    assert_eq!(r.err("a Parse in a failed block").code, "25P02");
     assert_eq!(r.status, b'E', "the block is still failed");
     a.q("ROLLBACK").ok("end");
     let r = round(&mut a, "SELECT $1", &[2], &[b"1", b"2"]);
