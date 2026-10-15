@@ -6193,6 +6193,33 @@ mod tests {
         }
     }
 
+    /// The savepoint verbs' edges (wire review 14 items 21 and 22). A `$` continues a name after its
+    /// first byte, as in an identifier, and no name starts with one; a `--` comment ends at \r as at
+    /// \n; an unterminated nested comment is no verb (pins of c305f1a13's halves, which no test
+    /// held). A savepoint may be named savepoint: `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
+    /// with no other word name it, as PostgreSQL's grammar reads them (TO ColId, RELEASE ColId),
+    /// where the reader stripped the keyword and found no name (Other: in a failed block, 25P02).
+    #[test]
+    fn the_savepoint_verbs_are_read_by_their_grammar() {
+        for (sql, want) in [
+            ("SAVEPOINT a$b", TxVerb::Savepoint),
+            ("RELEASE a$1", TxVerb::Release),
+            ("SAVEPOINT $1", TxVerb::Other),
+            ("-- x\rCOMMIT", TxVerb::Commit),
+            ("/* a /* b */ COMMIT", TxVerb::Other),
+            ("SAVEPOINT savepoint", TxVerb::Savepoint),
+            ("ROLLBACK TO SAVEPOINT", TxVerb::RollbackTo),
+            ("ROLLBACK WORK TO savepoint", TxVerb::RollbackTo),
+            ("ROLLBACK TO SAVEPOINT savepoint", TxVerb::RollbackTo),
+            ("RELEASE SAVEPOINT", TxVerb::Release),
+            ("RELEASE SAVEPOINT savepoint", TxVerb::Release),
+            ("ROLLBACK TO", TxVerb::Other),
+            ("RELEASE", TxVerb::Other),
+        ] {
+            assert_eq!(TxVerb::of(sql), want, "{sql:?}");
+        }
+    }
+
     /// A COMMIT behind a comment that the trunk refuses settles as a COMMIT's refusal: committed
     /// or 40001 with nothing kept, the session idle, never run again (wire review 9 item 7).
     #[test]

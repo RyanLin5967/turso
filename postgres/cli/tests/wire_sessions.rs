@@ -8852,6 +8852,93 @@ fn a_savepoint_verb_in_an_implicit_block_is_25p01() {
     }
 }
 
+/// SAVEPOINT, RELEASE and ROLLBACK TO outside a block are 25P01 whatever the name's spelling, read
+/// by their leading keywords: a name the verb reader cannot hold as one word (`U&"a"`) made the
+/// statement Other, so the engine ran SAVEPOINT and opened a transaction with no BEGIN (status T;
+/// after a write it held the trunk's write lock, and other sessions' writes and creates met
+/// 55P03), and RELEASE or ROLLBACK TO reached the engine's XX000 (wire review 14 item 15).
+/// PostgreSQL 18.6 answers 25P01 (recorded, artie raw loud-20261015/pg18-diff/pg18-r14.out).
+/// `SAVEPOINT a$b`, a name the reader
+/// holds, is the control (wire review 14 item 22's wire half).
+#[test]
+fn a_savepoint_verb_outside_a_block_is_25p01_whatever_its_name() {
+    let dir = Scratch::new("savepointnames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for sql in [
+        "SAVEPOINT U&\"a\"",
+        "RELEASE U&\"a\"",
+        "ROLLBACK TO U&\"a\"",
+        "ROLLBACK TRANSACTION TO SAVEPOINT U&\"a\"",
+        "SAVEPOINT a$b",
+    ] {
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "25P01", "{sql}");
+        assert_eq!(r.status, b'I', "{sql} opened a block");
+        a.q("INSERT INTO t VALUES (5, 'x')").ok("a write after it");
+        a.q("DELETE FROM t WHERE id = 5").ok("undo");
+        let mut b = server.connect();
+        b.q("INSERT INTO t VALUES (9, 'z')")
+            .ok("another session writes at once");
+        b.q("DELETE FROM t WHERE id = 9").ok("undo");
+    }
+}
+
+/// A savepoint may be named savepoint, as in PostgreSQL 18.6 (recorded, pg18-r14.out): in a failed
+/// block, `ROLLBACK TO
+/// SAVEPOINT` rolls back to it and the block carries on to its COMMIT. The verb reader stripped the
+/// keyword, found no name and read Other, so the failed block refused it 25P02 (wire review 14
+/// item 21).
+#[test]
+fn a_savepoint_named_savepoint_is_reached() {
+    let dir = Scratch::new("savepointsavepoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    a.q("SAVEPOINT savepoint").ok("savepoint savepoint");
+    let r = a.q("SELECT * FROM nosuch");
+    assert!(r.error.is_some(), "premise: the statement fails");
+    let r = a.q("ROLLBACK TO SAVEPOINT").ok("rollback to savepoint savepoint");
+    assert_eq!(r.status, b'T', "the block is still failed");
+    assert_eq!(a.q("SELECT 2").single("in the block"), "2");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("kept"),
+        "1"
+    );
+}
+
+/// COMMIT or ROLLBACK inside an implicit block warns 25P01 "there is no transaction in progress",
+/// as PostgreSQL warns for `SELECT 1; COMMIT` (18.6, recorded, pg18-r14.out) and for a pipeline's
+/// COMMIT before its Sync (17.11, the review's), and still ends the block. They reached the engine
+/// with no notice, though the commit that made them end the block claimed PostgreSQL's behaviour
+/// (wire review 14 item 20).
+#[test]
+fn a_block_end_in_an_implicit_block_warns_25p01() {
+    let dir = Scratch::new("implicitend");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for verb in ["COMMIT", "ROLLBACK"] {
+        let sql = format!("SELECT 1; {verb}");
+        let r = a.q(&sql).ok(&sql);
+        assert!(
+            r.notices.iter().any(|n| n.code == "25P01"),
+            "{sql}: notices {:?}",
+            r.notices
+        );
+        assert_eq!(r.status, b'I', "{sql}");
+        let r = a.pipeline(&["SELECT 1", verb]).ok(verb);
+        assert!(
+            r.notices.iter().any(|n| n.code == "25P01"),
+            "pipeline {verb}: notices {:?}",
+            r.notices
+        );
+        assert_eq!(r.status, b'I', "pipeline {verb}");
+    }
+}
+
 /// A savepoint that does not exist is 3B001 wherever it is named, and ROLLBACK TO or RELEASE
 /// outside a block is 25P01, as in PostgreSQL. Only an engine-dropped failed block answered 3B001;
 /// a mistyped ROLLBACK TO in a live block, RELEASE of an unknown name and either verb in autocommit
