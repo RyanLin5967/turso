@@ -1393,10 +1393,11 @@ struct StoreMutex {
     /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
     /// as it arrived.
     compacting: AtomicU64,
-    /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
-    /// background compaction's sync under the mutex (an exception counter,
-    /// `BranchStore::exception_counters`). One that arrived in the margins (before the writer
-    /// locked, or after it unlocked) and did not wait is counted too: an overcount, never a miss.
+    /// Lock acquisitions that arrived while `compacting` was odd, or during which it moved:
+    /// operations that waited behind a background compaction's sync under the mutex (an exception
+    /// counter, `BranchStore::exception_counters`). One that arrived in the margins (before the
+    /// writer locked, or after it unlocked) and did not wait is counted too: an overcount, never a
+    /// miss (`StoreMutex::lock`).
     compaction_waits: AtomicU64,
 }
 
@@ -1409,17 +1410,25 @@ impl StoreMutex {
         }
     }
 
+    /// Counted when `compacting` was odd before the mutex was tried, or moved while it was tried
+    /// (Codex C25 MED 1): every counted hold adds one as it begins and one as it ends, so a hold that
+    /// began, and took the mutex first, after the precheck read it even leaves a different value by
+    /// the time this thread holds the mutex. Mutant `compaction_wait_precheck_only` (test builds
+    /// only): the precheck alone decides, as before.
     fn lock(&self) -> StoreGuard<'_> {
-        if self.compacting.load(Ordering::Acquire) & 1 == 1 {
-            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
-        }
+        let before = self.compacting.load(Ordering::Acquire);
         #[cfg(test)]
         AFTER_PRECHECK.with(|h| {
             if let Some(hook) = h.borrow_mut().as_mut() {
                 hook();
             }
         });
-        self.lock_uncounted()
+        let guard = self.lock_uncounted();
+        let moved = self.compacting.load(Ordering::Acquire) != before && !fe_mutant("compaction_wait_precheck_only");
+        if before & 1 == 1 || moved {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        guard
     }
 
     /// `lock`, not counted as waiting behind a compaction: the background compaction's own.
