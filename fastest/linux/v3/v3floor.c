@@ -219,7 +219,7 @@ static int REQREG = 0;             /* --require-registered: rental mode refuses 
 /* REGISTERED.tsv: "key<TAB>value<TAB>registration ref" lines, '#' comments. Every line is under one rule, the same as
  * check.py's (tenth review LOW 2), and each broken part of it refuses with its own code and text (V3 review 12 item 2:
  * the value allowlist inside reg_lookup made a planted frame_arm append25 refuse with the generic byte/length text);
- * the offending key and value are kept in REG_BAD_KEY and REG_BAD_VAL. reg_lookup ->
+ * the offending key and value are kept in REG_BAD_KEY and REG_BAD_VAL, set only by -3, -4 and -5. reg_lookup ->
  *   0  the key was found (a key appears at most once: a second line with it refuses, never last-wins)
  *   1  the key is absent
  *  -1  the file cannot be read
@@ -234,6 +234,9 @@ static int REQREG = 0;             /* --require-registered: rental mode refuses 
 #define REG_VAL_MAX 60   /* < d0val's and frame_reg's 64 */
 #define REG_REF_MAX 200  /* < d0ref's and frame_ref's 256: a ref is never truncated */
 #define REG_NKEYS 28     /* frame_arm and the 27 d0 threshold keys: the seen set is a 28-bit mask (review 12 item 16) */
+/* V3 review 13 item 13: nothing tied the key count to reg_key_index's 1 + 3*3*3 keys or to the mask's width */
+_Static_assert(1 + 3 * 3 * 3 == REG_NKEYS && REG_NKEYS <= (int)(8 * sizeof(unsigned)),
+               "seen mask: one bit per registry key");
 static char REG_BAD_KEY[REG_KEY_MAX + 1], REG_BAD_VAL[REG_VAL_MAX + 1];
 /* the key's index (0 frame_arm, 1..27 the d0 threshold keys), -1 for any other key */
 static int reg_key_index(const char *k) {
@@ -284,12 +287,15 @@ static int reg_lookup(const char *path, const char *key, char *val, size_t vcap,
         *t2++ = 0;
         if (strlen(line) > REG_KEY_MAX || strlen(t1) > REG_VAL_MAX || strlen(t2) > REG_REF_MAX ||
             strlen(t1) >= vcap || strlen(t2) >= rcap) { code = -2; break; }
-        snprintf(REG_BAD_KEY, sizeof REG_BAD_KEY, "%s", line);
-        snprintf(REG_BAD_VAL, sizeof REG_BAD_VAL, "%s", t1);
         int idx = reg_key_index(line);
-        if (idx < 0) { code = -5; break; }
-        if (!reg_value_ok(idx, t1)) { code = -3; break; }
-        if (seen & (1u << idx)) { code = -4; break; }
+        if (idx < 0) code = -5;
+        else if (!reg_value_ok(idx, t1)) code = -3;
+        else if (seen & (1u << idx)) code = -4;
+        if (code) { /* REG_BAD_* name the OFFENDING line only (V3 review 13 item 13: they named the last line read) */
+            snprintf(REG_BAD_KEY, sizeof REG_BAD_KEY, "%s", line);
+            snprintf(REG_BAD_VAL, sizeof REG_BAD_VAL, "%s", t1);
+            break;
+        }
         seen |= 1u << idx;
         if (!strcmp(line, key)) {
             snprintf(val, vcap, "%s", t1);
