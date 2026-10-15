@@ -153,18 +153,25 @@ pub(super) fn emit_array_encode(
     // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
     // are themselves arrays (blobs), so we use ANY/Blob for validation.
     // Only 1-dimensional arrays validate elements against the declared base type.
-    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
+    // A custom element type with no ENCODE (bigint, float4, float8) is checked as its base: named
+    // as itself it reached ArrayEncode's catch-all for custom types, which checks nothing, so
+    // '{1.5,abc}' was stored in a float8[] (ultrareview of fastest-wire, finding 2).
+    let element_ty = match resolver.schema().get_type_def_unchecked(&col.ty_str) {
+        Some(type_def) if type_def.encode().is_none() => type_def.base(),
+        _ => col.ty_str.as_str(),
+    };
+    let is_any = element_ty.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
     let col_name = col.name.as_deref().unwrap_or("");
     let element_affinity = if is_any || is_multidim {
         Affinity::Blob
     } else {
-        Affinity::affinity(&col.ty_str)
+        Affinity::affinity(element_ty)
     };
     let element_type = if is_any || is_multidim {
         "ANY".into()
     } else {
-        col.ty_str.to_uppercase().into()
+        element_ty.to_uppercase().into()
     };
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
