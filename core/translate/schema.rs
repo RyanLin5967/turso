@@ -845,6 +845,12 @@ fn validate(
                                         provided
                                     );
                                 }
+                                let params: Vec<Box<ast::Expr>> = match &col_type.size {
+                                    Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
+                                    Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
+                                    None => vec![],
+                                };
+                                check_numeric_typmod(type_name, &params)?;
                             }
                             Some(_) => {}
                         }
@@ -1097,6 +1103,31 @@ fn emit_ctas_insert(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A numeric column's typmod as PostgreSQL bounds it, at the DDL that declares it (class (a),
+/// DECISIONS 994f7d41e0): numeric(p, s) builds a `NumericTypmod`, refused with PostgreSQL's 22023
+/// message outside its range. Called by CREATE TABLE and ALTER TABLE ADD COLUMN, every DDL that
+/// declares a column type with parameters (a domain's base type takes none). Parameters that are
+/// not integer literals are left to numeric's ENCODE, which builds the same typmod at every write
+/// and CAST.
+pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>]) -> crate::Result<()> {
+    if !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
+        return Ok(());
+    }
+    fn literal(e: &ast::Expr) -> Option<i64> {
+        match e {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse().ok(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => literal(inner).and_then(i64::checked_neg),
+            _ => None,
+        }
+    }
+    if let [p, s] = params {
+        if let (Some(p), Some(s)) = (literal(p), literal(s)) {
+            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| crate::LimboError::ParseError(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,

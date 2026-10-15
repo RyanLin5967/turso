@@ -18,7 +18,7 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 /// [num_limbs: 4 bytes, u32 LE]
 /// [limb0: 4 bytes u32 LE] [limb1: 4 bytes u32 LE] ... [limbN: 4 bytes u32 LE]
 /// ```
-pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
+fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
     let (bigint, scale) = val.as_bigint_and_exponent();
     let (sign, magnitude) = bigint.into_parts();
 
@@ -58,8 +58,10 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
     buf
 }
 
-/// Deserialize a BigDecimal from our portable blob format.
-pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
+/// Deserialize a BigDecimal from our portable blob format: the decoder's raw step, bounded only by the
+/// blob's own sanity limits. Outside its tests, only `PgNumeric::from_blob` calls it, which bounds
+/// the value it returns.
+pub(crate) fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     // Minimum size: version(1) + flags(1) + scale(8) + num_limbs(4) = 14
     if blob.len() < 14 {
         return Err(LimboError::Constraint(
@@ -150,8 +152,8 @@ const PG_MAX_FRACTION_DIGITS: i128 = 16_383;
 ///
 /// A zero is bounded by its fraction digits alone, as PostgreSQL bounds it (Codex C25 HIGH 3: every
 /// zero passed, so `'0e-2000000000' / x` asked the division for 10^1999999000). A zero with a
-/// positive exponent is in range; `numeric_operand_value` makes it a plain 0 before arithmetic.
-pub fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
+/// positive exponent is in range; `PgNumeric::new` makes it a plain 0.
+fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
     let (int, scale) = v.as_bigint_and_exponent();
     if int.sign() == Sign::NoSign {
         // Mutant `numeric_zero_unbounded` (test builds only): every zero passes, as before.
@@ -170,21 +172,6 @@ pub fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
     Err(LimboError::Constraint("value overflows numeric format".to_string()))
 }
 
-/// `v` entering numeric arithmetic: within PostgreSQL's range (`check_numeric_range`), and a zero
-/// with a positive exponent made a plain 0, as PostgreSQL's input makes it (`'0e1000000'::numeric`
-/// is 0; PG 18.6, artie raw frontier/fastest/lanes/engine/raw/pg18-numeric-zero-scale.txt). Kept,
-/// its negative scale carried into every scale-dependent result (`'0e1000000' * x` printed "0", not
-/// PostgreSQL's "0.00") and into the division's power of ten (Codex C25 HIGH 3). Mutant
-/// `numeric_zero_unbounded` (test builds only): the zero is kept as parsed, as before.
-pub fn numeric_operand_value(v: BigDecimal) -> crate::Result<BigDecimal> {
-    check_numeric_range(&v)?;
-    let (int, scale) = v.as_bigint_and_exponent();
-    if int.sign() == Sign::NoSign && scale < 0 && !crate::branch::store::fe_mutant("numeric_zero_unbounded") {
-        return Ok(BigDecimal::new(BigInt::from(0), 0));
-    }
-    Ok(v)
-}
-
 /// `a / b` as PostgreSQL computes it (numeric.c `select_div_scale`, then `div_var` rounding at
 /// that scale): the result scale keeps at least 16 significant digits and is never below either
 /// operand's display scale, and the quotient is rounded half away from zero (lead ruling
@@ -192,7 +179,7 @@ pub fn numeric_operand_value(v: BigDecimal) -> crate::Result<BigDecimal> {
 /// numeric range (`check_numeric_range`); one that is not is refused here too, so the shift below
 /// stays a few hundred thousand digits at most (engine review 21 MED 10: it was unbounded, and the
 /// exponent past u32 was silently replaced by u32::MAX).
-pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> crate::Result<BigDecimal> {
+fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> crate::Result<BigDecimal> {
     // Mutant `numeric_range_unchecked` (test builds only) skips this check too.
     if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
         check_numeric_range(a)?;
@@ -279,7 +266,7 @@ fn pg_weight_and_first_digit(v: &BigDecimal) -> (i64, u32) {
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
 /// BigDecimal::to_string() may drop trailing zeros, but we want "1.10" to
 /// remain "1.10" and "0.00" to remain "0.00" for a value stored with scale=2.
-pub fn format_numeric(bd: &BigDecimal) -> String {
+fn format_numeric(bd: &BigDecimal) -> String {
     let (bigint, scale) = bd.as_bigint_and_exponent();
     if scale <= 0 {
         // No decimal places: just print the integer (possibly scaled up)
@@ -312,51 +299,174 @@ pub fn format_numeric(bd: &BigDecimal) -> String {
     }
 }
 
-/// Validate that a BigDecimal fits within the given precision and scale.
-/// Precision = total number of significant digits.
-/// Scale = number of digits after the decimal point.
-pub fn validate_precision_scale(
-    val: &BigDecimal,
+/// A numeric value within PostgreSQL's limits (lead ruling, class (a), DECISIONS 994f7d41e0): at most
+/// 16383 fraction digits and 131072 integer digits, a zero with a positive exponent made a plain 0.
+/// `new` is its only constructor and every arithmetic result is built through it, so an unbounded
+/// value cannot exist past the parser: each one-instance fix before it (the zero's scale, C25 HIGH
+/// 3; the product's scale; the operand range, review 21 MED 10; the typmod's precision and scale,
+/// review 0e8b1cf18..0a4a127a1 HIGH and MED 1) is now a property of the type. Every path a value
+/// takes is one of these methods: `parse` (text, a real's text), `from_i64`, `from_blob` (a stored
+/// value), the operators `add`/`sub`/`mul`/`div`, `with_typmod` (numeric's ENCODE and every CAST to
+/// numeric(p, s)), `to_blob` and `format`. The expected values of its tests are PG 18.6's (artie
+/// raws pg18-numeric-*.txt).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PgNumeric(BigDecimal);
+
+/// PostgreSQL's display-scale cap on a product (numeric.c `mul_var`'s rscale is at most
+/// NUMERIC_DSCALE_MAX).
+const PG_MAX_DSCALE: i64 = 16_383;
+
+impl PgNumeric {
+    /// `v` within PostgreSQL's range, or PostgreSQL's 22003 "value overflows numeric format". Mutant
+    /// `numeric_range_unchecked` (test builds only): any value, as before (`check_numeric_range`
+    /// reads it); `numeric_zero_unbounded`: a zero keeps its exponent.
+    pub fn new(v: BigDecimal) -> crate::Result<Self> {
+        if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
+            check_numeric_range(&v)?;
+        }
+        let (int, scale) = v.as_bigint_and_exponent();
+        if int.sign() == Sign::NoSign && scale < 0 && !crate::branch::store::fe_mutant("numeric_zero_unbounded") {
+            return Ok(Self(BigDecimal::new(BigInt::from(0), 0)));
+        }
+        Ok(Self(v))
+    }
+
+    /// Numeric input text, or `None` for text that is not a number (the caller words the refusal).
+    pub fn parse(text: &str) -> Option<crate::Result<Self>> {
+        use std::str::FromStr;
+        BigDecimal::from_str(text).ok().map(Self::new)
+    }
+
+    pub fn from_i64(i: i64) -> Self {
+        Self(BigDecimal::from(i))
+    }
+
+    /// A stored value, refused if its blob holds one outside the range.
+    pub fn from_blob(blob: &[u8]) -> crate::Result<Self> {
+        Self::new(blob_to_bigdecimal(blob)?)
+    }
+
+    pub fn to_blob(&self) -> ValueBlob {
+        bigdecimal_to_blob(&self.0)
+    }
+
+    pub fn format(&self) -> String {
+        format_numeric(&self.0)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0.as_bigint_and_exponent().0.sign() == Sign::NoSign
+    }
+
+    /// The display scale: the scale, at least 0.
+    fn dscale(&self) -> i64 {
+        self.0.as_bigint_and_exponent().1.max(0)
+    }
+
+    pub fn add(&self, other: &Self) -> crate::Result<Self> {
+        Self::new(&self.0 + &other.0)
+    }
+
+    pub fn sub(&self, other: &Self) -> crate::Result<Self> {
+        Self::new(&self.0 - &other.0)
+    }
+
+    /// PostgreSQL's product: at the sum of the display scales, at most 16383, rounded half away from
+    /// zero (a rescale up only appends zeros). Mutant `mul_scale_bigdecimal` (test builds only):
+    /// bigdecimal's own product; `product_scale_uncapped`: the sum not capped.
+    pub fn mul(&self, other: &Self) -> crate::Result<Self> {
+        let product = &self.0 * &other.0;
+        if crate::branch::store::fe_mutant("mul_scale_bigdecimal") {
+            return Self::new(product);
+        }
+        let mut scale = self.dscale() + other.dscale();
+        if !crate::branch::store::fe_mutant("product_scale_uncapped") {
+            scale = scale.min(PG_MAX_DSCALE);
+        }
+        Self::new(product.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp))
+    }
+
+    /// PostgreSQL's quotient (`pg_numeric_div`); `other` must not be zero. Mutant
+    /// `div_scale_bigdecimal` (test builds only): bigdecimal's own quotient.
+    pub fn div(&self, other: &Self) -> crate::Result<Self> {
+        if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
+            return Self::new(&self.0 / &other.0);
+        }
+        Self::new(pg_numeric_div(&self.0, &other.0)?)
+    }
+
+    /// This value in `typmod` (numeric.c `apply_typmod`): rounded half away from zero to its scale,
+    /// then refused with PostgreSQL's 22003 "numeric field overflow" if it needs more integer digits
+    /// than the precision leaves. The typmod is bounded (`NumericTypmod::new`), so the rescale is a
+    /// thousand digits at most. Mutant `typmod_truncates` (test builds only): digits dropped, as
+    /// bigdecimal's `with_scale` did before.
+    pub fn with_typmod(&self, typmod: NumericTypmod) -> crate::Result<Self> {
+        let NumericTypmod { precision, scale } = typmod;
+        let rounded = if crate::branch::store::fe_mutant("typmod_truncates") {
+            self.0.with_scale(scale)
+        } else {
+            self.0.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp)
+        };
+        if !self.is_zero() {
+            let (bigint, _) = rounded.as_bigint_and_exponent();
+            let digits = if bigint.sign() == Sign::NoSign { 0 } else { bigint.magnitude().to_string().len() as i64 };
+            if digits > precision {
+                return Err(LimboError::Constraint(format!(
+                    "numeric field overflow: a field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}",
+                    precision - scale
+                )));
+            }
+        }
+        Self::new(rounded)
+    }
+}
+
+/// numeric(precision, scale) as PostgreSQL bounds it (numeric.c `numerictypmodin`): precision 1 to
+/// 1000 and scale -1000 to 1000, refused with its 22023 messages. `new` is the only constructor;
+/// CREATE TABLE, ALTER TABLE ADD COLUMN (`check_numeric_typmod`) and numeric's ENCODE build one,
+/// so no rescale is ever asked for an unbounded scale. Narrower than PostgreSQL still, as before:
+/// a negative scale and a scale above the precision are refused (PostgreSQL 15+ accepts both).
+/// Mutant `typmod_range_unchecked` (test builds only): any precision and scale pass the range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumericTypmod {
     precision: i64,
     scale: i64,
-) -> crate::Result<BigDecimal> {
-    use bigdecimal::Zero;
+}
 
-    if precision <= 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric precision must be positive, got {precision}"
-        )));
+impl NumericTypmod {
+    pub fn new(precision: i64, scale: i64) -> crate::Result<Self> {
+        if !crate::branch::store::fe_mutant("typmod_range_unchecked") {
+            if !(1..=1000).contains(&precision) {
+                return Err(LimboError::Constraint(format!(
+                    "NUMERIC precision {precision} must be between 1 and 1000"
+                )));
+            }
+            if !(-1000..=1000).contains(&scale) {
+                return Err(LimboError::Constraint(format!(
+                    "NUMERIC scale {scale} must be between -1000 and 1000"
+                )));
+            }
+        }
+        if scale < 0 {
+            return Err(LimboError::Constraint(format!(
+                "numeric scale must be non-negative, got {scale}"
+            )));
+        }
+        if scale > precision {
+            return Err(LimboError::Constraint(format!(
+                "numeric scale ({scale}) must not exceed precision ({precision})"
+            )));
+        }
+        Ok(Self { precision, scale })
     }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
-    if scale > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale ({scale}) must not exceed precision ({precision})"
-        )));
-    }
+}
 
-    if val.is_zero() {
-        return Ok(BigDecimal::new(BigInt::from(0), scale));
-    }
-
-    // Round to the requested scale
-    let rounded = val.with_scale(scale);
-
-    // Count total significant digits (excluding leading zeros)
-    let (bigint, _) = rounded.as_bigint_and_exponent();
-    let abs_str = bigint.magnitude().to_string();
-    let total_digits = abs_str.len() as i64;
-
-    if total_digits > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric value out of range: precision {precision}, scale {scale}"
-        )));
-    }
-
-    Ok(rounded)
+/// The old validator's shape, kept for its unit tests: `val` in numeric(precision, scale) through the
+/// bounded type.
+#[cfg(test)]
+fn validate_precision_scale(val: &BigDecimal, precision: i64, scale: i64) -> crate::Result<BigDecimal> {
+    let typmod = NumericTypmod::new(precision, scale)?;
+    Ok(PgNumeric::new(val.clone())?.with_typmod(typmod)?.0)
 }
 
 #[cfg(test)]

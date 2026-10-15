@@ -210,46 +210,39 @@ macro_rules! check_arg_count {
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
 
-/// Parse a Value (text, int, float, or blob) into a BigDecimal.
-fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
-    use bigdecimal::BigDecimal;
-    use std::str::FromStr;
+/// A Value (integer, real, text, or a stored encoding) as a numeric, within PostgreSQL's range
+/// (`PgNumeric`, the one bounded type: class (a), DECISIONS 994f7d41e0).
+fn value_to_numeric(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
+    use crate::numeric::decimal::PgNumeric;
     match val {
-        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
-        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
+        Value::Numeric(Numeric::Integer(i)) => Ok(PgNumeric::from_i64(*i)),
+        Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
+            .unwrap_or_else(|| Err(LimboError::Constraint(format!("invalid numeric value: {f}")))),
+        Value::Text(t) => PgNumeric::parse(&t.value)
+            .unwrap_or_else(|| Err(LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value)))),
+        Value::Blob(b) => PgNumeric::from_blob(b),
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
         ))),
     }
 }
 
-/// An argument of numeric's operator functions as a decimal (engine review 16 #21, review 20
+/// An argument of numeric's operator functions as a numeric (engine review 16 #21, review 20
 /// HIGH 2). Their operands reach them as user-facing values (a numeric column read decoded, as
 /// text; the other operand as given: `emit_custom_type_operator`), so a blob can only be an operand
 /// given as one, which numeric's INSERT refuses (`numeric_encode`). It is refused here with that
 /// same error rather than read as the type's internal encoding, which made `x = <blob>` match a
 /// value no INSERT could have stored. The sort comparator still reads stored encodings
-/// (`value_to_bigdecimal`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
-/// encoding, as before.
-fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
+/// (`value_to_numeric`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
+/// encoding, as before. The range (review 21 MED 10) and the zero's exponent (Codex C25 HIGH 3)
+/// are the type's own (`PgNumeric::new`).
+fn numeric_operand(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
     if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
         return Err(LimboError::Constraint(format!(
             "invalid input for type numeric: \"{val}\""
         )));
     }
-    let value = value_to_bigdecimal(val)?;
-    // Within PostgreSQL's numeric range, or refused before any arithmetic (engine review 21 MED
-    // 10: a scale bounded only by i64 made one division build billions of digits). Mutant
-    // `numeric_range_unchecked` (test builds only): not checked, as before.
-    // A zero with a positive exponent is made a plain 0 here too (Codex C25 HIGH 3).
-    if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
-        return crate::numeric::decimal::numeric_operand_value(value);
-    }
-    Ok(value)
+    value_to_numeric(val)
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
@@ -265,10 +258,10 @@ fn make_sort_comparator(
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => {
-                        // Decode from ValueRef to Value for value_to_bigdecimal
+                        // Decode from ValueRef to Value for value_to_numeric
                         let a_val = a.to_owned()?;
                         let b_val = b.to_owned()?;
-                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
+                        match (value_to_numeric(&a_val), value_to_numeric(&b_val)) {
                             (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
@@ -10581,11 +10574,7 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     other => {
-                        use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
-                        };
-                        use bigdecimal::BigDecimal;
-                        use std::str::FromStr;
+                        use crate::numeric::decimal::{NumericTypmod, PgNumeric};
 
                         let precision = match precision_reg.get_value() {
                             Value::Numeric(Numeric::Integer(i)) => *i,
@@ -10603,27 +10592,30 @@ pub fn op_function(
                                 ));
                             }
                         };
-                        let text = match other {
-                            Value::Numeric(Numeric::Integer(i)) => i.to_string(),
-                            Value::Numeric(Numeric::Float(f)) => f.to_string(),
-                            Value::Text(t) => t.value.to_string(),
+                        // The typmod first, before any value is parsed or rescaled: a CAST or a
+                        // column whose typmod CREATE TABLE never saw is bounded here too.
+                        let typmod = NumericTypmod::new(precision, scale)?;
+                        let value = match other {
+                            Value::Numeric(Numeric::Integer(i)) => PgNumeric::from_i64(*i),
+                            Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
+                                .unwrap_or_else(|| {
+                                    Err(LimboError::Constraint(format!(
+                                        "invalid input for type numeric: \"{f}\""
+                                    )))
+                                })?,
+                            Value::Text(t) => PgNumeric::parse(&t.value).unwrap_or_else(|| {
+                                Err(LimboError::Constraint(format!(
+                                    "invalid input for type numeric: \"{}\"",
+                                    t.value
+                                )))
+                            })?,
                             _ => {
                                 return Err(LimboError::Constraint(format!(
                                     "invalid input for type numeric: \"{other}\""
                                 )));
                             }
                         };
-                        let bd = BigDecimal::from_str(&text).map_err(|_| {
-                            LimboError::Constraint(format!(
-                                "invalid input for type numeric: \"{text}\""
-                            ))
-                        })?;
-                        // PostgreSQL's range first: a rescale of an unbounded scale is as
-                        // unbounded as a division (engine review 21 MED 10).
-                        // A zero with a positive exponent stored as a plain 0 (Codex C25 HIGH 3).
-                        let bd = crate::numeric::decimal::numeric_operand_value(bd)?;
-                        let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        Value::from_blob(value.with_typmod(typmod)?.to_blob())
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10634,8 +10626,7 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     Value::Blob(b) => {
-                        let bd = crate::numeric::decimal::blob_to_bigdecimal(b)?;
-                        Value::build_text(crate::numeric::decimal::format_numeric(&bd))
+                        Value::build_text(crate::numeric::decimal::PgNumeric::from_blob(b)?.format())
                     }
                     other => {
                         return Err(LimboError::Constraint(format!(
@@ -10658,42 +10649,20 @@ pub fn op_function(
                         let a = numeric_operand(&lhs_val)?;
                         let b = numeric_operand(&rhs_val)?;
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => {
-                                // PostgreSQL's product scale: the operands' display scales (each
-                                // at least 0) summed (numeric.c `mul_var`). bigdecimal's product of
-                                // a zero is a plain 0, and a negative operand scale lowers it; the
-                                // rescale only appends zeros, so it is exact. Mutant
-                                // `mul_scale_bigdecimal` (test builds only): bigdecimal's own.
-                                let display = |v: &bigdecimal::BigDecimal| v.as_bigint_and_exponent().1.max(0);
-                                let scale = display(&a) + display(&b);
-                                let product = &a * &b;
-                                if crate::branch::store::fe_mutant("mul_scale_bigdecimal") {
-                                    product
-                                } else {
-                                    product.with_scale(scale)
-                                }
-                            }
+                            ScalarFunc::NumericAdd => a.add(&b)?,
+                            ScalarFunc::NumericSub => a.sub(&b)?,
+                            ScalarFunc::NumericMul => a.mul(&b)?,
                             ScalarFunc::NumericDiv => {
-                                use bigdecimal::Zero;
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
                                         "division by zero".to_string(),
                                     ));
                                 }
-                                // PostgreSQL's result scale (lead ruling 2026-10-09 on
-                                // e52f01422). Mutant `div_scale_bigdecimal` (test builds
-                                // only): bigdecimal's own, as before.
-                                if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
-                                    a / b
-                                } else {
-                                    crate::numeric::decimal::pg_numeric_div(&a, &b)?
-                                }
+                                a.div(&b)?
                             }
                             _ => unreachable!(),
                         };
-                        Value::build_text(crate::numeric::decimal::format_numeric(&res))
+                        Value::build_text(res.format())
                     }
                 };
                 state.registers[*dest].set_value(result);
