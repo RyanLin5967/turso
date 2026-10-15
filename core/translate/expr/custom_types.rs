@@ -403,6 +403,28 @@ pub(crate) fn type_eq_function(type_def: &TypeDef) -> Option<&str> {
 /// whose '=' is naked or absent: its seek keys by the encoding alone, as before. Mutant
 /// `seek_key_encodes_raising` (test builds only): None for every type, so the key is ENCODEd in
 /// place, raising and losing precision, and the term is consumed.
+/// The functions a BUILT-IN type's '=' may call and still agree with equality of the type's
+/// encodings, which an index compares (engine review 20 item 8): numeric_eq (numeric_encode is
+/// canonical at the column's scale) and the wire's bpchareq (its ENCODE drops the trailing blanks
+/// bpchareq ignores). An allowlist: a function not named here, or named by a user type whose ENCODE
+/// we did not read, is taken to disagree.
+const EQ_AGREES_WITH_ENCODING: [&str; 2] = ["numeric_eq", "bpchareq"];
+
+/// Whether an equality on a column of `type_def` may be answered from an index (engine review 20
+/// item 8): the type's '=' agrees with equality of the encodings, so the seek misses no row the
+/// '=' would find (the WHERE term's re-check can only remove rows). A type with no function '='
+/// compares with the plain comparison, which is that equality. Mutant `eq_index_ignores_coarse_eq`
+/// (test builds only): every type may, as before.
+pub(crate) fn eq_agrees_with_encoding(type_def: &TypeDef) -> bool {
+    if crate::branch::store::fe_mutant("eq_index_ignores_coarse_eq") {
+        return true;
+    }
+    match type_eq_function(type_def) {
+        None => true,
+        Some(func) => type_def.is_builtin && EQ_AGREES_WITH_ENCODING.iter().any(|f| func.eq_ignore_ascii_case(f)),
+    }
+}
+
 pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
     let eq = type_eq_function(type_def);
     if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {

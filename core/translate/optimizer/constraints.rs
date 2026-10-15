@@ -1106,16 +1106,18 @@ pub fn constraints_from_where_clause(
                         // Custom type columns encode values as blobs. Blob ordering (memcmp)
                         // doesn't necessarily match the custom type's semantic ordering, so
                         // range constraints (>, <, >=, <=) can't use the index. Equality (=)
-                        // still works because encoded(A) == encoded(B) iff A == B.
-                        if schema
-                            .get_type_def(
-                                &constrained_column.ty_str,
-                                table_reference.table.is_strict(),
-                            )
-                            .is_some()
-                            && constraint.operator != ast::Operator::Equals.into()
-                        {
-                            continue;
+                        // can only where the type's '=' agrees with equality of the encodings
+                        // (engine review 20 item 8: tag's instr '=' is coarser, so the seek
+                        // missed rows the '=' finds; `eq_agrees_with_encoding`).
+                        if let Some(type_def) = schema.get_type_def(
+                            &constrained_column.ty_str,
+                            table_reference.table.is_strict(),
+                        ) {
+                            if constraint.operator != ast::Operator::Equals.into()
+                                || !crate::translate::expr::eq_agrees_with_encoding(type_def)
+                            {
+                                continue;
+                            }
                         }
                         let idx_col_aff = constrained_column
                             .affinity_with_strict(table_reference.table.is_strict());
