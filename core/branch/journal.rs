@@ -2206,6 +2206,7 @@ impl Journal {
         }
         let class = self.rewrite_class();
         let mut synced = prep.synced;
+        let mut synced_in_class = false;
         let mut len = LOG_HEADER_LEN as u64 + prep.written;
         // A raise since the prep (review 5 #11) reaches the new header; one always comes with a
         // flight's frames, so the delta's sync below covers it. Mutant `cut_drops_raise` (test
@@ -2226,10 +2227,19 @@ impl Journal {
                 let syncs = delta_claims_sync(&delta, self.nonce, prep.nonce, class)?;
                 if syncs {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
+                    synced_in_class = true;
                 }
                 synced &= syncs;
                 len += frames.len() as u64;
             }
+        }
+        // Codex C25 HIGH 2: the prep and its catch-ups synced the temp log in the prep's class; a
+        // flight raised since (FullFsync over a Fsync prep) may have been copied by a catch-up, with
+        // no delta left here to sync it. Kept bytes acknowledged in a stronger class are synced in
+        // it before the rename, after the raised header above. Mutant `cut_keeps_prep_class`
+        // (test builds only): not synced, as before.
+        if class.syncs() && class > prep.class && !synced_in_class && !super::store::fe_mutant("cut_keeps_prep_class") {
+            sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
         }
         if let Err(e) = rename_file(&prep.tmp, &self.files.log) {
             let _ = std::fs::remove_file(&prep.tmp);
@@ -2383,6 +2393,16 @@ impl Journal {
 
     /// A background compaction's cut source (`cut_source`), prepared into its own temp log.
     pub(crate) fn bg_cut_source(&self, bg: &BgCompaction) -> Result<Option<CutSource>> {
+        // Codex C25 HIGH 1: only over the log this compaction installed its snapshot over. The
+        // store mutex is released between the install and this call, and an inline compaction
+        // there replaces the log (a new generation, nonce and rewrite count): the capture's offset
+        // then names a byte of ANOTHER incarnation, and the cut would install the older generation
+        // over a newer one, losing what was flushed in between. Mutant `bg_cut_identity_unchecked`
+        // (test builds only): not checked, as before.
+        let same = self.generation == bg.generation && self.rewrites == bg.rewrites && self.nonce == bg.nonce;
+        if !same && !super::store::fe_mutant("bg_cut_identity_unchecked") {
+            return Ok(None);
+        }
         Ok(self.cut_source(bg.from)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
     }
 
