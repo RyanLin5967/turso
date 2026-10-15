@@ -273,6 +273,21 @@ check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.j
    cp "$T/sw1/timed.window" "$T/sw4/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw4/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"nice 0\" in (j[\"sweeper_refused\"] or \"\")))"'
+# foreign_cpu.py classes a process as the run's own (sut) by FASTEST_CELL in /proc/PID/environ, which is the environment
+# at exec: a sweeper forked straight from t3run's shell would read as foreign, while the competitors' (inside the exec'd
+# run_system.sh) reads as sut. ours_timed_exec runs ours_timed_run in an exec'd bash, so ours' sweeper is classed as theirs
+# the command, run once the start sweep is written: exit 0 iff the sweeper's own environ names the cell
+mkdir -p "$T/sw6"
+cat > "$T/sw6-env.sh" << 'EOF'
+p=$(awk '$1 == "sweeper" { sub(/^pid=/, "", $2); print $2 }' "$1/timed.tracer.tsv")
+[ -n "$p" ] && tr '\0' '\n' < "/proc/$p/environ" | grep -qx "FASTEST_CELL=$2"
+EOF
+check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in its exec-time environ (sut, as theirs)" \
+  '( export FASTEST_CELL=sw6-cell; ours_timed_exec "$T/sw6" bash "$T/sw6-env.sh" "$T/sw6" sw6-cell ) &&
+   grep -q " rc=0$" "$T/sw6/timed.window"'
+check "MED 12: ours_timed_exec with no gates/sweeper.sh beside t3lib.sh refuses (rc 2), the command never ran" \
+  'mkdir -p "$T/lib7/t3" "$T/sw7" && cp "$HERE/t3lib.sh" "$T/lib7/t3/" &&
+   ( source "$T/lib7/t3/t3lib.sh"; ours_timed_exec "$T/sw7" touch "$T/sw7/ran" ); [ $? = 2 ] && [ ! -e "$T/sw7/ran" ]'
 check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
   'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
