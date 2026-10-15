@@ -738,7 +738,10 @@ fn emit_add_column_check_validation(
 
     // Collect CHECK constraints from column-level constraints + domain CHECKs.
     // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
-    let mut all_checks: Vec<(Option<String>, Option<String>, Box<ast::Expr>)> = constraints
+    // The fourth element is the domain a CHECK comes from (its failure is the domain's, in
+    // PostgreSQL's words: `schema::domain_check_failure`).
+    #[allow(clippy::type_complexity)]
+    let mut all_checks: Vec<(Option<String>, Option<String>, Box<ast::Expr>, Option<String>)> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
@@ -746,6 +749,7 @@ fn emit_add_column_check_validation(
                     c.name.as_ref().map(|n| n.as_str().to_string()),
                     source.clone(),
                     expr.clone(),
+                    None,
                 ))
             } else {
                 None
@@ -759,10 +763,10 @@ fn emit_add_column_check_validation(
     {
         if resolved.is_domain() {
             for td in &resolved.chain {
-                for dc in &td.domain_checks {
+                for (dc, name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
                     let rewritten =
                         crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
-                    all_checks.push((dc.name.clone(), None, rewritten));
+                    all_checks.push((Some(name), None, rewritten, Some(td.name.clone())));
                 }
             }
         }
@@ -790,7 +794,7 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_source, check_expr) in &all_checks {
+    for (constraint_name, check_source, check_expr, domain) in &all_checks {
         let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
@@ -838,9 +842,16 @@ fn emit_add_column_check_validation(
             (None, Some(source)) => crate::util::check_source_for_error(source),
             (None, None) => format!("{check_expr}"),
         };
+        let (err_code, description) = match domain {
+            Some(domain) => (
+                crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN,
+                crate::schema::domain_check_failure(domain, &name),
+            ),
+            None => (SQLITE_CONSTRAINT_CHECK, name),
+        };
         program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: name,
+            err_code,
+            description,
             on_error: None,
             description_reg: None,
         });

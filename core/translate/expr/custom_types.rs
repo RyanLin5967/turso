@@ -647,7 +647,7 @@ pub(super) fn emit_domain_cast_constraints(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
+    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
 
     let any_not_null = chain.iter().any(|td| td.not_null);
 
@@ -663,11 +663,7 @@ pub(super) fn emit_domain_cast_constraints(
     }
 
     for td in chain {
-        for (i, dc) in td.domain_checks.iter().enumerate() {
-            let constraint_name = dc
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{}_{}", td.name, i));
+        for (dc, constraint_name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
 
             // Bind `value` → reg, translate check expr, verify truthy
             program.id_register_overrides.insert("value", reg);
@@ -692,11 +688,8 @@ pub(super) fn emit_domain_cast_constraints(
             });
 
             program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "value for domain {} violates check constraint \"{}\"",
-                    td.name, constraint_name
-                ),
+                err_code: crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN,
+                description: crate::schema::domain_check_failure(&td.name, &constraint_name),
                 on_error: None,
                 description_reg: None,
             });

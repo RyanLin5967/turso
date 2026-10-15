@@ -3595,6 +3595,7 @@ pub fn halt(
         SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
             "CHECK constraint failed: {description}"
         ))),
+        crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN => Some(LimboError::Constraint(description.to_string())),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
             "NOT NULL constraint failed: {description}"
         ))),

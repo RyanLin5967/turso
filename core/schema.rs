@@ -3174,6 +3174,49 @@ pub struct CheckConstraint {
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
+    /// The domain this CHECK comes from, when it is a domain's CHECK applied to a column of the
+    /// domain (`resolve_custom_type_affinities`): its failure is the domain's, reported as
+    /// PostgreSQL reports it (`domain_check_failure`).
+    pub domain: Option<String>,
+}
+
+/// A domain CHECK's name as PostgreSQL names it (the domain-CHECK failure class, PG 18.6 raw artie
+/// 0673f158a3): the constraint's own name, or `<domain>_check` for the first unnamed one and
+/// `<domain>_check<k>` for the k-th after it, in declaration order. `index` is the CHECK's position
+/// among the domain's CHECKs; `unnamed_before` how many unnamed ones precede it.
+pub fn domain_check_name(domain: &str, given: Option<&str>, unnamed_before: usize) -> String {
+    // Mutant `domain_check_index_names` (test builds only): `<domain>_<k>`, as before.
+    if given.is_none() && crate::branch::store::fe_mutant("domain_check_index_names") {
+        return format!("{domain}_{unnamed_before}");
+    }
+    match given {
+        Some(name) => name.to_string(),
+        None if unnamed_before == 0 => format!("{domain}_check"),
+        None => format!("{domain}_check{unnamed_before}"),
+    }
+}
+
+/// The failure of a domain CHECK as PostgreSQL words it (SQLSTATE 23514 at the wire): one message
+/// for every path that enforces a domain CHECK (a CAST, a column's INSERT and UPDATE, ALTER TABLE
+/// ADD COLUMN's existing rows). Raised with `SQLITE_CONSTRAINT_CHECK_DOMAIN`, which the VDBE does not
+/// prefix with SQLite's "CHECK constraint failed: ".
+pub fn domain_check_failure(domain: &str, name: &str) -> String {
+    format!("value for domain {domain} violates check constraint \"{name}\"")
+}
+
+/// The PostgreSQL names of a domain's CHECKs, in declaration order (`domain_check_name`).
+pub fn domain_check_names(td: &TypeDef) -> Vec<String> {
+    let mut unnamed = 0;
+    td.domain_checks
+        .iter()
+        .map(|dc| {
+            let name = domain_check_name(&td.name, dc.name.as_deref(), unnamed);
+            if dc.name.is_none() {
+                unnamed += 1;
+            }
+            name
+        })
+        .collect()
 }
 
 impl CheckConstraint {
@@ -3188,6 +3231,7 @@ impl CheckConstraint {
             expr: expr.clone(),
             source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
+            domain: None,
         }
     }
 
@@ -3574,17 +3618,14 @@ impl BTreeTable {
                 if td.not_null {
                     notnull_cols.try_push(col_idx)?;
                 }
-                for (i, dc) in td.domain_checks.iter().enumerate() {
+                for (dc, name) in td.domain_checks.iter().zip(domain_check_names(td)) {
                     let rewritten = rewrite_value_to_column(&dc.check, &col_name);
-                    let name = dc
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
                     new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
                         source: None,
                         column: Some(col_name.clone()),
+                        domain: Some(td.name.clone()),
                     })?;
                 }
             }
