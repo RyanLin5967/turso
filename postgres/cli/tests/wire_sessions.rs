@@ -7709,7 +7709,10 @@ fn parameter_lexer_round_trip(sql: &str, expected: &str) {
     let err = err.expect("two values for a statement requiring one must fail");
     assert_eq!(err.code, "08P01", "{sql}: {err:?}");
     assert!(err.message.contains("requires 1"), "{sql}: {err:?}");
-    assert!(!messages.contains(&b'2'), "BindComplete before the count refusal");
+    assert!(
+        !messages.contains(&b'2'),
+        "BindComplete before the count refusal"
+    );
 }
 
 /// A Bind's value count is checked at Bind for every statement, its parameters counted as

@@ -167,7 +167,7 @@ pub fn sql_comment(b: &[u8]) -> Option<Option<usize>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamScan {
     /// The highest `$n` the text holds, 0 for none; None for a number past MAX_PARAMETER, which
-    /// the parser refuses (42601), so no count is taken from it.
+    /// the parser refuses (42601), or unreadable tokens; no count is taken from either.
     pub highest: Option<u32>,
     /// PostgreSQL analyses the statement at Parse and so counts its `$n`: a query (SELECT, VALUES,
     /// TABLE, WITH, a parenthesised one), INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, DECLARE,
@@ -186,169 +186,88 @@ impl Default for ParamScan {
     }
 }
 
-/// [`ParamScan`] of `sql`, read as PostgreSQL's lexer reads it: a `$` followed by digits is a
-/// parameter unless it continues an identifier (`a$3`, whose `$` is an identifier byte); nothing
-/// inside a string (standard, `E'..'` with backslash escapes, `U&'..'`, `B'..'`, `X'..'`), a quoted
-/// identifier, a dollar-quoted string or a comment (`--`, nested `/* */`) is a parameter. One pass,
-/// no allocation but the first word's. The server reads it at Parse to count a Bind's values
-/// before anything runs: it tested for a `$` byte, so a `$` in a comment or a quoted name skipped
-/// the count and Execute's prepare performed a SET before refusing it (wire review 17 item 2).
+/// Read parameter tokens with the same libpg_query lexer that produces the parse tree used at
+/// Execute. In particular, continued strings retain their escape mode and identifier bytes never
+/// become parameter tokens. Bind keeps this result from Parse; it does not tokenize SQL itself.
 pub fn scan_params(sql: &str) -> ParamScan {
-    let b = sql.as_bytes();
-    let ident_start = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c >= 0x80;
-    let ident_cont = |c: u8| ident_start(c) || c.is_ascii_digit() || c == b'$';
-    // The end of the quoted token opening at `i` (its closing quote doubled inside it; with
-    // `backslash`, a backslash escapes the next byte), or the text's end when it never closes.
-    let quoted = |i: usize, q: u8, backslash: bool| {
-        let mut j = i + 1;
-        while j < b.len() {
-            if backslash && b[j] == b'\\' {
-                j += 2;
-            } else if b[j] == q {
-                if b.get(j + 1) == Some(&q) {
-                    j += 2;
-                } else {
-                    return j + 1;
-                }
-            } else {
-                j += 1;
-            }
-        }
-        b.len()
+    use pg_query::protobuf::Token;
+
+    count_libpg_query_call();
+    let Ok(tokens) = pg_query::scan(sql) else {
+        // No count is available for a lexical error. The normal prepare path reports that error;
+        // never treat an unreadable statement as requiring zero values.
+        return ParamScan {
+            highest: None,
+            analysed: true,
+        };
     };
     let mut scan = ParamScan::default();
-    let mut highest: u64 = 0;
-    let mut first: Option<String> = None;
+    let mut first = None;
     let mut depth = 0usize;
-    // CREATE TABLE ... AS <query>, read at depth 0: TABLE seen before an AS, and the AS followed
-    // by a query.
     let (mut saw_table, mut after_as) = (false, false);
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if pg_space(c) {
-            i += 1;
+    for token in tokens.tokens {
+        let kind = token.token();
+        if matches!(kind, Token::SqlComment | Token::CComment | Token::Ascii59) {
             continue;
         }
-        match sql_comment(&b[i..]) {
-            Some(Some(len)) => {
-                i += len;
-                continue;
-            }
-            Some(None) => break,
-            None => {}
+        if kind == Token::Param {
+            // libpg_query 17 stores parameter numbers in an i32. Read its token's original digits
+            // so a wrapped number cannot become a smaller count (checked_param_numbers also checks
+            // the original text at Execute).
+            let value = sql
+                .get(token.start as usize..token.end as usize)
+                .and_then(|text| text.strip_prefix('$'))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .filter(|n| *n <= MAX_PARAMETER);
+            scan.highest = scan.highest.zip(value).map(|(a, b)| a.max(b));
         }
-        let at_depth = depth;
-        let token_start = i;
-        let mut word: Option<&[u8]> = None;
-        match c {
-            b'\'' => i = quoted(i, b'\'', false),
-            b'"' => i = quoted(i, b'"', false),
-            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
-                let mut j = i + 1;
-                let mut n: u64 = 0;
-                while j < b.len() && b[j].is_ascii_digit() {
-                    n = n.saturating_mul(10).saturating_add(u64::from(b[j] - b'0'));
-                    j += 1;
-                }
-                highest = highest.max(n);
-                i = j;
-            }
-            b'$' => {
-                // A dollar quote: $tag$ ... $tag$, the tag empty or an identifier without `$`.
-                let mut j = i + 1;
-                if j < b.len() && ident_start(b[j]) {
-                    while j < b.len() && (ident_start(b[j]) || b[j].is_ascii_digit()) {
-                        j += 1;
-                    }
-                }
-                if b.get(j) == Some(&b'$') {
-                    let delimiter = &b[i..=j];
-                    let body = j + 1;
-                    i = b[body..]
-                        .windows(delimiter.len())
-                        .position(|w| w == delimiter)
-                        .map_or(b.len(), |p| body + p + delimiter.len());
-                } else {
-                    i += 1;
-                }
-            }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            c if ident_start(c) => {
-                while i < b.len() && ident_cont(b[i]) {
-                    i += 1;
-                }
-                let w = &b[token_start..i];
-                if w.eq_ignore_ascii_case(b"e") && b.get(i) == Some(&b'\'') {
-                    // E'..': a string whose backslash escapes the next byte.
-                    i = quoted(i, b'\'', true);
-                } else {
-                    word = Some(w);
-                }
-            }
-            c if c.is_ascii_digit() => {
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_')
-                {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-        let paren = c == b'(';
-        if first.is_none() {
-            first = Some(match word {
-                Some(w) => String::from_utf8_lossy(w).to_ascii_uppercase(),
-                None if paren => "(".to_string(),
-                None => String::new(),
-            });
-        }
-        if first.as_deref() == Some("CREATE") && at_depth == 0 {
-            let is = |k: &str| word.is_some_and(|w| w.eq_ignore_ascii_case(k.as_bytes()));
+        let first = *first.get_or_insert(kind);
+        if first == Token::Create && depth == 0 {
             if after_as {
                 if saw_table
-                    && (paren
-                        || ["SELECT", "WITH", "VALUES", "TABLE", "EXECUTE"]
-                            .iter()
-                            .any(|k| is(k)))
+                    && matches!(
+                        kind,
+                        Token::Ascii40
+                            | Token::Select
+                            | Token::With
+                            | Token::Values
+                            | Token::Table
+                            | Token::Execute
+                    )
                 {
                     scan.analysed = true;
                 }
                 after_as = false;
             }
-            if is("AS") {
-                after_as = true;
-            } else if is("TABLE") {
-                saw_table = true;
+            match kind {
+                Token::As => after_as = true,
+                Token::Table => saw_table = true,
+                _ => {}
             }
         }
-    }
-    scan.highest = u32::try_from(highest).ok().filter(|n| *n <= MAX_PARAMETER);
-    if let Some(first) = first.as_deref() {
-        if matches!(
-            first,
-            "SELECT"
-                | "VALUES"
-                | "TABLE"
-                | "WITH"
-                | "("
-                | "INSERT"
-                | "UPDATE"
-                | "DELETE"
-                | "MERGE"
-                | "CALL"
-                | "EXPLAIN"
-                | "DECLARE"
-        ) {
-            scan.analysed = true;
+        match kind {
+            Token::Ascii40 => depth += 1,
+            Token::Ascii41 => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
+    scan.analysed |= matches!(
+        first,
+        Some(
+            Token::Select
+                | Token::Values
+                | Token::Table
+                | Token::With
+                | Token::Ascii40
+                | Token::Insert
+                | Token::Update
+                | Token::DeleteP
+                | Token::Merge
+                | Token::Call
+                | Token::Explain
+                | Token::Declare
+        )
+    );
     scan
 }
 
