@@ -12,7 +12,7 @@ mkdir -p "$S/root" || exit 2
 export DOLT_ROOT_PATH="$S/root" DOLT_DISABLE_EVENT_FLUSH=1
 gs() { python3 -B "$HERE/gen_seed.py" "$@"; }
 want() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import gen_seed as g
-f = g.facts(int(sys.argv[2]), int(sys.argv[3]), 1); print(f"{f[\"count\"]}|{f[\"sum\"]}|{f[\"row_hash\"]}")' "$HERE" "$1" "$2"; }
+f = g.facts(int(sys.argv[2]), int(sys.argv[3]), 1); print("%d|%d|%d" % (f["count"], f["sum"], f["row_hash"]))' "$HERE" "$1" "$2"; }
 bad=0
 check() { # check ENGINE ROWS AGE GOT
   local w; w=$(want "$2" "$3")
