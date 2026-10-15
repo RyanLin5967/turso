@@ -2215,9 +2215,15 @@ impl Journal {
     /// A cut's first phase, under the store mutex with no flight in the air and none to start (the
     /// group's `cutting`): what `prepare_cut` copies off the mutex. `None` when the records the cut
     /// keeps do not all lie in the file yet (some before `from` are still buffered): the install
-    /// then cuts the whole way under the mutex (`rewrite_from`). `format`: the version the new log
-    /// is written at, the store's record's (a catalog checkpoint's committed meta row; one authority).
-    pub(crate) fn cut_source(&self, from: u64, format: u32) -> Result<Option<CutSource>> {
+    /// then cuts the whole way under the mutex (`rewrite_from`). The new log is at the journal's
+    /// version; `cut_source_at` names another.
+    pub(crate) fn cut_source(&self, from: u64) -> Result<Option<CutSource>> {
+        self.cut_source_at(from, self.format)
+    }
+
+    /// `cut_source`, the new log at `format`: the store's record's, a catalog checkpoint's committed
+    /// meta row, which the install then advances the journal to (one authority, links adversary H1).
+    pub(crate) fn cut_source_at(&self, from: u64, format: u32) -> Result<Option<CutSource>> {
         self.check_live()?;
         if from < LOG_HEADER_LEN as u64 || from > self.len {
             return Ok(None);
@@ -2474,7 +2480,7 @@ impl Journal {
 
     /// A background compaction's cut source (`cut_source`), prepared into its own temp log.
     pub(crate) fn bg_cut_source(&self, bg: &BgCompaction) -> Result<Option<CutSource>> {
-        Ok(self.cut_source(bg.from, self.format)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
+        Ok(self.cut_source(bg.from)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
     }
 
     /// The snapshot's length, after a cut (`finish_cut` zeroes it, as a catalog store has none).

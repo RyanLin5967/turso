@@ -3692,7 +3692,7 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
                 return None;
             }
             // The new log at the version the commit just recorded (one authority).
-            let src = match guard.journal.as_ref()?.cut_source(cap.log_from, cap.meta.format) {
+            let src = match guard.journal.as_ref()?.cut_source_at(cap.log_from, cap.meta.format) {
                 Ok(Some(src)) => src,
                 _ => return None,
             };
