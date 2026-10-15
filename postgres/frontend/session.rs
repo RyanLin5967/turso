@@ -837,7 +837,9 @@ fn prepare_statement_checked(
         // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
         // 2026-10-15).
         types.param_targets = crate::result_types::param_targets(&parse_result);
-        let fixed = crate::result_types::expression_types(&parse_result);
+        // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
+        let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
+        let fixed = crate::result_types::expression_types(&parse_result, &tables);
         if fixed.len() == types.columns.len() {
             for (column, fixed) in types.columns.iter_mut().zip(fixed) {
                 *column = column.or(fixed);
@@ -2550,6 +2552,10 @@ mod tests {
         run(&conn, "INSERT INTO s3 VALUES (1, 2)");
         run(&conn, "INSERT INTO s3 VALUES (DEFAULT, 3)");
         assert_eq!(table_info_reads() - before, 0, "a positional INSERT read the catalog");
+        // A table's `*` beside a derived boolean reads the table's width from memory too.
+        let before = table_info_reads();
+        run(&conn, "SELECT s3.*, flag FROM s3, (SELECT true AS flag) x");
+        assert_eq!(table_info_reads() - before, 0, "a table's * read the catalog");
         let before = table_info_reads();
         run(&conn, "DELETE FROM s3 USING s3 AS x WHERE s3.a = x.a AND s3.a = 9");
         assert!(table_info_reads() > before, "the instrument never fires");

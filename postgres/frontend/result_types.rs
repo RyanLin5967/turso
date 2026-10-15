@@ -73,7 +73,9 @@ pub fn aggregate_targets(parse: &ParseResult) -> Vec<bool> {
 /// The engine has no boolean type, so it typed them int4 or text holding 1 and 0, and a float4
 /// cast float8; PostgreSQL 18 announces bool and float4 (recorded 2026-10-15, artie
 /// lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out).
-pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
+/// `tables` gives a table's column names, by (schema as written, name), when a `*` over it must be
+/// expanded to line the list up (read from the in-memory schema: no catalog query).
+pub fn expression_types(parse: &ParseResult, tables: &TableColumns) -> Vec<Option<u32>> {
     let [raw] = parse.protobuf.stmts.as_slice() else {
         return Vec::new();
     };
@@ -83,13 +85,33 @@ pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
     if select.larg.is_some() || select.rarg.is_some() || select.target_list.is_empty() {
         return Vec::new();
     }
-    let columns = select_fixed(select, &[]);
+    let unexpanded = |columns: &[(String, Option<u32>)]| {
+        columns.iter().any(|(name, ty)| name == "*" && ty.is_none())
+    };
+    // First without reading any table: a statement with no typed column says nothing, and only one
+    // with a `*` over a table beside a typed column reads that table's width.
+    let mut columns = select_fixed(select, &[], &|_, _| None);
+    if unexpanded(&columns) {
+        // A typed column may sit inside the `*`, or beside it: only a FROM list holding some
+        // derived item or CTE (whose columns the walk types) is worth expanding.
+        let derived =
+            select.with_clause.is_some() || select.from_clause.iter().any(holds_derived);
+        if !derived && columns.iter().all(|(_, ty)| ty.is_none()) {
+            return Vec::new();
+        }
+        columns = select_fixed(select, &[], tables);
+    } else if columns.iter().all(|(_, ty)| ty.is_none()) {
+        return Vec::new();
+    }
     // A `*` left unexpanded: the list does not line up with the result columns.
-    if columns.iter().any(|(name, ty)| name == "*" && ty.is_none()) {
+    if unexpanded(&columns) {
         return Vec::new();
     }
     columns.into_iter().map(|(_, ty)| ty).collect()
 }
+
+/// A table's column names by (schema as written, name), or None when they cannot be read.
+pub type TableColumns<'a> = dyn Fn(&str, &str) -> Option<Vec<String>> + 'a;
 
 /// One derived FROM item's output columns as [`select_fixed`] names and types them, a `*` it could
 /// not expand kept as an entry named "*" (a name lookup skips it; a `*` over the item does not
@@ -97,6 +119,8 @@ pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
 struct Derived {
     alias: String,
     columns: Option<Vec<(String, Option<u32>)>>,
+    /// A table item's (schema, name), whose columns are read only when a `*` expands over it.
+    table: Option<(String, String)>,
 }
 
 /// A SELECT's result columns, each named as PostgreSQL names it and typed when its grammar fixes the
@@ -105,13 +129,17 @@ struct Derived {
 /// announced bytea here: the regress corpus's join.sql). A `*` expands over the FROM items when
 /// every one is a derived table or a CTE; otherwise it stays one untyped entry, so the list does not
 /// line up with the result and is not used. `outer` holds the enclosing statements' CTEs.
-fn select_fixed(select: &SelectStmt, outer: &[(String, Vec<(String, Option<u32>)>)]) -> Vec<(String, Option<u32>)> {
+fn select_fixed(
+    select: &SelectStmt,
+    outer: &[(String, Vec<(String, Option<u32>)>)],
+    tables: &TableColumns,
+) -> Vec<(String, Option<u32>)> {
     let mut ctes: Vec<(String, Vec<(String, Option<u32>)>)> = outer.to_vec();
     if let Some(with) = &select.with_clause {
         for cte in &with.ctes {
             if let Some(Node::CommonTableExpr(c)) = cte.node.as_ref() {
                 if let Some(Node::SelectStmt(q)) = c.ctequery.as_ref().and_then(|q| q.node.as_ref()) {
-                    let mut columns = select_fixed(q, &ctes);
+                    let mut columns = select_fixed(q, &ctes, tables);
                     for (column, name) in columns.iter_mut().zip(&c.aliascolnames) {
                         if let Some(Node::String(n)) = name.node.as_ref() {
                             column.0.clone_from(&n.sval);
@@ -124,7 +152,7 @@ fn select_fixed(select: &SelectStmt, outer: &[(String, Vec<(String, Option<u32>)
     }
     let mut derived = Vec::new();
     for item in &select.from_clause {
-        from_derived(item, &ctes, &mut derived);
+        from_derived(item, &ctes, tables, &mut derived);
     }
     let lookup = |c: &turso_pg_parser::pg_query::protobuf::ColumnRef| -> Option<u32> {
         let fields: Vec<&str> = c
@@ -175,8 +203,12 @@ fn select_fixed(select: &SelectStmt, outer: &[(String, Vec<(String, Option<u32>)
                 // Only a FROM list of derived items alone (no join's USING merge) expands.
                 let plain = rel.is_some() || select.from_clause.iter().all(|i| !matches!(i.node, Some(Node::JoinExpr(_))));
                 // An item holding a `*` of its own (a table's) cannot be listed.
-                let listed = |d: &&Derived| {
-                    d.columns.clone().filter(|c| !c.iter().any(|(n, _)| n == "*"))
+                let listed = |d: &&Derived| match &d.columns {
+                    Some(c) => Some(c.clone()).filter(|c| !c.iter().any(|(n, _)| n == "*")),
+                    // A table's columns are the engine's to type; only their number is read.
+                    None => d.table.as_ref().and_then(|(schema, name)| tables(schema, name)).map(
+                        |names| names.into_iter().map(|n| (n, None)).collect(),
+                    ),
                 };
                 match items.iter().map(listed).collect::<Option<Vec<_>>>() {
                     Some(lists) if plain && !items.is_empty() => out.extend(lists.into_iter().flatten()),
@@ -194,8 +226,24 @@ fn select_fixed(select: &SelectStmt, outer: &[(String, Vec<(String, Option<u32>)
     out
 }
 
+/// Whether a FROM item is, or joins, a subselect (a CTE is the WITH's, checked beside this).
+fn holds_derived(item: &PgNode) -> bool {
+    match item.node.as_ref() {
+        Some(Node::RangeSubselect(_)) => true,
+        Some(Node::JoinExpr(j)) => {
+            j.larg.as_deref().is_some_and(holds_derived) || j.rarg.as_deref().is_some_and(holds_derived)
+        }
+        _ => false,
+    }
+}
+
 /// The derived items `item` brings into scope: a subselect, a CTE read by name, and a join's sides.
-fn from_derived(item: &PgNode, ctes: &[(String, Vec<(String, Option<u32>)>)], out: &mut Vec<Derived>) {
+fn from_derived(
+    item: &PgNode,
+    ctes: &[(String, Vec<(String, Option<u32>)>)],
+    tables: &TableColumns,
+    out: &mut Vec<Derived>,
+) {
     let rename = |columns: &mut Vec<(String, Option<u32>)>, names: &[PgNode]| {
         for (column, name) in columns.iter_mut().zip(names) {
             if let Some(Node::String(n)) = name.node.as_ref() {
@@ -208,13 +256,17 @@ fn from_derived(item: &PgNode, ctes: &[(String, Vec<(String, Option<u32>)>)], ou
             let Some(alias) = r.alias.as_ref() else { return };
             let columns = match r.subquery.as_ref().and_then(|q| q.node.as_ref()) {
                 Some(Node::SelectStmt(q)) if !r.lateral => {
-                    let mut columns = select_fixed(q, ctes);
+                    let mut columns = select_fixed(q, ctes, tables);
                     rename(&mut columns, &alias.colnames);
                     Some(columns)
                 }
                 _ => None,
             };
-            out.push(Derived { alias: alias.aliasname.clone(), columns });
+            out.push(Derived {
+                alias: alias.aliasname.clone(),
+                columns,
+                table: None,
+            });
         }
         Some(Node::RangeVar(rv)) => {
             let alias = rv.alias.as_ref().map_or(rv.relname.clone(), |a| a.aliasname.clone());
@@ -228,14 +280,21 @@ fn from_derived(item: &PgNode, ctes: &[(String, Vec<(String, Option<u32>)>)], ou
                     }
                     columns
                 });
-            out.push(Derived { alias, columns });
+            let table = columns
+                .is_none()
+                .then(|| (rv.schemaname.clone(), rv.relname.clone()));
+            out.push(Derived {
+                alias,
+                columns,
+                table,
+            });
         }
         Some(Node::JoinExpr(j)) => {
             if let Some(l) = j.larg.as_deref() {
-                from_derived(l, ctes, out);
+                from_derived(l, ctes, tables, out);
             }
             if let Some(r) = j.rarg.as_deref() {
-                from_derived(r, ctes, out);
+                from_derived(r, ctes, tables, out);
             }
         }
         _ => {}
