@@ -847,15 +847,18 @@ fn prepare_statement_checked(
     }
 
     // A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
-    // item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21), and so does an INSERT
-    // whose VALUES lists, with no column list, hold DEFAULT (its positions are named); a translator
-    // with no lookup refuses one. No other statement pays for the lookup.
-    let translator = if is_delete_using(sql, &parse_result)
-        || is_positional_insert_default(sql, &parse_result)
-    {
+    // item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21); a translator with no
+    // lookup refuses one. An INSERT whose VALUES lists, with no column list, hold DEFAULT names its
+    // positions from the in-memory schema alone (no catalog query). No other statement pays for a
+    // lookup.
+    let translator = if is_delete_using(sql, &parse_result) {
         let pg_conn = pg_conn.clone();
         PostgreSQLTranslator::new()
             .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
+    } else if is_positional_insert_default(sql, &parse_result) {
+        let pg_conn = pg_conn.clone();
+        PostgreSQLTranslator::new()
+            .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
     } else {
         PostgreSQLTranslator::new()
     };
@@ -907,7 +910,7 @@ fn prepare_statement_checked(
         if prepared.is_err() && is_positional_insert_values(&parse_result) {
             let lookup_conn = pg_conn.clone();
             let retried = PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| relation_columns(&lookup_conn, schema, table))
+                .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
                 .map_err(|e| LimboError::ParseError(e.to_string()))?;
             return pg_conn
@@ -2328,6 +2331,38 @@ fn is_positional_insert_values(parse: &turso_pg_parser::pg_query::ParseResult) -
         }
         _ => false,
     })
+}
+
+/// The columns `table` declares when the in-memory schema answers alone, with no catalog query
+/// (lead ruling: an INSERT's lookup adds none): a main table named as main or public, or unqualified
+/// under no search path or one that starts at public. None otherwise, and the statement keeps the
+/// engine's refusal (an attached schema's table is read only through PRAGMA table_info).
+fn resident_relation_columns(
+    pg_conn: &Arc<PgConnectionInner>,
+    schema: &str,
+    table: &str,
+) -> Option<Vec<String>> {
+    use turso_pg_parser::SchemaQualifier;
+    let unqualified_main = || {
+        let state = pg_conn.session_state.lock().unwrap();
+        state
+            .search_path
+            .first()
+            .is_none_or(|first| first.eq_ignore_ascii_case("public"))
+    };
+    let main = match turso_pg_parser::schema_qualifier(schema) {
+        SchemaQualifier::Main => true,
+        SchemaQualifier::Unqualified => unqualified_main(),
+        _ => false,
+    };
+    main.then(|| {
+        pg_conn
+            .conn
+            .current_schema()
+            .get_btree_table(table)
+            .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+    })
+    .flatten()
 }
 
 /// The columns `table` declares, from the table the engine reads under the name: an unqualified
