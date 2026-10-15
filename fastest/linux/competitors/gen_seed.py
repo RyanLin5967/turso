@@ -101,13 +101,14 @@ def readback_sql(dialect):
         return ("SELECT count(*), CAST(SUM(v) AS DECIMAL(20,0)), "
                 "CAST(SUM(CONV(SUBSTR(MD5(CONCAT(id, ':', v, ':', pad)), 1, 6), 16, 10)) AS DECIMAL(20,0)) FROM t")
     if dialect == "pg":
-        h = "md5(id::text || ':' || v::text || ':' || pad)"
-
+        # comp review 1 LOW 27: each row's md5 once, in an OFFSET 0 subquery (which the planner does not flatten), not
+        # twelve times in the digit sum; the same triple (re-pinning it on PG 18, Doltgres 1.4.0 and Dolt is owed)
         def dig(k):
-            c = f"ascii(substr({h}, {k}, 1))"
+            c = f"ascii(substr(h, {k}, 1))"
             return f"(CASE WHEN {c} > 57 THEN {c} - 87 ELSE {c} - 48 END)"
         expr = " + ".join(f"{dig(k)} * {16 ** (6 - k)}" for k in range(1, 7))
-        return f"SELECT count(*), sum(v), sum({expr}) FROM t"
+        return (f"SELECT count(*), sum(v), sum({expr}) FROM "
+                f"(SELECT v, md5(id::text || ':' || v::text || ':' || pad) AS h FROM t OFFSET 0) s")
     raise ValueError(f"unknown dialect {dialect}")
 
 
