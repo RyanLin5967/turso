@@ -1467,6 +1467,14 @@ impl Touched {
 
 #[cfg(test)]
 thread_local! {
+    /// Review L4 M1 (test builds): `l4_facts_check_for_test` on this thread also checks the facts a
+    /// checkpoint in flight keeps the store from using (checks (4) and (5)), against the catalog
+    /// connection, which reads the snapshot the capture pinned.
+    pub(crate) static CHECK_FACTS_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// LEAP L4 2b's oracle (test builds): an open on this thread also asks the catalog's free table
     /// for every touched slot whose checkpoint state it inferred from the log, and records the
     /// first disagreement (`CatState::free_inference_mismatch`).
@@ -8505,7 +8513,8 @@ impl BranchStore {
             }
         }
         // (5) Slice 4: the name mirror, built and out of a flight, equals `branch_name`.
-        if let (Some(mirror), false) = (inner.names.catalog.as_ref(), cat.flight) {
+        let in_flight_too = CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get);
+        if let (Some(mirror), false) = (inner.names.catalog.as_ref(), cat.flight && !in_flight_too) {
             let stop = std::sync::atomic::AtomicBool::new(false);
             let rows = cat.catalog.name_pairs(&stop).map_err(|e| format!("name_pairs: {e}"))?;
             let asked: HashMap<Arc<str>, BranchId> = rows.into_iter().map(|(n, id)| (n, BranchId(id))).collect();
@@ -8520,7 +8529,7 @@ impl BranchStore {
         }
         // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
         // whether the catalog holds a trunk version, as known, equal their queries.
-        if !cat.flight {
+        if !cat.flight || in_flight_too {
             if let Some(known) = cat.trunk_child_max {
                 let asked = cat.catalog.children_below(0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied();
                 if known != asked {

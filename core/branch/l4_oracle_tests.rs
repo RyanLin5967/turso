@@ -182,6 +182,14 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
                         }
                         _ => {}
                     }
+                    // The facts a flight keeps the store from using, checked in the flight anyway
+                    // (does the guard protect anything?).
+                    super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(true));
+                    let r = db.branches.l4_facts_check_for_test();
+                    super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(false));
+                    if let Err(e) = r {
+                        panic!("seed {seed} step {step} (in flight): an L4 fact disagrees with the catalog: {e}");
+                    }
                 }
             }
             db.branch_checkpoint_hold(0);
