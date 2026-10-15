@@ -235,6 +235,9 @@ preflight() {
     [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
+    # V3L's floor-rule SLACK gates the billed run, so it must be registered first (review 5 LOW 29)
+    python3 -B "$L/t3/v3l.py" registration > "$OUT/v3l-registration.txt" 2>&1 ||
+      { cat "$OUT/v3l-registration.txt"; echo "REFUSED: V3L's SLACK has no PREREG annex row"; return 2; }
     sudo -n python3 -B "$L/t3/devguard.py" check "$DEVICE" > "$OUT/devguard.txt" 2>&1 || { cat "$OUT/devguard.txt"; return 2; }
     # the node devguard just checked; every block's mkfs re-checks against it (devguard round-2 attack LOW 4)
     DEV_REAL=$(readlink -f "$DEVICE")

@@ -11,6 +11,9 @@
   v3l.py block BEFORE AFTER     one block's record from its two v3l.json files: the pooled fsync p50 (the block's
                                 normaliser), the ratio and the drift (published, never gates); exit 0 when both are
                                 VALID, 3 when either is VOID, 2 when either is missing or unreadable
+  v3l.py registration           exit 0 when the floor rule's SLACK is registered by a PREREG annex row, 2 with the
+                                reason when it is not (review 5 LOW 29: t3run's preflight refuses a real run on it,
+                                before deps and build are paid for; measure() refuses a real run on it too)
   v3l.py self-test              the parsers and the gates on planted inputs; exit 0 iff every case passes
 
 As registered: fio `--rw=write --bs=4k --ioengine=sync --fsync=1`, exactly 10,000 writes (`--number_ios=10000`),
@@ -84,6 +87,9 @@ from fractions import Fraction
 
 N = 10000
 SLACK = Fraction("0.05")  # provisional until registered: the floor rule's allowance, timed vs labelling flushes per fsync
+# the PREREG annex row that registers SLACK (review 5 LOW 29); None until the lead registers it, and while it is None a
+# real run (V3L_REAL=1) refuses, because SLACK would gate a billed run unregistered
+SLACK_REGISTERED = None
 V1L = ["strace", "-f", "-y", "-ttt",
        "-e", "trace=%file,%desc,ioctl,copy_file_range,sync_file_range,syncfs,msync,fallocate"]
 WRITES = ("write", "pwrite64", "writev", "pwritev", "pwritev2")
@@ -448,6 +454,15 @@ def real_mode_problem(real, chain, disk, leafrec):
         return f"a real run on {chain} -> {disk}: loop and ram devices are dry-run only (A16)"
     if not leafrec:
         return "a real run needs the V3 batch's leaf record (LEAFREC): the drive's own cache report is cross-checked"
+    return registration_problem()
+
+
+def registration_problem():
+    """Why a real V3L run may not use the floor rule's SLACK, or None (review 5 LOW 29): it can gate a billed run, so a
+    PREREG annex row must register it first (SLACK_REGISTERED names that row)"""
+    if not SLACK_REGISTERED:
+        return (f"SLACK {float(SLACK)} is unregistered (no PREREG annex row names it): a real V3L run may not use it "
+                "(review 5 LOW 29)")
     return None
 
 
@@ -1253,8 +1268,12 @@ def self_test():
         # cache report is always there to cross-check; a dry run may go without it
         ("item 14: a real run without a leaf record is refused",
          _ok(lambda: "leaf record" in (real_mode_problem("1", ["nvme1n1"], "nvme1n1", None) or ""))),
-        ("item 14: a real run with a leaf record on a drive passes",
-         _ok(lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "/x/summary.json") is None)),
+        # TEST EDIT, flagged as a SPEC CHANGE (review 5 LOW 29): a real run now also needs SLACK registered, so this
+        # case states that premise (SLACK_REGISTERED set for the call); its expectation (passes) is unchanged, and the
+        # LOW 29 case above pins the unregistered refusal
+        ("item 14: a real run with a leaf record on a drive passes (SLACK registered)",
+         _ok(lambda: _with_global("SLACK_REGISTERED", "A99 (self-test)",
+                                  lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "/x/summary.json")) is None)),
         ("item 14: a real run on a loop or a ram disk is refused (the earlier rule, kept)",
          _ok(lambda: real_mode_problem("1", ["loop3", "nvme1n1"], "nvme1n1", "/x/summary.json") is not None
              and real_mode_problem("1", ["ram0"], "ram0", "/x/summary.json") is not None)),
@@ -1283,6 +1302,10 @@ def main(a):
             json.dump({"plants": res, "all_fired": ok}, open(a[3], "w"), indent=1, default=str)
             print(json.dumps({"all_fired": ok, "fired": {p["plant"]: p["fired"] for p in res}}))
             return 0 if ok else 1
+        if a[1:] == ["registration"]:
+            why = registration_problem()
+            print(why or f"SLACK {float(SLACK)} registered: {SLACK_REGISTERED}")
+            return 2 if why else 0
         if len(a) == 4 and a[1] == "block":
             r = block(a[2], a[3])
             print(json.dumps(r, indent=1))
