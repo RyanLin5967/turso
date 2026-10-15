@@ -1526,6 +1526,31 @@ mod tests {
         }
     }
 
+    /// Engine review 21 LOW 24, a REGISTERED DIVERGENCE (fastest DECISIONS), red until fixed: a
+    /// real literal reaches numeric's operators as a REAL (SQLite's literal), and its decimal comes
+    /// from `f64::to_string`, which drops the literal's trailing zeros, so `1.50` takes display scale
+    /// 1, not PostgreSQL's 2. Multiplication shows it: PostgreSQL's numeric_mul gives the product
+    /// the sum of the operands' display scales (numeric.c, read, not run: rscale = var1.dscale +
+    /// var2.dscale), so numeric(10, 2) 10.00 * 1.50 is 15.0000, where this engine answers 15.000.
+    /// The text literal '1.50' is the control. LOUD-OWED: both rows from PostgreSQL 18 (rpgdiv).
+    #[test]
+    fn a_real_literal_operand_keeps_its_display_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        for (sql, want) in [
+            ("SELECT x * '1.50' FROM t WHERE id = 1", "15.0000"),
+            ("SELECT x * 1.50 FROM t WHERE id = 1", "15.0000"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "{sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
+
     /// Engine review 21 MED 10: a numeric operand's scale was bounded only by i64, so
     /// `x / '1e-2000000000'` built 10^(2*10^9) inside one division, with no interrupt point, and
     /// `'1e9223372036854775807' / x` overflowed i64 (a panic in a debug build, a wrapped value in a
