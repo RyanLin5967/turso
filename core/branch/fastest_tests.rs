@@ -8565,6 +8565,58 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     }
 }
 
+/// Lead finding and order 5 (fastest DECISIONS, 2026-10-15T07:2xZ): in-place VACUUM builds its
+/// image in a target database (`etilqs_<name>`, on the source's IO), whose own WAL commit syncs a
+/// DIFFERENT file. A failure of that sync must not reach the trunk store's at-risk decision: the
+/// trunk's durability state is not that file's. Only the target's WAL armed (its first sync fails
+/// at issue), with x's Release undrained in the trunk store (the state in which a counted failure
+/// can fail-stop it): the VACUUM fails, the trunk store counts no sync failure, and the next fork
+/// is acknowledged. Both modes.
+#[test]
+fn a_failed_vacuum_target_wal_sync_leaves_the_trunk_store_untouched() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vacuum-target.db");
+        let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+            only: Some("/etilqs_vacuum-target.db-wal".to_string()),
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            armed: armed.clone(),
+            held: Arc::new(std::sync::Mutex::new(None)),
+        });
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            opts(catalog, SyncClass::Off).with_vacuum(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let failures = db.branches.sync_failures();
+        armed.store(1, O::Release);
+        let vacuumed = trunk.execute("VACUUM");
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the VACUUM target's WAL sync was reached");
+        assert!(vacuumed.is_err(), "{what}: premise: the failed target WAL sync failed the VACUUM");
+        assert_eq!(
+            db.branches.sync_failures(),
+            failures,
+            "CLAIM: {what}: the VACUUM target's WAL sync failure reached the trunk store"
+        );
+        let next = db.connect().unwrap().fork_branch().map(|x| x.into_id());
+        assert!(next.is_ok(), "CLAIM: {what}: the trunk store refused a fork after the VACUUM target's sync failed: {:?}", next.err());
+    }
+}
+
 /// Engine review 21 LOW 20: a raw-frame WAL header sync whose completion failed was reported
 /// twice: `watched` noted the completion, and `write_frame_raw_watched` reported the failed wait
 /// directly without taking that note, so the next check of the connection's noted syncs (the next
