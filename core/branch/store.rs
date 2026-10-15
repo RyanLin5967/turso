@@ -236,9 +236,11 @@ pub(crate) struct BranchStore {
     /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
     /// own part is on its handle).
     prewarm: PrewarmStats,
-    /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
-    /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
-    flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// The fuzzy checkpoints' persistent worker (`CkptWorker`), started at the first checkpoint
+    /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
+    /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
+    ckpt_worker: Mutex<Option<CkptWorker>>,
+    flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
@@ -500,6 +502,11 @@ pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 /// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's snapshot is installed and
+/// its directory synced, its cut not yet taken, and the store mutex free (Codex C25 HIGH 1's window).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
 
 #[derive(Default)]
 struct GroupState {
@@ -1912,8 +1919,6 @@ fn expire_batch() -> usize {
     })
 }
 
-/// F-FZ: fuzzy-checkpoint threads kept unjoined before the oldest is joined.
-const FLIGHTS_KEPT: usize = 64;
 
 /// How long a fork's creator, or an open of a new branch, waits for the trunk commit it forks after
 /// to be published before it is `Busy` (`BranchStore::wait_trunk_commit_published`).
@@ -3207,6 +3212,13 @@ pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
 /// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
 /// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
 /// the capture's (`start_flight`) and the install's. Observation only.
+/// Test builds: fuzzy installs that finished a prepared cut, and those that fell back to a rewrite
+/// under the store mutex (no cut was prepared). Observation only.
+#[cfg(test)]
+pub(crate) static INSTALL_CUTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(test)]
 pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
 
@@ -3343,6 +3355,8 @@ fn run_flight(
         ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         ckpt_held("install.installed");
+        // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
+        let retired = guard.journal.as_mut().and_then(Journal::take_retired);
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3382,8 +3396,11 @@ fn run_flight(
         let (count, signal) = &*installs;
         *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         signal.notify_all();
-        installed
+        (installed, retired)
     };
+    let (installed, retired) = installed;
+    // Holding no lock now: the old log's handles close here.
+    drop(retired);
     // Flights go on, into the new log.
     drop(cut);
     ckpt_phase("installed");
@@ -3409,6 +3426,59 @@ fn run_flight(
             }
         }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
+    }
+}
+
+type CkptJob = Box<dyn FnOnce() + Send>;
+
+/// The fuzzy checkpoints' persistent thread (`BranchStore::dispatch_flight`): runs each checkpoint
+/// handed to it in turn (only one is ever in flight), counting it finished even if it panicked, and
+/// exits when its channel closes (the store's `Drop`). Counted a persistent store thread for the
+/// budgets' probe while it is parked, as the confirmation writer is, and a live one while it runs
+/// a checkpoint.
+struct CkptWorker {
+    pid: u32,
+    tx: std::sync::mpsc::Sender<CkptJob>,
+    handle: crate::thread::JoinHandle<()>,
+}
+
+impl CkptWorker {
+    fn start(jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<CkptJob>();
+        #[cfg(test)]
+        super::budget_probe::persistent_started();
+        let spawned = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                // While it runs a checkpoint the worker is NOT parked: the budgets' probe counts it
+                // a live thread then, as it counted the per-checkpoint thread this replaced, so a
+                // measured window still waits out the checkpoint (budgets' ckpt cells: "at least
+                // three checkpoints installed (0)" at 4fbc6de65 without this).
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    tracing::warn!("a branch catalog checkpoint panicked");
+                }
+                #[cfg(test)]
+                super::budget_probe::persistent_started();
+                Self::finished(&jobs);
+            }
+            #[cfg(test)]
+            super::budget_probe::persistent_ended();
+        });
+        match spawned {
+            Ok(handle) => Ok(Self { pid: std::process::id(), tx, handle }),
+            Err(e) => {
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                Err(e)
+            }
+        }
+    }
+
+    /// One checkpoint handed out is over (run, panicked, or never handed over).
+    fn finished(jobs: &(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)) {
+        jobs.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        jobs.1.notify_all();
     }
 }
 
@@ -3784,7 +3854,8 @@ impl BranchStore {
         Self {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4090,7 +4161,8 @@ impl BranchStore {
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5632,24 +5704,15 @@ impl BranchStore {
         let over_hard = self.over_hard.clone();
         let truncating = self.truncating.clone();
         let installs = self.installs.clone();
-        let mut flights = self.flights.lock();
-        if flights.len() >= FLIGHTS_KEPT {
-            // Past its install long ago (only one checkpoint is ever in flight), so this join
-            // waits for nothing.
-            let _ = flights.remove(0).join();
-        }
         let spawned = if inner.failpoint.take_if(|f| *f == BranchFailpoint::SpawnFails).is_some() {
             Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
         } else {
-            crate::thread::Builder::new()
-                .name("branch-checkpoint".to_string())
-                .spawn(move || {
-                    run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
-                })
+            self.dispatch_flight(Box::new(move || {
+                run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+            }))
         };
         match spawned {
-            Ok(handle) => {
-                flights.push(handle);
+            Ok(()) => {
                 if let Some(cat) = inner.cat.as_mut() {
                     cat.ckpt.flights += 1;
                 }
@@ -5717,14 +5780,63 @@ impl BranchStore {
         }
     }
 
-    /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
-    /// mutex: a thread in flight takes it for its install.
-    fn join_flights(&self) {
-        let handles = std::mem::take(&mut *self.flights.lock());
-        for handle in handles {
-            if handle.join().is_err() {
-                tracing::warn!("a branch catalog checkpoint thread panicked");
+    /// Hand a fuzzy checkpoint to the persistent worker, starting it first if this process has
+    /// none (checkpoint FIX, budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex:
+    /// a thread spawn per checkpoint was about ten syscalls inside the starting operation's
+    /// store-mutex hold; a send wakes a parked worker with one). A fork(2) child has no worker of
+    /// its parent's, and starts its own. A worker that died is replaced once. Mutant
+    /// `checkpoint_thread_per_flight` (test builds only): a new thread for every one, as before.
+    fn dispatch_flight(&self, job: CkptJob) -> std::io::Result<()> {
+        if fe_mutant("checkpoint_thread_per_flight") {
+            let jobs = self.flight_jobs.clone();
+            jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+            let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+                job();
+                CkptWorker::finished(&jobs);
+            });
+            return handle.map(drop).inspect_err(|_| CkptWorker::finished(&self.flight_jobs));
+        }
+        let mut worker = self.ckpt_worker.lock();
+        let pid = std::process::id();
+        if worker.as_ref().is_some_and(|w| w.pid != pid) {
+            // The parent's thread does not exist in this process: never joined, never sent to.
+            std::mem::forget(worker.take());
+        }
+        self.flight_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        let mut job = job;
+        for _ in 0..2 {
+            if worker.is_none() {
+                match CkptWorker::start(self.flight_jobs.clone()) {
+                    Ok(w) => *worker = Some(w),
+                    Err(e) => {
+                        CkptWorker::finished(&self.flight_jobs);
+                        return Err(e);
+                    }
+                }
             }
+            match worker.as_ref().expect("started above").tx.send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::SendError(back)) => {
+                    // It exited: joined, and replaced.
+                    if let Some(w) = worker.take() {
+                        let _ = w.handle.join();
+                    }
+                    job = back;
+                }
+            }
+        }
+        CkptWorker::finished(&self.flight_jobs);
+        Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
+    }
+
+    /// Wait for every fuzzy checkpoint handed out so far to finish (F-FZ). Called without the
+    /// store mutex: one in flight takes it for its install.
+    fn join_flights(&self) {
+        let (m, cv) = &*self.flight_jobs;
+        let mut jobs = m.lock().unwrap_or_else(|e| e.into_inner());
+        let target = jobs.0;
+        while jobs.1 < target {
+            jobs = cv.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -5889,6 +6001,8 @@ impl BranchStore {
             }
             bg.sync_dir()?;
             group.mark_committed(bg.lsn(), bg.class());
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_INSTALLED);
             // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
             // would (`COMPACT_STOP_BEFORE_CUT`).
             #[cfg(test)]
@@ -5964,7 +6078,10 @@ impl BranchStore {
             group.mark_durable(written, class);
             let durable = group.durable(inner.free_class());
             inner.mature_frees(durable);
+            let retired = inner.journal.as_mut().and_then(Journal::take_retired);
             drop(inner);
+            // The old log's handles close holding no lock.
+            drop(retired);
             drop(counted);
             return Ok(());
         }
@@ -8630,6 +8747,17 @@ impl Drop for BranchStore {
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
+        // The worker stops once its channel closes; joined only in the process that started it.
+        if let Some(w) = self.ckpt_worker.lock().take() {
+            if w.pid == std::process::id() {
+                drop(w.tx);
+                if w.handle.join().is_err() {
+                    tracing::warn!("the branch catalog checkpoint worker panicked");
+                }
+            } else {
+                std::mem::forget(w);
+            }
+        }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
@@ -10135,12 +10263,18 @@ impl StoreInner {
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
             Some(prep) => {
+                #[cfg(test)]
+                INSTALL_CUTS.fetch_add(1, Ordering::Relaxed);
                 ckpt_held("install.before_cut");
                 let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
                 ckpt_held("install.cut_finished");
                 cut
             }
-            None => journal.rewrite_from(cap.log_from, cap.generation),
+            None => {
+                #[cfg(test)]
+                INSTALL_REWRITES.fetch_add(1, Ordering::Relaxed);
+                journal.rewrite_from(cap.log_from, cap.generation)
+            }
         };
         if rewritten.is_err() {
             // The old log stays, correct and longer; not cut again before another threshold's

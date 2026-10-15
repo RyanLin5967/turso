@@ -8694,9 +8694,17 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
     let len = db.branches.log_len_for_test();
+    let cuts = super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed);
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
     db.branch_checkpoint_wait();
     assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint cut the log");
+    // Strengthened (my own test, 0ac4f207d, unaccepted): the shortening must be a CUT (a prepared
+    // cut finished at the install), not the install's fallback rewrite, which also shortens it.
+    assert!(
+        super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed) > cuts,
+        "premise: the checkpoint finished a prepared cut (it fell back to a rewrite: {} rewrites so far)",
+        super::store::INSTALL_REWRITES.load(std::sync::atomic::Ordering::Relaxed)
+    );
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
     let before = dirs();
     let _ = trunk.fork_branch().unwrap().into_id();
@@ -8831,6 +8839,46 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
         }
     }
     assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
+}
+
+/// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
+/// it installed its snapshot and before it takes its cut (`HOLD_COMPACT_INSTALLED`, store mutex
+/// free), creates go on past the hard limit until one compacts the log INLINE (counted,
+/// `branch_exception_counters()[2]`), then one more create, acknowledged in D1 (the victim). The
+/// writer released, its compaction finishes; the store closed and reopened: the victim is a live
+/// branch. Before the fix the stale cut installed the older generation over the inline one.
+/// Mutant `bg_cut_identity_unchecked`.
+#[test]
+fn a_create_after_an_inline_compaction_survives_a_stale_background_cut() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stale-cut.db");
+    let (victim, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_INSTALLED);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.confirm_held_for_test() != super::store::HOLD_COMPACT_INSTALLED | super::store::HOLD_ARRIVED {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction reached its install");
+        }
+        let inline = db.branch_exception_counters()[2];
+        while db.branch_exception_counters()[2] == inline {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: no create compacted inline past the hard limit");
+        }
+        let victim = trunk.fork_branch().unwrap().into_id();
+        db.branches.confirm_hold_for_test(0);
+        eventually("premise: the held background compaction never finished", || !db.branches.compaction_owed_for_test());
+        (victim, db.incarnation)
+    };
+    let db = reopen(&path, opts(false, SyncClass::Fsync), incarnation);
+    assert!(
+        db.branch_ids().unwrap().contains(&victim),
+        "CLAIM: a create acknowledged after an inline compaction was lost to the stale background cut"
+    );
 }
 
 /// L2 slope (budget create_allocates_no_table_of_every_branch_under_the_store_mutex): the create
