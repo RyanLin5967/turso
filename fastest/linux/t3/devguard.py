@@ -21,8 +21,11 @@ Rules (all must hold):
     when nothing or several devices are at "/", when a top-level ancestor is not a disk, when lsblk prints no KNAME
     or PKNAME, or when a PKNAME is not the device lsblk nests the node under. This rule is evaluated first, so no
     rule that returns early can skip it;
-  - DEVICE resolves (symlinks followed) to /dev/<name> with name a whole NVMe namespace (nvmeXnY), SCSI disk (sdX) or
-    virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem or anything else is refused);
+  - DEVICE resolves (symlinks followed) to /dev/<name>, directly under /dev, with name a whole NVMe namespace
+    (nvmeXnY), SCSI disk (sdX) or virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem
+    or anything else is refused); the node the O_EXCL open below opens is a block device whose st_rdev is the disk's
+    own /sys/block/<name>/dev, and each partition's its own (review 6 LOW 5: a hand-made /dev/<sub>/nvme1n1 carrying
+    the root disk's MAJ:MIN passed as the spare);
   - no partition or holder of it is mounted or in use: lsblk MOUNTPOINTS anywhere in its tree; every descendant is a
     bare partition (an LVM volume, md array, crypt or dm child refuses); the disk's AND each partition's
     /sys/block/<disk>/<part>/holders are empty; and an exclusive open (O_EXCL) of the disk and of each partition
@@ -45,10 +48,13 @@ several disks shows "/" on one member only, so this rule does not refuse the oth
 claims every member exclusively, so the O_EXCL rule refuses them instead. sysfs cannot name any btrfs root (its
 device number is anonymous), so t3run's fire refuses to run on such a box. Neither instrument names a disk that
 carries part of "/" without a holder link: an XFS logdev= or rtdev=, an ext4 journal_dev, a DRBD backing disk, a
-detached LUKS header, a PV of the root volume group with no root extents (round-2 attack MED 2). The kernel claims
-the first three, so the O_EXCL rule refuses them; the signature rule refuses all five. A signature libblkid does not
-know (a raw partition with no metadata, a disk holding only ciphertext) is not seen, and the partition-table rule
-covers it only when the raw data sits in a partition.
+detached LUKS header, a PV of the root volume group with no root extents (round-2 attack MED 2). While "/" is
+mounted the kernel claims its XFS log and rtdev and its ext4 journal device, so the O_EXCL rule refuses those three.
+The signature rule refuses each of the six that carries a signature libblkid knows. An XFS rtdev carries none before
+xfsprogs 6.13 (inferred, review 5 LOW 21; owed: `mkfs.xfs -r rtdev=` on 24.04, then `blkid -p`), so an rtdev not in
+use is in the next blind spot. A signature libblkid does not know (a raw partition with no metadata, a disk holding
+only ciphertext, an XFS rtdev) is not seen, and the partition-table rule covers it only when the raw data sits in a
+partition.
 """
 import errno
 import json
@@ -258,11 +264,13 @@ def descendants(node):
     return out
 
 
-def problems(name, devices, holders, multipath, part_holders=None, busy=None, ctrl=None, sigs=None, info=None):
+def problems(name, devices, holders, multipath, part_holders=None, busy=None, ctrl=None, sigs=None, info=None,
+             nodes=None):
     """every reason NAME may not be destroyed. HOLDERS, MULTIPATH, PART_HOLDERS and BUSY are the sysfs and O_EXCL
     readings; CTRL maps disk -> realpath of /sys/block/<disk>/device; SIGS maps disk or partition -> blkid -p's
-    (rc, stdout); INFO is root_info(devices), computed here when not given. check() always passes all of them; the
-    self-test passes None to leave a rule out of a case"""
+    (rc, stdout); INFO is root_info(devices), computed here when not given; NODES maps each device the O_EXCL open
+    opened -> (st_mode, st_rdev, its sysfs dev or None). check() always passes all of them; the self-test passes None
+    to leave a rule out of a case"""
     info = root_info(devices) if info is None else info
     # the root rule first, so the early return below cannot skip it (MED 13: a partition under an LVM root was
     # refused only as "not top-level", and the root rule never ran)
@@ -300,6 +308,14 @@ def problems(name, devices, holders, multipath, part_holders=None, busy=None, ct
                 bad.append(f"cannot probe {dev}'s signatures (blkid -p rc {rc}: {found or 'no output'}): refused")
     if multipath:
         bad.append(f"{name} is a multipath NVMe head ({multipath}): its flush counter may be on the path devices")
+    for dev, (mode, rdev, sysdev) in sorted((nodes or {}).items()):
+        if not stat.S_ISBLK(mode):
+            bad.append(f"{dev}'s node is not a block device (st_mode {oct(mode)})")
+        elif sysdev is None:
+            bad.append(f"no sysfs dev for {dev}: its node cannot be matched to the disk (refused)")
+        elif f"{os.major(rdev)}:{os.minor(rdev)}" != sysdev:
+            bad.append(f"{dev}'s node is device {os.major(rdev)}:{os.minor(rdev)}, not its sysfs dev {sysdev}: another "
+                       "disk's numbers")
     return bad
 
 
@@ -337,19 +353,25 @@ def blkid_probe(kname, dev_root="/dev"):
 
 
 def excl_open(path):
-    """an exclusive open of PATH, closed at once; OSError (EBUSY) when the kernel claims the device"""
-    os.close(os.open(path, os.O_RDONLY | os.O_EXCL))
+    """an exclusive open of PATH, closed at once: the opened node's (st_mode, st_rdev), read from the fd itself (review
+    6 LOW 5); OSError (EBUSY) when the kernel claims the device"""
+    fd = os.open(path, os.O_RDONLY | os.O_EXCL)
+    try:
+        st = os.fstat(fd)
+        return st.st_mode, st.st_rdev
+    finally:
+        os.close(fd)
 
 
 def check(dev, sys_root="/sys", dev_root="/dev", lsblk=None, blkid=None, excl=excl_open):
     """every rule on DEV, as `devguard.py check` runs it: (name, reasons). Every input is injectable so the self-test
     runs this allow path on a fake box before a paid one does (review 5 MED 1): SYS_ROOT and DEV_ROOT, LSBLK (lsblk's
     JSON text; None runs lsblk), BLKID (kname -> (rc, stdout); None probes DEV_ROOT/kname with blkid -p), EXCL (the
-    O_EXCL opener)."""
+    O_EXCL opener, answering the opened node's (st_mode, st_rdev))."""
     droot = os.path.realpath(dev_root)
     real = os.path.realpath(dev)
     name = os.path.basename(real)
-    if not real.startswith(droot.rstrip("/") + "/") or not os.path.exists(real):
+    if os.path.dirname(real) != droot or not os.path.exists(real):
         return name, [f"{dev} does not resolve to a device node under {dev_root} ({real})"]
     try:
         devices = parse_lsblk(lsblk_text() if lsblk is None else lsblk)
@@ -366,12 +388,21 @@ def check(dev, sys_root="/sys", dev_root="/dev", lsblk=None, blkid=None, excl=ex
     for p in parts:
         ph = os.path.join(blk, p, "holders")
         part_holders[p] = sorted(os.listdir(ph)) if os.path.isdir(ph) else []
-    busy = {}
+    busy, nodes = {}, {}
     for d in [name] + parts:
         try:
-            excl(os.path.join(droot, d))
+            got = excl(os.path.join(droot, d))
         except OSError as e:
             busy[d] = e.strerror
+            continue
+        sysdev = None
+        try:
+            with open(os.path.join(blk, *([] if d == name else [d]), "dev")) as f:
+                sysdev = f.read().strip() or None
+        except OSError:
+            pass
+        mode, rdev = got if isinstance(got, tuple) and len(got) == 2 else (0, 0)
+        nodes[d] = (mode, rdev, sysdev)
     info = root_info(devices)  # once, for the root rule, the controller rule and the links below
     roots = [] if isinstance(info, CannotTell) else info[0]
     ctrl = {}
@@ -383,7 +414,7 @@ def check(dev, sys_root="/sys", dev_root="/dev", lsblk=None, blkid=None, excl=ex
     probe = blkid or (lambda k: blkid_probe(k, droot))
     sigs = {name: probe(name)}
     sigs.update({c.get("name"): probe(c.get("kname")) for c in descendants(node)})
-    return name, problems(name, devices, holders, multipath, part_holders, busy, ctrl, sigs, info)
+    return name, problems(name, devices, holders, multipath, part_holders, busy, ctrl, sigs, info, nodes)
 
 
 def _node(name, typ, pkname=None, mounts=None, children=None, kname=None):
