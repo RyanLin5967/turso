@@ -1067,6 +1067,37 @@ mod tests {
         }
     }
 
+    /// Each `(predicate, parameter, rows)` answers `rows` through the default plan, which does NOT
+    /// seek `index` (engine review 20 item 8: the type's '=' does not agree with equality of the
+    /// encodings, so the index is refused for the term), and through a scan (NOT INDEXED) of
+    /// `table`, each plan asserted as a premise.
+    fn answers_unindexed_by_both_plans(
+        conn: &Arc<crate::Connection>,
+        table: &str,
+        index: &str,
+        cases: &[(&str, Option<Value>, i64)],
+    ) {
+        for (pred, param, want) in cases {
+            let default = format!("SELECT count(*) FROM {table} WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM {table} NOT INDEXED WHERE {pred}");
+            assert!(
+                !seeks(conn, &default, table, index),
+                "premise: {default} does not seek index {index} (a coarser '='): {:?}",
+                plan(conn, &default)
+            );
+            let by_scan = count(conn, &scan, param.clone());
+            assert!(
+                matches!(by_scan, Ok(n) if n == *want),
+                "premise: the scan answers {want} for {pred} ({param:?}): {by_scan:?}"
+            );
+            let by_default = count(conn, &default, param.clone());
+            assert!(
+                matches!(by_default, Ok(n) if n == *want),
+                "the default plan answered {by_default:?} for {pred} ({param:?}), the scan {want}"
+            );
+        }
+    }
+
     /// Engine review 16 HIGH 2 (review 14 MED 6): the seek path ENCODEs an equality's key with the
     /// column's parameters and consumes the term, so the type's operator never re-checks a row the
     /// seek returns, while a scan passes the operand to the operator as given (2fa04254c). On
@@ -1155,6 +1186,15 @@ mod tests {
     /// MED 6 prescribed): both types gained a bare `OPERATOR '<'`, without which no index can be
     /// created on them (index.rs refuses it), so the test panicked at its CREATE INDEX at its
     /// parent and at its fix alike; the CREATE INDEX is now an asserted premise.
+    ///
+    /// FLAGGED TEST EDIT (engine review 20 item 8, a premise the fix changes; for the lead's
+    /// ruling): both types' '=' is instr, which does not agree with equality of the encodings, so
+    /// since aeb76c261 the index is refused for these equalities and the premise "the default plan
+    /// seeks the index" cannot hold. The arms assert the opposite premise and the same answers
+    /// (`answers_unindexed_by_both_plans`). The claim (an over-length operand compares, false, and
+    /// raises nothing) is unchanged; the seek-path RAISE half it exercised is now reachable in core
+    /// only through a type whose '=' is allowlisted (none of core's built-ins RAISEs in its ENCODE;
+    /// the wire's bpchar does, postgres/ tests).
     #[test]
     fn an_indexed_length_checked_type_compares_an_over_length_operand() {
         let conn = open();
@@ -1187,7 +1227,7 @@ mod tests {
                     .is_err(),
                 "premise: {ty}'s own length check refuses an over-length value"
             );
-            answers_by_both_plans(
+            answers_unindexed_by_both_plans(
                 &conn,
                 table,
                 index,
