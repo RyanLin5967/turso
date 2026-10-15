@@ -479,7 +479,7 @@ def self_test():
     N = v3l.N
     RULE = "1000:10:180"
 
-    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop"):
+    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop", mode="dry"):
         """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
         over VOID arms (review L5). A brd block's record is a ram disk's, as the real one is (ram0, write through, the
         probe's 'none (RAM)', no flush counted: fourth lane review HIGH 3's second half); any other is a write-back
@@ -503,6 +503,10 @@ def self_test():
                                          "iostats": "1"},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
+        # TEST EDIT, flagged (review 7 / C21 findings 4, 5): the record names its mode (these packages are dry) and the
+        # sync path resolve_leaf named, as v3l.py measure() records them; new required fields at their passing values
+        r["mode"], r["slack_registered"] = mode, "A27"
+        r["leaf"]["sync_paths"] = ["/mnt/t3-x/v3l"]
         # the sync before each run, as v3l.py measure() records it since annex A24. TEST EDIT, flagged (repairs an
         # unseen break of b7de8cb22, review 6 MED 2 / annex A24-AM1): the record also carries its one `sync -f` entry
         # (DIR's filesystem; no loop layer), rc 0, a new required field at its passing value. Without it v3l.block()'s
@@ -557,7 +561,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed"):
+             loop="closed", v3l_mode="dry"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -636,7 +640,7 @@ def self_test():
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
         bounds = [f"b{i}" for i in range(k + 1)]
         bb = boundary_bins or [(10000, 5)] * (k + 1)
-        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block, v3l_mode))
         for i, b in enumerate(bounds[1:], 1):
             if i == 1 and after_v3l is None:
                 continue
@@ -662,6 +666,10 @@ def self_test():
         ("item 5 red test: the BEFORE batch refused (rc 2, no out dir) fails the package", {"before_rc": 2}, False, None),
         ("an AFTER batch with rc 0 but no raw.tsv fails the package", {"drop": "v3-after/raw.tsv"}, False, None),
         ("item 6: a VOID V3L after fails the package", {"after_v3l": "VOID"}, False, None),
+        # review 7 / C21 finding 4: a V3L record's mode must be its package's (an explicit dry label is kept; a record
+        # saying real inside a dry package, or the reverse, cannot stand for that package)
+        ("finding 4: a V3L record labelled real inside a dry package fails its block, naming the mode",
+         {"v3l_mode": "real"}, False, lambda s: "mode" in s["failed_blocks"][0]),
         ("item 6: a missing V3L after fails the package", {"after_v3l": None}, False, None),
         ("item 6: a VOID V3L before with no after (the run stopped) reads VOID, not MISSING",
          {"before_v3l": "VOID", "after_v3l": None}, False,

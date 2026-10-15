@@ -912,9 +912,10 @@ def _measure_with(patches, env=None, leaf=None):
             import io
             with contextlib.redirect_stdout(io.StringIO()):  # measure() prints its summary line
                 measure(os.path.join(d, "dir"), out, lr)
-            return None, os.path.exists(out)
+            j = os.path.join(out, "v3l.json")
+            return None, os.path.exists(out), (json.load(open(j)) if os.path.exists(j) else None)
         except Exception as e:  # noqa: BLE001
-            return f"{type(e).__name__}: {e}", os.path.exists(out)
+            return f"{type(e).__name__}: {e}", os.path.exists(out), None
     finally:
         g.update(saved)
         for k, v in env0.items():
@@ -1048,7 +1049,8 @@ def self_test():
 
     def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
             timed_syncs=N - 1, ctl_fio_syncs=0, layers=None, drive="same", lab_syncs=N - 1, disk="nvme1n1",
-            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync="auto", iostats="1"):
+            sectors=2 * N * 8, lab_sectors=2 * N * 8, sync="auto", iostats="1", mode="dry", pair=None, slack="A27",
+            sync_paths="auto"):
         def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
@@ -1073,6 +1075,21 @@ def self_test():
         if sync is not None:
             r["arms"]["fsync"]["sync"] = {"labelling": json.loads(json.dumps(dict(sync))),
                                           "timed": json.loads(json.dumps(dict(sync)))}
+        # TEST EDIT, flagged (review 7 / C21 findings 4, 5): the record names its mode (default "dry": no A27 pair is
+        # required, so every existing verdict stands), its SLACK registration, and the sync paths resolve_leaf named
+        # (default: the auto sync entries' own paths, in order); PAIR = (first, second[, stored problem]) adds
+        # annex A27's labelling pair with a valid second labelling run (a copy of the first)
+        if mode is not None:
+            r["mode"] = mode
+        r["slack_registered"] = slack
+        if sync_paths == "auto":
+            sync_paths = [f"/fs{i}" for i in range(1 + len(layers or []))]
+        if sync_paths is not None:
+            r["leaf"]["sync_paths"] = sync_paths
+        if pair is not None:
+            fa = r["arms"]["fsync"]
+            fa["lab_pair"] = {"first": pair[0], "second": pair[1], "problem": pair[2] if len(pair) > 2 else None}
+            fa["v1l_2"], fa["labelling_fio_2"] = dict(fa["v1l"]), dict(fa["labelling_fio"])
         return r
 
     def fake_sync(rc_f=0):
@@ -1423,6 +1440,49 @@ def self_test():
              rec()["arms"]["fsync"], v1l_2=dict(rec()["arms"]["fsync"]["v1l"], data_fsyncs=N - 1),
              labelling_fio_2=dict(rec()["arms"]["fsync"]["labelling_fio"]))))),
              "V1L fsync (A27 second labelling):", "fsync of the data file"))),
+        # review 7 / C21 finding 4: a stored record earns A27 credit only from its own counts: it names its mode; a real
+        # one names the registration this code implements and carries a pair whose first count is its labelling
+        # count and which re-derives within SLACK/2 (a stored problem text is never read); a dry one keeps its label
+        ("finding 4: a real record with no A27 labelling pair VOIDs",
+         _ok(lambda: _has(gates(rec(mode="real")), "drive nvme1n1:", "no A27 labelling pair"))),
+        ("finding 4: a real record whose pair is 20004/21004 with a stored problem of null VOIDs on the re-derived A27 text",
+         _ok(lambda: _has(gates(_lab(rec(delta=20003, mode="real", pair=(20004, 21004, None)), 20004)),
+                          "drive nvme1n1:", "annex A27"))),
+        ("finding 4: a real record with a bound pair (20004/20004, its labelling count) is VALID",
+         _ok(lambda: gates(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004)) == [])),
+        ("finding 4: a real record whose pair's first count (19000) is not its labelling count (20004) VOIDs",
+         _ok(lambda: _has(gates(_lab(rec(delta=20003, mode="real", pair=(19000, 19000)), 20004)),
+                          "drive nvme1n1:", "is not its labelling count"))),
+        ("finding 4: a real record naming another SLACK registration (A99) VOIDs",
+         _ok(lambda: _has(gates(_lab(rec(delta=20003, mode="real", pair=(20004, 20004), slack="A99"), 20004)),
+                          "drive nvme1n1:", "SLACK registration"))),
+        ("finding 4: a drive record that names no mode VOIDs",
+         _ok(lambda: _has(gates(rec(mode=None)), "drive nvme1n1:", "names no mode"))),
+        ("finding 4: a dry record keeps its label: no pair needed, and publish says slack_bound false",
+         _ok(lambda: gates(rec()) == [] and publish(rec())["slack_bound"] is False)),
+        ("finding 4: publish of a real record with a bound pair says slack_bound true",
+         _ok(lambda: publish(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004))["slack_bound"] is True)),
+        ("finding 4/5: measure() records mode real, slack_registered A27 and leaf.sync_paths (DIR alone, a drive)",
+         _ok(lambda: (lambda r: r[0] is None and r[2] is not None and r[2].get("mode") == "real"
+                      and r[2].get("slack_registered") == "A27"
+                      and [p.endswith("/dir") for p in r[2]["leaf"].get("sync_paths") or []] == [True])(
+             _measure_with(_runs_box(20000, 20000, []), env={"V3L_REAL": "1"}, leaf=_LEAF)))),
+        # review 7 / C21 finding 5: A24-AM1's coverage is judged by path identity, in order, not by a count
+        ("finding 5: a loop record whose two sync entries are both DIR (the backing file's filesystem missing) VOIDs",
+         _ok(lambda: _has(gates(sync_mut(rec(layers=[{"name": "loop3", "write_cache": "write through",
+                                                      "flush_ios_delta": 0}]), "timed",
+                                         lambda y: y.__setitem__("layers", [dict(y["layers"][0]), dict(y["layers"][0])]))),
+                          "drive nvme1n1:", "the sync before the timed fsync run synced", "in order"))),
+        ("finding 5: a direct-drive record whose one sync entry has no path VOIDs",
+         _ok(lambda: _has(gates(sync_mut(rec(), "timed", lambda y: y["layers"][0].pop("path"))),
+                          "drive nvme1n1:", "in order"))),
+        ("finding 5: a record whose leaf names no sync paths VOIDs",
+         _ok(lambda: _has(gates(rec(sync_paths=None)), "drive nvme1n1:", "names no sync paths"))),
+        ("finding 5: plants sync-wrong-path, sync-missing-path and sync-dup-path fire, each on the path text",
+         _ok(lambda: (lambda res: all(_plant(res, n).get("fired") is True
+                                      and _has(_plant(res, n)["got"], "drive nvme1n1:", "in order")
+                                      for n in ("sync-wrong-path", "sync-missing-path", "sync-dup-path")))(
+             plants(rec(delta=20003))[0]))),
         ("A27: measure(), real, a labelling pair 20000 and 20000 goes on: the third run is the timed fio",
          _ok(lambda: (lambda calls: (lambda r: r[0] is None and len(calls) >= 3 and calls[0][0] == calls[1][0] == "strace"
                                      and calls[2][0] == "fio")(
