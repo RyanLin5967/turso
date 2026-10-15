@@ -99,7 +99,9 @@ def tie(j, live):
     stop's claim at stop_secs (printed to ms), the same capped and rule."""
     if not isinstance(live, dict):
         return ["no live warm-up record (warmup-live.json)"]
-    w = j.get("warmup") or {}
+    if not isinstance(j, dict) or not isinstance(j.get("warmup"), dict):
+        return ["the summary, or its warmup, is not an object: the live record cannot be tied to the run"]
+    w = j["warmup"]
     claims, st, wo, cap = live.get("claims_ns"), live.get("stop_at"), live.get("warm_ops"), live.get("capped")
     bad = []
     if not isinstance(claims, list) or not claims or any(type(c) is not int for c in claims):
@@ -116,6 +118,18 @@ def tie(j, live):
         bad.append(f"live capped {cap!r}, summary capped {w.get('capped')!r}")
     if live.get("rule") != w.get("rule"):
         bad.append(f"live rule {live.get('rule')!r}, summary rule {w.get('rule')!r}")
+    return bad
+
+
+def tracerpid_problems(j, linux=sys.platform.startswith("linux")):
+    """The driver's own TracerPid at the measured span's bounds (tracerpid_tm0/tm1, as bbload's): an int >= 0; null only
+    where there is no /proc to read (not Linux), so a Linux driver that failed to read it is caught here, not at T3"""
+    bad = []
+    for k in ("tracerpid_tm0", "tracerpid_tm1"):
+        v = j.get(k, "(absent)")
+        if not ((type(v) is int and v >= 0) or (v is None and not linux)):
+            bad.append(f"{k} {v!r}: the driver's own TracerPid at the measured span's bound, an int >= 0"
+                       + ("" if linux else ", or null where there is no /proc"))
     return bad
 
 
@@ -155,10 +169,7 @@ def stamp_problems(j):
                 if type(x) is not int or type(y) is not int or x < 0 or y < x:
                     bad.append(f"window {name}: exception counter {k} before {x!r} after {y!r}: not two non-negative "
                                "ints, never going back")
-    for k in ("tracerpid_tm0", "tracerpid_tm1"):
-        if k not in j or not (j[k] is None or (type(j[k]) is int and j[k] >= 0)):
-            bad.append(f"{k} {j.get(k, '(absent)')!r}: the driver's own TracerPid at the measured span's bound, an int "
-                       ">= 0, or null where there is no /proc")
+    bad += tracerpid_problems(j)
     first, last = wins[0], wins[-1]
     for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
                     ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):
