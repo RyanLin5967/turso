@@ -38,8 +38,13 @@ HZ = os.sysconf("SC_CLK_TCK")
 
 
 def read_procs(cell):
-    """pid -> (comm, cpu_ticks, class)."""
+    """pid -> (comm, cpu_ticks, class). A process is sut when its environ carries FASTEST_CELL=<cell> OR any ancestor
+    (by ppid, within this snapshot) is sut: a child of the system under test is the system under test, even when its
+    environ no longer says so (PostgreSQL's ps display clobbers the environ area of every process it forks: the first
+    --dry-block run VOIDed every pg18 attempt on its own backends, 2026-10-15). A process with no sut ancestor is
+    judged by its own environ, as before."""
     out = {}
+    ppid = {}
     me = os.getpid()
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -56,6 +61,7 @@ def read_procs(cell):
         comm = st[st.find("(") + 1:r]
         fields = st[r + 2:].split()
         ticks = int(fields[11]) + int(fields[12])  # utime + stime
+        ppid[pid] = int(fields[1])
         try:
             with open(f"/proc/{d}/cmdline", "rb") as f:
                 cmd = f.read()
@@ -71,6 +77,17 @@ def read_procs(cell):
             except OSError:
                 cls = "foreign"
         out[pid] = (comm, ticks, cls)
+    # ancestry: a non-kernel process whose ppid chain reaches a sut process is sut (cycles and unknown pids end the walk)
+    for pid, (comm, ticks, cls) in list(out.items()):
+        if cls != "foreign":
+            continue
+        seen, q = set(), ppid.get(pid)
+        while q and q not in seen and q in out:
+            seen.add(q)
+            if out[q][2] == "sut":
+                out[pid] = (comm, ticks, "sut")
+                break
+            q = ppid.get(q)
     return out
 
 
