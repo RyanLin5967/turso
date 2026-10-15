@@ -5110,6 +5110,35 @@ fn a_parameter_number_the_scanner_would_wrap_is_refused() {
     }
 }
 
+/// The parameter refusals can be told apart by their words, not by the code alone (42601 is shared):
+/// a `$n` above i32::MAX is PostgreSQL 18's `parameter number too large at or near "$n"`, on both
+/// protocols, and a Bind whose value count is wrong names the unnamed statement as `""`, as
+/// PostgreSQL's exec_bind_message does (recorded on 18.6: `bind message supplies 1 parameters, but
+/// prepared statement "" requires 0`, artie raw loud-20261015/pg18-diff/pg18.out). The arms above
+/// asserted the code only, so a mutant answering the fail-closed "could not read the statement's
+/// parameters" refusal passed every one (wire review 14 item 18). That refusal, which no client
+/// text is known to reach, now has its own code, XX000.
+#[test]
+fn the_parameter_refusals_can_be_told_apart() {
+    let dir = Scratch::new("paramwords");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sql = "SELECT v FROM t WHERE id = $4294967297";
+    let too_large = "parameter number too large at or near \"$4294967297\"";
+    let e = a.q(sql).err(sql);
+    assert!(e.message.contains(too_large), "simple: {e:?}");
+    let e = a.x(sql, &["1"]).err(sql);
+    assert!(e.message.contains(too_large), "extended: {e:?}");
+    let (_, e) = a.bind_round("SELECT 1", &[], &[Some(b"x")], &[]);
+    let e = e.expect("one value for no parameter, none declared, is refused");
+    assert_eq!(e.code, "08P01");
+    assert!(
+        e.message
+            .contains("bind message supplies 1 parameters, but prepared statement \"\" requires 0"),
+        "{e:?}"
+    );
+}
+
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
 /// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
 /// described and is bound, as in PostgreSQL. They were read from the engine's slots, so

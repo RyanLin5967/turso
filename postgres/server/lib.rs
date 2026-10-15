@@ -2839,6 +2839,15 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(m) if m == "division by zero" => "22012",
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
+        // The fail-closed refusal of a parse tree whose parameters cannot be read (turso_pg_parser
+        // checked_param_numbers): an internal failure, never a client's syntax error, so it is not
+        // 42601, the code of PostgreSQL's "parameter number too large" beside it (wire review 14
+        // item 18).
+        LimboError::ParseError(m)
+            if m.contains("could not read the statement's parameters from its parse tree") =>
+        {
+            "XX000"
+        }
         LimboError::ParseError(m)
             if m.starts_with("no such table")
                 || m.starts_with("no such view")
