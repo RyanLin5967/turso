@@ -87,14 +87,30 @@ def self_test():
     # TEST EDIT, flagged (review 5 LOW 15): ot defaults to oa. It was 5010 beside oa 5000, and two cases gave 40 beside
     # 12: a completion-counting driver's numbers, which A23's claim count cannot produce. No expectation changes.
     def rec(t=33, c=4, rule="1000000:0:2", st=2.02, dr=0.3, oa=5000, ot=None, by=None, per="auto", wpc=None,
-            capped=True):
+            capped=True, ready=1500, wins="auto", tm=("auto", "auto")):
         ot = oa if ot is None else ot
         by = by if by is not None else split(t, c)
-        return {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
-                "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
-                "warmup_per_client": wpc, "warmup_rule": rule,
-                "warmup": {"rule": rule, "ops_at_stop": oa, "ops": ot, "stop_secs": st, "drain_secs": dr,
-                           "secs": round(st + dr, 3), "capped": capped}}
+        # TEST EDIT, flagged (review 5 MED 8's driver half; the MED 12 ruling's window stamps): the record gains the
+        # warm-up's start after the last client was ready (t0_after_ready_ns) and each window's realtime bounds with
+        # the run's measured span (tm0/tm1_realtime_s), new required fields at passing values; no expectation changes
+        if wins == "auto":
+            wins = [{"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5},
+                    {"window": "connect", "secs": 0.25, "t0_realtime_s": 1000.6, "t1_realtime_s": 1000.85}]
+        r = {"ops_total": t, "ops_total_asked": t, "ops_by_client": by,
+             "ops_per_client": (by[0] if len(set(by)) == 1 else None) if per == "auto" else per,
+             "warmup_per_client": wpc, "warmup_rule": rule,
+             "warmup": {"rule": rule, "ops_at_stop": oa, "ops": ot, "stop_secs": st, "drain_secs": dr,
+                        "secs": round(st + dr, 3), "capped": capped}, "windows": wins}
+        if ready is not None:
+            r["warmup"]["t0_after_ready_ns"] = ready
+        for k, v, x in (("tm0_realtime_s", tm[0], 0), ("tm1_realtime_s", tm[1], -1)):
+            if v == "auto":
+                v = wins[x]["t0_realtime_s" if x == 0 else "t1_realtime_s"] if wins else None
+            if v is not None:
+                r[k] = v
+        return r
+
+    W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5}
 
     cases = [
         ("a run to MAX_S with T=33 over 4 clients keeps the contract", check(rec(), 33, 4, "1000000:0:2") == []),
@@ -140,6 +156,30 @@ def self_test():
          check(rec(rule="10:5:2", st=2.0, oa=12, capped=False), 33, 4, "10:5:2") != []),
         ("LOW 15: MAX_S below S, OPS met, capped keeps the contract (done needs S too)",
          check(rec(rule="10:5:2", st=2.0, oa=12, capped=True), 33, 4, "10:5:2") == []),
+        # review 5 MED 8 (the driver half): the warm-up's clock starts only after every client is ready, as bbload's
+        # g_t0 does, so no client's connect or setup counts as warm-up: t0 minus the last client's ready, in ns, >= 0
+        ("MED 8: a warm-up record with no t0_after_ready_ns fails", check(rec(ready=None), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0 before the last client was ready (-5 ns) fails", check(rec(ready=-5), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0_after_ready_ns as a bool fails", check(rec(ready=True), 33, 4, "1000000:0:2") != []),
+        ("MED 8: t0 exactly at the last ready (0 ns) keeps the contract", check(rec(ready=0), 33, 4, "1000000:0:2") == []),
+        # the MED 12 ruling's window stamps: each window's realtime bounds and the run's measured span, so ours' timed
+        # run is judged over its measured windows as the competitors' is (tm0/tm1_realtime_s, their names)
+        ("stamps: no windows fails", check(rec(wins=[]), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window without t0_realtime_s fails",
+         check(rec(wins=[{k: v for k, v in W0.items() if k != "t0_realtime_s"}], tm=(1000.0, 1000.5)), 33, 4,
+               "1000000:0:2") != []),
+        ("stamps: a window closing before it opens fails",
+         check(rec(wins=[W0 | {"t1_realtime_s": 999.5, "secs": -0.5}], tm=(1000.0, 999.5)), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window opening before the previous one closed fails",
+         check(rec(wins=[W0, W0 | {"window": "connect", "t0_realtime_s": 1000.4, "t1_realtime_s": 1000.9}]), 33, 4,
+               "1000000:0:2") != []),
+        ("stamps: tm0_realtime_s other than the first window's open fails",
+         check(rec(tm=(999.0, "auto")), 33, 4, "1000000:0:2") != []),
+        ("stamps: tm1_realtime_s other than the last window's close fails",
+         check(rec(tm=("auto", 1001.0)), 33, 4, "1000000:0:2") != []),
+        ("stamps: no tm1_realtime_s fails", check(rec(tm=("auto", None)), 33, 4, "1000000:0:2") != []),
+        ("stamps: a window whose realtime span (0.5 s) disagrees with its secs (0.2) by over 0.05 s fails",
+         check(rec(wins=[W0 | {"secs": 0.2}]), 33, 4, "1000000:0:2") != []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
