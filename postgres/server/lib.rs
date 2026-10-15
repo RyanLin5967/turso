@@ -2119,7 +2119,7 @@ impl Session {
             arity(call, 0)?;
             result_format(format, 0, WORK_COLUMNS.len())?;
             bad_code(&*st)?;
-            return work_row(format);
+            return work_row(format, &self.shared.db);
         }
         if !matches!(
             f,
@@ -2910,11 +2910,19 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[at..]
 }
 
-const WORK_COLUMNS: [&str; 3] = ["unix_syscalls", "instructions", "allocations"];
+const WORK_COLUMNS: [&str; 5] = [
+    "unix_syscalls",
+    "instructions",
+    "allocations",
+    "thread_instructions",
+    "confirms_written",
+];
 
-/// turso_branch_work(): this process's system calls and instructions (counters::process_counters)
-/// and allocations (counters::allocations, NULL without the alloc-count feature), read at once.
-fn work_row(format: &Format) -> SqlResult<Response> {
+/// turso_branch_work(): this process's system calls and instructions (counters::process_counters),
+/// allocations (counters::allocations, NULL without the alloc-count feature), this session
+/// thread's own instructions (counters::thread_counters) and the branch store's confirmation words
+/// written (its background confirm writer's work, Database::branch_confirm_counts), read at once.
+fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
     let fields = WORK_COLUMNS
         .iter()
         .enumerate()
@@ -2936,6 +2944,8 @@ fn work_row(format: &Format) -> SqlResult<Response> {
         .encode_field(&counters.map(|c| c.unix_syscalls as i64))
         .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
         .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
+        .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
+        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
         .and_then(|()| encoder.finish());
     Ok(Response::Query(QueryResponse::new(header, stream::iter(vec![row]))))
 }

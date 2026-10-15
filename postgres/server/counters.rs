@@ -141,3 +141,23 @@ pub fn allocations() -> Option<u64> {
         n => Some(n),
     }
 }
+
+/// This thread's own instructions retired and cycles (`thread_selfcounts`, the kernel's per-thread
+/// fixed counters; no privilege), so a budget window counts the session's work alone: the engine's
+/// background threads (the branch store's confirm writer) land in windows at random and made the
+/// process-wide counts swing by tens of thousands of instructions. `None` off Apple platforms.
+pub fn thread_counters() -> Option<(u64, u64)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            fn thread_selfcounts(kind: i32, buf: *mut u64, size: usize) -> i32;
+        }
+        let mut c = [0u64; 2];
+        let rc = unsafe { thread_selfcounts(1, c.as_mut_ptr(), std::mem::size_of_val(&c)) };
+        (rc == 0).then_some((c[0], c[1]))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
