@@ -6095,35 +6095,40 @@ mod format_tests {
     #[test]
     fn a_synced_log_cut_at_a_d0_recovery_is_truncated_in_place_and_made_durable() {
         use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::TempDir::new().unwrap();
-        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
-        // A hole in the last flight: it was never acknowledged, and is cut.
-        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
-        let inode = std::fs::metadata(&files.log).unwrap().ino();
-        // FLAGGED TEST EDIT (engine review 20 LOW 14's expectation; for the lead's ruling): the cut is
-        // made durable by a directory sync in Fsync and then a FullFsync of the log, whose device
-        // drain covers both (engine review 16 LOW 11, accepted: one flush, not two). The old
-        // assertion, at least 2 F_FULLFSYNCs, was red since that change (artie raws l1-branch*,
-        // "1 full syncs") and held only under mutant open_dir_sync_in_class. Counted by class
-        // requested (CLASS_SYNCS) and directory (DIR_SYNCS), so it holds off Apple too.
-        let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
-        let dirs = || DIR_SYNCS.with(|c| c.get());
-        let ((fsyncs, fulls), dir) = (classes(), dirs());
-        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
-        let ((fsyncs_after, fulls_after), dir_after) = (classes(), dirs());
-        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
-        drop(recovered);
-        let meta = std::fs::metadata(&files.log).unwrap();
-        assert_eq!(meta.ino(), inode, "the cut replaced the log instead of truncating it");
-        assert_eq!(meta.len(), starts[2], "the log was not truncated at the first dropped record");
-        assert_eq!(
-            (fulls_after - fulls, fsyncs_after - fsyncs, dir_after - dir),
-            (1, 1, 1),
-            "the cut was not made durable (one FullFsync of the log after one Fsync of its directory) \
-             before the next append: (FullFsync, Fsync, directory) syncs"
-        );
-        assert_eq!(end_tags(&files), (true, false), "the cut retagged synced flights as unsynced");
+        // FLAGGED TEST EDIT, a spec change re-derived per class (lead ruling c32fad57d5, citing review
+        // 16 LOW 11 and D1's promise, both accepted; it supersedes review 7 #1's "F_FULLFSYNC of the
+        // log and of its directory" for a Fsync-class cut, and 7b76b222f's (1, 1, 1) for every
+        // class): the directory is synced in Fsync, then the log in the class recovery decided. A
+        // D1 log's cut: (FullFsync, Fsync, directory) = (0, 2, 1), no device flush, as D1 promises
+        // only fsync(2); a D2 log's: (1, 1, 1), the log's F_FULLFSYNC draining the device, the
+        // directory's write included. Counted by class requested (CLASS_SYNCS) and directory
+        // (DIR_SYNCS), so it holds off Apple too. Mutants `torn_cut_log_sync_full` (the log always in
+        // FullFsync, as before: the D1 arm reads (1, 1, 1)) and `torn_cut_dir_sync_in_class`.
+        for (class, want) in [(SyncClass::Fsync, (0, 2, 1)), (SyncClass::FullFsync, (1, 1, 1))] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let starts = flights(&files, 0, &[1, 1, 1], class);
+            // A hole in the last flight: it was never acknowledged, and is cut.
+            overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+            let inode = std::fs::metadata(&files.log).unwrap().ino();
+            let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
+            let dirs = || DIR_SYNCS.with(|c| c.get());
+            let ((fsyncs, fulls), dir) = (classes(), dirs());
+            let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+            let ((fsyncs_after, fulls_after), dir_after) = (classes(), dirs());
+            assert_eq!(forks(&recovered.records), vec![1, 11], "{class:?}: premise: the torn last flight was cut");
+            drop(recovered);
+            let meta = std::fs::metadata(&files.log).unwrap();
+            assert_eq!(meta.ino(), inode, "{class:?}: the cut replaced the log instead of truncating it");
+            assert_eq!(meta.len(), starts[2], "{class:?}: the log was not truncated at the first dropped record");
+            assert_eq!(
+                (fulls_after - fulls, fsyncs_after - fsyncs, dir_after - dir),
+                want,
+                "{class:?}: the cut was not made durable in its decided class (the directory in Fsync, then \
+                 the log in {class:?}) before the next append: (FullFsync, Fsync, directory) syncs"
+            );
+            assert_eq!(end_tags(&files), (true, false), "{class:?}: the cut retagged synced flights as unsynced");
+        }
     }
 
     /// Engine review 7 #1: a log of D0 flights cut at a D2 recovery keeps them tagged unsynced, so
