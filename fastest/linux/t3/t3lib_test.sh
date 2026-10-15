@@ -189,6 +189,30 @@ FAKE_MKFS_UUID=u-other
 check "LOW 6: a mkfs that did not take the given UUID refuses before mount, and the made record names what was asked" \
   'refuses2 dm && grep -q UUID "$T/out.txt" && [ "$(steps)" = "$P$G$M$U" ] && [ "$(cat "$T/made.txt")" = "xfs U-1" ]'
 FAKE_MKFS_UUID=""
+# the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk passes REG = DRY-VIRT, which
+# skips the A17 registration (a dry run is never credited; t3run passes it only under --dry-block, and the stamp is
+# refused for credit by summarize); every other step and refusal of device_make is unchanged
+echo "write back" > "$T/sys/block/nvme5n1/queue/write_cache"
+dmv() { : > "$HL"; rm -f "$T/made.txt"; FAKE_TYPE="" FAKE_UUID="" FAKE_MOUNTED=""
+        device_make "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" no DRY-VIRT xfs U-1 /mnt/t3-xfs "$T/made.txt"; }
+check "dry-block: device_make with REG DRY-VIRT on a write-back drive with nothing registered makes and mounts it, in order" \
+  'dmv && [ "$(steps)" = "$P$G${M}mount xfs $REAL5 /mnt/t3-xfs,$U" ] && grep -q "DRY-VIRT" "$T/out.txt"'
+ident nvme5n1 eui.0099 259:5 PM9A3 S1 GDC5
+check "dry-block: DRY-VIRT keeps the identity refusal (a changed wwid refuses, rc 2, no mkfs)" \
+  'refuses2 dmv && grep -q wwid "$T/out.txt" && [ "$(steps)" = "$P$G$U" ]'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+echo "write through" > "$T/sys/block/nvme5n1/queue/write_cache"
+# virt_ok MODE VIRT: a real run refuses any virtualization (gate-6 review 8, unchanged); --dry-block allows it
+check "dry-block: virt_ok real none passes" 'virt_ok real none'
+for v in apple kvm qemu microsoft vmware ""; do
+  check "dry-block: virt_ok real '$v' refuses (rc 2), naming bare metal" "refuses2 virt_ok real '$v' && grep -q 'bare metal' \"\$T/out.txt\""
+done
+check "dry-block: virt_ok dryblock apple passes (the VM is the point)" 'virt_ok dryblock apple'
+check "dry-block: virt_ok with an unknown mode refuses (rc 2)" 'refuses2 virt_ok frobnicate none'
+# host_room_ok FREE_KB [MIN_GB]: the Mac host must have at least 35 GiB free before a VM dry run builds
+check "dry-block: host_room_ok 35 GiB free passes" 'host_room_ok $((35 * 1024 * 1024))'
+check "dry-block: host_room_ok 1 KiB under 35 GiB refuses (rc 2), naming 35" 'refuses2 host_room_ok $((35 * 1024 * 1024 - 1)) && grep -q 35 "$T/out.txt"'
+check "dry-block: host_room_ok on a reading that is no number refuses (rc 2)" 'refuses2 host_room_ok "n/a"'
 FAKE_MKFS="ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5"
 check "MED 1: the drive changes between mkfs and mount: refuses (rc 2), no mount" 'refuses2 dm && [ "$(steps)" = "$P$G$M$U" ]'
 FAKE_MKFS=""; ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5

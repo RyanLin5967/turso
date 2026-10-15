@@ -847,7 +847,8 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
+             stamp=None, mode_dry="1"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -859,7 +860,8 @@ def self_test():
             rows.append(f"xfs\t{c}\t{system}\t1\t1\t{rc_}\t{v_}")
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\n" + "\n".join(rows) + "\n")
         w(f"{out}/fslist.txt", fslist + "\n")
-        w(f"{out}/mode.txt", f"dry=1\nblock={block}\nplant=\nplp={plp}\n")
+        w(f"{out}/mode.txt", f"dry={mode_dry}\nblock={block}\nplant=\nplp={plp}\n"
+          + (f"stamp={stamp}\n" if stamp is not None else ""))
         if rule is not None:
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
@@ -1147,6 +1149,20 @@ def self_test():
          lambda s: any("tm0_realtime_s" in x for x in s["parity_refusals"])),
         ("measured span: a measured span outside the wrapper's process window fails", {"ours_sweeper": "outside"},
          False, lambda s: any("outside" in x for x in s["parity_refusals"])),
+        # the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT, and
+        # summarize refuses it for credit; every dry run is uncreditable, and a DRY-VIRT stamp on a run that says it
+        # is real is a contradiction that fails the package
+        ("dry-block: a DRY-VIRT dry package passes as a dry run and is refused for credit, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT"}, True, lambda s: s.get("stamp") == "DRY-VIRT" and s.get("creditable") is False
+         and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: an ordinary dry package is refused for credit as a dry run", {}, True,
+         lambda s: s.get("creditable") is False and any("dry run" in x for x in s.get("credit_refusals") or [])),
+        ("dry-block: a DRY-VIRT stamp on a package whose mode says dry=0 fails it, naming DRY-VIRT",
+         {"stamp": "DRY-VIRT", "mode_dry": "0"}, False,
+         lambda s: any("DRY-VIRT" in x for x in s.get("failed_stages", []) + s.get("parity_refusals", [])
+                       + s.get("fixture_refusals", []) + s.get("mode_refusals", []))),
+        ("dry-block: a stamp other than DRY-VIRT (an unknown label) fails the package", {"stamp": "DRY-VM"}, False,
+         lambda s: any("DRY-VM" in x for x in s.get("mode_refusals", []))),
         ("MED 12: ours with no timed.json fails, naming the sweeper", {"ours_sweeper": None}, False,
          lambda s: any("sweeper" in x and "timed.json" in x for x in s["parity_refusals"])),
         ("MED 12: ours with no timed.tracer.tsv fails, naming it", {"ours_sweeper": "notracer"}, False,
