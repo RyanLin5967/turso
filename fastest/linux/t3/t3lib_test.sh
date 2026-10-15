@@ -236,5 +236,47 @@ check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (ne
      truncate -s 8M "$T/img" && mkfs.ext4 -q -F -U "$U6" "$T/img" &&
      [ "$(t3_blkid TYPE "$T/img")" = ext4 ] && [ "$(t3_blkid UUID "$T/img")" = "$U6" ] )'
 
+# The lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z, SAME INSTRUMENT FOR EVERY SYSTEM): ours' timed run runs
+# under the competitors' shared sweeper (gates/sweeper.sh) and its timed.json records sweeper_cpu_s, read by the one
+# reader (gates/sweeper_record.py). These need Linux /proc and bash 5 (EPOCHREALTIME), as the T3 box has.
+SW=$HERE/../gates/sweeper.sh SR=$HERE/../gates/sweeper_record.py
+check "MED 12: the shared sweeper (gates/sweeper.sh) and its one reader (gates/sweeper_record.py) are in the tree" \
+  '[ -f "$SW" ] && [ -f "$SR" ]'
+# swrun N CMD...: ours_timed_run into $T/swN with the real sweeper sourced; its rc is the function's
+swrun() { local d=$T/sw$1; shift; mkdir -p "$d"; ( source "$SW" && ours_timed_run "$d" "$@" ); }
+# the window as numbers, and the first and last sweep's times, from the files the run wrote
+swnums() { awk '{for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "t0") a = kv[2]; if (kv[1] == "t1") b = kv[2] }}
+                END { print a, b }' "$1/timed.window"; awk '$1 == "SWEEP" { if (f == "") f = $3; l = $3 } END { print f, l }' \
+                "$1/timed.tracer.tsv"; }
+check "MED 12: ours_timed_run returns the command's rc (3) and records its window, t0 < t1, both inside the sweeps" \
+  'swrun 1 bash -c "sleep 0.5; exit 3"; [ $? = 3 ] && grep -q "^sweeper pid=[0-9]* nice=19 " "$T/sw1/timed.tracer.tsv" &&
+   grep -q " rc=3$" "$T/sw1/timed.window" &&
+   swnums "$T/sw1" | tr "\n" " " | awk "{ exit !(\$1 < \$2 && \$3 <= \$1 && \$2 <= \$4) }"'
+check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
+  'python3 -B "$SR" record "$T/sw1/timed.tracer.tsv" $(swnums "$T/sw1" | head -1)'
+check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number, the window process, the reader's own value" \
+  '( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw1" "$SR" ) && python3 -B -c "
+import json, sys; sys.path.insert(0, \"$HERE/../gates\"); import sweeper_record as s
+j = json.load(open(\"$T/sw1/timed.json\"))
+r, why = s.sweeper_record(open(\"$T/sw1/timed.tracer.tsv\").read().splitlines(), j[\"t0\"], j[\"t1\"])
+sys.exit(not (isinstance(j[\"sweeper_cpu_s\"], float) and j[\"sweeper_window\"] == \"process\" and j[\"rc\"] == 3
+              and r is not None and j[\"sweeper_cpu_s\"] == r[\"sweeper_cpu_s\"] and j[\"sweeper_refused\"] is None))"'
+check "MED 12: ours_timed_run without the sweeper sourced refuses (rc 2) and never runs the command" \
+  '( mkdir -p "$T/sw2"; unset -f sweeper_start sweeper_wait; ours_timed_run "$T/sw2" touch "$T/sw2/ran" ); [ $? = 2 ] &&
+   [ ! -e "$T/sw2/ran" ]'
+check "MED 12: a sweeper whose start sweep never comes: refused (rc 2) within its bound, the command never ran" \
+  '( mkdir -p "$T/sw3"; source "$SW"; sweeper_start() { SWEEPER_PID=""; }; sweeper_wait() { :; }
+     ours_timed_run "$T/sw3" touch "$T/sw3/ran" ); [ $? = 2 ] && [ ! -e "$T/sw3/ran" ] &&
+   grep -q "no start sweep" "$T/sw3/timed.window"'
+check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
+  'mkdir -p "$T/sw4" && sed "s/ nice=19 / nice=0 /" "$T/sw1/timed.tracer.tsv" > "$T/sw4/timed.tracer.tsv" &&
+   cp "$T/sw1/timed.window" "$T/sw4/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
+   python3 -B -c "import json, sys; j = json.load(open(\"$T/sw4/timed.json\"))
+sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"nice 0\" in (j[\"sweeper_refused\"] or \"\")))"'
+check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
+  'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
+   python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
+sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"window\" in (j[\"sweeper_refused\"] or \"\")))"'
+
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]
