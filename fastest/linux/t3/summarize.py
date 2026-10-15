@@ -93,7 +93,7 @@ def v3_batch(fsdir, when, rc, block=None, plp="no"):
     return rec
 
 
-def block_record(out, fs, plp="no"):
+def block_record(out, fs, plp="no", dry=None):
     fsdir = os.path.join(out, f"fs-{fs}")
     if not os.path.isdir(fsdir):
         return {"fs": fs, "ok": False, "why": ["the block never ran"]}
@@ -151,6 +151,12 @@ def block_record(out, fs, plp="no"):
         except (OSError, ValueError) as e:
             rec["why"].append(f"V3L {when}: v3l-{when}/v3l.json unreadable ({type(e).__name__})")
             continue
+        # review 7 / C21 finding 4: the record's own mode is its package's (a dry label is kept, never upgraded; a
+        # record saying real in a dry package, or the reverse, does not stand for this package)
+        want = {"1": "dry", "0": "real"}.get(str(dry))
+        if want and (not isinstance(meas, dict) or meas.get("mode") != want):
+            rec["why"].append(f"V3L {when}: the record's mode is {(meas or {}).get('mode') if isinstance(meas, dict) else None!r}, "
+                              f"this package is {want}")
         try:
             again, ok_again = v3l.plants(meas)
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -337,6 +343,7 @@ def summarize(out, sha, dry, manifest):
     wtext = open(wt).read().split() if os.path.exists(wt) else []
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
+    warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -398,8 +405,9 @@ def summarize(out, sha, dry, manifest):
             # the loop is reported in runs[].warmup_loops, never used to excuse one
             for tcell, b in r.get("warmup_backsteps") or []:
                 if type(b) is not int or b != 0:
-                    parity.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
-                                  "order (PREREG annex A23; refused in either loop mode)")
+                    warm.append(f"{fs}/{cell}: timed run {tcell}: warm-up backsteps {b!r}: claims judged out of time "
+                                "order (PREREG annex A23; refused in either loop mode)")
+                    parity.append(warm[-1])
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
         runs.append(r)
         if not result:
@@ -412,7 +420,7 @@ def summarize(out, sha, dry, manifest):
     mt0 = os.path.join(out, "mode.txt")
     if os.path.exists(mt0):
         plp = dict(l.split("=", 1) for l in open(mt0).read().splitlines() if "=" in l).get("plp") or "no"
-    blocks = [block_record(out, fs, plp) for fs in fslist]
+    blocks = [block_record(out, fs, plp, dry) for fs in fslist]
     # each run is normalised by its own block's pooled V3L p50 (PREREG line 180; gate-6 review 9)
     pooled = {b["fs"]: b.get("v3l_pooled_by_block") or {} for b in blocks}
     verdicts = {b["fs"]: {pr["k"]: pr["verdict"] for pr in (b.get("v3l") or {}).get("blocks") or []} for b in blocks}
@@ -448,7 +456,8 @@ def summarize(out, sha, dry, manifest):
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
     parity += [f"warm-up (A23): {x}" for x in conf]
-    summary["warmup_creditable"] = not conf
+    # creditable only when NO warm-up refusal stands: the conformance binding and every backstep (review 7 finding 7)
+    summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
@@ -479,7 +488,7 @@ def self_test():
     N = v3l.N
     RULE = "1000:10:180"
 
-    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop"):
+    def v3lj(verdict="VALID", lie=False, bins=(10000, 5), block="loop", mode="dry"):
         """A full V3L record: VALID arms, or VOID arms (5,000 fsyncs, as the fsync-half plant); lie=True records VALID
         over VOID arms (review L5). A brd block's record is a ram disk's, as the real one is (ram0, write through, the
         probe's 'none (RAM)', no flush counted: fourth lane review HIGH 3's second half); any other is a write-back
@@ -503,9 +512,17 @@ def self_test():
                                          "iostats": "1"},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
-        # the sync before each run, as v3l.py measure() records it since annex A24
+        # TEST EDIT, flagged (review 7 / C21 findings 4, 5): the record names its mode (these packages are dry) and the
+        # sync path resolve_leaf named, as v3l.py measure() records them; new required fields at their passing values
+        r["mode"], r["slack_registered"] = mode, "A27"
+        r["leaf"]["sync_paths"] = ["/mnt/t3-x/v3l"]
+        # the sync before each run, as v3l.py measure() records it since annex A24. TEST EDIT, flagged (repairs an
+        # unseen break of b7de8cb22, review 6 MED 2 / annex A24-AM1): the record also carries its one `sync -f` entry
+        # (DIR's filesystem; no loop layer), rc 0, a new required field at its passing value. Without it v3l.block()'s
+        # gates re-run VOIDs every VALID fixture here on the coverage rule ("synced no filesystems")
         for a in r["arms"].values():
-            a["sync"] = {"labelling": {"ran": True, "rc": 0}, "timed": {"ran": True, "rc": 0}}
+            a["sync"] = {run: {"ran": True, "rc": 0, "layers": [{"path": "/mnt/t3-x/v3l", "rc": 0, "secs": 0.0}]}
+                         for run in ("labelling", "timed")}
         return json.dumps(r)
 
     def v3sum(rc, block, plp="no", a25=300.0, void=None):
@@ -553,7 +570,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed"):
+             loop="closed", v3l_mode="dry"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -632,7 +649,7 @@ def self_test():
             w(f"{f}/blockgate-plants.json", json.dumps({"plants": res, "all_fired": ok and plants_fired}))
         bounds = [f"b{i}" for i in range(k + 1)]
         bb = boundary_bins or [(10000, 5)] * (k + 1)
-        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block))
+        w(f"{f}/v3l-b0/v3l.json", v3lj(before_v3l, lie, bb[0], block, v3l_mode))
         for i, b in enumerate(bounds[1:], 1):
             if i == 1 and after_v3l is None:
                 continue
@@ -658,6 +675,10 @@ def self_test():
         ("item 5 red test: the BEFORE batch refused (rc 2, no out dir) fails the package", {"before_rc": 2}, False, None),
         ("an AFTER batch with rc 0 but no raw.tsv fails the package", {"drop": "v3-after/raw.tsv"}, False, None),
         ("item 6: a VOID V3L after fails the package", {"after_v3l": "VOID"}, False, None),
+        # review 7 / C21 finding 4: a V3L record's mode must be its package's (an explicit dry label is kept; a record
+        # saying real inside a dry package, or the reverse, cannot stand for that package)
+        ("finding 4: a V3L record labelled real inside a dry package fails its block, naming the mode",
+         {"v3l_mode": "real"}, False, lambda s: "mode" in s["failed_blocks"][0]),
         ("item 6: a missing V3L after fails the package", {"after_v3l": None}, False, None),
         ("item 6: a VOID V3L before with no after (the run stopped) reads VOID, not MISSING",
          {"before_v3l": "VOID", "after_v3l": None}, False,
@@ -796,13 +817,15 @@ def self_test():
          lambda s: s.get("warmup_creditable") is False and any("rc 3" in x for x in s["parity_refusals"])),
         ("MED 6: a record whose fastest_profile sha256 is not the package's refuses, naming it", {"conformance": "badsha"},
          False, lambda s: any("fastest_profile" in x and "sha256" in x for x in s["parity_refusals"])),
+        # TEST EDIT, flagged (review 7 / C21 finding 7; a strengthening): each backstep negative also requires
+        # warmup_creditable false, as A23 and the field's docstring say; it read true while the backstep refused
         ("MED 6: a competitor timed run with a warm-up backstep refuses", {"cell": "comp", "backsteps": 1}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a backstep refuses in open loop too (loop is only reported)", {"cell": "comp", "backsteps": 2,
                                                                                "loop": "open"}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a competitor timed run that records no warmup_backsteps refuses", {"cell": "comp", "backsteps": None},
-         False, lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         False, lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a clean competitor run (closed loop, 0 backsteps) passes and reports its loop", {"cell": "comp"}, True,
          lambda s: s["runs"][0].get("warmup_loops") == ["closed", "closed"]),
     ]:
