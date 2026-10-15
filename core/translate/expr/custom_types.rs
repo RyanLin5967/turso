@@ -670,9 +670,7 @@ pub(super) fn emit_domain_cast_constraints(
                 .unwrap_or_else(|| format!("{}_{}", td.name, i));
 
             // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
+            program.id_register_overrides.insert("value", reg);
 
             let expr_result_reg = program.alloc_register();
             translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
@@ -723,9 +721,7 @@ pub(crate) fn emit_type_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     // Set up value override
-    program
-        .id_register_overrides
-        .insert("value".to_string(), value_reg);
+    program.id_register_overrides.insert("value", value_reg);
 
     // Set up type parameter overrides. Capture the result so we can
     // clean up overrides even if param translation fails.
@@ -737,9 +733,7 @@ pub(crate) fn emit_type_expr(
             if let Some(param_expr) = column.ty_params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
+                program.id_register_overrides.insert(&param.name, reg);
             }
         }
         Ok(())
