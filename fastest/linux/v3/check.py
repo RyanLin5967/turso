@@ -26,6 +26,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
 
+
+def current_f3_sync_record(sy):
+    """Shared acceptance predicate for banked F3 fixtures and their regenerator."""
+    if not isinstance(sy, dict):
+        return False
+    ua = sy.get("unattributed")
+    arms = sy.get("arms")
+    return (isinstance(ua, dict)
+            and sorted(ua) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
+            and all(v == 0 for v in ua.values())
+            and isinstance(arms, dict) and bool(arms)
+            and isinstance(arms.get("nosync25"), dict)
+            and arms["nosync25"].get("syncs_inside_any_fd") == 0
+            and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in arms.values()))
+
 # ---- the spec -----------------------------------------------------------------------------------------------
 # Syscalls each arm issues per op (per round, one op per arm), by definition. Copy arms: openat (create the clone in
 # the clones' directory), the copy (ioctl FICLONE or copy_file_range), close, fsync of the directory; clone2b and
@@ -1385,9 +1400,7 @@ def real_selftest(chk):
             n00 = (sy0.get("arms") or {}).get("nosync25") or {}
             chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
                 "no_fd, inside_foreign_fd, inside_no_fd present and 0; every arm's windows_over 0, review 12 item 8)" % fx,
-                n00.get("syncs_inside_any_fd") == 0 and sorted(ua0) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
-                and all(v == 0 for v in ua0.values()) and bool(sy0.get("arms"))
-                and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in (sy0.get("arms") or {}).values()),
+                current_f3_sync_record(sy0),
                 (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
