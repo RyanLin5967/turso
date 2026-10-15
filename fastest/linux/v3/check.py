@@ -1326,6 +1326,62 @@ def self_test():
     chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
         "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
         and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
+    # V3 review 13 item 8: teardown_nest's OUTCOME check (no loop still backed by the chain at the end) had never fired
+    # alone, and item 13's red was not isolating. mkfixtures.sh --teardown-nest runs here on a temp BASE with PATH
+    # shims (nestloops.sh's technique): sudo runs its command, mountpoint and findmnt say nothing is mounted, and
+    # losetup lists FAKE_LOOPS and, with FAKE_DETACH=1, `-d DEV` removes DEV's line. The one loop is
+    # /dev/loopfake9 backed by /elsewhere/v3fx-n1.img: no level's sweep matches it, only the final chain_loops sweep
+    # does, and /sys/block/loopfake9 cannot exist, so detach_loop's wait passes. Expectations by hand:
+    #   T1 FAKE_DETACH=0: every step reports success, the loop stays listed -> rc 1, "loops still backed by the chain"
+    #   T2 FAKE_DETACH=1 (control): the final sweep detaches it -> rc 0, no such line
+    #   T3 item 13's mutant (the final sweep deleted from a copy), FAKE_DETACH=1 -> rc 1, the outcome check names it
+    import tempfile as _tf8, shutil as _sh8
+    mk8 = os.path.join(HERE, "mkfixtures.sh")
+    sweep8 = '''  # n1's image held by a loop that is not n1's mount (a failed mount, a second attach): detach it too
+  strays=$(chain_loops) || { echo "teardown: cannot list the loops (losetup failed)"; rc=1; strays=""; }
+  for stray in $strays; do
+    found=1
+    detach_loop "$stray" "n1's image" && echo "teardown: detached $stray, still backed by the chain" || rc=1
+  done
+'''
+    td8 = _tf8.mkdtemp(prefix="check-teardown8-")
+    try:
+        sh8 = os.path.join(td8, "shim")
+        os.makedirs(sh8)
+        for nm8, body8 in (("sudo", 'exec "$@"\n'), ("mountpoint", "exit 1\n"), ("findmnt", "exit 1\n"),
+                           ("losetup", 'case "$1" in\n  --list) cat "$FAKE_LOOPS"; exit 0 ;;\n'
+                                       '  -d) if [ "${FAKE_DETACH:-1}" = 1 ]; then grep -v "^$2 " "$FAKE_LOOPS" > '
+                                       '"$FAKE_LOOPS.new"; mv "$FAKE_LOOPS.new" "$FAKE_LOOPS"; fi; exit 0 ;;\nesac\n'
+                                       'exit 1\n')):
+            open(os.path.join(sh8, nm8), "w").write("#!/bin/sh\n" + body8)
+            os.chmod(os.path.join(sh8, nm8), 0o755)
+        mut8 = os.path.join(td8, "mut")
+        os.makedirs(mut8)
+        src8 = rd(mk8) or ""
+        open(os.path.join(mut8, "mkfixtures.sh"), "w").write(src8.replace(sweep8, "") if src8.count(sweep8) == 1 else "")
+        _sh8.copy(os.path.join(HERE, "nestloops.sh"), os.path.join(mut8, "nestloops.sh"))
+
+        def td_run(script, detach, tag):
+            base8 = os.path.join(td8, "base-" + tag)
+            loops8 = os.path.join(td8, "loops-" + tag)
+            open(loops8, "w").write("/dev/loopfake9 /elsewhere/v3fx-n1.img\n")
+            env8 = dict(os.environ, PATH=sh8 + os.pathsep + os.environ.get("PATH", ""), FAKE_LOOPS=loops8,
+                        FAKE_DETACH=detach)
+            r8 = _sp12.run(["bash", script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
+                           timeout=120)
+            return r8.returncode, r8.stdout + r8.stderr
+        t1 = td_run(mk8, "0", "t1")
+        t2 = td_run(mk8, "1", "t2")
+        t3 = td_run(os.path.join(mut8, "mkfixtures.sh"), "1", "t3")
+    finally:
+        _sh8.rmtree(td8)
+    chk("teardown outcome (review 13 item 8) T1: steps report success, the loop stays -> rc 1, 'loops still backed by "
+        "the chain'", t1[0] == 1 and "loops still backed by the chain" in t1[1], t1)
+    chk("teardown outcome (review 13 item 8) T2 control: the final sweep detaches it -> rc 0, the check silent",
+        t2[0] == 0 and "loops still backed by the chain" not in t2[1], t2)
+    chk("teardown outcome (review 13 item 8) T3: item 13's mutant (final sweep deleted) is killed -> rc 1, named",
+        src8.count(sweep8) == 1 and t3[0] == 1 and "loops still backed by the chain: /dev/loopfake9" in t3[1],
+        (src8.count(sweep8), t3))
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
