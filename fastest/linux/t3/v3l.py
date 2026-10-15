@@ -57,7 +57,8 @@ Published, not gates (lines 180 and 553): both runs' drive flushes per fsync and
 (item 18), the fsync p50, the fsync/control write p50 ratio, the before-to-after
 drift. floor_kind names only what was checked, one text per state (T3 runner review item 19): a ram disk, "brd: no
 drive (dry runs only, never credited)"; a write-back drive, "write-back drive: flush requests completed by the
-driver (issued and acknowledged, not persistence)"; a write-through drive whose counter read 0, "no volatile cache:
+driver (issued and acknowledged, not persistence)", or, when its flush counts VOID, "write-back drive with flushes
+short (VOID)" (review 5 LOW 23); a write-through drive whose counter read 0, "no volatile cache:
 no flush request sent (counter 0 checked in both runs)", or, for a record without a labelling count, "no volatile
 cache: no flush request sent (counter 0 checked in the timed run; no labelling count)": the block layer sends such a
 drive no flush, so the fsync latency is not a drive flush (GitHub-hosted runners' disks are such drives); a
@@ -410,6 +411,11 @@ def counter_gate(what, wc, timed, lab):
       recorded state and VOIDs), each run judged on its own and reported in its own words (T3 runner review item 4)."""
     bad = []
     if wc == "write back":
+        # review 5 LOW 24: a timed count that is not an int is unreadable, VOID as a labelling one is (it raised
+        # TypeError, which block() reported as MISSING)
+        if timed is not None and (not isinstance(timed, int) or isinstance(timed, bool)):
+            bad.append(f"write-back {what}: timed count unreadable ({timed!r}): not absent, so not judged as absent")
+            return bad
         short = timed is None or timed < N
         if short:
             bad.append(f"write-back {what}: its flush counter rose {timed} across {N} fsyncs (fewer than one per fsync)")
@@ -475,8 +481,9 @@ def measure(d, out, leafrec=None):
            "virtualization": virt, "arms": {}, "plant": os.environ.get("V3L_PLANT") or None, "argv": {}}
     if not rec["fio_version"] or not rec["strace_version"]:
         raise RuntimeError("fio or strace is not installed")
-    if not disk.startswith("ram") and iostats_problem(rec["leaf"]["iostats"]):
-        raise RuntimeError(f"{disk}: {iostats_problem(rec['leaf']['iostats'])} (review 5 MED 2; refused before any run)")
+    ip = None if disk.startswith("ram") else iostats_problem(rec["leaf"]["iostats"])
+    if ip:
+        raise RuntimeError(f"{disk}: {ip} (review 5 MED 2; refused before any run)")
     os.makedirs(out)
     for arm, fs in (("fsync", True), ("control", False)):
         a = {}
@@ -565,8 +572,10 @@ def floor_kind(rec):
     wc, timed, lab = leaf.get("write_cache"), t.get("flush_ios_delta"), t.get("lab_flush_ios_delta")
     if str(leaf.get("disk", "")).startswith("ram"):
         k = "brd: no drive (dry runs only, never credited)"
-    elif wc == "write back":
+    elif wc == "write back" and not counter_gate("drive", wc, timed, lab):
         k = "write-back drive: flush requests completed by the driver (issued and acknowledged, not persistence)"
+    elif wc == "write back":
+        k = "write-back drive with flushes short (VOID)"
     elif wc == "write through" and timed == 0 and lab == 0:
         k = "no volatile cache: no flush request sent (counter 0 checked in both runs)"
     elif wc == "write through" and timed == 0 and lab is None:
@@ -726,6 +735,10 @@ def plants(rec):
         arm("unsynced", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("timed", {"ran": True, "rc": 1}),
             (f"drive {disk}:", "the sync before the timed fsync run"))
+        # and before the labelling run, on its own text (review 6 LOW 10)
+        arm("unsynced-lab", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("labelling", {"ran": True, "rc": 1}),
+            (f"drive {disk}:", "the sync before the labelling fsync run"))
         # A24-AM1: the deepest filesystem's sync -f failed (the one shape of a failed sync measure() can see)
         arm("unsynced-layer", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"][-1].__setitem__("rc", 1),
