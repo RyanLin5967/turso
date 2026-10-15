@@ -49,4 +49,4 @@ arm conformance-selftest 0 python3 -B "$W" self-test
 arm conformance 3 python3 -B "$W" run --fastest-profile "$BIN"
 cat "$OUT/contract-conformance.txt"
 [ -z "$FAILED" ] || { echo "driver contract: FAILED arms:$FAILED"; exit 1; }
-echo "driver contract: 3 records kept and their live warm-ups replayed, 6 refusals refused, conformance PARTIAL with every case matching"
+echo "driver contract: 3 records kept, their live warm-ups replayed and tied to the records, 6 refusals refused, conformance PARTIAL with every case matching"
