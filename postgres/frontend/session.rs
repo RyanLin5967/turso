@@ -2363,11 +2363,26 @@ fn relation_columns(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's PRAGMA table_info reads (`get_table_columns`): the catalog queries a prepare
+    /// may make, for a test to assert none was made.
+    static TABLE_INFO_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's PRAGMA table_info reads so far.
+#[cfg(test)]
+fn table_info_reads() -> u64 {
+    TABLE_INFO_READS.with(|n| n.get())
+}
+
 fn get_table_columns(
     conn: &Arc<Connection>,
     table_name: &str,
     schema_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    #[cfg(test)]
+    TABLE_INFO_READS.with(|n| n.set(n.get() + 1));
     // The names quoted here, once, for every caller: COPY passed its table's name as written, so
     // a quote in it broke the PRAGMA's text.
     let table_name = table_name.replace('\'', "''");
@@ -2419,6 +2434,40 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(conn: &crate::Connection, sql: &str) {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        stmt.run_ignore_rows().unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// A positional INSERT shorter than its table is filled from the in-memory schema, at prepare,
+    /// with no catalog query (lead ruling, DECISIONS newest: "It must add NO catalog query"), also
+    /// with a search path set, which sent the lookup through PRAGMA table_info once per path entry.
+    /// The instrument, `table_info_reads` (this thread's PRAGMA table_info reads), is shown to fire
+    /// by a DELETE ... USING under the same path.
+    #[test]
+    fn a_short_positional_insert_reads_no_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        run(&conn, "CREATE TABLE s3 (a int, b int, c text default 'd')");
+        run(&conn, "SET search_path TO public");
+        let before = table_info_reads();
+        run(&conn, "INSERT INTO s3 VALUES (1, 2)");
+        run(&conn, "INSERT INTO s3 VALUES (DEFAULT, 3)");
+        assert_eq!(table_info_reads() - before, 0, "a positional INSERT read the catalog");
+        let before = table_info_reads();
+        run(&conn, "DELETE FROM s3 USING s3 AS x WHERE s3.a = x.a AND s3.a = 9");
+        assert!(table_info_reads() > before, "the instrument never fires");
+    }
 
     fn slow(sql: &str) -> Option<PgBranchCall> {
         try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
