@@ -1136,8 +1136,9 @@ struct Parsed {
 impl Parsed {
     fn new(sql: String) -> Self {
         let call = branch_call(&sql);
-        // A branch call's parameters are its arguments' (branch_call_types).
-        let scan = if call.is_some() {
+        // A branch call's parameters are its arguments' (branch_call_types). Without a '$'
+        // byte there can be no parameter token; otherwise use the parser's lexer once at Parse.
+        let scan = if call.is_some() || !sql.as_bytes().contains(&b'$') {
             ParamScan::default()
         } else {
             scan_params(&sql)
