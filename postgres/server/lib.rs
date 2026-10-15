@@ -2680,6 +2680,9 @@ fn sqlstate(e: &LimboError) -> &'static str {
         }
         LimboError::ParseError(_) => "42601",
         LimboError::IntegerOverflow => "22003",
+        // encode()'s unknown format (functions.rs exec_encode), PostgreSQL's
+        // invalid_parameter_value.
+        LimboError::InvalidArgument(m) if m.starts_with("unrecognized encoding") => "22023",
         LimboError::ReadOnly => "25006",
         LimboError::DatabaseFull(_) => "53100",
         LimboError::Interrupt => "57014",
