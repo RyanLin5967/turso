@@ -619,7 +619,12 @@ run_cell() {
       ours)
         # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3); the run
         # goes under the shared sweeper, as every competitor timed run does (MED 12 ruling; t3lib.sh ours_timed_exec)
-        ours_timed_exec "$d" timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
+        # the outer bound covers the wrapper, the start-sweep wait and the end sweep (as the competitors' run_system.sh
+        # runs under its own); timeout signals its own process group, which holds the wrapper and the sweeper. The
+        # inner timeout makes a group of its own, so it escalates to KILL (-k 30) rather than wait on a fastest_profile
+        # that ignores TERM
+        timeout 7300 bash -c 'source "$1" && shift && ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
+          "$d" timeout -k 30 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
           --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
           > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|dolt|doltgres|b1)
@@ -635,9 +640,11 @@ run_cell() {
       *) echo "unknown system $system" > "$d/adapter.txt"; false ;;
     esac
     rc=$?
-    unset FASTEST_CELL
-    # its timed.json: sweeper_cpu_s by the one reader (summarize re-derives it; a refused record fails the package there)
+    # its timed.json: sweeper_cpu_s by the one reader (summarize re-derives it; a refused record fails the package
+    # there), while FASTEST_CELL is still exported, so foreign_cpu.py classes the reader as the run's own (sut), as the
+    # competitors' timedrun.py check inside run_system.sh is
     [ "$system" = ours ] && { ours_timed_record "$d" "$L/gates/sweeper_record.py" >> "$d/adapter.txt" 2>&1 || true; }
+    unset FASTEST_CELL
     touch "$d/.stop"
     wait "$sampler"
     python3 -B "$L/t3/foreign_cpu.py" decide "$d/foreign.tsv" --json "$d/void.json" > /dev/null

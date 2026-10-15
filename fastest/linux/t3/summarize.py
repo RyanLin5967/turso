@@ -45,6 +45,7 @@ rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -212,7 +213,7 @@ def block_record(out, fs, plp="no", dry=None):
     return rec
 
 
-def run_parity(d, system):
+def run_parity(d, system, adapter_rc=None):
     """What a measured run itself recorded of its warm-up rule and measured op total (ours: result/summary.json; a
     competitor: every timed run under result/cells/*/timed/summary.json, the only latency files)."""
     if system == "ours":
@@ -220,7 +221,7 @@ def run_parity(d, system):
             j = json.load(open(os.path.join(d, "result", "summary.json")))
         except (OSError, ValueError):
             j = {}
-        cpu, win, sw = ours_sweeper(d)
+        cpu, win, sw = ours_sweeper(d, adapter_rc)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
                 "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
                 "sweeper_problems": sw}
@@ -248,7 +249,7 @@ def run_parity(d, system):
         if tj is not None:
             x = tj.get("sweeper_cpu_s")
             sweepers.append(x)
-            if type(x) not in (int, float) or x < 0:
+            if type(x) not in (int, float) or not math.isfinite(x) or x < 0:
                 sw.append(f"timed run {cell}: timed.json sweeper_cpu_s {x!r}, not a CPU time (the shared sweeper's "
                           "record)")
         if j.get("capped") and isinstance(j.get("measured_ops"), int):
@@ -270,10 +271,18 @@ def run_parity(d, system):
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
 
 
-def ours_sweeper(d):
+COMPETITORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "competitors")
+
+
+def ours_sweeper(d, adapter_rc=None):
     """The lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z, SAME INSTRUMENT FOR EVERY SYSTEM): ours' timed.json
     (t3lib.sh ours_timed_record), its sweeper_cpu_s RE-DERIVED from the run's own timed.tracer.tsv over the run's own
-    window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer).
+    window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer). The
+    record is held to the competitors' untraced-run rules by their own implementation, timedrun.py tracer_problems
+    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window; its
+    two checks of the load generator's own TracerPid at tm0 and tm1 are not asked of ours (fastest_profile records
+    none: Rust, HELD), so they are dropped by their field names (a reworded refusal there fails closed, as a refusal).
+    timed.json's t0, t1 and rc must be t3lib.sh's own timed.window record, and its rc the cell's adapter rc.
     Returns (sweeper_cpu_s or None, sweeper_window or None, the refusals)."""
     try:
         tj = json.load(open(os.path.join(d, "timed.json")))
@@ -283,16 +292,29 @@ def ours_sweeper(d):
         return None, None, ["timed.json is not a record: the shared sweeper's record is unreadable"]
     win = tj.get("sweeper_window")
     try:
-        sys.path.insert(0, GATES)
-        import sweeper_record  # noqa: E402
-    except ImportError:
-        return None, win, ["gates/sweeper_record.py cannot be imported: the sweeper's record cannot be re-derived"]
-    finally:
-        sys.path.remove(GATES)
+        kv = dict(x.split("=", 1) for x in open(os.path.join(d, "timed.window")).read().split() if "=" in x)
+        tw = (float(kv["t0"]), float(kv["t1"]), int(kv["rc"]))
+    except (OSError, KeyError, ValueError):
+        tw = None
+    if adapter_rc is not None and tj.get("rc") != adapter_rc:
+        return None, win, [f"timed.json's rc {tj.get('rc')!r} is not the cell's adapter rc {adapter_rc}"]
+    if tw is None or (tj.get("t0"), tj.get("t1"), tj.get("rc")) != tw:
+        return None, win, [f"timed.json's window and rc {(tj.get('t0'), tj.get('t1'), tj.get('rc'))!r} are not "
+                           f"timed.window's {tw!r}"]
     try:
-        lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
-    except OSError:
-        return None, win, ["no timed.tracer.tsv: the shared sweeper's record of this timed run is missing"]
+        sys.path[:0] = [GATES, COMPETITORS]
+        import sweeper_record  # noqa: E402
+        import timedrun  # noqa: E402
+    except ImportError as e:
+        return None, win, [f"{e.name} cannot be imported: the sweeper's record cannot be re-derived or judged"]
+    finally:
+        del sys.path[:2]
+    tp = [x for x in timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
+                                              {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1")})
+          if not x.startswith(("the load generator's own tracerpid_tm0 ", "the load generator's own tracerpid_tm1 "))]
+    if tp:  # tracer_problems also carries the shared reader's own refusals
+        return None, win, [f"ours' timed run under the shared sweeper: {x}" for x in tp]
+    lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
     r, why = sweeper_record.sweeper_record(lines, tj.get("t0"), tj.get("t1"))
     if r is None:
         return None, win, ["the sweeper record is refused: " + "; ".join(why)]
@@ -438,7 +460,7 @@ def summarize(out, sha, dry, manifest):
         r = {"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why,
              "measured": measured, "settle": settle, "plan": prow.get((fs, cell))}
         if measured:
-            r.update(run_parity(d, system))
+            r.update(run_parity(d, system, last["adapter_rc"]))
             want = (prow.get((fs, cell)) or {}).get("ops")
             # timedrun.py's own verdict first: it names why a competitor's timed run cannot stand
             for tcell, v in r.get("timed_verdicts") or []:
@@ -623,16 +645,22 @@ def self_test():
         ours_timed_record): timed.tracer.tsv in gates/sweeper.sh's format and timed.json. By hand: sweeps every 0.05 s
         from 100.00 with cpu = index at clk_tck 100; the window [100.1, 100.3] is bracketed by the sweeps at 100.10
         (cpu 2) and 100.30 (cpu 6): 4 ticks / 100 = 0.04 s. kind: ok, None (no timed.json), nice0 (the reader refuses
-        the record), stored (timed.json says 0.5, not the 0.04 its record gives), notracer (no timed.tracer.tsv)"""
+        the record), stored (timed.json says 0.5, not the 0.04 its record gives), notracer (no timed.tracer.tsv),
+        traced (a sweep found a task with TracerPid 4321), gap (0.45 s with no sweep, the window still bracketed),
+        window (timed.window says t0 100.15, timed.json 100.1), rc (timed.json rc 1, the cell's adapter rc 0)"""
         if kind is None:
             return
         nice = 0 if kind == "nice0" else 19
         if kind != "notracer":
+            sweeps = "".join(f"SWEEP {'start' if i == 0 else 'mid'} {100.0 + 0.05 * i + (0.4 if kind == 'gap' and i > 6 else 0):.6f}"
+                             f" cmd=3:{4321 if kind == 'traced' and i == 4 else 0} srv=0:0 cpu={i}\n" for i in range(10))
             w(f"{a1}/timed.tracer.tsv", f"roles cmd=500 srv=none tree=children\nsweeper pid=600 nice={nice} clk_tck=100\n"
-              + "".join(f"SWEEP {'start' if i == 0 else 'mid'} {100.0 + 0.05 * i:.6f} cmd=3:0 srv=0:0 cpu={i}\n"
-                        for i in range(10)))
+              + ("TRACED mid cmd 501 501 4321\n" if kind == "traced" else "") + sweeps)
+        # TEST EDIT, flagged (the MED 12 fix list): t3lib.sh's own window record, which timed.json must agree with
+        w(f"{a1}/timed.window", f"t0={100.15 if kind == 'window' else 100.1} t1=100.3 rc=0\n")
         w(f"{a1}/timed.json", json.dumps({"system": "ours", "sweeper_window": "process", "t0": 100.1, "t1": 100.3,
-                                          "rc": 0, "sweeper_cpu_s": 0.5 if kind == "stored" else 0.04,
+                                          "rc": 1 if kind == "rc" else 0,
+                                          "sweeper_cpu_s": 0.5 if kind == "stored" else 0.04,
                                           "sweeper_cpu_span_s": [100.1, 100.3], "sweeper_nice": nice,
                                           "sweeper_clk_tck": 100, "sweeper_refused": None}))
 
@@ -941,6 +969,26 @@ def self_test():
                                                                                      "comp_sweeper": "absent"},
          False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
         ("MED 12: a competitor timed.json with sweeper_cpu_s null fails", {"cell": "comp", "comp_sweeper": None},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        # the MED 12 fix list (fresh read of 44083dd2f..fac30eeec): ours' tracer record is held to the competitors'
+        # untraced-run rules by their own implementation (timedrun.py tracer_problems), timed.json agrees with the
+        # run's own window record and rc, and a competitor's sweeper_cpu_s must be finite
+        ("MED 12 fix 1: ours whose tracer record shows a traced task fails, naming it", {"ours_sweeper": "traced"},
+         False, lambda s: any("traced during the timed run" in x for x in s["parity_refusals"])
+         and any("saw a TracerPid" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 1: ours whose sweeps leave a 0.45 s gap fails, naming the gap", {"ours_sweeper": "gap"}, False,
+         lambda s: any("stretch with no sweep" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 1: the clean ours record raises no tracer refusal (its TracerPid at tm0/tm1 is not asked of ours)",
+         {}, True, lambda s: not any("tracer" in x.lower() for x in s["parity_refusals"])),
+        ("MED 12 fix 3: ours whose timed.json window is not its timed.window fails", {"ours_sweeper": "window"}, False,
+         lambda s: any("timed.window" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 3: ours whose timed.json rc (1) is not the cell's adapter rc (0) fails", {"ours_sweeper": "rc"},
+         False, lambda s: any("adapter rc" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 4: a competitor timed.json with sweeper_cpu_s NaN fails", {"cell": "comp",
+                                                                               "comp_sweeper": float("nan")},
+         False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        ("MED 12 fix 4: a competitor timed.json with sweeper_cpu_s Infinity fails", {"cell": "comp",
+                                                                                    "comp_sweeper": float("inf")},
          False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
         ("MED 12: a clean competitor run carries each timed run's sweeper_cpu_s over its measured window",
          {"cell": "comp"}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04, 0.04]
