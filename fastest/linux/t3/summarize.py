@@ -227,8 +227,9 @@ def run_parity(d, system, adapter_rc=None):
             j = json.load(open(os.path.join(d, "result", "summary.json")))
         except (OSError, ValueError):
             j = {}
-        cpu, win, sw = ours_sweeper(d, adapter_rc)
         exc, exc_bad = exception_deltas(j)
+        j = j if isinstance(j, dict) else {}  # a non-object summary.json is refused above, never read as one
+        cpu, win, sw = ours_sweeper(d, adapter_rc)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
                 "exception_counter_deltas": exc, "exception_counter_problems": exc_bad,
                 "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
@@ -283,23 +284,48 @@ GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
 # DECISIONS 2026-10-15T05:16:51Z): each counts a path that stalls or widens a create, so a credited cell needs all four
 # unchanged inside its windows
 EXCEPTION_COUNTERS = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
+PHASES = ("create", "connect", "write", "delete")  # fastest_profile's --mode phases windows, in order (main.rs PHASES)
 
 
 def exception_deltas(j):
     """({window: {counter: after - before}} or None, the refusals) from ours' result/summary.json: every window carries
     exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
-    deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED)."""
-    wins = j.get("windows") if isinstance(j, dict) else None
+    deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED). The windows
+    listed must be exactly, in order, the ones the run measured (its own mode and phases_run: PHASES[:phases_run], or
+    cycle), each named, and no counter may fall between one window's close and the next one's open."""
+    if not isinstance(j, dict):
+        return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"]
+    wins = j.get("windows")
     if not isinstance(wins, list) or not wins:
         return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
                       "(fastest_profile must record them per window: Rust, HELD)"]
-    out, bad = {}, []
+    pr = j.get("phases_run")
+    if j.get("mode") == "cycle":
+        want = ["cycle"]
+    elif j.get("mode") == "phases" and type(pr) is int and 1 <= pr <= len(PHASES):
+        want = list(PHASES[:pr])
+    else:
+        return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} name no measured windows, so the "
+                      "exception counters' coverage cannot be judged"]
+    out, bad, prev = {}, [], None
+    names = [w.get("window") if isinstance(w, dict) else None for w in wins]
+    if names != want:
+        bad += [f"window {x}: measured (mode {j.get('mode')}) but not listed" for x in want if x not in names]
+        bad += [f"window {x}: listed but not measured (mode {j.get('mode')}, phases_run {pr})" for x in names
+                if isinstance(x, str) and x not in want]
+        if not bad:
+            bad.append(f"windows {names!r} are not the measured {want!r}, in order")
     for i, w in enumerate(wins):
-        name = w.get("window") if isinstance(w, dict) and isinstance(w.get("window"), str) else f"#{i}"
-        ec = w.get("exception_counters") if isinstance(w, dict) else None
+        if not isinstance(w, dict) or not isinstance(w.get("window"), str) or not w["window"]:
+            bad.append(f"window #{i} has no name")
+            prev = None
+            continue
+        name = w["window"]
+        ec = w.get("exception_counters")
         if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
             bad.append(f"window {name}: no exception_counters {{before, after}} (the engine's branch exception "
                        "counters; fastest_profile must record them: Rust, HELD)")
+            prev = None
             continue
         d = {}
         for k in EXCEPTION_COUNTERS:
@@ -310,6 +336,10 @@ def exception_deltas(j):
                 bad.append(f"window {name}: exception counter {k} went backwards ({a} -> {b})")
             else:
                 d[k] = b - a
+                if prev is not None and type(prev[1].get(k)) is int and a < prev[1][k]:
+                    bad.append(f"exception counter {k} fell between windows {prev[0]} (closed at {prev[1][k]}) and "
+                               f"{name} (opened at {a})")
+        prev = (name, ec["after"])
         if name in out:
             bad.append(f"window {name}: named twice")
         out[name] = d
@@ -414,7 +444,7 @@ def fixture_check(d, system, plan, dry):
     if system == "ours":
         try:
             fx = json.load(open(os.path.join(d, "result", "summary.json"))).get("fixture")
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):  # AttributeError: a summary.json that is not an object
             fx = None
         if not isinstance(fx, dict):
             return ["ours records no fixture record (fastest_profile does not yet build the plan's parent: gen_seed "
@@ -588,6 +618,10 @@ def summarize(out, sha, dry, manifest):
                "failed_checks": failed_checks, "failed_blocks": failed_blocks, "warmup_rule": rule,
                "parity_refusals": parity, "fixture_refusals": fixture, "normaliser_missing": normaliser,
                "unquiet_runs": unquiet, "uncredited_cells": uncredited,
+               # every measured ours run's exception counters read and unchanged in every window (None: no ours run)
+               "counters_creditable": (None if not any(r["measured"] and r["system"] == "ours" for r in runs) else
+                                       not uncredited and all(r.get("counters_credited") is True for r in runs
+                                                              if r["measured"] and r["system"] == "ours")),
                "failed_stages": failed, "blocks": blocks, "runs": runs}
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
@@ -704,7 +738,8 @@ def self_test():
         TEST EDIT, flagged (fresh read of 4529742d8, finding 1): the windows are now what --mode phases with 4 phases
         measures (create, connect, write, delete; fastest_profile main.rs PHASES), so the coverage rule can hold them
         to it; the ok case's expected deltas follow (unruled, unrun red f2abbc8cb).
-        kind: ok (four windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 3 -> 5), missing (the
+        kind: ok (four windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 7 -> 9, the delete
+        window's 9 -> 9), missing (the
         write window has no exception_counters), noname (its after lacks compaction_waits), backwards (hardcap_upgrades
         4 -> 2), notint (inline_compaction_syncs after is "9"), boolean (header_raise_exclusive before is true),
         nowindows (no windows at all), dropwin (no delete window), extrawin (a cycle window too), unnamed (the connect
@@ -717,6 +752,8 @@ def self_test():
             if name == "delete" and kind == "dropwin":
                 continue
             before, after = {k: 7 for k in EXC}, {k: 7 for k in EXC}
+            if name == "delete" and kind == "nonzero":  # the counter never falls: delete opens where write closed
+                before["compaction_waits"] = after["compaction_waits"] = 9
             if name == "create" and kind == "crossback":
                 before["hardcap_upgrades"] = after["hardcap_upgrades"] = 8
             win = {"window": name, "secs": 1.0}
@@ -724,7 +761,7 @@ def self_test():
                 del win["window"]
             if name == "write":
                 if kind == "nonzero":
-                    before["compaction_waits"], after["compaction_waits"] = 3, 5
+                    before["compaction_waits"], after["compaction_waits"] = 7, 9
                 elif kind == "noname":
                     del after["compaction_waits"]
                 elif kind == "backwards":
@@ -1100,7 +1137,7 @@ def self_test():
                                                                                        "delete")}
          and s["runs"][0].get("counters_credited") is True and s.get("uncredited_cells") == []
          and s.get("counters_creditable") is True),
-        ("exception counters: compaction_waits 3 -> 5 in the write window labels the cell uncredited, naming it; the "
+        ("exception counters: compaction_waits 7 -> 9 in the write window labels the cell uncredited, naming it; the "
          "package still passes", {"ours_counters": "nonzero"}, True,
          lambda s: s["runs"][0].get("counters_credited") is False
          and s["runs"][0]["exception_counter_deltas"]["write"]["compaction_waits"] == 2
