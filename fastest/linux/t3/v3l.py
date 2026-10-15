@@ -25,10 +25,12 @@ write", and every block VOIDs. end_fsync supplies the last one. The registered c
   timed      untraced: the latencies, and the drive's flush counter (/sys/block/<disk>/stat field 16, flush requests
              completed) read just before and just after.
 Every run also reads the drive's sectors-written counter (stat field 7) just before and just after (gated on the
-fsync arm's two runs), and every run is preceded by a sync of every filesystem (sync(1)), outside its window, so dirty
-data written earlier (the labelling run's, through a buffered loop) is not written back inside a later window and does
-not pad its count (annex A24, the lead's ruling). The record keeps each sync's rc and seconds; a failed sync refuses
-the measurement.
+fsync arm's two runs), and every run is preceded, outside its window, by a sync of every filesystem (sync(1)) and then
+`sync -f` (syncfs) on each filesystem under DIR, top-down: DIR's, then each loop layer's backing file's. So dirty data
+written earlier (the labelling run's, through a buffered loop) is not written back inside a later window and does not
+pad its count (annex A24, the lead's ruling). sync(1) calls the void sync(2), so its rc is 0 by construction; the rc
+that carries a writeback error is each sync -f's (review 6 MED 2, annex A24-AM1 as proposed). The record keeps each
+one's path, rc and seconds, and /proc/meminfo's Dirty and Writeback after them; a failed one refuses the measurement.
 Gates (any failure makes the measurement VOID, and the block with it):
   - V1L: exactly 10,000 writes to the data file on each arm; 10,000 fsync of the data file on the fsync arm and no
     fsync on the control; no fdatasync, sync_file_range, syncfs or msync on either; no failed write or fsync; no
@@ -100,9 +102,10 @@ def mount_source(path):
 
 
 def resolve_leaf(d):
-    """DIR's mount followed down to a whole disk: (chain of device names, disk). Loops are followed through their
-    backing file; device-mapper and md are refused."""
-    chain, path = [], d
+    """DIR's mount followed down to a whole disk: (chain of device names, disk, paths), paths being one path on each
+    filesystem under DIR, top-down (DIR, then each loop's backing file), which the pre-run sync syncs one by one
+    (annex A24-AM1). Loops are followed through their backing file; device-mapper and md are refused."""
+    chain, path, paths = [], d, [d]
     for _ in range(6):
         name = os.path.basename(os.path.realpath(mount_source(path)))
         chain.append(name)
@@ -111,6 +114,7 @@ def resolve_leaf(d):
                 path = open(f"/sys/block/{name}/loop/backing_file").read().strip()
             except OSError as e:
                 raise RuntimeError(f"loop {name} has no readable backing file: {e}")
+            paths.append(path)
             continue
         if name.startswith("dm-") or name.startswith("md"):
             raise RuntimeError(f"{name}: device-mapper and md are not resolved to a drive (refused)")
@@ -120,7 +124,7 @@ def resolve_leaf(d):
         if os.path.isdir(mp) and os.listdir(mp):
             raise RuntimeError(f"{disk} is a native-multipath NVMe head ({sorted(os.listdir(mp))}): its flush counter "
                                "may live on the path devices (refused, not resolved)")
-        return chain, disk
+        return chain, disk, paths
     raise RuntimeError(f"more than 5 layers under {d}")
 
 
@@ -279,6 +283,7 @@ def gates(rec):
         else:
             bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
         bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
+        bad += sync_cover_gate(rec["leaf"], rec["arms"]["fsync"].get("sync"))
     return bad
 
 
@@ -293,8 +298,9 @@ def iostats_problem(v):
 
 
 def sync_gate(disk, sy):
-    """Annex A24: each fsync run on a drive was preceded by a sync that ran and exited 0, as its record says; without
-    one, earlier dirty data may have been written back inside the window and padded the write count."""
+    """Annex A24: each fsync run on a drive was preceded by a sync that ran and exited 0, as its record says, and
+    (A24-AM1) each filesystem's sync -f in it exited 0; without that, earlier dirty data may have been written back
+    inside the window and padded the write count."""
     bad = []
     for run in ("timed", "labelling"):
         r = sy.get(run) if isinstance(sy, dict) else None
@@ -303,20 +309,66 @@ def sync_gate(disk, sy):
         elif r.get("ran") is not True or type(r.get("rc")) is not int or r["rc"] != 0:
             bad.append(f"drive {disk}: the sync before the {run} fsync run did not run clean ({r!r}): earlier dirty "
                        "data may pad its counts (annex A24)")
+        else:
+            for x in r.get("layers") or []:
+                if not isinstance(x, dict) or type(x.get("rc")) is not int or x["rc"] != 0:
+                    bad.append(f"drive {disk}: the sync before the {run} fsync run failed on "
+                               f"{x.get('path') if isinstance(x, dict) else x!r} ({x!r}): that filesystem's dirty "
+                               "data may pad its counts (annex A24-AM1)")
     return bad
 
 
-def sync_record(runner=subprocess.run):
-    """The sync before a V3L run, outside its window (annex A24): sync(1), whose exit status is the rc the record
-    keeps, with the seconds it took. A sync that fails, times out or cannot start refuses the measurement."""
-    t = time.monotonic()
+def sync_cover_gate(leaf, sy):
+    """Annex A24-AM1: the sync before each fsync run reached every filesystem under DIR, one sync -f each: DIR's and
+    each loop layer's backing file's (1 + the loop layers), so a buffered loop's dirty pages in its backing file's
+    cache are not written back inside a later window. A missing record is sync_gate's to report."""
+    want, bad = 1 + len(leaf.get("layers") or []), []
+    for run in ("timed", "labelling"):
+        r = sy.get(run) if isinstance(sy, dict) else None
+        lay = r.get("layers") if isinstance(r, dict) else None
+        if isinstance(r, dict) and (not isinstance(lay, list) or len(lay) != want):
+            bad.append(f"drive {leaf.get('disk')}: the sync before the {run} fsync run synced "
+                       f"{len(lay) if isinstance(lay, list) else 'no'} filesystems, not the {want} under DIR "
+                       "(annex A24-AM1)")
+    return bad
+
+
+def meminfo_dirty():
+    """/proc/meminfo's Dirty and Writeback in kB, or None where it cannot be read (published, not a gate)"""
     try:
-        r = runner(["sync"], capture_output=True, text=True, timeout=600)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"the sync before a V3L run failed: {type(e).__name__}: {e}")
-    if r.returncode != 0:
-        raise RuntimeError(f"the sync before a V3L run failed: rc {r.returncode}: {(r.stderr or '').strip()[:200]}")
-    return {"ran": True, "rc": r.returncode, "secs": round(time.monotonic() - t, 3), "how": "sync(1)"}
+        m = dict(ln.split(":", 1) for ln in open("/proc/meminfo") if ":" in ln)
+        return {k: int(m[k].split()[0]) for k in ("Dirty", "Writeback")}
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+def sync_record(runner=subprocess.run, paths=()):
+    """The sync before a V3L run, outside its window (annex A24, A24-AM1): sync(1), whose rc is 0 by construction
+    (it calls the void sync(2)), then `sync -f P` (syncfs, whose rc does carry a writeback error) for each P in
+    PATHS, one per filesystem under DIR, top-down (resolve_leaf's paths). Each is recorded with its seconds, and
+    /proc/meminfo's Dirty and Writeback after them. Any that fails, times out or cannot start refuses the
+    measurement, naming it."""
+    def one(argv):
+        t = time.monotonic()
+        try:
+            r = runner(argv, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"the sync before a V3L run failed: {' '.join(argv)}: {type(e).__name__}: {e}")
+        if r.returncode != 0:
+            raise RuntimeError(f"the sync before a V3L run failed: {' '.join(argv)}: rc {r.returncode}: "
+                               f"{(r.stderr or '').strip()[:200]}")
+        return r.returncode, round(time.monotonic() - t, 3)
+
+    t0 = time.monotonic()
+    grc, gsecs = one(["sync"])
+    layers = []
+    for p in paths:
+        rc, secs = one(["sync", "-f", p])
+        layers.append({"path": p, "rc": rc, "secs": secs})
+    return {"ran": True, "rc": max([grc] + [x["rc"] for x in layers]), "secs": round(time.monotonic() - t0, 3),
+            "how": "sync(1), then sync -f per filesystem under DIR, top-down (annex A24-AM1)",
+            "global": {"rc": grc, "secs": gsecs, "note": "sync(2) is void: this rc is 0 by construction"},
+            "layers": layers, "meminfo_after": meminfo_dirty()}
 
 
 def write_gate(disk, t):
@@ -396,7 +448,7 @@ def measure(d, out, leafrec=None):
     if os.path.exists(out):
         raise RuntimeError(f"{out} exists")
     os.makedirs(d, exist_ok=True)
-    chain, disk = resolve_leaf(d)
+    chain, disk, sync_paths = resolve_leaf(d)
     why = real_mode_problem(os.environ.get("V3L_REAL"), chain, disk, leafrec)
     if why:
         raise RuntimeError(why)
@@ -433,7 +485,8 @@ def measure(d, out, leafrec=None):
         tr, lj = os.path.join(out, f"{arm}.v1l"), os.path.join(out, f"{arm}-labelling.json")
         cmd = V1L + ["-o", tr] + fio_cmd(f"v3l-{arm}", f, fs, lj)
         rec["argv"][f"{arm}/labelling"] = cmd
-        sy_lab = sync_record()  # outside the window: earlier dirty data cannot pad this run's counts (annex A24)
+        # outside the window: earlier dirty data cannot pad this run's counts (annex A24, A24-AM1)
+        sy_lab = sync_record(paths=sync_paths)
         k0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         g0, gs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
@@ -448,7 +501,7 @@ def measure(d, out, leafrec=None):
         tj = os.path.join(out, f"{arm}-timed.json")
         cmd = fio_cmd(f"v3l-{arm}", f, fs, tj)
         rec["argv"][f"{arm}/timed"] = cmd
-        sy_timed = sync_record()
+        sy_timed = sync_record(paths=sync_paths)
         l0 = {lay["name"]: flush_ios(lay["name"]) for lay in rec["leaf"]["layers"]}
         f0, fs0 = flush_ios(disk), sectors_written(disk)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
@@ -650,6 +703,10 @@ def plants(rec):
     def plant_layer(r):
         r["leaf"].setdefault("layers", []).append({"name": "loop-plant", "write_cache": "write back",
                                                    "flush_ios_delta": 2 * N, "lab_flush_ios_delta": 2 * N})
+        # and its backing filesystem synced, as a real loop's would be (annex A24-AM1's coverage rule)
+        for y in (r["arms"]["fsync"].get("sync") or {}).values():
+            if isinstance(y, dict) and isinstance(y.get("layers"), list):
+                y["layers"].append({"path": "/plant/loop-plant.img", "rc": 0, "secs": 0.0})
 
     arm("wb-layer-half", "write back",
         lambda r: r["leaf"]["layers"][-1].__setitem__("flush_ios_delta", 3 * N // 2),
@@ -668,6 +725,10 @@ def plants(rec):
         arm("unsynced", rec["leaf"]["write_cache"],
             lambda r: r["arms"]["fsync"].setdefault("sync", {}).__setitem__("timed", {"ran": True, "rc": 1}),
             (f"drive {disk}:", "the sync before the timed fsync run"))
+        # A24-AM1: the deepest filesystem's sync -f failed (the one shape of a failed sync measure() can see)
+        arm("unsynced-layer", rec["leaf"]["write_cache"],
+            lambda r: r["arms"]["fsync"]["sync"]["timed"]["layers"][-1].__setitem__("rc", 1),
+            (f"drive {disk}:", "the sync before the timed fsync run", "failed on"))
     arm("timed-half-syncs", rec["leaf"]["write_cache"],
         lambda r: r["arms"]["fsync"]["timed"].__setitem__("syncs", r["arms"]["fsync"]["timed"]["syncs"] // 2),
         "they must agree")
