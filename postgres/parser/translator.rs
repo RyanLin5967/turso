@@ -2381,6 +2381,65 @@ impl PostgreSQLTranslator {
                 .map_or(range_var.relname.as_str(), |a| a.aliasname.as_str()),
         );
 
+        // An alias's column list (`t AS a (x, y)`) renames the relation's first columns: read as a
+        // subselect naming each column anew, under the alias. It was dropped, and the columns kept
+        // their own names (PG 18.6 recorded, pg18-join1.out).
+        if let Some(a) = range_var.alias.as_ref().filter(|a| !a.colnames.is_empty()) {
+            let declared = self
+                .columns
+                .as_ref()
+                .and_then(|lookup| lookup(&range_var.schemaname, &range_var.relname))
+                .ok_or_else(|| {
+                    ParseError::ParseError(
+                        "a FROM alias column list is supported only on a table of the main schema"
+                            .into(),
+                    )
+                })?;
+            if a.colnames.len() > declared.len() {
+                return Err(ParseError::ParseError(format!(
+                    "table \"{}\" has {} columns available but {} columns specified",
+                    a.aliasname,
+                    declared.len(),
+                    a.colnames.len()
+                )));
+            }
+            let renamed = {
+                let mut renamed = declared.clone();
+                rename_columns(&mut renamed, &a.colnames);
+                renamed
+            };
+            let columns = declared
+                .iter()
+                .zip(&renamed)
+                .map(|(from, to)| {
+                    ast::ResultColumn::Expr(
+                        Box::new(ast::Expr::Id(ast::Name::from_string(from))),
+                        Some(ast::As::As(ast::Name::from_string(to))),
+                    )
+                })
+                .collect();
+            let select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns,
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(qualified_name, None, None)),
+                            joins: vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            return Ok(ast::SelectTable::Select(select, alias));
+        }
+
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
 

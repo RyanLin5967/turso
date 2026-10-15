@@ -855,7 +855,8 @@ fn prepare_statement_checked(
         let pg_conn = pg_conn.clone();
         PostgreSQLTranslator::new()
             .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
-    } else if is_positional_insert_default(sql, &parse_result) {
+    } else if is_positional_insert_default(sql, &parse_result) || has_alias_column_list(&parse_result)
+    {
         let pg_conn = pg_conn.clone();
         PostgreSQLTranslator::new()
             .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
@@ -2308,6 +2309,15 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
         .nodes()
         .iter()
         .any(|(n, ..)| matches!(n, NodeRef::DeleteStmt(d) if !d.using_clause.is_empty()))
+}
+
+/// Whether a FROM item's alias carries a column list (`t AS a (x, y)`), which the translator reads
+/// the table's columns for.
+fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::NodeRef;
+    parse.protobuf.nodes().iter().any(|(n, ..)| {
+        matches!(n, NodeRef::RangeVar(rv) if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()))
+    })
 }
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.

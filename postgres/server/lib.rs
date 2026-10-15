@@ -2889,6 +2889,12 @@ fn sqlstate(e: &LimboError) -> &'static str {
         // overflowed the stack (statement_too_complex, PostgreSQL's stack depth limit); and a
         // make_date / make_timestamp past the date range, which aborted the process.
         LimboError::ParseError(m) if m.starts_with("stack depth limit exceeded") => "54001",
+        // The translator's alias column list longer than its table (PostgreSQL's 42P10).
+        LimboError::ParseError(m)
+            if m.starts_with("table \"") && m.contains(" columns available but ") =>
+        {
+            "42P10"
+        }
         LimboError::ExtensionError(m) if m.starts_with("date field value out of range") => "22008",
         LimboError::ParseError(m)
             if m.starts_with("no such table")
