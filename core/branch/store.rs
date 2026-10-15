@@ -3177,6 +3177,13 @@ pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
 /// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
 /// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
 /// the capture's (`start_flight`) and the install's. Observation only.
+/// Test builds: fuzzy installs that finished a prepared cut, and those that fell back to a rewrite
+/// under the store mutex (no cut was prepared). Observation only.
+#[cfg(test)]
+pub(crate) static INSTALL_CUTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(test)]
 pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
 
@@ -9991,12 +9998,18 @@ impl StoreInner {
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
             Some(prep) => {
+                #[cfg(test)]
+                INSTALL_CUTS.fetch_add(1, Ordering::Relaxed);
                 ckpt_held("install.before_cut");
                 let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
                 ckpt_held("install.cut_finished");
                 cut
             }
-            None => journal.rewrite_from(cap.log_from, cap.generation),
+            None => {
+                #[cfg(test)]
+                INSTALL_REWRITES.fetch_add(1, Ordering::Relaxed);
+                journal.rewrite_from(cap.log_from, cap.generation)
+            }
         };
         if rewritten.is_err() {
             // The old log stays, correct and longer; not cut again before another threshold's

@@ -8694,9 +8694,17 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
     let len = db.branches.log_len_for_test();
+    let cuts = super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed);
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
     db.branch_checkpoint_wait();
     assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint cut the log");
+    // Strengthened (my own test, 0ac4f207d, unaccepted): the shortening must be a CUT (a prepared
+    // cut finished at the install), not the install's fallback rewrite, which also shortens it.
+    assert!(
+        super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed) > cuts,
+        "premise: the checkpoint finished a prepared cut (it fell back to a rewrite: {} rewrites so far)",
+        super::store::INSTALL_REWRITES.load(std::sync::atomic::Ordering::Relaxed)
+    );
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
     let before = dirs();
     let _ = trunk.fork_branch().unwrap().into_id();
