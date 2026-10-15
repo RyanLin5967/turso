@@ -1419,12 +1419,14 @@ impl Database {
                 return e;
             }
             #[cfg(test)]
-            let mapped = crate::branch::store::fe_mutant("connect_race_maps_released")
-                .then(|| self.branches.is_gone_or_released(id));
-            #[cfg(not(test))]
-            let mapped: Option<bool> = None;
-            let gone = mapped.unwrap_or_else(|| matches!(self.branches.branch_named(name), Ok(None)));
-            if gone {
+            if crate::branch::store::fe_mutant("connect_race_maps_released") {
+                return if self.branches.is_gone_or_released(id) {
+                    store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+                } else {
+                    e
+                };
+            }
+            if matches!(self.branches.branch_named(name), Ok(None)) {
                 store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
             } else {
                 e
