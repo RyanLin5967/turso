@@ -1796,6 +1796,14 @@ struct CatState {
     /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
     /// no trunk version when it was made. Cleared with the cache.
     trunk_all_complete: bool,
+    /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
+    /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
+    /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
+    /// commits, and its install sets both from what its writer read in that transaction. A delete
+    /// of a trunk child forked after the newest row then asks the catalog nothing for its
+    /// neighbours, and none for the trunk's catalog garbage when there is no trunk version.
+    trunk_child_max: Option<Option<u64>>,
+    trunk_versions: Option<bool>,
     /// The count of rows released while held open, from a format 19/20 meta row at the open
     /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
     held_released_at_open: Option<u64>,
@@ -2115,6 +2123,8 @@ impl CatState {
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
             held_released_at_open: None,
+            trunk_child_max: None,
+            trunk_versions: None,
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
@@ -2601,6 +2611,7 @@ impl ChildIndex {
         parent: BranchId,
         f: u64,
         catalog: bool,
+        newest: Option<Option<u64>>,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
         let listed = self.map.remove(&(parent.0, f)).is_some();
         if !catalog {
@@ -2612,8 +2623,16 @@ impl ChildIndex {
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
         let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
-        let lo = self.below(cat.as_deref_mut(), parent, f)?;
-        let hi = self.above(cat, parent, f)?;
+        // LEAP L4 slice 3: when every catalog child of `parent` is older than `f` (`newest`, the
+        // newest one's epoch, exact), the catalog's nearest below is that one and none is above:
+        // both are answered without asking. Else asked, as before.
+        let (lo, hi) = match newest {
+            Some(n) if n.is_none_or(|n| n < f) => {
+                let mem = self.map.range((parent.0, 0)..(parent.0, f)).next_back().map(|(&(_, e), _)| e);
+                (mem.max(self.resolve(parent.0, n, true)), self.above(None, parent, f)?)
+            }
+            _ => (self.below(cat.as_deref_mut(), parent, f)?, self.above(cat, parent, f)?),
+        };
         self.removed.insert((parent.0, f), (lo, hi));
         Ok((listed || fresh, lo, hi))
     }
@@ -3041,7 +3060,18 @@ struct Captured {
 
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
 /// transaction. Holds no store lock: nothing here reads the store.
-fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<()> {
+/// What a checkpoint's writer read of the catalog in its own transaction, after every row it
+/// committed (LEAP L4): its earliest lease deadline, the fork epoch of the trunk's newest child row,
+/// and whether it holds any trunk version. Exact as of that commit, so the install sets the facts
+/// from it and asks the catalog nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CkptFacts {
+    lease_min: Option<u64>,
+    trunk_child_max: Option<u64>,
+    trunk_versions: bool,
+}
+
+fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<CkptFacts> {
     if cap.fail_write {
         return Err(LimboError::InternalError(
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
@@ -3126,13 +3156,23 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // they summarize exactly those rows. Mutant `l4_stale_meta_facts` (test builds only): the
         // facts read before the rows are written (the oracle's plant).
         let mut meta = cap.meta;
+        let lease_min = catalog.lease_min()?;
         if super::journal::meta_carries_facts(meta.format) {
-            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { catalog.lease_min()? });
+            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { lease_min });
             meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
         }
-        catalog.put_meta(&meta)
+        // LEAP L4 slice 3: the facts a delete of a trunk child reads instead of the catalog. Mutant
+        // `l4_stale_child_facts` (test builds only): none, whatever the rows say (the oracle's plant).
+        let stale = fe_mutant("l4_stale_child_facts");
+        let facts = CkptFacts {
+            lease_min,
+            trunk_child_max: if stale { None } else { catalog.children_below(0, u64::MAX, 1)?.first().copied() },
+            trunk_versions: !stale && !catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty(),
+        };
+        catalog.put_meta(&meta)?;
+        Ok(facts)
     })()
-    .and_then(|()| {
+    .and_then(|facts| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
         // A store fail-stopped since the capture commits nothing more (review 4 #1); checked
         // last, so no failure before the commit is missed. Mutant `commit_poisoned` (test builds
@@ -3142,13 +3182,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // A failed commit may or may not have reached the catalog: from here on, only a reopen
         // can tell, so the store fail-stops.
-        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))
+        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))?;
+        Ok(facts)
     });
     if let Err(e) = written {
         catalog.rollback();
         return Err(e);
     }
-    Ok(())
+    written
 }
 
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
@@ -8297,6 +8338,22 @@ impl BranchStore {
                 ));
             }
         }
+        // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
+        // whether the catalog holds a trunk version, as known, equal their queries.
+        if !cat.flight {
+            if let Some(known) = cat.trunk_child_max {
+                let asked = cat.catalog.children_below(0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied();
+                if known != asked {
+                    return Err(format!("the trunk's newest catalog child is known as {known:?}; the catalog answers {asked:?}"));
+                }
+            }
+            if let Some(known) = cat.trunk_versions {
+                let asked = !cat.catalog.trunk_born_range(None, u64::MAX, 1).map_err(|e| format!("trunk_born_range: {e}"))?.is_empty();
+                if known != asked {
+                    return Err(format!("the catalog is known to hold trunk versions: {known}; it answers {asked}"));
+                }
+            }
+        }
         // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
         let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
         let mut meta_set = false;
@@ -9181,6 +9238,16 @@ impl StoreInner {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
+        // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
+        // unknown, never while a checkpoint is in the air).
+        if !cat.flight && !fe_mutant("l4_probe_always") {
+            if cat.trunk_versions.is_none() {
+                cat.trunk_versions = Some(!cat.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty());
+            }
+            if cat.trunk_versions == Some(false) {
+                return Ok(());
+            }
+        }
         let only_f = |born: u64, died: u64| {
             lo.is_none_or(|lo| born > lo) && born <= f && f < died && hi.is_none_or(|hi| died <= hi)
         };
@@ -9889,29 +9956,36 @@ impl StoreInner {
     fn checkpoint_install(
         &mut self,
         cap: Box<Captured>,
-        written: Result<()>,
+        written: Result<CkptFacts>,
         prepared: Option<super::journal::CutPrep>,
     ) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
-            return written;
+            return written.map(|_| ());
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
         cat.flight = false;
-        if let Err(e) = written {
-            // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
-            if !mutant("r13_install_err_drops_dirty") {
-                for (id, what) in cap.dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+        // A failed write may have reached the catalog or not: its trunk facts are unknown until
+        // asked again (LEAP L4 slice 3).
+        cat.trunk_child_max = None;
+        cat.trunk_versions = None;
+        let facts = match written {
+            Ok(facts) => facts,
+            Err(e) => {
+                // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
+                if !mutant("r13_install_err_drops_dirty") {
+                    for (id, what) in cap.dirty {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
                 }
+                // The capture copied the names; the index still holds them, for the next checkpoint.
+                // Not retried before another threshold's worth of log (review 2 #5).
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.defer_compaction();
+                }
+                return Err(e);
             }
-            // The capture copied the names; the index still holds them, for the next checkpoint.
-            // Not retried before another threshold's worth of log (review 2 #5).
-            if let Some(journal) = self.journal.as_mut() {
-                journal.defer_compaction();
-            }
-            return Err(e);
-        }
+        };
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
         // The catalog holds the captured names now: drop each entry no release or create since
@@ -10017,7 +10091,10 @@ impl StoreInner {
         // whatever was written (the oracle's plant).
         let wrote_free = !(cap.free_list.is_empty() && cap.reserved.is_empty() && cap.deferred.is_empty());
         cat.free_exhausted = cap.free_exhausted && (!wrote_free || fe_mutant("l4_free_ignores_puts"));
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: what the writer read of the catalog in its commit's transaction (`CkptFacts`).
+        cat.lease_floor = facts.lease_min;
+        cat.trunk_child_max = Some(facts.trunk_child_max);
+        cat.trunk_versions = Some(facts.trunk_versions);
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
@@ -10391,8 +10468,19 @@ impl StoreInner {
                 )));
             }
             let catalog_mode = self.cat.is_some();
+            // LEAP L4 slice 3: the trunk's newest child row in the catalog, known (asked once while
+            // unknown) whenever no checkpoint is in the air.
+            let newest = match self.cat.as_mut() {
+                Some(cat) if parent.is_trunk() && !cat.flight && !fe_mutant("l4_probe_always") => {
+                    if cat.trunk_child_max.is_none() {
+                        cat.trunk_child_max = Some(cat.catalog.children_below(0, u64::MAX, 1)?.first().copied());
+                    }
+                    cat.trunk_child_max
+                }
+                _ => None,
+            };
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest)?;
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint
