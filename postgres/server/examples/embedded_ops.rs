@@ -29,8 +29,9 @@
 //! Before the ops it creates `t(id INT PRIMARY KEY, v INT)` with `--rows` rows and an empty `t2(id
 //! INT)`, as the wire side's seed does through the server.
 //!
-//! Output: TSV `seq phase step start_ns end_ns cpu_ns unix_syscalls instructions`, phase `warmup`
-//! or `measure`; `cpu_ns` is the calling thread's CPU time across the step
+//! Output: TSV `seq phase step start_ns end_ns cpu_ns unix_syscalls instructions branch`, phase
+//! `warmup` or `measure`, `branch` the op's branch name (so budget.py can check, from the raw, that
+//! the two sides named their branches alike: wire review 15 item 29); `cpu_ns` is the calling thread's CPU time across the step
 //! (CLOCK_THREAD_CPUTIME_ID), and the last two are the process's unix system calls and
 //! instructions retired across it (turso_pg_server::counters, 0 where not counted). Each op starts
 //! with a `noop` step, two probes and nothing between, whose counts the budgets subtract.
@@ -185,9 +186,10 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
     writeln!(
         out,
-        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions"
+        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch"
     )
     .unwrap();
+    let prefix = a.name_prefix.clone();
     let mut rec = |seq: u64, phase: &str, step: &str, t0: Probe, t1: Probe| {
         let (s0, i0) = t0
             .counters
@@ -197,7 +199,7 @@ fn main() {
             .map_or((0, 0), |c| (c.unix_syscalls, c.instructions));
         writeln!(
             out,
-            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}",
+            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}",
             t0.ns,
             t1.ns,
             t1.cpu_ns - t0.cpu_ns,
