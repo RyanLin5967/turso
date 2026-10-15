@@ -2293,6 +2293,38 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// A refused CREATE TABLE leaves nothing behind, its SERIAL column's sequence included, as in
+/// PostgreSQL: one whose key onto itself does not resolve (42830, after the CREATE), and one whose
+/// table already exists. The sequence's `CREATE SEQUENCE IF NOT EXISTS` ran and committed at prepare,
+/// before the CREATE's own transaction began, so each refusal left a sequence (wire review 16 item
+/// 15). The controls: the same CREATE that succeeds adds its one sequence.
+#[test]
+fn a_refused_create_table_leaves_no_sequence() {
+    let dir = Scratch::new("serialundo");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sequences = |a: &mut Wire| {
+        a.q("SELECT count(*) FROM pg_sequences")
+            .single("pg_sequences")
+    };
+    a.q("CREATE TABLE p(id INT)").ok("p");
+    let before = sequences(&mut a);
+    let keyed = "CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT, parent INT REFERENCES tree(code))";
+    assert_eq!(a.q(keyed).err(keyed).code, "42830", "premise: code is not unique");
+    assert_eq!(sequences(&mut a), before, "the refused tree left its sequence");
+    let exists = "CREATE TABLE p(id SERIAL)";
+    a.q(exists).err(exists);
+    assert_eq!(sequences(&mut a), before, "the refused p left its sequence");
+    a.q("CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT UNIQUE, parent INT REFERENCES tree(code))")
+        .ok("control: tree with a unique code");
+    let after: u64 = sequences(&mut a).parse().unwrap();
+    assert_eq!(
+        after,
+        before.parse::<u64>().unwrap() + 1,
+        "control: the CREATE that succeeds adds one sequence"
+    );
+}
+
 /// The settings whose effect a ROLLBACK would have to undo, foreign_keys and search_path, are
 /// refused (0A000) inside an explicit transaction block and as SET LOCAL, as this server keeps a
 /// SET past the block whatever ends it: `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off for
