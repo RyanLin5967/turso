@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
-    PgBranchCall, PgConnection, StatementTypes,
+    PgBranchCall, PgConnection, StatementTypes, TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
@@ -1224,7 +1224,7 @@ impl Session {
         if !conn.inner().get_auto_commit() {
             return Ok(());
         }
-        engine_tx(&conn, TxStmt::Begin).map_err(|e| engine_info(&e))?;
+        conn.engine_tx(TxStmt::Begin).map_err(|e| engine_info(&e))?;
         st.implicit = true;
         Ok(())
     }
@@ -1241,11 +1241,10 @@ impl Session {
         st.implicit = false;
         if failed {
             st.aborted = false;
+            // A rollback that fails breaks the connection, and the next statement ends the
+            // session (run): the block's work is still held (wire review 16 item 14).
             if let Ok(conn) = self.current(&mut st) {
-                if !conn.inner().get_auto_commit() {
-                    let _ = turso_pg::undo_failpoint()
-                        .and_then(|()| engine_tx(&conn, TxStmt::Rollback));
-                }
+                let _ = conn.roll_back_or_break();
             }
         } else if TxVerb::of(sql) != TxVerb::Begin {
             // The block lasts while the engine holds its transaction: a statement that ended it,
@@ -1277,7 +1276,8 @@ impl Session {
         };
         if implicit {
             st.aborted = false;
-            let _ = engine_tx(&conn, TxStmt::Rollback);
+            // A failed rollback breaks the connection (roll_back_or_break), read by run.
+            let _ = conn.roll_back_or_break();
         } else {
             st.aborted = true;
         }
@@ -1297,14 +1297,16 @@ impl Session {
         // A statement of the block failed where nothing rolled it back (a simple Query inside an
         // unsynced pipeline): the block rolls back, never commits (wire review 13 item 1).
         if std::mem::take(&mut st.aborted) {
-            let _ = engine_tx(&conn, TxStmt::Rollback);
-            return Ok(());
+            return conn
+                .roll_back_or_break()
+                .map_err(|e| broken_fatal(engine_info(&e)));
         }
-        if let Err(e) = engine_tx(&conn, TxStmt::Commit) {
-            if !conn.inner().get_auto_commit() {
-                let _ = engine_tx(&conn, TxStmt::Rollback);
+        if let Err(e) = conn.engine_tx(TxStmt::Commit) {
+            // The same rule as a client's COMMIT (wire review 8 item 1); a rollback that fails
+            // breaks the connection (wire review 16 item 14).
+            if let Err(undo) = conn.roll_back_or_break() {
+                return Err(broken_fatal(engine_info(&undo)));
             }
-            // The same rule as a client's COMMIT (wire review 8 item 1).
             return Err(commit_failed(&conn, engine_info(&e)));
         }
         Ok(())
@@ -1322,6 +1324,18 @@ impl Session {
         let verb = TxVerb::of(sql);
         let mut st = self.state();
         let conn = self.current(&mut st)?;
+        // A connection an undo failed on (a rollback of an implicit block, after its statement
+        // was answered) holds work nobody can name: it serves nothing more, the next statement
+        // ending the session, never joining that transaction (wire review 16 item 14).
+        if conn.is_broken() {
+            return Err(broken_fatal(error(
+                "08006",
+                format!(
+                    "{}: an earlier undo failed; the connection is closed",
+                    turso_pg::CONNECTION_BROKEN
+                ),
+            )));
+        }
         // The session's lock wait and message level, as its last SET left them.
         self.lock_timeout_ms
             .store(conn.lock_timeout_ms(), Ordering::Relaxed);
@@ -1476,11 +1490,7 @@ impl Session {
         // more statements on it (wire review 2 item 1). Read from the connection's flag, not the
         // error's text (wire review 5 item 4).
         let result = match result {
-            Err(mut info) if conn.is_broken() => {
-                info.code = "08006".to_string();
-                info.severity = "FATAL".to_string();
-                Err(info)
-            }
+            Err(info) if conn.is_broken() => Err(broken_fatal(info)),
             r => r,
         };
         if result.is_err() {
@@ -2349,16 +2359,12 @@ fn tx_modes(mut w: &[&str]) -> bool {
     true
 }
 
-/// A transaction-control statement the client did not send: an implicit block's own, or the
-/// savepoint a statement runs under inside a block ([`create_with_keys`]).
-#[derive(Debug, Clone, Copy)]
-enum TxStmt {
-    Begin,
-    Commit,
-    Rollback,
-    Savepoint(&'static str),
-    Release(&'static str),
-    RollbackTo(&'static str),
+/// A broken connection's answer (an undo failed; turso_pg's PgConnection::is_broken): FATAL 08006,
+/// which serve_session ends the session on.
+fn broken_fatal(mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
+    info.code = "08006".to_string();
+    info.severity = "FATAL".to_string();
+    info
 }
 
 /// What a failed COMMIT tells the client, once the engine's transaction is settled: a COMMIT the
@@ -2389,51 +2395,6 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
         );
     }
     info
-}
-
-/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
-/// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
-fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
-    use turso_parser::ast::{Name, Stmt};
-    let (stmt, text) = match tx {
-        TxStmt::Begin => (
-            Stmt::Begin {
-                typ: None,
-                name: None,
-            },
-            "BEGIN".to_string(),
-        ),
-        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT".to_string()),
-        TxStmt::Rollback => (
-            Stmt::Rollback {
-                tx_name: None,
-                savepoint_name: None,
-            },
-            "ROLLBACK".to_string(),
-        ),
-        TxStmt::Savepoint(name) => (
-            Stmt::Savepoint {
-                name: Name::from_string(name),
-            },
-            format!("SAVEPOINT {name}"),
-        ),
-        TxStmt::Release(name) => (
-            Stmt::Release {
-                name: Name::from_string(name),
-            },
-            format!("RELEASE SAVEPOINT {name}"),
-        ),
-        TxStmt::RollbackTo(name) => (
-            Stmt::Rollback {
-                tx_name: None,
-                savepoint_name: Some(Name::from_string(name)),
-            },
-            format!("ROLLBACK TO SAVEPOINT {name}"),
-        ),
-    };
-    conn.inner()
-        .prepare_translated_stmt(stmt, &text)?
-        .run_ignore_rows()
 }
 
 /// The schema a CREATE SCHEMA or DROP SCHEMA names (`[IF [NOT] EXISTS] name`, quotes dropped), if
@@ -3654,8 +3615,11 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 /// that every key is resolved once the table exists, as the engine resolves it for a write, and the
 /// table is undone if one does not resolve (42830, turso_pg::check_table_keys): the parents were
 /// checked at prepare, a key onto the table itself only now. It was created unchecked, and every
-/// INSERT into it then failed 'foreign key mismatch' (wire review 13 item 2). The transaction is
-/// the engine's (engine_tx), so no SQL text is parsed for it.
+/// INSERT into it then failed 'foreign key mismatch' (wire review 13 item 2). The transaction and
+/// its undo are the frontend's one rule (PgConnection::in_own_transaction): an undo that fails
+/// breaks the connection, FATAL 08006 here, where `let _ =` kept the refused table in a transaction
+/// the client's next COMMIT committed (wire review 16 item 14). In its own transaction a lock met
+/// at any step was rolled back with it: 40001, as for a failed COMMIT (commit_failed).
 fn create_with_keys(
     conn: &PgConnection,
     stmt: &mut turso_core::Statement,
@@ -3663,48 +3627,23 @@ fn create_with_keys(
     table: &str,
     backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
-    const SAVEPOINT: &str = "__turso_create_keys";
     let own = conn.inner().get_auto_commit();
-    engine_tx(
-        conn,
-        if own {
-            TxStmt::Begin
-        } else {
-            TxStmt::Savepoint(SAVEPOINT)
-        },
-    )
-    .map_err(engine_error)?;
-    let r = execute_non_query(stmt, sql, backoff).and_then(|response| {
+    conn.in_own_transaction("__turso_create_keys", "CREATE TABLE", || {
+        run_waiting(stmt, backoff, |_| Ok(()))?;
         turso_pg::check_table_keys(conn.inner(), table)
-            .map(|()| response)
-            .map_err(engine_error)
-    });
-    let end = match &r {
-        // The same rule as an implicit block's COMMIT (end_implicit): a block the engine still
-        // holds is rolled back, and a transaction it stranded breaks the connection.
-        Ok(_) if own => engine_tx(conn, TxStmt::Commit).map_err(|e| {
-            let info = commit_failed(conn, engine_info(&e));
-            if !conn.inner().get_auto_commit() {
-                let _ = engine_tx(conn, TxStmt::Rollback);
-            }
-            PgWireError::UserError(info)
-        }),
-        Ok(_) => engine_tx(conn, TxStmt::Release(SAVEPOINT)).map_err(engine_error),
-        Err(_) => {
-            if !conn.inner().get_auto_commit() {
-                let _ = turso_pg::undo_failpoint().and_then(|()| {
-                    if own {
-                        engine_tx(conn, TxStmt::Rollback)
-                    } else {
-                        engine_tx(conn, TxStmt::RollbackTo(SAVEPOINT))
-                            .and_then(|()| engine_tx(conn, TxStmt::Release(SAVEPOINT)))
-                    }
-                });
-            }
-            Ok(())
+    })
+    .map_err(|e| {
+        let info = engine_info(&e);
+        if conn.is_broken() {
+            broken_fatal(info)
+        } else if own {
+            commit_failed(conn, info)
+        } else {
+            info
         }
-    };
-    end.and(r)
+    })
+    .map_err(PgWireError::UserError)?;
+    Ok(Response::Execution(command_tag(sql, stmt.n_change() as usize)))
 }
 
 /// Execute a query that returns rows and build a Query response. Each column has the type the

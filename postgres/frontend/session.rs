@@ -239,6 +239,38 @@ impl PgConnection {
         self.inner.broken.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Run `tx` from the engine's AST: no SQL text is parsed, so an implicit block costs no
+    /// libpg_query call.
+    pub fn engine_tx(&self, tx: TxStmt) -> Result<()> {
+        run_tx(&self.inner.conn, tx)
+    }
+
+    /// Run `f` in a transaction of its own ([`own_transaction`]'s rule: an undo that fails breaks
+    /// the connection); `name` is its savepoint's inside an open transaction, `what` names the
+    /// statement in a broken connection's error.
+    pub fn in_own_transaction<T>(
+        &self,
+        name: &'static str,
+        what: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        own_transaction(&self.inner, name, what, f)
+    }
+
+    /// Roll back the transaction the engine holds (an implicit block's): a rollback that fails, or
+    /// leaves a transaction held, breaks the connection ([`own_transaction`]'s rule), and its error
+    /// says so. Nothing to do in autocommit.
+    pub fn roll_back_or_break(&self) -> Result<()> {
+        let conn = &self.inner.conn;
+        if conn.get_auto_commit() {
+            return Ok(());
+        }
+        undo_failpoint()
+            .and_then(|()| run_tx(conn, TxStmt::Rollback))
+            .and_then(|()| held_after_undo(conn, false))
+            .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo))
+    }
+
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         prepare_statement(&self.inner, sql.as_ref())
     }
@@ -1503,103 +1535,55 @@ fn handle_pg_add_constraints(
     // Whether the table's older keys resolve: if they do, the engine's own resolution after the
     // rebuild can refuse only for a key this ALTER adds, and backs the per-key checks.
     let resolved_before = keys.is_empty() || check_table_keys(conn, table).is_ok();
-    let in_tx = !conn.get_auto_commit();
-    execute_root(
-        conn,
-        if in_tx {
-            "SAVEPOINT __turso_rebuild"
-        } else {
-            "BEGIN"
-        },
-    )?;
     let enforced = conn.foreign_keys_enabled();
-    // Every step is a root statement: an internal helper statement opens no transaction of its
-    // own (DDL through one panicked the engine at SetCookie) and skips foreign key checks.
-    let rebuild = (|| {
-        conn.set_foreign_keys_enabled(false);
-        run_pg_statement(pg_conn, &aside_def)?;
-        execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
-        execute_root(conn, format!("DROP TABLE {quoted}"))?;
-        run_pg_statement(pg_conn, &rebuilt)?;
-        // The copy back checks every row against the new PRIMARY KEY, UNIQUE and CHECK
-        // constraints. It runs with foreign keys off, as the DROP does, so neither half touches
-        // the connection's pending deferred-key count: with keys on it counted the rows again, and
-        // a block's deferred orphan was cancelled, or a fixed one counted twice (wire review 6
-        // item 1).
-        execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
-        execute_root(conn, format!("DROP TABLE {aside}"))?;
-        for sql in &dependents {
-            match catalog::decode_stored_pg_schema_sql(sql) {
-                Some(pg_sql) => run_pg_statement(pg_conn, pg_sql)?,
-                None => execute_root(conn, sql)?,
-            }
-        }
-        // The keys the ALTER adds are checked whole once the table's indexes are back (a unique
-        // index the ALTER adds can be a self-reference's parent key, and the orphan query can use
-        // the indexes): each key on its own (check_foreign_key), then, when the table's older keys
-        // resolved, the engine's own resolution of every key with unique parent keys required
-        // (with keys off, a non-unique parent key was accepted, and every later INSERT into the
-        // table failed 'foreign key mismatch'; wire review 11 item 5), then the orphans (23503).
-        let mut parent_keys = Vec::with_capacity(keys.len());
-        for key in &keys {
-            parent_keys.push(check_foreign_key(conn, table, &child_columns, key, false)?);
-        }
-        if !keys.is_empty() && resolved_before {
-            check_table_keys(conn, table)?;
-        }
-        for (key, parent_columns) in keys.iter().zip(&parent_keys) {
-            check_added_foreign_key(conn, &quoted, key, parent_columns)?;
-        }
-        Ok(())
-    })();
-    conn.set_foreign_keys_enabled(enforced);
-    // The rebuild's own end, its COMMIT or RELEASE, fails into the same undo as its steps: a
-    // failed COMMIT returned without it left the transaction open, the session 'T' holding the
-    // trunk's write lock (wire review 6 item 1).
-    let rebuild = rebuild.and_then(|()| {
-        execute_root(
-            conn,
-            if in_tx {
-                "RELEASE SAVEPOINT __turso_rebuild"
-            } else {
-                "COMMIT"
-            },
-        )
-    });
-    match rebuild {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let undone = if in_tx {
-                execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_rebuild")
-                    .and_then(|()| execute_root(conn, "RELEASE SAVEPOINT __turso_rebuild"))
-            } else if !conn.get_auto_commit() {
-                execute_root(conn, "ROLLBACK")
-            } else if conn.is_in_write_tx() {
-                // A COMMIT that left autocommit before failing: the transaction cannot be ended
-                // on this connection.
-                Err(LimboError::InternalError(
-                    "the rebuild's transaction is held after its COMMIT failed".to_string(),
-                ))
-            } else {
-                // The engine already rolled the rebuild back.
-                Ok(())
-            };
-            // An undo that failed leaves the table half rebuilt in a transaction nobody can name:
-            // the connection is broken, not merely the statement (the server ends the session).
-            match undone {
-                Ok(()) => Err(e),
-                Err(undo) => {
-                    pg_conn
-                        .broken
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(LimboError::InternalError(format!(
-                        "{CONNECTION_BROKEN}: ALTER TABLE ADD CONSTRAINT failed ({e}) and undoing \
-                         it failed too ({undo})"
-                    )))
+    // In a transaction of its own, under one undo rule (own_transaction): its end, COMMIT or
+    // RELEASE, fails into the same undo as its steps (a failed COMMIT returned without it left the
+    // transaction open, the session 'T' holding the trunk's write lock; wire review 6 item 1), and
+    // an undo that fails breaks the connection (it left the table half rebuilt).
+    own_transaction(pg_conn, "__turso_rebuild", "ALTER TABLE ADD CONSTRAINT", || {
+        // Every step is a root statement: an internal helper statement opens no transaction of its
+        // own (DDL through one panicked the engine at SetCookie) and skips foreign key checks.
+        let rebuild = (|| {
+            conn.set_foreign_keys_enabled(false);
+            run_pg_statement(pg_conn, &aside_def)?;
+            execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
+            execute_root(conn, format!("DROP TABLE {quoted}"))?;
+            run_pg_statement(pg_conn, &rebuilt)?;
+            // The copy back checks every row against the new PRIMARY KEY, UNIQUE and CHECK
+            // constraints. It runs with foreign keys off, as the DROP does, so neither half touches
+            // the connection's pending deferred-key count: with keys on it counted the rows again,
+            // and a block's deferred orphan was cancelled, or a fixed one counted twice (wire
+            // review 6 item 1).
+            execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
+            execute_root(conn, format!("DROP TABLE {aside}"))?;
+            for sql in &dependents {
+                match catalog::decode_stored_pg_schema_sql(sql) {
+                    Some(pg_sql) => run_pg_statement(pg_conn, pg_sql)?,
+                    None => execute_root(conn, sql)?,
                 }
             }
-        }
-    }
+            // The keys the ALTER adds are checked whole once the table's indexes are back (a unique
+            // index the ALTER adds can be a self-reference's parent key, and the orphan query can
+            // use the indexes): each key on its own (check_foreign_key), then, when the table's
+            // older keys resolved, the engine's own resolution of every key with unique parent keys
+            // required (with keys off, a non-unique parent key was accepted, and every later INSERT
+            // into the table failed 'foreign key mismatch'; wire review 11 item 5), then the
+            // orphans (23503).
+            let mut parent_keys = Vec::with_capacity(keys.len());
+            for key in &keys {
+                parent_keys.push(check_foreign_key(conn, table, &child_columns, key, false)?);
+            }
+            if !keys.is_empty() && resolved_before {
+                check_table_keys(conn, table)?;
+            }
+            for (key, parent_columns) in keys.iter().zip(&parent_keys) {
+                check_added_foreign_key(conn, &quoted, key, parent_columns)?;
+            }
+            Ok(())
+        })();
+        conn.set_foreign_keys_enabled(enforced);
+        rebuild
+    })
 }
 
 /// A FOREIGN KEY an ALTER adds: its columns, the parent table and the parent's columns (empty: the
@@ -1944,11 +1928,11 @@ pub fn fail_next_undo() {
     UNDO_FAILS.with(|f| f.set(true));
 }
 
-/// Where [`fail_next_undo`] strikes: an error once after it, else Ok. Without the `failpoints`
-/// feature it is always Ok and compiles to nothing.
-#[doc(hidden)]
+/// Where `fail_next_undo` strikes, before every undo [`own_transaction`] and
+/// [`PgConnection::roll_back_or_break`] run: an error once after it, else Ok. Without the
+/// `failpoints` feature it is always Ok and compiles to nothing.
 #[inline]
-pub fn undo_failpoint() -> Result<()> {
+fn undo_failpoint() -> Result<()> {
     #[cfg(feature = "failpoints")]
     if UNDO_FAILS.with(|f| f.replace(false)) {
         return Err(LimboError::InternalError(
@@ -1956,6 +1940,148 @@ pub fn undo_failpoint() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A transaction-control statement the client did not send: the server's implicit block's own, or
+/// the transaction a statement runs in ([`own_transaction`]).
+#[derive(Debug, Clone, Copy)]
+pub enum TxStmt {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(&'static str),
+    Release(&'static str),
+    RollbackTo(&'static str),
+}
+
+/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed for it.
+fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
+    use turso_parser::ast::{Name, Stmt};
+    let (stmt, text) = match tx {
+        TxStmt::Begin => (
+            Stmt::Begin {
+                typ: None,
+                name: None,
+            },
+            "BEGIN".to_string(),
+        ),
+        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT".to_string()),
+        TxStmt::Rollback => (
+            Stmt::Rollback {
+                tx_name: None,
+                savepoint_name: None,
+            },
+            "ROLLBACK".to_string(),
+        ),
+        TxStmt::Savepoint(name) => (
+            Stmt::Savepoint {
+                name: Name::from_string(name),
+            },
+            format!("SAVEPOINT {name}"),
+        ),
+        TxStmt::Release(name) => (
+            Stmt::Release {
+                name: Name::from_string(name),
+            },
+            format!("RELEASE SAVEPOINT {name}"),
+        ),
+        TxStmt::RollbackTo(name) => (
+            Stmt::Rollback {
+                tx_name: None,
+                savepoint_name: Some(Name::from_string(name)),
+            },
+            format!("ROLLBACK TO SAVEPOINT {name}"),
+        ),
+    };
+    conn.prepare_translated_stmt(stmt, &text)?.run_ignore_rows()
+}
+
+/// Run `f` in a transaction of its own, so that what it does is kept whole or not at all: under the
+/// savepoint `name` inside a transaction already open (a client's block, an implicit block),
+/// otherwise between its own BEGIN and COMMIT. Its end (RELEASE or COMMIT) fails into the same
+/// undo as `f`'s steps. One undo rule for every statement run this way (CREATE TABLE with keys,
+/// ALTER TABLE ADD CONSTRAINT's rebuild, COPY FROM; wire review 16 item 14, where the CREATE's
+/// undo was `let _ =`): roll back to the savepoint and release it, or roll the own transaction
+/// back, then read the engine's state again. An undo that fails, or one after which the engine
+/// still holds a transaction this call opened, breaks the connection (the server ends the session,
+/// FATAL 08006): its work sits in a transaction nobody can name, and a statement after it would
+/// join it (a client's COMMIT kept the refused table). Inside a block the engine no longer holds
+/// (the error rolled the whole transaction back) there is nothing to undo.
+fn own_transaction<T>(
+    pg_conn: &Arc<PgConnectionInner>,
+    name: &'static str,
+    what: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let conn = &pg_conn.conn;
+    let in_tx = !conn.get_auto_commit();
+    run_tx(
+        conn,
+        if in_tx {
+            TxStmt::Savepoint(name)
+        } else {
+            TxStmt::Begin
+        },
+    )?;
+    let ended = f().and_then(|done| {
+        run_tx(
+            conn,
+            if in_tx {
+                TxStmt::Release(name)
+            } else {
+                TxStmt::Commit
+            },
+        )
+        .map(|()| done)
+    });
+    let e = match ended {
+        Ok(done) => return Ok(done),
+        Err(e) => e,
+    };
+    let undone = if conn.get_auto_commit() {
+        Ok(())
+    } else {
+        undo_failpoint().and_then(|()| {
+            if in_tx {
+                run_tx(conn, TxStmt::RollbackTo(name))
+                    .and_then(|()| run_tx(conn, TxStmt::Release(name)))
+            } else {
+                run_tx(conn, TxStmt::Rollback)
+            }
+        })
+    }
+    .and_then(|()| held_after_undo(conn, in_tx));
+    match undone {
+        Ok(()) => Err(e),
+        Err(undo) => Err(break_connection(
+            pg_conn,
+            &format!("{what} failed ({e}) and its undo"),
+            &undo,
+        )),
+    }
+}
+
+/// After an undo, whether the engine still holds a transaction the undone work opened: with no
+/// block open before (`in_tx` false), any transaction, or a write transaction in autocommit (a
+/// COMMIT that left autocommit before failing, which no ROLLBACK on this connection can end).
+/// Inside a block its transaction is the client's and stays. Blind spot: a stranded READ
+/// transaction in autocommit is not visible (Connection::is_in_write_tx).
+fn held_after_undo(conn: &Arc<Connection>, in_tx: bool) -> Result<()> {
+    if !in_tx && (!conn.get_auto_commit() || conn.is_in_write_tx()) {
+        return Err(LimboError::InternalError(
+            "the engine still holds the transaction".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mark the connection broken (the server ends the session on it, FATAL 08006) and say why: `what`
+/// could not be undone (`undo`).
+fn break_connection(pg_conn: &Arc<PgConnectionInner>, what: &str, undo: &LimboError) -> LimboError {
+    pg_conn
+        .broken
+        .store(true, std::sync::atomic::Ordering::Release);
+    LimboError::InternalError(format!("{CONNECTION_BROKEN}: {what} failed ({undo})"))
 }
 
 /// The start of the error text of a statement whose undo failed too. The server ends the session on
@@ -2044,17 +2170,9 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     // client's block, or the implicit block of a multi-statement query or a pipeline), under a
     // savepoint, so a failed COPY undoes its own rows and leaves the block to its owner. Its own
     // BEGIN was refused inside any open transaction (wire review 4 item 2).
-    let in_tx = !conn.get_auto_commit();
-    execute_root(
-        conn,
-        if in_tx {
-            "SAVEPOINT __turso_copy"
-        } else {
-            "BEGIN"
-        },
-    )?;
-
-    let result = (|| {
+    // An undo that fails breaks the connection, as for ALTER's rebuild (own_transaction): it left
+    // some of the rows in a transaction nobody can name.
+    own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
         let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
         for row in &rows {
             for (i, val) in row.iter().enumerate() {
@@ -2068,43 +2186,8 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
             insert_stmt.reset()?;
             insert_stmt.clear_bindings();
         }
-
-        execute_root(
-            conn,
-            if in_tx {
-                "RELEASE SAVEPOINT __turso_copy"
-            } else {
-                "COMMIT"
-            },
-        )?;
         Ok(rows_inserted)
-    })();
-
-    let e = match result {
-        Ok(n) => return Ok(n),
-        Err(e) => e,
-    };
-    let undone = if in_tx {
-        execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_copy")
-            .and_then(|()| execute_root(conn, "RELEASE SAVEPOINT __turso_copy"))
-    } else if !conn.get_auto_commit() {
-        execute_root(conn, "ROLLBACK")
-    } else {
-        Ok(())
-    };
-    // An undo that failed leaves some of the rows in a transaction nobody can name: the connection
-    // is broken, not merely the statement (the server ends the session), as for ALTER's rebuild.
-    match undone {
-        Ok(()) => Err(e),
-        Err(undo) => {
-            pg_conn
-                .broken
-                .store(true, std::sync::atomic::Ordering::Release);
-            Err(LimboError::InternalError(format!(
-                "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
-            )))
-        }
-    }
+    })
 }
 
 /// The database holding `table` on the session's search path, as the engine resolves an
