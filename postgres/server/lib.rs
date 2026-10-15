@@ -2779,13 +2779,29 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
         // A savepoint name that names none (wire review 6 item 6).
         LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
+        // Matched by their producers' whole shapes, never by words anywhere: the message can embed
+        // a client's value, and `SET bytea_output = 'is ambiguous'` answered 42702 (wire review 16
+        // item 20). The producers: the translator's `column reference "c" is ambiguous` and `table
+        // name "t" specified more than once`, core's `ROWID is ambiguous` and `ambiguous column
+        // name`.
         LimboError::ParseError(m)
-            if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
+            if (m.starts_with("column reference \"") && m.ends_with("\" is ambiguous"))
+                || m == "ROWID is ambiguous"
+                || m.starts_with("ambiguous column name") =>
         {
             "42702"
         }
         LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
-        LimboError::ParseError(m) if m.contains("specified more than once") => "42712",
+        LimboError::ParseError(m)
+            if m.starts_with("table name \"") && m.ends_with("\" specified more than once") =>
+        {
+            "42712"
+        }
+        // Blind spot: refusals reach here as text from some thirty producers in core, the
+        // translator and the frontend, so this arm matches words, and a message that embeds a
+        // client's text holding them (an identifier the engine quotes) answers 0A000 instead of
+        // the arm after. Errors that carry their code would close it; that needs a variant in
+        // core's LimboError.
         LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
             "0A000"
         }
