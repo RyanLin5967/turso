@@ -206,6 +206,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// The time aliases (`now()` and its siblings), registered once per Database rather than on
+    /// every connection: a branch switch makes a new engine connection.
+    fn static_extensions(&self) -> &'static [fn(&mut turso_ext::ExtensionApi)] {
+        &[crate::aliases::register_pg_functions]
+    }
+
     /// PostgreSQL's float input reads 'Infinity', '-Infinity', 'inf' and '-inf' in any case, with
     /// surrounding blanks, as the infinities, where SQLite's rules read 0 (the crash batch,
     /// 2026-10-15). The engine has no NaN value, so 'NaN' is refused 0A000, as the translator's

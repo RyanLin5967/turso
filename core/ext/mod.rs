@@ -299,7 +299,51 @@ impl Database {
             }
         }
         let _ = unsafe { Box::from_raw(ctx) };
+        // The dialect's own statically linked functions, once per Database (a frontend's aliases:
+        // registered here instead of on each connection, which copies them at connect).
+        for register in self.dialect().static_extensions() {
+            self.register_static_extension(*register);
+        }
         Ok(())
+    }
+
+    /// Register statically linked functions or virtual tables once for this Database, through the
+    /// generic extension API: into its built-in symbols, which every connection made after this
+    /// copies at connect (`Database::connect`). A connection made before keeps what it had. For a
+    /// frontend's functions, which a per-connection `Connection::register_static_extension` would
+    /// register again on every connection (the PostgreSQL time aliases: 13 allocations a branch
+    /// switch).
+    pub fn register_static_extension<F>(&self, register: F)
+    where
+        F: FnOnce(&mut ExtensionApi),
+    {
+        let syms = self.builtin_syms.data_ptr();
+        let schema_mutex_ptr =
+            &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        let ctx = Box::into_raw(Box::new(ExtensionCtx {
+            syms,
+            schema: schema_mutex_ptr as *mut c_void,
+            prepare_context_generation: std::ptr::null(),
+        }));
+        #[allow(unused)]
+        let mut ext_api = ExtensionApi {
+            ctx: ctx as *mut c_void,
+            register_scalar_function: register_scalar_function_with_options,
+            register_aggregate_function,
+            unregister_function,
+            register_vtab_module,
+            #[cfg(feature = "fs")]
+            vfs_interface: turso_ext::VfsInterface {
+                register_vfs: dynamic::register_vfs,
+                builtin_vfs: std::ptr::null_mut(),
+                builtin_vfs_count: 0,
+            },
+        };
+        // Exclusive access to the built-in symbols while the extension registers into them.
+        let _guard = self.builtin_syms.write();
+        register(&mut ext_api);
+        drop(_guard);
+        let _ = unsafe { Box::from_raw(ctx) };
     }
 }
 
