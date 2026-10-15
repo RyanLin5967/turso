@@ -171,14 +171,26 @@ def summary(r):
 
 
 # ---------------------------------------------------------------- selftest
-def fake_disk(sysfs, path, majmin, wc, fua, model="Virtual Disk", parts=()):
-    """A disk at SYSFS/devices/PATH with optional partitions [(name, majmin)]; registers /sys/dev/block links."""
+def fake_disk(sysfs, path, majmin, wc, fua, model="Virtual Disk", parts=(), report="same"):
+    """A disk at SYSFS/devices/PATH with optional partitions [(name, majmin)]; registers /sys/dev/block links. REPORT
+    (comp review 1 LOW 13) is the drive's own cache report: an sd disk's device/scsi_disk/0:0:0:0/cache_type, an NVMe
+    disk's VWC for fake_nvme ("1", "0" or "unreadable: why", in a fake_vwc file); "same": the report agreeing with WC;
+    None: no report."""
     d = os.path.join(sysfs, "devices", path)
     os.makedirs(os.path.join(d, "queue"))
     os.makedirs(os.path.join(d, "device"))
+    name = os.path.basename(d)
+    if report == "same":
+        report = None if wc not in ("write back", "write through") else (
+            ("1" if wc == "write back" else "0") if name.startswith("nvme") else wc)
     for f, v in (("queue/write_cache", wc), ("queue/fua", fua), ("device/model", model), ("queue/rotational", "0")):
         if v is not None:
             open(os.path.join(d, f), "w").write(v + "\n")
+    if report is not None and name.startswith("nvme"):
+        open(os.path.join(d, "fake_vwc"), "w").write(report + "\n")
+    elif report is not None:
+        os.makedirs(os.path.join(d, "device", "scsi_disk", "0:0:0:0"))
+        open(os.path.join(d, "device", "scsi_disk", "0:0:0:0", "cache_type"), "w").write(report + "\n")
     link(sysfs, majmin, d)
     for pn, pmm in parts:
         p = os.path.join(d, pn)
@@ -195,63 +207,88 @@ def link(sysfs, majmin, target):
     os.symlink(os.path.relpath(target, b), os.path.join(b, majmin))
 
 
-def fake_loop(sysfs, n, majmin, backing):
+def fake_loop(sysfs, n, majmin, backing, wc="write back"):
+    """A loop device; its own queue/write_cache is WC (a real loop device reads "write back")."""
     d = os.path.join(sysfs, "devices", "virtual", "block", f"loop{n}")
     os.makedirs(os.path.join(d, "loop"))
+    os.makedirs(os.path.join(d, "queue"))
     open(os.path.join(d, "loop", "backing_file"), "w").write(backing + "\n")
+    open(os.path.join(d, "queue", "write_cache"), "w").write(wc + "\n")
     link(sysfs, majmin, d)
     return d
 
 
-def fake_dm(sysfs, majmin, slave_dirs):
+def fake_dm(sysfs, majmin, slave_dirs, wc="write back"):
     d = os.path.join(sysfs, "devices", "virtual", "block", "dm-0")
     os.makedirs(os.path.join(d, "slaves"))
+    os.makedirs(os.path.join(d, "queue"))
+    open(os.path.join(d, "queue", "write_cache"), "w").write(wc + "\n")
     for s in slave_dirs:
         os.symlink(os.path.relpath(s, os.path.join(d, "slaves")), os.path.join(d, "slaves", os.path.basename(s)))
     link(sysfs, majmin, d)
     return d
 
 
+def fake_nvme(disk_dir):
+    """The selftest's NVMe cache report (comp review 1 LOW 13): the fake disk's fake_vwc in place of the Identify
+    Controller ioctl -- ("write back" | "write through", source), or Unread for "unreadable: why" or no file."""
+    v = read(os.path.join(disk_dir, "fake_vwc"))
+    if v in ("0", "1"):
+        return ("write back" if v == "1" else "write through"), "fake Identify Controller VWC bit 0"
+    raise Unread(v[len("unreadable: "):] if v and v.startswith("unreadable: ") else f"no fake VWC under {disk_dir}")
+
+
+class Unread(Exception):  # (the selftest's fake raises it; defined here so the red's fixtures run at its base)
+    pass
+
+
 def selftest():
     # (name, builder(sysfs) -> (devof map, mount map or None for "rw,relatime" everywhere), want class or None for
     #  refused, want chain or None, want flush_reaches_drive or None)
+    # Comp review 1 LOW 13: flush_reaches_drive is "yes", "no", "n/a: write-through" (the kernel sends a write-through
+    # leaf no flush: it has nothing to drain), "n/a: volatile RAM" or "unknown" (the drive's own cache report was not
+    # read, so the kernel's write_cache may be an override); every layer's write_cache is read, and a drive report
+    # that disagrees with its leaf's write_cache is refused. NVMe reports come from fake_nvme, not the ioctl.
+    globals()["NVME_REPORT"] = fake_nvme
     cases = []
     MNTX, BACK = "/mnt/fastest-xfs", "/fastest-loop-xfs.img"
 
-    def loop_on(wc, fua, model, disk="sda", part="sda1", mounts=None):
+    def loop_on(wc, fua, model, disk="sda", part="sda1", mounts=None, loop_wc="write back", report="same"):
         def b(s):
-            fake_disk(s, f"pci0/host0/block/{disk}", "8:0", wc, fua, model, parts=[(part, "8:1")])
-            fake_loop(s, 0, "7:0", BACK)
+            fake_disk(s, f"pci0/host0/block/{disk}", "8:0", wc, fua, model, parts=[(part, "8:1")], report=report)
+            fake_loop(s, 0, "7:0", BACK, wc=loop_wc)
             return {MNTX: "7:0", BACK: "8:1"}, mounts
         return b
+    # (LOW 13 flips this case: True claimed a flush reaches a write-through leaf, from which the kernel strips it)
     cases.append(("xfs loop on a write-through sda (GitHub's Virtual Disk)",
                   loop_on("write through", "0", "Virtual Disk"), "write-through",
-                  ["loop0", BACK, "sda1", "sda"], True))
+                  ["loop0", BACK, "sda1", "sda"], "n/a: write-through"))
     cases.append(("xfs loop on a write-back NVMe with FUA (MSFT NVMe Accelerator)",
                   loop_on("write back", "1", "MSFT NVMe Accelerator v1.0", "nvme0n1", "nvme0n1p1"), "write-back+fua",
-                  ["loop0", BACK, "nvme0n1p1", "nvme0n1"], True))
+                  ["loop0", BACK, "nvme0n1p1", "nvme0n1"], "yes"))
     cases.append(("write back without FUA", loop_on("write back", "0", "x"), "write-back-no-fua", None, None))
     # finding 3: the loop's flush is an fsync of the backing file, and a nobarrier filesystem sends nothing down
     nob = {MNTX: ("/mnt/fastest-xfs", "/dev/loop0", "xfs", "rw,relatime,attr2,inode64"),
            BACK: ("/", "/dev/root", "ext4", "rw,relatime,nobarrier,discard")}
     cases.append(("NVMe with FUA under a backing filesystem mounted nobarrier",
                   loop_on("write back", "1", "MSFT NVMe Accelerator v1.0", "nvme0n1", "nvme0n1p1", nob),
-                  "write-back+fua", None, False))
+                  "write-back+fua", None, "no"))
     b0 = {MNTX: ("/mnt/fastest-xfs", "/dev/loop0", "btrfs", "rw,barrier=0"), BACK: ("/", "/dev/sda1", "ext4", "rw")}
-    cases.append(("barrier=0 on the run's own filesystem", loop_on("write through", "0", "Virtual Disk", mounts=b0),
-                  "write-through", None, False))
+    cases.append(("barrier=0 on the run's own filesystem over a write-through leaf (nothing to drain either way)",
+                  loop_on("write through", "0", "Virtual Disk", mounts=b0), "write-through", None, "n/a: write-through"))
     cases.append(("mount options cannot be read", loop_on("write through", "0", "Virtual Disk", mounts={}), None, None,
                   None))
 
     def whole(s):
         fake_disk(s, "pci0/nvme/block/nvme1n1", "259:0", "write back", "1", "Datacenter NVMe")
         return {"/data/work": "259:0"}, None
-    cases.append(("a real data disk, no loop, no partition (a T3 cell)", whole, "write-back+fua", ["nvme1n1"], True))
+    cases.append(("a real data disk, no loop, no partition (a T3 cell)", whole, "write-back+fua", ["nvme1n1"], "yes"))
 
     def ram(s):  # finding 7: brd's ram0 says "write through" and is volatile
-        fake_disk(s, "virtual/block/ram0", "1:0", "write through", "0", None)
+        fake_disk(s, "virtual/block/ram0", "1:0", "write through", "0", None, report=None)
         return {"/mnt/brd": "1:0"}, None
-    cases.append(("a RAM disk (brd ram0) is volatile, not write-through", ram, "ram-volatile", ["ram0"], None))
+    cases.append(("a RAM disk (brd ram0) is volatile, not write-through", ram, "ram-volatile", ["ram0"],
+                  "n/a: volatile RAM"))
 
     def dm(wc2):
         def b(s):
@@ -261,7 +298,28 @@ def selftest():
             return {"/mnt/x": "253:0"}, None
         return b
     cases.append(("device-mapper over two write-through disks", dm("write through"), "write-through",
-                  ["dm-0", "sda2", "sda", "sdb1", "sdb"], None))
+                  ["dm-0", "sda2", "sda", "sdb1", "sdb"], "n/a: write-through"))
+    # LOW 13's new cases: a write-through LAYER strips the flush before the drive; a drive report that disagrees with
+    # its leaf's write_cache means one was overridden (v3floor's refusal); an unread report leaves the flush unknown
+    cases.append(("a write-through loop layer over an NVMe with FUA (the flush stops at the loop)",
+                  loop_on("write back", "1", "MSFT NVMe Accelerator v1.0", "nvme0n1", "nvme0n1p1",
+                          loop_wc="write through"), "write-back+fua", None, "no"))
+
+    def nvme_override(s):
+        fake_disk(s, "pci0/nvme/block/nvme1n1", "259:0", "write through", "0", "Datacenter NVMe", report="1")
+        return {"/data/work": "259:0"}, None
+    cases.append(("an NVMe whose queue says write through while the drive reports a volatile cache (VWC 1)",
+                  nvme_override, None, None, None))
+    cases.append(("an sd whose queue says write through while its cache_type says write back",
+                  loop_on("write through", "0", "Virtual Disk", report="write back"), None, None, None))
+
+    def nvme_unread(s):
+        fake_disk(s, "pci0/nvme/block/nvme1n1", "259:0", "write back", "1", "Datacenter NVMe",
+                  report="unreadable: open /dev/nvme1: Permission denied")
+        return {"/data/work": "259:0"}, None
+    cases.append(("an NVMe whose own cache report cannot be read", nvme_unread, "write-back+fua", None, "unknown"))
+    cases.append(("a write-through sd with no cache report (an override could hide a cache)",
+                  loop_on("write through", "0", "Virtual Disk", report=None), "write-through", None, "unknown"))
     cases.append(("device-mapper over disks of different classes", dm("write back"), None, None, None))
     cases.append(("no write_cache file", loop_on(None, "0", "x"), None, None, None))
     cases.append(("write back with no fua file", loop_on("write back", None, "x"), None, None, None))
