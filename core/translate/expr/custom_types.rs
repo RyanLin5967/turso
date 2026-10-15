@@ -1980,6 +1980,34 @@ mod tests {
         assert!(bad.is_empty(), "CLAIM: a numeric typmod rounded or overflowed unlike PostgreSQL: {bad:?}");
     }
 
+    /// Class (a) (DECISIONS 994f7d41e0), the typmod's other DDL: ALTER TABLE ADD COLUMN declared a
+    /// numeric(p, s) column with no check at all (CREATE TABLE at least counted the parameters).
+    /// PG 18.6 refuses numeric(1001, 0) and numeric(1000, 1001) there with its 22023 messages and
+    /// adds numeric(10, 2) (artie raw pg18-numeric-typmod-round.txt 048831ffdf, appended).
+    #[test]
+    fn alter_table_add_column_refuses_a_numeric_typmod_outside_postgresqls_range() {
+        let base = || vec!["CREATE TABLE al(id INTEGER PRIMARY KEY) STRICT".to_string()];
+        let mut bad = Vec::new();
+        for (col, want) in [
+            ("y numeric(1001, 0)", Err("NUMERIC precision 1001 must be between 1 and 1000")),
+            ("z numeric(1000, 1001)", Err("NUMERIC scale 1001 must be between -1000 and 1000")),
+            ("w numeric(10, 2)", Ok(())),
+        ] {
+            let mut steps = base();
+            steps.push(format!("ALTER TABLE al ADD COLUMN {col}"));
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(_), Ok(())) => true,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("ADD COLUMN {col} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN took a numeric typmod unlike PostgreSQL: {bad:?}");
+    }
+
     /// Review 0e8b1cf18..0a4a127a1 numeric MED 1 (DECISIONS d1a8dcb982): a product's scale was the sum
     /// of the display scales uncapped (PostgreSQL caps it at 16383), and add, sub and mul did not
     /// refuse a result past 131072 integer digits (PostgreSQL: 22003, "value overflows numeric
