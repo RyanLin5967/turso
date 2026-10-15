@@ -616,8 +616,8 @@ impl Group {
     }
 
     /// Record a flight's outcome and wake every waiter: on success every byte below `end` is
-    /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) replaces
-    /// the last one for the confirmation writer. Returns whether the landing was accepted: a flight
+    /// durable in `class` and every weaker one, and the flight's confirmation (`confirm`) is offered
+    /// to the confirmation writer (`offer_confirm`). Returns whether the landing was accepted: a flight
     /// that succeeded on a store fail-stopped meanwhile is refused, and its owner must say so
     /// (engine review 9 #3).
     fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
@@ -630,13 +630,7 @@ impl Group {
                 self.set_durable(&mut g, c, end);
             }
             if let Some(confirm) = confirm {
-                // The writer sleeps without a deadline while it holds nothing it may write: woken
-                // when that changes.
-                let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
-                replaced = g.confirm.replace((Instant::now(), confirm));
-                if wake {
-                    self.confirm_cv.notify_one();
-                }
+                replaced = self.offer_confirm(&mut g, confirm);
             }
         } else {
             self.failed.store(true, Ordering::Release);
@@ -664,17 +658,41 @@ impl Group {
         self.cv.notify_all();
     }
 
+    /// Hand `confirm` to the confirmation writer, under the group's lock: it replaces the one held
+    /// when it supersedes it (`Confirm::supersedes`). Returns the confirmation let go, for the caller
+    /// to close holding no lock.
+    fn offer_confirm(&self, g: &mut GroupState, confirm: Confirm) -> Option<Confirm> {
+        if g.confirm.as_ref().is_some_and(|(_, held)| !confirm.supersedes(held)) {
+            return Some(confirm);
+        }
+        // The writer sleeps without a deadline while it holds nothing it may write: woken when that
+        // changes.
+        let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
+        let replaced = g.confirm.replace((Instant::now(), confirm)).map(|(_, c)| c);
+        if wake {
+            self.confirm_cv.notify_one();
+        }
+        replaced
+    }
+
     /// A held-free upgrade's landing (`BranchStore::sync_upgrade`), called holding the store mutex:
     /// every byte below `end` is durable in `class` and every weaker one, unless the store
-    /// fail-stopped meanwhile. It had no frames, so the last flight's confirmation is kept.
-    fn mark_upgraded(&self, end: u64, class: SyncClass) {
+    /// fail-stopped meanwhile. It had no frames, so it does not move the log's last flight;
+    /// `confirm`, that flight's confirmation (engine review 21 MED 6), is offered to the writer.
+    /// Returns the confirmation let go, for the caller to close holding no lock.
+    fn mark_upgraded(&self, end: u64, class: SyncClass, confirm: Option<Confirm>) -> Option<Confirm> {
         let mut g = self.lock();
+        let mut left = confirm;
         if self.accepts() {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
             }
+            if let Some(confirm) = left.take() {
+                left = self.offer_confirm(&mut g, confirm);
+            }
         }
         self.cv.notify_all();
+        left
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -4551,9 +4569,11 @@ impl BranchStore {
     /// (the rewrite replaced the log it synced, and made durable itself what it kept). Only the
     /// first raise of the header's class makes it `exclusive`: it then holds the flight slot, once
     /// per store. On success it marks every byte written at its take durable in the free class read
-    /// then, under the store mutex and only over the same log, and returns the frees that covers.
-    /// Nothing is taken when what it was armed for (`due`) or everything written is durable in that
-    /// class already (a FULL trunk commit's flush covered it; engine review 21 LOW 16). A failed sync
+    /// then, under the store mutex and only over the same log, and returns the frees that covers;
+    /// when no flight was taken since, it also hands the confirmation writer the confirmation of the
+    /// log's last flight, which it made durable (engine review 21 MED 6). Nothing is taken when
+    /// what it was armed for (`due`) or everything written is durable in that class already (a
+    /// FULL trunk commit's flush covered it; engine review 21 LOW 16). A failed sync
     /// fail-stops the store, as a failed flight does (failpoint `UpgradeSyncFails`). `hold` is the
     /// test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`). Kill points `upgrade.taken` and
     /// `upgrade.landed`.
@@ -4595,7 +4615,7 @@ impl BranchStore {
             let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
                 return Ok(());
             };
-            match journal.take_upgrade(arena, class) {
+            match journal.take_upgrade(arena, class, end) {
                 Ok(mut upgrade) => {
                     upgrade.fail = fail;
                     g.upgrading = true;
@@ -4615,19 +4635,30 @@ impl BranchStore {
         #[cfg(test)]
         pause_at(hold, HOLD_FLIGHT_TAKEN);
         let (class, at, rewrites, exclusive) = (upgrade.class, upgrade.at, upgrade.rewrites, upgrade.exclusive);
-        let synced = upgrade.sync();
+        let (synced, mut confirm) = split_confirm(upgrade.sync());
         group.end_upgrade(exclusive, synced.is_ok());
         synced?;
         let mut inner = store.lock();
-        let same_log = inner
+        let landed = inner
             .journal
             .as_mut()
-            .is_some_and(|journal| journal.upgrade_landed(at, rewrites));
-        if same_log {
-            group.mark_upgraded(end, class);
+            .and_then(|journal| journal.upgrade_landed(at, rewrites));
+        if let Some(last) = landed {
+            // The upgrade's confirmation names the flight that was last at its take: offered only
+            // if no flight was taken since (engine review 21 MED 6). Mutant
+            // `held_free_upgrade_confirms_nothing` (test builds only): none, as before.
+            let offered = if last && !fe_mutant("held_free_upgrade_confirms_nothing") {
+                confirm.take()
+            } else {
+                None
+            };
+            confirm = group.mark_upgraded(end, class, offered).or(confirm);
         }
         kill_point("upgrade.landed");
         inner.mature_frees(group.durable(class));
+        drop(inner);
+        // A confirmation not kept is closed holding no lock.
+        drop(confirm);
         Ok(())
     }
 

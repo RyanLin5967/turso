@@ -2457,8 +2457,9 @@ impl Journal {
     /// cost of one repeated plain fsync of each by the next syncing flight per upgrade. When the
     /// upgrade raises the class the header records, it writes that field, and is then `exclusive`
     /// (it holds the flight slot), so no flight's own header write can race it; the first raise of
-    /// a store only. A take that fails fail-stops the journal, as a flight's does.
-    pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass) -> Result<Upgrade> {
+    /// a store only. A take that fails fail-stops the journal, as a flight's does. `end_lsn` is the
+    /// group's written mark, where the log's last flight ends (its confirmation's, `Upgrade::sync`).
+    pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass, end_lsn: u64) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
         let taken = (|| -> Result<(File, Option<File>)> {
@@ -2499,22 +2500,27 @@ impl Journal {
             header,
             class,
             at: self.len,
+            end_lsn,
             rewrites: self.rewrites,
             fail: false,
         })
     }
 
-    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed. Returns whether
-    /// the log is still the one it synced (no rewrite ran since), the condition for its landing to
-    /// mark anything (engine review 21 MED 2). When no flight was taken either, every byte the log
-    /// holds was synced, so the next flight's end frame says so (`prev_synced`), as after an
-    /// upgrade flight.
-    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) -> bool {
-        let same_log = self.rewrites == rewrites;
-        if same_log && self.len == at {
+    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed. `None` when a
+    /// rewrite ran since: the log is not the one it synced, and its landing marks nothing (engine
+    /// review 21 MED 2). Otherwise whether no flight was taken since either (the log still ends at
+    /// `at`): then every byte the log holds was synced, so the next flight's end frame says so
+    /// (`prev_synced`), as after an upgrade flight, and the log's last flight is the one the
+    /// upgrade's confirmation names (engine review 21 MED 6).
+    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) -> Option<bool> {
+        if self.rewrites != rewrites {
+            return None;
+        }
+        let last = self.len == at;
+        if last {
             self.prev_synced = true;
         }
-        same_log
+        Some(last)
     }
 
     /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
@@ -2804,11 +2810,34 @@ fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32
 pub(crate) struct Confirm {
     log: File,
     word: u32,
+    /// The journal's `lsn` at the end of the flight it confirms: a confirmation of a later flight
+    /// supersedes it (`supersedes`).
+    lsn: u64,
     /// The flight's sync proved stable storage (`proves_stable`); otherwise only a close, after a
     /// full flush of its own, may write the word.
     proved: bool,
     /// The `ConfirmWriteFails` failpoint.
     fail: bool,
+}
+
+/// The confirmation of the log's last flight, for a sync that wrote no frame of its own (engine
+/// review 21 MED 6: a zero-byte upgrade flight, a held-free upgrade): read from `log`, which ends at
+/// `at`, where that flight's end frame ends (its checksum is the log's last 4 bytes, as
+/// `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log holds no flight, or
+/// the read fails: the word's absence proves nothing.
+fn confirm_last(log: File, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
+    if at < (LOG_HEADER_LEN + END_FRAME_LEN) as u64 {
+        return None;
+    }
+    let mut crc = [0u8; 4];
+    read_at(&log, &mut crc, at - 4).ok()?;
+    Some(Confirm {
+        word: confirm_word(u32::from_le_bytes(crc), at),
+        lsn,
+        proved,
+        fail,
+        log,
+    })
 }
 
 impl Journal {
@@ -2835,6 +2864,7 @@ impl Confirm {
         Self {
             log,
             word: 0,
+            lsn: 0,
             proved,
             fail: false,
         }
@@ -2843,6 +2873,14 @@ impl Confirm {
     /// Whether the word may be written as is (`proved`).
     pub(crate) fn proved(&self) -> bool {
         self.proved
+    }
+
+    /// Whether this confirmation replaces `held` as the one the confirmation writer holds: it
+    /// confirms a later flight, or the same one with the proof `held` lacks. A sync that wrote no
+    /// frame confirms the last flight landed before it, which a later flight's own confirmation may
+    /// already have replaced (engine review 21 MED 6).
+    pub(crate) fn supersedes(&self, held: &Confirm) -> bool {
+        self.lsn > held.lsn || (self.lsn == held.lsn && self.proved && !held.proved)
     }
 
     /// Write the word (unsynced: its absence proves nothing, its presence that the sync returned).
@@ -3072,6 +3110,7 @@ impl Flight {
                 let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
                 let c = Confirm {
                     word: confirm_word(crc, self.at + self.bytes.len() as u64),
+                    lsn: self.end_lsn,
                     proved: proves_stable(self.class),
                     fail: self.fail_confirm,
                     log,
@@ -3081,6 +3120,13 @@ impl Flight {
                 } else {
                     confirm = Some(c);
                 }
+            } else if self.bytes.is_empty() && !super::store::fe_mutant("upgrade_confirms_nothing") {
+                // A zero-byte upgrade: its flush made the log's last flight durable, slots and
+                // records, and wrote no end frame of its own, so it confirms that flight (engine
+                // review 21 MED 6). Unconfirmed, a slot of it damaged after the acknowledgement had
+                // open drop the flight silently. Mutant `upgrade_confirms_nothing` (test builds
+                // only): no confirmation, as before.
+                confirm = confirm_last(log, self.at, self.end_lsn, proves_stable(self.class), self.fail_confirm);
             }
         }
         // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
@@ -3126,6 +3172,9 @@ pub(crate) struct Upgrade {
     /// The log's length and its rewrite count when taken (`Journal::upgrade_landed`).
     pub(crate) at: u64,
     pub(crate) rewrites: u64,
+    /// The group's written mark when taken: where the log's last flight ends, as its confirmation
+    /// says (`Confirm::supersedes`).
+    end_lsn: u64,
     /// The `UpgradeSyncFails` failpoint (engine review 21 MED 4): the sync fails.
     pub(crate) fail: bool,
 }
@@ -3137,7 +3186,11 @@ impl Upgrade {
     /// sync left out; killed by `a_held_free_upgrade_syncs_the_arena_and_the_log`. No mutant drops
     /// the directory's sync: no test reaches a dirty directory under an upgrade (a raised store's
     /// rewrites sync and leave it clean), so one would have no killer.
-    pub(crate) fn sync(self) -> Result<()> {
+    ///
+    /// Returns the confirmation of the log's last flight, which the sync made durable (engine review
+    /// 21 MED 6): the store offers it only if that flight is still the last when the upgrade lands
+    /// (`Journal::upgrade_landed`).
+    pub(crate) fn sync(self) -> Result<Option<Confirm>> {
         if self.fail {
             return Err(LimboError::InternalError(
                 "failpoint: the held-free upgrade's sync failed".to_string(),
@@ -3155,9 +3208,10 @@ impl Upgrade {
             fsync_dir(dir, SyncClass::Fsync)?;
         }
         if super::store::fe_mutant("upgrade_no_log_sync") {
-            return Ok(());
+            return Ok(None);
         }
-        fsync_file(&self.log, self.class)
+        fsync_file(&self.log, self.class)?;
+        Ok(confirm_last(self.log, self.at, self.end_lsn, proves_stable(self.class), false))
     }
 }
 
