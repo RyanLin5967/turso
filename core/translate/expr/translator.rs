@@ -616,6 +616,17 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                            return Ok(target_register);
+                        }
+                        // A numeric base with no ENCODE (bigint, float4, float8) converts as
+                        // its base does: left a no-op, CAST('1.5' AS float8) stayed text where
+                        // SQLite's name rule ("FLOA") makes it REAL.
+                        let base_affinity = Affinity::affinity(type_def.base());
+                        if matches!(base_affinity, Affinity::Integer | Affinity::Real) {
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: base_affinity,
+                            });
                         }
                         return Ok(target_register);
                     }
