@@ -781,6 +781,12 @@ fn main() {
             ),
         ),
     };
+    // the measured span's bounds are the first window's open and the last one's close: a run with no window has none
+    // (unreachable: --phases is 1-4 and cycle mode has one window), and is refused rather than printed as NaN
+    let (Some(first), Some(last)) = (windows.first(), windows.last()) else {
+        not_a_result("no measured window, so no measured span")
+    };
+    let (tm0, tm1) = (first.4, last.5);
     let even = a.ops_of.iter().all(|&n| n == a.ops_of[0]);
     let by_client: Vec<String> = a.ops_of.iter().map(|n| n.to_string()).collect();
     let mut json = format!(
@@ -795,8 +801,8 @@ fn main() {
         a.rows,
         a.phases,
         if a.mode == Mode::Phases { "phases" } else { "cycle" },
-        windows.first().map_or(f64::NAN, |w| w.4),
-        windows.last().map_or(f64::NAN, |w| w.5)
+        tm0,
+        tm1
     );
     for (k, (name, secs, syncs, busy, rt0, rt1)) in windows.iter().enumerate() {
         let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();

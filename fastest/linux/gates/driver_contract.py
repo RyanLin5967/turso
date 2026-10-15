@@ -13,6 +13,8 @@
             implies stop_secs >= S, and OPS and S both met implies not capped (review 5 LOW 15),
           - drain_secs >= 0, secs == stop_secs + drain_secs (to print precision), ops == ops_at_stop (A23 counts
             claims, so nothing is counted after the claim that ended the warm-up; review 5 LOW 15).
+  driver_contract.py tie SUMMARY.json WARMUP-LIVE.json          the live warm-up record is that run's own warm-up
+                                                                (tie()); exit 0 kept, 1 broken, 2 unreadable
   driver_contract.py self-test                                  the checker on synthetic records; exit 0 iff all pass
 
 The fastest-gates release job runs the built driver with rules whose outcome is forced (1000000:0:2 must run to
@@ -88,6 +90,33 @@ def check(j, t, c, rule, by_client=None):
         bad.append(f"warmup.t0_after_ready_ns {rd!r}: the warm-up's start must follow the last client's ready (an int "
                    ">= 0 ns), so no connect or setup counts as warm-up")
     return bad + stamp_problems(j)
+
+
+def tie(j, live):
+    """The live warm-up record (warmup-live.json) is the run's own warm-up (summary.json `warmup`): the replay in
+    warmup_conformance.py live shares warm_ends with the live loop, so only this ties the record to the run (fresh read
+    of 7a8c3a817..0802dd739, finding 2). One claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, the
+    stop's claim at stop_secs (printed to ms), the same capped and rule."""
+    if not isinstance(live, dict):
+        return ["no live warm-up record (warmup-live.json)"]
+    w = j.get("warmup") or {}
+    claims, st, wo, cap = live.get("claims_ns"), live.get("stop_at"), live.get("warm_ops"), live.get("capped")
+    bad = []
+    if not isinstance(claims, list) or not claims or any(type(c) is not int for c in claims):
+        return ["the live record's claims_ns is not a non-empty list of ints"]
+    if type(st) is not int or len(claims) != st + 1:
+        bad.append(f"{len(claims)} live claims for stop_at {st!r}: want one per warm-up op plus the stop's")
+    if not (st == wo == w.get("ops_at_stop") == w.get("ops")):
+        bad.append(f"live stop_at {st!r}, warm_ops {wo!r}; summary ops_at_stop {w.get('ops_at_stop')!r}, ops "
+                   f"{w.get('ops')!r}: not one warm-up")
+    ss = w.get("stop_secs")
+    if not isinstance(ss, (int, float)) or abs(claims[-1] / 1e9 - ss) > 0.0005 + 1e-9:
+        bad.append(f"the live stop's claim at {claims[-1] / 1e9:.6f} s, summary stop_secs {ss!r}")
+    if cap not in (0, 1) or bool(cap) != w.get("capped"):
+        bad.append(f"live capped {cap!r}, summary capped {w.get('capped')!r}")
+    if live.get("rule") != w.get("rule"):
+        bad.append(f"live rule {live.get('rule')!r}, summary rule {w.get('rule')!r}")
+    return bad
 
 
 STAMP_SLACK_S = 0.05  # a window's realtime span vs its monotonic secs: two clocks read a few calls apart
@@ -283,6 +312,17 @@ def self_test():
 def main(a):
     if a[1:] == ["self-test"]:
         return self_test()
+    if a[1:2] == ["tie"] and len(a) == 4:
+        try:
+            j, live = json.load(open(a[2])), json.load(open(a[3]))
+        except (OSError, ValueError) as e:
+            print(f"driver contract tie: REFUSED: {type(e).__name__}: {e}")
+            return 2
+        bad = tie(j, live)
+        for b in bad:
+            print(f"driver contract tie: {a[3]}: {b}")
+        print(f"driver contract tie: {a[3]}: {'ok' if not bad else 'BROKEN'}")
+        return 0 if not bad else 1
     if a[1:2] == ["check"] and len(a) in (6, 7):
         j = json.load(open(a[2]))
         by = [int(x) for x in a[6].split(",")] if len(a) == 7 else None
