@@ -3249,27 +3249,71 @@ impl Lineage {
 
 /// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
 /// resident branch's row, current page map and retained versions, with what changed in it.
+/// A branch state's catalog row (`capture_rows`, and L2(d)'s copy-on-write pre-image).
+fn row_of(id: BranchId, st: &BranchState) -> CatBranch {
+    CatBranch {
+        id: id.0,
+        parent: st.parent.0,
+        fork_epoch: st.fork_epoch,
+        epoch: st.lineage.epoch,
+        released: st.handle == Handle::Released,
+        held_open: st.handle == Handle::Released && st.open,
+        lease: if st.handle == Handle::Released { None } else { st.lease },
+        n_children: st.lineage.n_children,
+        current: st
+            .current
+            .iter()
+            .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+            .collect(),
+        retained: st.lineage.retained_list(),
+        name: None,
+    }
+}
+
+impl super::table::Preimage for BranchState {
+    type Row = CatBranch;
+    fn preimage(&self, id: BranchId) -> CatBranch {
+        row_of(id, self)
+    }
+}
+
+/// Test builds (`FE_CAPTURE_VERIFY`): the rows the copy-on-write gave the writer equal the rows
+/// the capture would have built, the old way, at the capture point. A mutation path that changed a
+/// frozen state without the table's preserve makes them differ: a panic naming the branch.
+#[cfg(test)]
+fn verify_frozen_rows(want: Vec<(CatBranch, u8)>, got: &[(CatBranch, u8)]) {
+    let norm = |rows: &[(CatBranch, u8)]| {
+        let mut v: Vec<_> = rows
+            .iter()
+            .map(|(b, w)| {
+                let mut b = b.clone();
+                b.current.sort_unstable();
+                b.retained.sort_unstable();
+                (b.id, format!("{b:?}"), *w)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let (want, got) = (norm(&want), norm(got));
+    if want != got {
+        let diff: Vec<_> = want.iter().zip(got.iter()).filter(|(a, b)| a != b).take(3).collect();
+        panic!(
+            "FE_CAPTURE_VERIFY: the frozen rows differ from the capture's ({} vs {} rows); first differences: {diff:?}",
+            want.len(),
+            got.len()
+        );
+    }
+}
+
+/// Rows a fuzzy checkpoint's writer encodes per store-mutex hold (L2(d), ASYNC-DESIGN R1.3's
+/// CKPT_BATCH): its rows are encoded in batches, each hold O(64 rows).
+const CKPT_BATCH: usize = 64;
+
 fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
-        .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
-        .map(|(&id, st, what)| (CatBranch {
-            id: id.0,
-            parent: st.parent.0,
-            fork_epoch: st.fork_epoch,
-            epoch: st.lineage.epoch,
-            released: st.handle == Handle::Released,
-            held_open: st.handle == Handle::Released && st.open,
-            lease: if st.handle == Handle::Released { None } else { st.lease },
-            n_children: st.lineage.n_children,
-            current: st
-                .current
-                .iter()
-                .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                .collect(),
-            retained: st.lineage.retained_list(),
-            name: None,
-        }, what))
+        .filter_map(|(id, &what)| branches.get(id).map(|st| (row_of(*id, st), what)))
         .collect();
     #[cfg(test)]
     CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
@@ -3315,7 +3359,17 @@ struct Captured {
     generation: u64,
     /// The logical log position the capture covers (`Journal::mark`).
     log_from: u64,
+    /// The rows the catalog takes: built at the capture (a sharp checkpoint), or, for a fuzzy one,
+    /// frozen in the branch table at the capture and encoded into here by its writer (L2(d),
+    /// `BranchTable::freeze`) before it writes anything.
     rows: Vec<(CatBranch, u8)>,
+    /// Test builds with `FE_CAPTURE_VERIFY` set: every frozen row encoded at the capture too, the
+    /// old way, for the writer to compare with what the copy-on-write gave it (a mutation path that
+    /// skips the table's preserve would make them differ).
+    #[cfg(test)]
+    verify: Option<Vec<(CatBranch, u8)>>,
+    /// Whether the rows are frozen in the branch table, owed to the writer (fuzzy, L2(d)).
+    rows_frozen: bool,
     /// The dirty map the capture swapped out: merged back if the write fails.
     dirty: BTreeMap<BranchId, u8>,
     removed: Vec<BranchId>,
@@ -3645,6 +3699,24 @@ fn run_flight(
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
     ckpt_phase("start");
+    // L2(d): the rows the capture froze, encoded first, CKPT_BATCH per store-mutex hold, each as of
+    // the capture (a state changed since was encoded by the table the moment before it changed;
+    // `BranchTable::freeze`). Short, so the copy-on-write window is too.
+    let mut cap = cap;
+    if cap.rows_frozen {
+        let rows = loop {
+            let mut guard = inner.lock();
+            if let Some(rows) = guard.branches.encode_frozen(CKPT_BATCH) {
+                break rows;
+            }
+        };
+        #[cfg(test)]
+        if let Some(want) = cap.verify.take() {
+            verify_frozen_rows(want, &rows);
+        }
+        cap.rows = rows;
+    }
+    ckpt_phase("rows");
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3705,7 +3777,6 @@ fn run_flight(
         )
     });
     let (written, rows_written) = written;
-    let mut cap = cap;
     cap.shape_rows_written = rows_written;
     let write_ns = ns(t);
     if written.is_ok() {
@@ -6113,7 +6184,7 @@ impl BranchStore {
                         *cat.dirty.entry(id).or_insert(0) |= what;
                     }
                 }
-                inner.names.unfreeze();
+                inner.unfreeze_capture();
                 FlightStart::Failed
             }
         }
@@ -9291,8 +9362,8 @@ impl BranchStore {
         for (id, what) in cap.dirty {
             *cat.dirty.entry(id).or_insert(0) |= what;
         }
-        // And its frozen names (L2(d) slice 1), as any capture that is not written.
-        inner.names.unfreeze();
+        // And its frozen names and rows (L2(d)), as any capture that is not written.
+        inner.unfreeze_capture();
         Ok(())
     }
 
@@ -9602,6 +9673,10 @@ impl StoreInner {
         if self.branches.len() > cap {
             let excess = self.branches.len() - cap;
             let parked = &self.parked;
+            // A state whose row a fuzzy checkpoint still owes stays resident until its writer has
+            // encoded it (L2(d), `BranchTable::freeze`).
+            let table = &self.branches;
+            let frozen_owed = |id: &BranchId| table.frozen_owes(id);
             let mut yielded = 0u64;
             let scanned = std::cell::Cell::new(0u64);
             let victims: Vec<BranchId> = self
@@ -9610,6 +9685,7 @@ impl StoreInner {
                 .inspect(|_| yielded += 1)
                 .filter(|(id, st)| {
                     !cat.dirty.contains_key(*id)
+                        && !frozen_owed(id)
                         && !parked.contains_key(*id)
                         && matches!(st.handle, Handle::Detached | Handle::Released)
                         && !st.open
@@ -10142,6 +10218,18 @@ impl StoreInner {
     }
 
     /// Part of `id`'s catalog state (`DIRTY_*`) is stale: rewrite it at the next checkpoint.
+    /// A capture that will not be written (its dispatch failed, or a test undid it): its frozen
+    /// names and rows go back (L2(d), `NameIndex::unfreeze`, `BranchTable::unfreeze`).
+    fn unfreeze_capture(&mut self) {
+        self.names.unfreeze();
+        let back = self.branches.unfreeze(|row| BranchId(row.id));
+        if let Some(cat) = self.cat.as_mut() {
+            for (id, what) in back {
+                *cat.dirty.entry(id).or_insert(0) |= what;
+            }
+        }
+    }
+
     fn mark_dirty(&mut self, id: BranchId, what: u8) {
         if let Some(cat) = self.cat.as_mut() {
             if !id.is_trunk() {
@@ -10618,21 +10706,32 @@ impl StoreInner {
             return Err(e);
         }
         held_trace("capture.snapshot");
+        // A fuzzy capture FREEZES its rows (L2(d), O(1); `BranchTable::freeze`, at the end, after
+        // every fallible step): the writer encodes them, each as of the capture. A sharp one, under
+        // the mutex for its whole write anyway, builds them here. Mutant `capture_copies` (test
+        // builds only): the fuzzy capture builds them here too, O(dirty) under the mutex, as before.
+        let cow = fuzzy && early.is_none() && !fe_mutant("capture_copies");
         let (dirty, rows) = match early {
             Some(taken) => taken,
+            None if cow => (std::mem::take(&mut cat.dirty), Vec::new()),
             None => {
                 let dirty = std::mem::take(&mut cat.dirty);
                 let rows = capture_rows(&self.branches, &dirty);
                 (dirty, rows)
             }
         };
+        #[cfg(test)]
+        let verify = (cow && std::env::var_os("FE_CAPTURE_VERIFY").is_some()).then(|| capture_rows(&self.branches, &dirty));
         held_trace("capture.rows");
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
-        let (n_rows, n_trunk_new, n_trunk_gone) =
-            (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
+        let (n_rows, n_trunk_new, n_trunk_gone) = (
+            if cow { dirty.len() } else { rows.len() } as u64,
+            trunk_new.len() as u64,
+            trunk_gone.len() as u64,
+        );
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
         // F-W2: only a branch that reserved a slot since the last prune can hold one, so the walk
@@ -10751,10 +10850,35 @@ impl StoreInner {
         });
         self.names.frozen = Some(names.clone());
         held_trace("capture.names");
+        // The rows last, after every fallible step (see above): the dirty map moves into the
+        // branch table's freeze, and the capture keeps none of it.
+        let dirty = if cow {
+            if let Err(back) = self.branches.freeze(dirty) {
+                // Never: one flight at a time, and its writer or its undo ends the freeze. Refused
+                // rather than lose a row: the capture is undone as any failed one.
+                if let Some(cat) = self.cat.as_mut() {
+                    cat.catalog.end_read_snapshot();
+                    cat.flight = false;
+                    for (id, what) in back {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
+                }
+                self.names.unfreeze();
+                return Err(LimboError::InternalError(
+                    "a fuzzy capture while another's rows are still frozen".to_string(),
+                ));
+            }
+            BTreeMap::new()
+        } else {
+            dirty
+        };
         Ok(Box::new(Captured {
             generation,
             log_from,
             rows,
+            #[cfg(test)]
+            verify,
+            rows_frozen: cow,
             dirty,
             removed: cat.removed.iter().copied().collect(),
             trunk_new,
@@ -10813,6 +10937,10 @@ impl StoreInner {
             if !mutant("r13_install_err_drops_dirty") {
                 for (id, what) in cap.dirty {
                     *cat.dirty.entry(id).or_insert(0) |= what;
+                }
+                // A fuzzy capture's rows, which the dirty map was frozen into (L2(d)).
+                for (row, what) in &cap.rows {
+                    *cat.dirty.entry(BranchId(row.id)).or_insert(0) |= *what;
                 }
             }
             self.names.unfreeze();

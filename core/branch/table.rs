@@ -22,6 +22,32 @@
 //! `growth()` counts the top's doublings.
 
 use super::BranchId;
+use std::collections::BTreeMap;
+
+/// A state's row as a checkpoint writes it (L2(d)'s copy-on-write, `BranchTable::freeze`).
+pub(crate) trait Preimage {
+    type Row;
+    fn preimage(&self, id: BranchId) -> Self::Row;
+}
+
+impl Preimage for u64 {
+    type Row = u64;
+    fn preimage(&self, _: BranchId) -> u64 {
+        *self
+    }
+}
+
+/// The rows a fuzzy checkpoint's capture froze (L2(d), O(1) under the store mutex): the ids it
+/// covers and their dirty bits, swapped in whole at the capture. Each is encoded once, as of the
+/// capture: by the table, the moment before the first change to its state (`get_mut`, `insert` over
+/// it, `remove`), or by the writer, in batches (`encode_frozen`), from a state nothing has changed
+/// since the capture. So every row is exact to the capture point, which the replay of the log
+/// suffix after it needs (a Commit replayed onto a row that already holds it frees the slot it maps:
+/// fastest-engine NOTES, "L2(d)").
+pub(crate) struct Frozen<R> {
+    pub(crate) pending: BTreeMap<BranchId, u8>,
+    pub(crate) done: Vec<(R, u8)>,
+}
 
 pub(crate) const CHUNK: usize = 64;
 /// Chunk slots per directory segment.
@@ -34,7 +60,9 @@ struct Chunk<T> {
 
 type Segment<T> = Box<[Option<Chunk<T>>]>;
 
-pub(crate) struct BranchTable<T> {
+pub(crate) struct BranchTable<T: Preimage> {
+    /// A fuzzy checkpoint's frozen rows, encoded on first change (see [`Frozen`]).
+    frozen: Option<Frozen<T::Row>>,
     dir: Vec<Option<Segment<T>>>,
     len: usize,
     chunks: usize,
@@ -45,9 +73,10 @@ pub(crate) struct BranchTable<T> {
     chunk_allocs: u64,
 }
 
-impl<T> BranchTable<T> {
+impl<T: Preimage> BranchTable<T> {
     pub(crate) fn new() -> Self {
         Self {
+            frozen: None,
             dir: Vec::new(),
             len: 0,
             chunks: 0,
@@ -70,6 +99,7 @@ impl<T> BranchTable<T> {
     }
 
     pub(crate) fn get_mut(&mut self, id: &BranchId) -> Option<&mut T> {
+        self.preserve(id);
         let (g, c, i) = Self::at(id);
         self.dir.get_mut(g)?.as_mut()?[c].as_mut()?.entries[i].as_mut().map(|(_, v)| v)
     }
@@ -79,6 +109,7 @@ impl<T> BranchTable<T> {
     }
 
     pub(crate) fn insert(&mut self, id: BranchId, val: T) -> Option<T> {
+        self.preserve(&id);
         let (g, c, i) = Self::at(&id);
         if g >= self.dir.len() {
             let (len, cap) = (self.dir.len(), self.dir.capacity());
@@ -106,6 +137,7 @@ impl<T> BranchTable<T> {
     }
 
     pub(crate) fn remove(&mut self, id: &BranchId) -> Option<T> {
+        self.preserve(id);
         let (g, c, i) = Self::at(id);
         let segment = self.dir.get_mut(g)?.as_mut()?;
         let chunk = segment[c].as_mut()?;
@@ -125,6 +157,62 @@ impl<T> BranchTable<T> {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// The moment before `id`'s state changes: if a frozen checkpoint still owes its row, encode
+    /// it now, as of the capture. O(1) when nothing is frozen or `id` is not owed.
+    #[inline]
+    fn preserve(&mut self, id: &BranchId) {
+        let Some(what) = self.frozen.as_mut().and_then(|f| f.pending.remove(id)) else {
+            return;
+        };
+        if let Some(row) = self.get(id).map(|v| v.preimage(*id)) {
+            if let Some(f) = self.frozen.as_mut() {
+                f.done.push((row, what));
+            }
+        }
+    }
+
+    /// A fuzzy checkpoint's capture: freeze the rows of `dirty` (swapped in, O(1)). Refused, the
+    /// map handed back, while another freeze is still owed rows.
+    pub(crate) fn freeze(&mut self, dirty: BTreeMap<BranchId, u8>) -> Result<(), BTreeMap<BranchId, u8>> {
+        if self.frozen.is_some() {
+            return Err(dirty);
+        }
+        self.frozen = Some(Frozen { pending: dirty, done: Vec::new() });
+        Ok(())
+    }
+
+    /// The writer's batch: encode up to `max` owed rows from states unchanged since the capture.
+    /// `Some(rows)`, the freeze ended, once none is owed; the rows of ids with no state (removed
+    /// before the capture) are skipped, as the capture skipped them.
+    pub(crate) fn encode_frozen(&mut self, max: usize) -> Option<Vec<(T::Row, u8)>> {
+        for _ in 0..max {
+            let Some((id, what)) = self.frozen.as_mut()?.pending.pop_first() else {
+                break;
+            };
+            if let Some(row) = self.get(&id).map(|v| v.preimage(id)) {
+                self.frozen.as_mut()?.done.push((row, what));
+            }
+        }
+        if self.frozen.as_ref()?.pending.is_empty() {
+            return self.frozen.take().map(|f| f.done);
+        }
+        None
+    }
+
+    /// A freeze that will not be written (a capture undone): its ids and dirty bits, owed or
+    /// encoded, to mark dirty again. Empty if nothing is frozen.
+    pub(crate) fn unfreeze(&mut self, id_of: impl Fn(&T::Row) -> BranchId) -> Vec<(BranchId, u8)> {
+        let Some(f) = self.frozen.take() else {
+            return Vec::new();
+        };
+        f.pending.into_iter().chain(f.done.iter().map(|(r, w)| (id_of(r), *w))).collect()
+    }
+
+    /// Rows still owed by a freeze (an id the eviction must keep).
+    pub(crate) fn frozen_owes(&self, id: &BranchId) -> bool {
+        self.frozen.as_ref().is_some_and(|f| f.pending.contains_key(id))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -187,7 +275,7 @@ impl<T> BranchTable<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a BranchTable<T> {
+impl<'a, T: Preimage> IntoIterator for &'a BranchTable<T> {
     type Item = (&'a BranchId, &'a T);
     type IntoIter = Box<dyn Iterator<Item = (&'a BranchId, &'a T)> + 'a>;
 
@@ -197,7 +285,7 @@ impl<'a, T> IntoIterator for &'a BranchTable<T> {
 }
 
 /// As `HashMap`'s: panics when the id has no state.
-impl<T> std::ops::Index<&BranchId> for BranchTable<T> {
+impl<T: Preimage> std::ops::Index<&BranchId> for BranchTable<T> {
     type Output = T;
 
     fn index(&self, id: &BranchId) -> &T {
@@ -208,7 +296,6 @@ impl<T> std::ops::Index<&BranchId> for BranchTable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     /// Against a BTreeMap model under inserts and removes, including whole chunks emptied and refilled;
     /// iteration is ascending by id; no state moves (a pointer taken before thousands of inserts still
@@ -277,5 +364,38 @@ mod tests {
         }
         assert_eq!(t.len(), m.len());
         assert!(CHUNK * 368 + SEG * 24 <= 64 << 10, "premise: a chunk of 368-byte states and a segment fit 64 KiB together");
+    }
+
+    /// L2(d)'s copy-on-write: a frozen row is encoded as of the freeze whichever way the state is
+    /// next reached (get_mut, an insert over it, a remove) or by the writer's batches, exactly once
+    /// each; an unfrozen id is never encoded; an undone freeze gives every id back.
+    #[test]
+    fn a_frozen_row_is_its_value_at_the_freeze_however_it_is_next_changed() {
+        let mut t: BranchTable<u64> = BranchTable::new();
+        for i in 1..=6 {
+            t.insert(BranchId(i), i * 10);
+        }
+        let dirty: BTreeMap<BranchId, u8> = (1..=5).map(|i| (BranchId(i), i as u8)).collect();
+        assert!(t.freeze(dirty).is_ok());
+        assert!(t.freeze(BTreeMap::new()).is_err(), "a second freeze was accepted while rows were owed");
+        *t.get_mut(&BranchId(1)).unwrap() = 111;
+        *t.get_mut(&BranchId(1)).unwrap() = 1111;
+        t.insert(BranchId(2), 222);
+        t.remove(&BranchId(3));
+        *t.get_mut(&BranchId(6)).unwrap() = 666;
+        let mut rows = None;
+        while rows.is_none() {
+            rows = t.encode_frozen(1);
+        }
+        let mut rows = rows.unwrap();
+        rows.sort();
+        assert_eq!(rows, vec![(10, 1), (20, 2), (30, 3), (40, 4), (50, 5)], "rows not as of the freeze");
+        assert!(t.encode_frozen(64).is_none(), "a freeze ended twice");
+        assert_eq!(t[&BranchId(1)], 1111);
+        assert!(t.freeze((1..=2).map(|i| (BranchId(i), 9)).collect()).is_ok());
+        *t.get_mut(&BranchId(1)).unwrap() = 7;
+        let mut back = t.unfreeze(|r| BranchId(*r / 1111));
+        back.sort();
+        assert_eq!(back, vec![(BranchId(1), 9), (BranchId(2), 9)], "an undone freeze lost an id");
     }
 }
