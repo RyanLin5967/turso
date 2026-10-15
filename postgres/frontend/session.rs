@@ -31,6 +31,52 @@ struct PgConnectionInner {
     broken: std::sync::atomic::AtomicBool,
     /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
     view_cache: Mutex<crate::result_types::ViewCache>,
+    /// SET lock_timeout, in milliseconds: 0 when unset or set to 0, PostgreSQL's "no timeout",
+    /// which here is the server's own lock wait. Lock-free, as the server reads it while a branch
+    /// call waits (wire review 16 item 12).
+    lock_timeout_ms: std::sync::atomic::AtomicU64,
+    /// SET client_min_messages, as its rank in PostgreSQL's order for it (see [`message_rank`]):
+    /// a message of a lower rank is not sent. NOTICE by default.
+    min_messages: std::sync::atomic::AtomicU8,
+}
+
+/// A message level's rank in PostgreSQL's order for client_min_messages: debug5 to debug1 1 to 5,
+/// log 6, notice 7, warning 8, error 9 (LOG ranks below NOTICE here, unlike for the server's own
+/// log). None for no such level.
+pub fn message_rank(level: &str) -> Option<u8> {
+    Some(match level.to_ascii_lowercase().as_str() {
+        "debug5" => 1,
+        "debug4" => 2,
+        "debug3" => 3,
+        "debug2" | "debug" => 4,
+        "debug1" => 5,
+        "log" => 6,
+        "notice" => 7,
+        "warning" => 8,
+        "error" => 9,
+        _ => return None,
+    })
+}
+
+/// A time setting's value in milliseconds, as PostgreSQL reads one: a number, its unit ms by
+/// default, or followed by us, ms, s, min, h or d. None for a negative or unreadable value.
+fn setting_ms(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let value: f64 = text[..split].parse().ok()?;
+    let ms = match text[split..].trim() {
+        "" | "ms" => 1.0,
+        "us" => 0.001,
+        "s" => 1000.0,
+        "min" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        _ => return None,
+    };
+    let ms = (value * ms).round();
+    (ms.is_finite() && ms >= 0.0 && ms <= u64::MAX as f64).then_some(ms as u64)
 }
 
 impl PgConnectionInner {
@@ -92,12 +138,29 @@ impl PgConnection {
                 session_state: Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
                 view_cache: Mutex::new(crate::result_types::ViewCache::default()),
+                lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+                min_messages: std::sync::atomic::AtomicU8::new(7),
             }),
         }
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// SET lock_timeout, in milliseconds; 0 when unset or set to 0 (see
+    /// `PgConnectionInner::lock_timeout_ms`).
+    pub fn lock_timeout_ms(&self) -> u64 {
+        self.inner
+            .lock_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// SET client_min_messages' rank ([`message_rank`]); NOTICE's when unset.
+    pub fn min_messages_rank(&self) -> u8 {
+        self.inner
+            .min_messages
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
@@ -173,6 +236,13 @@ impl PgConnection {
         }
         let path = from.inner.session_state.lock().unwrap().search_path.clone();
         self.inner.set_search_path(path);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner
+            .lock_timeout_ms
+            .store(from.inner.lock_timeout_ms.load(Relaxed), Relaxed);
+        self.inner
+            .min_messages
+            .store(from.inner.min_messages.load(Relaxed), Relaxed);
     }
 }
 
@@ -770,7 +840,6 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
 const NOOP_PARAMETERS: &[&str] = &[
     "application_name",
     "check_function_bodies",
-    "client_min_messages",
     "cpu_index_tuple_cost",
     "cpu_operator_cost",
     "cpu_tuple_cost",
@@ -779,17 +848,14 @@ const NOOP_PARAMETERS: &[&str] = &[
     "effective_io_concurrency",
     "from_collapse_limit",
     "geqo",
-    "idle_in_transaction_session_timeout",
     "jit",
     "join_collapse_limit",
-    "lock_timeout",
     "maintenance_work_mem",
     "max_parallel_workers_per_gather",
     "plan_cache_mode",
     "random_page_cost",
     "row_security",
     "seq_page_cost",
-    "statement_timeout",
     "synchronous_commit",
     "temp_buffers",
     "work_mem",
@@ -858,7 +924,39 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             "SET {name} = {text} is not supported: {what}"
         )))
     };
+    let invalid = || {
+        Err(LimboError::InvalidArgument(format!(
+            "invalid value for parameter \"{name}\": \"{text}\""
+        )))
+    };
     let accepted = match name.as_str() {
+        // These change answers PostgreSQL gives, so they act, or are refused, rather than being
+        // accepted as no-ops (wire review 16 item 12): lock_timeout is the session's lock wait
+        // (0 the server's), client_min_messages filters the messages sent, and the two timeouts
+        // this server does not enforce are accepted at 0 alone.
+        "lock_timeout" => {
+            let Some(ms) = setting_ms(&text) else {
+                return invalid();
+            };
+            pg_conn
+                .lock_timeout_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        "client_min_messages" => {
+            let Some(rank) = message_rank(&text) else {
+                return invalid();
+            };
+            pg_conn
+                .min_messages
+                .store(rank, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        "statement_timeout" | "idle_in_transaction_session_timeout" => match setting_ms(&text) {
+            Some(0) => true,
+            Some(_) => return unsupported("this server enforces no such timeout; 0 is accepted"),
+            None => return invalid(),
+        },
         "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
             Some(false) => true,
             _ => {

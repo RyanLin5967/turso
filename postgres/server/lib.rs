@@ -766,6 +766,11 @@ struct Session {
     shared: Arc<Shared>,
     state: Mutex<SessionState>,
     query_parser: Arc<ParsedQueryParser>,
+    /// The session's SET lock_timeout (ms, 0 none) and client_min_messages rank, copied from its
+    /// connection as each statement starts (`run`), so a branch call's wait and the notice drain
+    /// read them without the session's lock (wire review 16 item 12).
+    lock_timeout_ms: AtomicU64,
+    min_messages: std::sync::atomic::AtomicU8,
 }
 
 /// A statement as Parse stored it: its text, and the branch call the text is, read once, at Parse
@@ -931,7 +936,28 @@ impl Session {
             shared,
             state: Mutex::new(SessionState::default()),
             query_parser: Arc::new(ParsedQueryParser),
+            lock_timeout_ms: AtomicU64::new(0),
+            min_messages: std::sync::atomic::AtomicU8::new(7),
         }
+    }
+
+    /// How long a statement waits for a lock: the session's SET lock_timeout, else (unset, or 0,
+    /// PostgreSQL's "no timeout") the server's lock wait.
+    fn lock_wait(&self) -> std::time::Duration {
+        match self.lock_timeout_ms.load(Ordering::Relaxed) {
+            0 => self.shared.lock_wait,
+            ms => std::time::Duration::from_millis(ms),
+        }
+    }
+
+    /// The notices the session's client_min_messages lets through: a NOTICE or WARNING below its
+    /// level is not sent (an INFO is always sent, as in PostgreSQL).
+    fn deliverable(&self, notices: Vec<Box<ErrorInfo>>) -> Vec<Box<ErrorInfo>> {
+        let least = self.min_messages.load(Ordering::Relaxed);
+        notices
+            .into_iter()
+            .filter(|n| turso_pg::message_rank(&n.severity).is_none_or(|rank| rank >= least))
+            .collect()
     }
 
     /// The session's state. Only the session's own thread takes the lock, so it never waits; a
@@ -976,7 +1002,7 @@ impl Session {
             st.described = None;
             std::mem::take(&mut st.notices)
         };
-        (notices, self.transaction_status())
+        (self.deliverable(notices), self.transaction_status())
     }
 
     /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
@@ -1044,7 +1070,10 @@ impl Session {
 
     /// [`Session::simple`], each result with the notices its statement raised.
     fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
-        let with_notices = |r: Response| (std::mem::take(&mut self.state().notices), r);
+        let with_notices = |r: Response| {
+            let notices = std::mem::take(&mut self.state().notices);
+            (self.deliverable(notices), r)
+        };
         // A query that is one branch call goes straight to the engine: no split, no parse (L5).
         // Inside an unsynced pipeline's implicit block it ends the block as any Query does: a
         // refusal rolls it back and leaves the session idle, success commits it. The fast path
@@ -1231,6 +1260,11 @@ impl Session {
         let verb = TxVerb::of(sql);
         let mut st = self.state();
         let conn = self.current(&mut st)?;
+        // The session's lock wait and message level, as its last SET left them.
+        self.lock_timeout_ms
+            .store(conn.lock_timeout_ms(), Ordering::Relaxed);
+        self.min_messages
+            .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
         if st.aborted {
             match verb {
@@ -1591,7 +1625,7 @@ impl Session {
         let mut backoff = if ends_block {
             Backoff::never()
         } else {
-            Backoff::new(self.shared.lock_wait)
+            Backoff::new(self.lock_wait())
         };
         // The last attempt, once the lock wait is spent, goes through the same rules as every
         // other: it returned unchecked, past the backstop (wire review 14 item 7).
@@ -1875,7 +1909,7 @@ impl Session {
         mut f: impl FnMut() -> Result<T, E>,
         busy: impl Fn(&E) -> bool,
     ) -> Result<T, E> {
-        let mut backoff = Backoff::new(self.shared.lock_wait);
+        let mut backoff = Backoff::new(self.lock_wait());
         loop {
             match f() {
                 Err(e) if busy(&e) => {
@@ -2682,7 +2716,12 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::IntegerOverflow => "22003",
         // encode()'s unknown format (functions.rs exec_encode), PostgreSQL's
         // invalid_parameter_value.
-        LimboError::InvalidArgument(m) if m.starts_with("unrecognized encoding") => "22023",
+        LimboError::InvalidArgument(m)
+            if m.starts_with("unrecognized encoding")
+                || m.starts_with("invalid value for parameter") =>
+        {
+            "22023"
+        }
         LimboError::ReadOnly => "25006",
         LimboError::DatabaseFull(_) => "53100",
         LimboError::Interrupt => "57014",

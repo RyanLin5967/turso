@@ -10,7 +10,7 @@ mod session;
 pub use session::PgConnection as Connection;
 pub use session::{
     attach_schema_files, branch_call, check_table_keys, open_database, open_database_with_io,
-    pg_bool, split_statements, PgConnection, PgQueryRunner, CONNECTION_BROKEN,
+    message_rank, pg_bool, split_statements, PgConnection, PgQueryRunner, CONNECTION_BROKEN,
 };
 pub use turso_core::{
     Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, Result, StepResult,
