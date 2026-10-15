@@ -307,6 +307,9 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     // Class (b): the threads that made the window unattributable, and the holds inside it that
     // could not be attributed to their holder (`probe::end_owning`, `store_unlocked`).
     s.insert("foreign_threads", s1.foreign);
+    // Probe-adversary item 1: every sample records the probe's mode and the shim's lost count.
+    s.insert("shim_loaded", u64::from(s1.shim_loaded));
+    s.insert("shim_lost", s1.shim_lost);
     s.insert("held_unattributed", delta(s0.held_unattributed, s1.held_unattributed));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
@@ -1692,6 +1695,104 @@ fn run_instruments(cell: &str) -> String {
         go.store(false, std::sync::atomic::Ordering::Release);
         h.join().unwrap();
     }
+    // Probe-adversary items 2-4 (artie reviews/ADV-claude-budget-probe-04385d32e.md), forced both
+    // ways. (a) A foreign thread that runs (an undeclared spin) and makes NO syscall while the
+    // window makes 7: the shim path may accept it, at exactly 7; without the shim it is refused.
+    {
+        let (go, done, h) = helper(false, 0);
+        put(
+            "fc_shim_quiet_foreign",
+            &window(&mut || {
+                for _ in 0..7 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                // Let the helper's spin run inside the window for a while: 30 ms, past a scheduler
+                // quantum (at 2 ms the helper's CPU time read unmoved in 1 of 4 runs: a running
+                // thread's time is not always current in thread_info, the blind spot `attribute`
+                // states).
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    // (b) Row 6, the compensation: the window makes one call the shim cannot see (a raw syscall(2))
+    // and 5 it can, while a foreign thread makes 10. The shim's total can then equal the kernel's;
+    // a foreign thread with calls must refuse it in every mode.
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_shim_compensation",
+            &window(&mut || {
+                // SAFETY: getppid (BSD syscall 39) through syscall(2), which the shim does not
+                // interpose (gen.py's SKIP): one syscall the shim cannot see.
+                #[allow(deprecated)]
+                unsafe {
+                    libc::syscall(39)
+                };
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    // (c) A thread present at the window's start that is gone at its end: refused in every mode.
+    {
+        let (go, done, h) = helper(false, 3);
+        let mut h = Some(h);
+        put(
+            "fc_gone_thread",
+            &window(&mut || {
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                go.store(false, std::sync::atomic::Ordering::Release);
+                // Joined inside the window: present at the start, gone at the end.
+                if let Some(h) = h.take() {
+                    h.join().unwrap();
+                }
+            }),
+        );
+    }
+    // (d) More threads than the 48 the table has room for: refused in every mode.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let stop = Arc::new(AtomicBool::new(false));
+        let parked: Vec<_> = (0..50)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(50));
+                    }
+                })
+            })
+            .collect();
+        put(
+            "fc_too_many_threads",
+            &window(&mut || {
+                for _ in 0..3 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+            }),
+        );
+        stop.store(true, Release);
+        for t in parked {
+            t.thread().unpark();
+            t.join().unwrap();
+        }
+    }
     put(
         "fc_close_37",
         &window(&mut || {
@@ -2523,10 +2624,20 @@ fn the_budget_syscall_counts_are_attributed_by_thread() {
     let shim = row("fc_shim_loaded")["loaded"] == 1;
     let foreign = row("fc_foreign_window");
     assert!(foreign["foreign_threads"] >= 1, "premise: the helper thread did not run inside the window: {foreign:?}");
+    // FLAGGED, lead-ordered (probe-adversary item 3, DECISIONS newest): a foreign thread with
+    // syscalls REFUSES the window in both modes. The shim used to exclude its calls (Some(0)).
+    assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count (counter loaded: {shim}): {foreign:?}");
+    assert_eq!(foreign["shim_loaded"], u64::from(shim), "CLAIM: the sample does not record the probe's mode: {foreign:?}");
+    let quiet = row("fc_shim_quiet_foreign");
+    assert!(quiet["foreign_threads"] >= 1, "premise: the spinning helper did not run inside the window: {quiet:?}");
     if shim {
-        assert_eq!(foreign.get("syscalls").copied(), Some(0), "CLAIM: the per-thread counter charged the helper's syscalls to the window: {foreign:?}");
+        assert_eq!(quiet.get("syscalls").copied(), Some(7), "CLAIM: the shim path did not accept a window whose only foreign thread made no syscall, at its own 7: {quiet:?}");
     } else {
-        assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count: {foreign:?}");
+        assert!(quiet.get("syscalls").is_none(), "CLAIM: a window another thread ran in kept a count with no shim: {quiet:?}");
+    }
+    for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads"] {
+        let r = row(op);
+        assert!(r.get("syscalls").is_none(), "CLAIM: {op} kept a syscall count (counter loaded: {shim}): {r:?}");
     }
     let spinner = row("fc_spinner_window");
     assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
@@ -2534,11 +2645,39 @@ fn the_budget_syscall_counts_are_attributed_by_thread() {
     assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
     assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
     let hold = row("fc_foreign_hold");
-    let want_unattributed = if shim { 0 } else { 1 };
-    assert_eq!(hold["held_unattributed"], want_unattributed, "CLAIM: a hold another thread ran in was attributed wrongly (counter loaded: {shim}): {hold:?}");
+    // FLAGGED, lead-ordered (probe-adversary item 3): the helper makes syscalls inside the hold, so the
+    // hold is unattributable in both modes (the shim used to attribute it, 0 held).
+    assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread made syscalls in was attributed (counter loaded: {shim}): {hold:?}");
     assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
     let nothing = row("fc_nothing");
     assert_eq!((nothing["foreign_threads"], nothing["held_unattributed"]), (0, 0), "CLAIM: an empty window was not attributed: {nothing:?}");
+}
+
+/// Probe-adversary item 1: a run labelled a shim run (`FE_SHIM_RUN`, set by feshim-run) whose shim is
+/// not loaded is refused, not measured as one. A child of this binary, with the label and with the
+/// shim stripped, must panic in `probe::prime` naming the refusal; a child with neither must not.
+#[test]
+fn a_run_labelled_shim_without_the_shim_is_refused() {
+    if std::env::var_os("FE_PRIME_CHILD").is_some() {
+        probe::prime();
+        return;
+    }
+    let run = |label: bool| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["branch::budget_tests::a_run_labelled_shim_without_the_shim_is_refused", "--exact", "--nocapture", "--test-threads=1"])
+            .env("FE_PRIME_CHILD", "1")
+            .env_remove("DYLD_INSERT_LIBRARIES")
+            .env_remove("FE_SHIM_RUN");
+        if label {
+            cmd.env("FE_SHIM_RUN", "1");
+        }
+        let out = cmd.output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    let (ok, text) = run(true);
+    assert!(!ok && text.contains("REFUSED: this run is labelled a shim run"), "CLAIM: a labelled run without the shim was not refused: {text}");
+    let (ok, text) = run(false);
+    assert!(ok, "premise: an unlabelled run without the shim primes: {text}");
 }
 
 /// Every counter the budgets read moves by exactly what was done, and not at all when nothing was
