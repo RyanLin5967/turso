@@ -228,6 +228,41 @@ fn the_sqlite_dialect_still_casts_infinity_text_to_zero() {
     assert_eq!(rows, vec![vec![Value::from_f64(0.0); 3]]);
 }
 
+/// C32 HIGH (a Claude review, verified, 2026-10-15): the time operators did unchecked chrono
+/// arithmetic, so a result past chrono's range (or a u32 month span, or a blob's seconds near
+/// i64::MIN) panicked inside an extern "C" scalar, which cannot unwind: the process aborted. Each
+/// case must answer NULL or a clean error, and the connection must answer after it. Expected RED:
+/// the test process aborts at the first case.
+#[test]
+fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        // 10^8 days past now (about 273,800 years, past chrono's year 262142).
+        "SELECT time_add_date(time_now(), 0, 0, 100000000)",
+        // 2^63 - 1 ns past year 262000.
+        "SELECT time_add(time_date(262000, 1, 1), 9223372036854775807)",
+        // ... and before year -262000.
+        "SELECT time_add(time_date(-262000, 1, 1), -9223372036854775807)",
+        // 4 * 10^8 years: the month span overflows a u32.
+        "SELECT time_add_date(time_now(), 400000000)",
+        // 2^31 years: truncated to an i32 before.
+        "SELECT time_add_date(time_now(), 2147483648)",
+        // A day count that fits a Duration, added past chrono's range.
+        "SELECT time_date(2020, 1, 100000000)",
+        // A blob whose seconds are i64::MIN.
+        "SELECT time_get_year(x'01800000000000000000000000')",
+    ] {
+        match conn.prepare(sql).and_then(|mut st| st.run_collect_rows()) {
+            Ok(rows) => assert_eq!(rows, vec![vec![Value::Null]], "{sql}: answered {rows:?}; want NULL or an error"),
+            Err(_) => {}
+        }
+        let rows = conn.prepare("SELECT 1").unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]], "after {sql}: the connection does not answer");
+    }
+}
+
 /// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
 fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
     let joined = std::thread::Builder::new()
