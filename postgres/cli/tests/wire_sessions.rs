@@ -820,6 +820,91 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
     );
 }
 
+/// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
+/// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
+/// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
+/// 53300 for 30 s and more). With --max-connections 1 and --authentication-timeout 1, a second
+/// client must log in within 8 s.
+#[test]
+fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
+    let dir = Scratch::new("sslflood");
+    let server = Server::start(&dir.db(), &["--max-connections", "1", "--authentication-timeout", "1"]);
+    let flood = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    unsafe {
+        use std::os::fd::AsRawFd;
+        let small: libc::c_int = 4096;
+        libc::setsockopt(
+            flood.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &small as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    flood.set_nonblocking(true).unwrap();
+    let mut ssl = Vec::new();
+    for _ in 0..512 {
+        ssl.extend_from_slice(&8i32.to_be_bytes());
+        ssl.extend_from_slice(&80877103i32.to_be_bytes());
+    }
+    let started = Instant::now();
+    let mut f = &flood;
+    while started.elapsed() < Duration::from_millis(1500) {
+        match f.write(&ssl) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(_) => break, // the server closed it: the refusal this test wants
+        }
+    }
+    let mut last = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        match server.connect_to("postgres") {
+            Ok(mut w) => {
+                w.q("SELECT 1").ok("the second client's query");
+                return;
+            }
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("8 s after the flood began the slot is still held: {last:?}");
+}
+
+/// A second SSLRequest on one connection is refused as PostgreSQL 18.6 refuses it (recorded,
+/// artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-ssl2.out, ssl2.py): 'N' to the first, then
+/// FATAL 0A000 "unsupported frontend protocol 1234.5679: server supports 3.0 to 3.2", and the
+/// connection closes.
+#[test]
+fn a_second_ssl_request_is_refused_as_postgresql_refuses_it() {
+    let dir = Scratch::new("ssltwice");
+    let server = Server::start(&dir.db(), &[]);
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut ssl = 8i32.to_be_bytes().to_vec();
+    ssl.extend_from_slice(&80877103i32.to_be_bytes());
+    s.write_all(&ssl).unwrap();
+    let mut b = [0u8; 1];
+    s.read_exact(&mut b).unwrap();
+    assert_eq!(&b, b"N", "the first SSLRequest");
+    s.write_all(&ssl).unwrap();
+    let mut head = [0u8; 5];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(head[0], b'E', "the second SSLRequest's answer: {head:?}");
+    let len = i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize - 4;
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).unwrap();
+    let e = error_fields(&body);
+    assert_eq!(e.code, "0A000");
+    assert_eq!(
+        e.message,
+        "unsupported frontend protocol 1234.5679: server supports 3.0 to 3.2"
+    );
+    let mut rest = Vec::new();
+    assert_eq!(s.read_to_end(&mut rest).map(|_| rest.len()).unwrap_or(0), 0, "then the close");
+}
+
 /// Shutting the server down (SIGINT) ends every session and joins its thread before the process
 /// exits: idle sessions, one inside a transaction, and one running a long statement, which is
 /// cancelled. The server says how many it shut and joined, and exits 0 (lead 2026-10-15).
