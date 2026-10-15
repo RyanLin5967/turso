@@ -900,6 +900,79 @@ fn lock_timeout_and_client_min_messages_follow_the_transaction() {
     }
 }
 
+/// The three settings this server acts on (lock_timeout, statement_timeout, client_min_messages)
+/// follow PostgreSQL 18.6's rules case for case (recorded, pg18-diff/pg18-settings.out, every case
+/// replayed): SHOW's text with PostgreSQL's units; SET LOCAL outside a block warns 25P01 and changes
+/// nothing; ROLLBACK TO a savepoint undoes the SETs after it and RELEASE keeps them; SET after SET
+/// LOCAL replaces both, and SET LOCAL after SET lasts until the block ends; a failed implicit
+/// block's SET is undone (the C26 MED 3 class).
+#[test]
+fn the_acted_on_settings_show_and_scope_as_postgresql_does() {
+    let dir = Scratch::new("settingrules");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let show = |a: &mut Wire, name: &str| {
+        a.q(&format!("SHOW {name}")).ok("SHOW").rows[0][0].clone().unwrap_or_default()
+    };
+    for (set, want) in [
+        ("SET lock_timeout = '1000ms'", "1s"),
+        ("SET lock_timeout = 90000", "90s"),
+        ("SET lock_timeout = 60000", "1min"),
+        ("SET lock_timeout = '1500ms'", "1500ms"),
+        ("SET lock_timeout = '2h'", "2h"),
+        ("SET lock_timeout = 0", "0"),
+    ] {
+        a.q(set).ok(set);
+        assert_eq!(show(&mut a, "lock_timeout"), want, "{set}");
+    }
+    a.q("SET statement_timeout = '100ms'").ok("statement_timeout");
+    assert_eq!(show(&mut a, "statement_timeout"), "100ms");
+    a.q("SET statement_timeout = 0").ok("statement_timeout 0");
+    assert_eq!(show(&mut a, "statement_timeout"), "0");
+    a.q("SET client_min_messages = WARNING").ok("client_min_messages");
+    assert_eq!(show(&mut a, "client_min_messages"), "warning");
+    a.q("SET client_min_messages = notice").ok("client_min_messages back");
+    let r = a.q("SET LOCAL lock_timeout = '1s'").ok("SET LOCAL outside a block");
+    assert_eq!(
+        r.notices.iter().map(|n| (n.code.as_str(), n.message.as_str())).collect::<Vec<_>>(),
+        [("25P01", "SET LOCAL can only be used in transaction blocks")],
+        "the warning"
+    );
+    assert_eq!(show(&mut a, "lock_timeout"), "0");
+    for sql in ["BEGIN", "SET lock_timeout = '1s'", "SAVEPOINT a", "SET lock_timeout = '2s'", "ROLLBACK TO a"] {
+        a.q(sql).ok(sql);
+    }
+    assert_eq!(show(&mut a, "lock_timeout"), "1s", "after ROLLBACK TO a");
+    for sql in ["SAVEPOINT b", "SET lock_timeout = '3s'", "RELEASE b"] {
+        a.q(sql).ok(sql);
+    }
+    assert_eq!(show(&mut a, "lock_timeout"), "3s", "after RELEASE b");
+    a.q("COMMIT").ok("COMMIT");
+    assert_eq!(show(&mut a, "lock_timeout"), "3s", "after COMMIT");
+    a.q("SET lock_timeout = 0").ok("reset");
+    for sql in ["BEGIN", "SET LOCAL lock_timeout = '1s'", "SET lock_timeout = '2s'"] {
+        a.q(sql).ok(sql);
+    }
+    assert_eq!(show(&mut a, "lock_timeout"), "2s", "SET after SET LOCAL");
+    a.q("COMMIT").ok("COMMIT");
+    assert_eq!(show(&mut a, "lock_timeout"), "2s", "after COMMIT");
+    a.q("SET lock_timeout = 0").ok("reset");
+    for sql in ["BEGIN", "SET lock_timeout = '2s'", "SET LOCAL lock_timeout = '1s'"] {
+        a.q(sql).ok(sql);
+    }
+    assert_eq!(show(&mut a, "lock_timeout"), "1s", "SET LOCAL after SET");
+    a.q("COMMIT").ok("COMMIT");
+    assert_eq!(show(&mut a, "lock_timeout"), "2s", "after COMMIT");
+    a.q("SET lock_timeout = 0").ok("reset");
+    // The recording's 1/0 case is not replayed here: this engine answers 1/0 with NULL (the known
+    // red integer_division_by_zero_is_22012); its missing-table twin is the same recorded rule.
+    let e = a
+        .q("SET lock_timeout = '5s'; SELECT * FROM no_such_table")
+        .err("a failed implicit block");
+    assert_eq!(e.code, "42P01");
+    assert_eq!(show(&mut a, "lock_timeout"), "0", "the failed implicit block's SET");
+}
+
 /// A branch call waiting for another session to leave its branch (the in-use wait, up to 5 s) is
 /// the session's statement: statement_timeout ends it with 57014, and so does a CancelRequest
 /// (Claude C37 M1: both got 55006 after the whole 5 s, scripts/inuse.py; PostgreSQL's equivalent
