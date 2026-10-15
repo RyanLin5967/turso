@@ -304,6 +304,10 @@ pub(crate) struct BranchStore {
     /// catalog's own volatile store counts its catalog's, which the main store routes through its
     /// at-risk decision (`truncate_catalog_wal`; engine review 17 MED 3).
     sync_failures: AtomicU64,
+    /// A branch catalog's own store: the group of the store whose catalog it is, which its failed
+    /// syncs go to as they happen (`trunk_wal_sync_failed`; engine review 21 MED 5). Unset
+    /// elsewhere.
+    drain_parent: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
     /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
@@ -398,6 +402,10 @@ pub(crate) struct Group {
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
     confirm_hold: AtomicU8,
+    /// This group, for a branch catalog's own store to forward its catalog's failed syncs to as
+    /// they happen (`BranchStore::link_drain_parent`; engine review 21 MED 5). Set by
+    /// `Group::shared`.
+    me: crate::sync::OnceLock<crate::sync::Weak<Group>>,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -503,7 +511,15 @@ impl Group {
             upgrade_overdue: AtomicBool::new(false),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
+            me: crate::sync::OnceLock::new(),
         }
+    }
+
+    /// `new`, shared, and knowing its own handle (`me`).
+    fn shared(durable: u64, failed: Arc<AtomicBool>) -> Arc<Self> {
+        let group = Arc::new(Self::new(durable, failed));
+        let _ = group.me.set(Arc::downgrade(&group));
+        group
     }
 
     /// Every journal byte below `end` is durable in class index `c` (called holding the lock, `g`).
@@ -3261,11 +3277,12 @@ impl BranchStore {
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
-            group: Arc::new(Group::new(0, Arc::new(AtomicBool::new(false)))),
+            group: Group::shared(0, Arc::new(AtomicBool::new(false))),
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3523,11 +3540,12 @@ impl BranchStore {
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
             fuzzy,
-            group: Arc::new(Group::new(opened_lsn, inner.fail_stop.clone())),
+            group: Group::shared(opened_lsn, inner.fail_stop.clone()),
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             sync_failures: AtomicU64::new(0),
+            drain_parent: crate::sync::OnceLock::new(),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
@@ -3556,6 +3574,12 @@ impl BranchStore {
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
         };
+        // A catalog the open recovered: its failed syncs reach this store's at-risk decision as
+        // they happen (engine review 21 MED 5; a catalog created later is linked at its creation,
+        // `ensure_backing`).
+        if let Some(cat) = store.inner.lock().cat.as_ref() {
+            cat.catalog.link_drain_parent(Self::group_handle(&store.group));
+        }
         if store.inner.lock().files.is_some() {
             store.start_confirm_writer();
         }
@@ -6104,6 +6128,15 @@ impl BranchStore {
     /// (it always stops, as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         self.sync_failures.fetch_add(1, Ordering::AcqRel);
+        // A branch catalog's own store forwards the failure, as it happens, to the store whose
+        // catalog it is (engine review 21 MED 5): decided there now, not after that store's phase
+        // 4 returned (`truncate_catalog_wal`), when a flight that landed in between would hide the
+        // loss. Mutant `catalog_sync_failure_decided_late` (test builds only): not forwarded.
+        if let Some(parent) = self.drain_parent.get().and_then(crate::sync::Weak::upgrade) {
+            if !fe_mutant("catalog_sync_failure_decided_late") {
+                parent.drain_failed(drains, |_| true);
+            }
+        }
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
@@ -6136,6 +6169,18 @@ impl BranchStore {
     /// The failed syncs of this store's trunk files reported to it (`trunk_wal_sync_failed`).
     pub(crate) fn sync_failures(&self) -> u64 {
         self.sync_failures.load(Ordering::Acquire)
+    }
+
+    /// Make this store (a branch catalog's own) forward its failed syncs, as they happen, to
+    /// `parent`, the group of the store whose catalog it is (engine review 21 MED 5). Once.
+    pub(crate) fn link_drain_parent(&self, parent: crate::sync::Weak<Group>) {
+        let _ = self.drain_parent.set(parent);
+    }
+
+    /// This store's group's own handle, for its catalog to forward failed syncs to
+    /// (`Catalog::link_drain_parent`).
+    pub(crate) fn group_handle(group: &Group) -> Option<crate::sync::Weak<Group>> {
+        group.me.get().cloned()
     }
 
     pub(crate) fn end_trunk_commit(&self) {
@@ -8330,6 +8375,9 @@ impl StoreInner {
                 // refused any other store and before the arena is truncated.
                 if self.catalog_mode && self.cat.is_none() {
                     let mut catalog = Catalog::open(&files.cat, self.sync)?;
+                    // Its failed syncs reach this store's at-risk decision as they happen
+                    // (engine review 21 MED 5).
+                    catalog.link_drain_parent(BranchStore::group_handle(group));
                     if catalog.meta()?.is_some() {
                         return Err(LimboError::LockingError(format!(
                             "branch catalog {} gained state after this branch store opened: \

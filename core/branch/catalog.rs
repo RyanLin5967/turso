@@ -1002,6 +1002,15 @@ impl Catalog {
         self._db.branches.sync_failures()
     }
 
+    /// Have this catalog's failed syncs go, as they happen, to the at-risk decision of the store
+    /// whose catalog it is (`parent`, that store's group; engine review 21 MED 5). Every handle on
+    /// this catalog shares its Database, and so the link.
+    pub(crate) fn link_drain_parent(&self, parent: Option<crate::sync::Weak<super::store::Group>>) {
+        if let Some(parent) = parent {
+            self._db.branches.link_drain_parent(parent);
+        }
+    }
+
     /// The class this handle's commits sync in (`set_commit_sync`).
     pub(crate) fn commit_sync(&self) -> SyncClass {
         self.sync
