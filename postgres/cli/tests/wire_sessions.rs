@@ -2214,6 +2214,44 @@ fn encode_answers_as_postgresql_does() {
     assert_eq!(a.q(sql).err(sql).code, "22023");
 }
 
+/// The parameters SET accepted as no-ops but which change PostgreSQL's answers act as they do
+/// there: `SET lock_timeout = '100ms'` makes a branch create behind another session's write
+/// transaction fail 55P03 within a second, not wait out the server's lock wait (5 s here, 60 s
+/// by default); statement_timeout and idle_in_transaction_session_timeout are accepted at 0 alone
+/// (another value is 0A000, as this server enforces neither); and client_min_messages filters the
+/// warnings a session is sent (COMMIT outside a block warns 25P01 at the default, at warning, not
+/// at error). Each answered SET and changed nothing (wire review 16 item 12).
+#[test]
+fn settings_that_change_answers_act_as_in_postgresql() {
+    let dir = Scratch::new("settings");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "5000"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')")
+        .ok("a write transaction holds the lock");
+    b.q("SET lock_timeout = '100ms'").ok("lock_timeout");
+    let started = Instant::now();
+    let r = b.q("SELECT turso_branch_create('x')");
+    let took = started.elapsed();
+    assert_eq!(r.err("create behind the lock").code, "55P03");
+    assert!(took < Duration::from_secs(1), "the create waited {took:?}");
+    a.q("ROLLBACK").ok("release");
+    for sql in [
+        "SET statement_timeout = '1ms'",
+        "SET idle_in_transaction_session_timeout = '5s'",
+    ] {
+        assert_eq!(b.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    b.q("SET statement_timeout = 0").ok("statement_timeout 0");
+    let warned = |w: &mut Wire| w.q("COMMIT").ok("COMMIT outside a block").notices.len();
+    assert_eq!(warned(&mut b), 1, "the default level sends the warning");
+    b.q("SET client_min_messages = warning").ok("warning");
+    assert_eq!(warned(&mut b), 1, "at warning");
+    b.q("SET client_min_messages = error").ok("error");
+    assert_eq!(warned(&mut b), 0, "at error no warning is sent");
+}
+
 /// The failure triggers the failure-path tests use do fail, each with its code, so a test that
 /// fails a statement or a block takes its failure path: a missing relation at prepare (42P01; in a
 /// block the block fails) and a duplicate key at execution (23505). `SELECT 1/0`, which they used,
