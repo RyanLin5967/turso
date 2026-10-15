@@ -119,6 +119,9 @@ std::thread_local! {
     static STACK_BOUNDS: Option<(usize, usize)> = stack_bounds();
     /// Nested steps in progress on this thread, for the fallback bound.
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test builds (C32 MED): this thread's stack taken as unknown, as on a platform with no answer.
+    #[cfg(test)]
+    pub(crate) static FORCE_UNKNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Statements stepping on this thread ([`Executing`]).
     static EXECUTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -160,6 +163,10 @@ fn stack_bounds() -> Option<(usize, usize)> {
 pub(crate) fn remaining_stack() -> Option<usize> {
     let here = 0u8;
     let sp = std::ptr::addr_of!(here) as usize;
+    #[cfg(test)]
+    if FORCE_UNKNOWN.with(|u| u.get()) {
+        return None;
+    }
     STACK_BOUNDS.with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)))
 }
 
@@ -299,6 +306,37 @@ mod tests {
                 );
                 let levels = nest_until_refused(1);
                 assert!(levels >= 2, "only {levels} levels on a {size:?} B thread");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// C32 MED (a Claude review, 2026-10-15): where the stack is unknown, the 64-deep fallback admitted
+    /// about 32 views (two steps each), which overflow a 2 MiB thread in a debug build (Windows'
+    /// spawned-thread default; wasm32 has no guard page). On a 2 MiB thread taken as unknown, nested
+    /// steps of 120 KiB each must be refused before the stack runs out. Overflowing aborts the test
+    /// process: that is the red.
+    #[test]
+    fn an_unknown_stack_refuses_nesting_instead_of_guessing_a_depth() {
+        #[inline(never)]
+        fn nest(levels: usize) -> usize {
+            let mut frame = [0u8; 120 << 10];
+            std::hint::black_box(&mut frame);
+            match NestGuard::enter("nested") {
+                Ok(_guard) => nest(levels + 1),
+                Err(_) => levels,
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                FORCE_UNKNOWN.with(|u| u.set(true));
+                assert_eq!(remaining_stack(), None, "premise: the stack is unknown");
+                let outer = NestGuard::enter("outermost");
+                assert!(outer.is_ok(), "the outermost step was refused");
+                let levels = nest(0);
+                assert!(levels * (120 << 10) < (2 << 20), "{levels} nested levels of 120 KiB on a 2 MiB thread");
             })
             .unwrap()
             .join()
