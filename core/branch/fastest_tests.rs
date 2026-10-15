@@ -5119,8 +5119,16 @@ fn a_failed_held_free_upgrade_fail_stops_the_store_and_frees_nothing() {
         let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("upgrade-fails.db"), catalog, true);
         assert_eq!(slots.len(), 2, "{what}: premise: x's release frees two slots, past the bound");
         db.branch_failpoint(Some(BranchFailpoint::UpgradeSyncFails));
+        // C15 MED 3 (a fixture reaching its path, ruled at fastest DECISIONS 2026-10-15T04:15:07Z):
+        // the writer is held where it finds the upgrade due until the arming fork has returned, so
+        // its failing sync cannot fail-stop the store under that fork's unwrap.
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
         x.reap().unwrap();
         let _armed = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        db.branches.confirm_hold_for_test(0);
         eventually(&format!("{what}: a failed upgrade sync left the store running"), || {
             db.connect().unwrap().fork_branch().is_err()
         });
