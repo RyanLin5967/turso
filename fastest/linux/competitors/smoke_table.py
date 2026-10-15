@@ -80,13 +80,15 @@ ROWS = [
     # pg18-defaults is dropped on Linux (lead ruling, artie 6b0bef481b); its copy control runs on pg18-d2
     (PG, "FILE_COPY, file_copy_method=copy (clone-proof control)", "pg18-d2", "pg18-create-copy", None),
     (PG, "SELECT 1 floor", "pg18-d2", "pg18-select1", None),
-    (DOLT, "(a) DOLT_CHECKOUT(main) + DOLT_CHECKOUT('-b', b)", "dolt", "dolt-a-m1c", "dolt-a-m1"),
+    # (a) times only the create since comp review 1 MED 6 (it timed a no-op checkout of main before): rows of runs
+    # before that commit measured different work under this label (SMOKE.md errata)
+    (DOLT, "(a) DOLT_CHECKOUT('-b', b) on a session at main", "dolt", "dolt-a-m1c", "dolt-a-m1"),
     (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
     (DOLT, "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
      "dolt-c-m1"),
     (DOLT, "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
     (DOLT, "SELECT 1 floor", "dolt", "dolt-select1", None),
-    (DOLTGRES, "(a) dolt_checkout(main) + dolt_checkout('-b', b)", "doltgres", "doltgres-a-m1c",
+    (DOLTGRES, "(a) dolt_checkout('-b', b) on a session at main", "doltgres", "doltgres-a-m1c",
      "doltgres-a-m1"),
     (DOLTGRES, "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
     (DOLTGRES, "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",

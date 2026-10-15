@@ -278,11 +278,8 @@ cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command li
   CBA=(timeout "$OUTER_S" "$CB" run --mode b1 --op "$1" --sync "$2" --parent "$ROOT/parent.db" --dir "$3"
     --clients "$4" --max-ops "$5" --rows "$ROWS" --warmup "$WARMUP" --max-window-s "$CAP_S" --drop --out "$6")
 }
-# create_step CELLDIR -> the spec's create step for fthelp.py ops: 2 for amendment 14 variant (a), whose step 1 checks
-# out the parent, else 1 (LOW 27: ops_of and timedrun_check each carried this case)
-create_step() {
-  case $(basename "$1") in *-a-m1c-c*|*-a-m1-c*) echo 2 ;; *) echo 1 ;; esac
-}
+# Every spec's create is its step 1 (comp review 1 MED 6: variant (a)'s timed no-op checkout of main is gone, so its
+# create_step 2 case went with it), so fthelp.py ops reads the create at step 1 everywhere.
 bbload() { # bbload SPEC C N OUT [nowarm] -> bbload's rc
   local rc=0
   bb_args "$@"
@@ -310,9 +307,7 @@ count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of 
 # zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
 # never inside $(...) or <(...), where fail()'s count would be lost.
 ops_of() {
-  local k
-  k=$(create_step "$2")
-  if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
+  if ! python3 "$FH" ops "$1" 1 >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
   # LOW 26: the reader's line itself must be three counts, or the job FAILS (a short or empty line read as empty
   # totals and reached stracecount's --ops)
   ops_line_ok "$2/ops.txt" || { fail "ops reader on $1: [$(head -c 200 "$2/ops.txt")] is not three counts"; echo "0 0 0" >"$2/ops.txt"; }
@@ -324,10 +319,8 @@ ops_line_ok() {
 # timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
 # N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
 timedrun_check() {
-  local k
-  k=$(create_step "$1")
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" "$DRY" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
-  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
+  if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" 1 >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
     fail "$3 timed run: ops reader ($(tail -c 200 "$1/timed.ops.err" 2>/dev/null))"; echo "0 0 0" >"$1/timed.ops.txt"
   fi
