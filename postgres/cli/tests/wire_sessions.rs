@@ -2411,6 +2411,29 @@ fn boolean_and_float4_results_are_typed_as_postgresql_types_them() {
     assert_eq!(r.oids, Some(vec![16]), "a comparison over a parameter");
 }
 
+/// An arithmetic expression one of whose operands the walk cannot type (a function it does not
+/// know) types nothing, so a parameter compared with it is refused 42P18 unless declared, as for
+/// any expression the walk does not type (COMPAT's Parameters row): `sqrt(2) + 1 > $1` typed $1
+/// int4 from the literal alone, where PostgreSQL 18.6 types it float8 (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-r14.out), so a value '1.5' was refused 22P02. A parameter operand
+/// still takes the other side's type (`$1 + 1 > 2`, int4) (wire review 14 item 17).
+#[test]
+fn an_operand_the_walk_cannot_type_types_nothing() {
+    let dir = Scratch::new("untypedoperand");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT 1 WHERE sqrt(2) + 1 > $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P18"),
+        "{sql}: params {:?}",
+        r.params
+    );
+    let r = a.describe_statement("SELECT 1 WHERE $1 + 1 > 2").ok("control");
+    assert_eq!(r.params, Some(vec![23]), "a parameter operand takes the other side's type");
+}
+
 /// INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag and row count, as
 /// PostgreSQL 18 answers them (`INSERT 0 n`, `UPDATE n`, `DELETE n`; recorded in artie
 /// lanes/wire/raw/loud-20261015/pg18-diff), on both protocols: drivers read the affected count from
