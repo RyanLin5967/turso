@@ -4401,6 +4401,10 @@ fn a_rewrite_of_a_raised_d0_log_matures_the_frees_it_covers() {
 #[test]
 fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
     let _s = serial();
+    // FLAGGED TEST EDIT (engine review 18 LOW 9; for the lead's ruling): each arm's claim failure is
+    // collected and all are asserted at the end, so a run shows which arms are red, where the first
+    // panic hid the rest. Premises still stop the test. No claim or expected value changed.
+    let mut failed = Vec::new();
     for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
         let what = format!("catalog={catalog} written={written:?}");
         let dir = tempfile::TempDir::new().unwrap();
@@ -4423,11 +4427,14 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
         let trunk = db.connect().unwrap();
         db.branch(id).unwrap().reap().unwrap();
         let took = reused_by_a_new_branch(&trunk, &slots);
-        assert!(
-            took.is_empty(),
-            "{what}: slots {took:?} were reused before a sync covered the Release, over records an earlier run made durable"
-        );
+        if !took.is_empty() {
+            failed.push(format!("{what}: slots {took:?}"));
+        }
     }
+    assert!(
+        failed.is_empty(),
+        "slots were reused before a sync covered the Release, over records an earlier run made durable: {failed:?}"
+    );
 }
 
 /// Engine review 18 MED 2 (a): the class an earlier run synced the log in (`synced_base`) lived only
