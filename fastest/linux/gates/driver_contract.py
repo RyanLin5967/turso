@@ -9,8 +9,10 @@
           - stop_secs < MAX_S + SLACK (never past MAX_S by more than the cycles in flight and a scheduling delay),
           - stop_secs < MAX_S implies ops_at_stop >= OPS (it stopped early only because both minimums held),
           - capped is a bool (bbload's warmup_cap_applied); ops_at_stop < OPS implies capped, and capped implies
-            stop_secs >= MAX_S (fourth lane review LOW 14: bbload's OPS:S:MAX_S rule is the definition),
-          - drain_secs >= 0, secs == stop_secs + drain_secs (to print precision), ops >= ops_at_stop.
+            stop_secs >= MAX_S (fourth lane review LOW 14: bbload's OPS:S:MAX_S rule is the definition); not capped
+            implies stop_secs >= S, and OPS and S both met implies not capped (review 5 LOW 15),
+          - drain_secs >= 0, secs == stop_secs + drain_secs (to print precision), ops == ops_at_stop (A23 counts
+            claims, so nothing is counted after the claim that ended the warm-up; review 5 LOW 15).
   driver_contract.py self-test                                  the checker on synthetic records; exit 0 iff all pass
 
 The fastest-gates release job runs the built driver with rules whose outcome is forced (1000000:0:2 must run to
@@ -58,8 +60,12 @@ def check(j, t, c, rule, by_client=None):
         bad.append(f"stopped at {st} s, past MAX_S {m} by more than {SLACK} s")
     if st < m and oa < ops:
         bad.append(f"stopped at {st} s, before MAX_S {m}, with {oa} ops < OPS {ops}")
-    if dr < 0 or abs(se - (st + dr)) > 2e-3 or ot < oa:
-        bad.append(f"drain {dr}, secs {se} vs stop + drain {st + dr}, ops {ot} vs ops_at_stop {oa}")
+    if dr < 0 or abs(se - (st + dr)) > 2e-3:
+        bad.append(f"drain {dr}, secs {se} vs stop + drain {st + dr}")
+    # review 5 LOW 15: under A23 the warm-up ops are the claims before the claim that ended it, read after every client
+    # finished, so a count that differs from ops_at_stop counted a claim after the end (or lost one)
+    if ot != oa:
+        bad.append(f"ops {ot} vs ops_at_stop {oa}: the warm-up count moved after the claim that ended it")
     cap = w.get("capped")
     if not isinstance(cap, bool):
         bad.append(f"warmup.capped {cap!r}, want true or false (bbload's warmup_cap_applied)")
@@ -68,6 +74,12 @@ def check(j, t, c, rule, by_client=None):
             bad.append(f"stopped with {oa} ops < OPS {ops} and not capped: only MAX_S can end it there")
         if cap and st < m - 1e-3:
             bad.append(f"capped at {st} s, before MAX_S {m}")
+        # both ways (LOW 15): ending before S takes MAX_S, and done (OPS and S both met, clear of print precision) is
+        # never capped, as warm_ends' capped = !done
+        if not cap and st < s - 1e-3:
+            bad.append(f"not capped, stopped at {st} s before S {s}: only MAX_S ends a warm-up before S")
+        if cap and oa >= ops and st >= s + 1e-3:
+            bad.append(f"capped, but OPS {ops} and S {s} were both met ({oa} ops at {st} s): done is not capped")
     return bad
 
 
