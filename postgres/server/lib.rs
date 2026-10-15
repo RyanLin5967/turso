@@ -5789,6 +5789,33 @@ mod tests {
         assert_eq!(val, Value::from_f64(1.23));
     }
 
+    /// A text bytea parameter without the `\x` prefix is read in byteain's escape format, as
+    /// PostgreSQL 18.6 reads it (recorded, artie raw loud-20261015/pg18-diff/pg18-bytea.out): `\\`
+    /// is one backslash, `\ooo` (three octal digits, the first 0-3) one byte, and any other
+    /// backslash is 22P02 "invalid input syntax for type bytea"; bytes with no backslash are
+    /// themselves. It was stored as the raw bytes, backslashes included (wire review 13 item 15).
+    #[test]
+    fn a_bytea_parameter_is_read_in_the_escape_format() {
+        let bytes = |text: &[u8]| match pg_bytes_to_value(text, &Type::BYTEA) {
+            Ok(Value::Blob(b)) => Ok(b),
+            Ok(other) => panic!("{other:?}"),
+            Err(PgWireError::UserError(e)) => Err(e.code.clone()),
+            Err(e) => panic!("{e:?}"),
+        };
+        assert_eq!(bytes(b"abc"), Ok(b"abc".to_vec()));
+        assert_eq!(bytes(b"a\\\\b"), Ok(b"a\\b".to_vec()));
+        assert_eq!(bytes(b"a\\101b"), Ok(b"aAb".to_vec()));
+        assert_eq!(bytes(b"\\x4142"), Ok(b"AB".to_vec()));
+        for bad in [&b"a\\qb"[..], b"a\\1b", b"a\\400b", b"a\\"] {
+            assert_eq!(
+                bytes(bad),
+                Err("22P02".to_string()),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
     /// Wire review 16 item 23: parameter decoding at the edges, as PostgreSQL's input functions read
     /// them. float4's own largest output, '3.4028235e+38' (float4out of FLT_MAX), binds, where it
     /// was refused 22003 (compared as an f64 above f32::MAX); a spelling that underflows to zero
