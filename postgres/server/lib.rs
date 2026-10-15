@@ -4366,8 +4366,15 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                     decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22023", e)))?;
                 Ok(Value::from_blob(data))
             } else {
-                // Raw bytes as-is
-                Ok(Value::from_blob(bytes.to_vec()))
+                // byteain's escape format: `\\` one backslash, `\ooo` (first digit 0-3) one
+                // byte, any other backslash 22P02, every other byte itself. It stored the raw
+                // bytes, backslashes included (wire review 13 item 15).
+                decode_bytea_escape(bytes).map(Value::from_blob).ok_or_else(|| {
+                    PgWireError::UserError(error(
+                        "22P02",
+                        "invalid input syntax for type bytea".to_string(),
+                    ))
+                })
             }
         }
         // TEXT, VARCHAR, UNKNOWN and all other types: the text as given (a parameter nothing
@@ -4533,6 +4540,37 @@ fn pg_integer(text: &str) -> Option<Option<i64>> {
         magnitude as i64
     };
     Some(Some(value))
+}
+
+/// PostgreSQL's escape-format bytea text, as its byteain reads it (PostgreSQL 18.6 recorded,
+/// artie raw loud-20261015/pg18-diff/pg18-bytea.out): `\\` is a backslash, `\` and three octal
+/// digits whose first is 0-3 is that byte, any other backslash is invalid (None).
+fn decode_bytea_escape(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1..i + 4) {
+            _ if bytes.get(i + 1) == Some(&b'\\') => {
+                out.push(b'\\');
+                i += 2;
+            }
+            Some(&[a, b, c])
+                if (b'0'..=b'3').contains(&a)
+                    && (b'0'..=b'7').contains(&b)
+                    && (b'0'..=b'7').contains(&c) =>
+            {
+                out.push(((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0'));
+                i += 4;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
