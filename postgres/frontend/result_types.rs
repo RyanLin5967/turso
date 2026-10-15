@@ -230,10 +230,13 @@ pub fn parameter_types(
     search_path: &[String],
     cache: &std::sync::Mutex<ViewCache>,
     attached: &Attached<'_>,
-) -> (
-    std::collections::BTreeMap<u32, u32>,
-    std::collections::BTreeSet<u32>,
-) {
+) -> Result<
+    (
+        std::collections::BTreeMap<u32, u32>,
+        std::collections::BTreeSet<u32>,
+    ),
+    String,
+> {
     let memo = {
         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         let same = cache
@@ -284,10 +287,13 @@ fn parameter_types_with(
     search_path: &[String],
     view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     attached: &Attached<'_>,
-) -> (
-    std::collections::BTreeMap<u32, u32>,
-    std::collections::BTreeSet<u32>,
-) {
+) -> Result<
+    (
+        std::collections::BTreeMap<u32, u32>,
+        std::collections::BTreeSet<u32>,
+    ),
+    String,
+> {
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
@@ -300,6 +306,7 @@ fn parameter_types_with(
         cuts: Default::default(),
         cut_views: Default::default(),
         attached,
+        missing_rte: Default::default(),
     };
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
@@ -312,7 +319,10 @@ fn parameter_types_with(
         .filter(|n| !infer.types.contains_key(n))
         .copied()
         .collect();
-    (infer.types, untyped)
+    if let Some(missing) = infer.missing_rte.take() {
+        return Err(missing);
+    }
+    Ok((infer.types, untyped))
 }
 
 /// A relation a column reference can name, by the name references qualify it by: a table (its
@@ -391,6 +401,10 @@ struct Infer<'a> {
     cut_views: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     /// The session's attached schemas ([`Attached`]).
     attached: &'a Attached<'a>,
+    /// A column reference that names no FROM entry (`s.t.c` with no relation s.t in scope),
+    /// PostgreSQL's errorMissingRTE (42P01): the statement is refused with it. Shared with the walks
+    /// of the statement's own subqueries, not with a view's (wire review 17 item 5).
+    missing_rte: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 /// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
@@ -825,6 +839,7 @@ impl Infer<'_> {
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
             attached: self.attached,
+            missing_rte: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1452,19 +1467,33 @@ impl Infer<'_> {
                 }
                 None
             }
-            // `public.t.c` (or `main.t.c`, a view's stored spelling) is t's c; a reference
-            // through any other schema (or deeper) names a relation this walk cannot read: found,
-            // untyped, so a parameter compared with it is refused (42P18). It was not found, which
-            // fell to text (wire review 14 item 3, review 18 item 5).
-            [schema, table, column]
-                if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") =>
-            {
-                for level in scope.iter().rev() {
-                    if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
-                        return of(rel, column);
+            // `schema.t.c` names the FROM entry t of that schema, as PostgreSQL's
+            // refnameNamespaceItem reads it. Through public, `main` (a view's stored spelling) or
+            // pg_catalog it is the relation t in scope; through another schema it is a relation
+            // this walk cannot read (found, untyped: 42P18 for a parameter compared with it), unless
+            // the t in scope is main's or a derived one, which is no relation of that schema. With
+            // no entry t in scope at all, it names none: 42P01, PostgreSQL's errorMissingRTE. The
+            // path hard-coded public, so the pg_catalog form was 42P18, and a reference through a
+            // schema whose t was not in FROM was typed untyped instead of refused (wire review 14
+            // item 3, review 17 item 5, review 18 item 5).
+            [schema, table, column] => {
+                let found = scope
+                    .iter()
+                    .rev()
+                    .find_map(|level| level.iter().find(|rel| rel.name() == *table));
+                let main = ["public", "main", "pg_catalog"]
+                    .iter()
+                    .any(|m| schema.eq_ignore_ascii_case(m));
+                match found {
+                    Some(rel) if main => of(rel, column),
+                    Some(Rel::Unknown { .. }) => Some(None),
+                    _ => {
+                        self.missing_rte.borrow_mut().get_or_insert_with(|| {
+                            format!("missing FROM-clause entry for table \"{table}\"")
+                        });
+                        Some(None)
                     }
                 }
-                None
             }
             _ => Some(None),
         }
@@ -1596,6 +1625,7 @@ impl Infer<'_> {
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
             attached: self.attached,
+            missing_rte: self.missing_rte.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();

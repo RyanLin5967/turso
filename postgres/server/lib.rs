@@ -2638,6 +2638,7 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ParseError(m)
             if m.starts_with("no such table")
                 || m.starts_with("no such view")
+                || m.starts_with("missing FROM-clause entry for table")
                 || (m.starts_with("relation \"") && m.ends_with("\" does not exist")) =>
         {
             "42P01"

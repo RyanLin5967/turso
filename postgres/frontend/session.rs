@@ -594,13 +594,16 @@ fn prepare_statement_checked(
                 names: &names,
                 holds: &holds,
             };
+            // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
+            // item 5).
             (types.params, types.untyped) = crate::result_types::parameter_types(
                 &parse_result,
                 &schema,
                 &search_path,
                 &pg_conn.view_cache,
                 &attached,
-            );
+            )
+            .map_err(LimboError::ParseError)?;
         }
         types.used = used;
     }
