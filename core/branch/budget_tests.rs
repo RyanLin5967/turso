@@ -51,7 +51,12 @@ const GROWTH: u64 = 23_040;
 /// The checkpoint arm's threshold (the default is 1 MiB) and its rounds: about 130 log bytes a
 /// round, so a checkpoint every ~60 rounds.
 const CKPT_THRESHOLD: u64 = 8 << 10;
-const CKPT_ROUNDS: u64 = 240;
+/// FLAGGED FIXTURE CHANGE, lead-ruled (class (b) acceptance, DECISIONS 2026-10-15): 240 rounds made
+/// about 3 checkpoints, and with attribution by thread fewer than 3 of them were attributable, so
+/// the checkpoint cells refused. 960 rounds make about 12. The claims and thresholds are unchanged;
+/// `checkpoint_excess` still refuses below 3 attributable installs and reports both counts, and
+/// `a_checkpoint_flushes_at_most_three_times_over_every_round` bounds the unselected total.
+const CKPT_ROUNDS: u64 = 960;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
@@ -2980,14 +2985,35 @@ fn recovery_appends_nothing_to_the_log() {
 /// (`ckpt_started == 0`), summed per counter, with the checkpoints installed. Refuses fewer than
 /// three.
 fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
+    let (installed, excess, _) = checkpoint_excess_of(spec, true);
+    (installed, excess)
+}
+
+/// The excess of the operations that started a checkpoint over their calm minimum, summed, and the
+/// checkpoints they installed: over the QUIET samples only (`quiet_only`, every budget but the
+/// selection-bias check) or over every sample. Reports the checkpoint-starting rounds attributable
+/// and refused. With `quiet_only`, refuses below three attributable installs (class (b): never a
+/// verdict from fewer).
+fn checkpoint_excess_of(spec: &str, quiet_only: bool) -> (u64, BTreeMap<&'static str, i64>, (u64, u64)) {
     let c = cell(spec);
     let mut excess: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut installed = 0;
+    let (mut attributable, mut refused) = (0u64, 0u64);
     for op in ["ckpt_create", "ckpt_first_write"] {
+        let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
         let samples = quiet(&c, op);
         let calm: Vec<&&Map> = samples.iter().filter(|s| s["ckpt_started"] == 0).collect();
         assert!(calm.len() * 2 >= samples.len(), "{spec}: {op}: most operations started a checkpoint");
-        for s in samples.iter().filter(|s| s["ckpt_started"] > 0) {
+        for s in all.iter().filter(|s| s["ckpt_started"] > 0) {
+            let quiet = s.get("quiet").copied().unwrap_or(1) == 1;
+            if quiet {
+                attributable += 1;
+            } else {
+                refused += 1;
+            }
+            if quiet_only && !quiet {
+                continue;
+            }
             installed += s["ckpt_installed"];
             for k in ["syscalls", "held_syscalls", "held_syncs", "fsync", "full_fsync", "barrier", "locks_process", "catalog_queries"] {
                 let Some(&v) = s.get(k) else { continue };
@@ -2996,8 +3022,13 @@ fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
             }
         }
     }
-    assert!(installed >= 3, "{spec}: premise: at least three checkpoints installed ({installed})");
-    (installed, excess)
+    if quiet_only {
+        assert!(
+            installed >= 3,
+            "{spec}: premise: at least three checkpoints installed in attributable rounds ({installed}; checkpoint rounds attributable {attributable}, refused {refused})"
+        );
+    }
+    (installed, excess, (attributable, refused))
 }
 
 /// Review 1 #7 and the engine's b79dc250e (a fuzzy checkpoint issues no sync inside the store
@@ -3056,6 +3087,28 @@ fn a_checkpoint_flushes_at_most_three_times() {
         assert!(
             full <= 3 * n as i64 && other <= n as i64,
             "{spec}: {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
+        );
+    }
+}
+
+/// The lead's selection-bias condition on the CKPT_ROUNDS ruling: the flush budget over EVERY
+/// checkpoint-starting round, attributable or not (the engine's flush counters, not the syscall
+/// attribution), with each operation's own calm cost subtracted, so a cost that appears only in the
+/// overlapping, refused rounds cannot hide behind the selection. Same thresholds as
+/// `a_checkpoint_flushes_at_most_three_times`: 3 full flushes and 1 other sync per checkpoint.
+#[test]
+fn a_checkpoint_flushes_at_most_three_times_over_every_round() {
+    if in_child() {
+        return;
+    }
+    for spec in ["ckpt_n10", "ckpt_n1e4"] {
+        let (n, excess, (attributable, refused)) = checkpoint_excess_of(spec, false);
+        assert!(n >= 3, "{spec}: premise: at least three checkpoints installed over every round ({n})");
+        let full = excess.get(FULL).copied().unwrap_or(0);
+        let other = excess.get(NOT_FULL).copied().unwrap_or(0) + excess.get("barrier").copied().unwrap_or(0);
+        assert!(
+            full <= 3 * n as i64 && other <= n as i64,
+            "{spec}: over every round ({attributable} attributable, {refused} refused): {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
         );
     }
 }
