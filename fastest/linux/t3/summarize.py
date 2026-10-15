@@ -847,7 +847,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -881,6 +881,10 @@ def self_test():
                     # TEST EDIT, flagged (SPEC CHANGE, bb96279f3): the measured span ours' sweeper is read over
                     | ({} if ours_tm == "absent" else {"tm0_realtime_s": 100.12 if ours_tm == "differs" else 100.1,
                                                        "tm1_realtime_s": 100.3})
+                    # TEST EDIT, flagged: fastest_profile's own TracerPid at the measured span's open and close, as
+                    # the competitors' load generator records it (the checks summarize used to drop for ours)
+                    | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
+                                                       "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
                     | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
@@ -1129,6 +1133,12 @@ def self_test():
          {}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04] and s["runs"][0].get("sweeper_windows")
          == ["measured"] and s.get("sweeper_creditable") is True
          and not any("sweeper" in x and "process" in x for x in s.get("loud_owed") or [])),
+        # the tracer checks summarize dropped for ours (fastest_profile recorded no TracerPid of its own): it records
+        # them now, at the measured span's open and close, so the competitors' rule applies whole
+        ("tracerpid: ours whose own TracerPid at tm1 is 4321 fails, naming tracerpid_tm1", {"ours_tp": "traced"}, False,
+         lambda s: any("tracerpid_tm1" in x for x in s["parity_refusals"])),
+        ("tracerpid: ours recording no TracerPid of its own fails, naming tracerpid_tm0", {"ours_tp": "absent"}, False,
+         lambda s: any("tracerpid_tm0" in x for x in s["parity_refusals"])),
         ("measured span: a timed.json still naming the process window fails", {"ours_sweeper": "processwin"}, False,
          lambda s: any("'process'" in x for x in s["parity_refusals"])),
         ("measured span: summary.json's tm0 (100.12) other than timed.json's t0 (100.1) fails, naming tm0",
@@ -1281,7 +1291,8 @@ def self_test():
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
                                                                "ops_total_asked": int(ops), "mode": "phases",
                                                                "phases_run": 4, "tm0_realtime_s": 100.1,
-                                                               "tm1_realtime_s": 100.3,
+                                                               "tm1_realtime_s": 100.3, "tracerpid_tm0": 0,
+                                                               "tracerpid_tm1": 0,
                                                                "windows": ours_windows()}))  # TEST EDIT, flagged
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
