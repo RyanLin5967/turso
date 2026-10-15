@@ -550,16 +550,22 @@ def self_test():
         top = tempfile.mkdtemp(dir=tmp)
         droot, sroot = os.path.join(top, "dev"), os.path.join(top, "sys")
         os.makedirs(os.path.join(droot, "sub"))
-        nums = {"nvme0n1": 0, "nvme0n1p1": 1, "nvme0n2": 2, "nvme1n1": 3, "nvme2n1": 4, "nvme3n1": 5}
+        nums = {"nvme0n1": 0, "nvme0n1p1": 1, "nvme0n2": 2, "nvme1n1": 3, "nvme2n1": 4, "nvme3n1": 5, "nvme4n1": 7,
+                "nvme5n1": 6, "nvme6n1": 8, "nvme7n1": 9}
         for d in nums:
             open(os.path.join(droot, d), "w").close()
         open(os.path.join(droot, "sub", "nvme1n1"), "w").close()
         os.symlink(os.path.join(droot, "nvme1n1"), os.path.join(droot, "by-id-spare"))
         os.symlink(os.path.join(droot, "sub", "nvme1n1"), os.path.join(droot, "by-id-sub"))
-        for c in ("nvme0", "nvme1", "nvme2", "nvme3"):
+        for c in ("nvme0", "nvme1", "nvme2", "nvme3", "nvme4", "nvme7"):
             os.makedirs(os.path.join(sroot, "devices", "pci", c))
+        # review 5 LOW 19 (TEST EDIT, flagged: new fixture files): each controller's subsysnqn; nvme4 is a second
+        # controller of the root drive (multipath=N, dual port: the root's subsysnqn), nvme7 has none readable
+        for c, q in (("nvme0", "root"), ("nvme1", "spare"), ("nvme2", "mp2"), ("nvme3", "held3"), ("nvme4", "root")):
+            with open(os.path.join(sroot, "devices", "pci", c, "subsysnqn"), "w") as f:
+                f.write(f"nqn.2014-08.org.nvmexpress:uuid:{q}\n")
         for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1"), ("nvme2n1", "nvme2"),
-                     ("nvme3n1", "nvme3")):
+                     ("nvme3n1", "nvme3"), ("nvme4n1", "nvme4"), ("nvme7n1", "nvme7")):
             os.makedirs(os.path.join(sroot, "block", d, "holders"))
             os.symlink(os.path.join("..", "..", "devices", "pci", c), os.path.join(sroot, "block", d, "device"))
             with open(os.path.join(sroot, "block", d, "dev"), "w") as f:
@@ -570,9 +576,28 @@ def self_test():
         os.makedirs(os.path.join(sroot, "block", "nvme2n1", "multipath"))
         open(os.path.join(sroot, "block", "nvme2n1", "multipath", "nvme2c2n1"), "w").close()
         open(os.path.join(sroot, "block", "nvme3n1", "holders", "dm-9"), "w").close()
+        # review 5 LOW 18: native-multipath heads as kernel 6.8 lays them out, with NO multipath directory: the head
+        # under devices/virtual/nvme-subsystem/nvme-subsysS (its device link is the subsystem), the subsystem linking
+        # each controller, the hidden path nvme<S>c<C>n<N> under its controller; nvme6's link dangles, so its paths
+        # cannot be listed
+        for hs, ok in ((5, True), (6, False)):
+            sub = os.path.join(sroot, "devices", "virtual", "nvme-subsystem", f"nvme-subsys{hs}")
+            head = os.path.join(sub, f"nvme{hs}n1")
+            os.makedirs(os.path.join(head, "holders"))
+            with open(os.path.join(head, "dev"), "w") as f:
+                f.write(f"259:{nums[f'nvme{hs}n1']}\n")
+            with open(os.path.join(sub, "subsysnqn"), "w") as f:
+                f.write(f"nqn.2014-08.org.nvmexpress:uuid:cmic{hs}\n")
+            os.symlink("..", os.path.join(head, "device"))
+            if ok:
+                os.makedirs(os.path.join(sroot, "devices", "pci", f"nvme{hs}", f"nvme{hs}c{hs}n1"))
+            os.symlink(os.path.join("..", "..", "..", "pci", f"nvme{hs}"), os.path.join(sub, f"nvme{hs}"))
+            os.symlink(os.path.join("..", "devices", "virtual", "nvme-subsystem", f"nvme-subsys{hs}", f"nvme{hs}n1"),
+                       os.path.join(sroot, "block", f"nvme{hs}n1"))
         lsblk = json.dumps({"blockdevices": [N("nvme0n1", "disk", children=[N("nvme0n1p1", "part", "nvme0n1", ["/"])]),
                                              N("nvme0n2", "disk"), N("nvme1n1", "disk"), N("nvme2n1", "disk"),
-                                             N("nvme3n1", "disk")]})
+                                             N("nvme3n1", "disk"), N("nvme4n1", "disk"), N("nvme5n1", "disk"),
+                                             N("nvme6n1", "disk"), N("nvme7n1", "disk")]})
         answers = {"nvme0n1": (0, "DEVNAME=/dev/nvme0n1\nPTTYPE=gpt\n"), "nvme0n1p1": (0, "TYPE=ext4\n")}
 
         def run(dev, node=None):
@@ -590,6 +615,27 @@ def self_test():
         return run
 
     box = fake_box()
+
+    def ends_check(d):
+        big, empty = os.path.join(d, "ends-3m"), os.path.join(d, "ends-0")
+        with open(big, "wb") as f:
+            f.write(b"\0" * (3 << 20))
+        open(empty, "wb").close()
+        return ends_readable(big), ends_readable(empty)
+
+    def probe_unreadable(d):
+        """blkid_probe on a 0-byte node, with a blkid first on PATH that answers blank (rc 2, nothing printed)"""
+        b = tempfile.mkdtemp(dir=d)
+        with open(os.path.join(b, "blkid"), "w") as f:
+            f.write("#!/bin/sh\nexit 2\n")
+        os.chmod(os.path.join(b, "blkid"), 0o755)
+        open(os.path.join(b, "nvme9n9"), "wb").close()
+        path0 = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = b + os.pathsep + path0
+            return blkid_probe("nvme9n9", b)
+        finally:
+            os.environ["PATH"] = path0
     pci = {"pci/nvme0n1": "disk", "pci/nvme0n1/nvme0n1p1": "part", "pci/nvme0n1/nvme0n1p2": "part",
            "pci/nvme0n1/nvme0n1p3": "part", "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
     # round-2 attack LOW 2: an NVMe multipath head whose slaves are its path devices (the 4.15-era layout)
@@ -765,6 +811,30 @@ def self_test():
         ("LOW 5: check() refuses a spare whose opened node is not a block device",
          lambda: (lambda r: (any("nvme1n1's node is not a block device" in b for b in r[1]), r))(
              box("nvme1n1", node={"nvme1n1": (stat.S_IFREG | 0o644, 0)}))),
+        # review 5 LOW 18: a native-multipath head is told by where its sysfs node lives, not by a multipath directory
+        # kernel 6.8 does not have
+        ("LOW 18: check() refuses nvme5n1, a native-multipath head (devices/virtual/nvme-subsystem) with no multipath "
+         "directory, naming its path nvme5c5n1",
+         lambda: (lambda r: (any("nvme5n1 is a multipath NVMe head (['nvme5c5n1'])" in b for b in r[1]), r))(
+             box("nvme5n1"))),
+        ("LOW 18: check() refuses nvme6n1, a head whose paths cannot be listed",
+         lambda: (lambda r: (any("nvme6n1 is a native-multipath NVMe head whose paths cannot be listed" in b
+                                 for b in r[1]), r))(box("nvme6n1"))),
+        # review 5 LOW 19: another controller of the root drive (multipath=N, dual port, SR-IOV) has its own device
+        # link, so only the subsystem NQN tells
+        ("LOW 19: check() refuses nvme4n1, on controller nvme4, which carries the root drive's subsysnqn",
+         lambda: (lambda r: (any("nvme4n1's subsystem (nqn.2014-08.org.nvmexpress:uuid:root) is nvme0n1's" in b
+                                 for b in r[1]), r))(box("nvme4n1"))),
+        ("LOW 19: check() refuses an NVMe spare whose subsysnqn cannot be read",
+         lambda: (lambda r: (any("no subsysnqn for nvme7n1" in b for b in r[1]), r))(box("nvme7n1"))),
+        ("LOW 18/19: the spare on its own single-path controller still passes (no head, its own subsysnqn)",
+         lambda: (lambda r: (r == ("nvme1n1", []), r))(box("nvme1n1"))),
+        # review 5 LOW 20: blkid exits 2 with nothing on stderr for a device it could not read as for a blank one, so
+        # the probe first reads the first and last MiB itself
+        ("LOW 20: ends_readable reads the first and last MiB of a 3 MiB file, and refuses a 0-byte one",
+         lambda: (lambda r: (r[0] is None and r[1] is not None, r))(ends_check(tmp))),
+        ("LOW 20: blkid_probe on a node it cannot read is a failed probe (rc None), though blkid answers blank",
+         lambda: (lambda r: (r[0] is None, r))(probe_unreadable(tmp))),
     ]
     bad = []
     try:
