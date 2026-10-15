@@ -1734,15 +1734,23 @@ fn a_busy_commit_re_stepped_over_a_paused_sibling_writer_is_refused() {
     }
 }
 
-/// Engine review 16 HIGH 1 (h): statement S1's COMMIT is Busy; BEGIN and COMMIT then run on another
-/// statement S2, which commits the transaction. Re-stepping S1 finds no transaction.
+/// Engine review 16 HIGH 1 (h): statement S1's COMMIT is Busy; a BEGIN on another statement is
+/// refused (the transaction is still open, as (f) shows), and a COMMIT on another statement S2
+/// commits it. Re-stepping S1 finds no transaction.
+///
+/// FLAGGED TEST EDIT (engine review 19 LOW 20 b, a strengthening): the BEGIN's result was swallowed
+/// (`let _ =`); it is asserted refused, and the doc says what it does.
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn a_busy_commit_re_stepped_after_another_statement_committed_finds_no_transaction() {
     let _s = serial();
     for catalog in [false, true] {
         let mut f = BusyCommit::new(catalog, true);
-        let _ = f.a.execute("BEGIN");
+        let begin = f.a.execute("BEGIN");
+        assert!(
+            matches!(begin, Err(LimboError::TxError(_))),
+            "catalog={catalog}: premise: a BEGIN over the open transaction is refused: {begin:?}"
+        );
         let s2 = f.a.execute("COMMIT");
         assert!(s2.is_ok(), "catalog={catalog}: premise: S2's COMMIT commits: {s2:?}");
         let s1 = f.restep();
