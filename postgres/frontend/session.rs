@@ -2617,6 +2617,56 @@ mod tests {
         assert!(table_info_reads() > before, "the instrument never fires");
     }
 
+    /// A positional INSERT with DEFAULT, or one shorter than its table, finds the table through the
+    /// whole search path, still with no catalog query: under PostgreSQL's default path ("$user",
+    /// public), under a path whose first schema is attached, and for an attached table named by its
+    /// schema. Only a path starting at public was read, so each was refused (ultrareview of
+    /// fastest-wire, finding 6).
+    #[test]
+    fn a_positional_insert_finds_its_table_through_the_whole_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        run(&conn, "CREATE TABLE m (a int, b int, c text default 'm')");
+        run(&conn, "CREATE SCHEMA app");
+        run(&conn, "CREATE TABLE app.w (a int, b int, c text default 'w')");
+        let before = table_info_reads();
+        run(&conn, "SET search_path TO \"$user\", public");
+        run(&conn, "INSERT INTO m VALUES (DEFAULT, 1)");
+        run(&conn, "INSERT INTO m VALUES (2)");
+        run(&conn, "SET search_path TO app, public");
+        run(&conn, "INSERT INTO w VALUES (DEFAULT, 3)");
+        run(&conn, "INSERT INTO w VALUES (4)");
+        run(&conn, "INSERT INTO m VALUES (5)");
+        run(&conn, "SET search_path TO public");
+        run(&conn, "INSERT INTO app.w VALUES (DEFAULT, 6)");
+        assert_eq!(table_info_reads() - before, 0, "a positional INSERT read the catalog");
+        let rows = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|r| r.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join("|"))
+                .collect()
+        };
+        assert_eq!(
+            rows("SELECT a, b, c FROM m ORDER BY rowid"),
+            ["|1|m", "2||m", "5||m"]
+        );
+        assert_eq!(
+            rows("SELECT a, b, c FROM app.w ORDER BY rowid"),
+            ["|3|w", "4||w", "|6|w"]
+        );
+    }
+
     fn slow(sql: &str) -> Option<PgBranchCall> {
         try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
     }
