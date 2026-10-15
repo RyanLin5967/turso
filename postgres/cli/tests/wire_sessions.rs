@@ -2289,6 +2289,40 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// The settings whose effect a ROLLBACK would have to undo, foreign_keys and search_path, are
+/// refused (0A000) inside an explicit transaction block and as SET LOCAL, as this server keeps a
+/// SET past the block whatever ends it: `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off for
+/// the session, and `BEGIN; SET search_path TO s, public; ROLLBACK` sent later unqualified writes
+/// to s (wire review 16 item 18; review 17 folded search_path into it). Each refusal fails its
+/// block, as any error does; outside a block, and in a multi-statement query's implicit block,
+/// both still act.
+#[test]
+fn a_setting_a_rollback_cannot_undo_is_refused_in_a_block() {
+    let dir = Scratch::new("setinblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(x INT REFERENCES p(id))").ok("c");
+    for sql in ["SET foreign_keys = off", "SET search_path TO s, public"] {
+        a.q("BEGIN").ok("begin");
+        let r = a.q(sql);
+        assert_eq!(r.err(sql).code, "0A000", "{sql} in a block");
+        assert_eq!(r.status, b'E', "{sql} fails the block");
+        a.q("ROLLBACK").ok("end");
+    }
+    let orphan = "INSERT INTO c VALUES (5)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "keys still on");
+    for sql in [
+        "SET LOCAL foreign_keys = off",
+        "SET LOCAL search_path TO public",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    a.q("SET search_path TO public; SELECT 1")
+        .ok("in a multi-statement query's implicit block");
+    a.q("SET search_path TO public").ok("outside a block");
+}
+
 /// A pg_dump -s header's settings each answer SET: those PostgreSQL 17 and 18 dumps write, one by
 /// one (the list is recalled from pg_dump's output, not recorded here; the owed run replays the
 /// BranchBench dump through psql). xmloption, transaction_timeout, default_tablespace and
