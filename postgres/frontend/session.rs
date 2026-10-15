@@ -833,6 +833,15 @@ fn prepare_statement_checked(
             types.untyped = walked.untyped;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
+        // The columns whose type PostgreSQL's grammar fixes (a boolean expression, a float4 cast),
+        // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
+        // 2026-10-15).
+        let fixed = crate::result_types::expression_types(&parse_result);
+        if fixed.len() == types.columns.len() {
+            for (column, fixed) in types.columns.iter_mut().zip(fixed) {
+                *column = column.or(fixed);
+            }
+        }
         types.used = used;
     }
 

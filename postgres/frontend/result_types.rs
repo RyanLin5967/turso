@@ -64,6 +64,89 @@ pub fn aggregate_targets(parse: &ParseResult) -> Vec<bool> {
     aggregates
 }
 
+/// The result columns of a plain SELECT (as [`aggregate_targets`] lines them up) whose type
+/// PostgreSQL's grammar fixes whatever the operands are: bool for a boolean literal, a comparison
+/// (=, <>, !=, <, >, <=, >=), AND / OR / NOT, IS [NOT] NULL, IS [NOT] TRUE / FALSE / UNKNOWN, IN,
+/// BETWEEN, LIKE, ILIKE, SIMILAR TO, IS [NOT] DISTINCT FROM, ANY / ALL, EXISTS, a cast to bool, and a
+/// CASE whose every result is one of these; float4 for a cast to float4 or real. None for every
+/// other column (the engine's to type) and the empty list when the statement is no such SELECT.
+/// The engine has no boolean type, so it typed them int4 or text holding 1 and 0, and a float4
+/// cast float8; PostgreSQL 18 announces bool and float4 (recorded 2026-10-15, artie
+/// lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out).
+pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
+    if aggregate_targets(parse).is_empty() {
+        return Vec::new();
+    }
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    select
+        .target_list
+        .iter()
+        .map(|target| match target.node.as_ref() {
+            Some(Node::ResTarget(t)) => t.val.as_deref().and_then(expression_type),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`expression_types`] for one expression.
+fn expression_type(node: &PgNode) -> Option<u32> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind, SubLinkType};
+    let boolean = match node.node.as_ref()? {
+        Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
+        Node::AExpr(e) => match e.kind() {
+            AExprKind::AexprOp => matches!(
+                e.name.as_slice(),
+                [op] if matches!(
+                    op.node.as_ref(),
+                    Some(Node::String(s))
+                        if matches!(s.sval.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
+                )
+            ),
+            AExprKind::AexprOpAny
+            | AExprKind::AexprOpAll
+            | AExprKind::AexprDistinct
+            | AExprKind::AexprNotDistinct
+            | AExprKind::AexprIn
+            | AExprKind::AexprLike
+            | AExprKind::AexprIlike
+            | AExprKind::AexprSimilar
+            | AExprKind::AexprBetween
+            | AExprKind::AexprNotBetween
+            | AExprKind::AexprBetweenSym
+            | AExprKind::AexprNotBetweenSym => true,
+            _ => false,
+        },
+        Node::SubLink(l) => matches!(
+            l.sub_link_type(),
+            SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink
+        ),
+        Node::TypeCast(c) => {
+            let name = c.type_name.as_ref()?.names.last()?;
+            return match name.node.as_ref()? {
+                Node::String(s) if s.sval == "bool" => Some(BOOL),
+                Node::String(s) if s.sval == "float4" => Some(FLOAT4),
+                _ => None,
+            };
+        }
+        Node::CaseExpr(c) => {
+            let results = c.args.iter().map(|w| match w.node.as_ref() {
+                Some(Node::CaseWhen(w)) => w.result.as_deref().and_then(expression_type),
+                _ => None,
+            });
+            let default = c.defresult.as_deref().map(expression_type);
+            results.chain(default).all(|t| t == Some(BOOL))
+        }
+        _ => false,
+    };
+    boolean.then_some(BOOL)
+}
+
 /// The aggregate columns' types ([`aggregate_targets`]) out of the walk's types for the result
 /// columns ([`Walked::columns`]), which reads an aggregate's argument through its scope: the
 /// relation the engine reads, through the search path, a CTE, a derived table or a view. None for
