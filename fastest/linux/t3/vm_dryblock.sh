@@ -28,7 +28,9 @@ mkdir -p "$OUTDIR" || exit 2
 # the same self-tests on THIS platform first, from the commit the VM will run (gates/run_everywhere.py over a git
 # archive of SHA): the Mac half of "every gate runs on both Mac and Linux"; t3run's selftests stage is the Linux half
 mac=$(mktemp -d)
-git -C "$HERE" archive "$SHA" fastest .github | tar -x -C "$mac" ||
+# from the repository's top: git archive's pathspecs are relative to the directory it runs in (its first run, from
+# t3/, matched nothing: the platform class again, a path inherited from where the script happens to sit)
+top=$(git -C "$HERE" rev-parse --show-toplevel) && git -C "$top" archive "$SHA" fastest .github | tar -x -C "$mac" ||
   { echo "vm_dryblock: REFUSED: cannot archive $SHA here for the Mac self-tests"; rm -rf "$mac"; exit 2; }
 gnu=""; for g in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreutils/libexec/gnubin; do [ -d "$g" ] && gnu=$g:; done
 PATH=$gnu/opt/homebrew/bin:$PATH timeout 3600 python3 -B "$mac/fastest/linux/gates/run_everywhere.py" "$mac/fastest/linux" \

@@ -220,6 +220,21 @@ def block_record(out, fs, plp="no", dry=None):
     return rec
 
 
+def functional_verdict(text):
+    """'PASS', 'FAIL' or None: the LAST 'VERDICT ' line of a competitor's functional.txt (T3 runner review LOW 21), read
+    by its first word, as run_system.sh writes it ("VERDICT PASS (dolt)", "VERDICT FAIL (b1): 6 check(s) failed")"""
+    vl = [l.split() for l in text.splitlines() if l.startswith("VERDICT ")]
+    w = vl[-1][1] if vl and len(vl[-1]) > 1 else None
+    return w if w in ("PASS", "FAIL") else None
+
+
+def timed_verdict_ok(v, dry):
+    """a competitor timed run's timedrun.py verdict stands for this package: 'ok' in a real one; 'ok-smoke' in a dry one
+    (timedrun.py gives a dry run 'ok-smoke', never 'ok'; a real run warmed by another rule is 'ok-smoke-warmup', which
+    stands nowhere). Anything else is refused."""
+    return v == ("ok-smoke" if str(dry) == "1" else "ok")
+
+
 def run_parity(d, system, adapter_rc=None):
     """What a measured run itself recorded of its warm-up rule and measured op total (ours: result/summary.json; a
     competitor: every timed run under result/cells/*/timed/summary.json, the only latency files)."""
@@ -252,7 +267,7 @@ def run_parity(d, system, adapter_rc=None):
         except (OSError, ValueError):
             tj = None
         rules.append(j.get("warmup_rule"))
-        ops.append((tj or {}).get("ops"))
+        ops.append((tj or {}).get("timed_measured_ops"))  # timedrun.py's own field (the writer's format)
         backsteps.append((cell, j.get("warmup_backsteps")))  # PREREG annex A23 (comp 12f79726b's field)
         loops.append(j.get("loop"))
         seen.add(cell)
@@ -536,10 +551,11 @@ def summarize(out, sha, dry, manifest):
                 # the verdict is the LAST 'VERDICT ' line (T3 runner review LOW 21). run_system.sh exits 0 on PASS and
                 # 1 on FAIL, so a FAIL arrives at rc 1: complete raws of a failed check, its FAIL lines kept (fourth
                 # lane review LOW 21); any other rc (a kill, a refusal) is an incomplete run (LOW 12)
+                fv = functional_verdict(text)
                 vl = [l.strip() for l in text.splitlines() if l.startswith("VERDICT ")]
                 verdict = vl[-1] if vl else None
                 rc_ = last["adapter_rc"]
-                if verdict == "VERDICT PASS":
+                if fv == "PASS":
                     result = rc_ == 0
                 elif verdict is not None:
                     result = rc_ in (0, 1)
@@ -547,7 +563,7 @@ def summarize(out, sha, dry, manifest):
                     result = False
                 why = verdict if result else f"no functional VERDICT (adapter rc {rc_})" if verdict is None else \
                     f"functional {verdict} written but the adapter exited {rc_}"
-                if result and verdict != "VERDICT PASS":
+                if result and fv != "PASS":
                     failed_checks.append(f"{fs}/{cell}: " + "; ".join(
                         l for l in text.splitlines() if l.startswith("FAIL ")))
         st = os.path.join(d, "settle.txt") if d else None
@@ -560,7 +576,7 @@ def summarize(out, sha, dry, manifest):
             want = (prow.get((fs, cell)) or {}).get("ops")
             # timedrun.py's own verdict first: it names why a competitor's timed run cannot stand
             for tcell, v in r.get("timed_verdicts") or []:
-                if v != "ok":
+                if not timed_verdict_ok(v, dry):
                     what = v if v == "no timed.json" else f"timedrun verdict {v!r}"
                     parity.append(f"{fs}/{cell}: timed run {tcell}: {what}")
             for x in r["warmup_rules"] or [None]:
@@ -915,7 +931,7 @@ def self_test():
                 sweeper_files(a1, ours_sweeper)
             else:
                 verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail"
-                                           else "PASS F1\nVERDICT PASS\n")
+                                           else "PASS F1\nVERDICT PASS (dolt)\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
                 if info is not None:
@@ -925,7 +941,10 @@ def self_test():
                     w(f"{a1}/result/expected-cells.txt", "".join(e + "\n" for e in expected))
                 for cc in ("c1-create", "c1-m1"):
                     # timed: None (an uncapped run of comp_ops), or (measured_ops, capped, timedrun's verdict)
-                    mo, cap, tv = timed if timed else (comp_ops, False, "ok")
+                    # TEST EDIT, flagged (the writer-format class, 2026-10-15): the fixtures write the competitors'
+                    # records as timedrun.py and run_system.sh now write them: a dry package's verdict 'ok-smoke', the
+                    # measured count timed_measured_ops, functional.txt ending "VERDICT PASS (dolt)"
+                    mo, cap, tv = timed if timed else (comp_ops, False, "ok-smoke")
                     w(f"{a1}/result/cells/{cc}/timed/summary.json",
                       json.dumps({"warmup_rule": RULE, "measured_ops": mo, "capped": cap, "verdict": "ok", "rc": 0}
                                  | ({"warmup_backsteps": backsteps} if backsteps is not None else {})
@@ -934,7 +953,7 @@ def self_test():
                     # 44f272499); a new required field at its passing value (None: the field absent)
                     if tv is not None:
                         w(f"{a1}/result/cells/{cc}/timed.json", json.dumps(
-                            {"verdict": tv, "ops": comp_ops}
+                            {"verdict": tv, "timed_measured_ops": comp_ops}
                             | ({"sweeper_cpu_s": comp_sweeper} if comp_sweeper != "absent" else {})))
                 w(f"{a1}/adapter.txt", "")
         w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
@@ -1050,7 +1069,7 @@ def self_test():
         ("MED 3: a competitor's timed run at other than the planned ops fails (parity)", {"cell": "comp", "comp_ops": 199},
          False, lambda s: "199" in first(s, "parity_refusals")),
         ("MED 4: a competitor run ended by the cap (150 of 200 ops) that timedrun ok'd is complete, with reduced n",
-         {"cell": "comp", "timed": (150, True, "ok")}, True,
+         {"cell": "comp", "timed": (150, True, "ok-smoke")}, True,
          lambda s: s["runs"][0].get("reduced_n") == {"c1-create": 150, "c1-m1": 150}),
         ("MED 4: a capped run timedrun refused (fewer than 1000 ok ops) fails",
          {"cell": "comp", "timed": (80, True, "REFUSED: capped with 80 ok ops (< 1000)")}, False,
@@ -1297,7 +1316,8 @@ def self_test():
                                                                          "warmup_backsteps": 0, "loop": "closed"}))
         # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
         # TEST EDIT, flagged (MED 12 ruling): timed.json carries sweeper_cpu_s, at its passing value
-        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok", "ops": 300, "sweeper_cpu_s": 0.04}))
+        w(f"{a1}/result/cells/c1-create/timed.json", json.dumps({"verdict": "ok-smoke", "timed_measured_ops": 300,
+                                                                  "sweeper_cpu_s": 0.04}))
         w(f"{a1}/result/expected-cells.txt", "c1-create\n")
         s, ok = summarize(out, "sha", "1", "m")
         # TEST EDIT, flagged (fourth lane review HIGH 2): this case pinned the withdrawn cross-system rule (it
@@ -1337,7 +1357,7 @@ def self_test():
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
                                                                               "measured_ops": int(ops),
                                                                               "warmup_backsteps": 0, "loop": "closed"}))
-                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok", "ops": int(ops),
+                    w(f"{a1}/result/cells/c1/timed.json", json.dumps({"verdict": "ok-smoke", "timed_measured_ops": int(ops),
                                                                       "sweeper_cpu_s": 0.04}))  # TEST EDIT, flagged
                     w(f"{a1}/result/expected-cells.txt", "c1\n")
         w(f"{out}/cells.tsv", "\n".join(rows) + "\n")
@@ -1363,6 +1383,24 @@ def self_test():
                   f"(RUNNER_MODE {RUNNER_MODE!r}, RUNNER_PHASES {RUNNER_PHASES})",
                   RUNNER_MODE == "phases" and RUNNER_PHASES == len(PHASES)
                   and any("--mode phases" in ln for ln in fp) and not any("--phases" in ln for ln in fp), fp))
+    # CLASS (Ryan's class rule): summarize re-parsed records whose writers had changed, with nothing tying the two. The
+    # first full --dry-block run (2026-10-15) showed three instances on every competitor cell: timed.json's measured
+    # ops are "timed_measured_ops" now (summarize read "ops": "measured None ops"); a dry package's timedrun verdict is
+    # "ok-smoke" (summarize required "ok"); functional.txt's last line is "VERDICT PASS (dolt)" (summarize required the
+    # bare "VERDICT PASS", so a passing cell was listed in failed_checks with no FAIL line). The fix reads the
+    # writers' own format, and this case runs it on a REAL cell's records from that run (testdata, bytes as run)
+    td = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "dryblock-20261015-dolt-xfs")
+    rp = run_parity(td, "dolt")
+    cases.append(("writer formats: a real dolt cell's timed runs measure 30 ops each, as its plan row asks",
+                  bool(rp["ops_measured"]) and all(x == 30 for x in rp["ops_measured"]), rp["ops_measured"]))
+    cases.append(("writer formats: 'ok-smoke' stands in a dry package and never in a real one",
+                  timed_verdict_ok("ok-smoke", "1") and not timed_verdict_ok("ok-smoke", "0") and timed_verdict_ok("ok", "0")
+                  and not timed_verdict_ok("REFUSED: x", "1"), None))
+    fv = functional_verdict(open(os.path.join(td, "result", "functional.txt")).read())
+    cases.append(("writer formats: the real functional.txt's 'VERDICT PASS (dolt)' reads as PASS", fv == "PASS", fv))
+    cases.append(("writer formats: a last VERDICT FAIL (dolt) after a PASS reads as FAIL; no VERDICT line reads as None",
+                  functional_verdict("VERDICT PASS (dolt)\nFAIL F1\nVERDICT FAIL (dolt): 1 check(s) failed\n") == "FAIL"
+                  and functional_verdict("PASS F1\n") is None, None))
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
