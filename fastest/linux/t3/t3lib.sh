@@ -131,7 +131,18 @@ dev_unmoved() { # dev_unmoved PATH REAL
 t3_first_line() { [ -r "$1" ] && awk 'NR == 1 { gsub(/^[ \t]+|[ \t]+$/, ""); print }' "$1"; }
 
 dev_identity() { # dev_identity SYS DEV
-  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f
+  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f seq
+  # a DRY-VIRT run's virtual disk (t3run sets T3_IDENTITY_MODE=virtio in its --dry-block branch alone, and drops any
+  # inherited value first): virtio-blk exposes no wwid, model, serial or firmware, so it is identified by the diskseq
+  # the kernel gives each disk it attaches and does not reuse while it runs, beside its MAJ:MIN and the virtio vendor
+  if [ "${T3_IDENTITY_MODE:-}" = virtio ] && [[ $(t3_first_line "$d/modalias") == virtio:d00000002* ]]; then
+    seq=$(t3_first_line "$b/diskseq"); dev=$(t3_first_line "$b/dev")
+    [[ $seq =~ ^[0-9]+$ ]] || { echo "REFUSED: cannot read $2's diskseq under $1/block/$2 (a virtio disk's identity)" >&2; return 2; }
+    [ -n "$dev" ] || { echo "REFUSED: cannot read $2's dev under $1/block/$2" >&2; return 2; }
+    printf 'wwid=virtio-diskseq:%s\ndev=%s\nmodel=virtio-blk %s\nserial=diskseq-%s\nfirmware=virtio\n' "$seq" "$dev" \
+      "$(t3_first_line "$d/vendor")" "$seq"
+    return 0
+  fi
   wwid=$(t3_first_line "$b/wwid"); [ -n "$wwid" ] || wwid=$(t3_first_line "$d/wwid")
   dev=$(t3_first_line "$b/dev")
   model=$(t3_first_line "$d/model")

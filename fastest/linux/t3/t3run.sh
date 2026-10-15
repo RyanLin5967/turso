@@ -85,6 +85,8 @@
 # rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
+# the virtio disk identity (t3lib.sh dev_identity) is a DRY-VIRT run's alone: never inherited, set below only by --dry-block
+unset T3_IDENTITY_MODE
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
 DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
@@ -153,6 +155,7 @@ if [ -n "$DRYB_GIVEN" ]; then
   [ -z "$DEVICE$DESTROY" ] || { echo "t3run: REFUSED: --device/--destroy are a real run's; --dry-block names its own disk" >&2; exit 2; }
   case ${PLP:=no} in no) ;; *) echo "t3run: REFUSED: --plp is for real runs (a virtual disk has no power-loss protection)" >&2; exit 2 ;; esac
   DRY=1 BLOCK=device DEVICE=$DRY_BLOCK DESTROY=$DRY_BLOCK STAMP=DRY-VIRT
+  export T3_IDENTITY_MODE=virtio
 elif [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
   case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-cache-lie) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
