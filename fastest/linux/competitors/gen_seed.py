@@ -11,16 +11,17 @@ SQLite; INSERTs in batches of 1000 rows.
                                           K random single-row UPDATEs, one statement each (autocommit: each committed),
                                           the same ids and values for every system (PREREG §7 / amendment 52 ages with
                                           1e5); deterministic for (R, K, S); K = 0 writes nothing
-  gen_seed.py expect --rows R [--updates K] [--seed S]
-                                          'count|sum|row_hash' the engine must read back from t
   gen_seed.py readback-sql --dialect pg|mysql
-                                          the engine's own read-back query of that triple (pg: PostgreSQL, Doltgres)
+                                          the engine's own read-back query of 'count|sum|row_hash' from t (pg:
+                                          PostgreSQL, Doltgres), which fixture.py write compares with facts()
   gen_seed.py readback-sqlite FILE        the same triple read from an SQLite file
   gen_seed.py sum --rows R [--updates K] [--seed S]
-                                          sum(v) over t after the aging (0 fresh): what isolation checks expect
+                                          sum(v) over t after the aging (0 fresh): what isolation checks expect; it
+                                          walks the aging only
   gen_seed.py selftest
-fixture.json's gen_seed_sha256 (the sha256 of the parent stream, then the aging) is digest(), taken by facts() in the
-same pass as everything else fixture.py records.
+Everything fixture.py records about the generator (gen_seed_sha256, the stream digests, the expected read-back) is
+facts(), ONE pass over the parent stream; a job generates the parent twice, the seed's stream and that pass (comp
+review 1 MED 10: the old `expect` subcommand was a third).
 """
 import glob
 import hashlib
@@ -38,12 +39,16 @@ def xorshift32(x):
     return x
 
 
+# The parent's schema line, the stream's first (fixture.py records its sha256 by itself, MED 11). INTEGER PRIMARY KEY
+# (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so B1's parent has no
+# separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres read INTEGER as INT, so
+# one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
+SCHEMA = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+
+
 def sql_lines(rows):
     """The parent, as `gen_seed.py sql` prints it (one pad stream across batches)."""
-    # INTEGER PRIMARY KEY (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so
-    # B1's parent has no separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres
-    # read INTEGER as INT, so one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
-    yield "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+    yield SCHEMA
     x = 2463534242
     for start in range(1, rows + 1, 1000):
         vals = []
@@ -67,57 +72,25 @@ def age_lines(rows, updates, seed=1):
         yield "UPDATE t SET v = %d WHERE id = %d;" % (x % 1000000, i)
 
 
-def aged_sum(rows, updates=0, seed=1):
-    """sum(v) over t after the aging: the isolation checks' expected parent value (0 when fresh)."""
+def aged_values(aging):
+    """{id: v} after the aging lines AGING (the last write to each id wins): O(aged rows), never the parent."""
     last = {}
-    for ln in age_lines(rows, updates, seed):
+    for ln in aging:
         v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
         last[int(i)] = int(v)
-    return sum(last.values())
+    return last
 
 
-def digest(rows, updates=0, seed=1):
-    h = hashlib.sha256()
-    for ln in sql_lines(rows):
-        h.update(ln.encode() + b"\n")
-    for ln in age_lines(rows, updates, seed):
-        h.update(ln.encode() + b"\n")
-    return h.hexdigest()
+def aged_sum(rows, updates=0, seed=1):
+    """sum(v) over t after the aging: the isolation checks' expected parent value (0 when fresh). It walks the aging
+    only, never the parent stream, so `gen_seed.py sum` (run_system.sh's PSUM) is not a generator pass."""
+    return sum(aged_values(age_lines(rows, updates, seed)).values())
 
 
 # ---- what the engine must READ BACK (lead review 62430d8bf..b49fb656a MED 3: the fixture guard compared its own
 # inputs; now each job records the digest of the bytes it actually piped and the engine's own read-back of t)
-def stream_digests(rows, updates=0, seed=1):
-    """sha256 of each stream exactly as `gen_seed.py sql` and `gen_seed.py age` write it (every line + "\\n")."""
-    out = {}
-    for k, lines in (("sql", sql_lines(rows)), ("age", age_lines(rows, updates, seed))):
-        h = hashlib.sha256()
-        for ln in lines:
-            h.update(ln.encode() + b"\n")
-        out[k] = h.hexdigest()
-    return out
-
-
 def hash_row(i, v, pad):
     return int(hashlib.md5(f"{i}:{v}:{pad}".encode()).hexdigest()[:6], 16)
-
-
-def row_hash(rows, updates=0, seed=1):
-    """The order-independent row hash: sum over t of the first 6 hex digits of md5("id:v:pad") (exact in every engine:
-    a 24-bit term, so 5e8 rows stay below 2^53, where Dolt's SUM is a double). Streams the parent once, holding only
-    the aged rows' final values (O(K) memory, not O(rows))."""
-    last = {}
-    for ln in age_lines(rows, updates, seed):
-        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
-        last[int(i)] = int(v)
-    total = 0
-    for ln in sql_lines(rows):
-        if ln.startswith("INSERT"):
-            for tup in ln[ln.index("VALUES ") + 7:-1].split("),("):
-                i, v, pad = tup.strip("()").split(",", 2)
-                i = int(i)
-                total += hash_row(i, last.get(i, int(v)), pad.strip("'"))
-    return total
 
 
 def readback_sql(dialect):
@@ -140,13 +113,14 @@ def readback_sql(dialect):
 
 def facts(rows, updates=0, seed=1):
     """Everything a fixture records about the generator, in ONE pass over the parent stream (MED 12: at the 10 GiB
-    tier each pass takes about 30 min): {"count", "sum", "row_hash", "streams": {"sql", "age"}, "digest"} -- the same
-    values as aged_sum, row_hash, stream_digests and digest, with O(aged rows) memory."""
+    tier each pass takes about 30 min), with O(aged rows) memory: {"count", "sum", "row_hash", "streams": {"sql",
+    "age"}, "digest"}. row_hash is the order-independent read-back hash, sum over t of the first 6 hex digits of
+    md5("id:v:pad") (exact in every engine: a 24-bit term, so 5e8 rows stay below 2^53, where Dolt's SUM is a double);
+    the streams' digests frame each line as `gen_seed.py sql` / `age` write it (line + "\\n"), and digest is the
+    sha256 of the parent stream then the aging (fixture.json gen_seed_sha256). The ONLY implementation of these values
+    (comp review 1 MED 10: expect, row_hash, stream_digests and digest each streamed the parent again)."""
     aging = list(age_lines(rows, updates, seed))  # K lines (1e5 at most registered): small
-    last = {}
-    for ln in aging:
-        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
-        last[int(i)] = int(v)
+    last = aged_values(aging)
     hs, ha, hc = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
     total = 0
     for ln in sql_lines(rows):
@@ -164,11 +138,6 @@ def facts(rows, updates=0, seed=1):
         hc.update(b)
     return {"count": rows, "sum": sum(last.values()), "row_hash": total,
             "streams": {"sql": hs.hexdigest(), "age": ha.hexdigest()}, "digest": hc.hexdigest()}
-
-
-def expect(rows, updates=0, seed=1):
-    """'count|sum|row_hash' the engine must read back from t after loading these streams."""
-    return f"{rows}|{aged_sum(rows, updates, seed)}|{row_hash(rows, updates, seed)}"
 
 
 # The subcommands the drivers may call (comp review 1 MED 10): the seed's two streams (sql, age), the aged sum (PSUM;
@@ -310,8 +279,6 @@ if __name__ == "__main__":
         if "--digest-out" in av:
             with open(av[av.index("--digest-out") + 1], "w") as f:
                 f.write(h.hexdigest() + "\n")
-    elif cmd == "expect":
-        print(expect(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     elif cmd == "readback-sql":
         print(readback_sql(arg(av, "--dialect", conv=str)))
     elif cmd == "readback-sqlite" and len(av) == 2:

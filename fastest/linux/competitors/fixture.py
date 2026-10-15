@@ -24,9 +24,11 @@ cells (each with one private write: the system's own M1 op, untimed). Each job w
                                (page_count x page_size) and the fed streams' digests (also DIR/seed-{sql,age}.sha256)
   fixture.py write ... --streams SQL.sha256 AGE.sha256 --readback 'COUNT|SUM|ROW_HASH'
                                (MED 3) the write path's own stream digests and the engine's read-back of t (gen_seed.py
-                               readback-sql / readback-sqlite), recorded beside the generator's expected values;
-                               compare refuses a job where either differs. The size tolerance against ours is not
-                               implemented here (competitor half only; ours is fastest-linux's)
+                               readback-sql / readback-sqlite), recorded beside the generator's expected values
+                               (gen_seed.facts, the job's one generator pass beyond the seed's stream); write exits
+                               non-zero when either is missing or differs (comp review 1 MED 10), and compare refuses
+                               such a job too. The size tolerance against ours is not implemented here (competitor
+                               half only; ours is fastest-linux's)
   fixture.py selftest          known-answer fixtures for compare
 """
 import hashlib
@@ -147,7 +149,7 @@ def write(av):
           "live_branches": int(lv) if lv.isdigit() else None,
           "gen_seed_sha256": gf["digest"], "du_paths": o.get("--du", []),
           # MED 11: the table's schema line, by itself (a schema change no longer hides inside the stream digest)
-          "schema_sha256": hashlib.sha256((next(gen_seed.sql_lines(1)) + "\n").encode()).hexdigest(),
+          "schema_sha256": hashlib.sha256((gen_seed.SCHEMA + "\n").encode()).hexdigest(),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,
           "extents": {p: extent_count(p) for p in o.get("--extents", [])},
@@ -172,6 +174,18 @@ def write(av):
     with open(out, "w") as f:
         json.dump(fx, f, indent=1)
     print(json.dumps(fx))
+    # comp review 1 MED 10: the job's own check of its parent, against facts() (the drivers' `gen_seed.py expect`, a
+    # further pass over the parent, is gone): refused -- non-zero, after fixture.json is written for the record -- when
+    # the engine's read-back is missing or differs, or the piped streams' digests are missing or differ
+    why = []
+    if fx["readback"] is None:
+        why.append(f"no read-back of t as three counts (--readback [{o.get('--readback', '')}])")
+    elif fx["readback"] != fx["expected_readback"]:
+        why.append(f"the engine read back {fx['readback']}, the generator wrote {fx['expected_readback']}")
+    if fx["stream_sha256"] != fx["expected_streams"]:
+        why.append(f"piped stream digests {fx['stream_sha256']} are not the generator's {fx['expected_streams']}")
+    if why:
+        sys.exit("fixture.py write: REFUSED: " + "; ".join(why))
 
 
 def sqlite(av):

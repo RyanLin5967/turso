@@ -508,18 +508,22 @@ server_fixture() {
   esac
   [ ${#ext[@]} -gt 0 ] || { fail "fixture: no data file found for the extent record"; return; }
   # MED 3: what the engine READS BACK from the parent (count, exact sum, order-independent row hash: gen_seed.py
-  # readback-sql in its dialect), against what the generator wrote; and the digests the seed's own write path recorded
+  # readback-sql in its dialect), against what the generator wrote; and the digests the seed's own write path recorded.
+  # Comp review 1 MED 10: fixture.py write compares both with gen_seed.facts -- the job's one generator pass beyond
+  # the seed's stream -- and exits non-zero on a difference (the separate `gen_seed.py expect` pass is gone)
   local rb dial=pg
   [ "$KIND" = dolt ] && dial=mysql
   rb=$(sqlp "$(python3 -B "$HERE/gen_seed.py" readback-sql --dialect "$dial")" | tr '\t' '|' | tail -1)
   echo "$rb" >"$RAW/readback.txt"
-  expect "parent read back by the engine (count|sum|row hash)" "$rb" \
-    "$(python3 -B "$HERE/gen_seed.py" expect --rows "$ROWS" --updates "$AGE")"
   cp "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" "$RAW/" 2>/dev/null || fail "seed stream digests missing"
-  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+  if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} \
     ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" \
-    --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null || fail "fixture.json"
+    --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null 2>"$RAW/fixture-write.err"; then
+    pass "parent read back by the engine (count|sum|row hash) and its piped streams are the generator's: $rb"
+  else
+    fail "fixture.json: $(tail -1 "$RAW/fixture-write.err")"
+  fi
 }
 # jf FILE KEY -> one key of a JSON file (empty when unreadable)
 jf() { python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null; }
@@ -830,12 +834,11 @@ b1_main() {
   rm -f "$mp" "$mp-wal" "$mp-shm"
   python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
     tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
-  # MED 3: the parent as SQLite reads it back (count, sum, row hash) against what the generator wrote
+  # MED 3: the parent as SQLite reads it back (count, sum, row hash), which fixture.py write below compares with what
+  # the generator wrote (gen_seed.facts; comp review 1 MED 10: no separate `gen_seed.py expect` pass)
   local rb
   rb=$(python3 -B "$HERE/gen_seed.py" readback-sqlite "$ROOT/parent.db")
   echo "$rb" >"$RAW/readback.txt"
-  expect "parent read back from the SQLite file (count|sum|row hash)" "$rb" \
-    "$(python3 -B "$HERE/gen_seed.py" expect --rows "$ROWS" --updates "$AGE")"
   # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
   # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
   # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
@@ -900,11 +903,15 @@ b1_main() {
     fi
   done
   expect "warm-up plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
-  python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
+  if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
     --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
-    --streams "$RAW/seed-sql.sha256" "$RAW/seed-age.sha256" --readback "$rb" >/dev/null || fail "fixture.json"
+    --streams "$RAW/seed-sql.sha256" "$RAW/seed-age.sha256" --readback "$rb" >/dev/null 2>"$RAW/fixture-write.err"; then
+    pass "parent read back from the SQLite file (count|sum|row hash) and its fed streams are the generator's: $rb"
+  else
+    fail "fixture.json: $(tail -1 "$RAW/fixture-write.err")"
+  fi
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}
