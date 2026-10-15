@@ -2091,13 +2091,22 @@ impl Session {
             bad_code(&*st)?;
             return stats_row(format, &self.shared.db);
         }
+        // The allocations the server process has made, for the per-step allocation budget
+        // (budget.py work); NULL in a build that counts none (no `alloc-count` feature).
+        if f == "turso_branch_allocations" {
+            arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
+            let n = counters::allocations().map(|n| n as i64);
+            return one_row(f, Type::INT8, format, |e| e.encode_field(&n));
+        }
         if !matches!(
             f,
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
                 "42883",
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current() and turso_branch_stats()"),
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats() and turso_branch_allocations()"),
             ));
         }
         arity(call, 1)?;
@@ -2916,7 +2925,10 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
     }
-    let pg_type = if call.function == "turso_branch_create" {
+    let pg_type = if matches!(
+        call.function.as_str(),
+        "turso_branch_create" | "turso_branch_allocations"
+    ) {
         Type::INT8
     } else {
         Type::TEXT

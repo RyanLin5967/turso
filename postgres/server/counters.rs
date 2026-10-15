@@ -86,3 +86,41 @@ pub fn process_counters() -> Option<ProcessCounters> {
         None
     }
 }
+
+/// A global allocator that counts the allocations (alloc, alloc_zeroed and realloc calls) it serves,
+/// over the system allocator, for the per-step allocation budget (budget.py work). A binary installs
+/// it as its `#[global_allocator]` only in a build with the `alloc-count` feature: one relaxed atomic
+/// add per allocation, shared by every thread, which a credited build must not pay.
+pub struct CountingAlloc;
+
+static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+/// The allocations [`CountingAlloc`] has served in this process; None when it is not this process's
+/// allocator (it has served none: every process allocates before it could ask).
+pub fn allocations() -> Option<u64> {
+    match ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}

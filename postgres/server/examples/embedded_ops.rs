@@ -77,6 +77,7 @@ struct Probe {
     ns: u64,
     cpu_ns: u64,
     counters: Option<turso_pg_server::counters::ProcessCounters>,
+    allocations: Option<u64>,
 }
 
 impl Probe {
@@ -85,6 +86,7 @@ impl Probe {
             ns: now_ns(),
             cpu_ns: thread_cpu_ns(),
             counters: turso_pg_server::counters::process_counters(),
+            allocations: turso_pg_server::counters::allocations(),
         }
     }
 }
@@ -186,7 +188,7 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
     writeln!(
         out,
-        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch"
+        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch\tallocations"
     )
     .unwrap();
     let prefix = a.name_prefix.clone();
@@ -197,9 +199,14 @@ fn main() {
         let (s1, i1) = t1
             .counters
             .map_or((0, 0), |c| (c.unix_syscalls, c.instructions));
+        // NA where the build counts no allocations (no `alloc-count`): budget.py refuses it.
+        let allocations = match (t0.allocations, t1.allocations) {
+            (Some(a0), Some(a1)) => (a1 - a0).to_string(),
+            _ => "NA".to_string(),
+        };
         writeln!(
             out,
-            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}",
+            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}\t{allocations}",
             t0.ns,
             t1.ns,
             t1.cpu_ns - t0.cpu_ns,
@@ -254,3 +261,8 @@ fn main() {
     }
     out.flush().unwrap();
 }
+
+/// The wire budget's allocation counter (feature `alloc-count`, budget builds only).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOC: turso_pg_server::counters::CountingAlloc = turso_pg_server::counters::CountingAlloc;

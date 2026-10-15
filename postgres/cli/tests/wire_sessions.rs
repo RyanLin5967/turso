@@ -3333,6 +3333,18 @@ fn a_cancel_must_name_the_sessions_pid_and_secret() {
     a.q("SELECT 1").ok("the session after");
 }
 
+/// turso_branch_allocations() is one int8 column, NULL in a build that counts no allocations (this
+/// test's: the counter is the budget builds' `alloc-count` feature alone), so the budget refuses
+/// a server that cannot count rather than read 0 as none.
+#[test]
+fn branch_allocations_is_null_where_nothing_counts() {
+    let dir = Scratch::new("allocs");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT turso_branch_allocations()").ok("allocations");
+    assert_eq!((r.oids, r.rows), (Some(vec![20]), vec![vec![None]]));
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew

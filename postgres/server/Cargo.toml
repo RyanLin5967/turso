@@ -14,6 +14,9 @@ path = "lib.rs"
 # The wire budget's fire-check plant (lanes/wire/budget/budget.py --plant split-reply): never in a credited
 # build.
 budget-plant-split-reply = []
+# The wire budget's allocation counter (budget.py work): the binaries install counters::CountingAlloc.
+# Never in a credited build: every allocation pays a shared atomic add.
+alloc-count = []
 
 [dependencies]
 anyhow.workspace = true
