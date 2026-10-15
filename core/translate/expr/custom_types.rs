@@ -261,7 +261,11 @@ pub(super) struct OperatorEncodeInfo {
 
 /// The column an operand meets, for mutant `operand_keeps_column_typmod` alone: built in test
 /// builds only (engine review 16 #22: a `Column` clone per prepare that production never read).
-fn encode_info(column: &Column, type_def: &Arc<TypeDef>, which: EncodeArg) -> Option<OperatorEncodeInfo> {
+fn encode_info(
+    column: &Column,
+    type_def: &Arc<TypeDef>,
+    which: EncodeArg,
+) -> Option<OperatorEncodeInfo> {
     cfg!(test).then(|| OperatorEncodeInfo {
         column: column.clone(),
         type_def: type_def.clone(),
