@@ -409,6 +409,16 @@ run_server_cell() { # run_server_cell SPEC C
       fun "FLAG $spec-c$c timed run: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $tav, busy-template errors $tbusy"
   fi
   if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >"$d/timed.checkpoint.txt" 2>&1 || fail "$spec-c$c post-timed CHECKPOINT rc=$?"; fi
+  # Comp review 1 MED 8: the per-cycle DROP throws a branch's dirty pages away before any checkpoint writes them, so
+  # the deferred window above reads about 0 for WAL_LOG; the KEPT arm counts what a kept branch pays (kept_arm, C=1).
+  if [ "$KIND" = pg ] && [ "$c" = 1 ] && [ "$spec" != pg18-select1 ]; then
+    kept_arm "$spec" "$d"
+    if [ "$spec" = pg18-create-wal ]; then
+      expect "kept arm $spec-c1: deferred flushes per kept create > 0 (the writes the per-cycle DROP erases)" \
+        "$(python3 -B -c 'import json, sys; k = json.load(open(sys.argv[1])); print(k.get("verdict") == "ok" and (k.get("per_create") or 0) > 0)' "$d/kept.json" 2>&1 | tail -1)" \
+        True
+    fi
+  fi
   timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
   # Every op is a cycle now (create [+ switch][+ first write] + the untimed delete): at C=1 the load window's flushes
