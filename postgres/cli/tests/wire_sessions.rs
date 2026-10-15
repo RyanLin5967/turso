@@ -7793,6 +7793,11 @@ fn a_bind_counts_parameters_as_the_lexer_reads_them() {
     let r = round(&mut a, "SELECT $1", &[], &[b"1"]);
     assert_eq!(r.err("a Parse in a failed block").code, "25P02");
     assert_eq!(r.status, b'E', "the block is still failed");
+    // C40 lead ruling: the original request includes a new Parse and two values. PostgreSQL
+    // 18.6 refuses that Parse with 25P02, before either ParseComplete or BindComplete.
+    let (messages, err) = a.bind_round("SELECT $1", &[], &[Some(b"1"), Some(b"2")], &[]);
+    assert_eq!(err.expect("Parse in failed block").code, "25P02");
+    assert_eq!(messages, vec![b'E', b'Z']);
     a.q("ROLLBACK").ok("end");
     let r = round(&mut a, "SELECT $1", &[2], &[b"1", b"2"]);
     assert_eq!(r.err("two values, format code 2").code, "08P01");
