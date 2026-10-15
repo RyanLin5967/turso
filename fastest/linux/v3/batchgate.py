@@ -532,6 +532,9 @@ def post(out, cell, sha, mode, verdict_path):
             for t in _ck.sync_fds_def_problems(sj, sorted(sj.get("arms") or {}), sj.get("n")):
                 if t[1] == "missing or overflowed":
                     voids.append("fsync: %s: missing or overflowed (sync_fds_overflow %r)" % (t[0], t[2]))
+                elif t[1] == "n":  # V3 review 13 item 22: the summary's own n is missing or bad: cannot judge
+                    refusals.append("fsync: the probe summary's n %r is not a positive int: sync_fds cannot be judged"
+                                    % (t[2],))
                 else:
                     voids.append("fsync: %s: %s recorded %r, defined %d fd(s) and %d sync(s)" % t)
             merged["app_syncs_per_op"] = {a: round(r.get("syncs", 0) / max(1, r.get("ops", 1)), 4) for a, r in sarms.items()}

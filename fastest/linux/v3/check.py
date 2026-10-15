@@ -2775,7 +2775,11 @@ def sync_fds_def_problems(sj, rows, n):
     """The arm-definitions half of sync_fds_problems, on its own so batchgate's post runs it too (V3 review 11 LOW 2,
     review 12 item 7: post trusted the probe's sync_fds): per arm in rows, one fd per synced file (the clone and the
     directory for clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25), each
-    synced n times; a missing or overflowed record is one problem. -> [(tag, arm, recorded, fds, syncs)]."""
+    synced n times; a missing or overflowed record is one problem, and so is an n that is not a positive int (V3 review
+    13 item 22: `None * per_op` raised inside batchgate post, which then wrote no gate.json). -> [(tag, arm, recorded,
+    fds, syncs)], or the one-problem forms [(tag, "missing or overflowed", overflow)] and [(tag, "n", n)]."""
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return [("the probe summary's n is not a positive int: sync_fds cannot be judged", "n", n)]
     sf = sj.get("sync_fds")
     if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
         return [("sync_fds disagrees with the arm definitions", "missing or overflowed", sj.get("sync_fds_overflow"))]
@@ -2802,7 +2806,7 @@ def sync_fds_problems(sj, rows, n, f1b_path, work):
     13 item 21: it takes the trace's PATH, so a trace that is there but cannot be read whole (a truncated gzip) refuses
     as such, not as a missing one."""
     bad = sync_fds_def_problems(sj, rows, n)
-    if bad and bad[0][1] == "missing or overflowed":
+    if bad and bad[0][1] in ("missing or overflowed", "n"):
         return bad
     sf = sj.get("sync_fds")
     f1b_trace = rd(f1b_path) if f1b_path else None
