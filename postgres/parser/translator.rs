@@ -3031,11 +3031,20 @@ impl PostgreSQLTranslator {
                 // column or result it reaches; the parameter was bound as the array), an ARRAY[...]
                 // is one already; any other operand is refused rather than cast by affinity
                 // (PostgreSQL 18.6 differential, 2026-10-15).
-                if type_cast
+                if let Some(t) = type_cast
                     .type_name
                     .as_ref()
-                    .is_some_and(|t| !t.array_bounds.is_empty())
+                    .filter(|t| !t.array_bounds.is_empty())
                 {
+                    // Only to an array of a built-in type: an element type the translator does not
+                    // map (a domain, a custom type) has its own checks or coercion the cast must
+                    // run (`ARRAY['too long']::vc4[]` truncates in PostgreSQL), so it is refused
+                    // (the PostgreSQL regression corpus, domain.sql).
+                    if pg_type_name_to_ast_type(t).is_none() {
+                        return Err(ParseError::ParseError(
+                            "a cast to an array of this type is not supported".into(),
+                        ));
+                    }
                     return match arg.node.as_ref() {
                         Some(pg_query::protobuf::node::Node::AConst(c))
                             if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
