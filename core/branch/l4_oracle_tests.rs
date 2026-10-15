@@ -160,12 +160,14 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
             db.branch_checkpoint_wait();
             "checkpoint"
         } else if op < 94 {
-            // Review L4 M1: a fuzzy checkpoint held in flight before its commit, with creates,
+            // Review L4 M1: a fuzzy checkpoint held in flight (before or after its commit), with creates,
             // deletes and named connects (and writes) under it; checked once it has landed.
-            db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+            // Held before its commit, or after it and before its install.
+            let stage = if rng.below(2) == 0 { super::store::HOLD_BEFORE_COMMIT } else { super::store::HOLD_AFTER_COMMIT };
+            db.branch_checkpoint_hold(stage);
             if db.branch_checkpoint_fuzzy_now().unwrap() {
-                until(&format!("seed {seed} step {step}: the flight never held"), || {
-                    db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+                until(&format!("seed {seed} step {step}: the flight never held at {stage}"), || {
+                    db.branch_checkpoint_held() == stage | super::store::HOLD_ARRIVED
                 });
                 seen.in_flight += 1;
                 for _ in 0..1 + rng.below(4) {
