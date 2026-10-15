@@ -26,7 +26,9 @@ fn run_child() -> bool {
         .stack_size(kib * 1024)
         .spawn(move || {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
+            // The open and the connect are outcomes too: on a thread inside the red zone they are
+            // refused like any statement.
+            let got = Database::open_file_with_flags(
                 io,
                 ":memory:",
                 OpenFlags::Create,
@@ -34,9 +36,9 @@ fn run_child() -> bool {
                 None,
                 Arc::new(SqliteDialect),
             )
-            .unwrap();
-            let conn = db.connect().unwrap();
-            match conn.prepare(&sql).and_then(|mut s| s.run_collect_rows()) {
+            .and_then(|db| db.connect())
+            .and_then(|conn| conn.prepare(&sql).and_then(|mut s| s.run_collect_rows()));
+            match got {
                 Ok(rows) => format!("ok {rows:?}"),
                 Err(e) => format!("err {:?}", e),
             }
@@ -141,9 +143,9 @@ fn shapes(depth: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The class (lead order): client SQL must never crash the server. Every nesting shape above, 60
-/// levels deep, on threads of 128 KiB to 1 MiB: each outcome is an answer or a refusal, never a
-/// dead process. Premise: each shape answers on 8 MiB at depth 3 (so the shapes are valid SQL, and
+/// The class (lead order): client SQL must never crash the server. Every nesting shape above, 20,
+/// 60 and 200 levels deep, on threads of 128 KiB to 8 MiB: each outcome is an answer or a refusal,
+/// never a dead process. Premise: each shape answers on 8 MiB at depth 3 (so the shapes are valid SQL, and
 /// the guard has a case it must pass), but a parenthesised FROM, which the planner refuses after
 /// the parser has recursed through it.
 #[test]
@@ -161,11 +163,11 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     }
     let mut died = Vec::new();
     let mut refused = 0;
-    for kib in [128usize, 256, 512, 1024] {
-        for (shape, sql) in shapes(60) {
+    for kib in [128usize, 256, 512, 1024, 2048, 8192] {
+        for (shape, sql) in [20, 60, 200].into_iter().flat_map(shapes) {
             let got = in_child(test, kib, &sql);
             if got.starts_with("died") {
-                died.push(format!("{shape} on {kib} KiB: {got}"));
+                died.push(format!("{shape} ({} bytes of SQL) on {kib} KiB: {got}", sql.len()));
             } else if got.starts_with("err StackDepthLimitExceeded") {
                 refused += 1;
             }

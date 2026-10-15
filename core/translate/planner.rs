@@ -1199,6 +1199,9 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     validate_explicit_column_count: bool,
 ) -> Result<JoinedTable> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    crate::error::check_stack()?;
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -1319,6 +1322,9 @@ fn prepare_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    crate::error::check_stack()?;
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter {
