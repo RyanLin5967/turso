@@ -3449,10 +3449,12 @@ pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
 
-/// Test builds: while armed, every thread's CPU time at each `ckpt_held` point, read just after
-/// its syscall count (`budget_probe::thread_table`; Mach traps only, so the count does not move),
-/// so a test can tell which threads ran inside a held span. Diagnostics only; the test reserves
-/// the vector's room first, so pushing allocates nothing.
+/// Test builds: every thread's CPU time just BEFORE and just AFTER each `ckpt_held` point's syscall
+/// count (`budget_probe::thread_table`; Mach traps only, so the count does not move), so a span
+/// from point i to point j is attributed by exclusion (class (b), DECISIONS 994f7d41e0): its
+/// syscalls are the recording thread's only if no other thread ran between i's "before" table and
+/// j's "after" table. Recorded only while a test arms `CKPT_THREADS_ARMED` (and has reserved the
+/// vector's room), so no other test's held allocations see it.
 #[cfg(test)]
 pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
 /// Test builds, armed with `CKPT_THREADS_ARMED`: the backtraces of the allocations and frees of 16
@@ -3464,25 +3466,35 @@ pub(crate) static CKPT_BIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::ne
 #[cfg(test)]
 pub(crate) static CKPT_BIG_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16 << 10);
 #[cfg(test)]
-pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<Vec<(&'static str, [super::budget_probe::ThreadCpu; 48])>> =
-    std::sync::Mutex::new(Vec::new());
+#[allow(clippy::type_complexity)]
+pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<
+    Vec<(&'static str, [super::budget_probe::ThreadCpu; 48], [super::budget_probe::ThreadCpu; 48])>,
+> = std::sync::Mutex::new(Vec::new());
 
 fn ckpt_held(label: &'static str) {
     #[cfg(test)]
-    if let Some(n) = super::budget_probe::unix_syscalls() {
-        CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
-        if CKPT_THREADS_ARMED.load(Ordering::Acquire) {
-            let mut table = [super::budget_probe::ThreadCpu::EMPTY; 48];
-            let _ = super::budget_probe::thread_table(&mut table);
-            CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, table));
-            // The span from the cut's finish to the install's end: big allocations and frees on
-            // this thread, with backtraces (`CKPT_BIG`), for the span that grows past two syscalls.
-            if label == "install.cut_finished" {
-                super::budget_probe::record_big(CKPT_BIG_MIN.load(Ordering::Acquire));
-            } else if label == "install.installed" {
-                let (_, _, traces) = super::budget_probe::recorded_allocs();
-                super::budget_probe::record_allocs(false, usize::MAX);
-                *CKPT_BIG.lock().unwrap_or_else(|e| e.into_inner()) = traces;
+    {
+        let armed = CKPT_THREADS_ARMED.load(Ordering::Acquire);
+        let mut before = [super::budget_probe::ThreadCpu::EMPTY; 48];
+        if armed {
+            let _ = super::budget_probe::thread_table(&mut before);
+        }
+        if let Some(n) = super::budget_probe::unix_syscalls() {
+            CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+            if armed {
+                let mut after = [super::budget_probe::ThreadCpu::EMPTY; 48];
+                let _ = super::budget_probe::thread_table(&mut after);
+                CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, before, after));
+                // The span from the cut's finish to the install's end: big allocations and frees
+                // on this thread, with backtraces (`CKPT_BIG`), for the span that grows past two
+                // syscalls.
+                if label == "install.cut_finished" {
+                    super::budget_probe::record_big(CKPT_BIG_MIN.load(Ordering::Acquire));
+                } else if label == "install.installed" {
+                    let (_, _, traces) = super::budget_probe::recorded_allocs();
+                    super::budget_probe::record_allocs(false, usize::MAX);
+                    *CKPT_BIG.lock().unwrap_or_else(|e| e.into_inner()) = traces;
+                }
             }
         }
     }

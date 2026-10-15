@@ -8985,7 +8985,7 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
         assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread table");
         // Each span is skipped for the thread that recorded its end (capture points are the caller's,
         // install points the checkpoint thread's).
-        let recorder = |j: usize| tables[j].1.iter().find(|x| x.me).map_or(0, |x| x.id);
+        let recorder = |j: usize| tables[j].2.iter().find(|x| x.me).map_or(0, |x| x.id);
         let at = |label: &str| points.iter().position(|(l, _)| *l == label);
         // The original test's five spans and its arithmetic (each span minus one reading), for the
         // over-budget verdict; the finer install sub-spans printed as raw deltas.
@@ -9013,7 +9013,7 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
             };
             let n = (points[j].1 - points[i].1).saturating_sub(1);
             total += n;
-            let ran = ran_between(&tables[i].1, &tables[j].1, recorder(j));
+            let ran = ran_between(&tables[i].1, &tables[j].2, recorder(j));
             line += &format!(" {a}..{b}={n} ran={:?}", names(&ran));
             if n > 0 {
                 spans_over.push((a, b, n, ran.is_empty()));
@@ -9022,7 +9022,7 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
         line += " | raw:";
         for (a, b) in fine {
             if let (Some(i), Some(j)) = (at(a), at(b)) {
-                let ran = ran_between(&tables[i].1, &tables[j].1, recorder(j));
+                let ran = ran_between(&tables[i].1, &tables[j].2, recorder(j));
                 line += &format!(" {a}..{b}={} ran={:?}", points[j].1 - points[i].1, names(&ran));
             }
         }
@@ -9124,28 +9124,61 @@ fn diag_create_write_delete_syscalls_by_thread() {
 
 /// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
 /// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
-/// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`, the
-/// task's count: every thread, each reading one call itself, subtracted here). A D2 catalog store,
-/// three checkpoints after 30 creates each; nothing else runs but the store's own threads.
+/// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`). A D2
+/// catalog store, checkpoints after 30 creates each.
+///
+/// FLAGGED TEST EDIT, lead-ordered (class (b) and ruling (b), DECISIONS 994f7d41e0): the count is
+/// the TASK's, so a span's syscalls are the recording thread's only if no other thread ran inside
+/// it (`store::CKPT_HELD_THREADS`, a thread table before and after every point; attribution by
+/// exclusion). A round with an unattributable span is not judged: rounds run until 3 are fully
+/// attributable (at most 12), and fewer is a refusal, never a pass. And the span no longer
+/// subtracts 1 "for the reading", which costs 0 BSD syscalls (measured: raw l35-diag-ckpt): a
+/// tightening, so newly red cells are real.
 #[test]
 fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+    use super::budget_probe::ran_between;
     let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CKPT_THREADS_ARMED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _d = Disarm;
+    super::store::CKPT_THREADS_ARMED.store(true, std::sync::atomic::Ordering::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(&dir.path().join("ckpt-held.db"), opts(true, SyncClass::FullFsync));
     let trunk = db.connect().unwrap();
     seed(&trunk);
-    let mut over = Vec::new();
-    for round in 0..3 {
+    let (mut over, mut judged, mut refused) = (Vec::new(), 0, Vec::new());
+    for round in 0..12 {
+        if judged == 3 {
+            break;
+        }
         for _ in 0..30 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
         super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
+            t.clear();
+            t.reserve(32);
+        }
         assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
         db.branch_checkpoint_wait();
         let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
-        let at = |label: &str| points.iter().find(|(l, _)| *l == label).map(|(_, n)| *n);
-        let span = |a: &str, b: &str| match (at(a), at(b)) {
-            (Some(x), Some(y)) => (y - x).saturating_sub(1),
+        let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
+        assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread tables");
+        let at = |label: &str| points.iter().position(|(l, _)| *l == label);
+        let mut foreign = Vec::new();
+        let mut span = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(i), Some(j)) => {
+                let me = tables[j].2.iter().find(|x| x.me).map_or(0, |x| x.id);
+                for (_, name, _) in ran_between(&tables[i].1, &tables[j].2, me) {
+                    foreign.push(format!("{a}..{b}: {name}"));
+                }
+                points[j].1 - points[i].1
+            }
             _ => u64::MAX,
         };
         let capture = (span("capture.begin", "capture.matured"), span("capture.matured", "capture.captured"));
@@ -9154,15 +9187,18 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             span("install.quiesced", "install.installed"),
             span("install.installed", "install.marked"),
         );
-        let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
-        // Inside the install: the catalog read snapshot's end, and the cut's finish (each point a
-        // call of its own, subtracted).
         let inside = (
             span("install.quiesced", "install.snapshot_ended"),
             span("install.snapshot_ended", "install.before_cut"),
             span("install.before_cut", "install.cut_finished"),
             span("install.cut_finished", "install.installed"),
         );
+        if !foreign.is_empty() {
+            refused.push(format!("round {round}: {foreign:?}"));
+            continue;
+        }
+        judged += 1;
+        let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
         if total > 2 {
             over.push(format!(
                 "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
@@ -9170,6 +9206,10 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             ));
         }
     }
+    assert!(
+        judged == 3,
+        "premise: only {judged} of up to 12 rounds could be attributed by thread (refusing; unattributable: {refused:?})"
+    );
     assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than two syscalls under the store mutex: {over:?}");
 }
 

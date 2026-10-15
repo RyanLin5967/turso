@@ -264,6 +264,10 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("locks", delta(s0.t_locks, s1.t_locks));
     s.insert("locks_process", delta(s0.locks, s1.locks));
     s.insert("held_syscalls", delta(s0.held_syscalls, s1.held_syscalls));
+    // Class (b): the threads that made the window unattributable, and the holds inside it that
+    // could not be attributed to their holder (`probe::end_owning`, `store_unlocked`).
+    s.insert("foreign_threads", s1.foreign);
+    s.insert("held_unattributed", delta(s0.held_unattributed, s1.held_unattributed));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
@@ -335,17 +339,30 @@ fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
 /// whether it left one; `quiet`, that nothing else ran in the window, so the process-wide counts
 /// are its own.
 fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (R, Sample) {
+    measure_owning(db, base, &[], f)
+}
+
+/// `measure`, charging the window with the work of the store threads named in `owned` (a
+/// persistent worker the operation dispatches, or the confirmation writer whose own cost a cell
+/// measures). Class (b), DECISIONS 994f7d41e0: the window's syscalls are the measuring thread's,
+/// its spawns' and its owned threads' only if no other thread ran inside it
+/// (`probe::end_owning`); a window where one did is not quiet, and `quiet` refuses a cell where
+/// fewer than half its samples are. The harness's own waits inside the window are declared
+/// syscall-free (`probe::spinning`), as `fc_writer_settled_cost` and `fc_threads_1000` check.
+fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: impl FnOnce() -> R) -> (R, Sample) {
     let settled = quiesce(db, base);
     let o0 = Outside::read(db);
     let c0 = db.branch_confirm_counts();
     let s0 = probe::begin();
     let r = f();
     let left = probe::threads() != base;
-    let (synced, parked) = absorb_confirm(db, &s0);
-    let back = spin_settled(base, std::time::Duration::from_secs(30));
+    let ((synced, parked), back) = probe::spinning(|| {
+        let absorbed = absorb_confirm(db, &s0);
+        (absorbed, spin_settled(base, std::time::Duration::from_secs(30)))
+    });
     // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
-    let s1 = probe::end();
+    let s1 = probe::end_owning(owned);
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
     let confirms = delta(c0[0], c1[0]);
@@ -355,7 +372,9 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && parked && absorbed && (left || s["allocs_process"] == s["allocs"]);
+    let attributed = s1.foreign == 0 && s1.held_unattributed == s0.held_unattributed;
+    let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
+
     s.insert("writer_parked", u64::from(parked));
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
@@ -488,17 +507,21 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         built.incarnation = opened.incarnation;
         // The background threads are waited out by spinning (no syscall), not by joining them: a
         // join that blocks issues syscalls of its own, as many as the timing makes.
-        let (_, parked) = absorb_confirm(&opened, &s0);
-        let settled = parked && spin_settled(base, std::time::Duration::from_secs(30));
+        let settled = probe::spinning(|| {
+            let (_, parked) = absorb_confirm(&opened, &s0);
+            parked && spin_settled(base, std::time::Duration::from_secs(30))
+        });
         let s_all = probe::end();
         opened.branch_wait_name_filter();
         let settled = settled && quiesce(&opened, base);
         let o1 = Outside::read(&opened);
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
-        a.insert("quiet", u64::from(t0 == base && t_open == base));
+        // Class (b): a recovery window is the opening thread's and the threads the open spawned;
+        // another thread that ran inside it makes it unattributable (`probe::end`).
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.foreign == 0));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled));
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.foreign == 0));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
@@ -637,9 +660,10 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     for i in 0..CKPT_ROUNDS {
         let name = format!("c-{i:04}");
         let sql = format!("UPDATE t SET v = 'c{i:04}' WHERE id = {}", 1 + i % 50);
-        let (_, s_create) = measure(db, base, || trunk.create_branch(&name).unwrap());
+        // The checkpoint each starts runs on the persistent checkpoint worker: owned.
+        let (_, s_create) = measure_owning(db, base, &["branch-checkpoint"], || trunk.create_branch(&name).unwrap());
         let c = db.connect_named(&name).unwrap();
-        let (_, s_write) = measure(db, base, || c.execute(&sql).unwrap());
+        let (_, s_write) = measure_owning(db, base, &["branch-checkpoint"], || c.execute(&sql).unwrap());
         drop(c);
         line(out, cell, "ckpt_create", i, &s_create);
         line(out, cell, "ckpt_first_write", i, &s_write);
@@ -874,13 +898,14 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
         db.branch_compact_now().unwrap();
         db.branch_checkpoint_wait();
         let (_, _) = measure(db, base, || trunk.create_branch(&format!("u-{i:04}")).unwrap());
-        let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
+        // These cells measure the confirmation writer's own cost (its word, its wake): owned.
+        let (_, s_written) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("w-{i:04}")).unwrap());
         hold_word(true);
-        let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
+        let (_, s_held) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("h-{i:04}")).unwrap());
         // Review 2 H2: the reference. `h` landed with no proved word pending (w's was written), so its
         // landing woke the parked writer (`confirm_cv.notify_one`, on the acknowledging thread); this
         // second held create lands on h's pending word and wakes no one.
-        let (_, s_reference) = measure(db, base, || trunk.create_branch(&format!("r-{i:04}")).unwrap());
+        let (_, s_reference) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("r-{i:04}")).unwrap());
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
@@ -1451,6 +1476,106 @@ fn run_instruments(cell: &str) -> String {
         sample_of(&s0, &s1, &Outside::zero(None), &Outside::zero(None))
     };
     put("fc_nothing", &window(&mut || {}));
+    // Class (b)'s attribution by thread, forced both ways. A helper thread that exists before the
+    // window waits on an atomic, then makes 10 syscalls; the window must refuse its count.
+    let helper = |declared: bool, closes: usize| {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (g, d, r) = (go.clone(), done.clone(), ready.clone());
+        let h = std::thread::spawn(move || {
+            // Ready (declared, when it is) before the window opens; done, then lingering until the
+            // window has closed (`go` cleared), so its declaration covers the whole window.
+            let body = || {
+                r.store(true, Release);
+                while !g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..closes {
+                    // SAFETY: closing an invalid descriptor only fails (EBADF): one syscall each.
+                    unsafe { libc::close(-1) };
+                }
+                d.store(true, Release);
+                while g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            };
+            if declared {
+                probe::spinning(body)
+            } else {
+                body()
+            }
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        (go, done, h)
+    };
+    let wait = |done: &std::sync::atomic::AtomicBool| {
+        while !done.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    };
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_window",
+            &window(&mut || {
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    {
+        // A declared spinner making no syscall does not make the window foreign.
+        let (go, done, h) = helper(true, 0);
+        put(
+            "fc_spinner_window",
+            &window(&mut || {
+                for _ in 0..7 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    put(
+        "fc_spawned_window",
+        &window(&mut || {
+            // A thread the window spawns is the window's own: its 5 syscalls are counted.
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+            })
+            .join()
+            .unwrap();
+        }),
+    );
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_hold",
+            &window(&mut || {
+                probe::arm(true);
+                probe::store_locked();
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                probe::store_unlocked();
+                probe::arm(false);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
     put(
         "fc_close_37",
         &window(&mut || {
@@ -2229,6 +2354,35 @@ const RELEASE_FRAME: u64 = 8 + 1 + 8;
 const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 
 // ---- the instruments ----
+
+/// Class (b) (DECISIONS 994f7d41e0): the syscall counts are attributed by thread. A window in which
+/// a thread that existed at its start made syscalls has NO syscall count and names the foreign
+/// thread; a declared spinner making none, and a thread the window spawned, do not make it foreign
+/// (the window keeps exactly its own 7, and the spawn's 5); a hold during which another thread
+/// ran is unattributable, never counted as held. Forced both ways, in the instruments' child.
+#[test]
+fn the_budget_syscall_counts_are_attributed_by_thread() {
+    if in_child() {
+        return;
+    }
+    let c = cell("instruments");
+    let row = |op: &str| c.ops.get(op).and_then(|s| s.first()).unwrap_or_else(|| panic!("{op}: no sample")).clone();
+    let foreign = row("fc_foreign_window");
+    assert!(
+        foreign.get("syscalls").is_none() && foreign["foreign_threads"] >= 1,
+        "CLAIM: a window another thread made syscalls in kept a syscall count: {foreign:?}"
+    );
+    let spinner = row("fc_spinner_window");
+    assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
+    let spawned = row("fc_spawned_window");
+    assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
+    assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
+    let hold = row("fc_foreign_hold");
+    assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread ran in was not marked unattributable: {hold:?}");
+    assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
+    let nothing = row("fc_nothing");
+    assert_eq!((nothing["foreign_threads"], nothing["held_unattributed"]), (0, 0), "CLAIM: an empty window was not attributed: {nothing:?}");
+}
 
 /// Every counter the budgets read moves by exactly what was done, and not at all when nothing was
 /// (forced both ways, in a child that runs nothing else).
