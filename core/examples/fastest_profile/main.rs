@@ -57,7 +57,9 @@
 //! record `{rule, claims_ns, stop_at, warm_ops, capped}`: every claim it judged, in ns since its start, in judging
 //! order, and the decision, which `warmup_conformance.py live` replays through `--warmup-replay` (review 5 MED 8). The
 //! warm-up's clock starts only after every client is ready (a ready barrier, then t0, then a go barrier, as bbload's
-//! g_t0), recorded as `warmup.t0_after_ready_ns` (t0 minus the last client's ready). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
+//! g_t0), recorded as `warmup.t0_after_ready_ns` (t0 minus the last client's ready). Every window also records the
+//! engine's four branch exception counters at its open and close (`exception_counters {before, after}`, from
+//! `Database::branch_exception_counters()`; the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
 //! with `NOT AVAILABLE` while the engine has no async-durable class (SyncClass is Off, Fsync,
 //! FullFsync at the time of writing), so a caller records the arm as not run instead of
 //! measuring something else.
@@ -74,6 +76,11 @@ use turso_core::{
 };
 
 const PHASES: [&str; 4] = ["create", "connect", "write", "delete"];
+
+/// `Database::branch_exception_counters()`, in its order: the counted exceptions to "no operation waits on background
+/// work" (the lead's routing ruling, fastest DECISIONS 2026-10-15T05:16:51Z). Every window records them at its open
+/// and close (`exception_counters {before, after}`); a cell whose window moved one is labelled and not credited.
+const EXCEPTIONS: [&str; 4] = ["hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -683,8 +690,10 @@ fn main() {
     let mut t0_after_ready_ns = 0i64;
     // this process's TracerPid at the first window's open and the last one's close
     let (mut tp0, mut tp1) = (None, None);
-    // (window, secs, engine sync counter deltas by field, busy retries in the window, realtime open and close)
-    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64, f64, f64)> = Vec::new();
+    // (window, secs, engine sync counter deltas by field, busy retries in the window, realtime open and close, the
+    // engine's exception counters at open and close)
+    #[allow(clippy::type_complexity)]
+    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64, f64, f64, [u64; 4], [u64; 4])> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
     let per_client: Vec<[Vec<u64>; 4]> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..a.clients)
@@ -719,6 +728,7 @@ fn main() {
         for w in &windows_wanted {
             let s0 = engine_syncs();
             let r0 = retries();
+            let e0 = db.branch_exception_counters();
             // the TracerPid reads sit outside every window's fences (no counted or marked syscall), the first before
             // the first window opens and the last after the last one closes
             if windows.is_empty() {
@@ -731,6 +741,7 @@ fn main() {
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
             let rt1 = realtime_s();
+            let e1 = db.branch_exception_counters();
             fence.end(w);
             if windows.len() + 1 == windows_wanted.len() {
                 tp1 = Some(tracer_pid());
@@ -740,7 +751,7 @@ fn main() {
                 not_a_result(&format!("engine sync counters unreadable: {:?}", sync_counts()));
             }
             let delta = s1.iter().zip(&s0).map(|((k, b), (_, a))| (k.clone(), b - a)).collect();
-            windows.push((w.to_string(), secs, delta, retries() - r0, rt0, rt1));
+            windows.push((w.to_string(), secs, delta, retries() - r0, rt0, rt1, e0, e1));
         }
         handles
             .into_iter()
@@ -823,13 +834,18 @@ fn main() {
         tp0.flatten().map_or("null".to_string(), |v| v.to_string()),
         tp1.flatten().map_or("null".to_string(), |v| v.to_string())
     );
-    for (k, (name, secs, syncs, busy, rt0, rt1)) in windows.iter().enumerate() {
+    for (k, (name, secs, syncs, busy, rt0, rt1, e0, e1)) in windows.iter().enumerate() {
         let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();
+        let exc = |c: &[u64; 4]| -> String {
+            EXCEPTIONS.iter().zip(c).map(|(n, v)| format!("\"{n}\":{v}")).collect::<Vec<_>>().join(",")
+        };
         let total: u64 = syncs.iter().map(|(_, v)| v).sum();
         json.push_str(&format!(
-            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total},\"t0_realtime_s\":{rt0:.6},\"t1_realtime_s\":{rt1:.6}}}",
+            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total},\"t0_realtime_s\":{rt0:.6},\"t1_realtime_s\":{rt1:.6},\"exception_counters\":{{\"before\":{{{}}},\"after\":{{{}}}}}}}",
             if k > 0 { "," } else { "" },
-            fields.join(",")
+            fields.join(","),
+            exc(e0),
+            exc(e1)
         ));
     }
     json.push_str("],\"phases\":{");
