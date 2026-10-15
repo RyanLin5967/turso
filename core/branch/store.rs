@@ -2403,8 +2403,10 @@ struct NameIndex {
 #[derive(Default)]
 struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
-    built: Option<HashSet<u64, BuildIdHasher>>,
-    pending: Option<HashSet<u64, BuildIdHasher>>,
+    /// Ordered sets (L2 slope, red 5aa62c9e7: `built`, a hash set, regrew to 516,096 bytes under the
+    /// store mutex inside a named create): a B-tree grows a node at a time.
+    built: Option<BTreeSet<u64>>,
+    pending: Option<BTreeSet<u64>>,
     /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
     /// and catalog scans that failed.
     moved_max: u64,
@@ -2425,9 +2427,6 @@ impl NameFilter {
         }
         let h = self.hash(name);
         if let Some(built) = self.built.as_mut() {
-            if built.len() == built.capacity() {
-                self.moved_max = self.moved_max.max(built.len() as u64);
-            }
             built.insert(h);
         }
         if let Some(pending) = self.pending.as_mut() {
@@ -2445,25 +2444,6 @@ impl NameFilter {
     }
 }
 
-/// The name filter's keys are keyed hashes already: hashed again as themselves.
-#[derive(Default, Clone, Copy)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-
-type BuildIdHasher = std::hash::BuildHasherDefault<IdHasher>;
 
 /// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
 /// connection syntax may narrow this; the store refuses nothing narrower.
@@ -7787,10 +7767,10 @@ impl BranchStore {
             ("names.gone", inner.names.gone.len(), 0),
         ];
         if let Some(built) = inner.names.filter.built.as_ref() {
-            out.push(set("names.filter.built", built));
+            out.push(("names.filter.built", built.len(), 0));
         }
         if let Some(pending) = inner.names.filter.pending.as_ref() {
-            out.push(set("names.filter.pending", pending));
+            out.push(("names.filter.pending", pending.len(), 0));
         }
         if let Some(cat) = inner.cat.as_ref() {
             // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
@@ -7889,7 +7869,7 @@ impl BranchStore {
                     return;
                 }
             };
-            let mut pending: HashSet<u64, BuildIdHasher> = HashSet::default();
+            let mut pending: BTreeSet<u64> = BTreeSet::new();
             for name in names.map.keys().chain(names.fresh.keys()) {
                 pending.insert(names.filter.hash(name));
             }
@@ -7921,26 +7901,16 @@ impl BranchStore {
                 // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
                 // scanned names are inserted under the mutex, as before.
                 let under = fe_mutant("name_filter_built_under_mutex");
-                let mut scanned = scanned.map(|hashes| {
+                let scanned = scanned.map(|hashes| {
                     if under {
-                        (HashSet::default(), hashes)
+                        (BTreeSet::new(), hashes)
                     } else {
-                        (hashes.into_iter().collect::<HashSet<u64, BuildIdHasher>>(), Vec::new())
+                        (hashes.into_iter().collect::<BTreeSet<u64>>(), Vec::new())
                     }
                 });
-                // Room for the names applied meanwhile is made off the mutex too, so joining them
-                // never grows the table under it (a resize moves all N entries).
-                let mut inner = loop {
-                    let inner = shared.lock();
-                    let joining = inner.names.filter.pending.as_ref().map_or(0, HashSet::len);
-                    match scanned.as_mut() {
-                        Ok((built, _)) if !under && built.capacity() - built.len() < joining => {
-                            drop(inner);
-                            built.reserve(joining);
-                        }
-                        _ => break inner,
-                    }
-                };
+                // An ordered set needs no room made for the names applied meanwhile: joining them
+                // adds nodes, never moves the set (it was a hash table reserved off the mutex).
+                let mut inner = shared.lock();
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
@@ -9330,7 +9300,7 @@ impl StoreInner {
                     self.cat = Some(CatState::new(catalog, self.sync, 0)?);
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
-                        let mut built = HashSet::default();
+                        let mut built = BTreeSet::new();
                         for name in self.names.map.keys() {
                             built.insert(self.names.filter.hash(name));
                         }
