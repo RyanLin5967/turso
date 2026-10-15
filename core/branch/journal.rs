@@ -1323,7 +1323,7 @@ pub(crate) struct BgCompaction {
     /// from.
     from: u64,
     class: SyncClass,
-    arena: Option<File>,
+    arena: Option<Arc<File>>,
     snap: PathBuf,
     snap_tmp: PathBuf,
     log_tmp: PathBuf,
@@ -2685,7 +2685,7 @@ impl Journal {
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
         // applied in memory and will never be durable, so nothing may be written after them.
         let fail_take = std::mem::take(&mut self.fail_next_take);
-        let taken = (|| -> Result<(Arc<File>, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<Arc<File>>)> {
             if fail_take {
                 return Err(LimboError::InternalError(
                     "failpoint: the flight's log descriptor could not be duplicated".to_string(),
@@ -2827,7 +2827,7 @@ impl Journal {
     pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass, end_lsn: u64) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
-        let taken = (|| -> Result<(Arc<File>, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<Arc<File>>)> {
             let on_disk = file_len(&self.file)?;
             if on_disk != self.len {
                 return Err(corrupt(
@@ -3471,7 +3471,7 @@ pub(crate) struct Flight {
     log: Option<Arc<File>>,
     /// Where the frame buffer goes back once the flight is done with it (`Journal::recycled`).
     recycle: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
-    arena: Option<File>,
+    arena: Option<Arc<File>>,
     bytes: Vec<u8>,
     at: u64,
     pub(crate) class: SyncClass,
@@ -3681,7 +3681,7 @@ impl Flight {
 /// holds no flight slot, unless `exclusive`.
 pub(crate) struct Upgrade {
     log: Arc<File>,
-    arena: Option<File>,
+    arena: Option<Arc<File>>,
     dir: Option<File>,
     /// A D0 compaction's snapshot (`Journal::snap_dirty`, left set; engine review 19 MED 7).
     snap: Option<File>,

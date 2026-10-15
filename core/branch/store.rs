@@ -2978,7 +2978,7 @@ struct Captured {
     child_keys: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
-    arena: Option<std::fs::File>,
+    arena: Option<Arc<std::fs::File>>,
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.

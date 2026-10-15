@@ -35,7 +35,10 @@ const SLOTS_PER_CHUNK: usize = 256;
 
 enum Backing {
     Memory { chunks: Vec<Box<[u8]>> },
-    File { file: File, dirty: bool },
+    /// Shared, so a flight or a checkpoint takes a handle with no dup(2) under the store mutex
+    /// (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex): an fsync through any
+    /// handle of the file makes every write before it durable.
+    File { file: std::sync::Arc<File>, dirty: bool },
 }
 
 /// Test builds: while set, every file-backed arena reports a device other than its own (review 5
@@ -123,7 +126,7 @@ impl Arena {
             .collect();
         Ok(Self {
             page_size,
-            backing: Backing::File { file, dirty: false },
+            backing: Backing::File { file: std::sync::Arc::new(file), dirty: false },
             high_water,
             in_use: high_water as usize - free.len(),
             #[cfg(test)]
@@ -147,7 +150,7 @@ impl Arena {
     ) -> Result<Self> {
         let mut arena = Self {
             page_size,
-            backing: Backing::File { file, dirty: false },
+            backing: Backing::File { file: std::sync::Arc::new(file), dirty: false },
             high_water,
             free: Vec::with_capacity(free.len()),
             free_bits: vec![0; (high_water as usize).div_ceil(64)],
@@ -275,14 +278,17 @@ impl Arena {
     /// descriptor if slots were written since the last sync, clearing the mark; the flight syncs it.
     /// A slot written after this sets the mark again, so the flight that carries its record syncs
     /// it. `None` for the memory backing or a clean arena.
-    pub(crate) fn take_dirty_file(&mut self) -> Result<Option<File>> {
+    pub(crate) fn take_dirty_file(&mut self) -> Result<Option<std::sync::Arc<File>>> {
         if let Backing::File { file, dirty } = &mut self.backing {
             if *dirty {
-                let dup = file
-                    .try_clone()
-                    .map_err(|e| crate::error::io_error(e, "dup branch arena"))?;
+                // Mutant `arena_take_dups` (test builds only): a dup(2) per take, as before.
+                let handle = if super::store::fe_mutant("arena_take_dups") {
+                    std::sync::Arc::new(file.try_clone().map_err(|e| crate::error::io_error(e, "dup branch arena"))?)
+                } else {
+                    file.clone()
+                };
                 *dirty = false;
-                return Ok(Some(dup));
+                return Ok(Some(handle));
             }
         }
         Ok(None)
@@ -328,12 +334,9 @@ impl Arena {
     /// A second handle on the arena file, for a fuzzy checkpoint's writer to sync the slots its
     /// rows name without the store mutex (r11-restart-r2, F-FZ): an fsync through any descriptor of
     /// the file makes every write made before it durable. `None` for the memory backing.
-    pub(crate) fn sync_handle(&self) -> Result<Option<File>> {
+    pub(crate) fn sync_handle(&self) -> Result<Option<std::sync::Arc<File>>> {
         match &self.backing {
-            Backing::File { file, .. } => file
-                .try_clone()
-                .map(Some)
-                .map_err(|e| crate::error::io_error(e, "clone branch arena handle")),
+            Backing::File { file, .. } => Ok(Some(file.clone())),
             Backing::Memory { .. } => Ok(None),
         }
     }
