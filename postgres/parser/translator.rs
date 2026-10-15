@@ -4971,6 +4971,12 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
         let base_type = match map_pg_type(&pg_type, &[]) {
+            // A domain's base stays the built-in REAL for the float types: on the engine's float4
+            // / float8 types a domain refused a quoted value ("cannot store TEXT value in REAL
+            // column"), which the column types themselves take.
+            Some(mapping) if matches!(mapping.type_name.as_str(), "FLOAT4" | "FLOAT8") => {
+                "REAL".to_string()
+            }
             Some(mapping) => mapping.type_name,
             None => pg_type, // custom type or domain — pass through
         };
