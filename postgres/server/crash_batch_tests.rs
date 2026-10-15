@@ -266,7 +266,9 @@ fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
 /// The lead, 2026-10-15 (the checked-time class): SQLite's date functions added caller values with
 /// wrapping_add, so arithmetic past the date range could wrap to a silent wrong date where SQLite
 /// answers NULL. Each case's expected NULL is sqlite3 3.51.0's (/usr/bin/sqlite3, 2025-06-12, raw
-/// artie lanes/budgets/raw/sqlite3-date-oracle.txt). Expected RED where the engine wraps.
+/// artie lanes/budgets/raw/sqlite3-date-oracle.txt), the chained ones included. The 12 single
+/// modifiers were already NULL at 1f38e9d83 (each modifier's own limit keeps one add in range); the
+/// chained ones are the red, where the engine wraps.
 #[test]
 fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
@@ -286,7 +288,15 @@ fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
         "SELECT datetime('2000-01-01', '+99999:00:00')",
         "SELECT datetime('2000-01-01', '+1000000000000:00')",
         "SELECT date('-4713-11-24','-1 day')",
-    ] {
+    ]
+    .into_iter()
+    .map(String::from)
+    // Each modifier within its own limit, 25 of them chained: the sum passes i64 (about 20 do).
+    .chain(["+464269999999999 seconds", "-464269999999999 seconds", "+128969999999 hours"].iter().map(|m| {
+        let mods: Vec<String> = (0..25).map(|_| format!("'{m}'")).collect();
+        format!("SELECT julianday('2000-01-01', {})", mods.join(", "))
+    })) {
+        let sql = sql.as_str();
         match conn.prepare(sql).and_then(|mut st| st.run_collect_rows()) {
             Ok(rows) if rows == vec![vec![Value::Null]] => {}
             other => wrong.push(format!("{sql}: {other:?}")),
