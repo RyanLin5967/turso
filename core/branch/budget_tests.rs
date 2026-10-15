@@ -862,7 +862,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                     }
                     let trunk = trunk.unwrap();
                     for i in 0..rounds {
-                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                        trunk.create_branch(&format!("load{c}-d{delay_ms}-{t}-{i:04}")).unwrap();
                     }
                 });
                 match spawned {
