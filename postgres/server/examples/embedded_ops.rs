@@ -91,13 +91,21 @@ struct Probe {
 
 impl Probe {
     fn now(db: &turso_core::Database) -> Self {
+        // The counters in turso_branch_work()'s order (process counters, allocations, thread
+        // counters, confirms), then the clocks: the work budget's syscall coverage check
+        // (logged = kernel + 1 + getpid per window, lead 2026-10-15) holds the two sides to one
+        // reading sequence around the kernel's count.
+        let counters = turso_pg_server::counters::process_counters();
+        let allocations = turso_pg_server::counters::allocations();
+        let thread_instructions = turso_pg_server::counters::thread_counters().map_or(0, |c| c.0);
+        let confirms = db.branch_confirm_counts()[0];
         Self {
             ns: now_ns(),
             cpu_ns: thread_cpu_ns(),
-            counters: turso_pg_server::counters::process_counters(),
-            allocations: turso_pg_server::counters::allocations(),
-            thread_instructions: turso_pg_server::counters::thread_counters().map_or(0, |c| c.0),
-            confirms: db.branch_confirm_counts()[0],
+            counters,
+            allocations,
+            thread_instructions,
+            confirms,
         }
     }
 }
