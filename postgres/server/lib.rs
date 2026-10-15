@@ -1098,17 +1098,24 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
-        use std::hash::BuildHasher;
         let interrupts = Arc::new(Interrupts::new());
         let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
-        // A secret from std's randomly seeded hasher (no syscall past the thread's first): only a
-        // client that read the BackendKeyData can cancel the session.
-        let secret = std::collections::hash_map::RandomState::new().hash_one(pid) as i32;
-        shared
-            .cancels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((pid, secret), Arc::downgrade(&interrupts));
+        // The secret from the OS's CSPRNG (getentropy, one call per session): only a client that
+        // read the BackendKeyData can cancel the session, and a CancelRequest must name both. A
+        // session whose secret cannot be drawn is registered for no cancel at all (fail closed);
+        // its BackendKeyData still carries a key, which names nothing.
+        let mut bytes = [0u8; 4];
+        let drawn = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0;
+        let secret = i32::from_ne_bytes(bytes);
+        if drawn {
+            shared
+                .cancels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((pid, secret), Arc::downgrade(&interrupts));
+        } else {
+            warn!("no cancel key for session {pid}: getentropy failed");
+        }
         Self {
             shared,
             state: Mutex::new(SessionState::default()),
