@@ -4009,8 +4009,9 @@ fn copy_refuses_an_option_it_does_not_implement() {
 }
 
 /// A statement the frontend performs while preparing it is refused before it runs when it holds a
-/// parameter: 42P02 over the simple protocol (nothing binds one), 0A000 over the extended one (no
-/// such statement takes parameters here); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
+/// parameter: 42P02 on both protocols, as PostgreSQL answers a utility statement's $n (FLAGGED
+/// edit, the lead's pre-approval of wire review 17 item 4: the extended arm asserted an invented
+/// 0A000); and COPY ... WHERE is refused (0A000, COMPAT.md), as it
 /// has no WHERE. The COPY ran inside the prepare before any guard saw it, and its WHERE was never
 /// read, so `WHERE id > 5` and `WHERE v = $1` imported every row (wire review 13 item 9).
 #[test]
@@ -4027,7 +4028,7 @@ fn a_prepare_time_statement_is_refused_before_it_runs() {
     assert_eq!(r.err("COPY with $1 by simple query").code, "42P02");
     assert_eq!(count(&mut a), "0", "nothing imported");
     let r = a.xt(&with_param, &[(25, 0, b"one")]);
-    assert_eq!(r.err("COPY with $1 by Bind").code, "0A000");
+    assert_eq!(r.err("COPY with $1 by Bind").code, "42P02");
     assert_eq!(count(&mut a), "0", "nothing imported");
     let r = a.q(&format!("COPY cw FROM '{}' WHERE id > 5", rows.display()));
     assert_eq!(r.err("COPY ... WHERE").code, "0A000");
