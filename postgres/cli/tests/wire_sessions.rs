@@ -4205,26 +4205,92 @@ fn dml_returning_is_tagged_by_its_verb() {
 /// pg18-num.out), and never ends the session: `SELECT 0b10000000000000000000000000000000` reached
 /// the engine as that text, whose literal parser assumes SQLite's grammar checked it and hit
 /// unreachable!(), closing the connection (found by the PostgreSQL regression corpus,
-/// numerology.sql, 2026-10-15). A literal past i64 still answers and the session serves on (its
-/// value is a numeric in PostgreSQL, a float here: the bare-NUMERIC divergence).
+/// numerology.sql, 2026-10-15). Each literal's column type is PostgreSQL's too (Claude C33: red
+/// a7aac0094 had dropped the recorded types; recorded again with every case, pg18-diff/pg18-c33.out):
+/// int4 (23) within int4, int8 (20) past it, numeric (1700) past int8, with the exact value.
 #[test]
 fn a_non_decimal_integer_literal_is_its_value() {
     let dir = Scratch::new("numlit");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    for (sql, want) in [
-        ("SELECT 0b10000000000000000000000000000000", "2147483648"),
-        ("SELECT 0o20000000000", "2147483648"),
-        ("SELECT 0x80000000", "2147483648"),
-        ("SELECT -0x8000000000000000", "-9223372036854775808"),
-        ("SELECT 1_000_000", "1000000"),
-        ("SELECT 0b1_0", "2"),
+    for (sql, oid, want) in [
+        ("SELECT 0b10000000000000000000000000000000", 20, "2147483648"),
+        ("SELECT 0o20000000000", 20, "2147483648"),
+        ("SELECT 0x80000000", 20, "2147483648"),
+        ("SELECT -0x8000000000000000", 20, "-9223372036854775808"),
+        ("SELECT 1_000_000", 23, "1000000"),
+        ("SELECT 0b1_0", 23, "2"),
+        ("SELECT 0x_7FFF_FFFF_FFFF_FFFF_F", 1700, "147573952589676412927"),
+        ("SELECT 2147483647", 23, "2147483647"),
+        ("SELECT 2147483648", 20, "2147483648"),
+        ("SELECT 9223372036854775807", 20, "9223372036854775807"),
+        ("SELECT 9223372036854775808", 1700, "9223372036854775808"),
     ] {
-        assert_eq!(a.q(sql).single(sql), want, "{sql}");
+        let r = a.q(sql).ok(sql);
+        assert_eq!(
+            (r.oids.clone(), r.rows.clone()),
+            (Some(vec![oid]), vec![vec![Some(want.to_string())]]),
+            "{sql}"
+        );
     }
-    let sql = "SELECT 0x_7FFF_FFFF_FFFF_FFFF_F";
-    let _ = a.q(sql);
     assert_eq!(a.q("SELECT 1").single("the session serves on"), "1");
+}
+
+/// A negative zero literal is written as PostgreSQL 18.6 writes it (recorded, pg18-diff/
+/// pg18-c33.out): an integer -0 and a numeric -0.0 or '-0' have no sign (0, 0.0, 0), a float8's
+/// keeps it (-0). Claude C33: since 27d41a19a the numeric literal read '-0'.
+#[test]
+fn a_negative_zero_literal_is_written_as_postgresql_writes_it() {
+    let dir = Scratch::new("negzero");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, oid, want) in [
+        ("SELECT -0", 23, "0"),
+        ("SELECT -0.0", 1700, "0.0"),
+        ("SELECT -0.0::float8", 701, "-0"),
+        ("SELECT '-0'::float8", 701, "-0"),
+        ("SELECT '-0'::numeric", 1700, "0"),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(
+            (r.oids.clone(), r.rows.clone()),
+            (Some(vec![oid]), vec![vec![Some(want.to_string())]]),
+            "{sql}"
+        );
+    }
+}
+
+/// A real (float4) value out of float4's range is refused 22003 at storage and at a cast, with
+/// PostgreSQL's message, as float4in refuses it (recorded, pg18-diff/pg18-c33.out, every case);
+/// 3.4e38 fits. Claude C33: ours stored Infinity or 0.
+#[test]
+fn a_real_out_of_range_is_22003_at_storage_and_at_a_cast() {
+    let dir = Scratch::new("realrange");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("create table rr (x real)").ok("rr");
+    for (sql, message) in [
+        ("insert into rr values (1e39)", "\"1000000000000000000000000000000000000000\" is out of range for type real"),
+        ("insert into rr values ('1e39')", "\"1e39\" is out of range for type real"),
+        ("insert into rr values (-1e39)", "\"-1000000000000000000000000000000000000000\" is out of range for type real"),
+        (
+            "insert into rr values (1e-50)",
+            "\"0.00000000000000000000000000000000000000000000000001\" is out of range for type real",
+        ),
+        ("SELECT CAST(1e39 AS real)", "\"1000000000000000000000000000000000000000\" is out of range for type real"),
+        ("SELECT 1e39::real", "\"1000000000000000000000000000000000000000\" is out of range for type real"),
+        ("SELECT '1e39'::real", "\"1e39\" is out of range for type real"),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", message), "{sql}");
+    }
+    let r = a.q("select * from rr").ok("rr after");
+    assert_eq!((r.oids.clone(), r.rows.len()), (Some(vec![700]), 0));
+    let r = a.q("SELECT '3.4e38'::real").ok("3.4e38");
+    assert_eq!(
+        (r.oids.clone(), r.rows.clone()),
+        (Some(vec![700]), vec![vec![Some("3.4e+38".to_string())]])
+    );
 }
 
 /// A CREATE TABLE with a SERIAL column completes as CREATE TABLE, with no row description, on both
