@@ -27,6 +27,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "make_date" => &[3],
+        "make_timestamp" => &[6],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -41,6 +43,9 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         _ => String::new(),
     };
     match name {
+        // PostgreSQL refuses a date past the range (22008) where the SQLite dialect answers NULL.
+        "make_date" => turso_core::make_date_or_refuse(args),
+        "make_timestamp" => turso_core::make_timestamp_or_refuse(args),
         "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
