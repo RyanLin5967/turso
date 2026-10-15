@@ -790,7 +790,7 @@ struct Parsed {
     call: Option<PgBranchCall>,
     scan: ParamScan,
     params: OnceLock<Vec<Type>>,
-    columns: OnceLock<Vec<Type>>,
+    columns: OnceLock<Vec<(String, Type)>>,
 }
 
 impl Parsed {
@@ -826,9 +826,12 @@ impl Parsed {
         ))
     }
 
-    /// Fix the statement's result column types at the first call, and refuse any later call whose
-    /// types are others, in PostgreSQL's words.
-    fn fix_columns(&self, columns: &[Type]) -> SqlResult<()> {
+    /// Fix the statement's result columns, each its name and type, at the first call, and refuse
+    /// any later call whose columns are others, in PostgreSQL's words: its equalRowTypes compares
+    /// names with types, so the same types in another order under other names are another row
+    /// type. Compared by type alone, a SELECT * over (b int, a int) ran under the (a int, b int)
+    /// RowDescription its Describe sent, each value in the other's column (wire review 18 item 9).
+    fn fix_columns(&self, columns: &[(String, Type)]) -> SqlResult<()> {
         if self.columns.get_or_init(|| columns.to_vec()).as_slice() == columns {
             return Ok(());
         }
@@ -1672,7 +1675,12 @@ impl Session {
                     .map_err(unprepared)?;
                 let parsed = &portal.statement.statement;
                 parsed.fix_params(&params).map_err(unprepared)?;
-                parsed.fix_columns(&columns).map_err(unprepared)?;
+                let named: Vec<(String, Type)> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| (stmt.get_column_name(i).into_owned(), ty.clone()))
+                    .collect();
+                parsed.fix_columns(&named).map_err(unprepared)?;
                 bind_portal_parameters(&mut stmt, portal, &params)
                     .map_err(|e| unprepared(wire_info(e)))?
             }
@@ -3327,9 +3335,13 @@ where
     Ok(true)
 }
 
-/// The type of each result column a Describe reported, as [`Parsed::fix_columns`] reads them.
-fn field_types(fields: &[FieldInfo]) -> Vec<Type> {
-    fields.iter().map(|f| f.datatype().clone()).collect()
+/// The name and type of each result column a Describe reported, as [`Parsed::fix_columns`] reads
+/// them.
+fn field_types(fields: &[FieldInfo]) -> Vec<(String, Type)> {
+    fields
+        .iter()
+        .map(|f| (f.name().to_string(), f.datatype().clone()))
+        .collect()
 }
 
 /// A prepared statement's result columns, typed by [`column_type`]: what Describe reports and what
