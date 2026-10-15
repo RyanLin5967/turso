@@ -55,6 +55,10 @@ struct Seen {
     /// Review L4 M1: fact use sites reached under a held flight, each asserting the facts equal
     /// their queries (counted for the last store of a history).
     site_checks: u64,
+    /// LEAP L4 (the MCTS deletes): resident branches with known links, summed over the checks; and
+    /// checks of a legacy store before its first checkpoint, at the version it was made at.
+    links_known: u64,
+    read_at_made: u64,
 }
 
 impl Seen {
@@ -71,6 +75,8 @@ impl Seen {
         self.flight_ops += o.flight_ops;
         self.facts_in_flight += o.facts_in_flight;
         self.site_checks += o.site_checks;
+        self.links_known += o.links_known;
+        self.read_at_made += o.read_at_made;
     }
 }
 
@@ -112,7 +118,10 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
     super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
     trunk.create_branch("first").unwrap();
     super::journal::CREATE_LEGACY.with(|c| c.set(false));
-    let want_format = if legacy { 17 } else { 19 };
+    // One write path (DECISIONS e977c1d010): a store is read at the version it was made at (17 for
+    // a legacy one) until its first checkpoint, which upgrades it; from then on it is 21.
+    let made_at = if legacy { 17 } else { 21 };
+    let mut checkpointed = false;
     let mut live: Vec<String> = vec!["first".to_string()];
     let mut ids: Vec<BranchId> = Vec::new();
     // Connections on unnamed branches whose handle was dropped: released while held open.
@@ -247,11 +256,22 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
             }
             "reopen"
         };
-        assert_eq!(
-            db.branches.format_for_test(),
-            Some(want_format),
-            "seed {seed} step {step} ({what}): the store writes another format than it was made at"
-        );
+        checkpointed |= what == "checkpoint";
+        let (links_known, catalog_format) = db.branches.links_known_and_catalog_format_for_test();
+        if checkpointed {
+            // The upgrade claim: the catalog, and every file the store writes, at 21.
+            assert_eq!(catalog_format, Some(21), "seed {seed} step {step} ({what}): the catalog was not upgraded by a checkpoint");
+            assert_eq!(db.branches.format_for_test(), Some(21), "seed {seed} step {step} ({what}): the store writes an older format after a checkpoint");
+        } else {
+            // The read claim: until then the store reads what it was made at (a background
+            // checkpoint may already have upgraded it).
+            assert!(
+                catalog_format.is_none_or(|f| f == made_at || f == 21),
+                "seed {seed} step {step} ({what}): catalog format {catalog_format:?}, made at {made_at}"
+            );
+            seen.read_at_made += u64::from(legacy && catalog_format.is_none_or(|f| f == made_at));
+        }
+        seen.links_known += links_known;
         match db.branches.l4_facts_check_for_test() {
             Ok((pages, all, exhausted, meta)) => {
                 seen.mirror_built += u64::from(db.branches.name_mirror_built_for_test());
@@ -302,7 +322,7 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     premise("format 19", &total);
     println!("L4 oracle, format 19: {total:?}");
     assert!(
-        total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0 && total.site_checks > 0,
+        total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0 && total.site_checks > 0 && total.links_known > 0,
         "premise: an open inferred a slot's state, a step ran under a held flight, a held name scan's mirror was discarded, and a fact use site was reached under a held flight: {total:?}"
     );
     // Review L4 M2: with a small resident cap the trunk-version cache is trimmed, and the facts
@@ -321,7 +341,12 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     }
     println!("L4 oracle, legacy 17: {legacy:?}");
     assert!(
-        legacy.pages_complete > 0 && legacy.all_complete > 0 && legacy.free_exhausted > 0 && legacy.mirror_built > 0,
+        legacy.pages_complete > 0
+            && legacy.all_complete > 0
+            && legacy.free_exhausted > 0
+            && legacy.mirror_built > 0
+            && legacy.read_at_made > 0
+            && legacy.links_known > 0,
         "premise (legacy 17): every fact was set at some check: {legacy:?}"
     );
 }

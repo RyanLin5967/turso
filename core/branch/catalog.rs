@@ -79,11 +79,27 @@ use crate::{
     Statement, Value, IO,
 };
 
+/// The `branch` table of a format 21/22 catalog: each row also carries its nearest catalog
+/// siblings' fork epochs (`sib_lo` below, `sib_hi` above; NULL for none) and its newest catalog
+/// child's (`child_max`), kept by the checkpoint writer (LEAP L4, the MCTS deletes).
+const BRANCH_TABLE: &str = "CREATE TABLE IF NOT EXISTS branch(id INTEGER PRIMARY KEY, parent INTEGER NOT NULL, \
+     fork_epoch INTEGER NOT NULL, epoch INTEGER NOT NULL, released INTEGER NOT NULL, \
+     lease INTEGER, n_children INTEGER NOT NULL, sib_lo INTEGER, sib_hi INTEGER, child_max INTEGER)";
+/// The `branch` table as a 17-20 catalog has it (test builds' `CREATE_LEGACY` makes one).
+#[cfg(test)]
+const LEGACY_BRANCH_TABLE: &str = "CREATE TABLE IF NOT EXISTS branch(id INTEGER PRIMARY KEY, parent INTEGER NOT NULL, \
+     fork_epoch INTEGER NOT NULL, epoch INTEGER NOT NULL, released INTEGER NOT NULL, \
+     lease INTEGER, n_children INTEGER NOT NULL)";
+/// The columns a 17-20 catalog gains at its upgrade (`Catalog::upgrade_links`).
+const LINK_COLUMNS: [&str; 3] = [
+    "ALTER TABLE branch ADD COLUMN sib_lo INTEGER",
+    "ALTER TABLE branch ADD COLUMN sib_hi INTEGER",
+    "ALTER TABLE branch ADD COLUMN child_max INTEGER",
+];
+
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS branch(id INTEGER PRIMARY KEY, parent INTEGER NOT NULL, \
-     fork_epoch INTEGER NOT NULL, epoch INTEGER NOT NULL, released INTEGER NOT NULL, \
-     lease INTEGER, n_children INTEGER NOT NULL)",
+    BRANCH_TABLE,
     "CREATE INDEX IF NOT EXISTS branch_children ON branch(parent, fork_epoch)",
     "CREATE INDEX IF NOT EXISTS branch_lease ON branch(lease)",
     // `released` is 0, 1, or 2 for a branch released while a connection held it open (r11-ever's
@@ -239,7 +255,24 @@ pub(crate) struct CatBranch {
     pub(crate) retained: Vec<(u32, u64, u64, Slot, u32)>,
     /// A named server branch's name (fastest-engine M1 item 4), kept in `branch_name`.
     pub(crate) name: Option<String>,
+    /// Format 21/22 (LEAP L4, the MCTS deletes): the row's nearest catalog siblings' fork epochs
+    /// and its newest catalog child's, as the last checkpoint left them; `None` from a catalog
+    /// without the columns (one not upgraded yet). Written only by the checkpoint writer's own
+    /// statements, never by `put_branch`.
+    pub(crate) links: Option<Links>,
 }
+
+/// A catalog branch row's links (format 21/22): its nearest catalog siblings below and above (by
+/// fork epoch, under the same parent) and its newest catalog child; each `None` when there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Links {
+    pub(crate) lo: Option<u64>,
+    pub(crate) hi: Option<u64>,
+    pub(crate) child_max: Option<u64>,
+}
+
+/// A row whose links a checkpoint's writer set: `(id, links)` (`Catalog::relink`).
+pub(crate) type LinkUpdate = (u64, Links);
 
 /// Counters, observing only (r11-restart lane instrument).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -253,6 +286,19 @@ pub(crate) struct CatalogCounters {
 /// saturated lease deadline, which is clamped: `i64::MAX` ms is as unreachable as `u64::MAX`.
 fn int(v: u64) -> Value {
     Value::from_i64(v.min(i64::MAX as u64) as i64)
+}
+
+/// An integer column that may be NULL.
+fn get_opt(row: &[Value], at: usize) -> Result<Option<u64>> {
+    match row.get(at) {
+        Some(Value::Null) => Ok(None),
+        _ => get(row, at).map(Some),
+    }
+}
+
+/// `None` as SQL NULL.
+fn int_opt(v: Option<u64>) -> Value {
+    v.map_or(Value::Null, int)
 }
 
 fn get(row: &[Value], at: usize) -> Result<u64> {
@@ -494,6 +540,12 @@ pub(crate) struct Catalog {
     /// one that had them, so no stale fact is left behind.
     meta_del_facts: Stmt,
     branch_get: Stmt,
+    /// Whether this catalog's `branch` table has the link columns (format 21/22, or a 17-20 one
+    /// after its upgrade): `branch_get` reads them and `link_stmts` exist only then.
+    links: bool,
+    link_stmts: Option<LinkStmts>,
+    /// Every row's (id, parent, fork epoch) in the children index's order: the upgrade's fill.
+    child_ids_all: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
     branch_rekey: Stmt,
@@ -538,6 +590,21 @@ pub(crate) struct Catalog {
     name_del_id: Stmt,
 }
 
+/// The statements that read and write the link columns (`Catalog::links`).
+struct LinkStmts {
+    set: Stmt,
+}
+
+/// Whether `conn`'s `branch` table has the link columns.
+fn has_link_columns(conn: &Arc<Connection>) -> Result<bool> {
+    let rows = conn.prepare("PRAGMA table_info(branch)")?.run_collect_rows()?;
+    Ok(rows.iter().any(|r| matches!(r.get(1), Some(Value::Text(t)) if t.as_str() == "sib_lo")))
+}
+
+const BRANCH_GET: &str = "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1";
+const BRANCH_GET_LINKED: &str =
+    "SELECT parent, fork_epoch, epoch, released, lease, n_children, sib_lo, sib_hi, child_max FROM branch WHERE id = ?1";
+
 impl Catalog {
     /// Open (creating if absent) the catalog at `path`. A `sync` class that syncs selects
     /// `synchronous = FULL`, so a checkpoint's commit is durable before the log starts over; `Off`
@@ -570,7 +637,18 @@ impl Catalog {
             Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
+        // Test builds' CREATE_LEGACY makes the catalog as a 17-20 build did (no link columns).
+        #[cfg(test)]
+        let legacy = super::journal::CREATE_LEGACY.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let legacy = false;
         for sql in SCHEMA {
+            #[cfg(test)]
+            if legacy && *sql == BRANCH_TABLE {
+                conn.execute(LEGACY_BRANCH_TABLE)?;
+                continue;
+            }
+            let _ = legacy;
             conn.execute(*sql)?;
         }
         Self::prepared(db, conn, sync)
@@ -597,13 +675,15 @@ impl Catalog {
         }
         conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
         let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: Box::new(conn.prepare(sql)?) }) };
+        let links = has_link_columns(&conn)?;
         Ok(Catalog {
+            links,
+            link_stmts: if links { Some(Self::link_stmts(&conn)?) } else { None },
+            child_ids_all: p("SELECT id, parent, fork_epoch FROM branch ORDER BY parent, fork_epoch")?,
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
             meta_del_facts: p("DELETE FROM meta WHERE k >= 10")?,
-            branch_get: p(
-                "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
-            )?,
+            branch_get: p(if links { BRANCH_GET_LINKED } else { BRANCH_GET })?,
             branch_put: p(
                 "INSERT OR REPLACE INTO branch(id, parent, fork_epoch, epoch, released, lease, n_children) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -689,6 +769,103 @@ impl Catalog {
             sync,
             opened_sync: sync,
         })
+    }
+
+    fn link_stmts(conn: &Arc<Connection>) -> Result<LinkStmts> {
+        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: Box::new(conn.prepare(sql)?) }) };
+        Ok(LinkStmts {
+            set: p("UPDATE branch SET sib_lo = ?2, sib_hi = ?3, child_max = ?4 WHERE id = ?1")?,
+        })
+    }
+
+    /// Whether the `branch` table has the link columns.
+    pub(crate) fn links(&self) -> bool {
+        self.links
+    }
+
+    /// Read the table's columns again and prepare the statements that use the link columns: after
+    /// a checkpoint that upgraded the catalog (the install, on the store's own connection), or a
+    /// writer's rollback of one.
+    pub(crate) fn refresh_links(&mut self) -> Result<()> {
+        let links = has_link_columns(&self.conn)?;
+        if links != self.links {
+            self.branch_get = Stmt { stmt: Box::new(self.conn.prepare(if links { BRANCH_GET_LINKED } else { BRANCH_GET })?) };
+            self.link_stmts = if links { Some(Self::link_stmts(&self.conn)?) } else { None };
+            self.links = links;
+        }
+        Ok(())
+    }
+
+    /// The one-write-path upgrade of a 17-20 catalog (DECISIONS e977c1d010), inside the checkpoint
+    /// writer's transaction: add the link columns, then set every row's links from the rows as they
+    /// stand (in the children index's order, one pass). Kill points `ckpt.upgrade.columns` (the
+    /// columns added, no row linked) and `ckpt.upgrade.rows` (every row linked, before the meta row
+    /// and the commit): a kill at either leaves the catalog as it was, by the transaction.
+    pub(crate) fn upgrade_links(&mut self) -> Result<()> {
+        for sql in LINK_COLUMNS {
+            self.conn.execute(sql)?;
+        }
+        self.refresh_links()?;
+        super::store::kill_point("ckpt.upgrade.columns");
+        let rows = self.child_ids_all.rows(&[], &mut self.counters)?;
+        let rows: Vec<(u64, u64, u64)> =
+            rows.iter().map(|r| Ok((get(r, 0)?, get(r, 1)?, get(r, 2)?))).collect::<Result<_>>()?;
+        let mut newest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for (i, &(id, parent, f)) in rows.iter().enumerate() {
+            let lo = i.checked_sub(1).map(|j| rows[j]).filter(|r| r.1 == parent).map(|r| r.2);
+            let hi = rows.get(i + 1).filter(|r| r.1 == parent).map(|r| r.2);
+            newest.insert(parent, f);
+            self.set_links(id, Links { lo, hi, child_max: None })?;
+        }
+        for &(id, ..) in &rows {
+            if let Some(&max) = newest.get(&id) {
+                self.set_child_max_of(id, Some(max))?;
+            }
+        }
+        super::store::kill_point("ckpt.upgrade.rows");
+        Ok(())
+    }
+
+    fn set_links(&mut self, id: u64, l: Links) -> Result<()> {
+        let Some(st) = self.link_stmts.as_mut() else {
+            return Err(LimboError::InternalError("branch catalog: links set without the columns".to_string()));
+        };
+        st.set.exec(&[int(id), int_opt(l.lo), int_opt(l.hi), int_opt(l.child_max)], &mut self.counters)
+    }
+
+    /// The links of the row at `(parent, f)` as the rows now stand, written into it: `None` when no
+    /// row is there.
+    pub(crate) fn relink(&mut self, parent: u64, f: u64) -> Result<Option<LinkUpdate>> {
+        let Some(id) = self.child_at(parent, f)? else {
+            return Ok(None);
+        };
+        let l = Links {
+            lo: self.children_below(parent, f, 1)?.first().copied(),
+            hi: self.children_above(parent, f, 1)?.first().copied(),
+            child_max: self.children_below(id, u64::MAX, 1)?.first().copied(),
+        };
+        self.set_links(id, l)?;
+        Ok(Some((id, l)))
+    }
+
+    /// `relink` of the row of branch `id`, by its key: a parent whose newest child changed.
+    pub(crate) fn relink_id(&mut self, id: u64) -> Result<Option<LinkUpdate>> {
+        let rows = self.branch_get.rows(&[int(id)], &mut self.counters)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let (parent, f) = (get(row, 0)?, get(row, 1)?);
+        self.relink(parent, f)
+    }
+
+    /// Set `parent`'s newest-child link from the rows (its row's other links kept).
+    fn set_child_max_of(&mut self, parent: u64, max: Option<u64>) -> Result<()> {
+        let rows = self.branch_get.rows(&[int(parent)], &mut self.counters)?;
+        let Some(row) = rows.first() else {
+            return Ok(());
+        };
+        let (lo, hi) = (get_opt(row, 6)?, get_opt(row, 7)?);
+        self.set_links(parent, Links { lo, hi, child_max: max })
     }
 
     /// Sync this handle's commits in `class`, or in the class it was opened in if that is
@@ -1022,7 +1199,8 @@ impl Catalog {
             self.meta_put
                 .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
         }
-        // LEAP L4: only a format that carries them writes the facts, and it must have them.
+        // One write path (DECISIONS e977c1d010): every meta row a store of this build writes is at
+        // its current format (`Captured::meta`), so it carries the L4 facts.
         if super::journal::meta_carries_facts(m.format) {
             let (Some(lease_min), Some(held)) = (m.lease_min, m.held_released) else {
                 return Err(LimboError::InternalError(format!(
@@ -1035,6 +1213,7 @@ impl Catalog {
                     .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
             }
         } else {
+            // Only a test's legacy catalog, or the catalog-only harness (`catalog_only_fixture`).
             self.meta_del_facts.exec(&[], &mut self.counters)?;
         }
         Ok(())
@@ -1118,6 +1297,11 @@ impl Catalog {
             current: Vec::new(),
             retained: Vec::new(),
             name: None,
+            links: if self.links {
+                Some(Links { lo: get_opt(row, 6)?, hi: get_opt(row, 7)?, child_max: get_opt(row, 8)? })
+            } else {
+                None
+            },
         };
         (b.released, b.held_open) = match get(row, 3)? {
             0 => (false, false),

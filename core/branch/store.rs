@@ -2526,6 +2526,10 @@ struct BranchState {
     /// write the store holds in memory: nothing reads the branch again in this process (lead
     /// review 1 item 11). Only ever set on a fail-stopped store.
     in_doubt: bool,
+    /// LEAP L4 (the MCTS deletes): this branch's catalog row's links (its nearest catalog
+    /// siblings, its newest catalog child) as of the last installed checkpoint; `None` unknown (a
+    /// branch created since, or read from a catalog not yet upgraded).
+    links: Option<super::catalog::Links>,
 }
 
 /// Named server branches' names (fastest-engine M1 item 4), under the store mutex. An eager store
@@ -2743,6 +2747,14 @@ impl BranchState {
 #[derive(Default)]
 struct ChildIndex {
     map: BTreeMap<(u64, u64), BranchId>,
+    /// Keys a splice re-keyed away (`relink`: the child's catalog row still names the spliced-out
+    /// parent until the next checkpoint rewrites it), relinked around by that checkpoint's writer
+    /// (`Captured::child_moved`).
+    moved: Vec<(u64, u64)>,
+    /// Keys a splice gave a child since the last checkpoint (`relink`): the catalog still holds
+    /// the spliced-out parent's row there, so the child's catalog neighbours are not its parent's
+    /// newest child; its delete asks the catalog.
+    relinked: HashSet<(u64, u64)>,
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
@@ -2763,6 +2775,7 @@ impl ChildIndex {
         f: u64,
         catalog: bool,
         newest: Option<Option<u64>>,
+        known: Option<(Option<u64>, Option<u64>)>,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
         let listed = self.map.remove(&(parent.0, f)).is_some();
         if !catalog {
@@ -2777,6 +2790,21 @@ impl ChildIndex {
         // LEAP L4 slice 3: when every catalog child of `parent` is older than `f` (`newest`, the
         // newest one's epoch, exact), the catalog's nearest below is that one and none is above:
         // both are answered without asking. Else asked, as before.
+        // LEAP L4 (the MCTS deletes): the catalog's nearest rows below and above `f`, known (the
+        // removed child's links, or its parent's newest child), resolved through the removal
+        // links exactly as a row the catalog returned would be.
+        if let Some((row_lo, row_hi)) = known {
+            let p = parent.0;
+            let mem_lo = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
+            let lo = mem_lo.max(self.resolve(p, row_lo, true));
+            let mem_hi = self.map.range((p, f.saturating_add(1))..=(p, u64::MAX)).next().map(|(&(_, e), _)| e);
+            let hi = match (mem_hi, self.resolve(p, row_hi, false)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            self.removed.insert((p, f), (lo, hi));
+            return Ok((listed || fresh, lo, hi));
+        }
         let (lo, hi) = match newest {
             Some(n) if n.is_none_or(|n| n < f) => {
                 let mem = self.map.range((parent.0, 0)..(parent.0, f)).next_back().map(|(&(_, e), _)| e);
@@ -2865,6 +2893,8 @@ impl ChildIndex {
     /// since no query names it as a parent again.
     fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
         self.map.remove(&(zombie.0, f));
+        self.moved.push((zombie.0, f));
+        self.relinked.insert((parent.0, zf));
         self.map.insert((parent.0, zf), child);
         let links: Vec<(u64, u64)> = self
             .removed
@@ -3095,6 +3125,7 @@ fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u
                 .collect(),
             retained: st.lineage.retained_list(),
             name: None,
+            links: None,
         }, what))
         .collect();
     #[cfg(test)]
@@ -3183,6 +3214,8 @@ struct Captured {
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
+    /// The child index's `moved` keys at the capture (see `ChildIndex::moved`).
+    child_moved: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<std::fs::File>,
@@ -3219,11 +3252,15 @@ struct Captured {
 /// committed (LEAP L4): its earliest lease deadline, the fork epoch of the trunk's newest child row,
 /// and whether it holds any trunk version. Exact as of that commit, so the install sets the facts
 /// from it and asks the catalog nothing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CkptFacts {
     lease_min: Option<u64>,
     trunk_child_max: Option<u64>,
     trunk_versions: bool,
+    /// LEAP L4 (the MCTS deletes): the rows whose links this checkpoint's writer set, as it set
+    /// them, and whether it upgraded a 17-20 catalog (then every row's were set, and none listed).
+    links: Vec<super::catalog::LinkUpdate>,
+    upgraded: bool,
 }
 
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
@@ -3284,6 +3321,35 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &id in &cap.removed {
             catalog.delete_branch(id.0)?;
         }
+        // LEAP L4 (the MCTS deletes; DECISIONS e977c1d010): the rows' sibling and newest-child links,
+        // in this transaction, from the rows as they now stand. A 17-20 catalog is upgraded here,
+        // once (its columns and every row's links); else only the rows around a removed, moved or
+        // new child, and their parents, are relinked. Kill point `ckpt.unlinked`: the rows of this
+        // capture removed, their siblings not yet relinked (a kill there leaves the catalog as it
+        // was, by the transaction). Mutant `l4_stale_sibling_link` (test builds only): nothing is
+        // relinked (the oracle's plant).
+        let mut links = Vec::new();
+        let mut upgraded = false;
+        if super::journal::carries_links(cap.meta.format) && !catalog.links() {
+            catalog.upgrade_links()?;
+            upgraded = true;
+        } else if catalog.links() && !fe_mutant("l4_stale_sibling_link") {
+            kill_point("ckpt.unlinked");
+            let mut rows: BTreeSet<(u64, u64)> = BTreeSet::new();
+            let mut parents: BTreeSet<u64> = BTreeSet::new();
+            for &(p, f) in cap.child_removed.iter().chain(&cap.child_moved).chain(&cap.child_keys) {
+                parents.insert(p);
+                rows.insert((p, f));
+                rows.extend(catalog.children_below(p, f, 1)?.first().map(|&e| (p, e)));
+                rows.extend(catalog.children_above(p, f, 1)?.first().map(|&e| (p, e)));
+            }
+            for (p, f) in rows {
+                links.extend(catalog.relink(p, f)?);
+            }
+            for p in parents {
+                links.extend(catalog.relink_id(p)?);
+            }
+        }
         for &(page, born) in &cap.trunk_gone {
             catalog.trunk_delete(page, born)?;
         }
@@ -3326,6 +3392,8 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             lease_min,
             trunk_child_max: if stale { None } else { catalog.children_below(0, u64::MAX, 1)?.first().copied() },
             trunk_versions: !stale && !catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty(),
+            links,
+            upgraded,
         };
         catalog.put_meta(&meta)?;
         Ok(facts)
@@ -3345,6 +3413,8 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     });
     if let Err(e) = written {
         catalog.rollback();
+        // An upgrade rolled back takes its columns with it: this handle reads the table again.
+        let _ = catalog.refresh_links();
         return Err(e);
     }
     written
@@ -8660,6 +8730,26 @@ impl BranchStore {
                 ));
             }
         }
+        // (8) The MCTS deletes: every resident branch's links, when known, equal the catalog's
+        // nearest rows to its own (its siblings below and above, its newest child), out of a
+        // flight (or in one, with CHECK_FACTS_IN_FLIGHT: the pinned snapshot is the last install's).
+        if !cat.flight || in_flight_too {
+            for (&id, st) in inner.branches.iter() {
+                let Some(l) = st.links else { continue };
+                let (p, f) = (st.parent.0, st.fork_epoch);
+                if inner.children.map.contains_key(&(p, f)) || inner.children.relinked.contains(&(p, f)) {
+                    continue;
+                }
+                let asked = super::catalog::Links {
+                    lo: cat.catalog.children_below(p, f, 1).map_err(|e| format!("children_below: {e}"))?.first().copied(),
+                    hi: cat.catalog.children_above(p, f, 1).map_err(|e| format!("children_above: {e}"))?.first().copied(),
+                    child_max: cat.catalog.children_below(id.0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied(),
+                };
+                if l != asked {
+                    return Err(format!("branch {}'s links are known as {l:?}; the catalog answers {asked:?}", id.0));
+                }
+            }
+        }
         // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
         // whether the catalog holds a trunk version, as known, equal their queries.
         if !cat.flight || in_flight_too {
@@ -8699,6 +8789,16 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn take_mirror_install_bytes_for_test(&self) -> u64 {
         std::mem::take(&mut self.inner.lock().names.mirror_install_bytes_max)
+    }
+
+    /// Test builds (LEAP L4, the MCTS deletes): resident branches whose links are known, and the
+    /// catalog's format (its meta row's, or `None` before its first checkpoint).
+    #[cfg(test)]
+    pub(crate) fn links_known_and_catalog_format_for_test(&self) -> (u64, Option<u32>) {
+        let mut inner = self.inner.lock();
+        let known = inner.branches.iter().filter(|(_, st)| st.links.is_some()).count() as u64;
+        let format = inner.cat.as_mut().and_then(|c| c.catalog.meta().ok().flatten()).map(|m| m.format);
+        (known, format)
     }
 
     pub(crate) fn name_mirror_built_for_test(&self) -> bool {
@@ -9472,6 +9572,7 @@ impl StoreInner {
                 name: None,
                 fork_lsn: 0,
                 in_doubt: false,
+                links: b.links,
             },
         );
         self.note_table_growth(grown_before);
@@ -10268,11 +10369,9 @@ impl StoreInner {
                 - reserved.len()
                 - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
-            // The store keeps writing the version it opened (LEAP L4: a 17/18 store stays one).
-            format: self
-                .journal
-                .as_ref()
-                .map_or_else(|| super::journal::format_version(self.splice), Journal::format),
+            // One write path (DECISIONS e977c1d010): this build's version of the store's arm, whatever
+            // version it was opened at; the writer upgrades a 17-20 catalog in this checkpoint.
+            format: super::journal::format_version(self.splice),
             // Filled by the writer in the transaction that commits (`checkpoint_write`).
             lease_min: None,
             held_released: None,
@@ -10320,6 +10419,7 @@ impl StoreInner {
             meta,
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
+            child_moved: self.children.moved.clone(),
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
@@ -10500,6 +10600,7 @@ impl StoreInner {
         }
         // Children forked before the capture have rows now; links of children removed before it
         // pointed at rows that are deleted now.
+        self.children.moved.drain(..cap.child_moved.len().min(self.children.moved.len()));
         for key in &cap.child_keys {
             self.children.map.remove(key);
         }
@@ -10550,6 +10651,12 @@ impl StoreInner {
         cat.lease_floor = facts.lease_min;
         cat.trunk_child_max = Some(facts.trunk_child_max);
         cat.trunk_versions = Some(facts.trunk_versions);
+        // LEAP L4 (the MCTS deletes): an upgrade added the link columns, which this connection reads
+        // from now on; the links the writer set go to the resident states below.
+        if facts.upgraded {
+            cat.catalog.refresh_links()?;
+        }
+        let link_updates = facts.links;
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
@@ -10565,6 +10672,18 @@ impl StoreInner {
         // F-W3: the catalog now holds every state that is not dirty. A state changed since the
         // capture is dirty again, so `evict_clean` keeps it (r13-compose S-2b). Only after the log
         // was cut: a failed rewrite leaves the old log, whose replay is correct, and nothing evicted.
+        // Each resident row's links as the writer set them (a row not resident is read with its
+        // links when it is loaded). Mutant `l4_stale_sibling_link` (test builds only): none
+        // applied (with the writer's own).
+        for (id, links) in link_updates {
+            if let Some(st) = self.branches.get_mut(&BranchId(id)) {
+                st.links = Some(links);
+            }
+        }
+        // Relinked keys captured here are catalog rows now, with links of their own.
+        for key in &cap.child_keys {
+            self.children.relinked.remove(key);
+        }
         if rewritten.is_ok() {
             self.evict_clean();
         }
@@ -10752,6 +10871,7 @@ impl StoreInner {
                 name: name.clone(),
                 fork_lsn: 0,
                 in_doubt: false,
+                links: None,
             },
         );
         self.note_table_growth(grown_before);
@@ -10943,8 +11063,24 @@ impl StoreInner {
                 }
                 _ => None,
             };
+            // LEAP L4 (the MCTS deletes): the child's catalog neighbours, known without asking: a
+            // catalog child's from its own row's links; a child forked since the checkpoint, of a
+            // branch, from its parent's newest catalog child (every catalog child is older). A
+            // child a splice re-keyed since asks. Mutant `l4_probe_always`: never known.
+            let key = (parent.0, f);
+            let known = if fe_mutant("l4_probe_always") || !catalog_mode || self.children.relinked.contains(&key) {
+                None
+            } else if self.children.map.contains_key(&key) {
+                if parent.is_trunk() {
+                    None
+                } else {
+                    self.branches.get(&parent).and_then(|p| p.links).map(|l| (l.child_max, None))
+                }
+            } else {
+                st.links.map(|l| (l.lo, l.hi))
+            };
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest)?;
+            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest, known)?;
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint
@@ -11609,6 +11745,7 @@ impl StoreInner {
                     name: b.name.as_deref().filter(|_| !b.released).map(Arc::from),
                     fork_lsn: 0,
                     in_doubt: false,
+                    links: None,
                 },
             );
             if let Some(name) = b.name.filter(|_| !b.released) {

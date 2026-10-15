@@ -119,10 +119,24 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// reads the meta row only. The log and snapshot layouts are 17's and 18's. This build still opens
 /// a 17 or 18 store, by the older query path, and keeps writing it at its own version: only a store
 /// created by this build is 19 or 20 (`LEGACY_*`, `accepts_format`). An older build refuses 19/20.
-const FORMAT_VERSION: u32 = 19;
-const SPLICE_FORMAT_VERSION: u32 = 20;
-/// The versions before the L4 meta facts this build still opens and keeps writing (17, 18).
+///
+/// 21 and 22 (LEAP L4, the MCTS deletes, DECISIONS e977c1d010): a catalog's branch rows carry
+/// their nearest catalog siblings (`sib_lo`, `sib_hi`) and newest catalog child (`child_max`), kept
+/// by the checkpoint writer, so a delete asks the catalog nothing for its neighbours. ONE WRITE
+/// PATH (the same ruling's class fix): this build reads 17-20 only to upgrade them, at the store's
+/// first checkpoint, in the checkpoint's own transaction (the catalog's columns and every row's
+/// links, and the meta row at this version); every file it writes after an open is 21/22 (the log
+/// and snapshot layouts are 17's and 18's, so a 21/22 store's older log reads as one).
+const FORMAT_VERSION: u32 = 21;
+const SPLICE_FORMAT_VERSION: u32 = 22;
+/// The versions this build reads, to upgrade them: per arm, the L4 meta facts' (19, 20) and the
+/// ones before them (17, 18).
+const OLDER_FORMATS: [u32; 2] = [19, 17];
+const OLDER_SPLICE_FORMATS: [u32; 2] = [20, 18];
+/// The oldest of them, what a test makes an older build's store at (`CREATE_LEGACY`).
+#[cfg(test)]
 const LEGACY_FORMAT_VERSION: u32 = 17;
+#[cfg(test)]
 const LEGACY_SPLICE_FORMAT_VERSION: u32 = 18;
 
 /// The format version a store in the splice arm (`true`) or not creates, and reads (its log and
@@ -147,19 +161,32 @@ std::thread_local! {
     pub(crate) static CREATE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The older version of `format`'s arm this build still opens (LEAP L4: 19 -> 17, 20 -> 18).
-pub(crate) fn legacy_format(format: u32) -> Option<u32> {
+/// The older versions of `format`'s arm this build reads, to upgrade them (21: 19, 17; 22: 20, 18).
+fn older_formats(format: u32) -> &'static [u32] {
     match format {
-        FORMAT_VERSION => Some(LEGACY_FORMAT_VERSION),
-        SPLICE_FORMAT_VERSION => Some(LEGACY_SPLICE_FORMAT_VERSION),
-        _ => None,
+        FORMAT_VERSION => &OLDER_FORMATS,
+        SPLICE_FORMAT_VERSION => &OLDER_SPLICE_FORMATS,
+        _ => &[],
     }
 }
 
-/// Whether a store of arm format `format` reads files of version `version`: its own, or its arm's
-/// legacy version. Mutant `legacy_format_refused` (test builds only): its own only, as before.
+/// Whether a store of arm format `format` reads files of version `version`: its own, or one of its
+/// arm's older versions (their log and snapshot layouts are its own). Mutant
+/// `legacy_format_refused` (test builds only): its own only.
 pub(crate) fn accepts_format(version: u32, format: u32) -> bool {
-    version == format || (legacy_format(format) == Some(version) && !super::store::fe_mutant("legacy_format_refused"))
+    version == format || (older_formats(format).contains(&version) && !super::store::fe_mutant("legacy_format_refused"))
+}
+
+/// The version this build writes for the arm of a file read at `version` (17, 19, 21 -> 21; 18, 20,
+/// 22 -> 22; test builds' `CREATE_LEGACY` keeps making the legacy one).
+pub(crate) fn current_format_of(version: u32) -> u32 {
+    let splice = matches!(version, 18 | 20 | 22);
+    format_version(splice)
+}
+
+/// Whether a catalog of format `format` has the sibling-link columns (21, 22).
+pub(crate) fn carries_links(format: u32) -> bool {
+    format == FORMAT_VERSION || format == SPLICE_FORMAT_VERSION
 }
 
 /// The version of the branch files at `files` when this build reads it for arm format `format`
@@ -179,9 +206,9 @@ pub(crate) fn on_disk_format(files: &BranchFiles, format: u32) -> u32 {
     }
 }
 
-/// Whether a catalog meta row of format `format` carries the L4 facts (19, 20).
+/// Whether a catalog meta row of format `format` carries the L4 facts (19 to 22).
 pub(crate) fn meta_carries_facts(format: u32) -> bool {
-    format == FORMAT_VERSION || format == SPLICE_FORMAT_VERSION
+    matches!(format, 19..=22)
 }
 /// magic(8) format(4) page size(4) generation(8) nonce(4) crc32c of the 28 bytes before it(4),
 /// then the raised class (`HEADER_RAISED_AT`, outside the checksum: rewritten in place) and 4
@@ -1531,6 +1558,12 @@ impl Journal {
     }
 
     /// The format version this journal writes: set by a store in the splice arm before `start`.
+    /// One write path (DECISIONS e977c1d010): a log or snapshot this journal writes from here on is
+    /// at this build's version of its arm, whatever version it was read at.
+    pub(crate) fn upgrade_format(&mut self) {
+        self.format = current_format_of(self.format);
+    }
+
     pub(crate) fn set_format(&mut self, format: u32) {
         self.format = format;
     }
@@ -2064,6 +2097,7 @@ impl Journal {
     /// (a D0 store over flights synced by an earlier run; engine review 7 #1).
     pub(crate) fn rewrite_from_as(&mut self, from: u64, generation: u64, class: SyncClass) -> Result<()> {
         self.check_live()?;
+        self.upgrade_format();
         let end = self.mark();
         if from < LOG_HEADER_LEN as u64 || from > end {
             return Err(LimboError::InternalError(format!(
@@ -2164,7 +2198,8 @@ impl Journal {
             log,
             upto: self.len,
             rewrites: self.rewrites,
-            format: self.format,
+            // One write path: the cut log is written at this build's version of the arm.
+            format: current_format_of(self.format),
             page_size: self.page_size,
             raised: self.header_class(),
             class: self.rewrite_class(),
@@ -2231,6 +2266,8 @@ impl Journal {
     /// for another cut — is dropped and the whole cut done here instead.
     pub(crate) fn finish_cut(&mut self, prep: CutPrep, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
+        // The prepared log's header is at this build's version (`cut_source`): the journal is now.
+        self.upgrade_format();
         let usable = self.cut_usable(&prep, from, generation) && !super::store::fe_mutant("cut_under_mutex");
         if !usable {
             let tmp = prep.tmp.clone();
@@ -3055,6 +3092,7 @@ impl Journal {
         fail_after_rename: bool,
     ) -> Result<()> {
         self.check_live()?;
+        self.upgrade_format();
         // Every record the snapshot replaces stays as durable as it was, raised ones included
         // (review B-F3).
         let class = self.rewrite_class();
@@ -4108,11 +4146,13 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>
     }
     let field = |at: usize| bytes.get(at..at + 4).map(|f| u32::from_le_bytes(f.try_into().unwrap()));
     let version = field(8).expect("16 bytes read");
-    let other = if super::store::fe_mutant("old_layout_checked_below_11_only") { version < 11 } else { version != format };
+    // An older version of this arm (17-20) has this layout: read as this one (one write path).
+    let foreign = !accepts_format(version, format);
+    let other = if super::store::fe_mutant("old_layout_checked_below_11_only") { version < 11 } else { foreign };
     let old = other
         && bytes.len() >= 28
         && crc32c::crc32c(&bytes[..24]) == field(24).expect("28 bytes read");
-    if old || (version != format && bytes.len() >= LOG_HEADER_LEN && crc32c::crc32c(&bytes[..HEADER_CRC_AT]) == field(HEADER_CRC_AT).expect("40 bytes")) {
+    if old || (foreign && bytes.len() >= LOG_HEADER_LEN && crc32c::crc32c(&bytes[..HEADER_CRC_AT]) == field(HEADER_CRC_AT).expect("40 bytes")) {
         return Err(corrupt(&format!(
             "log format version {version}; this store reads version {format}{}",
             version_hint(version, format)
@@ -4336,7 +4376,7 @@ fn read_snapshot(path: &Path, format: u32) -> Result<(u32, u64, SnapshotState, u
     if crc32c::crc32c(body) != u32::from_le_bytes(trailer.try_into().unwrap()) {
         return Err(corrupt("snapshot checksum"));
     }
-    if u32::from_le_bytes(body[8..12].try_into().unwrap()) != format {
+    if !accepts_format(u32::from_le_bytes(body[8..12].try_into().unwrap()), format) {
         return Err(corrupt("snapshot format version (8 is the F7 splice arm's)"));
     }
     let page_size = u32::from_le_bytes(body[12..16].try_into().unwrap());
