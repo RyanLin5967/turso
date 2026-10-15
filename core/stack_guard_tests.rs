@@ -143,8 +143,9 @@ fn shapes(depth: usize) -> Vec<(&'static str, String)> {
 
 /// The class (lead order): client SQL must never crash the server. Every nesting shape above, 60
 /// levels deep, on threads of 128 KiB to 1 MiB: each outcome is an answer or a refusal, never a
-/// dead process. Premise: each shape answers, or is refused by a fixed depth bound, on 8 MiB at
-/// depth 3 (so the shapes are valid SQL, and the guard has a case it must pass).
+/// dead process. Premise: each shape answers on 8 MiB at depth 3 (so the shapes are valid SQL, and
+/// the guard has a case it must pass), but a parenthesised FROM, which the planner refuses after
+/// the parser has recursed through it.
 #[test]
 fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     if run_child() {
@@ -153,7 +154,10 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     let test = "stack_guard_tests::no_nesting_shape_kills_the_process_on_any_thread_stack";
     for (shape, sql) in shapes(3) {
         let got = in_child(test, 8 * 1024, &sql);
-        assert!(got.starts_with("ok"), "premise: {shape} at depth 3 on 8 MiB did not answer: {got} ({sql})");
+        // A parenthesised FROM parses (its recursion is the parser's) and the planner refuses it.
+        let valid = got.starts_with("ok")
+            || (shape == "parenthesised FROM" && got.contains("Parenthesized FROM clause subqueries are not supported"));
+        assert!(valid, "premise: {shape} at depth 3 on 8 MiB did not answer: {got} ({sql})");
     }
     let mut died = Vec::new();
     let mut refused = 0;
