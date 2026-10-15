@@ -263,6 +263,38 @@ fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
     }
 }
 
+/// The lead, 2026-10-15 (the checked-time class): SQLite's date functions added caller values with
+/// wrapping_add, so arithmetic past the date range could wrap to a silent wrong date where SQLite
+/// answers NULL. Each case's expected NULL is sqlite3 3.51.0's (/usr/bin/sqlite3, 2025-06-12, raw
+/// artie lanes/budgets/raw/sqlite3-date-oracle.txt). Expected RED where the engine wraps.
+#[test]
+fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT date('9999-12-31','+1 day')",
+        "SELECT julianday('2000-01-01','+5373484 days')",
+        "SELECT date('2000-01-01','+176545 months')",
+        "SELECT date('2000-01-01','+14712 years')",
+        "SELECT datetime('2000-01-01','+464269999999999 seconds')",
+        "SELECT datetime('2000-01-01','-464269999999999 seconds')",
+        "SELECT julianday('2000-01-01','+128969999999 hours')",
+        "SELECT date('2000-01-01','-14712 years')",
+        "SELECT datetime(5373484.4, '+1 day')",
+        "SELECT datetime('2000-01-01', '+99999:00:00')",
+        "SELECT datetime('2000-01-01', '+1000000000000:00')",
+        "SELECT date('-4713-11-24','-1 day')",
+    ] {
+        match conn.prepare(sql).and_then(|mut st| st.run_collect_rows()) {
+            Ok(rows) if rows == vec![vec![Value::Null]] => {}
+            other => wrong.push(format!("{sql}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "sqlite3 answers NULL for each:\n{}", wrong.join("\n"));
+}
+
 /// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
 fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
     let joined = std::thread::Builder::new()
