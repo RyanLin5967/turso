@@ -8,6 +8,13 @@
  *   clonebench --warmup-replay OPS:S:MAX_S < TRACE
  *       the warm-up decision (warm_ends, the one each claim makes) replayed on claim times, for the shared
  *       cross-driver test fastest/linux/gates/warmup_conformance.py (PREREG annex A23)
+ *   clonebench --warmup-decide OPS:S:MAX_S < TRACE
+ *       the same claims through warm_step, the live decision, accepting times that step back; prints " backsteps=B"
+ *       too (competitors review 2 item 4; bin_plants.sh)
+ *   Every phase is decided at a claim under one lock (claim_op, the macOS bbload's, closed loop; comp review 1 LOW
+ *   40): the claim that ends the warm-up stamps tm0, the claim that finds the window full stamps tm1, and later claims
+ *   are unmeasured DRAIN ops until every measured op has completed; summary.json records t0_ns, tm0_ns, tm1_ns,
+ *   drain_ops and drain_claims.
  *   clonebench par --src FILE --dir D --procs P --n N --out OUT
  *       D0 clonefile throughput with P processes (M0 exit 3; the decider's clone_par.py, compiled).
  *
@@ -53,7 +60,7 @@
  *   - no mkparent (lead review 62430d8bf..b49fb656a LOW 27): the Mac's own-generator parent is replaced on Linux by
  *     gen_seed.py's stream, loaded by fixture.py sqlite (gate-6 review, t3run item 4: one parent for every system).
  *   - the warm-up (PREREG annex A23 / A23-AM1): --warmup OPS:S:MAX_S is the macOS bbload's claim_op rule, decided AT
- *     EACH CLAIM of an op by warm_ends (claim_warm): the warm-up ends at the first claim with OPS warm-up ops claimed
+ *     EACH CLAIM of an op by warm_ends (claim_op's warm_step): the warm-up ends at the first claim with OPS warm-up ops claimed
  *     before it and S seconds since t0 (done), or with MAX_S seconds since t0 (capped), in integer ns with seconds
  *     truncated as (uint64_t)(S * 1e9); the ending claim is the first measured op. MAX_S is a bound, never "no limit":
  *     MAX_S 0 ends the warm-up at the first claim. --warmup-ops alone takes S 0 and MAX_S 0.1 x --max-window-s (as the
@@ -291,16 +298,22 @@ static double DUR_S;
 static double WARM_S, WARM_MAX_S;
 static uint64_t WARM_S_NS, WARM_MAX_NS;
 static char WARM_RULE[64];
-/* A23: the claim state, under g_claim_mu (claim_warm), and the window's start as the ending claim opened it */
+/* The claim state (claim_op, the macOS bbload's at artie 4010ff3b06, closed loop): every phase decision under
+ * g_claim_mu, and the window's start and end as the claims that opened and closed it stamped them */
 static pthread_mutex_t g_claim_mu = PTHREAD_MUTEX_INITIALIZER;
-static volatile uint64_t g_t0, g_tm0; /* the run's t0 (the warm-up clock's zero), the window's start (0: not yet) */
-static int g_warm_capped, g_warm_any;
-static uint64_t g_warm_end_ns, g_warm_last_ns;
-static struct rusage g_ru0;
-static uint64_t g_fl0;
-static int g_tp_tm0 = -2; /* MED 4: own TracerPid at the window's start (-2: never reached) */
+static volatile uint64_t g_t0, g_tm0, g_tm1; /* the run's t0 (the warm-up clock's zero), the window's start and end */
+/* the warm-up's decision state, the one warm_step updates for the live claims and for --warmup-decide */
+typedef struct { uint64_t claimed, prev_el, backsteps, last_el, end_el; int any, capped; } warm_state;
+static warm_state g_warm;
+static uint64_t g_meas_claimed, g_meas_final, g_meas_done, g_drain_claimed;
+static volatile int g_all_done;
+static volatile uint64_t g_exited;
+static struct rusage g_ru0, g_ru1;
+static uint64_t g_fl0, g_fl1;
+static int g_tp_tm0 = -2, g_tp_tm1 = -2; /* MED 4: own TracerPid at the window's start and end (-2: never reached) */
 /* --max-window-s S (gate-6 review, t3run item 16): the registered per-run cap as a bound on the measured window (0: none). */
 static double MAXWIN_S;
+static uint64_t DUR_NS, MAXWIN_NS; /* DUR_S and MAXWIN_S truncated to ns once */
 static int CAPPED;
 static int g_dirfd;
 static sqlite3 *g_parent;
@@ -309,7 +322,7 @@ static char g_parent_wal[2100];
 static pthread_rwlock_t g_parent_rw = PTHREAD_RWLOCK_INITIALIZER;
 static uint64_t g_checkpoints;
 static volatile int g_phase = PH_INIT;
-static volatile uint64_t g_warm, g_meas, g_done;
+static volatile uint64_t g_done;
 static v1_hdr *V1;
 static char RUN_TAG[32];
 /* B0 flusher */
@@ -413,7 +426,7 @@ static int create_branch(const char *dst, rec_t *r) {
  * LOW 14; PREREG annex A23): at a claim, with CLAIMED warm-up ops claimed before it and EL ns since t0, the warm-up
  * ends at this claim when CLAIMED >= OPS and EL >= S_NS (done) or EL >= MAX_NS (capped). 0: go on, this claim is a
  * warm-up op; 1: it ends done; 2: it ends capped. Verbatim from the macOS bbload (artie 4010ff3b06), whose claim_op
- * is the validated implementation (A23-AM1); claim_warm decides with it, and --warmup-replay replays it. */
+ * is the validated implementation (A23-AM1); warm_step (claim_op's decision) calls it, and --warmup-replay replays it. */
 static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
     int done = claimed >= ops && el >= s_ns;
     return done ? 1 : el >= max_ns ? 2 : 0;
@@ -421,7 +434,7 @@ static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns,
 
 /* --warmup-replay OPS:S:MAX_S < TRACE: warm_ends on claim times read from stdin (integer ns since t0, one per line,
  * non-decreasing). Prints "stop_at=I warm_ops=N capped=0|1", or "stop_at=none warm_ops=N capped=none" when the trace
- * ends first; seconds become ns as claim_warm makes them, (uint64_t)(S * 1e9). The macOS bbload's (artie 4010ff3b06)
+ * ends first; seconds become ns as claim_op makes them, (uint64_t)(S * 1e9). The macOS bbload's (artie 4010ff3b06)
  * with clonebench's name in its messages, so the shared harness feeds every driver the same claims. */
 static int warmup_replay(const char *rule) {
     unsigned long long ops;
@@ -456,57 +469,149 @@ static int warmup_replay(const char *rule) {
     return 0;
 }
 
-/* claim_warm -- the warm-up decision of one claim, serialized under g_claim_mu as the macOS bbload's claim_op
- * serializes under g_claim (A23; this port used to decide on a 1 ms main-thread poll of the claimed count, comparing
- * seconds as doubles, with MAX_S 0 as no limit). The claim's time T is read UNDER the lock, as claim_op reads now_ns()
- * after taking g_claim, so claims are judged in lock order with non-decreasing times (fastest-linux's LOW on
- * f6c2dbb2f: it was read before the lock, so a slower claimant could be judged later with an older time). Returns
- * PH_WARM when this claim is a warm-up op, else the phase now in force: the claim that ends the warm-up opens the
- * window at T and is its first measured op. g_warm_backsteps counts claims judged with an older time than the one
- * judged before them: 0 by construction here, recorded so timedrun.py can refuse a run where it is not. */
-static uint64_t g_claim_prev_el, g_warm_backsteps;
-static int claim_warm(void) {
-    pthread_mutex_lock(&g_claim_mu);
-    int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-    if (ph == PH_WARM) {
-        uint64_t t = now_ns();
-        uint64_t el = t > g_t0 ? t - g_t0 : 0;
-        if (el < g_claim_prev_el) g_warm_backsteps++;
-        g_claim_prev_el = el;
-        int end = warm_ends(g_warm, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
+/* warm_step -- one warm-up claim at EL ns since t0 (BEFORE_T0: read before t0, counted as a step back), judged by
+ * warm_ends against W: the ONE decision function, for the live claims (claim_op) and for --warmup-decide (competitors
+ * review 2 item 4; bbload.c has the same function). Returns warm_ends' answer: 0 a warm-up op, 1 done, 2 capped. */
+static int warm_step(warm_state *w, uint64_t el, int before_t0, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
+    if (before_t0 || el < w->prev_el) w->backsteps++;
+    w->prev_el = el;
+    int end = warm_ends(w->claimed, el, ops, s_ns, max_ns);
+    if (end) {
+        w->capped = end == 2;
+        w->end_el = el;
+        return end;
+    }
+    w->last_el = el;
+    w->any = 1;
+    w->claimed++;
+    return 0;
+}
+
+/* --warmup-decide OPS:S:MAX_S < TRACE: claim times (integer ns since t0, one per line, in ANY order) through warm_step.
+ * Prints "stop_at=I warm_ops=N capped=0|1 backsteps=B", or "stop_at=none warm_ops=N capped=none backsteps=B". */
+static int warmup_decide(const char *rule) {
+    unsigned long long ops;
+    double s, m;
+    char tail;
+    if (rule[0] < '0' || rule[0] > '9' || sscanf(rule, "%llu:%lf:%lf%c", &ops, &s, &m, &tail) != 3 || !isfinite(s) ||
+        !isfinite(m) || !(s >= 0) || !(m >= 0) || s > 1e7 || m > 1e7) {
+        fprintf(stderr, "clonebench: --warmup-decide OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds in [0, 1e7]): %s\n", rule);
+        return 2;
+    }
+    warm_state w;
+    memset(&w, 0, sizeof w);
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        if (line[0] == '\n') continue;
+        char *e;
+        errno = 0;
+        unsigned long long el = strtoull(line, &e, 10);
+        if (line[0] < '0' || line[0] > '9' || (*e != '\n' && *e != '\0') || errno) {
+            fprintf(stderr, "clonebench: --warmup-decide: bad trace line: %s", line);
+            return 2;
+        }
+        int end = warm_step(&w, el, 0, ops, (uint64_t)(s * 1e9), (uint64_t)(m * 1e9));
         if (end) {
-            g_warm_capped = end == 2;
-            g_warm_end_ns = el;
-            getrusage(RUSAGE_SELF, &g_ru0);
-            pthread_mutex_lock(&f_mu); /* lock order g_claim_mu -> f_mu; nothing holding f_mu takes g_claim_mu */
-            g_fl0 = f_nflights;
-            pthread_mutex_unlock(&f_mu);
-            __atomic_store_n(&g_tm0, t, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
-            if (V1 && C > 1) v1_set_mark(V1, MARKB + 2);
-            g_tp_tm0 = self_tracerpid();
-            ph = PH_MEAS;
-        } else {
-            g_warm_last_ns = el;
-            g_warm_any = 1;
-            g_warm++;
+            printf("stop_at=%llu warm_ops=%llu capped=%d backsteps=%llu\n", (unsigned long long)w.claimed,
+                   (unsigned long long)w.claimed, end == 2, (unsigned long long)w.backsteps);
+            return 0;
         }
     }
+    printf("stop_at=none warm_ops=%llu capped=none backsteps=%llu\n", (unsigned long long)w.claimed,
+           (unsigned long long)w.backsteps);
+    return 0;
+}
+
+/* claim_op -- every phase decision, made at a claim under g_claim_mu: the macOS bbload's claim_op at artie 4010ff3b06,
+ * closed loop (comp review 1 LOW 40; this port's main thread used to end the window on a 1 ms poll and offered no
+ * drain load). The claim's time T is now_ns() read UNDER the lock. In the warm-up, warm_step decides, and the claim
+ * that ends it stamps tm0 = T and is the first measured op; in the window, the claim that finds it full (--duration-s
+ * and --min-ops, or --max-ops, or past a --max-window-s bound: CAPPED) stamps tm1 = T and fixes the measured count;
+ * it and every later claim is an unmeasured DRAIN op (create, open, write and --drop as any op) until every measured
+ * op has completed (op_done), and then claims stop. self_tracerpid() runs after the unlock (review 2 item 6). CID:
+ * the claiming client, used only by the PLANT_CLAIM_TIME_EARLY build (build.sh clonebench-plant-claim-early), which
+ * reads the time before the lock and sleeps 20-200 us on odd clients (the defect 0138d2128 fixed). */
+typedef struct { int ph, stop, opened, closed; } claim_t;
+
+static void all_done_locked(void) {
+    if (!g_all_done) __atomic_store_n(&g_all_done, 1, __ATOMIC_RELEASE);
+}
+
+static claim_t claim_op(int cid) {
+    claim_t k;
+    memset(&k, 0, sizeof k);
+#ifdef PLANT_CLAIM_TIME_EARLY
+    uint64_t early = now_ns();
+    if (cid & 1) usleep((useconds_t)(20 + (early >> 4) % 181));
+#else
+    (void)cid;
+#endif
+    pthread_mutex_lock(&g_claim_mu);
+#ifdef PLANT_CLAIM_TIME_EARLY
+    uint64_t t = early;
+#else
+    uint64_t t = now_ns();
+#endif
+    int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+    if (ph == PH_DRAIN && g_meas_done >= g_meas_final) { k.stop = 1; goto out; }
+    if (ph == PH_WARM) {
+        if (!warm_step(&g_warm, t >= g_t0 ? t - g_t0 : 0, t < g_t0, WARM_OPS, WARM_S_NS, WARM_MAX_NS)) {
+            k.ph = PH_WARM;
+            goto out;
+        }
+        getrusage(RUSAGE_SELF, &g_ru0);
+        pthread_mutex_lock(&f_mu); /* lock order g_claim_mu -> f_mu; nothing holding f_mu takes g_claim_mu */
+        g_fl0 = f_nflights;
+        pthread_mutex_unlock(&f_mu);
+        __atomic_store_n(&g_tm0, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
+        if (V1 && C > 1) v1_set_mark(V1, MARKB + 2);
+        k.opened = 1;
+        ph = PH_MEAS;
+    }
+    if (ph == PH_MEAS) {
+        uint64_t el = t > g_tm0 ? t - g_tm0 : 0;
+        int timed = DUR_S > 0 || MIN_OPS > 0;
+        int end = (timed && el >= DUR_NS && g_meas_claimed >= MIN_OPS) || (MAX_OPS && g_meas_claimed >= MAX_OPS);
+        if (!end && MAXWIN_S > 0 && el > MAXWIN_NS) { end = 1; CAPPED = 1; }
+        if (!end) { g_meas_claimed++; k.ph = PH_MEAS; goto out; }
+        g_meas_final = g_meas_claimed;
+        getrusage(RUSAGE_SELF, &g_ru1);
+        pthread_mutex_lock(&f_mu);
+        g_fl1 = f_nflights;
+        pthread_mutex_unlock(&f_mu);
+        __atomic_store_n(&g_tm1, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
+        if (V1 && C > 1) v1_set_mark(V1, MARKB + 3);
+        k.closed = 1;
+        if (g_meas_done >= g_meas_final) { all_done_locked(); k.stop = 1; goto out; }
+    }
+    g_drain_claimed++;
+    k.ph = PH_DRAIN; /* a drain op: keeps the load on while measured ops are still running */
+out:
     pthread_mutex_unlock(&g_claim_mu);
-    return ph;
+    if (k.opened) g_tp_tm0 = self_tracerpid();
+    if (k.closed) g_tp_tm1 = self_tracerpid();
+    return k;
+}
+
+/* op_done PH -- an op of phase PH completed: a measured one counts toward the end of the drain (claim_op's stop) */
+static void op_done(int ph) {
+    __atomic_fetch_add(&g_done, 1, __ATOMIC_RELEASE);
+    if (ph != PH_MEAS) return;
+    pthread_mutex_lock(&g_claim_mu);
+    g_meas_done++;
+    if (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_DRAIN && g_meas_done >= g_meas_final) all_done_locked();
+    pthread_mutex_unlock(&g_claim_mu);
 }
 
 static void *client_main(void *arg) {
     client_t *c = arg;
     while (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_INIT) { struct timespec ts = {0, 100000}; nanosleep(&ts, NULL); }
     for (uint32_t seq = 0;; seq++) {
-        int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-        if (ph == PH_WARM) ph = claim_warm(); /* A23: decided at this claim, its time read under g_claim_mu */
-        if (ph >= PH_DRAIN) break;
-        if (ph == PH_MEAS) {
-            uint64_t k = __atomic_fetch_add(&g_meas, 1, __ATOMIC_RELAXED);
-            if (MAX_OPS && k >= MAX_OPS) break;
-        }
+        claim_t kc = claim_op(c->id); /* every phase decision at the claim, its time read under g_claim_mu */
+        if (kc.stop) break;
+        int ph = kc.ph;
         rec_t r;
         memset(&r, 0, sizeof r);
         r.client = (uint32_t)c->id;
@@ -570,8 +675,9 @@ static void *client_main(void *arg) {
         r.after_end = now_ns();
         if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 4096; c->rec = realloc(c->rec, c->cap * sizeof *c->rec); }
         c->rec[c->n++] = r;
-        __atomic_fetch_add(&g_done, 1, __ATOMIC_RELEASE);
+        op_done(ph);
     }
+    __atomic_fetch_add(&g_exited, 1, __ATOMIC_RELEASE); /* cmd_run waits for every client to exit */
     return NULL;
 }
 
@@ -645,6 +751,13 @@ static int cmd_run(int argc, char **argv) {
     }
     WARM_S_NS = (uint64_t)(WARM_S * 1e9);
     WARM_MAX_NS = (uint64_t)(WARM_MAX_S * 1e9);
+    /* the window's seconds become ns once at claims (claim_op), so they must be finite and in a range the cast holds */
+    if (!isfinite(DUR_S) || DUR_S < 0 || DUR_S > 1e7 || !isfinite(MAXWIN_S) || MAXWIN_S < 0 || MAXWIN_S > 1e8) {
+        fprintf(stderr, "clonebench: --duration-s needs [0, 1e7] s and --max-window-s [0, 1e8] s\n");
+        return 2;
+    }
+    DUR_NS = (uint64_t)(DUR_S * 1e9);
+    MAXWIN_NS = (uint64_t)(MAXWIN_S * 1e9);
     if (OP_M1 && ROWS < 1) { fprintf(stderr, "clonebench: --op m1 needs --rows (the parent's row count)\n"); return 2; }
     if (MUTANT_EARLY && !MODE_B0) { fprintf(stderr, "clonebench: --mutant-early-ack is a b0 mutant\n"); return 2; }
 #ifndef __APPLE__
@@ -697,14 +810,12 @@ static int cmd_run(int argc, char **argv) {
         if (!cl[i].rng) cl[i].rng = 1;
         pthread_create(&cl[i].th, NULL, client_main, &cl[i]);
     }
-    uint64_t t_start = now_ns(), tm1 = 0;
-    struct rusage ru1;
-    uint64_t fl1 = 0;
-    int tp_tm1 = -2; /* MED 4: own TracerPid at the window's end (-2: never reached; g_tp_tm0 at its start) */
+    uint64_t t_start = now_ns();
     g_t0 = t_start;
     /* No warm-up asked for (OPS, S and MAX_S all 0): start in the measured window, so --max-ops N makes exactly N ops
-     * (the B1 prebranch; lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1), as bbload does; A23 gives 0:0:0 the same
-     * 0 warm-up ops. Otherwise every claim decides the warm-up (claim_warm, PREREG annex A23). */
+     * at C=1 (the B1 prebranch; lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1), as bbload does; A23 gives 0:0:0 the
+     * same 0 warm-up ops. Otherwise every claim decides (claim_op). The window's start state is stamped before the
+     * phase opens, so a claim cannot close the window first. */
     if (WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0) {
         getrusage(RUSAGE_SELF, &g_ru0);
         g_tm0 = t_start;
@@ -712,29 +823,11 @@ static int cmd_run(int argc, char **argv) {
         __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
     } else __atomic_store_n(&g_phase, PH_WARM, __ATOMIC_RELEASE);
     if (V1 && C > 1) v1_set_mark(V1, MARKB + (g_phase == PH_MEAS ? 2 : 1));
-    for (;;) {
+    /* Every phase is decided at the claims (claim_op): wait for every client to exit, which they do once the drain has
+     * seen every measured op complete (comp review 1 LOW 40) */
+    while (__atomic_load_n(&g_exited, __ATOMIC_ACQUIRE) < (uint64_t)C) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
-        /* The phase first, then the clock: the claim that ended the warm-up stored g_tm0 before PH_MEAS (release), so
-         * a clock read after this acquire is not before it (the guard keeps a cross-CPU read from going negative). */
-        int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-        uint64_t n = now_ns();
-        if (ph == PH_MEAS) {
-            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
-            double el = n > tm0 ? (n - tm0) / 1e9 : 0;
-            int timed = DUR_S > 0 || MIN_OPS > 0;
-            int cap = MAXWIN_S > 0 && el > MAXWIN_S && !((timed && el >= DUR_S && g_meas >= MIN_OPS) || (MAX_OPS && g_meas >= MAX_OPS));
-            if (cap) CAPPED = 1;
-            if (cap || (timed && el >= DUR_S && g_meas >= MIN_OPS) || (MAX_OPS && g_meas >= MAX_OPS)) {
-                getrusage(RUSAGE_SELF, &ru1);
-                pthread_mutex_lock(&f_mu); fl1 = f_nflights; pthread_mutex_unlock(&f_mu);
-                tm1 = n;
-                __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
-                if (V1 && C > 1) v1_set_mark(V1, MARKB + 3);
-                tp_tm1 = self_tracerpid();
-                break;
-            }
-        }
     }
     for (int i = 0; i < C; i++) pthread_join(cl[i].th, NULL);
     if (MODE_B0) {
@@ -791,10 +884,11 @@ static int cmd_run(int argc, char **argv) {
     f = fopen(p, "w");
     hdr_percentiles_print(h, f, 5, 1000.0, CLASSIC);
     fclose(f);
-    uint64_t tm0 = g_tm0, fl0 = g_fl0; /* the window's start as the ending claim (or t0, with no warm-up) set it */
+    /* the window as the claims that opened and closed it stamped it (claim_op) */
+    uint64_t tm0 = g_tm0, tm1 = g_tm1, fl0 = g_fl0, fl1 = g_fl1;
     double win = (tm1 - tm0) / 1e9;
-    double cpu = (ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
-                 (ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
+    double cpu = (g_ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (g_ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
+                 (g_ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (g_ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = (ok == 0 || bad) ? 3 : 0;
     /* gate-6 review, t3run item 16; lead review 62430d8bf..b49fb656a MED 5: a run the registered cap (--max-window-s)
      * ended is reported, not judged: rc 0, verdict "capped", capped: true and its counts; timedrun.py alone applies
@@ -809,20 +903,27 @@ static int cmd_run(int argc, char **argv) {
         clock_gettime(CLOCK_REALTIME, &rt);
         double off = (double)rt.tv_sec + rt.tv_nsec / 1e9 - now_ns() / 1e9;
         fprintf(f, "\"tm0_realtime_s\":%.6f,\"tm1_realtime_s\":%.6f,\"tracerpid_tm0\":%d,\"tracerpid_tm1\":%d,",
-                tm0 / 1e9 + off, tm1 / 1e9 + off, g_tp_tm0, tp_tm1);
+                tm0 / 1e9 + off, tm1 / 1e9 + off, g_tp_tm0, g_tp_tm1);
     }
     /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
     snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
-    fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_ops\":%llu,\"warmup_s\":%.6f,", WARM_RULE, (unsigned long long)g_warm,
+    fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_ops\":%llu,\"warmup_s\":%.6f,", WARM_RULE, (unsigned long long)g_warm.claimed,
             tm0 > t_start ? (tm0 - t_start) / 1e9 : 0.0);
-    /* PREREG annex A23: the warm-up as claim_warm decided it -- the ending claim (ns since t0; 0 with no warm-up),
-     * whether it ended capped, and the last warm-up claim (null when none was claimed) -- for timedrun.py's exact check */
-    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm_capped ? "true" : "false");
-    if (tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
+    /* PREREG annex A23: the warm-up as claim_op decided it (warm_step) -- the ending claim (ns since t0; 0 with no
+     * warm-up), whether it ended capped, the last warm-up claim (null when none was claimed) and the backsteps -- for
+     * timedrun.py's exact check */
+    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm.capped ? "true" : "false");
+    if (tm0) fprintf(f, "%llu,", (unsigned long long)g_warm.end_el); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
-    if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
-    /* loop: clonebench is closed-loop only (its "mode" field is b1/b0); timedrun.py applies the order checks to it */
-    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"closed\",", (unsigned long long)g_warm_backsteps);
+    if (g_warm.any) fprintf(f, "%llu,", (unsigned long long)g_warm.last_el); else fprintf(f, "null,");
+    /* loop: clonebench is closed-loop only (its "mode" field is b1/b0); timedrun.py applies the order checks to it.
+     * t0_ns/tm0_ns/tm1_ns, drain_ops and drain_claims: claim_op's window, stamped at claims (comp review 1 LOW 40) */
+    uint64_t ndrain = 0;
+    for (size_t i = 0; i < total; i++) ndrain += all[i].phase == PH_DRAIN;
+    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"closed\",\"t0_ns\":%llu,\"tm0_ns\":%llu,\"tm1_ns\":%llu,"
+               "\"drain_ops\":%llu,\"drain_claims\":%llu,",
+            (unsigned long long)g_warm.backsteps, (unsigned long long)g_t0, (unsigned long long)tm0,
+            (unsigned long long)tm1, (unsigned long long)ndrain, (unsigned long long)g_drain_claimed);
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"
@@ -910,6 +1011,7 @@ static int cmd_par(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--warmup-replay")) return warmup_replay(argv[2]); /* PREREG annex A23 */
+    if (argc == 3 && !strcmp(argv[1], "--warmup-decide")) return warmup_decide(argv[2]); /* review 2 item 4 */
     if (argc < 2) { fprintf(stderr, "usage: clonebench extents|run|par|--warmup-replay ...\n"); return 2; }
     if (!strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "par")) return cmd_par(argc - 2, argv + 2);
