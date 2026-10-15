@@ -1535,6 +1535,45 @@ impl PostgreSQLTranslator {
         let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
+            // The lists' lengths are checked as PostgreSQL's transformInsertStmt checks them, before
+            // a DEFAULT position is dropped below: an empty row reached the engine and panicked it,
+            // and a ragged list was inserted (PG 18.6 recorded, pg18-insdef.out).
+            let width = values_width(&select_stmt.values_lists)?;
+            let mut columns = columns;
+            let mut has_explicit_columns = has_explicit_columns;
+            if has_explicit_columns {
+                if width < columns.len() {
+                    return Err(ParseError::ParseError(
+                        "INSERT has more target columns than expressions".into(),
+                    ));
+                }
+                if width > columns.len() {
+                    return Err(ParseError::ParseError(
+                        "INSERT has more expressions than target columns".into(),
+                    ));
+                }
+            } else if default_in_every_row(&select_stmt.values_lists) {
+                // A positional list's DEFAULT position is dropped by naming the columns it stands
+                // for, the table's first `width` columns; dropped unnamed, the later values moved
+                // one column left.
+                let declared = self.columns_of(relation).ok_or_else(|| {
+                    ParseError::ParseError(
+                        "DEFAULT in a VALUES list without a column list is not supported here"
+                            .into(),
+                    )
+                })?;
+                if width > declared.len() {
+                    return Err(ParseError::ParseError(
+                        "INSERT has more expressions than target columns".into(),
+                    ));
+                }
+                columns = declared
+                    .iter()
+                    .take(width)
+                    .map(|c| ast::Name::from_string(c))
+                    .collect();
+                has_explicit_columns = true;
+            }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
             let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
             // Strip columns that use DEFAULT in every row
@@ -6573,6 +6612,44 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     Some(PgBranchCall { function, args })
 }
 
+/// The length every VALUES list has, or PostgreSQL's 42601 when they differ.
+fn values_width(lists: &[pg_query::protobuf::Node]) -> Result<usize, ParseError> {
+    use pg_query::protobuf::node::Node;
+    let len = |n: &pg_query::protobuf::Node| match &n.node {
+        Some(Node::List(list)) => list.items.len(),
+        _ => 0,
+    };
+    let width = lists.first().map_or(0, len);
+    if lists.iter().any(|n| len(n) != width) {
+        return Err(ParseError::ParseError(
+            "VALUES lists must all be the same length".into(),
+        ));
+    }
+    Ok(width)
+}
+
+/// Whether some VALUES position is DEFAULT in every list (the positions translate_values drops).
+fn default_in_every_row(lists: &[pg_query::protobuf::Node]) -> bool {
+    use pg_query::protobuf::node::Node;
+    fn items(n: &pg_query::protobuf::Node) -> &[pg_query::protobuf::Node] {
+        match &n.node {
+            Some(pg_query::protobuf::node::Node::List(list)) => list.items.as_slice(),
+            _ => &[],
+        }
+    }
+    let Some(first) = lists.first() else {
+        return false;
+    };
+    (0..items(first).len()).any(|i| {
+        lists.iter().all(|n| {
+            matches!(
+                items(n).get(i).and_then(|item| item.node.as_ref()),
+                Some(Node::SetToDefault(_))
+            )
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9260,3 +9337,4 @@ mod tests {
         assert_eq!(names, vec![Some("n".to_string()), Some("k".to_string())]);
     }
 }
+

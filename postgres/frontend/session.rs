@@ -847,9 +847,12 @@ fn prepare_statement_checked(
     }
 
     // A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
-    // item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21); a translator with no
-    // lookup refuses one. No other statement pays for the lookup.
-    let translator = if is_delete_using(sql, &parse_result) {
+    // item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21), and so does an INSERT
+    // whose VALUES lists, with no column list, hold DEFAULT (its positions are named); a translator
+    // with no lookup refuses one. No other statement pays for the lookup.
+    let translator = if is_delete_using(sql, &parse_result)
+        || is_positional_insert_default(sql, &parse_result)
+    {
         let pg_conn = pg_conn.clone();
         PostgreSQLTranslator::new()
             .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
@@ -2287,6 +2290,28 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
         .nodes()
         .iter()
         .any(|(n, ..)| matches!(n, NodeRef::DeleteStmt(d) if !d.using_clause.is_empty()))
+}
+
+/// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
+fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    use turso_pg_parser::pg_query::NodeRef;
+    if !sql
+        .as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"default"))
+    {
+        return false;
+    }
+    parse.protobuf.nodes().iter().any(|(n, ..)| match n {
+        NodeRef::InsertStmt(i) if i.cols.is_empty() => {
+            matches!(
+                i.select_stmt.as_ref().and_then(|s| s.node.as_ref()),
+                Some(Node::SelectStmt(s)) if !s.values_lists.is_empty()
+            )
+        }
+        _ => false,
+    })
 }
 
 /// The columns `table` declares, from the table the engine reads under the name: an unqualified
