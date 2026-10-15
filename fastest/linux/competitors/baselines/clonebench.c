@@ -5,6 +5,7 @@
  *       [--max-ops N | --duration-s S [--min-ops N]] [--warmup-ops W] [--hold-us U] [--sync d2|d0] [--rows R]
  *       [--warmup OPS:S:MAX_S] [--max-window-s S]
  *       [--drop] [--seed S] [--v1-run NAME [--v1-mark-base B]] [--mutant-early-ack]
+ *       [--memstatus 0|1]  SQLite's MEMSTATUS (default 0, MULTITHREAD always; summary memstatus; comp review 1 LOW 39)
  *       [--no-drain]   claims stop at the window's end, exactly --max-ops ops (the driver's prebranch at C>1; summary
  *                      no_drain; comp review 1 LOW 21); a measured cell keeps the drain load (timedrun.py)
  *   clonebench --warmup-replay OPS:S:MAX_S < TRACE
@@ -289,6 +290,16 @@ typedef struct { int id; pthread_t th; uint64_t rng; rec_t *rec; size_t n, cap; 
 
 static int MODE_B0, OP_M1, SYNC_D0, DROP, MUTANT_EARLY, BRANCH_SHARED, MUTANT_BNOSYNC, C = 1;
 static int NO_DRAIN; /* --no-drain: claims stop at the window's end (the driver's prebranch; comp review 1 LOW 21) */
+/* comp review 1 LOW 39, ported from the macOS clonebench (artie 4010ff3b06:172-177): SQLite runs MULTITHREAD with
+ * MEMSTATUS off by default (--memstatus 1 restores it), so an allocation does not take the global allocator mutex */
+static int MEMSTATUS = 0;
+static void sq_configure(int memstatus) {
+    /* before any other sqlite3 call (sqlite3_config is refused after initialisation) */
+    if (sqlite3_config(SQLITE_CONFIG_MULTITHREAD) != SQLITE_OK || sqlite3_config(SQLITE_CONFIG_MEMSTATUS, memstatus) != SQLITE_OK) {
+        fprintf(stderr, "clonebench: sqlite3_config failed (a library built without threads?)\n");
+        exit(2);
+    }
+}
 static c1b_client g_c1b;
 static int g_have_c1b;
 static const char *PARENT, *BDIR;
@@ -731,6 +742,7 @@ static int cmd_run(int argc, char **argv) {
         else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(a, "--drop")) DROP = 1;
         else if (!strcmp(a, "--no-drain")) NO_DRAIN = 1;
+        else if (!strcmp(a, "--memstatus") && v) { MEMSTATUS = !strcmp(v, "1") ? 1 : !strcmp(v, "0") ? 0 : -1; i++; }
         else if (!strcmp(a, "--branch-shared")) BRANCH_SHARED = 1;
         else if (!strcmp(a, "--mutant-branch-nosync")) MUTANT_BNOSYNC = 1;
         else if (!strcmp(a, "--mutant-early-ack")) MUTANT_EARLY = 1;
@@ -779,6 +791,8 @@ static int cmd_run(int argc, char **argv) {
         return 2;
     }
 #endif
+    if (MEMSTATUS < 0) { fprintf(stderr, "clonebench: --memstatus needs 0 or 1\n"); return 2; }
+    sq_configure(MEMSTATUS);  /* comp review 1 LOW 39: before any other sqlite3 call */
     if (guard_dir(BDIR) || guard_file_dir(PARENT)) return 2;
     if (!(g_parent = sq_open(PARENT, 0))) return 2;
     sq_exec(g_parent, "PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1; SELECT count(*) FROM t");
@@ -931,6 +945,7 @@ static int cmd_run(int argc, char **argv) {
             (unsigned long long)g_warm.backsteps, (unsigned long long)g_t0, (unsigned long long)tm0,
             (unsigned long long)tm1, (unsigned long long)ndrain, (unsigned long long)g_drain_claimed,
             NO_DRAIN ? "true" : "false");
+    fprintf(f, "\"memstatus\":%d,\"threading\":\"multithread\",", MEMSTATUS);  /* comp review 1 LOW 39 */
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"
