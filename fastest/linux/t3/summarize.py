@@ -744,11 +744,12 @@ def self_test():
         4 -> 2), notint (inline_compaction_syncs after is "9"), boolean (header_raise_exclusive before is true),
         nowindows (no windows at all), dropwin (no delete window), extrawin (a cycle window too), unnamed (the connect
         window has no name), crossback (create reads hardcap_upgrades 8 -> 8, then connect 7 -> 7: the engine's counter
-        fell between windows)"""
+        fell between windows), short (the run says phases_run 1 and lists create alone)"""
         if kind == "nowindows":
             return []
         out = []
-        for name in ("create", "connect", "write", "delete") + (("cycle",) if kind == "extrawin" else ()):
+        for name in (("create",) if kind == "short" else ("create", "connect", "write", "delete")
+                     + (("cycle",) if kind == "extrawin" else ())):
             if name == "delete" and kind == "dropwin":
                 continue
             before, after = {k: 7 for k in EXC}, {k: 7 for k in EXC}
@@ -848,7 +849,8 @@ def self_test():
                 # gains its windows with the four exception counters, a new required record at its passing value
                 w(f"{a1}/result/summary.json", "[]" if ours_counters == "notobject" else json.dumps(
                     {"warmup_rule": ours_rule, "ops_total": ours_ops[0], "ops_total_asked": ours_ops[1],
-                     "mode": "phases", "phases_run": 4, "windows": ours_windows(ours_counters)}
+                     "mode": "phases", "phases_run": 1 if ours_counters == "short" else 4,
+                     "windows": ours_windows(ours_counters)}
                     | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
@@ -1149,6 +1151,10 @@ def self_test():
          {"ours_counters": "dropwin"}, False, lambda s: any("delete" in x and "window" in x for x in s["parity_refusals"])),
         ("exception counters f1: a window the run did not measure (cycle in a phases run) fails, naming it",
          {"ours_counters": "extrawin"}, False, lambda s: any("cycle" in x for x in s["parity_refusals"])),
+        # second fresh read (975bba2cb) finding 1: coverage is judged against what t3run asked for (--mode phases, every
+        # phase), not against the run's own claim, so a run saying phases_run 1 cannot hide a hot write
+        ("exception counters r2 f1: a run saying phases_run 1 with create alone fails (t3run asks for all 4 phases)",
+         {"ours_counters": "short"}, False, lambda s: any("phases_run" in x for x in s["parity_refusals"])),
         ("exception counters f2: a window with no name fails", {"ours_counters": "unnamed"}, False,
          lambda s: any("no name" in x for x in s["parity_refusals"])),
         ("exception counters f3: hardcap_upgrades falling between windows (create after 8, connect before 7) fails",
