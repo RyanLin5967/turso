@@ -3453,6 +3453,14 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
 /// small multiple of n/256 (256 shards), and the filter ends under n/2 entries (a rebuild keeps it
 /// near twice the larger of the live names and its rebuild floor). Before: one insert moved half
 /// of all the names ever created, and the filter held all n.
+///
+/// RE-SPECIFIED (lead order 2026-10-15, review REVIEW-claude-namefilter-2 LOW; a flagged edit of a
+/// red's instrument, not of its claim): the filter's growth moved off the mutex, and `moved_max`
+/// became the entries one growth copies on its own thread, which grows with n by design, so the
+/// first bound read a number the claim is not about. The claim, "never stalls one create with a
+/// rehash", is now read where it lives: the most entries one note moved inside its store-mutex hold
+/// (`name_filter_held_moves_for_test`), within the same n/256 bound (0 by construction; mutant
+/// `name_filter_grows_in_note` moves them all). The bound on entries is unchanged.
 #[test]
 fn the_name_filter_stays_bounded_under_churn() {
     let _s = serial();
@@ -3467,7 +3475,8 @@ fn the_name_filter_stays_bounded_under_churn() {
         db.drop_branch(&name).unwrap();
     }
     db.branch_wait_name_filter();
-    let (built, entries, moved, _, _) = db.branch_name_filter_stats();
+    let (built, entries, _, _, _) = db.branch_name_filter_stats();
+    let moved = db.branches.name_filter_held_moves_for_test();
     assert!(built, "premise: the name filter is built");
     assert!(
         moved <= 4 * n / 256 + 64,
@@ -3501,6 +3510,74 @@ fn a_failed_name_scan_is_retried() {
     assert_eq!(failed, 1, "the failed scan was not counted");
     assert!(built && builds == 1, "the name filter was not built after its scan failed once");
     assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
+}
+
+/// Review REVIEW-claude-namefilter-2 MED-1: a close joins EVERY name-filter thread. The handle was
+/// one slot, so a rebuild started while the open's build was held overwrote that build's handle,
+/// and close returned with the build still alive, holding a catalog connection and the store's
+/// files. Here the open's build is held before its scan (`NAME_SCAN_HOLD`), creates fill its
+/// pending table until the filter overflows and a rebuild starts, and the held build is released
+/// 300 ms after the close begins. When the close returns, no filter thread may be alive
+/// (`FILTER_THREADS_LIVE`, counted from each thread's first statement to its last).
+#[test]
+fn a_close_joins_every_name_filter_thread() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-join.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("held").unwrap();
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            super::store::NAME_SCAN_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Release;
+    let live0 = super::store::FILTER_THREADS_LIVE.load(O::Acquire);
+    super::store::NAME_SCAN_HOLD.store(1, O::Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    let t = std::time::Instant::now();
+    while super::store::NAME_SCAN_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the open's build never reached its scan");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let trunk = db.connect().unwrap();
+    let mut i = 0u32;
+    while db.branches.name_filter_state_for_test().1 == 0 {
+        assert!(i < 200_000, "premise: {i} creates never overflowed the held build's pending table");
+        trunk.create_branch(&format!("fill-{i}")).unwrap();
+        i += 1;
+    }
+    // The rebuild's thread, started by the create that took the owed rebuild, runs to its end;
+    // the held build stays alive until the release below.
+    let t = std::time::Instant::now();
+    while super::store::FILTER_THREADS_LIVE.load(O::Acquire) > live0 + 1 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the rebuild did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        super::store::FILTER_THREADS_LIVE.load(O::Acquire),
+        live0 + 1,
+        "premise: the open's held build is not alive"
+    );
+    let releaser = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        super::store::NAME_SCAN_HOLD.store(0, std::sync::atomic::Ordering::Release);
+    });
+    drop(trunk);
+    let store = Arc::downgrade(&db.branches);
+    drop(db);
+    assert!(store.upgrade().is_none(), "premise: the store was not closed (a reference outlived the database)");
+    let live = super::store::FILTER_THREADS_LIVE.load(O::Acquire);
+    releaser.join().unwrap();
+    assert_eq!(live, live0, "CLAIM: {} name-filter thread(s) outlived the store's close", live - live0);
 }
 
 /// Review 3 #7 (e): each way a held name reaches the filter is load-bearing once the name's state
@@ -8964,7 +9041,10 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
     }
     let _r = Reset;
     let mut lost = Vec::new();
-    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true)] {
+    // Stages 1-5 hold a growth; 6 and 7 hold a BUILD, in `Draining` before its pending copy and
+    // in `Building` before its scan (review REVIEW-claude-namefilter-2 MED-3), reached by the
+    // rebuild a failed drain owes. Mutant `name_filter_build_skips_pending` must turn stage 7 red.
+    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true), (6, true), (7, true)] {
         let dir = tempfile::TempDir::new().unwrap();
         let db = open_at(&dir.path().join("filter-oracle.db"), opts(true, SyncClass::Off));
         let trunk = db.connect().unwrap();
@@ -8974,17 +9054,22 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
         FILTER_DRAIN_FAILS.store(drain_fails, Release);
         FILTER_PAUSE_AT.store(stage, Release);
         let stop = Arc::new(AtomicBool::new(false));
+        // Every create any worker made (review MED-3: the premise that the held window saw one).
+        let creates = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let workers: Vec<_> = (0..4)
             .map(|k| {
-                let (db, stop) = (db.clone(), stop.clone());
+                let (db, stop, creates) = (db.clone(), stop.clone(), creates.clone());
                 std::thread::spawn(move || {
                     let conn = db.connect().unwrap();
                     let mut made = Vec::new();
                     let mut i = 0u32;
-                    while !stop.load(Acquire) && i < 4000 {
+                    // Uncapped while a stage is held (the cap ended the window early, review MED-3);
+                    // `stop` ends it.
+                    while !stop.load(Acquire) && i < 40_000 {
                         let name = format!("s{stage}-t{k}-{i}");
                         conn.create_branch(&name).unwrap();
                         made.push(name);
+                        creates.fetch_add(1, Release);
                         i += 1;
                     }
                     made
@@ -8993,11 +9078,19 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
             .collect();
         let t = std::time::Instant::now();
         while FILTER_PAUSED.load(Acquire) != stage {
-            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no growth reached the stage");
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no filter thread reached the stage");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // The window is held until at least 16 creates landed in it (not for a fixed time).
+        let at_pause = creates.load(Acquire);
+        let t = std::time::Instant::now();
+        while creates.load(Acquire) < at_pause + 16 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no create ran while the stage was held");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let in_window = creates.load(Acquire) - at_pause;
         FILTER_PAUSE_AT.store(0, Release);
+        assert!(in_window >= 1, "premise: stage {stage}: no create landed while the stage was held");
         std::thread::sleep(std::time::Duration::from_millis(30));
         stop.store(true, Release);
         let made: Vec<String> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
