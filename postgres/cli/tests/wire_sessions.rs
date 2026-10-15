@@ -4141,12 +4141,15 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
         .ok("delete once b left");
 }
 
-/// Inside a block, an error the engine answers by rolling the whole transaction back (an integer
-/// overflow in sum(): a read statement gets no statement savepoint) takes the block's savepoints
-/// with it. A later ROLLBACK TO one of them is refused as PostgreSQL refuses a savepoint that does
-/// not exist (3B001), and the block stays failed until its end; it was XX000 "no such savepoint".
-/// Keeping the work before the savepoint, as PostgreSQL does, is the engine's half (wire review 3
-/// item 10); once it lands this test needs another way to make the engine drop a block.
+/// Inside a block, an error from a statement with no statement savepoint of its own (an integer
+/// overflow in sum(), a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one
+/// ends the failed state, the block carries on, and COMMIT keeps the work done before the
+/// savepoint. Until the engine kept them (wire review 3 item 10, the engine's half) such an error
+/// rolled the whole transaction back, savepoints with it, and this test pinned the server's 3B001
+/// for the vanished savepoint; its expected values moved to PostgreSQL's behaviour, PROVISIONALLY
+/// (ruled c9c821dd8d, P7): a PostgreSQL 18 recording is LOUD-OWED, and if it differs the edit is
+/// reverted. The name is kept from then. The 3B001 arm (Session::run, an aborted block with no
+/// engine transaction) has no test that reaches it now.
 #[test]
 fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     let dir = Scratch::new("discardedsavepoint");
@@ -4160,16 +4163,16 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     a.q("SAVEPOINT s").ok("savepoint");
     let r = a.q("SELECT sum(v) FROM big");
     assert!(r.error.is_some(), "sum did not overflow: {:?}", r.rows);
-    let r = a.q("ROLLBACK TO s");
-    assert_eq!(r.err("rollback to s").code, "3B001");
-    assert_eq!(r.status, b'E', "the block is no longer failed");
-    assert_eq!(a.q("SELECT 1").err("in the failed block").code, "25P02");
+    let r = a.q("ROLLBACK TO s").ok("rollback to s");
+    assert_eq!(r.status, b'T', "the block is still failed");
+    assert_eq!(a.q("SELECT 1").single("in the block"), "1");
     let r = a.q("COMMIT").ok("the block's end");
-    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
     assert_eq!(r.status, b'I');
     assert_eq!(
         a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
-        "0"
+        "1",
+        "the work before the savepoint was kept"
     );
 }
 
