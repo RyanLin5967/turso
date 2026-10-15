@@ -824,23 +824,44 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
 /// 53300 for 30 s and more). With --max-connections 1 and --authentication-timeout 1, a second
-/// client must log in within 8 s.
+/// client must log in within 8 s. A GUARD, not a discriminating red: on this Mac the base passes it
+/// too (the server's send buffer, autotuned to 4 MiB, took every 'N' before the read deadline;
+/// raws c37-h1-red*). The write deadline itself is pinned in process by
+/// a_startup_write_to_a_client_that_never_reads_ends_at_the_deadline.
 #[test]
 fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
     let dir = Scratch::new("sslflood");
     let server = Server::start(&dir.db(), &["--max-connections", "1", "--authentication-timeout", "1"]);
-    let flood = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
-    unsafe {
-        use std::os::fd::AsRawFd;
+    // The receive buffer is set small BEFORE the connect, so the window the server can fill stays small
+    // (set after the connect, the server's 'N' bytes went on being taken and the flood never blocked it).
+    let flood = unsafe {
+        use std::os::fd::FromRawFd;
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
         let small: libc::c_int = 4096;
         libc::setsockopt(
-            flood.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             &small as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-    }
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = server.port.to_be();
+        addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        #[cfg(target_os = "macos")]
+        {
+            addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        let rc = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        assert_eq!(rc, 0, "connect");
+        TcpStream::from_raw_fd(fd)
+    };
     flood.set_nonblocking(true).unwrap();
     let mut ssl = Vec::new();
     for _ in 0..512 {
@@ -853,7 +874,7 @@ fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
         match f.write(&ssl) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10))
+                std::thread::sleep(Duration::from_millis(1))
             }
             Err(_) => break, // the server closed it: the refusal this test wants
         }
@@ -890,8 +911,9 @@ fn a_second_ssl_request_is_refused_as_postgresql_refuses_it() {
     assert_eq!(&b, b"N", "the first SSLRequest");
     s.write_all(&ssl).unwrap();
     let mut head = [0u8; 5];
-    s.read_exact(&mut head).unwrap();
-    assert_eq!(head[0], b'E', "the second SSLRequest's answer: {head:?}");
+    s.read_exact(&mut head[..1]).unwrap();
+    assert_eq!(head[0], b'E', "the second SSLRequest's answer: {:?}", head[0] as char);
+    s.read_exact(&mut head[1..]).unwrap();
     let len = i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize - 4;
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).unwrap();

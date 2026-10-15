@@ -5680,6 +5680,39 @@ mod tests {
         assert!(over.is_empty(), "over the budget: {over:#?}");
     }
 
+    /// The startup deadline bounds a session's WRITES as well as its reads (C37 H1): a client that
+    /// never reads, so that the server's replies fill its window, cannot hold the session thread
+    /// in a blocking write past the deadline. Here 64 MiB go to a peer that never reads, through
+    /// BlockingTcp with a 300 ms deadline: the write must fail as timed out within 5 s (it blocked
+    /// for good).
+    #[test]
+    fn a_startup_write_to_a_client_that_never_reads_ends_at_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut io = pgwire::tokio::server::BlockingTcp {
+                socket: server_side,
+                deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(300)),
+                timed_out: false,
+            };
+            let big = vec![b'N'; 64 << 20];
+            let r = futures::executor::block_on(tokio::io::AsyncWriteExt::write_all(&mut io, &big));
+            let _ = tx.send((r.map_err(|e| e.kind()), io.timed_out));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(client);
+        match got {
+            Ok((Err(kind), timed_out)) => {
+                assert_eq!(kind, std::io::ErrorKind::TimedOut, "the write's error");
+                assert!(timed_out, "timed_out is set");
+            }
+            Ok((Ok(()), _)) => panic!("64 MiB were written to a peer that never reads"),
+            Err(_) => panic!("the write to a peer that never reads still blocks 5 s after a 300 ms deadline"),
+        }
+    }
+
     /// L5's allocation budget for a write over the simple protocol (the cycle's write step,
     /// budget.py work): an UPDATE allocates, beyond the engine's own prepare and run of the same
     /// statement on the session's connection, no more than the empty query does. At 4f28b42c6 it
