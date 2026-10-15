@@ -1248,8 +1248,11 @@ fn emit_check_for_user_provided_rowid(
                     target_pc: ctx.loop_labels.row_done,
                 });
             } else {
-                // REPLACE has no default to substitute for a rowid alias, so it aborts too, as
-                // emit_notnulls does for a column without a DEFAULT.
+                // REPLACE aborts too, even for a serial key, whose column HAS a DEFAULT
+                // (nextval): a rowid alias's value is the row's key, and this check substitutes
+                // nothing for it (engine review 20 LOW 26 corrected "has no default"). UPDATE OR
+                // REPLACE goes through emit_notnull_constraint_check instead, which substitutes a
+                // column's DEFAULT; PostgreSQL SQL reaches neither (it has no OR REPLACE).
                 program.emit_insn(Insn::HaltIfNull {
                     target_reg: insertion.key_register(),
                     err_code: SQLITE_CONSTRAINT_NOTNULL,

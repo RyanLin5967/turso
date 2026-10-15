@@ -106,8 +106,15 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// were acknowledged in, no weaker and no stronger. One bump for every tag change since 12: a 13
 /// or 14 log carried two tag sets (with and without the ordered tags), and a build reading the
 /// other set cut an ordered last flight as torn. Refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 15;
-const SPLICE_FORMAT_VERSION: u32 = 16;
+///
+/// 17 and 18 (lead order 1, 2026-10-15T07:29:43Z, after 1f70dde48): a snapshot store's background
+/// compaction installs its snapshot over a log it then cuts, so a crash between the two leaves an
+/// OLDER log whose records past the marker of the snapshot's generation only the older-log replay
+/// keeps (`scan_base`). A 15 or 16 reader resets that log and loses them, so the layout, unchanged,
+/// takes a new number that reader refuses; this build refuses a 15 or 16 store in turn, never
+/// reinterprets it (red `a_store_needing_the_older_log_replay_is_refused_by_an_older_format`).
+const FORMAT_VERSION: u32 = 17;
+const SPLICE_FORMAT_VERSION: u32 = 18;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -339,7 +346,9 @@ pub(crate) enum Record {
     ForkNamed {
         child: u64,
         parent: u64,
-        name: String,
+        /// Shared with the name index (`NameIndex::map`), so a named create allocates its name once
+        /// under the store mutex (budget create_allocates_at_most_once_under_the_store_mutex).
+        name: Arc<str>,
     },
     /// A branch commit: every dirty page and the fresh slot it was written to.
     Commit {
@@ -519,7 +528,7 @@ impl Record {
                 let child = r.u64()?;
                 let parent = r.u64()?;
                 let len = r.u32()? as usize;
-                let name = String::from_utf8(r.take(len)?.to_vec()).ok()?;
+                let name: Arc<str> = Arc::from(std::str::from_utf8(r.take(len)?).ok()?);
                 Record::ForkNamed {
                     child,
                     parent,
@@ -997,10 +1006,10 @@ impl Scanned {
                     );
                     // The arena truncation clause (engine review 7 #1): when the class recovery
                     // decided syncs, the log is truncated IN PLACE at the first dropped or invalid
-                    // record and that is made durable — its directory synced in Fsync, then a full
-                    // sync of the log, whose device drain covers both (engine review 16 LOW 11;
-                    // review 20 LOW 15: in FullFsync whatever the decided class, so a D0 open of a
-                    // D1 log's torn tail pays one F_FULLFSYNC) — before anything is appended. The kept flights keep their bytes,
+                    // record and that is made durable — its directory synced in Fsync, then the
+                    // log in the decided class (engine review 16 LOW 11; lead ruling c32fad57d5
+                    // reverses review 20 LOW 15's FullFsync whatever the class: a D1 log's cut paid
+                    // an F_FULLFSYNC D1 never promised) — before anything is appended. The kept flights keep their bytes,
                     // nonce and tags, and the old bytes can never come back. Only a log nothing ever
                     // synced (the decided class does not sync) becomes a NEW incarnation instead (a
                     // fresh nonce; review 5 #7): its truncation would never reach the disk, so
@@ -1018,10 +1027,11 @@ impl Scanned {
                     if in_place {
                         set_file_len(&journal.file, whole as u64)?;
                         if class.syncs() {
-                            // The directory first, in Fsync: the log's full sync after it drains
-                            // the device, both writes included (engine review 16 LOW 11).
+                            // The directory first, in Fsync, then the log in the decided class: in
+                            // FullFsync its drain covers both writes (engine review 16 LOW 11); in
+                            // Fsync neither drains, as D1 promises (lead ruling c32fad57d5).
                             fsync_dir_of(&files.log, torn_cut_dir_class())?;
-                            fsync_file(&journal.file, SyncClass::FullFsync)?;
+                            fsync_file(&journal.file, torn_cut_log_class(class))?;
                             journal.prev_synced = true;
                         }
                     } else {
@@ -1170,6 +1180,21 @@ pub(crate) struct Journal {
     fail_next_take: bool,
     /// See [`Journal::fail_next_confirm`].
     fail_next_confirm: bool,
+    /// One duplicate of `file` that every flight and confirmation of this incarnation shares
+    /// (`Journal::shared_log`): made once, dropped when `file` is replaced, so taking a flight
+    /// under the store mutex issues no dup(2) (budget create_issues_no_syscall_under_the_store_mutex).
+    shared: Option<Arc<File>>,
+    /// A flight's frame buffer, handed back by the flight once written (`Flight`'s drop) and
+    /// taken as the next `pending` by `take_flight`, so buffering a record and taking a flight
+    /// allocate nothing under the store mutex in steady state (budget
+    /// create_allocates_at_most_once_under_the_store_mutex).
+    recycled: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// The handles a cut retires (the old log, its shared duplicate, the cut's source), closed by
+    /// whoever takes them (`take_retired`) once it holds no lock: a close is a syscall, and a cut
+    /// finishes under the store mutex (checkpoint FIX, budget
+    /// a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex). A later cut closes any left
+    /// untaken, so they never pile up.
+    retired: Option<Retired>,
     /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
     /// run off the store mutex (`prepare_cut`, through its `CutSource`).
     fail_next_replacement_sync: AtomicBool,
@@ -1248,6 +1273,13 @@ pub(crate) struct CutSource {
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
 /// the header and the kept records `[from, upto)` of the old one as one flight, synced; locked.
+/// File handles a cut retired, closed when this is dropped (`Journal::take_retired`).
+pub(crate) struct Retired {
+    _old: Option<File>,
+    _shared: Option<Arc<File>>,
+    _source: Option<File>,
+}
+
 pub(crate) struct CutPrep {
     file: File,
     from: u64,
@@ -1304,7 +1336,7 @@ pub(crate) struct BgCompaction {
     /// from.
     from: u64,
     class: SyncClass,
-    arena: Option<File>,
+    arena: Option<Arc<File>>,
     snap: PathBuf,
     snap_tmp: PathBuf,
     log_tmp: PathBuf,
@@ -1441,6 +1473,9 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            shared: None,
+            recycled: Arc::new(std::sync::Mutex::new(None)),
+            retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
@@ -1645,6 +1680,9 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            shared: None,
+            recycled: Arc::new(std::sync::Mutex::new(None)),
+            retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
@@ -1916,6 +1954,21 @@ impl Journal {
         self.fail_next_write = true;
     }
 
+    /// The handles the last cut retired (`retired`), for the caller to close holding no lock.
+    pub(crate) fn take_retired(&mut self) -> Option<Retired> {
+        self.retired.take()
+    }
+
+    /// The incarnation's shared duplicate of the log (`shared`), made on first use.
+    fn shared_log(&mut self) -> Result<Arc<File>> {
+        if let Some(log) = &self.shared {
+            return Ok(log.clone());
+        }
+        let log = Arc::new(self.file.try_clone().map_err(|e| io_error(e, "dup branch log"))?);
+        self.shared = Some(log.clone());
+        Ok(log)
+    }
+
     /// Fail the confirmation word of the next flight as an I/O error would (the
     /// `ConfirmWriteFails` failpoint; review 6 #1).
     pub(crate) fn fail_next_confirm(&mut self) {
@@ -2029,6 +2082,7 @@ impl Journal {
         }
         // From here the new file is the log.
         self.file = f;
+        self.shared = None;
         self.rewrites += 1;
         // A rewrite ends any back-off. Mutant `no_backoff_reset` (test builds only; engine review 8
         // #3): it keeps it, measured in the old log's length.
@@ -2152,6 +2206,7 @@ impl Journal {
         }
         let class = self.rewrite_class();
         let mut synced = prep.synced;
+        let mut synced_in_class = false;
         let mut len = LOG_HEADER_LEN as u64 + prep.written;
         // A raise since the prep (review 5 #11) reaches the new header; one always comes with a
         // flight's frames, so the delta's sync below covers it. Mutant `cut_drops_raise` (test
@@ -2172,18 +2227,34 @@ impl Journal {
                 let syncs = delta_claims_sync(&delta, self.nonce, prep.nonce, class)?;
                 if syncs {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
+                    synced_in_class = true;
                 }
                 synced &= syncs;
                 len += frames.len() as u64;
             }
+        }
+        // Codex C25 HIGH 2: the prep and its catch-ups synced the temp log in the prep's class; a
+        // flight raised since (FullFsync over a Fsync prep) may have been copied by a catch-up, with
+        // no delta left here to sync it. Kept bytes acknowledged in a stronger class are synced in
+        // it before the rename, after the raised header above. Mutant `cut_keeps_prep_class`
+        // (test builds only): not synced, as before.
+        if class.syncs() && class > prep.class && !synced_in_class && !super::store::fe_mutant("cut_keeps_prep_class") {
+            sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
         }
         if let Err(e) = rename_file(&prep.tmp, &self.files.log) {
             let _ = std::fs::remove_file(&prep.tmp);
             return Err(io_error(e, "rename branch log rewrite"));
         }
         super::store::kill_point("cut.renamed");
-        // From here the new file is the log.
-        self.file = prep.file;
+        // From here the new file is the log. The old handles are retired, not closed here (mutant
+        // `cut_closes_under_mutex`, test builds only: closed here, as before).
+        let old = std::mem::replace(&mut self.file, prep.file);
+        let retired = Retired { _old: Some(old), _shared: self.shared.take(), _source: Some(prep.source) };
+        if super::store::fe_mutant("cut_closes_under_mutex") {
+            drop(retired);
+        } else {
+            drop(self.retired.replace(retired));
+        }
         self.rewrites += 1;
         // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
         if !super::store::fe_mutant("no_backoff_reset") {
@@ -2313,13 +2384,25 @@ impl Journal {
         super::store::kill_point("compact.bg_renamed");
         self.generation = bg.generation;
         self.snapshot_len = bg.out.len() as u64;
-        self.snap_dirty = false;
+        // A D0 compaction's snapshot was written, not synced: the next flight that syncs syncs it
+        // (`snap_dirty`), as after an inline D0 compaction (engine review 19 MED 7).
+        self.snap_dirty = !bg.class.syncs();
         self.dir_dirty = true;
         Ok(true)
     }
 
     /// A background compaction's cut source (`cut_source`), prepared into its own temp log.
     pub(crate) fn bg_cut_source(&self, bg: &BgCompaction) -> Result<Option<CutSource>> {
+        // Codex C25 HIGH 1: only over the log this compaction installed its snapshot over. The
+        // store mutex is released between the install and this call, and an inline compaction
+        // there replaces the log (a new generation, nonce and rewrite count): the capture's offset
+        // then names a byte of ANOTHER incarnation, and the cut would install the older generation
+        // over a newer one, losing what was flushed in between. Mutant `bg_cut_identity_unchecked`
+        // (test builds only): not checked, as before.
+        let same = self.generation == bg.generation && self.rewrites == bg.rewrites && self.nonce == bg.nonce;
+        if !same && !super::store::fe_mutant("bg_cut_identity_unchecked") {
+            return Ok(None);
+        }
         Ok(self.cut_source(bg.from)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
     }
 
@@ -2431,12 +2514,29 @@ impl Journal {
     /// Queue a record. It reaches the file only through [`Journal::flush`].
     pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
         self.check_live()?;
-        let mut payload = Vec::with_capacity(32);
-        record.encode(&mut payload);
-        put_u32(&mut self.pending, payload.len() as u32);
-        put_u32(&mut self.pending, crc32c::crc32c(&payload));
-        self.pending.extend_from_slice(&payload);
-        self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
+        // Encoded in place after its frame header, which is filled in once the payload's length and
+        // checksum are known; room for the flight's end frame is kept, so `take_flight` need not
+        // reallocate. Mutant `record_encoded_aside` (test builds only): through a Vec of its own,
+        // as before.
+        let at = self.pending.len();
+        if super::store::fe_mutant("record_encoded_aside") {
+            let mut payload = Vec::with_capacity(32);
+            record.encode(&mut payload);
+            put_u32(&mut self.pending, payload.len() as u32);
+            put_u32(&mut self.pending, crc32c::crc32c(&payload));
+            self.pending.extend_from_slice(&payload);
+        } else {
+            self.pending.extend_from_slice(&[0u8; FRAME_HEADER_LEN]);
+            record.encode(&mut self.pending);
+            let body = at + FRAME_HEADER_LEN;
+            let len = (self.pending.len() - body) as u32;
+            let crc = crc32c::crc32c(&self.pending[body..]);
+            self.pending[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            self.pending[at + 4..body].copy_from_slice(&crc.to_le_bytes());
+            self.pending.reserve(END_FRAME_LEN);
+        }
+        let payload_len = self.pending.len() - at - FRAME_HEADER_LEN;
+        self.lsn += (FRAME_HEADER_LEN + payload_len) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
             Record::Commit { pages, .. } => self.pending_slots.extend(pages.iter().map(|p| p.1)),
@@ -2610,6 +2710,7 @@ impl Journal {
         if self.pending.is_empty() && !upgrade {
             return Ok(Flight {
                 log: None,
+                recycle: None,
                 arena: None,
                 bytes: Vec::new(),
                 at: self.len,
@@ -2630,22 +2731,27 @@ impl Journal {
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
         // applied in memory and will never be durable, so nothing may be written after them.
         let fail_take = std::mem::take(&mut self.fail_next_take);
-        let taken = (|| -> Result<(File, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<Arc<File>>)> {
             if fail_take {
                 return Err(LimboError::InternalError(
                     "failpoint: the flight's log descriptor could not be duplicated".to_string(),
                 ));
             }
-            let on_disk = file_len(&self.file)?;
-            if on_disk != self.len {
-                return Err(corrupt(
-                    "the branch log changed under this journal; another store instance wrote it",
-                ));
-            }
-            let log = self
-                .file
-                .try_clone()
-                .map_err(|e| io_error(e, "dup branch log"))?;
+            // The log's length is checked by the flight's write, holding no lock (review R8's
+            // guard; flights are taken one at a time, each once the last landed, so the file then
+            // ends at the flight's `at`). Mutant `flight_take_stats_and_dups` (test builds only):
+            // checked and duplicated here, under the store mutex, as before.
+            let log = if super::store::fe_mutant("flight_take_stats_and_dups") {
+                let on_disk = file_len(&self.file)?;
+                if on_disk != self.len {
+                    return Err(corrupt(
+                        "the branch log changed under this journal; another store instance wrote it",
+                    ));
+                }
+                Arc::new(self.file.try_clone().map_err(|e| io_error(e, "dup branch log"))?)
+            } else {
+                self.shared_log()?
+            };
             // A flight that syncs nothing (D0) leaves the arena's mark set, so a later flight in a
             // syncing class (an upgrade) still syncs the slots these frames name.
             let arena = if class.syncs() {
@@ -2680,7 +2786,12 @@ impl Journal {
         };
         self.note_class(class);
         let header = self.take_header_patch();
-        let mut bytes = std::mem::take(&mut self.pending);
+        let next = if super::store::fe_mutant("flight_buffer_not_recycled") {
+            None
+        } else {
+            self.recycled.lock().ok().and_then(|mut slot| slot.take())
+        };
+        let mut bytes = std::mem::replace(&mut self.pending, next.unwrap_or_default());
         let names_slots = !self.pending_slots.is_empty();
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
@@ -2699,6 +2810,7 @@ impl Journal {
         self.len += bytes.len() as u64;
         Ok(Flight {
             log: Some(log),
+            recycle: Some(self.recycled.clone()),
             arena,
             bytes,
             at,
@@ -2761,17 +2873,14 @@ impl Journal {
     pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass, end_lsn: u64) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
-        let taken = (|| -> Result<(File, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<Arc<File>>)> {
             let on_disk = file_len(&self.file)?;
             if on_disk != self.len {
                 return Err(corrupt(
                     "the branch log changed under this journal; another store instance wrote it",
                 ));
             }
-            let log = self
-                .file
-                .try_clone()
-                .map_err(|e| io_error(e, "dup branch log"))?;
+            let log = self.shared_log()?;
             let arena = if arena.is_dirty() { arena.sync_handle()? } else { None };
             Ok((log, arena))
         })();
@@ -3072,6 +3181,7 @@ impl Journal {
                 return Err(io_error(e, "rename branch log reset"));
             }
             self.file = f;
+            self.shared = None;
             if class.syncs() {
                 fsync_dir_of(&self.files.log, class)?;
             }
@@ -3174,7 +3284,7 @@ fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32
 /// acknowledgement window. The log may since have been replaced by a cut: the word then goes to
 /// the old file, which no recovery reads, and matches nothing in the new one.
 pub(crate) struct Confirm {
-    log: File,
+    log: Arc<File>,
     word: u32,
     /// The journal's `lsn` at the end of the flight it confirms: a confirmation of a later flight
     /// supersedes it (`supersedes`).
@@ -3188,7 +3298,7 @@ pub(crate) struct Confirm {
 
 /// The confirmation of a flight whose frames, its end frame last, are `bytes`, written at `at`
 /// (review 6 #1): bound to its end frame's checksum and to where it ends, the flight ending at `lsn`.
-fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
+fn flight_confirm(log: Arc<File>, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
     let crc = end_frame_crc(bytes[bytes.len() - END_FRAME_LEN..].try_into().unwrap());
     Confirm {
         word: confirm_word(crc, at + bytes.len() as u64),
@@ -3204,7 +3314,7 @@ fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail
 /// from `log`, which ends at `at`, where that flight's end frame ends (its checksum is the log's
 /// last 4 bytes, as `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log
 /// holds no flight, or the read fails: the word's absence proves nothing.
-fn confirm_last(log: File, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
+fn confirm_last(log: Arc<File>, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
     if at < (LOG_HEADER_LEN + END_FRAME_LEN) as u64 {
         return None;
     }
@@ -3248,7 +3358,7 @@ impl Confirm {
     #[cfg(test)]
     pub(crate) fn for_test(log: File, proved: bool) -> Self {
         Self {
-            log,
+            log: Arc::new(log),
             word: 0,
             lsn: 0,
             proved,
@@ -3418,8 +3528,10 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
 /// by [`Flight::write`] with no lock held; the journal already counts the region as written, so a
 /// failed write must fail-stop it.
 pub(crate) struct Flight {
-    log: Option<File>,
-    arena: Option<File>,
+    log: Option<Arc<File>>,
+    /// Where the frame buffer goes back once the flight is done with it (`Journal::recycled`).
+    recycle: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
+    arena: Option<Arc<File>>,
     bytes: Vec<u8>,
     at: u64,
     pub(crate) class: SyncClass,
@@ -3453,6 +3565,21 @@ pub(crate) struct Flight {
     empty_end: bool,
 }
 
+impl Drop for Flight {
+    /// The frame buffer goes back to its journal, emptied, for the next flight to buffer into.
+    fn drop(&mut self) {
+        if let Some(slot) = self.recycle.take() {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            bytes.clear();
+            if let Ok(mut slot) = slot.lock() {
+                if slot.is_none() {
+                    *slot = Some(bytes);
+                }
+            }
+        }
+    }
+}
+
 impl Flight {
     /// Arena first, then the frames, then the log: the order `Journal::flush` keeps. Returns the
     /// flight's confirmation (`Confirm`) when its sync returned, for the store to write once the log
@@ -3470,9 +3597,17 @@ impl Flight {
                 "failpoint: a branch log write failed".to_string(),
             ));
         }
-        let Some(log) = self.log else {
+        let Some(log) = self.log.take() else {
             return Ok(None);
         };
+        // Review R8's guard, holding no lock (it ran at the take, under the store mutex, before):
+        // flights are taken one at a time, each once the last landed, so the log ends where this
+        // one writes, unless another store instance wrote it.
+        if !super::store::fe_mutant("flight_take_stats_and_dups") && file_len(&log)? != self.at {
+            return Err(corrupt(
+                "the branch log changed under this journal; another store instance wrote it",
+            ));
+        }
         // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
         // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
         let syncs = self.class.syncs() && !super::store::fe_mutant("no_flight_sync");
@@ -3607,8 +3742,8 @@ impl Flight {
 /// through a handle of its own, synced by `Upgrade::sync` holding no lock. It writes no frame and
 /// holds no flight slot, unless `exclusive`.
 pub(crate) struct Upgrade {
-    log: File,
-    arena: Option<File>,
+    log: Arc<File>,
+    arena: Option<Arc<File>>,
     dir: Option<File>,
     /// A D0 compaction's snapshot (`Journal::snap_dirty`, left set; engine review 19 MED 7).
     snap: Option<File>,
@@ -4043,6 +4178,8 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
         " (written before per-flight writer evidence; recreate the branch files)".to_string()
     } else if version < 15 {
         " (written before per-flight sync-class tags; recreate the branch files)".to_string()
+    } else if version < 17 {
+        " (written before the older-log replay of a background compaction; recreate the branch files)".to_string()
     } else {
         String::new()
     }
@@ -4540,10 +4677,17 @@ thread_local! {
     pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
 }
 
-/// The class an open syncs the log's directory in, before the log itself (engine review 16 LOW
-/// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
-/// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
-/// class, as before (two device flushes per syncing open).
+/// The class an open's in-place torn-tail cut syncs the log in: the class recovery decided (lead
+/// ruling c32fad57d5). Mutant `torn_cut_log_sync_full` (test builds only): FullFsync whatever the
+/// class, as before (one extra device flush per D1 cut).
+fn torn_cut_log_class(decided: SyncClass) -> SyncClass {
+    if super::store::fe_mutant("torn_cut_log_sync_full") {
+        SyncClass::FullFsync
+    } else {
+        decided
+    }
+}
+
 /// The class an open's in-place torn-tail cut syncs its directory in: Fsync, the log's F_FULLFSYNC
 /// after it draining the device (engine review 16 LOW 11). Its own mutant (engine review 20 LOW 14:
 /// `open_dir_sync_in_class` was killed by the whole-log arm alone): `torn_cut_dir_sync_in_class`
@@ -4556,6 +4700,10 @@ fn torn_cut_dir_class() -> SyncClass {
     }
 }
 
+/// The class an open syncs the log's directory in, before the log itself (engine review 16 LOW
+/// 11): Fsync, since the log's sync after it, in the open's class, drains the device, as
+/// `Flight::write` orders them. Mutant `open_dir_sync_in_class` (test builds only): the open's
+/// class, as before (two device flushes per syncing open).
 fn open_dir_class(class: SyncClass) -> SyncClass {
     if super::store::fe_mutant("open_dir_sync_in_class") {
         class
@@ -5277,6 +5425,98 @@ mod tests {
                 Record::Release { branch: 1 }
             ]
         );
+    }
+
+    // Codex C25 (artie frontier/codex/reports/C25.md, raw C25-journal-probes.txt 93f203ac6c), HIGH 1
+    // and HIGH 2: its two journal-level reproductions, adopted as this lane's reds (names and claim
+    // texts made the lane's; the schedules unchanged). HIGH 1: a background compaction's cut, taken
+    // after an inline compaction replaced the log, applied the old capture's offset to the new
+    // incarnation and installed the older generation over it: the fork flushed in between was lost.
+    // HIGH 2: a cut's catch-up copied a flight raised to FullFsync and synced it only in the prep's
+    // Fsync, and the install added no stronger sync.
+    #[test]
+    fn a_stale_background_cut_keeps_a_fork_flushed_after_an_inline_compaction() {
+        for stale_cut in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+                let mut arena = Arena::new(512);
+                let bg = journal.begin_bg_compaction(&SnapshotState::default(), &arena).unwrap();
+                journal.flush(&mut arena).unwrap();
+                bg.sync_snapshot().unwrap();
+                assert!(journal.install_bg_snapshot(&bg).unwrap());
+                // The background worker is between snapshot installation and taking its cut source.
+                journal.compact(&SnapshotState::default(), &mut arena, false).unwrap();
+                assert_eq!(journal.generation, 2);
+                // Clock and Checkpoint have equal frame lengths: bg.from is a valid boundary in
+                // this NEW log, while referring to a different incarnation and snapshot.
+                journal.buffer(&Record::Clock { now_ms: 1 }).unwrap();
+                assert_eq!(journal.mark(), bg.from());
+                journal.buffer(&Record::Fork { child: 7, parent: 0 }).unwrap();
+                journal.flush(&mut arena).unwrap();
+                bg.sync_dir().unwrap();
+                // FLAGGED-ACCEPTED (DECISIONS 6c069f4a5e): the fix refuses the stale source, so the
+                // cut is taken only when it is offered; the outcome assertion below is unchanged.
+                if stale_cut {
+                    if let Some(src) = journal.bg_cut_source(&bg).unwrap() {
+                        let prep = Journal::prepare_cut(src, bg.from(), bg.generation()).unwrap();
+                        assert!(journal.cut_usable(&prep, bg.from(), bg.generation()));
+                        journal.finish_cut(prep, bg.from(), bg.generation()).unwrap();
+                    }
+                }
+                bg.discard();
+            }
+            let recovered = Journal::recover(&files, SyncClass::Fsync).unwrap().unwrap();
+            let forks: Vec<_> = recovered.records.iter().filter_map(|r| match r {
+                Record::Fork { child, .. } => Some(*child), _ => None,
+            }).collect();
+            eprintln!("stale_cut={stale_cut}: recovered forks={forks:?}");
+            assert_eq!(forks, vec![7], "CLAIM: stale_cut={stale_cut}: an acknowledged fork flushed after an inline compaction was lost to a stale background cut");
+        }
+    }
+
+    #[test]
+    fn a_cut_catch_up_keeps_a_raised_flights_sync_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+        let mut arena = Arena::new(512);
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        let from = journal.len;
+        let src = journal.cut_source(from).unwrap().unwrap();
+        let mut prep = Journal::prepare_cut(src, from, 1).unwrap();
+        journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        journal.raise_pending_class(SyncClass::FullFsync);
+        journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        assert_eq!(journal.rewrite_class(), SyncClass::FullFsync);
+        let before = CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+        Journal::extend_cut(&mut prep, journal.len, false).unwrap();
+        journal.finish_cut(prep, from, 1).unwrap();
+        let after = CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+        eprintln!("replacement syncs: Fsync={}, FullFsync={}", after[0]-before[0], after[1]-before[1]);
+        assert!(after[1] > before[1], "CLAIM: a FullFsync flight was replaced using only the old Fsync class");
+    }
+
+    /// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex): buffering a record
+    /// into a `pending` buffer with room allocates nothing, since the record is encoded in place
+    /// (adbf8b607). Counted with the test allocator (`budget_probe::thread_allocs`, exact per
+    /// thread), one Fork and one named fork. Mutant `record_encoded_aside` (a Vec of its own, as
+    /// before): one allocation each.
+    #[test]
+    fn buffering_a_record_into_room_allocates_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        journal.pending.reserve(4096);
+        let named = Record::ForkNamed { child: 2, parent: 0, name: Arc::from("room") };
+        for record in [Record::Fork { child: 1, parent: 0 }, named] {
+            let before = super::super::budget_probe::thread_allocs().0;
+            journal.buffer(&record).unwrap();
+            let allocs = super::super::budget_probe::thread_allocs().0 - before;
+            assert_eq!(allocs, 0, "CLAIM: buffering {record:?} into room allocated {allocs} times");
+        }
     }
 
     /// R7 made a snapshot field mean deadline + 1. A log or snapshot of another format version
@@ -6102,35 +6342,40 @@ mod format_tests {
     #[test]
     fn a_synced_log_cut_at_a_d0_recovery_is_truncated_in_place_and_made_durable() {
         use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::TempDir::new().unwrap();
-        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
-        // A hole in the last flight: it was never acknowledged, and is cut.
-        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
-        let inode = std::fs::metadata(&files.log).unwrap().ino();
-        // FLAGGED TEST EDIT (engine review 20 LOW 14's expectation; for the lead's ruling): the cut is
-        // made durable by a directory sync in Fsync and then a FullFsync of the log, whose device
-        // drain covers both (engine review 16 LOW 11, accepted: one flush, not two). The old
-        // assertion, at least 2 F_FULLFSYNCs, was red since that change (artie raws l1-branch*,
-        // "1 full syncs") and held only under mutant open_dir_sync_in_class. Counted by class
-        // requested (CLASS_SYNCS) and directory (DIR_SYNCS), so it holds off Apple too.
-        let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
-        let dirs = || DIR_SYNCS.with(|c| c.get());
-        let ((fsyncs, fulls), dir) = (classes(), dirs());
-        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
-        let ((fsyncs_after, fulls_after), dir_after) = (classes(), dirs());
-        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
-        drop(recovered);
-        let meta = std::fs::metadata(&files.log).unwrap();
-        assert_eq!(meta.ino(), inode, "the cut replaced the log instead of truncating it");
-        assert_eq!(meta.len(), starts[2], "the log was not truncated at the first dropped record");
-        assert_eq!(
-            (fulls_after - fulls, fsyncs_after - fsyncs, dir_after - dir),
-            (1, 1, 1),
-            "the cut was not made durable (one FullFsync of the log after one Fsync of its directory) \
-             before the next append: (FullFsync, Fsync, directory) syncs"
-        );
-        assert_eq!(end_tags(&files), (true, false), "the cut retagged synced flights as unsynced");
+        // FLAGGED TEST EDIT, a spec change re-derived per class (lead ruling c32fad57d5, citing review
+        // 16 LOW 11 and D1's promise, both accepted; it supersedes review 7 #1's "F_FULLFSYNC of the
+        // log and of its directory" for a Fsync-class cut, and 7b76b222f's (1, 1, 1) for every
+        // class): the directory is synced in Fsync, then the log in the class recovery decided. A
+        // D1 log's cut: (FullFsync, Fsync, directory) = (0, 2, 1), no device flush, as D1 promises
+        // only fsync(2); a D2 log's: (1, 1, 1), the log's F_FULLFSYNC draining the device, the
+        // directory's write included. Counted by class requested (CLASS_SYNCS) and directory
+        // (DIR_SYNCS), so it holds off Apple too. Mutants `torn_cut_log_sync_full` (the log always in
+        // FullFsync, as before: the D1 arm reads (1, 1, 1)) and `torn_cut_dir_sync_in_class`.
+        for (class, want) in [(SyncClass::Fsync, (0, 2, 1)), (SyncClass::FullFsync, (1, 1, 1))] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let starts = flights(&files, 0, &[1, 1, 1], class);
+            // A hole in the last flight: it was never acknowledged, and is cut.
+            overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+            let inode = std::fs::metadata(&files.log).unwrap().ino();
+            let classes = || CLASS_SYNCS.with(|c| (c[0].get(), c[1].get()));
+            let dirs = || DIR_SYNCS.with(|c| c.get());
+            let ((fsyncs, fulls), dir) = (classes(), dirs());
+            let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+            let ((fsyncs_after, fulls_after), dir_after) = (classes(), dirs());
+            assert_eq!(forks(&recovered.records), vec![1, 11], "{class:?}: premise: the torn last flight was cut");
+            drop(recovered);
+            let meta = std::fs::metadata(&files.log).unwrap();
+            assert_eq!(meta.ino(), inode, "{class:?}: the cut replaced the log instead of truncating it");
+            assert_eq!(meta.len(), starts[2], "{class:?}: the log was not truncated at the first dropped record");
+            assert_eq!(
+                (fulls_after - fulls, fsyncs_after - fsyncs, dir_after - dir),
+                want,
+                "{class:?}: the cut was not made durable in its decided class (the directory in Fsync, then \
+                 the log in {class:?}) before the next append: (FullFsync, Fsync, directory) syncs"
+            );
+            assert_eq!(end_tags(&files), (true, false), "{class:?}: the cut retagged synced flights as unsynced");
+        }
     }
 
     /// Engine review 7 #1: a log of D0 flights cut at a D2 recovery keeps them tagged unsynced, so

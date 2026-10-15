@@ -2222,7 +2222,7 @@ pub fn translate_expr(
         }
         ast::Expr::Id(id) => {
             // Check for custom type expression overrides (e.g. `value` placeholder)
-            if let Some(&reg) = program.id_register_overrides.get(id.as_str()) {
+            if let Some(reg) = program.id_register_overrides.get(id.as_str()) {
                 program.emit_insn(Insn::Copy {
                     src_reg: reg,
                     dst_reg: target_register,

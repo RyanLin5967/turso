@@ -236,15 +236,17 @@ pub(crate) struct BranchStore {
     /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
     /// own part is on its handle).
     prewarm: PrewarmStats,
-    /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
-    /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
-    flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// The fuzzy checkpoints' persistent worker (`CkptWorker`), started at the first checkpoint
+    /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
+    /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
+    ckpt_worker: Mutex<Option<CkptWorker>>,
+    flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
     confirm_writer: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
-    name_filter_build: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    name_filter_build: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     name_filter_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Test and harness hook (F-FZ): while it holds `HOLD_BEFORE_COMMIT` or `HOLD_AFTER_COMMIT`, a
     /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
@@ -394,9 +396,11 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
-    /// The confirmation the writer last took to write (`Confirm::key`, 0 for none; raised by
-    /// `fetch_max`, as keys order as `supersedes` does): an offer it does not supersede is refused
-    /// (`offer_confirm`; DECISIONS ba515419c3). Atomic, so the write path takes no lock for it.
+    /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
+    /// order as `supersedes` does), only once its write returned (lead ruling f329b0d2a8: it was
+    /// raised as the word was taken, so a failed write counted as done). An offer that supersedes
+    /// neither it nor `GroupState::confirm_taken` is refused (`offer_confirm`; DECISIONS
+    /// ba515419c3). Atomic, so the write path takes no lock for it.
     confirm_done: AtomicU64,
     /// Observation only (review 6 #1): confirmation words written into the log's header, and those
     /// whose write failed; counted without the group's lock (engine review 8 #11).
@@ -428,6 +432,10 @@ pub(crate) struct Group {
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
     confirm_hold: AtomicU8,
+    /// Test builds: the cut offset (`BgCompaction::from`) of the background compaction last held
+    /// at `HOLD_COMPACT_INSTALLED`, so a test can line a later log up with it (Codex C25 HIGH 1).
+    #[cfg(test)]
+    held_cut_from: AtomicU64,
     /// This group, for a branch catalog's own store to forward its catalog's failed syncs to as
     /// they happen (`BranchStore::link_drain_parent`; engine review 21 MED 5). Set by
     /// `Group::shared`.
@@ -499,6 +507,11 @@ pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
 
+/// Test hook stage (`Group::confirm_hold`): the background compaction's snapshot is installed and
+/// its directory synced, its cut not yet taken, and the store mutex free (Codex C25 HIGH 1's window).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
+
 #[derive(Default)]
 struct GroupState {
     /// A flight is being written.
@@ -562,6 +575,10 @@ struct GroupState {
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// The confirmation the writer or the close last took to write (`Confirm::key`, 0 for none):
+    /// an offer of it while its write runs is refused too, or it would be written twice
+    /// (DECISIONS ba515419c3). A taken word is written, or its failure fail-stops the store.
+    confirm_taken: u64,
     /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
     /// settling its capture, from the start of its wait for what the capture covers to the end of
     /// that step (`run_flight`).
@@ -629,6 +646,8 @@ impl Group {
             writer_pid: crate::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            held_cut_from: AtomicU64::new(0),
             me: crate::sync::OnceLock::new(),
             #[cfg(test)]
             confirm_notifies: AtomicU64::new(0),
@@ -810,7 +829,8 @@ impl Group {
         // of the same flight's word, as proved as it was (a held-free upgrade's landing with no
         // flight since; a proved ordered flight upgraded), was queued again once the slot was empty
         // and written a second time. Mutant `reoffer_written_word` (test builds only): queued.
-        if !confirm.supersedes_key(self.confirm_done.load(Ordering::Acquire)) && !fe_mutant("reoffer_written_word") {
+        let floor = self.confirm_done.load(Ordering::Acquire).max(g.confirm_taken);
+        if !confirm.supersedes_key(floor) && !fe_mutant("reoffer_written_word") {
             return Some(confirm);
         }
         // The writer sleeps without a deadline while it holds nothing it may write: woken when that
@@ -980,17 +1000,21 @@ impl Group {
         self.cv.notify_all();
         let left = g.confirm.take().map(|(_, c)| c);
         if let Some(c) = left.as_ref() {
-            self.confirm_done.fetch_max(c.key(), Ordering::AcqRel);
+            g.confirm_taken = g.confirm_taken.max(c.key());
         }
         left
     }
 
-    /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
-    /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
+    /// Write `confirm`'s word, counted, holding no lock. Written, it is recorded done
+    /// (`confirm_done`). A failure FAIL-STOPS the store (lead ruling f329b0d2a8, reversing review
+    /// 6 #1's "a failure changes no flight's outcome"), the rule of a failed WAL sync: the word is
+    /// what lets recovery tell damage from a lost write, and nothing names the one that failed.
+    /// Mutants (test builds only): `confirm_done_at_take`, recorded done before the write, as
+    /// before; `confirm_error_goes_on`, a failure only counted, as review 6 #1 had it.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
-        // The writer and the close record it as they take it, under the group's lock; recorded here
-        // too, for any other caller, with no lock (DECISIONS ba515419c3).
-        self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        if fe_mutant("confirm_done_at_take") {
+            self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        }
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
         // Counted without the group's lock (engine review 8 #11).
         match written {
@@ -999,12 +1023,13 @@ impl Group {
                 if confirm.word_for_test() == self.confirm_last_landed.load(Ordering::Relaxed) {
                     self.confirm_last_landed_writes.fetch_add(1, Ordering::Relaxed);
                 }
+                self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
                 self.confirms_written.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.confirm_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
-                if fe_mutant("confirm_error_fails_flight") {
+                tracing::error!("branch log: a flight's confirmation word was not written; the store fail-stops: {e}");
+                if !fe_mutant("confirm_error_goes_on") {
                     let mut g = self.lock();
                     self.fail(&mut g);
                 }
@@ -1155,7 +1180,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
-        group.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        g.confirm_taken = g.confirm_taken.max(confirm.key());
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
@@ -1368,10 +1393,11 @@ struct StoreMutex {
     /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
     /// as it arrived.
     compacting: AtomicU64,
-    /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
-    /// background compaction's sync under the mutex (an exception counter,
-    /// `BranchStore::exception_counters`). One that arrived in the margins (before the writer
-    /// locked, or after it unlocked) and did not wait is counted too: an overcount, never a miss.
+    /// Lock acquisitions that arrived while `compacting` was odd, or during which it moved:
+    /// operations that waited behind a background compaction's sync under the mutex (an exception
+    /// counter, `BranchStore::exception_counters`). One that arrived in the margins (before the
+    /// writer locked, or after it unlocked) and did not wait is counted too: an overcount, never a
+    /// miss (`StoreMutex::lock`).
     compaction_waits: AtomicU64,
 }
 
@@ -1384,11 +1410,30 @@ impl StoreMutex {
         }
     }
 
+    /// Counted as it arrives when `compacting` is odd (so a waiter shows while it waits), and
+    /// otherwise once it holds the mutex if `compacting` moved meanwhile (Codex C25 MED 1): every
+    /// counted hold adds one as it begins and one as it ends, so a hold that began, and took the
+    /// mutex first, after the precheck read it even leaves a different value by then. Mutant
+    /// `compaction_wait_precheck_only` (test builds only): the precheck alone decides, as before.
     fn lock(&self) -> StoreGuard<'_> {
-        if self.compacting.load(Ordering::Acquire) & 1 == 1 {
+        let before = self.compacting.load(Ordering::Acquire);
+        if before & 1 == 1 {
             self.compaction_waits.fetch_add(1, Ordering::Relaxed);
         }
-        self.lock_uncounted()
+        #[cfg(test)]
+        AFTER_PRECHECK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let guard = self.lock_uncounted();
+        if before & 1 == 0
+            && self.compacting.load(Ordering::Acquire) != before
+            && !fe_mutant("compaction_wait_precheck_only")
+        {
+            self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        guard
     }
 
     /// `lock`, not counted as waiting behind a compaction: the background compaction's own.
@@ -1430,6 +1475,13 @@ impl Drop for StoreGuard<'_> {
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
     static STORE_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (Codex C25 MED 1): run on this thread inside `StoreMutex::lock`, after its
+    /// compaction precheck and before it takes the mutex.
+    static AFTER_PRECHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Syncs of any file (`io::count_sync`, `io::count_barrier`) issued while the issuing thread held a
@@ -1763,7 +1815,7 @@ struct CatState {
     /// Branches whose catalog rows are stale, and which of their rows (`DIRTY_*`): at the next
     /// checkpoint only those are rewritten (fix v3, PREREG A9: a commit rewrites the branch's `cur`
     /// rows and never its `branch` row, so its secondary indexes are not touched).
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     /// Branches removed since the last checkpoint: deleted from the catalog at the next one, and
     /// never loaded from it again.
     removed: HashSet<BranchId>,
@@ -1887,8 +1939,6 @@ fn expire_batch() -> usize {
     })
 }
 
-/// F-FZ: fuzzy-checkpoint threads kept unjoined before the oldest is joined.
-const FLIGHTS_KEPT: usize = 64;
 
 /// How long a fork's creator, or an open of a new branch, waits for the trunk commit it forks after
 /// to be published before it is `Busy` (`BranchStore::wait_trunk_commit_published`).
@@ -2081,7 +2131,7 @@ impl CatState {
             flight: false,
             ckpt: CkptCounters::default(),
             catalog,
-            dirty: HashMap::new(),
+            dirty: BTreeMap::new(),
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
@@ -2366,15 +2416,142 @@ struct BranchState {
 /// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
 /// index still masks and still names what it did, and a capture that is never written (a write
 /// that failed, a thread that did not start) leaves nothing to restore.
+///
+/// Ordered maps, not hash maps (L2 slope, budget create_allocates_no_table_of_every_branch_under_the_store_mutex:
+/// a named create rehashed `map`, 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the
+/// store mutex at 33k branches): a B-tree grows a node at a time and never moves every name.
 #[derive(Default)]
 struct NameIndex {
-    map: HashMap<Arc<str>, BranchId>,
+    map: BTreeMap<Arc<str>, BranchId>,
     filter: NameFilter,
-    fresh: HashMap<Arc<str>, BranchId>,
+    fresh: BTreeMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
-    gone: HashMap<Arc<str>, u64>,
+    gone: BTreeMap<Arc<str>, u64>,
     releases: u64,
+}
+
+/// Test builds: allocations made inside `NameFilter::note`, by any store (lead ruling 2026-10-15:
+/// a create allocates nothing under the store mutex by construction; the filter's B-tree split a
+/// node in 37-39 of 40 creates, raws l35-diag-alloc).
+#[cfg(test)]
+pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+/// Test hooks for the name filter's growth (review REVIEW-claude-namefilter H1): the growth's drain
+/// copy fails (`FILTER_DRAIN_FAILS`), and the growth thread pauses at stage `FILTER_PAUSE_AT`
+/// (`FILTER_PAUSED` reads the stage it waits at) until the stage is changed: 3 before the swap, 5
+/// after the drain copy, before its install.
+#[cfg(test)]
+pub(crate) static FILTER_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSE_AT: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSED: AtomicU8 = AtomicU8::new(0);
+
+fn filter_pause(stage: u8) {
+    #[cfg(test)]
+    if FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+        FILTER_PAUSED.store(stage, Ordering::Release);
+        while FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = stage;
+}
+
+fn filter_drain_fails() -> bool {
+    #[cfg(test)]
+    return FILTER_DRAIN_FAILS.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    false
+}
+
+/// A fixed-capacity set of nonzero `u64` keys (open addressing, linear probing): the name filter's
+/// table (lead ruling 2026-10-15). Its slots are allocated once, at construction, so an insert never
+/// allocates; a full table refuses instead of growing, and the filter grows by copying into a
+/// larger table OFF the store mutex (`BranchStore::grow_name_filter`). The slots are atomics so that
+/// copy can read a table the store keeps inserting into under its mutex; an insert claims a slot
+/// with a compare-and-swap, so two inserters (the store, and a copy into a table already
+/// installed) never lose a key. Nothing is ever removed.
+struct FilterTable {
+    slots: Box<[AtomicU64]>,
+    len: AtomicUsize,
+}
+
+impl FilterTable {
+    /// Room for `n` keys at most half full: at least 2n slots, a power of two, at least 1024.
+    fn for_keys(n: usize) -> Self {
+        let cap = n.saturating_mul(2).max(1024).next_power_of_two();
+        Self {
+            slots: (0..cap).map(|_| AtomicU64::new(0)).collect(),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn cap(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Past half full: the filter owes a growth.
+    fn wants_room(&self) -> bool {
+        self.len() * 2 > self.cap()
+    }
+
+    /// 0 marks an empty slot, so a hash of 0 is stored as 1 (one more collision, which costs a
+    /// catalog query, as any does).
+    fn key(h: u64) -> u64 {
+        h.max(1)
+    }
+
+    /// Insert `h`; `false` if the table is full: a probe that meets a taken slot once 7/8 of the
+    /// slots are taken refuses (so a probe is bounded). Allocates nothing.
+    fn insert(&self, h: u64) -> bool {
+        let k = Self::key(h);
+        let mask = self.cap() - 1;
+        let mut i = (k as usize) & mask;
+        loop {
+            match self.slots[i].compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.len.fetch_add(1, Ordering::AcqRel);
+                    return true;
+                }
+                Err(v) if v == k => return true,
+                Err(_) => {}
+            }
+            if self.len() >= self.cap() / 8 * 7 {
+                return false;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn contains(&self, h: u64) -> bool {
+        let k = Self::key(h);
+        let mask = self.cap() - 1;
+        let mut i = (k as usize) & mask;
+        for _ in 0..self.cap() {
+            match self.slots[i].load(Ordering::Acquire) {
+                0 => return false,
+                v if v == k => return true,
+                _ => i = (i + 1) & mask,
+            }
+        }
+        false
+    }
+
+    /// Every key of this table into `to`; `false` if `to` filled. A key inserted here meanwhile
+    /// may be missed: the caller's pending table holds those.
+    fn copy_into(&self, to: &FilterTable) -> bool {
+        self.slots.iter().all(|s| match s.load(Ordering::Acquire) {
+            0 => true,
+            k => to.insert(k),
+        })
+    }
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -2382,18 +2559,59 @@ struct NameIndex {
 /// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
 /// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
 /// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
-/// the build ran (`pending`); until then, lookups query the catalog as before. Empty and built at
-/// once for a store with no catalog yet.
+/// the build ran; until then, lookups query the catalog as before. Empty and built at once for a
+/// store with no catalog yet.
+///
+/// A create allocates NOTHING here, by construction (lead ruling 2026-10-15; before, a B-tree bulk-
+/// built with full leaves split a node in 37-39 of 40 creates, raws l35-diag-alloc): the tables are
+/// fixed-size (`FilterTable`), a note fills a slot, and a table past half full owes a growth, which
+/// `BranchStore::grow_name_filter` makes off the mutex into a table twice the size.
+///
+/// ONE state (`FilterState`, review REVIEW-claude-namefilter H1, DECISIONS: the class of a half-
+/// updated filter): the tables, and what a note and a lookup do with them, are a single value,
+/// replaced only by one assignment inside one store-mutex hold, and the filter answers "absent" ONLY
+/// in `Ready`. Before, `built`, `pending`, `draining` and `overflowed` were four fields set in
+/// separate holds, and between two of them a lookup read "absent" for a name only a draining table
+/// held. A growth or a build that comes back to a state other than the one it left (an overflow
+/// meanwhile) changes nothing (`Arc::ptr_eq`).
 #[derive(Default)]
 struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
-    built: Option<HashSet<u64, BuildIdHasher>>,
-    pending: Option<HashSet<u64, BuildIdHasher>>,
-    /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
-    /// and catalog scans that failed.
+    state: FilterState,
+    /// Work the next create's caller starts once it has dropped the mutex: a growth (owed in
+    /// `Ready` past half full) or a rebuild (owed once, on entering `Overflowed`).
+    owed: Option<FilterWork>,
+    /// Observation (review 3 #7): the most entries one growth copied, builds and growths
+    /// installed, catalog scans that failed, and rebuilds started after an overflow.
     moved_max: u64,
     builds: u64,
     failed_scans: u64,
+    rebuilds: u64,
+}
+
+/// The name filter's one state (`NameFilter`).
+#[derive(Default)]
+enum FilterState {
+    /// No table: lookups ask the catalog (not built yet, or a failed scan).
+    #[default]
+    Unbuilt,
+    /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`.
+    Building { pending: Arc<FilterTable> },
+    /// The filter answers from `table`.
+    Ready { table: Arc<FilterTable> },
+    /// A growth copies `table` into a larger one off the mutex; notes go into both.
+    Growing { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A new `table` is installed and `pending` (a build's or a growth's) is being copied into it;
+    /// notes go into `table`.
+    Draining { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A table refused a key: lookups ask the catalog until the owed rebuild lands.
+    Overflowed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterWork {
+    Grow,
+    Rebuild,
 }
 
 impl NameFilter {
@@ -2404,50 +2622,90 @@ impl NameFilter {
 
     /// `name` is held by a branch from now on.
     fn note(&mut self, name: &str) {
-        if self.built.is_none() && self.pending.is_none() {
-            return;
-        }
+        #[cfg(test)]
+        let allocs0 = super::budget_probe::thread_allocs().0;
+        self.note_inner(name);
+        #[cfg(test)]
+        FILTER_NOTE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+    }
+
+    fn note_inner(&mut self, name: &str) {
         let h = self.hash(name);
-        if let Some(built) = self.built.as_mut() {
-            if built.len() == built.capacity() {
-                self.moved_max = self.moved_max.max(built.len() as u64);
+        // Mutant `name_filter_grows_in_note` (test builds only): a table past half full is grown
+        // here, under the store mutex, as a resizing set would.
+        if fe_mutant("name_filter_grows_in_note") {
+            if let FilterState::Ready { table } = &self.state {
+                if table.wants_room() {
+                    let grown = FilterTable::for_keys(table.len() * 2);
+                    table.copy_into(&grown);
+                    self.state = FilterState::Ready { table: Arc::new(grown) };
+                }
             }
-            built.insert(h);
         }
-        if let Some(pending) = self.pending.as_mut() {
-            pending.insert(h);
+        let fits = match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => true,
+            FilterState::Building { pending } => pending.insert(h),
+            FilterState::Ready { table } => {
+                let fits = table.insert(h);
+                if fits && table.wants_room() && self.owed.is_none() {
+                    self.owed = Some(FilterWork::Grow);
+                }
+                fits
+            }
+            // Both, whatever the first answers.
+            FilterState::Growing { table, pending } => table.insert(h) & pending.insert(h),
+            FilterState::Draining { table, .. } => table.insert(h),
+        };
+        if !fits {
+            self.overflow();
         }
     }
 
-    /// No branch ever held `name` (`false` while the filter is not built: ask the catalog).
+    /// A table refused a key: stop answering, and owe one rebuild (never a growth per create).
+    fn overflow(&mut self) {
+        self.state = FilterState::Overflowed;
+        self.owed = Some(FilterWork::Rebuild);
+    }
+
+    /// The work owed, taken by the caller, which starts it once it has dropped the mutex.
+    fn take_owed(&mut self) -> Option<FilterWork> {
+        self.owed.take()
+    }
+
+    /// No branch ever held `name`: answered only in `Ready`; every other state asks the catalog.
     fn says_absent(&self, name: &str) -> bool {
-        // fastest-engine mutant `filter_says_absent` (test builds only).
+        // fastest-engine mutant `filter_says_absent` (test builds only): "absent" whenever a table
+        // exists.
         if fe_mutant("filter_says_absent") {
-            return self.built.is_some();
+            return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed);
         }
-        self.built.as_ref().is_some_and(|built| !built.contains(&self.hash(name)))
+        match &self.state {
+            FilterState::Ready { table } => !table.contains(self.hash(name)),
+            FilterState::Unbuilt
+            | FilterState::Building { .. }
+            | FilterState::Growing { .. }
+            | FilterState::Draining { .. }
+            | FilterState::Overflowed => false,
+        }
+    }
+
+    /// The table a lookup will answer from once the filter is `Ready`, and the pending one in use.
+    fn tables(&self) -> (Option<&Arc<FilterTable>>, Option<&Arc<FilterTable>>) {
+        match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => (None, None),
+            FilterState::Building { pending } => (None, Some(pending)),
+            FilterState::Ready { table } => (Some(table), None),
+            FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
+                (Some(table), Some(pending))
+            }
+        }
+    }
+
+    fn entries(&self) -> u64 {
+        self.tables().0.map_or(0, |t| t.len() as u64)
     }
 }
 
-/// The name filter's keys are keyed hashes already: hashed again as themselves.
-#[derive(Default, Clone, Copy)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-
-type BuildIdHasher = std::hash::BuildHasherDefault<IdHasher>;
 
 /// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
 /// connection syntax may narrow this; the store refuses nothing narrower.
@@ -2875,7 +3133,7 @@ impl Lineage {
 
 /// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
 /// resident branch's row, current page map and retained versions, with what changed in it.
-fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
     let rows: Vec<(CatBranch, u8)> = dirty
         .iter()
         .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
@@ -2943,7 +3201,7 @@ struct Captured {
     log_from: u64,
     rows: Vec<(CatBranch, u8)>,
     /// The dirty map the capture swapped out: merged back if the write fails.
-    dirty: HashMap<BranchId, u8>,
+    dirty: BTreeMap<BranchId, u8>,
     removed: Vec<BranchId>,
     trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
     trunk_gone: Vec<(u32, u64)>,
@@ -2982,12 +3240,12 @@ struct Captured {
     child_keys: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
-    arena: Option<std::fs::File>,
+    arena: Option<Arc<std::fs::File>>,
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
-    names_gone: HashMap<Arc<str>, u64>,
-    names_fresh: HashMap<Arc<str>, BranchId>,
+    names_gone: BTreeMap<Arc<str>, u64>,
+    names_fresh: BTreeMap<Arc<str>, BranchId>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -3117,6 +3375,36 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
 /// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
 /// (test builds only): logged only, as before.
+/// The catalog WAL length from which a fuzzy checkpoint's phase 4 backfills and truncates it
+/// (checkpoint FIX, budget a_checkpoint_flushes_at_most_three_times). That phase cost 4 full flushes
+/// (PASSIVE: the WAL barrier and the database file's sync; TRUNCATE: the truncation's sync and the
+/// next commit's new WAL header), measured by red 39507c379 (artie raw l16-ckpt_3fb66f4ef.txt), and
+/// it ran after EVERY checkpoint. Bounded by size instead, as SQLite's and Turso's own
+/// auto-checkpoints are (1000 pages): the WAL stays under about this much plus one checkpoint's
+/// commit. Test builds: `CATALOG_WAL_TRUNCATE_AT_FORCED` (0: the constant; the tests that hold a
+/// checkpoint inside its truncation force every one with `CatalogWalTruncateAlways`).
+const CATALOG_WAL_TRUNCATE_AT: u64 = 4 << 20;
+
+#[cfg(test)]
+pub(crate) static CATALOG_WAL_TRUNCATE_AT_FORCED: AtomicU64 = AtomicU64::new(0);
+
+fn catalog_wal_truncate_at() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CATALOG_WAL_TRUNCATE_AT_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CATALOG_WAL_TRUNCATE_AT
+}
+
+/// Whether phase 4 runs: the catalog WAL has reached `catalog_wal_truncate_at()`. Mutant
+/// `catalog_wal_truncated_every_checkpoint` (test builds only): always, as before.
+fn catalog_wal_due(catalog: &Catalog) -> bool {
+    fe_mutant("catalog_wal_truncated_every_checkpoint") || catalog.wal_len() >= catalog_wal_truncate_at()
+}
+
 fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&AtomicU8>) {
     #[cfg(not(test))]
     let _ = hold;
@@ -3124,6 +3412,7 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
+    ckpt_phase("passive");
     #[cfg(test)]
     pause_at(hold, HOLD_AFTER_WAL_PASSIVE);
     match catalog.truncate_wal() {
@@ -3137,6 +3426,90 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
         let drains = !cfg!(target_vendor = "apple") || catalog.commit_sync() == SyncClass::FullFsync;
         group.drain_failed(drains, |_| true);
     }
+}
+
+/// Test builds (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3 checkpoints,
+/// budget 3 each): the process's sync counters (`super::sync_counts`: fsync, F_FULLFSYNC) at each
+/// phase of a fuzzy checkpoint's thread, so a test can attribute its flushes. Observation only; the
+/// counters are process-wide, so a test reading them runs nothing else meanwhile.
+#[cfg(test)]
+pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
+/// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
+/// the capture's (`start_flight`) and the install's. Observation only.
+/// Test builds: fuzzy installs that finished a prepared cut, and those that fell back to a rewrite
+/// under the store mutex (no cut was prepared). Observation only.
+#[cfg(test)]
+pub(crate) static INSTALL_CUTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: every thread's CPU time just BEFORE and just AFTER each `ckpt_held` point's syscall
+/// count (`budget_probe::thread_table`; Mach traps only, so the count does not move), so a span
+/// from point i to point j is attributed by exclusion (class (b), DECISIONS 994f7d41e0): its
+/// syscalls are the recording thread's only if no other thread ran between i's "before" table and
+/// j's "after" table. Recorded only while a test arms `CKPT_THREADS_ARMED` (and has reserved the
+/// vector's room), so no other test's held allocations see it.
+#[cfg(test)]
+pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
+/// Test builds, armed with `CKPT_THREADS_ARMED`: the backtraces of the allocations and frees of 16
+/// KiB or more between the last install's `install.cut_finished` and `install.installed`.
+#[cfg(test)]
+pub(crate) static CKPT_BIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Test builds: the smallest allocation or free `CKPT_BIG` records (16 KiB unless a test lowers it,
+/// as the diagnostic's fire-check does).
+#[cfg(test)]
+pub(crate) static CKPT_BIG_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16 << 10);
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<
+    Vec<(&'static str, [super::budget_probe::ThreadCpu; 48], [super::budget_probe::ThreadCpu; 48])>,
+> = std::sync::Mutex::new(Vec::new());
+
+fn ckpt_held(label: &'static str) {
+    #[cfg(test)]
+    {
+        let armed = CKPT_THREADS_ARMED.load(Ordering::Acquire);
+        let mut before = [super::budget_probe::ThreadCpu::EMPTY; 48];
+        if armed {
+            let _ = super::budget_probe::thread_table(&mut before);
+        }
+        if let Some(n) = super::budget_probe::unix_syscalls() {
+            CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+            if armed {
+                let mut after = [super::budget_probe::ThreadCpu::EMPTY; 48];
+                let _ = super::budget_probe::thread_table(&mut after);
+                CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, before, after));
+                // The span from the cut's finish to the install's end: big allocations and frees
+                // on this thread, with backtraces (`CKPT_BIG`), for the span that grows past two
+                // syscalls.
+                if label == "install.cut_finished" {
+                    super::budget_probe::record_big(CKPT_BIG_MIN.load(Ordering::Acquire));
+                } else if label == "install.installed" {
+                    let (_, _, traces) = super::budget_probe::recorded_allocs();
+                    super::budget_probe::record_allocs(false, usize::MAX);
+                    *CKPT_BIG.lock().unwrap_or_else(|e| e.into_inner()) = traces;
+                }
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+fn ckpt_phase(label: &'static str) {
+    #[cfg(test)]
+    {
+        let c = super::sync_counts();
+        CKPT_PHASES.lock().unwrap_or_else(|e| e.into_inner()).push((label, c.fsync, c.full_fsync));
+    }
+    #[cfg(not(test))]
+    let _ = label;
 }
 
 /// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
@@ -3156,6 +3529,7 @@ fn run_flight(
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
+    ckpt_phase("start");
     // A panic in the writer must still reach the install (with an error), or `flight` would stay
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3196,9 +3570,11 @@ fn run_flight(
                 return (Err(e), 0);
             }
         }
+        ckpt_phase("settled");
         let mut w = writer.lock();
         let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
+        ckpt_phase("written");
         if written.is_err() {
             w.rollback();
         }
@@ -3235,8 +3611,10 @@ fn run_flight(
                 None
             })
     });
+    ckpt_phase("cut");
     let installed = {
         let mut guard = inner.lock();
+        ckpt_held("install.locked");
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
@@ -3245,7 +3623,11 @@ fn run_flight(
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
+        ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
+        ckpt_held("install.installed");
+        // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
+        let retired = guard.journal.as_mut().and_then(Journal::take_retired);
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3278,19 +3660,29 @@ fn run_flight(
             cat.ckpt.hold(hold_ns);
             cat.ckpt.flight_ns += write_ns;
         }
+        ckpt_held("install.marked");
         // Set under the store mutex, so no capture can slip in before the truncation.
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
         let (count, signal) = &*installs;
         *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         signal.notify_all();
-        installed
+        (installed, retired)
     };
+    let (installed, retired) = installed;
+    // Holding no lock now: the old log's handles close here.
+    drop(retired);
     // Flights go on, into the new log.
     drop(cut);
+    ckpt_phase("installed");
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
+        Ok(()) if !catalog_wal_due(&writer.lock()) => {
+            truncating.store(false, Ordering::Release);
+            // The phase's end, skipped (the instrument's last point either way).
+            ckpt_phase("truncated");
+        }
         Ok(()) => {
             #[cfg(test)]
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
@@ -3299,11 +3691,65 @@ fn run_flight(
                 truncate_catalog_wal(&mut writer.lock(), &group, Some(&*hold))
             }));
             truncating.store(false, Ordering::Release);
+            ckpt_phase("truncated");
             if truncated.is_err() {
                 tracing::warn!("the branch catalog WAL truncation panicked");
             }
         }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
+    }
+}
+
+type CkptJob = Box<dyn FnOnce() + Send>;
+
+/// The fuzzy checkpoints' persistent thread (`BranchStore::dispatch_flight`): runs each checkpoint
+/// handed to it in turn (only one is ever in flight), counting it finished even if it panicked, and
+/// exits when its channel closes (the store's `Drop`). Counted a persistent store thread for the
+/// budgets' probe while it is parked, as the confirmation writer is, and a live one while it runs
+/// a checkpoint.
+struct CkptWorker {
+    pid: u32,
+    tx: std::sync::mpsc::Sender<CkptJob>,
+    handle: crate::thread::JoinHandle<()>,
+}
+
+impl CkptWorker {
+    fn start(jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<CkptJob>();
+        #[cfg(test)]
+        super::budget_probe::persistent_started();
+        let spawned = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                // While it runs a checkpoint the worker is NOT parked: the budgets' probe counts it
+                // a live thread then, as it counted the per-checkpoint thread this replaced, so a
+                // measured window still waits out the checkpoint (budgets' ckpt cells: "at least
+                // three checkpoints installed (0)" at 4fbc6de65 without this).
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    tracing::warn!("a branch catalog checkpoint panicked");
+                }
+                #[cfg(test)]
+                super::budget_probe::persistent_started();
+                Self::finished(&jobs);
+            }
+            #[cfg(test)]
+            super::budget_probe::persistent_ended();
+        });
+        match spawned {
+            Ok(handle) => Ok(Self { pid: std::process::id(), tx, handle }),
+            Err(e) => {
+                #[cfg(test)]
+                super::budget_probe::persistent_ended();
+                Err(e)
+            }
+        }
+    }
+
+    /// One checkpoint handed out is over (run, panicked, or never handed over).
+    fn finished(jobs: &(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)) {
+        jobs.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        jobs.1.notify_all();
     }
 }
 
@@ -3511,6 +3957,38 @@ pub(crate) fn fe_mutant(name: &str) -> bool {
     }
 }
 
+// Test builds (L2 slice, budget create_allocates_at_most_once_under_the_store_mutex): while armed
+// (`HELD_TRACE` holds a Vec with spare capacity), each `held_trace(label)` records this thread's
+// allocations under a store mutex so far, so a test can attribute a create's held allocations to
+// its steps. Pushing never allocates: the Vec is reserved before it is armed, and a full one stops
+// recording. Observation only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HELD_TRACE: std::cell::RefCell<Option<Vec<(&'static str, u64)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn held_trace(label: &'static str) {
+    #[cfg(test)]
+    HELD_TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            if v.len() < v.capacity() {
+                v.push((label, super::budget_probe::thread_allocs().2));
+            }
+        }
+    });
+    #[cfg(not(test))]
+    let _ = label;
+}
+
+/// A branch page's reservation (`BranchStore::first_write_branch`): its slot and, for a file arena,
+/// where the commit writes it, so `commit_pages` can write it before it takes the store mutex.
+#[derive(Clone)]
+pub(crate) struct Reserved {
+    slot: Slot,
+    io: Option<(Arc<std::fs::File>, u64)>,
+}
+
 /// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
 /// can aim a kill at. TEST BUILDS ONLY, and inert unless `FE_KILL_AT=<point>:<n>` is set: the n-th
 /// time this process reaches `point`, it appends `KILL-AT <point> <n>` to the file `FE_CRASH_LOG`
@@ -3647,7 +4125,8 @@ impl BranchStore {
         Self {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3950,7 +4429,8 @@ impl BranchStore {
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
-            flights: Mutex::new(Vec::new()),
+            ckpt_worker: Mutex::new(None),
+            flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4171,7 +4651,7 @@ impl BranchStore {
         };
         stats.log_bytes = scanned.log_bytes();
         let arena_file = scanned.open_arena(meta.is_some_and(|m| m.in_use > 0 || m.states > 0))?;
-        let meta = meta.unwrap_or(Meta {
+        let meta = meta.unwrap_or_else(|| Meta {
             page_size: scanned.page_size() as u32,
             ..Meta::default()
         });
@@ -4473,7 +4953,7 @@ impl BranchStore {
     /// Buffer `records` for an early-released operation and return the log sequence number the
     /// caller must wait for (`wait_durable`) once it has released every lock, before acknowledging
     /// the operation. Nothing is flushed here; 0 when volatile (always durable).
-    fn buffer_records(&self, inner: &mut StoreInner, records: &[Record]) -> Result<u64> {
+    fn buffer_records<'r>(&self, inner: &mut StoreInner, records: impl IntoIterator<Item = &'r Record>) -> Result<u64> {
         let StoreInner {
             journal, failpoint, ..
         } = inner;
@@ -4658,6 +5138,7 @@ impl BranchStore {
                     guard: store.lock(),
                     since: Instant::now(),
                 };
+                held_trace("lead.locked");
                 let mut g = group.lock();
                 if g.durable[need] >= lsn {
                     #[cfg(test)]
@@ -4681,7 +5162,9 @@ impl BranchStore {
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
                 let upgrade = g.durable[0] >= lsn;
-                match Self::take_flight(&mut inner, class, upgrade) {
+                let taken = Self::take_flight(&mut inner, class, upgrade);
+                held_trace("lead.taken");
+                match taken {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
@@ -5327,8 +5810,13 @@ impl BranchStore {
             // fell behind), with no writer running (it could not start; a fork(2) child), and in
             // a sharp catalog store it still runs here, and is counted (`inline_compaction_syncs`).
             // Mutant `compaction_on_ack_path` (test builds only): here always, as before.
+            // A D0 snapshot store's compaction syncs nothing, but it encodes a snapshot of every
+            // branch: O(N) allocation and time in the operation's own hold (budget
+            // create_allocates_no_table_of_every_branch_under_the_store_mutex: 2.2 MB at 33k
+            // branches). It is owed to the writer too. Mutant `d0_compaction_inline` (test builds
+            // only): run here, as before.
             let syncs = inner.journal.as_ref().is_some_and(|j| j.rewrite_class().syncs());
-            if syncs {
+            if syncs || !fe_mutant("d0_compaction_inline") {
                 let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
                 if inner.cat.is_none() && !past_hard && self.writer_runs() && !fe_mutant("compaction_on_ack_path") {
                     if self
@@ -5346,7 +5834,9 @@ impl BranchStore {
                     }
                     return;
                 }
-                self.group.lock().inline_compaction_syncs += 1;
+                if syncs {
+                    self.group.lock().inline_compaction_syncs += 1;
+                }
             }
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
@@ -5386,6 +5876,7 @@ impl BranchStore {
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started, or why not.
     fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        ckpt_held("capture.begin");
         match inner.cat.as_ref() {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
@@ -5446,6 +5937,7 @@ impl BranchStore {
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
         let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
+        ckpt_held("capture.matured");
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -5453,6 +5945,7 @@ impl BranchStore {
                 return FlightStart::Failed;
             }
         };
+        ckpt_held("capture.captured");
         let cat = inner.cat.as_mut().expect("captured above");
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
@@ -5464,24 +5957,15 @@ impl BranchStore {
         let over_hard = self.over_hard.clone();
         let truncating = self.truncating.clone();
         let installs = self.installs.clone();
-        let mut flights = self.flights.lock();
-        if flights.len() >= FLIGHTS_KEPT {
-            // Past its install long ago (only one checkpoint is ever in flight), so this join
-            // waits for nothing.
-            let _ = flights.remove(0).join();
-        }
         let spawned = if inner.failpoint.take_if(|f| *f == BranchFailpoint::SpawnFails).is_some() {
             Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
         } else {
-            crate::thread::Builder::new()
-                .name("branch-checkpoint".to_string())
-                .spawn(move || {
-                    run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
-                })
+            self.dispatch_flight(Box::new(move || {
+                run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
+            }))
         };
         match spawned {
-            Ok(handle) => {
-                flights.push(handle);
+            Ok(()) => {
                 if let Some(cat) = inner.cat.as_mut() {
                     cat.ckpt.flights += 1;
                 }
@@ -5549,14 +6033,63 @@ impl BranchStore {
         }
     }
 
-    /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
-    /// mutex: a thread in flight takes it for its install.
-    fn join_flights(&self) {
-        let handles = std::mem::take(&mut *self.flights.lock());
-        for handle in handles {
-            if handle.join().is_err() {
-                tracing::warn!("a branch catalog checkpoint thread panicked");
+    /// Hand a fuzzy checkpoint to the persistent worker, starting it first if this process has
+    /// none (checkpoint FIX, budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex:
+    /// a thread spawn per checkpoint was about ten syscalls inside the starting operation's
+    /// store-mutex hold; a send wakes a parked worker with one). A fork(2) child has no worker of
+    /// its parent's, and starts its own. A worker that died is replaced once. Mutant
+    /// `checkpoint_thread_per_flight` (test builds only): a new thread for every one, as before.
+    fn dispatch_flight(&self, job: CkptJob) -> std::io::Result<()> {
+        if fe_mutant("checkpoint_thread_per_flight") {
+            let jobs = self.flight_jobs.clone();
+            jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+            let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+                job();
+                CkptWorker::finished(&jobs);
+            });
+            return handle.map(drop).inspect_err(|_| CkptWorker::finished(&self.flight_jobs));
+        }
+        let mut worker = self.ckpt_worker.lock();
+        let pid = std::process::id();
+        if worker.as_ref().is_some_and(|w| w.pid != pid) {
+            // The parent's thread does not exist in this process: never joined, never sent to.
+            std::mem::forget(worker.take());
+        }
+        self.flight_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        let mut job = job;
+        for _ in 0..2 {
+            if worker.is_none() {
+                match CkptWorker::start(self.flight_jobs.clone()) {
+                    Ok(w) => *worker = Some(w),
+                    Err(e) => {
+                        CkptWorker::finished(&self.flight_jobs);
+                        return Err(e);
+                    }
+                }
             }
+            match worker.as_ref().expect("started above").tx.send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::SendError(back)) => {
+                    // It exited: joined, and replaced.
+                    if let Some(w) = worker.take() {
+                        let _ = w.handle.join();
+                    }
+                    job = back;
+                }
+            }
+        }
+        CkptWorker::finished(&self.flight_jobs);
+        Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
+    }
+
+    /// Wait for every fuzzy checkpoint handed out so far to finish (F-FZ). Called without the
+    /// store mutex: one in flight takes it for its install.
+    fn join_flights(&self) {
+        let (m, cv) = &*self.flight_jobs;
+        let mut jobs = m.lock().unwrap_or_else(|e| e.into_inner());
+        let target = jobs.0;
+        while jobs.1 < target {
+            jobs = cv.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -5721,6 +6254,11 @@ impl BranchStore {
             }
             bg.sync_dir()?;
             group.mark_committed(bg.lsn(), bg.class());
+            #[cfg(test)]
+            {
+                group.held_cut_from.store(bg.from(), Ordering::Release);
+                pause_at(hold, HOLD_COMPACT_INSTALLED);
+            }
             // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
             // would (`COMPACT_STOP_BEFORE_CUT`).
             #[cfg(test)]
@@ -5796,7 +6334,10 @@ impl BranchStore {
             group.mark_durable(written, class);
             let durable = group.durable(inner.free_class());
             inner.mature_frees(durable);
+            let retired = inner.journal.as_mut().and_then(Journal::take_retired);
             drop(inner);
+            // The old log's handles close holding no lock.
+            drop(retired);
             drop(counted);
             return Ok(());
         }
@@ -5947,7 +6488,9 @@ impl BranchStore {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
+        held_trace("fork.locked");
         self.mature(&mut inner);
+        held_trace("fork.matured");
         let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
         if restart {
             // `ensure_backing` may start an empty store over (a compaction or checkpoint that
@@ -5964,7 +6507,9 @@ impl BranchStore {
                 self.group.mark_durable(journal.lsn(), rewrite_class_marked(restart_class, journal));
             }
         }
+        held_trace("fork.backed");
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        held_trace("fork.expired");
         // After the expiry pass, which can reap the trunk's last child: a lock-free fork must never
         // be the first one.
         let mut schema = schema;
@@ -5998,20 +6543,27 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        held_trace("fork.named");
+        // One allocation for a name, shared by its record and the name index.
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name_arc.as_ref());
+        held_trace("fork.records");
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
+        held_trace("fork.buffered");
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
+        held_trace("fork.applied");
         inner.apply_fork_lease(id, lease);
         inner.note_fork_lsn(id, lsn);
         self.sync_trunk_children(&inner);
+        held_trace("fork.children_synced");
         kill_point("fork.applied");
         let work = &mut inner.work;
         work.trunk_forks += 1;
@@ -6022,6 +6574,10 @@ impl BranchStore {
         }
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
+        held_trace("fork.done");
+        let work = inner.names.filter.take_owed();
+        drop(inner);
+        self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
 
@@ -6087,19 +6643,23 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now, name);
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, parent, now, name_arc.as_ref());
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        let lsn = self.buffer_records(&mut inner, &records)?;
+        let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
         inner.note_fork_lsn(id, lsn);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
+        let work = inner.names.filter.take_owed();
+        drop(inner);
+        self.start_filter_work(work);
         Ok((id, lsn))
     }
 
@@ -6650,8 +7210,9 @@ impl BranchStore {
     }
 
     /// The copy decision for a branch's first write to `page` in a transaction: reserve the fresh
-    /// slot the commit will write the page into. Nothing is published until then.
-    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
+    /// slot the commit will write the page into. Nothing is published until then. Returns the
+    /// reservation, for the commit to write holding no lock (`Reserved`).
+    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<Reserved> {
         let mut inner = self.inner.lock();
         // Covered deferred frees first, so this reservation can reuse them (group commit).
         self.mature(&mut inner);
@@ -6674,12 +7235,15 @@ impl BranchStore {
                 id.0
             )));
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
-            e.insert(arena.alloc());
-            // F-W2: this branch may hold a reserved slot at the next checkpoint.
-            pending_holders.insert(id);
-        }
-        Ok(())
+        let slot = match st.pending.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // F-W2: this branch may hold a reserved slot at the next checkpoint.
+                pending_holders.insert(id);
+                *e.insert(arena.alloc())
+            }
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        };
+        Ok(Reserved { slot, io: arena.slot_io(slot) })
     }
 
     /// The copy decisions of one trunk commit, taken at its serialization point: after its frames
@@ -7045,7 +7609,7 @@ impl BranchStore {
         };
         if unsynced && *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
-            *orphans = journal.pending_slots.clone();
+            orphans.clone_from(&journal.pending_slots);
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: the trunk commit's branch barrier stopped before its records"
@@ -7283,6 +7847,36 @@ impl BranchStore {
     /// A commit whose wait fails leaves the branch in doubt: refused from then on (lead review 1
     /// item 11).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        self.commit_pages_reserved(id, pages, &HashMap::new())
+    }
+
+    /// `commit_pages`, with the connection's reservations (`BranchBinding::reserved`): when every
+    /// page has a file-arena reservation, the pages are written into their slots BEFORE the store
+    /// mutex is taken (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex: the
+    /// slot pwrite was a syscall under it). Safe: a reservation is this writer's until its commit
+    /// or abort, both on this connection, so nothing frees or reuses the slot meanwhile; the arena
+    /// is marked dirty in the same hold that buffers the Commit record, so the flight that carries
+    /// the record syncs the slots first, as before. Mutant `commit_slots_under_mutex` (test builds
+    /// only): written under the mutex, as before.
+    pub(crate) fn commit_pages_reserved(&self, id: BranchId, pages: &[PageRef], reserved: &HashMap<u32, Reserved>) -> Result<()> {
+        let prewritten = !pages.is_empty()
+            && !fe_mutant("commit_slots_under_mutex")
+            && !self.group.poisoned()
+            && pages
+                .iter()
+                .all(|p| reserved.get(&(p.get().id as u32)).is_some_and(|r| r.io.is_some()));
+        // Made before the mutex too: no allocation under it for the entries.
+        let mut entries: Vec<(u32, Slot, u32)> = Vec::with_capacity(pages.len());
+        if prewritten {
+            for page in pages {
+                let no = page.get().id as u32;
+                let r = &reserved[&no];
+                let (file, offset) = r.io.as_ref().expect("checked above");
+                let bytes = page.get_contents().as_slice();
+                super::journal::write_at(file, bytes, *offset)?;
+                entries.push((no, r.slot, crc32c::crc32c(bytes)));
+            }
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -7306,8 +7900,7 @@ impl BranchStore {
                 return Err(reaped(id));
             }
             let arena = arena.as_mut().expect("a branch exists, so the arena does");
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
+            for (i, page) in pages.iter().enumerate() {
                 let no = page.get().id as u32;
                 let slot = st.pending.remove(&no).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -7315,9 +7908,23 @@ impl BranchStore {
                         id.0
                     ))
                 })?;
-                let bytes = page.get_contents().as_slice();
-                arena.write_slot(slot, bytes)?;
-                entries.push((no, slot, crc32c::crc32c(bytes)));
+                if prewritten {
+                    if entries[i].1 != slot {
+                        return Err(LimboError::InternalError(format!(
+                            "branch {} page {no}: written into slot {} off the mutex, reserved {slot}",
+                            id.0, entries[i].1
+                        )));
+                    }
+                } else {
+                    let bytes = page.get_contents().as_slice();
+                    arena.write_slot(slot, bytes)?;
+                    entries.push((no, slot, crc32c::crc32c(bytes)));
+                }
+            }
+            if prewritten {
+                // The slots were written off the mutex: the flight that carries this record syncs
+                // them (rule 1), as a write_slot under it marked them.
+                arena.mark_unsynced();
             }
             // A reservation whose page is not dirty at commit was never written: free it.
             for (_, slot) in st.pending.drain() {
@@ -7617,8 +8224,8 @@ impl BranchStore {
         let inner = self.inner.lock();
         let f = &inner.names.filter;
         (
-            f.built.is_some(),
-            f.built.as_ref().map_or(0, |b| b.len() as u64),
+            f.tables().0.is_some(),
+            f.entries(),
             f.moved_max,
             f.builds,
             f.failed_scans,
@@ -7703,6 +8310,54 @@ impl BranchStore {
         self.group.confirm_notifies.load(Ordering::Relaxed)
     }
 
+    /// Test builds (L2 slice, budget create_allocates_no_table_of_every_branch_under_the_store_mutex):
+    /// the per-branch tables a create can grow under the store mutex, as (name, capacity, bytes a
+    /// regrowth to that capacity allocates, estimated as capacity x (entry + 1 control byte); the
+    /// branch table: its chunks, each allocated whole).
+    #[cfg(test)]
+    pub(crate) fn per_branch_tables_for_test(&self) -> Vec<(&'static str, usize, usize)> {
+        fn map<K, V, S>(name: &'static str, m: &HashMap<K, V, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<(K, V)>() + 1))
+        }
+        fn set<K, S>(name: &'static str, m: &HashSet<K, S>) -> (&'static str, usize, usize) {
+            (name, m.capacity(), m.capacity() * (std::mem::size_of::<K>() + 1))
+        }
+        let inner = self.inner.lock_uncounted();
+        let chunk = std::mem::size_of::<Option<(BranchId, BranchState)>>() * super::table::CHUNK;
+        let mut out = vec![
+            ("branches.chunks", inner.branches.chunks_for_test(), chunk),
+            map("parked", &inner.parked),
+            set("pending_holders", &inner.pending_holders),
+            // Ordered maps: no regrowth (L2 slope, red 5aa62c9e7).
+            ("names.map", inner.names.map.len(), 0),
+            ("names.fresh", inner.names.fresh.len(), 0),
+            ("names.gone", inner.names.gone.len(), 0),
+        ];
+        // The name filter's tables at their real bytes (8 per slot; lead condition, review MED-2: the
+        // 0-byte listing of 4cb167221 blinded the regrowth test). They are grown by
+        // `grow_name_filter` on its own thread, off the mutex, which the regrowth test attributes
+        // by the create's own held allocations.
+        let (table, pending) = inner.names.filter.tables();
+        if let Some(t) = table {
+            out.push(("names.filter.table", t.cap(), t.cap() * 8));
+        }
+        if let Some(p) = pending {
+            out.push(("names.filter.pending", p.cap(), p.cap() * 8));
+        }
+        if let Some(cat) = inner.cat.as_ref() {
+            // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
+            out.push(("cat.dirty", cat.dirty.len(), 0));
+            out.push(set("cat.removed", &cat.removed));
+        }
+        out
+    }
+
+    /// Test builds (lead ruling f329b0d2a8): the group's `confirm_done` key.
+    #[cfg(test)]
+    pub(crate) fn confirm_done_for_test(&self) -> u64 {
+        self.group.confirm_done.load(Ordering::Acquire)
+    }
+
     /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
     /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
     #[cfg(test)]
@@ -7759,24 +8414,54 @@ impl BranchStore {
     }
 
     pub(crate) fn wait_name_filter(&self) {
-        if let Some(build) = self.name_filter_build.lock().take() {
-            let _ = build.join();
+        // Review REVIEW-claude-namefilter M2: a fork(2) child inherits the handle of a thread it
+        // does not have; it is joined only by the process that spawned it.
+        if let Some((pid, build)) = self.name_filter_build.lock().take() {
+            if pid == std::process::id() {
+                let _ = build.join();
+            }
         }
     }
 
-    /// Build a catalog store's name filter (`NameFilter`) after open, off the store mutex: the
-    /// names in the catalog, read on a connection of its own, plus every name applied while the
-    /// read ran — those held now (the resident and since-checkpoint names, seeded here under the
-    /// mutex) and those created from now on (`NameFilter::note`). A failed read leaves the filter
-    /// unbuilt: lookups keep asking the catalog.
+    /// Start the work the filter owes (`NameFilter::take_owed`), with the store mutex let go.
+    fn start_filter_work(&self, work: Option<FilterWork>) {
+        match work {
+            Some(FilterWork::Grow) => self.grow_name_filter(),
+            Some(FilterWork::Rebuild) => {
+                self.inner.lock().names.filter.rebuilds += 1;
+                self.start_name_filter();
+            }
+            None => {}
+        }
+    }
+
+    fn keep_filter_thread(&self, handle: crate::thread::JoinHandle<()>) {
+        *self.name_filter_build.lock() = Some((std::process::id(), handle));
+    }
+
+    /// Build a catalog store's name filter (`NameFilter`) off the store mutex, after open or as an
+    /// overflow's rebuild: the names in the catalog, read on a connection of its own, plus every
+    /// name applied while the read ran (the resident and since-checkpoint names, seeded under the
+    /// mutex, and those noted from then on into the `Building` state's pending table). A failed read
+    /// leaves the filter `Unbuilt`: lookups keep asking the catalog.
     fn start_name_filter(&self) {
+        // The pending table is allocated with the mutex let go: room for the names held now and as
+        // many again created while the scan runs.
+        let held = {
+            let inner = self.inner.lock();
+            if inner.cat.is_none() || !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+                return;
+            }
+            inner.names.map.len() + inner.names.fresh.len()
+        };
+        let pending = Arc::new(FilterTable::for_keys(held.saturating_mul(2).max(8192)));
         let reader = {
             let mut inner = self.inner.lock();
             let StoreInner { cat, names, sync, .. } = &mut *inner;
             let Some(cat) = cat.as_ref() else {
                 return;
             };
-            if names.filter.built.is_some() {
+            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
                 return;
             }
             let reader = match cat.catalog.writer(*sync) {
@@ -7786,11 +8471,15 @@ impl BranchStore {
                     return;
                 }
             };
-            let mut pending: HashSet<u64, BuildIdHasher> = HashSet::default();
+            let mut fits = true;
             for name in names.map.keys().chain(names.fresh.keys()) {
-                pending.insert(names.filter.hash(name));
+                fits &= pending.insert(names.filter.hash(name));
             }
-            names.filter.pending = Some(pending);
+            if !fits {
+                tracing::warn!("branch name filter not built: its pending table filled at the seed");
+                return;
+            }
+            names.filter.state = FilterState::Building { pending: pending.clone() };
             reader
         };
         let hasher = self.inner.lock().names.filter.hasher.clone();
@@ -7800,6 +8489,7 @@ impl BranchStore {
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
+        let mine = pending.clone();
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
@@ -7811,55 +8501,172 @@ impl BranchStore {
                 } else {
                     reader.name_hashes(|name| hasher.hash_one(name), &stop)
                 };
-                // The set of the scanned names is built here, off the store mutex: its one table of
-                // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
-                // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
-                // byte). Under the mutex only the names applied while the scan ran join it, and it
-                // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
-                // scanned names are inserted under the mutex, as before.
+                // The table of the scanned names is built here, off the store mutex: its N inserts
+                // were the O(N) background hold (LEAP L4's build guard: 147,464 B held at 10^4
+                // branches, 1,179,656 B at 10^5). Sized for the scanned names AND the pending ones,
+                // half as many again (24-48 bytes per name: `for_keys` is a power of two of at least
+                // 2n slots). Mutant `name_filter_built_under_mutex` (test builds only): the scanned
+                // names are inserted under the mutex, as before.
                 let under = fe_mutant("name_filter_built_under_mutex");
-                let mut scanned = scanned.map(|hashes| {
+                let scanned = scanned.map(|hashes| {
+                    let n = hashes.len().saturating_add(pending.len());
+                    let table = FilterTable::for_keys(n.saturating_add(n / 2));
                     if under {
-                        (HashSet::default(), hashes)
+                        (table, hashes)
                     } else {
-                        (hashes.into_iter().collect::<HashSet<u64, BuildIdHasher>>(), Vec::new())
+                        let fits = hashes.iter().all(|h| table.insert(*h));
+                        (table, if fits { Vec::new() } else { hashes })
                     }
                 });
-                // Room for the names applied meanwhile is made off the mutex too, so joining them
-                // never grows the table under it (a resize moves all N entries).
-                let mut inner = loop {
-                    let inner = shared.lock();
-                    let joining = inner.names.filter.pending.as_ref().map_or(0, HashSet::len);
-                    match scanned.as_mut() {
-                        Ok((built, _)) if !under && built.capacity() - built.len() < joining => {
-                            drop(inner);
-                            built.reserve(joining);
+                let table = {
+                    let mut inner = shared.lock();
+                    let f = &mut inner.names.filter;
+                    if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
+                        return;
+                    }
+                    match scanned {
+                        Ok((table, unbuilt)) => {
+                            if !unbuilt.iter().all(|h| table.insert(*h)) {
+                                f.overflow();
+                                return;
+                            }
+                            let table = Arc::new(table);
+                            f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
+                            f.builds += 1;
+                            table
                         }
-                        _ => break inner,
+                        Err(e) => {
+                            f.failed_scans += 1;
+                            f.state = FilterState::Unbuilt;
+                            tracing::debug!("branch name filter not built: {e}");
+                            return;
+                        }
                     }
                 };
-                let filter = &mut inner.names.filter;
-                let pending = filter.pending.take().unwrap_or_default();
-                match scanned {
-                    Ok((mut built, unbuilt)) => {
-                        built.extend(unbuilt);
-                        built.extend(pending);
-                        filter.built = Some(built);
-                        filter.builds += 1;
-                    }
-                    Err(e) => {
-                        filter.failed_scans += 1;
-                        tracing::debug!("branch name filter not built: {e}")
+                let copied = pending.copy_into(&table);
+                let mut inner = shared.lock();
+                let f = &mut inner.names.filter;
+                if matches!(&f.state, FilterState::Draining { table: t, pending: p } if Arc::ptr_eq(t, &table) && Arc::ptr_eq(p, &pending)) {
+                    if copied {
+                        f.state = FilterState::Ready { table: table.clone() };
+                    } else {
+                        f.overflow();
                     }
                 }
             });
         match spawned {
-            Ok(handle) => *self.name_filter_build.lock() = Some(handle),
+            Ok(handle) => self.keep_filter_thread(handle),
             Err(e) => {
                 tracing::warn!("branch name filter thread not started: {e}");
-                self.inner.lock().names.filter.pending = None;
+                let mut inner = self.inner.lock();
+                let f = &mut inner.names.filter;
+                if matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &mine)) {
+                    f.state = FilterState::Unbuilt;
+                }
             }
         }
+    }
+
+    /// Grow the name filter off the store mutex (`NameFilter`, lead ruling 2026-10-15), owed by the
+    /// create whose note left its `Ready` table past half full and started once that create has let
+    /// the mutex go. On a thread of its own: a table twice the size and a pending table are
+    /// allocated here; `Ready` becomes `Growing` (notes go to both); the old table and then the
+    /// pending one are copied into the new; `Growing` becomes `Draining` with the new table; the
+    /// pending one is copied again (what was noted between the copy and the swap); `Draining`
+    /// becomes `Ready`. Each change is one assignment in one hold, made only if the state is still
+    /// the one this growth left (an overflow meanwhile ends it); a copy that fails overflows the
+    /// filter in the same hold that would have installed it (review H1). The tables are freed here,
+    /// after the last unlock. Hooks (test builds): `filter_pause` stages 1-5, `filter_drain_fails`.
+    /// Mutant `name_filter_swap_skips_pending` (test builds only): `Growing` becomes `Ready` with the
+    /// new table and no pending copy, the planted race the concurrency oracle must catch.
+    fn grow_name_filter(&self) {
+        let shared = self.inner.clone();
+        let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
+            let old = match &shared.lock().names.filter.state {
+                FilterState::Ready { table } => table.clone(),
+                _ => return,
+            };
+            let grown = FilterTable::for_keys(old.cap());
+            let pending = Arc::new(FilterTable::for_keys(old.cap() / 2));
+            {
+                let mut inner = shared.lock();
+                let f = &mut inner.names.filter;
+                if !matches!(&f.state, FilterState::Ready { table } if Arc::ptr_eq(table, &old)) {
+                    return;
+                }
+                f.state = FilterState::Growing { table: old.clone(), pending: pending.clone() };
+            }
+            filter_pause(1);
+            let mut copied = old.copy_into(&grown);
+            filter_pause(2);
+            let skip = fe_mutant("name_filter_swap_skips_pending");
+            if !skip {
+                copied = copied && pending.copy_into(&grown);
+            }
+            let grown = Arc::new(grown);
+            filter_pause(3);
+            {
+                let mut inner = shared.lock();
+                let f = &mut inner.names.filter;
+                if !matches!(&f.state, FilterState::Growing { table, pending: p } if Arc::ptr_eq(table, &old) && Arc::ptr_eq(p, &pending)) {
+                    return;
+                }
+                if !copied {
+                    f.overflow();
+                    return;
+                }
+                f.state = if skip {
+                    FilterState::Ready { table: grown.clone() }
+                } else {
+                    FilterState::Draining { table: grown.clone(), pending: pending.clone() }
+                };
+                f.builds += 1;
+                f.moved_max = f.moved_max.max(old.len() as u64);
+                if skip {
+                    return;
+                }
+            }
+            filter_pause(4);
+            // The failpoint stops the copy before it starts, as a copy refused at the name does.
+            let copied = !filter_drain_fails() && pending.copy_into(&grown);
+            filter_pause(5);
+            let mut inner = shared.lock();
+            let f = &mut inner.names.filter;
+            if matches!(&f.state, FilterState::Draining { table, pending: p } if Arc::ptr_eq(table, &grown) && Arc::ptr_eq(p, &pending)) {
+                if copied {
+                    f.state = FilterState::Ready { table: grown.clone() };
+                } else {
+                    f.overflow();
+                }
+            }
+        });
+        match spawned {
+            Ok(handle) => self.keep_filter_thread(handle),
+            Err(e) => tracing::warn!("branch name filter growth not started: {e}"),
+        }
+    }
+
+    /// Test builds: the name filter's state's name, and the rebuilds started after an overflow.
+    #[cfg(test)]
+    pub(crate) fn name_filter_state_for_test(&self) -> (&'static str, u64) {
+        let inner = self.inner.lock();
+        let f = &inner.names.filter;
+        let name = match f.state {
+            FilterState::Unbuilt => "Unbuilt",
+            FilterState::Building { .. } => "Building",
+            FilterState::Ready { .. } => "Ready",
+            FilterState::Growing { .. } => "Growing",
+            FilterState::Draining { .. } => "Draining",
+            FilterState::Overflowed => "Overflowed",
+        };
+        (name, f.rebuilds)
+    }
+
+    /// Test builds: the name filter's own answer for `name` ("absent, ask no catalog"), the step
+    /// `name_lookup` takes after the resident names (`names.map`) miss.
+    #[cfg(test)]
+    pub(crate) fn name_filter_says_absent_for_test(&self, name: &str) -> bool {
+        self.inner.lock().names.filter.says_absent(name)
     }
 
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
@@ -8193,6 +9000,13 @@ impl BranchStore {
         self.group.confirm_hold.load(Ordering::Acquire)
     }
 
+    /// Test builds: the cut offset of the background compaction last held at
+    /// `HOLD_COMPACT_INSTALLED` (`Group::held_cut_from`).
+    #[cfg(test)]
+    pub(crate) fn held_cut_from_for_test(&self) -> u64 {
+        self.group.held_cut_from.load(Ordering::Acquire)
+    }
+
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
     /// observing only).
     pub(crate) fn confirm_counts(&self) -> [u64; 2] {
@@ -8302,6 +9116,17 @@ impl Drop for BranchStore {
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
+        // The worker stops once its channel closes; joined only in the process that started it.
+        if let Some(w) = self.ckpt_worker.lock().take() {
+            if w.pid == std::process::id() {
+                drop(w.tx);
+                if w.handle.join().is_err() {
+                    tracing::warn!("the branch catalog checkpoint worker panicked");
+                }
+            } else {
+                std::mem::forget(w);
+            }
+        }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
@@ -8604,12 +9429,14 @@ impl StoreInner {
         child: BranchId,
         parent: BranchId,
         now: u64,
-        name: Option<&str>,
-    ) -> (Vec<Record>, Option<(u64, u64)>) {
+        name: Option<&Arc<str>>,
+    ) -> ([Option<Record>; 2], Option<(u64, u64)>) {
         // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
         // trunk's child, whatever the parent was).
         let logged_parent = if fe_mutant("fork_without_parent") { 0 } else { parent.0 };
-        let mut records = vec![match name {
+        // In place, no Vec (budget create_allocates_at_most_once_under_the_store_mutex): a fork
+        // logs its record and at most a lease.
+        let mut records = [Some(match name {
             None => Record::Fork {
                 child: child.0,
                 parent: logged_parent,
@@ -8617,15 +9444,15 @@ impl StoreInner {
             Some(name) => Record::ForkNamed {
                 child: child.0,
                 parent: logged_parent,
-                name: name.to_string(),
+                name: name.clone(),
             },
-        }];
+        }), None];
         let lease = self
             .default_lease
             .filter(|_| name.is_none())
             .map(|ttl| (now.saturating_add(millis(ttl)), now));
         if let Some((deadline_ms, now_ms)) = lease {
-            records.push(Record::Lease {
+            records[1] = Some(Record::Lease {
                 branch: child.0,
                 deadline_ms,
                 now_ms,
@@ -9224,12 +10051,14 @@ impl StoreInner {
                     }
                     self.cat = Some(CatState::new(catalog, self.sync, 0)?);
                     // A new catalog holds no name: the filter is built, empty, at once.
-                    if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
-                        let mut built = HashSet::default();
+                    if matches!(self.names.filter.state, FilterState::Unbuilt) {
+                        // The catalog's creation (the first create of a catalog store) makes the
+                        // table, once; every later create only fills it.
+                        let table = FilterTable::for_keys(self.names.map.len());
                         for name in self.names.map.keys() {
-                            built.insert(self.names.filter.hash(name));
+                            table.insert(self.names.filter.hash(name));
                         }
-                        self.names.filter.built = Some(built);
+                        self.names.filter.state = FilterState::Ready { table: Arc::new(table) };
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
@@ -9721,6 +10550,7 @@ impl StoreInner {
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
+        ckpt_held("install.snapshot_ended");
         cat.flight = false;
         if let Err(e) = written {
             // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
@@ -9766,8 +10596,19 @@ impl StoreInner {
         // A failure before its rename leaves the old log in use, whose checkpoint marker says
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
-            Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
-            None => journal.rewrite_from(cap.log_from, cap.generation),
+            Some(prep) => {
+                #[cfg(test)]
+                INSTALL_CUTS.fetch_add(1, Ordering::Relaxed);
+                ckpt_held("install.before_cut");
+                let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
+                ckpt_held("install.cut_finished");
+                cut
+            }
+            None => {
+                #[cfg(test)]
+                INSTALL_REWRITES.fetch_add(1, Ordering::Relaxed);
+                journal.rewrite_from(cap.log_from, cap.generation)
+            }
         };
         if rewritten.is_err() {
             // The old log stays, correct and longer; not cut again before another threshold's
@@ -10652,7 +11493,7 @@ impl StoreInner {
                     BranchId(*child),
                     None,
                     Handle::Detached,
-                    Some(Arc::from(name.as_str())),
+                    Some(name.clone()),
                 )
                 .map_err(corrupt),
             Record::Commit { branch, pages } => {
@@ -12255,6 +13096,26 @@ mod sota_tree_tests {
 mod group_tests {
     use super::*;
 
+    /// Budget create_allocates_no_table_of_every_branch_under_the_store_mutex (64 KiB per create
+    /// under the store mutex) measured one create allocating 2,195,727 bytes as the live branches
+    /// reached 33,056 (artie raw l5-branch_b88c38329.txt): a new chunk of the branch table
+    /// (table.rs: CHUNK entries, allocated whole under the mutex). The chunk's own size must fit
+    /// the budget; the message prints the entry's size, so the fix can be sized from it.
+    #[test]
+    fn a_branch_table_chunk_fits_the_create_allocation_budget() {
+        let entry = std::mem::size_of::<Option<(BranchId, BranchState)>>();
+        let chunk = entry * super::super::table::CHUNK;
+        assert!(
+            chunk <= 64 << 10,
+            "CLAIM: a branch table chunk is {chunk} bytes ({} entries of {entry}; BranchState {}, Lineage {}, \
+             PageMap {}), over the 64 KiB a create may allocate under the store mutex",
+            super::super::table::CHUNK,
+            std::mem::size_of::<BranchState>(),
+            std::mem::size_of::<Lineage>(),
+            std::mem::size_of::<PageMap>()
+        );
+    }
+
     /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
     /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
     /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
@@ -12333,6 +13194,80 @@ mod group_tests {
             group.lock().confirm.is_some(),
             "a frameless ordered upgrade dropped the last flight's confirmation"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_wait_tests {
+    use super::*;
+
+    /// Codex C25 MED 1 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
+    /// `StoreMutex::lock` read `compacting` only before it tried the mutex, so a requester that
+    /// read it even, then found a background compaction's counted hold begun and holding the mutex,
+    /// waited behind it uncounted, and a zero counter could not show A29's exclusion. Three
+    /// schedules on a real StoreMutex and Compacting, no disk: uncontended (counter +0), a
+    /// compaction marked before the precheck (+1, the control), and one begun after the precheck
+    /// (`AFTER_PRECHECK`) and holding the mutex when the requester locks: it must be counted too.
+    #[test]
+    fn a_lock_behind_a_compaction_begun_after_its_precheck_is_counted() {
+        let m = StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None));
+        let waits = |m: &StoreMutex| m.compaction_waits.load(Ordering::Relaxed);
+        let w0 = waits(&m);
+        drop(m.lock());
+        assert_eq!(waits(&m), w0, "premise: an uncontended lock was counted as waiting behind a compaction");
+        // Holds the mutex in a counted compaction hold until told to let go; `marked` is sent once
+        // it holds it.
+        let compactor = |m: &StoreMutex, marked: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>| {
+            let counted = Compacting::begin(m);
+            let guard = m.lock_uncounted();
+            marked.send(()).unwrap();
+            release.recv().unwrap();
+            drop(guard);
+            drop(counted);
+        };
+        for race in [false, true] {
+            let before = waits(&m);
+            let (marked_tx, marked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocked = std::thread::scope(|s| {
+                let mref = &m;
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                s.spawn(move || {
+                    go_rx.recv().unwrap();
+                    compactor(mref, marked_tx, release_rx)
+                });
+                if race {
+                    // After the precheck: the compaction begins and takes the mutex first.
+                    let mut once = Some((go_tx, marked_rx));
+                    AFTER_PRECHECK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            if let Some((go, marked)) = once.take() {
+                                go.send(()).unwrap();
+                                marked.recv().unwrap();
+                            }
+                        }))
+                    });
+                } else {
+                    go_tx.send(()).unwrap();
+                    marked_rx.recv().unwrap();
+                }
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    release_tx.send(()).unwrap();
+                });
+                let t = std::time::Instant::now();
+                drop(m.lock());
+                AFTER_PRECHECK.with(|h| *h.borrow_mut() = None);
+                release.join().unwrap();
+                t.elapsed() >= std::time::Duration::from_millis(50)
+            });
+            assert!(blocked, "premise: race={race}: the requester did not wait behind the compaction's hold");
+            assert_eq!(
+                waits(&m) - before,
+                1,
+                "CLAIM: race={race}: a lock that waited behind a background compaction's counted hold was not counted"
+            );
+        }
     }
 }
 

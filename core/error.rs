@@ -386,6 +386,10 @@ impl From<turso_ext::ResultCode> for LimboError {
 pub const SQLITE_ERROR: usize = 1;
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_CHECK: usize = SQLITE_CONSTRAINT | (1 << 8);
+/// A domain CHECK's failure (`schema::domain_check_failure`): a CHECK constraint failure whose
+/// description is PostgreSQL's whole message, raised unprefixed. Not an SQLite code: the error it
+/// becomes is a `Constraint`, whose result code is SQLITE_CONSTRAINT as for every CHECK.
+pub const SQLITE_CONSTRAINT_CHECK_DOMAIN: usize = SQLITE_CONSTRAINT | (100 << 8);
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 #[allow(dead_code)]
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);

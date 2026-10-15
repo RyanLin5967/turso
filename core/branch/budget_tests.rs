@@ -51,7 +51,12 @@ const GROWTH: u64 = 23_040;
 /// The checkpoint arm's threshold (the default is 1 MiB) and its rounds: about 130 log bytes a
 /// round, so a checkpoint every ~60 rounds.
 const CKPT_THRESHOLD: u64 = 8 << 10;
-const CKPT_ROUNDS: u64 = 240;
+/// FLAGGED FIXTURE CHANGE, lead-ruled (class (b) acceptance, DECISIONS 2026-10-15): 240 rounds made
+/// about 3 checkpoints, and with attribution by thread fewer than 3 of them were attributable, so
+/// the checkpoint cells refused. 960 rounds make about 12. The claims and thresholds are unchanged;
+/// `checkpoint_excess` still refuses below 3 attributable installs and reports both counts, and
+/// `a_checkpoint_flushes_at_most_three_times_over_every_round` bounds the unselected total.
+const CKPT_ROUNDS: u64 = 960;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
@@ -272,8 +277,14 @@ fn put_exceptions(s: &mut Sample, a: [u64; 4], b: [u64; 4]) {
 
 fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outside) -> Sample {
     let mut s = Sample::new();
-    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+    // Class (b): the window's OWN syscalls (`probe::end_owning`'s attribution: the kernel's count
+    // with no other thread running, or the per-thread counter's where it covered the window), or
+    // no count at all; the task's raw delta is kept apart for the fire-checks.
+    if let Some(d) = s1.attributed_syscalls {
         s.insert("syscalls", d);
+    }
+    if let Some(d) = kernel_delta(s0.syscalls, s1.syscalls) {
+        s.insert("syscalls_task", d);
     }
     if let (Some(a), Some(b)) = (s0.instructions, s1.instructions) {
         s.insert("instructions", delta(a, b));
@@ -293,6 +304,10 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("locks", delta(s0.t_locks, s1.t_locks));
     s.insert("locks_process", delta(s0.locks, s1.locks));
     s.insert("held_syscalls", delta(s0.held_syscalls, s1.held_syscalls));
+    // Class (b): the threads that made the window unattributable, and the holds inside it that
+    // could not be attributed to their holder (`probe::end_owning`, `store_unlocked`).
+    s.insert("foreign_threads", s1.foreign);
+    s.insert("held_unattributed", delta(s0.held_unattributed, s1.held_unattributed));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
@@ -367,17 +382,30 @@ fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
 /// whether it left one; `quiet`, that nothing else ran in the window, so the process-wide counts
 /// are its own.
 fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (R, Sample) {
+    measure_owning(db, base, &[], f)
+}
+
+/// `measure`, charging the window with the work of the store threads named in `owned` (a
+/// persistent worker the operation dispatches, or the confirmation writer whose own cost a cell
+/// measures). Class (b), DECISIONS 994f7d41e0: the window's syscalls are the measuring thread's,
+/// its spawns' and its owned threads' only if no other thread ran inside it
+/// (`probe::end_owning`); a window where one did is not quiet, and `quiet` refuses a cell where
+/// fewer than half its samples are. The harness's own waits inside the window are declared
+/// syscall-free (`probe::spinning`), as `fc_writer_settled_cost` and `fc_threads_1000` check.
+fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: impl FnOnce() -> R) -> (R, Sample) {
     let settled = quiesce(db, base);
     let o0 = Outside::read(db);
     let c0 = db.branch_confirm_counts();
     let s0 = probe::begin();
     let r = f();
     let left = probe::threads() != base;
-    let (synced, parked) = absorb_confirm(db, &s0);
-    let back = spin_settled(base, std::time::Duration::from_secs(30));
+    let ((synced, parked), back) = probe::spinning(|| {
+        let absorbed = absorb_confirm(db, &s0);
+        (absorbed, spin_settled(base, std::time::Duration::from_secs(30)))
+    });
     // Review 2 L3: the confirmation count is read inside the window, before its end snapshot.
     let c1 = db.branch_confirm_counts();
-    let s1 = probe::end();
+    let s1 = probe::end_owning(owned);
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
     let confirms = delta(c0[0], c1[0]);
@@ -387,7 +415,9 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let quiet = settled && back && parked && absorbed && (left || s["allocs_process"] == s["allocs"]);
+    let attributed = s1.attributed_syscalls.is_some() && s1.held_unattributed == s0.held_unattributed;
+    let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
+
     s.insert("writer_parked", u64::from(parked));
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
@@ -520,21 +550,69 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         built.incarnation = opened.incarnation;
         // The background threads are waited out by spinning (no syscall), not by joining them: a
         // join that blocks issues syscalls of its own, as many as the timing makes.
-        let (_, parked) = absorb_confirm(&opened, &s0);
-        let settled = parked && spin_settled(base, std::time::Duration::from_secs(30));
+        let settled = probe::spinning(|| {
+            let (_, parked) = absorb_confirm(&opened, &s0);
+            parked && spin_settled(base, std::time::Duration::from_secs(30))
+        });
         let s_all = probe::end();
         opened.branch_wait_name_filter();
         let settled = settled && quiesce(&opened, base);
         let o1 = Outside::read(&opened);
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
-        a.insert("quiet", u64::from(t0 == base && t_open == base));
+        // Class (b): a recovery window is the opening thread's and the threads the open spawned;
+        // another thread that ran inside it makes it unattributable (`probe::end`).
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some()));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled));
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.attributed_syscalls.is_some()));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
     (db.unwrap(), base)
+}
+
+/// Lead order (2026-10-15, attribution item 1): `create_allocates_at_most_once_under_the_store_mutex`
+/// and `create_is_independent_of_live_branches` flip between runs (n1e4_small's steady create
+/// allocates 2 when red, 1 when green). The allocation counters are this thread's own
+/// (`t_allocs`), so the extra allocation is the creating thread's. This diagnostic builds the
+/// n1e4_small cell four times in one process (each build its own hash keys), reopens it as the
+/// budget does, and runs the budget's rounds' create and delete, recording each create's
+/// allocations on this thread with a backtrace of every one past the first
+/// (`budget_probe::record_allocs`). Printed only: the per-build counts, and each distinct
+/// backtrace of an extra allocation with how often it was seen.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_n1e4_create_allocations_by_site() {
+    for build_no in 0..4 {
+        let mut built = build("diag_n1e4_small", 10_000, false, true);
+        let mut out = String::new();
+        let (db, _base) = recover("diag_n1e4_small", &mut built, 1, &mut out);
+        let trunk = db.connect().unwrap();
+        let mut counts: std::collections::BTreeMap<usize, u32> = Default::default();
+        let mut sites: std::collections::BTreeMap<String, u32> = Default::default();
+        for i in 0..40u64 {
+            let name = format!("m-{i:04}");
+            probe::record_allocs(true, 1);
+            trunk.create_branch(&name).unwrap();
+            let (n, sizes, traces) = probe::recorded_allocs();
+            probe::record_allocs(false, usize::MAX);
+            *counts.entry(n).or_default() += 1;
+            for t in traces {
+                // The frames inside this crate, the allocator's own left out: the site.
+                let frames: Vec<&str> = t
+                    .lines()
+                    .filter(|l| l.contains("turso_core::") && !l.contains("budget_probe"))
+                    .take(6)
+                    .collect();
+                *sites.entry(format!("{} sizes={sizes:?}\n    {}", t.lines().next().unwrap_or(""), frames.join("\n    "))).or_default() += 1;
+            }
+            db.drop_branch(&name).unwrap();
+        }
+        println!("build {build_no}: allocations per create (count: creates) {counts:?}");
+        for (site, n) in &sites {
+            println!("  x{n} {site}");
+        }
+    }
 }
 
 /// `k` rounds, each on a fresh named branch: create, connect by name, first write, disconnect,
@@ -628,9 +706,10 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     for i in 0..CKPT_ROUNDS {
         let name = format!("c-{i:04}");
         let sql = format!("UPDATE t SET v = 'c{i:04}' WHERE id = {}", 1 + i % 50);
-        let (_, s_create) = measure(db, base, || trunk.create_branch(&name).unwrap());
+        // The checkpoint each starts runs on the persistent checkpoint worker: owned.
+        let (_, s_create) = measure_owning(db, base, &["branch-checkpoint"], || trunk.create_branch(&name).unwrap());
         let c = db.connect_named(&name).unwrap();
-        let (_, s_write) = measure(db, base, || c.execute(&sql).unwrap());
+        let (_, s_write) = measure_owning(db, base, &["branch-checkpoint"], || c.execute(&sql).unwrap());
         drop(c);
         line(out, cell, "ckpt_create", i, &s_create);
         line(out, cell, "ckpt_first_write", i, &s_write);
@@ -872,13 +951,14 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
         db.branch_compact_now().unwrap();
         db.branch_checkpoint_wait();
         let (_, _) = measure(db, base, || trunk.create_branch(&format!("u-{i:04}")).unwrap());
-        let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
+        // These cells measure the confirmation writer's own cost (its word, its wake): owned.
+        let (_, s_written) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("w-{i:04}")).unwrap());
         hold_word(true);
-        let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
+        let (_, s_held) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("h-{i:04}")).unwrap());
         // Review 2 H2: the reference. `h` landed with no proved word pending (w's was written), so its
         // landing woke the parked writer (`confirm_cv.notify_one`, on the acknowledging thread); this
         // second held create lands on h's pending word and wakes no one.
-        let (_, s_reference) = measure(db, base, || trunk.create_branch(&format!("r-{i:04}")).unwrap());
+        let (_, s_reference) = measure_owning(db, base, &["branch-confirm"], || trunk.create_branch(&format!("r-{i:04}")).unwrap());
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
@@ -1509,6 +1589,109 @@ fn run_instruments(cell: &str) -> String {
         sample_of(&s0, &s1, &Outside::none(), &Outside::none())
     };
     put("fc_nothing", &window(&mut || {}));
+    let mut loaded = Sample::new();
+    loaded.insert("loaded", u64::from(probe::per_thread_counter_loaded()));
+    put("fc_shim_loaded", &loaded);
+    // Class (b)'s attribution by thread, forced both ways. A helper thread that exists before the
+    // window waits on an atomic, then makes 10 syscalls; the window must refuse its count.
+    let helper = |declared: bool, closes: usize| {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (g, d, r) = (go.clone(), done.clone(), ready.clone());
+        let h = std::thread::spawn(move || {
+            // Ready (declared, when it is) before the window opens; done, then lingering until the
+            // window has closed (`go` cleared), so its declaration covers the whole window.
+            let body = || {
+                r.store(true, Release);
+                while !g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..closes {
+                    // SAFETY: closing an invalid descriptor only fails (EBADF): one syscall each.
+                    unsafe { libc::close(-1) };
+                }
+                d.store(true, Release);
+                while g.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            };
+            if declared {
+                probe::spinning(body)
+            } else {
+                body()
+            }
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        (go, done, h)
+    };
+    let wait = |done: &std::sync::atomic::AtomicBool| {
+        while !done.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    };
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_window",
+            &window(&mut || {
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    {
+        // A declared spinner making no syscall does not make the window foreign.
+        let (go, done, h) = helper(true, 0);
+        put(
+            "fc_spinner_window",
+            &window(&mut || {
+                for _ in 0..7 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
+    put(
+        "fc_spawned_window",
+        &window(&mut || {
+            // A thread the window spawns is the window's own: its 5 syscalls are counted.
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+            })
+            .join()
+            .unwrap();
+        }),
+    );
+    {
+        let (go, done, h) = helper(false, 10);
+        put(
+            "fc_foreign_hold",
+            &window(&mut || {
+                probe::arm(true);
+                probe::store_locked();
+                go.store(true, std::sync::atomic::Ordering::Release);
+                wait(&done);
+                probe::store_unlocked();
+                probe::arm(false);
+            }),
+        );
+        go.store(false, std::sync::atomic::Ordering::Release);
+        h.join().unwrap();
+    }
     put(
         "fc_close_37",
         &window(&mut || {
@@ -2323,6 +2506,41 @@ const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 
 // ---- the instruments ----
 
+/// Class (b) (DECISIONS 994f7d41e0): the syscall counts are attributed by thread. A window in which
+/// a thread that existed at its start made syscalls has NO syscall count and names the foreign
+/// thread; a declared spinner making none, and a thread the window spawned, do not make it foreign
+/// (the window keeps exactly its own 7, and the spawn's 5); a hold during which another thread
+/// ran is unattributable, never counted as held. Forced both ways, in the instruments' child.
+#[test]
+fn the_budget_syscall_counts_are_attributed_by_thread() {
+    if in_child() {
+        return;
+    }
+    let c = cell("instruments");
+    let row = |op: &str| c.ops.get(op).and_then(|s| s.first()).unwrap_or_else(|| panic!("{op}: no sample")).clone();
+    // Two modes: the per-thread counter (`feshim`) loaded, which attributes a window another thread
+    // ran in exactly (here the window's own 0, the helper's 10 excluded), or not, which refuses it.
+    let shim = row("fc_shim_loaded")["loaded"] == 1;
+    let foreign = row("fc_foreign_window");
+    assert!(foreign["foreign_threads"] >= 1, "premise: the helper thread did not run inside the window: {foreign:?}");
+    if shim {
+        assert_eq!(foreign.get("syscalls").copied(), Some(0), "CLAIM: the per-thread counter charged the helper's syscalls to the window: {foreign:?}");
+    } else {
+        assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count: {foreign:?}");
+    }
+    let spinner = row("fc_spinner_window");
+    assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
+    let spawned = row("fc_spawned_window");
+    assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
+    assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
+    let hold = row("fc_foreign_hold");
+    let want_unattributed = if shim { 0 } else { 1 };
+    assert_eq!(hold["held_unattributed"], want_unattributed, "CLAIM: a hold another thread ran in was attributed wrongly (counter loaded: {shim}): {hold:?}");
+    assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
+    let nothing = row("fc_nothing");
+    assert_eq!((nothing["foreign_threads"], nothing["held_unattributed"]), (0, 0), "CLAIM: an empty window was not attributed: {nothing:?}");
+}
+
 /// Every counter the budgets read moves by exactly what was done, and not at all when nothing was
 /// (forced both ways, in a child that runs nothing else).
 #[test]
@@ -2904,14 +3122,35 @@ fn recovery_appends_nothing_to_the_log() {
 /// (`ckpt_started == 0`), summed per counter, with the checkpoints installed. Refuses fewer than
 /// three.
 fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
+    let (installed, excess, _) = checkpoint_excess_of(spec, true);
+    (installed, excess)
+}
+
+/// The excess of the operations that started a checkpoint over their calm minimum, summed, and the
+/// checkpoints they installed: over the QUIET samples only (`quiet_only`, every budget but the
+/// selection-bias check) or over every sample. Reports the checkpoint-starting rounds attributable
+/// and refused. With `quiet_only`, refuses below three attributable installs (class (b): never a
+/// verdict from fewer).
+fn checkpoint_excess_of(spec: &str, quiet_only: bool) -> (u64, BTreeMap<&'static str, i64>, (u64, u64)) {
     let c = cell(spec);
     let mut excess: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut installed = 0;
+    let (mut attributable, mut refused) = (0u64, 0u64);
     for op in ["ckpt_create", "ckpt_first_write"] {
+        let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
         let samples = quiet(&c, op);
         let calm: Vec<&&Map> = samples.iter().filter(|s| s["ckpt_started"] == 0).collect();
         assert!(calm.len() * 2 >= samples.len(), "{spec}: {op}: most operations started a checkpoint");
-        for s in samples.iter().filter(|s| s["ckpt_started"] > 0) {
+        for s in all.iter().filter(|s| s["ckpt_started"] > 0) {
+            let quiet = s.get("quiet").copied().unwrap_or(1) == 1;
+            if quiet {
+                attributable += 1;
+            } else {
+                refused += 1;
+            }
+            if quiet_only && !quiet {
+                continue;
+            }
             installed += s["ckpt_installed"];
             for k in ["syscalls", "held_syscalls", "held_syncs", "fsync", "full_fsync", "barrier", "locks_process", "catalog_queries"] {
                 let Some(&v) = s.get(k) else { continue };
@@ -2920,8 +3159,13 @@ fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
             }
         }
     }
-    assert!(installed >= 3, "{spec}: premise: at least three checkpoints installed ({installed})");
-    (installed, excess)
+    if quiet_only {
+        assert!(
+            installed >= 3,
+            "{spec}: premise: at least three checkpoints installed in attributable rounds ({installed}; checkpoint rounds attributable {attributable}, refused {refused})"
+        );
+    }
+    (installed, excess, (attributable, refused))
 }
 
 /// Review 1 #7 and the engine's b79dc250e (a fuzzy checkpoint issues no sync inside the store
@@ -2980,6 +3224,28 @@ fn a_checkpoint_flushes_at_most_three_times() {
         assert!(
             full <= 3 * n as i64 && other <= n as i64,
             "{spec}: {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
+        );
+    }
+}
+
+/// The lead's selection-bias condition on the CKPT_ROUNDS ruling: the flush budget over EVERY
+/// checkpoint-starting round, attributable or not (the engine's flush counters, not the syscall
+/// attribution), with each operation's own calm cost subtracted, so a cost that appears only in the
+/// overlapping, refused rounds cannot hide behind the selection. Same thresholds as
+/// `a_checkpoint_flushes_at_most_three_times`: 3 full flushes and 1 other sync per checkpoint.
+#[test]
+fn a_checkpoint_flushes_at_most_three_times_over_every_round() {
+    if in_child() {
+        return;
+    }
+    for spec in ["ckpt_n10", "ckpt_n1e4"] {
+        let (n, excess, (attributable, refused)) = checkpoint_excess_of(spec, false);
+        assert!(n >= 3, "{spec}: premise: at least three checkpoints installed over every round ({n})");
+        let full = excess.get(FULL).copied().unwrap_or(0);
+        let other = excess.get(NOT_FULL).copied().unwrap_or(0) + excess.get("barrier").copied().unwrap_or(0);
+        assert!(
+            full <= 3 * n as i64 && other <= n as i64,
+            "{spec}: over every round ({attributable} attributable, {refused} refused): {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
         );
     }
 }

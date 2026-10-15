@@ -275,21 +275,47 @@ fn cur_key(branch: u64, page: u32) -> Result<i64> {
     Ok(((branch as i64) << 32) | page as i64)
 }
 
+/// One prepared catalog statement, boxed: a `Statement` is ~1.6 KB inline, so ~55 of them made
+/// `Catalog` 87 KB and every frame holding one (an open, a `CatState`) larger than clippy's
+/// `large_stack_frames` bound (lead order 6: turso_core's clippy errors blocked the wire's).
+///
+/// Compiled on first use, not at the catalog's open (budget
+/// a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex: a first create compiled 118
+/// statements under the store mutex, two handles' worth, though the create uses almost none). Mutant
+/// `catalog_statements_compiled_at_open` (test builds only): all compiled at the open, as before.
 struct Stmt {
-    stmt: Statement,
+    sql: &'static str,
+    conn: Arc<Connection>,
+    stmt: Option<Box<Statement>>,
 }
 
 impl Stmt {
-    fn rows(&mut self, params: &[Value], counters: &mut CatalogCounters) -> Result<Vec<Vec<Value>>> {
-        self.stmt.reset()?;
-        for (i, p) in params.iter().enumerate() {
-            self.stmt
-                .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
+    fn new(conn: &Arc<Connection>, sql: &'static str) -> Result<Stmt> {
+        let mut stmt = Stmt { sql, conn: conn.clone(), stmt: None };
+        if crate::branch::store::fe_mutant("catalog_statements_compiled_at_open") {
+            stmt.get()?;
         }
-        let rows = self.stmt.run_collect_rows();
+        Ok(stmt)
+    }
+
+    /// The compiled statement, compiling it the first time.
+    fn get(&mut self) -> Result<&mut Statement> {
+        if self.stmt.is_none() {
+            self.stmt = Some(Box::new(self.conn.prepare(self.sql)?));
+        }
+        Ok(self.stmt.as_mut().expect("compiled above"))
+    }
+
+    fn rows(&mut self, params: &[Value], counters: &mut CatalogCounters) -> Result<Vec<Vec<Value>>> {
+        let stmt = self.get()?;
+        stmt.reset()?;
+        for (i, p) in params.iter().enumerate() {
+            stmt.bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
+        }
+        let rows = stmt.run_collect_rows();
         // Reset at once, finished or not: a statement left un-reset must hold no read mark on the
         // catalog's WAL (a held mark keeps the WAL from ever restarting; PREREG A7).
-        self.stmt.reset()?;
+        stmt.reset()?;
         let rows = rows?;
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
@@ -305,14 +331,15 @@ impl Stmt {
         counters: &mut CatalogCounters,
         mut f: impl FnMut(&crate::Row) -> Result<()>,
     ) -> Result<()> {
-        self.stmt.reset()?;
+        let stmt = self.get()?;
+        stmt.reset()?;
         let mut n = 0u64;
-        let ran = self.stmt.run_with_row_callback(|row| {
+        let ran = stmt.run_with_row_callback(|row| {
             n += 1;
             f(row)
         });
         // Reset at once, finished or not (see `rows`).
-        self.stmt.reset()?;
+        stmt.reset()?;
         ran?;
         counters.queries += 1;
         counters.rows_read += n;
@@ -322,13 +349,13 @@ impl Stmt {
     }
 
     fn exec(&mut self, params: &[Value], counters: &mut CatalogCounters) -> Result<()> {
-        self.stmt.reset()?;
+        let stmt = self.get()?;
+        stmt.reset()?;
         for (i, p) in params.iter().enumerate() {
-            self.stmt
-                .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
+            stmt.bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
         }
-        let done = self.stmt.run_ignore_rows();
-        self.stmt.reset()?;
+        let done = stmt.run_ignore_rows();
+        stmt.reset()?;
         done?;
         counters.queries += 1;
         counters.rows_written += 1;
@@ -544,8 +571,24 @@ impl Catalog {
             Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
-        for sql in SCHEMA {
-            conn.execute(*sql)?;
+        // One transaction for the whole schema (budget a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex:
+        // a first create committed 14 times, one per statement). Mutant `catalog_schema_per_statement`
+        // (test builds only): each statement its own commit, as before.
+        let one = !crate::branch::store::fe_mutant("catalog_schema_per_statement");
+        if one {
+            conn.execute("BEGIN")?;
+        }
+        let created = SCHEMA.iter().try_for_each(|sql| conn.execute(*sql));
+        if one {
+            match created {
+                Ok(()) => conn.execute("COMMIT")?,
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        } else {
+            created?;
         }
         Self::prepared(db, conn, sync)
     }
@@ -570,7 +613,7 @@ impl Catalog {
             conn.execute("PRAGMA fullfsync = ON")?;
         }
         conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
-        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
+        let p = |sql: &'static str| -> Result<Stmt> { Stmt::new(&conn, sql) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
@@ -1029,6 +1072,11 @@ impl Catalog {
 
     /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block
     /// nobody (F-FZ phase 4, before the TRUNCATE attempt).
+    /// The catalog WAL file's length (0 when it does not exist): a stat, no query.
+    pub(crate) fn wal_len(&self) -> u64 {
+        std::fs::metadata(self._db.wal_path()).map_or(0, |m| m.len())
+    }
+
     pub(crate) fn wal_passive(&mut self) -> Result<()> {
         self.conn
             .prepare("PRAGMA wal_checkpoint(PASSIVE)")?

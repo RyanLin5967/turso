@@ -425,6 +425,24 @@ pub(crate) fn eq_agrees_with_encoding(type_def: &TypeDef) -> bool {
     }
 }
 
+/// Whether an equality between a column of the custom type `type_name` (`type_def`) and the operand
+/// `key` compares through the type's operator (`find_custom_type_operator`): `key` is a column of
+/// the same type, or an operand the type takes (`operand_compatible`). Otherwise the equality takes
+/// the plain comparison, which never passes `key` to the type's '=' (a TEXT join column against
+/// numeric, `a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does`).
+pub(crate) fn key_takes_type_operator(
+    key: &ast::Expr,
+    type_name: &str,
+    type_def: &TypeDef,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> bool {
+    match expr_custom_type_info(key, referenced_tables, resolver) {
+        Some(info) => info.type_name.eq_ignore_ascii_case(type_name),
+        None => operand_compatible(key, type_def.value_input_type(), resolver),
+    }
+}
+
 pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
     let eq = type_eq_function(type_def);
     if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {
@@ -629,7 +647,7 @@ pub(super) fn emit_domain_cast_constraints(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
+    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
 
     let any_not_null = chain.iter().any(|td| td.not_null);
 
@@ -645,16 +663,10 @@ pub(super) fn emit_domain_cast_constraints(
     }
 
     for td in chain {
-        for (i, dc) in td.domain_checks.iter().enumerate() {
-            let constraint_name = dc
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{}_{}", td.name, i));
+        for (dc, constraint_name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
 
             // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
+            program.id_register_overrides.insert("value", reg);
 
             let expr_result_reg = program.alloc_register();
             translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
@@ -676,11 +688,8 @@ pub(super) fn emit_domain_cast_constraints(
             });
 
             program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "value for domain {} violates check constraint \"{}\"",
-                    td.name, constraint_name
-                ),
+                err_code: crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN,
+                description: crate::schema::domain_check_failure(&td.name, &constraint_name),
                 on_error: None,
                 description_reg: None,
             });
@@ -705,9 +714,7 @@ pub(crate) fn emit_type_expr(
     resolver: &Resolver,
 ) -> Result<usize> {
     // Set up value override
-    program
-        .id_register_overrides
-        .insert("value".to_string(), value_reg);
+    program.id_register_overrides.insert("value", value_reg);
 
     // Set up type parameter overrides. Capture the result so we can
     // clean up overrides even if param translation fails.
@@ -719,9 +726,7 @@ pub(crate) fn emit_type_expr(
             if let Some(param_expr) = column.ty_params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
+                program.id_register_overrides.insert(&param.name, reg);
             }
         }
         Ok(())
@@ -1888,5 +1893,353 @@ mod tests {
                 "CLAIM: {sql} gave {got:?} (a timeout: it never finished), not PostgreSQL's refusal"
             );
         }
+    }
+
+    /// The domain CHECK identifier class (lead order, from the ultrareview fix session): a domain CHECK
+    /// written with `VALUE` (any case but lower) was SILENTLY not enforced, because its `value` was
+    /// bound under the exact key "value" and looked up by the identifier as written. PostgreSQL folds
+    /// the identifier: VALUE, value, Value and "value" all enforce (PG 18.6, artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-domain-check-case.txt 6e02bd34ec): CAST(-5 AS d) is
+    /// refused (23514), CAST(5 AS d) is 5, and an INSERT of -5 into a column of the domain is refused.
+    /// The same map binds a type's parameters in its ENCODE: a parameter declared `Scale` and used
+    /// as `scale` must bind too (identifiers are case-insensitive here).
+    #[test]
+    fn a_domain_check_binds_value_in_any_case() {
+        let mut bad = Vec::new();
+        for spelling in ["VALUE", "value", "Value", "\"value\""] {
+            let conn = open();
+            let ddl = format!("CREATE DOMAIN d AS integer CHECK ({spelling} > 0)");
+            if let Err(e) = conn.execute(&ddl) {
+                bad.push(format!("{ddl} refused: {e}"));
+                continue;
+            }
+            let neg = conn.prepare("SELECT CAST(-5 AS d)").and_then(|mut s| s.run_collect_rows());
+            if !matches!(&neg, Err(e) if e.to_string().contains("violates check constraint")) {
+                bad.push(format!("{spelling}: CAST(-5 AS d) gave {neg:?}, not PostgreSQL's 23514"));
+            }
+            let pos = conn.prepare("SELECT CAST(5 AS d)").and_then(|mut s| s.run_collect_rows());
+            if !matches!(&pos, Ok(rows) if rows.len() == 1) {
+                bad.push(format!("{spelling}: CAST(5 AS d) gave {pos:?}, not PostgreSQL's 5"));
+            }
+            let _ = conn.execute("CREATE TABLE dt(id INTEGER PRIMARY KEY, x d) STRICT");
+            // Refused, as PostgreSQL refuses it. Its message here is the table CHECK's ("CHECK
+            // constraint failed: d_0", not PG's "violates check constraint"): a separate message
+            // divergence, reported, not this class.
+            let ins = conn.execute("INSERT INTO dt VALUES (1, -5)");
+            if ins.is_ok() {
+                bad.push(format!("{spelling}: INSERT of -5 was accepted, where PostgreSQL refuses it (23514)"));
+            }
+        }
+        let conn = open();
+        let ddl = "CREATE TYPE pct(value any, Scale integer) BASE integer ENCODE value * scale DECODE value";
+        match conn.execute(ddl) {
+            Err(e) => bad.push(format!("{ddl} refused: {e}")),
+            Ok(()) => {
+                let got = conn
+                    .execute("CREATE TABLE pt(id INTEGER PRIMARY KEY, x pct(10)) STRICT")
+                    .and_then(|()| conn.execute("INSERT INTO pt VALUES (1, 3)"))
+                    .and_then(|()| conn.prepare("SELECT CAST(x AS TEXT) FROM pt").and_then(|mut s| s.run_collect_rows()));
+                if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some("30")) {
+                    bad.push(format!("a parameter declared Scale and used as scale: {got:?}, not 30"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: an identifier bound by a custom type or domain matched only in its exact case: {bad:?}");
+    }
+
+    /// The lead's correction to `a_domain_check_binds_value_in_any_case`: PostgreSQL's exact claim for a
+    /// failed domain CHECK, registered as a red of its own. PG 18.6 (artie raw frontier/fastest/lanes/
+    /// engine/raw/pg18-domain-check-message.txt 0673f158a3) fails a CAST, an INSERT and an UPDATE alike
+    /// with SQLSTATE 23514 and `value for domain <d> violates check constraint "<name>"`, the name being
+    /// the constraint's own, or `<d>_check`, `<d>_check1`, ... in declaration order. Here: the message
+    /// and the name, exactly; the SQLSTATE is the wire's (postgres/server `sqlstate`).
+    #[test]
+    fn a_failed_domain_check_reports_postgresqls_message_and_name() {
+        let mut bad = Vec::new();
+        let conn = open();
+        for ddl in [
+            "CREATE DOMAIN dm AS integer CHECK (VALUE > 0)",
+            "CREATE DOMAIN d2 AS integer CHECK (VALUE > 0) CHECK (VALUE < 100)",
+            "CREATE DOMAIN dn AS integer CONSTRAINT positive CHECK (VALUE > 0)",
+            "CREATE TABLE tm(id INTEGER PRIMARY KEY, x dm) STRICT",
+            "CREATE TABLE tn(id INTEGER PRIMARY KEY, x dn) STRICT",
+            "INSERT INTO tm VALUES (2, 5)",
+        ] {
+            conn.execute(ddl).unwrap();
+        }
+        for (sql, want) in [
+            ("SELECT CAST(-5 AS dm)", r#"value for domain dm violates check constraint "dm_check""#),
+            ("INSERT INTO tm VALUES (1, -5)", r#"value for domain dm violates check constraint "dm_check""#),
+            ("UPDATE tm SET x = -1 WHERE id = 2", r#"value for domain dm violates check constraint "dm_check""#),
+            ("SELECT CAST(500 AS d2)", r#"value for domain d2 violates check constraint "d2_check1""#),
+            ("SELECT CAST(-1 AS d2)", r#"value for domain d2 violates check constraint "d2_check""#),
+            ("SELECT CAST(-5 AS dn)", r#"value for domain dn violates check constraint "positive""#),
+            ("INSERT INTO tn VALUES (1, -5)", r#"value for domain dn violates check constraint "positive""#),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|_| ());
+            match &got {
+                Err(e) if e.to_string() == want => {}
+                other => bad.push(format!("{sql} gave {other:?}, not PostgreSQL 18's {want:?}")),
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a failed domain CHECK did not report PostgreSQL's message and constraint name: {bad:?}");
+    }
+
+    /// Runs `steps` in order on a fresh connection, on a thread of its own: the first error, the last
+    /// statement's first column as text, or `Err("timeout")` after 10 s (a red: it never finished).
+    fn run_bounded(steps: Vec<String>) -> Result<Option<String>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = (|| -> crate::Result<Option<String>> {
+                let conn = open();
+                let mut last = None;
+                for sql in &steps {
+                    let rows = conn.prepare(sql)?.run_collect_rows()?;
+                    last = rows.first().and_then(|r| r.first()).and_then(|v| v.to_text().map(str::to_string));
+                }
+                Ok(last)
+            })();
+            let _ = tx.send(got.map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| Err("timeout".to_string()))
+    }
+
+    /// Review 0e8b1cf18..0a4a127a1 numeric HIGH (DECISIONS d1a8dcb982): numeric(p, s) took any
+    /// precision and scale, and an insert rescaled to the scale BEFORE the precision check, so
+    /// numeric(2000000000, 2000000000) asked one rescale for 2*10^9 digits. PostgreSQL refuses p
+    /// outside 1..1000 and s outside -1000..1000, at CREATE TABLE and at a cast, with 22023 (PG 18.6's
+    /// messages for this exact SQL: artie raw frontier/fastest/lanes/engine/raw/
+    /// pg18-numeric-typmod-range.txt 7a1d98f8d2, never ours). Control: numeric(1000, 1000) holds 0.5.
+    #[test]
+    fn a_numeric_type_outside_postgresqls_typmod_range_is_refused() {
+        let table = |p: &str| {
+            vec![
+                format!("CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric({p})) STRICT"),
+                "INSERT INTO a VALUES (1, 1)".to_string(),
+            ]
+        };
+        let mut bad = Vec::new();
+        for (steps, want) in [
+            (table("1001, 0"), "NUMERIC precision 1001 must be between 1 and 1000"),
+            (table("0, 0"), "NUMERIC precision 0 must be between 1 and 1000"),
+            (table("1000, 1001"), "NUMERIC scale 1001 must be between -1000 and 1000"),
+            (table("2000000000, 2000000000"), "NUMERIC precision 2000000000 must be between 1 and 1000"),
+            (vec!["SELECT CAST(1 AS numeric(1001, 0))".to_string()], "NUMERIC precision 1001 must be between 1 and 1000"),
+            (vec!["SELECT CAST(1 AS numeric(1000, 1001))".to_string()], "NUMERIC scale 1001 must be between -1000 and 1000"),
+        ] {
+            let got = run_bounded(steps.clone());
+            if !matches!(&got, Err(m) if m.contains(want)) {
+                bad.push(format!("{steps:?} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        let control = run_bounded(vec![
+            "CREATE TABLE w(id INTEGER PRIMARY KEY, x numeric(1000, 1000)) STRICT".to_string(),
+            "INSERT INTO w VALUES (1, '0.5')".to_string(),
+            "SELECT CAST(count(*) AS TEXT) FROM w".to_string(),
+        ]);
+        assert_eq!(control, Ok(Some("1".to_string())), "premise: numeric(1000, 1000) does not hold 0.5, as PostgreSQL's does");
+        assert!(bad.is_empty(), "CLAIM: a numeric typmod outside PostgreSQL's range was not refused as PostgreSQL refuses it: {bad:?}");
+    }
+
+    /// Found while making numeric one bounded type (class (a), DECISIONS 994f7d41e0): a typmod
+    /// rescale TRUNCATED (bigdecimal's `with_scale` drops digits), where PostgreSQL rounds half away
+    /// from zero, and a value that rounds past the precision is PostgreSQL's 22003 "numeric field
+    /// overflow". PG 18.6's answers for this exact SQL (artie raw frontier/fastest/lanes/engine/raw/
+    /// pg18-numeric-typmod-round.txt b4512c63d5): 1.005, -1.005, 1.004, 2.675 into numeric(10, 2)
+    /// read 1.01, -1.01, 1.00, 2.68; '-0.125' into numeric(4, 2) is -0.13; 99999999.995 into
+    /// numeric(10, 2) overflows; 99999999.994 reads 99999999.99.
+    #[test]
+    fn a_numeric_typmod_rounds_half_away_from_zero_as_postgresql_does() {
+        let mut bad = Vec::new();
+        let table = |rows: &str, read: &str| {
+            vec![
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                format!("INSERT INTO r VALUES {rows}"),
+                read.to_string(),
+            ]
+        };
+        for (steps, want) in [
+            (table("(1, '1.005')", "SELECT CAST(x AS TEXT) FROM r"), Ok("1.01")),
+            (table("(1, '-1.005')", "SELECT CAST(x AS TEXT) FROM r"), Ok("-1.01")),
+            (table("(1, '1.004')", "SELECT CAST(x AS TEXT) FROM r"), Ok("1.00")),
+            (table("(1, '2.675')", "SELECT CAST(x AS TEXT) FROM r"), Ok("2.68")),
+            (table("(1, '99999999.994')", "SELECT CAST(x AS TEXT) FROM r"), Ok("99999999.99")),
+            (table("(1, '99999999.995')", "SELECT CAST(x AS TEXT) FROM r"), Err("numeric field overflow")),
+            // Through a numeric(4, 2) column (PG 18.6: -0.13, raw acf4b78d7f): a CAST to numeric here
+            // yields its ENCODE's blob, not a decoded value, so the CAST form cannot be read back.
+            (
+                vec![
+                    "CREATE TABLE q(id INTEGER PRIMARY KEY, x numeric(4, 2)) STRICT".to_string(),
+                    "INSERT INTO q VALUES (1, '-0.125')".to_string(),
+                    "SELECT CAST(x AS TEXT) FROM q".to_string(),
+                ],
+                Ok("-0.13"),
+            ),
+        ] {
+            let got = run_bounded(steps.clone());
+            let ok = match (&got, &want) {
+                (Ok(Some(v)), Ok(w)) => v == w,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("{:?} gave {got:?}, not PostgreSQL 18's {want:?}", &steps[1..]));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric typmod rounded or overflowed unlike PostgreSQL: {bad:?}");
+    }
+
+    /// Class (a) (DECISIONS 994f7d41e0), the typmod's other DDL: ALTER TABLE ADD COLUMN declared a
+    /// numeric(p, s) column with no check at all (CREATE TABLE at least counted the parameters).
+    /// PG 18.6 refuses numeric(1001, 0) and numeric(1000, 1001) there with its 22023 messages and
+    /// adds numeric(10, 2) (artie raw pg18-numeric-typmod-round.txt 048831ffdf, appended).
+    #[test]
+    fn alter_table_add_column_refuses_a_numeric_typmod_outside_postgresqls_range() {
+        let base = || vec!["CREATE TABLE al(id INTEGER PRIMARY KEY) STRICT".to_string()];
+        let mut bad = Vec::new();
+        for (col, want) in [
+            ("y numeric(1001, 0)", Err("NUMERIC precision 1001 must be between 1 and 1000")),
+            ("z numeric(1000, 1001)", Err("NUMERIC scale 1001 must be between -1000 and 1000")),
+            ("w numeric(10, 2)", Ok(())),
+        ] {
+            let mut steps = base();
+            steps.push(format!("ALTER TABLE al ADD COLUMN {col}"));
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(_), Ok(())) => true,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("ADD COLUMN {col} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN took a numeric typmod unlike PostgreSQL: {bad:?}");
+    }
+
+    /// Review 0e8b1cf18..0a4a127a1 numeric MED 1 (DECISIONS d1a8dcb982): a product's scale was the sum
+    /// of the display scales uncapped (PostgreSQL caps it at 16383), and add, sub and mul did not
+    /// refuse a result past 131072 integer digits (PostgreSQL: 22003, "value overflows numeric
+    /// format"). Expected values are PG 18.6's for this exact SQL over these tables (artie raw
+    /// pg18-numeric-typmod-range.txt 7059fd299c): t.x = 1, u.x = 10, both numeric(10, 2). Add and sub
+    /// past the range are reached through a 131072-digit text operand: here a product's result does
+    /// not stay numeric, so `(a * x) + (b * x)` is SQLite arithmetic, not numeric's.
+    #[test]
+    fn a_numeric_result_outside_postgresqls_range_is_refused() {
+        let setup = || {
+            vec![
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                "INSERT INTO t VALUES (1, 1)".to_string(),
+                "CREATE TABLE u(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                "INSERT INTO u VALUES (1, 10)".to_string(),
+            ]
+        };
+        let overflow = "value overflows numeric format";
+        // 131072 nines: the most integer digits PostgreSQL holds; one more digit overflows.
+        let nines = "9".repeat(131_072);
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT '0e-16383' * x FROM t".to_string(), Ok(16385usize)),
+            ("SELECT '1e131070' * x FROM u".to_string(), Ok(131075)),
+            ("SELECT '1e131071' * x FROM u".to_string(), Err(overflow)),
+            (format!("SELECT '{nines}' + x FROM u"), Err(overflow)),
+            (format!("SELECT x + '{nines}' FROM u"), Err(overflow)),
+            (format!("SELECT '-{nines}' - x FROM u"), Err(overflow)),
+            (format!("SELECT '{nines}' - x FROM u"), Ok(131075)),
+        ] {
+            let mut steps = setup();
+            steps.push(sql.clone());
+            let sql: String = sql.chars().take(60).collect();
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(Some(v)), Ok(len)) => v.len() == *len,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                let shown = match &got {
+                    Ok(Some(v)) => format!("a value of {} characters ({}...)", v.len(), v.chars().take(24).collect::<String>()),
+                    other => format!("{other:?}"),
+                };
+                bad.push(format!("{sql} gave {shown}, not PostgreSQL 18's {want:?} (a length, or an error)"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric result outside PostgreSQL's range diverged: {bad:?}");
+    }
+
+    /// Found fixing Codex C25 HIGH 3: a numeric product's scale is the sum of its operands' DISPLAY
+    /// scales in PostgreSQL (numeric.c `mul_var`'s rscale = dscale1 + dscale2, each at least 0), but
+    /// bigdecimal's product of a zero is a plain 0 and a negative-scale operand subtracts from the
+    /// scale. Expected values are PostgreSQL 18.6's for this exact SQL over this table (artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-numeric-mul-scale.txt 69b25bea64), never ours.
+    #[test]
+    fn a_numeric_product_keeps_postgresqls_display_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT 0 * x FROM t", "0.00"),
+            ("SELECT '0' * x FROM t", "0.00"),
+            ("SELECT '1e5' * x FROM t", "100000.00"),
+            ("SELECT '0.000' * x FROM t", "0.00000"),
+            ("SELECT x * '0e-3' FROM t", "0.00000"),
+            ("SELECT '1e5' + x FROM t", "100001.00"),
+            ("SELECT '0e5' - x FROM t", "-1.00"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)) {
+                bad.push(format!("{sql} gave {got:?}, not {want}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric result's display scale diverged from PostgreSQL 18: {bad:?}");
+    }
+
+    /// Codex C25 HIGH 3 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
+    /// a numeric ZERO kept any exponent the parser gave it, and the range check passed every zero,
+    /// so `'0e-2000000000' / x` asked `pg_numeric_div` for 10^1999999000 (and `'0e1000000' / x` for
+    /// 10^1000022). Expected values are PostgreSQL 18.6's for this exact SQL over this table (artie
+    /// raw frontier/fastest/lanes/engine/raw/pg18-numeric-zero-scale.txt d034bf749e), never ours:
+    /// a zero past 16383 fractional digits is refused, "value overflows numeric format"; a zero with
+    /// a positive exponent is 0. Each runs on a thread of its own within 10 s: a timeout is the red.
+    #[test]
+    fn a_numeric_zero_at_any_scale_computes_as_postgresql_does() {
+        let zeros = |n: usize| format!("0.{}", "0".repeat(n));
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT '0e-2000000000' / x FROM t", Err("value overflows numeric format")),
+            ("SELECT '0e-16384' / x FROM t", Err("value overflows numeric format")),
+            ("SELECT '0e1000000' / x FROM t", Ok(zeros(20))),
+            ("SELECT '0e-1000' / x FROM t", Ok(zeros(1000))),
+            ("SELECT '0e1000000' * x FROM t", Ok(zeros(2))),
+            ("SELECT '0e1000000' + x FROM t", Ok("1.00".to_string())),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let owned = sql.to_string();
+            std::thread::spawn(move || {
+                let got = (|| -> crate::Result<Option<String>> {
+                    let conn = open();
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")?;
+                    conn.execute("INSERT INTO t VALUES (1, 1)")?;
+                    let rows = conn.prepare(&owned)?.run_collect_rows()?;
+                    Ok(rows.first().and_then(|r| r[0].to_text().map(str::to_string)))
+                })();
+                let _ = tx.send(got.map_err(|e| e.to_string()));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            let ok = match (&got, &want) {
+                (Ok(Err(m)), Err(w)) => m.contains(w),
+                (Ok(Ok(Some(v))), Ok(w)) => v == w,
+                _ => false,
+            };
+            let shown = |g: &Result<Result<Option<String>, String>, _>| {
+                format!("{g:?}").chars().take(200).collect::<String>()
+            };
+            if !ok {
+                bad.push(format!("{sql} gave {}, not {}", shown(&got), format!("{want:?}").chars().take(60).collect::<String>()));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: numeric zero diverged from PostgreSQL 18 (a timeout: it never finished): {bad:?}");
     }
 }

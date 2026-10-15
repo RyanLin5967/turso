@@ -4404,7 +4404,10 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
     // collected and all are asserted at the end, so a run shows which arms are red, where the first
     // panic hid the rest. Premises still stop the test. No claim or expected value changed.
     let mut failed = Vec::new();
-    for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
+    // Lead ruling 46628e056e on LOW 9: a planted failure in EACH arm must still fail the test,
+    // planted by FE_MUTANT=low9_plant_arm<i> (test builds only: a fake reused slot in arm i alone).
+    let arms = [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)];
+    for (arm, (catalog, written)) in arms.into_iter().enumerate() {
         let what = format!("catalog={catalog} written={written:?}");
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("synced-open.db");
@@ -4425,7 +4428,10 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
         assert!(db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the synced class outlives the first rewrite");
         let trunk = db.connect().unwrap();
         db.branch(id).unwrap().reap().unwrap();
-        let took = reused_by_a_new_branch(&trunk, &slots);
+        let mut took = reused_by_a_new_branch(&trunk, &slots);
+        if super::store::fe_mutant(&format!("low9_plant_arm{arm}")) {
+            took.push(u32::MAX);
+        }
         if !took.is_empty() {
             failed.push(format!("{what}: slots {took:?}"));
         }
@@ -5575,26 +5581,44 @@ fn a_create_does_not_wait_for_a_confirmation_word_being_written() {
     assert_eq!(created, Ok(true), "a create waited for the confirmation writer's word (or failed)");
 }
 
-/// Review 6 #1: a confirmation word that cannot be written changes no flight's outcome. The flight
-/// is durable once its sync returned; its word only lets recovery tell damage from a lost write,
-/// so a failure to write it is counted and the store goes on.
+// FLAGGED TEST EDIT (lead ruling f329b0d2a8 reverses review 6 #1): the test
+// `a_confirmation_that_cannot_be_written_fails_no_flight`, which asserted that the store goes on
+// after a failed confirmation word, is REMOVED. Its injection (ConfirmWriteFails on the second
+// create, both arms, D2) now asserts the opposite, below.
+
+/// Lead ruling f329b0d2a8 (order 2, 2026-10-15T07:29:43Z; gates ultrareview row 1), reversing
+/// review 6 #1: a confirmation word that cannot be written FAIL-STOPS the store, the rule of a
+/// failed WAL sync, and `confirm_done` is raised only once a word is written. Injected
+/// (`ConfirmWriteFails`): after the failed write is counted, `confirm_done` still names the last
+/// word written, and the next create is refused. The create whose word failed was acknowledged
+/// before its word was due (the word follows its sync), so it is not the claim.
 #[test]
-fn a_confirmation_that_cannot_be_written_fails_no_flight() {
+fn a_confirmation_that_cannot_be_written_fail_stops_the_store() {
     let _s = serial();
     let _q = ConfirmQuiet::set(1);
     for catalog in [false, true] {
         let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("confirmfail.db"), opts(catalog, SyncClass::FullFsync));
+        let db = open_at(&dir.path().join("confirmstop.db"), opts(catalog, SyncClass::FullFsync));
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("catalog={catalog}: premise: no confirmation word was written"), || {
+            db.branch_confirm_counts()[0] >= 1
+        });
+        let done = db.branches.confirm_done_for_test();
+        assert_ne!(done, 0, "catalog={catalog}: premise: a written word left confirm_done at 0");
         db.branch_failpoint(Some(BranchFailpoint::ConfirmWriteFails));
-        let created = trunk.fork_branch().map(|b| b.into_id());
-        assert!(created.is_ok(), "catalog={catalog}: a durable create failed with its confirmation word: {:?}", created.err());
-        eventually(&format!("catalog={catalog}: the failed confirmation was not counted"), || {
+        let _ = trunk.fork_branch().map(|b| b.into_id());
+        eventually(&format!("catalog={catalog}: premise: the failed confirmation was not counted"), || {
             db.branch_confirm_counts()[1] == 1
         });
-        trunk.fork_branch().unwrap_or_else(|e| panic!("catalog={catalog}: the store stopped over a confirmation word: {e}"));
+        assert_eq!(
+            db.branches.confirm_done_for_test(),
+            done,
+            "CLAIM: catalog={catalog}: confirm_done was raised over a word whose write failed"
+        );
+        let after = trunk.fork_branch().map(|b| b.into_id());
+        assert!(after.is_err(), "CLAIM: catalog={catalog}: a create was acknowledged after a confirmation word failed: {after:?}");
     }
 }
 
@@ -6005,6 +6029,23 @@ fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std:
     let db = Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
         .unwrap();
     (db, armed)
+}
+
+/// Every fuzzy checkpoint runs its phase 4 (the catalog WAL's backfill and truncation) while this
+/// lives: `CATALOG_WAL_TRUNCATE_AT_FORCED` at 1 byte, restored on drop.
+struct CatalogWalTruncateAlways;
+
+impl CatalogWalTruncateAlways {
+    fn set() -> Self {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for CatalogWalTruncateAlways {
+    fn drop(&mut self) {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(0, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// `what` was refused because the store is fail-stopped.
@@ -7381,6 +7422,11 @@ fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
 fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 runs only once
+    // the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (fa0897b69); this test fails phase 4's WAL sync,
+    // so it forces every checkpoint's (measured: its premise failed at 5344a5878, artie raw
+    // l17-branch_5344a5878.txt). No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -7435,6 +7481,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
 fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -7486,6 +7536,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
 fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -8547,6 +8601,902 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     }
 }
 
+/// L2 slice (budget create_allocates_no_table_of_every_branch_under_the_store_mutex, 64 KiB under
+/// the store mutex per create; budgets measured 2,195,727 bytes as the live branches reached
+/// 33,056): no per-branch table regrows, or allocates a chunk, of more than 64 KiB inside a create.
+/// Unnamed creates in D0 from 0 past 2^15 live branches, both modes; after each create the tables'
+/// capacities (`per_branch_tables_for_test`) are compared with the last ones, and every growth is
+/// priced at the bytes its new allocation takes. The message names the tables, so the fix is aimed.
+#[test]
+fn no_per_branch_table_regrows_past_64_kib_inside_a_create() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("growth.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut last = db.branches.per_branch_tables_for_test();
+        let mut worst: std::collections::BTreeMap<&str, usize> = Default::default();
+        for _ in 0..34_000 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            let now = db.branches.per_branch_tables_for_test();
+            for (name, cap, bytes) in &now {
+                let grew = last.iter().find(|(m, ..)| m == name).is_none_or(|(_, c, _)| cap > c);
+                if grew && *bytes > 0 {
+                    let e = worst.entry(name).or_default();
+                    *e = (*e).max(*bytes);
+                }
+            }
+            last = now;
+        }
+        for (name, bytes) in worst {
+            if bytes > 64 << 10 {
+                over.push(format!("catalog={catalog} {name}: {bytes} bytes"));
+            }
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
+}
+
+/// The NAMED twin of `no_per_branch_table_regrows_past_64_kib_inside_a_create`: budgets' growth cell
+/// still measured 1,638,591 bytes under the store mutex at 22c5c5da3 (artie raw
+/// l10-branch_22c5c5da3.txt), about one regrowth of a 65,536-bucket map of (Arc<str>, BranchId), so
+/// the name index is measured here: 34,000 named creates, both modes, every per-branch table and the
+/// name filter's sets priced at each growth.
+#[test]
+fn no_name_table_regrows_past_64_kib_inside_a_named_create() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("named-growth.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut last = db.branches.per_branch_tables_for_test();
+        let mut worst: std::collections::BTreeMap<&str, usize> = Default::default();
+        for n in 0..34_000u32 {
+            // FLAGGED TEST EDIT, lead-ordered (the name-filter acceptance condition, DECISIONS
+            // 2026-10-15): a table's growth counts against this create only if it happened under the
+            // store mutex on this create's thread, which its held allocations measure: a growth of
+            // `bytes` needs at least `bytes` allocated in the create's holds. A table grown on
+            // another thread (the name filter's, off the mutex) is not this create's.
+            let held0 = super::budget_probe::thread_allocs().3;
+            let _ = trunk.create_branch(&format!("g{n}")).unwrap();
+            let held = super::budget_probe::thread_allocs().3 - held0;
+            let now = db.branches.per_branch_tables_for_test();
+            for (name, cap, bytes) in &now {
+                let grew = last.iter().find(|(m, ..)| m == name).is_none_or(|(_, c, _)| cap > c);
+                if grew && *bytes > 0 && held >= *bytes as u64 {
+                    let e = worst.entry(name).or_default();
+                    *e = (*e).max(*bytes);
+                }
+            }
+            last = now;
+        }
+        for (name, bytes) in worst {
+            if bytes > 64 << 10 {
+                over.push(format!("catalog={catalog} {name}: {bytes} bytes"));
+            }
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a named create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
+}
+
+/// C1 coverage question (engine review 20 LOW 16): the kill point `cut.dir_synced` (a syncing flight
+/// after a cut, between its directory sync and its log sync) never landed in any C1 run, D0 or D1
+/// (artie raws l14-low16d1_7076641a5.txt: 0 of 6 in a D1 child; earlier catalog C1 runs: 0 landed).
+/// Either no flight after a fuzzy cut syncs the log's directory, which would leave the cut's rename
+/// undurable under acknowledged flights, or the window is not reached in a C1 trial. Here, in
+/// process: a D1 catalog store, a fuzzy checkpoint that cut the log (premise: the log shortened),
+/// then one create, whose flight this thread leads: it must sync the log's directory.
+#[test]
+fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cut-dir.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..30 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let len = db.branches.log_len_for_test();
+    let cuts = super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint cut the log");
+    // Strengthened (my own test, 0ac4f207d, unaccepted): the shortening must be a CUT (a prepared
+    // cut finished at the install), not the install's fallback rewrite, which also shortens it.
+    assert!(
+        super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed) > cuts,
+        "premise: the checkpoint finished a prepared cut (it fell back to a rewrite: {} rewrites so far)",
+        super::store::INSTALL_REWRITES.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+    let before = dirs();
+    let _ = trunk.fork_branch().unwrap().into_id();
+    assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
+}
+
+/// Review REVIEW-claude-namefilter-729f78659..4cb167221 H1 (a fresh adversary): when the growth's drain
+/// copy failed, `draining` was cleared in one store-mutex hold and `overflowed` set in the next, so
+/// between them the filter answered "absent" for a name only the pending table held. A create then
+/// asked no catalog, and an evicted name was given twice. The adversary's interleaving, forced by the
+/// hooks: the growth paused before its swap (stage 3), so `victim` is noted after both first copies
+/// and lives in the pending table only; then the drain copy fails (`FILTER_DRAIN_FAILS`) and the
+/// growth pauses after it (stage 5). There, the filter must not answer "absent" for `victim`.
+#[test]
+fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
+    use super::store::{FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-drain.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    FILTER_DRAIN_FAILS.store(true, Release);
+    FILTER_PAUSE_AT.store(3, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 3 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no filter growth reached its swap ({n} creates)");
+    }
+    trunk.create_branch("victim").unwrap();
+    FILTER_PAUSE_AT.store(5, Release);
+    while FILTER_PAUSED.load(Acquire) != 5 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never finished its drain copy");
+    }
+    let absent = db.branches.name_filter_says_absent_for_test("victim");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
+}
+
+/// Lead conditions on the name filter (DECISIONS, the acceptance of the one-state fix): the table
+/// listing the regrowth tests read (`per_branch_tables_for_test`) prices the filter's tables at their
+/// REAL bytes (8 per slot; 4cb167221 listed them at 0, which blinded the regrowth test), and a growth
+/// records how many entries it moved (`moved_max`, which the churn check reads). A catalog store's
+/// filter grown past one doubling, waited out.
+#[test]
+fn the_name_filter_lists_its_real_bytes_and_records_its_growth() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-bytes.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..1_500u32 {
+        trunk.create_branch(&format!("b{i:05}")).unwrap();
+    }
+    db.branch_wait_name_filter();
+    let (built, entries, moved_max, builds, _) = db.branches.name_filter_stats();
+    assert!(built && entries >= 1_500, "premise: the filter holds the 1,500 names ({entries})");
+    assert!(builds >= 1, "premise: the filter grew past its first table ({builds} growths)");
+    let listed: Vec<_> = db
+        .branches
+        .per_branch_tables_for_test()
+        .into_iter()
+        .filter(|(name, ..)| name.starts_with("names.filter"))
+        .collect();
+    let priced = listed.iter().any(|(_, cap, bytes)| *cap > 0 && *bytes == *cap * 8);
+    assert!(priced, "CLAIM: the filter's table is not listed at its real bytes (8 per slot): {listed:?}");
+    assert!(moved_max > 0, "CLAIM: a growth of the filter recorded no entries moved (moved_max {moved_max})");
+}
+
+/// The name filter's concurrency oracle (lead condition on the filter, and review REVIEW-claude-namefilter
+/// M3): since `says_absent` lets a create skip the catalog, a name the filter loses is a DUPLICATE
+/// name. Four threads create named branches while a growth is held at each of its stages (1-5,
+/// `FILTER_PAUSE_AT`), and once with the drain copy failing (`FILTER_DRAIN_FAILS`: the filter
+/// overflows, and its owed rebuild must restore it). Once everything has settled, every name any
+/// thread created is asked of the FILTER itself (`name_filter_says_absent_for_test`), so the resident
+/// names (`names.map`, which `name_lookup` consults first) cannot answer for it: none may be
+/// "absent". Mutant `name_filter_swap_skips_pending` (the planted race: the swap installs the new
+/// table without copying the pending one) must turn it red.
+#[test]
+fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
+    use super::store::{FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let mut lost = Vec::new();
+    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("filter-oracle.db"), opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("first").unwrap();
+        FILTER_PAUSED.store(0, Release);
+        FILTER_DRAIN_FAILS.store(drain_fails, Release);
+        FILTER_PAUSE_AT.store(stage, Release);
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|k| {
+                let (db, stop) = (db.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let conn = db.connect().unwrap();
+                    let mut made = Vec::new();
+                    let mut i = 0u32;
+                    while !stop.load(Acquire) && i < 4000 {
+                        let name = format!("s{stage}-t{k}-{i}");
+                        conn.create_branch(&name).unwrap();
+                        made.push(name);
+                        i += 1;
+                    }
+                    made
+                })
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        while FILTER_PAUSED.load(Acquire) != stage {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no growth reached the stage");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        FILTER_PAUSE_AT.store(0, Release);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.store(true, Release);
+        let made: Vec<String> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+        FILTER_DRAIN_FAILS.store(false, Release);
+        // One more create starts whatever the filter owes (a rebuild after the overflow), then all
+        // filter work is waited out.
+        trunk.create_branch(&format!("s{stage}-last")).unwrap();
+        db.branch_wait_name_filter();
+        let (state, rebuilds) = db.branches.name_filter_state_for_test();
+        assert_eq!(state, "Ready", "premise: stage {stage} (drain fails: {drain_fails}): the filter did not settle Ready");
+        if drain_fails {
+            assert!(rebuilds >= 1, "premise: the failed drain did not overflow the filter into a rebuild");
+        }
+        for name in made.iter().chain(std::iter::once(&"first".to_string())) {
+            if db.branches.name_filter_says_absent_for_test(name) {
+                lost.push(format!("stage {stage} (drain fails: {drain_fails}): {name}"));
+            }
+        }
+        assert!(made.len() > 512, "premise: stage {stage}: too few creates to grow the filter ({})", made.len());
+        // Judged per stage, so a later stage's premise cannot hide what an earlier one lost.
+        assert!(
+            lost.is_empty(),
+            "CLAIM: the name filter answered absent for {} names it was given (a create would make a duplicate): {:?}",
+            lost.len(),
+            &lost[..lost.len().min(8)]
+        );
+    }
+}
+
+/// Lead ruling (DECISIONS 2026-10-15, after the attribution: the n1e4 create's extra allocation is
+/// the name filter's B-tree splitting a full leaf, raws l35-diag-alloc): a create allocates NOTHING
+/// in the name filter, by construction, also while the filter grows. A catalog store with 10,000
+/// named branches, reopened so the filter is built from the catalog as the budgets' n1e4 cell
+/// builds it, then 8,000 more named creates (past any doubling of a table sized for 10,000): no
+/// allocation inside `NameFilter::note` (`FILTER_NOTE_ALLOCS`). Then, every name a branch holds is
+/// still refused to a second create, and the filter grew rather than stopped answering.
+#[test]
+fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-grow.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000 {
+            trunk.create_branch(&format!("pre-{i:05}")).unwrap();
+        }
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    let (built, entries0, _, builds0, _) = db.branches.name_filter_stats();
+    assert!(built && entries0 >= 10_000, "premise: the reopened store's name filter was built from its 10,000 names ({entries0})");
+    let trunk = db.connect().unwrap();
+    let before = super::store::FILTER_NOTE_ALLOCS.load(Relaxed);
+    for i in 0..8_000 {
+        trunk.create_branch(&format!("new-{i:05}")).unwrap();
+    }
+    let allocs = super::store::FILTER_NOTE_ALLOCS.load(Relaxed) - before;
+    assert_eq!(allocs, 0, "CLAIM: 8,000 named creates allocated {allocs} times inside the name filter (under the store mutex)");
+    db.branch_wait_name_filter();
+    for i in (0..10_000).step_by(97) {
+        assert!(trunk.create_branch(&format!("pre-{i:05}")).is_err(), "a held name pre-{i:05} was created twice");
+    }
+    for i in (0..8_000).step_by(89) {
+        assert!(trunk.create_branch(&format!("new-{i:05}")).is_err(), "a held name new-{i:05} was created twice");
+    }
+    let (built, entries, _, builds, _) = db.branches.name_filter_stats();
+    assert!(built && entries >= 18_000, "the name filter stopped answering, or lost names, as it grew: built {built}, {entries} entries");
+    assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
+}
+
+/// Lead order (2026-10-15, attribution item 1): `a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_
+/// the_store_mutex` fails about 3 runs in 10 at one sha (raws l28-ckpt-r*), its extra syscalls in
+/// the capture spans. Its instrument is the TASK's syscall count, so a span counts every thread's.
+/// This diagnostic runs its schedule for 20 rounds with every thread's CPU time read at each point
+/// as well (`CKPT_HELD_THREADS`, Mach traps only), and prints each round's spans with the threads
+/// other than the checkpoint thread that ran in them. The hypothesis under test, as its CLAIM: every
+/// span holding more syscalls than the reading's own had another thread running in it. Blind spot:
+/// a table is read just after its point's syscall count, so a thread that ran between the count and
+/// the table at the span's START is missed, and one between them at its END is charged to the span.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
+    use super::budget_probe::ran_between;
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CKPT_THREADS_ARMED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _d = Disarm;
+    struct BigMin;
+    impl Drop for BigMin {
+        fn drop(&mut self) {
+            super::store::CKPT_BIG_MIN.store(16 << 10, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _b = BigMin;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-diag.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    super::store::CKPT_THREADS_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    let (mut over, mut unexplained, mut rows) = (0u32, Vec::new(), Vec::new());
+    for round in 0..20 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
+            t.clear();
+            t.reserve(32);
+        }
+        // Round 0 is the recorder's fire-check: every allocation and free of the span recorded.
+        super::store::CKPT_BIG_MIN.store(if round == 0 { 1 } else { 16 << 10 }, std::sync::atomic::Ordering::Release);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        if round == 0 {
+            assert!(
+                !super::store::CKPT_BIG.lock().unwrap().is_empty(),
+                "premise: the span recorder recorded nothing at a 1-byte threshold: it cannot be trusted at 16 KiB"
+            );
+        }
+        let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
+        let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
+        assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread table");
+        // Each span is skipped for the thread that recorded its end (capture points are the caller's,
+        // install points the checkpoint thread's).
+        let recorder = |j: usize| tables[j].2.iter().find(|x| x.me).map_or(0, |x| x.id);
+        let at = |label: &str| points.iter().position(|(l, _)| *l == label);
+        // The original test's five spans and its arithmetic (each span minus one reading), for the
+        // over-budget verdict; the finer install sub-spans printed as raw deltas.
+        let spans = [
+            ("capture.begin", "capture.matured"),
+            ("capture.matured", "capture.captured"),
+            ("install.locked", "install.quiesced"),
+            ("install.quiesced", "install.installed"),
+            ("install.installed", "install.marked"),
+        ];
+        let fine = [
+            ("install.quiesced", "install.snapshot_ended"),
+            ("install.snapshot_ended", "install.before_cut"),
+            ("install.before_cut", "install.cut_finished"),
+            ("install.cut_finished", "install.installed"),
+        ];
+        let mut total = 0u64;
+        let mut line = format!("round {round}:");
+        let mut spans_over = Vec::new();
+        let names = |ran: &[(u64, String, u64)]| ran.iter().map(|(id, name, ns)| format!("{name}#{id}:{ns}ns")).collect::<Vec<_>>();
+        for (a, b) in spans {
+            let (Some(i), Some(j)) = (at(a), at(b)) else {
+                line += &format!(" [{a}..{b} missing]");
+                continue;
+            };
+            let n = (points[j].1 - points[i].1).saturating_sub(1);
+            total += n;
+            let ran = ran_between(&tables[i].1, &tables[j].2, recorder(j));
+            line += &format!(" {a}..{b}={n} ran={:?}", names(&ran));
+            if n > 0 {
+                spans_over.push((a, b, n, ran.is_empty()));
+            }
+        }
+        line += " | raw:";
+        for (a, b) in fine {
+            if let (Some(i), Some(j)) = (at(a), at(b)) {
+                let ran = ran_between(&tables[i].1, &tables[j].2, recorder(j));
+                line += &format!(" {a}..{b}={} ran={:?}", points[j].1 - points[i].1, names(&ran));
+            }
+        }
+        line += &format!(" total={total}");
+        let big = std::mem::take(&mut *super::store::CKPT_BIG.lock().unwrap());
+        let frames = |t: &str| {
+            t.lines()
+                .take(1)
+                .chain(t.lines().filter(|l| l.contains("turso_core::") && !l.contains("budget_probe")).take(5))
+                .collect::<Vec<_>>()
+                .join(" <- ")
+        };
+        line += &format!(" | big in cut_finished..installed: {:?}", big.iter().map(|t| frames(t)).collect::<Vec<_>>());
+        if total > 2 {
+            over += 1;
+            for (a, b, n, alone) in &spans_over {
+                if *alone {
+                    unexplained.push(format!("round {round} {a}..{b}: {n} syscalls with no other thread running"));
+                }
+            }
+        }
+        rows.push(line);
+    }
+    let r0 = super::budget_probe::unix_syscalls().unwrap();
+    let r1 = super::budget_probe::unix_syscalls().unwrap();
+    println!("one reading of the task's syscall count costs {} BSD syscalls (two back-to-back readings)", r1 - r0);
+    for r in &rows {
+        println!("{r}");
+    }
+    assert!(over > 0, "premise: no round went over two held syscalls in 20, so the attribution was not exercised");
+    assert!(unexplained.is_empty(), "CLAIM: ATTRIBUTION: an over-budget span's syscalls were the checkpoint thread's own: {unexplained:?}");
+}
+
+/// Lead finding (artie 79ef7d2caf, the wire's per-window data): the embedded create, write and
+/// delete are bimodal in syscalls (create 8 or 10). The task's syscall count per operation, with
+/// every OTHER thread's CPU time read around it (`budget_probe::thread_table`, Mach traps only),
+/// at D2 over a catalog store and a snapshot store: each operation's count grouped by value, and
+/// for each value how many of its operations had another thread run inside them, and which.
+/// Printed only: which mode is foreign is what this measures.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_create_write_delete_syscalls_by_thread() {
+    use super::budget_probe::{ran_between, thread_table, unix_syscalls, ThreadCpu};
+    let _s = serial();
+    struct Quiet;
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            super::store::CONFIRM_QUIET_MS.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _q = Quiet;
+    // Second pass: the confirmation word held back (the budgets' regime, `hold_word`), so the
+    // writer is woken by the first landing only and sleeps after.
+    for (catalog, held) in [(true, false), (false, false), (true, true), (false, true)] {
+        super::store::CONFIRM_QUIET_MS.store(if held { 1 << 40 } else { 0 }, std::sync::atomic::Ordering::Release);
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ops-diag.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut by: std::collections::BTreeMap<(&str, u64), (u32, u32, std::collections::BTreeMap<String, u32>)> = Default::default();
+        let mut measure = |op: &'static str, f: &mut dyn FnMut()| {
+            let mut t0 = [ThreadCpu::EMPTY; 48];
+            let mut t1 = [ThreadCpu::EMPTY; 48];
+            let s0 = unix_syscalls().unwrap();
+            let _ = thread_table(&mut t0);
+            f();
+            let s1 = unix_syscalls().unwrap();
+            let _ = thread_table(&mut t1);
+            let me = t0.iter().find(|x| x.me).map_or(0, |x| x.id);
+            let ran = ran_between(&t0, &t1, me);
+            let e = by.entry((op, (s1 - s0).saturating_sub(1))).or_default();
+            e.0 += 1;
+            if !ran.is_empty() {
+                e.1 += 1;
+            }
+            for (_, name, _) in ran {
+                *e.2.entry(name).or_default() += 1;
+            }
+        };
+        for i in 0..200 {
+            let name = format!("d-{i:04}");
+            measure("create", &mut || {
+                trunk.create_branch(&name).unwrap();
+            });
+            let c = db.connect_named(&name).unwrap();
+            measure("write", &mut || {
+                c.execute(&format!("UPDATE t SET v = 'w{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+            });
+            drop(c);
+            measure("delete", &mut || {
+                db.drop_branch(&name).unwrap();
+            });
+        }
+        for ((op, n), (count, foreign, names)) in &by {
+            println!("catalog={catalog} word_held={held} {op}: {n} syscalls x{count}, {foreign} with another thread running {names:?}");
+        }
+    }
+}
+
+/// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
+/// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`). A D2
+/// catalog store, checkpoints after 30 creates each.
+///
+/// FLAGGED TEST EDIT, lead-ordered (class (b) and ruling (b), DECISIONS 994f7d41e0): the count is
+/// the TASK's, so a span's syscalls are the recording thread's only if no other thread ran inside
+/// it (`store::CKPT_HELD_THREADS`, a thread table before and after every point; attribution by
+/// exclusion). A round with an unattributable span is not judged: rounds run until 3 are fully
+/// attributable (at most 12), and fewer is a refusal, never a pass. And the span no longer
+/// subtracts 1 "for the reading", which costs 0 BSD syscalls (measured: raw l35-diag-ckpt): a
+/// tightening, so newly red cells are real.
+#[test]
+fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+    use super::budget_probe::ran_between;
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CKPT_THREADS_ARMED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _d = Disarm;
+    super::store::CKPT_THREADS_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-held.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let (mut over, mut judged, mut refused) = (Vec::new(), 0, Vec::new());
+    for round in 0..12 {
+        if judged == 3 {
+            break;
+        }
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
+            t.clear();
+            t.reserve(32);
+        }
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
+        let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
+        assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread tables");
+        let at = |label: &str| points.iter().position(|(l, _)| *l == label);
+        let mut foreign = Vec::new();
+        let mut span = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(i), Some(j)) => {
+                let me = tables[j].2.iter().find(|x| x.me).map_or(0, |x| x.id);
+                for (_, name, _) in ran_between(&tables[i].1, &tables[j].2, me) {
+                    foreign.push(format!("{a}..{b}: {name}"));
+                }
+                points[j].1 - points[i].1
+            }
+            _ => u64::MAX,
+        };
+        let capture = (span("capture.begin", "capture.matured"), span("capture.matured", "capture.captured"));
+        let install = (
+            span("install.locked", "install.quiesced"),
+            span("install.quiesced", "install.installed"),
+            span("install.installed", "install.marked"),
+        );
+        let inside = (
+            span("install.quiesced", "install.snapshot_ended"),
+            span("install.snapshot_ended", "install.before_cut"),
+            span("install.before_cut", "install.cut_finished"),
+            span("install.cut_finished", "install.installed"),
+        );
+        if !foreign.is_empty() {
+            refused.push(format!("round {round}: {foreign:?}"));
+            continue;
+        }
+        judged += 1;
+        let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
+        if total > 2 {
+            over.push(format!(
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
+                capture.0, capture.1, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
+            ));
+        }
+    }
+    assert!(
+        judged == 3,
+        "premise: only {judged} of up to 12 rounds could be attributed by thread (refusing; unattributable: {refused:?})"
+    );
+    assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than two syscalls under the store mutex: {over:?}");
+}
+
+/// Checkpoint FIX (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3
+/// checkpoints in ckpt_n10, budget 3 each, review 1 #7): a fuzzy checkpoint of a D2 catalog store,
+/// its full flushes attributed to its thread's phases (`store::CKPT_PHASES`: start, settled,
+/// written, cut, installed, truncated). Budget: the catalog commit's one, one for the WAL header after
+/// the truncation, the cut log's one. Three checkpoints, each after 30 creates; nothing else runs.
+#[test]
+fn a_fuzzy_checkpoint_issues_at_most_three_full_flushes() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-flushes.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut over = Vec::new();
+    for round in 0..3 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_PHASES.lock().unwrap().clear();
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        eventually("premise: the checkpoint thread reached its truncation", || {
+            super::store::CKPT_PHASES.lock().unwrap().iter().any(|(p, ..)| *p == "truncated")
+        });
+        let phases = super::store::CKPT_PHASES.lock().unwrap().clone();
+        let (_, _, f0) = phases[0];
+        let fulls = phases.last().unwrap().2 - f0;
+        let mut last = f0;
+        let steps: Vec<String> = phases[1..]
+            .iter()
+            .map(|(p, _, f)| {
+                let d = f - last;
+                last = *f;
+                format!("{p}+{d}")
+            })
+            .collect();
+        if fulls > 3 {
+            over.push(format!("round {round}: {fulls} full flushes [{}]", steps.join(" ")));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than three full flushes: {over:?}");
+}
+
+/// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex: 7 held allocations per
+/// create in every cell, budget 1): a steady create's allocations under a store mutex, attributed to
+/// its steps by the `held_trace` points (fork_trunk's hold and the flight lead's hold), for both
+/// modes and D0/D2. The message lists each step's share, so the fix is aimed.
+#[test]
+fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for (catalog, class) in [(false, SyncClass::FullFsync), (true, SyncClass::FullFsync), (false, SyncClass::Off)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("held.db"), opts(catalog, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for _ in 0..20 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        let before = super::budget_probe::thread_allocs().2;
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        let _ = trunk.fork_branch().unwrap().into_id();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let total = super::budget_probe::thread_allocs().2 - before;
+        let mut last = before;
+        let steps: Vec<String> = trace
+            .iter()
+            .map(|(label, n)| {
+                let d = n - last;
+                last = *n;
+                format!("{label}+{d}")
+            })
+            .collect();
+        if total > 1 {
+            over.push(format!("catalog={catalog} {class:?}: {total} held allocations [{}], {} after the last point", steps.join(" "), total - (last - before)));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
+}
+
+/// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
+/// it installed its snapshot and before it takes its cut (`HOLD_COMPACT_INSTALLED`, store mutex
+/// free), creates go on past the hard limit until one compacts the log INLINE (counted,
+/// `branch_exception_counters()[2]`). Then creates pad the NEW log to exactly the held cut's offset
+/// (`held_cut_from_for_test`), the last one named so its length fits, as Codex's equal-length frames
+/// did: the stale offset is then a record boundary of the new log, which is what lets the old cut
+/// copy it (without the alignment its re-framing fails and nothing is lost, so the arm would not
+/// discriminate). Then one more create, the victim. The writer released, its compaction finishes;
+/// the store closed and reopened: EVERY create acknowledged since the hold is a live branch. Before
+/// the fix the stale cut installed the older generation over the inline one. Mutant
+/// `bg_cut_identity_unchecked`.
+#[test]
+fn a_create_after_an_inline_compaction_survives_a_stale_background_cut() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stale-cut.db");
+    let (made, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_INSTALLED);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.confirm_held_for_test() != super::store::HOLD_COMPACT_INSTALLED | super::store::HOLD_ARRIVED {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction reached its install");
+        }
+        let from = db.branches.held_cut_from_for_test();
+        let mut made = Vec::new();
+        let inline = db.branch_exception_counters()[2];
+        while db.branch_exception_counters()[2] == inline {
+            made.push(trunk.fork_branch().unwrap().into_id());
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: no create compacted inline past the hard limit");
+        }
+        let inline = db.branch_exception_counters()[2];
+        let len = || db.branches.log_len_for_test();
+        assert!(len() < from, "premise: the inline log ({}) is already past the held cut's offset {from}", len());
+        // One unnamed and one named create measure the two frame lengths: a named create's grows by
+        // one byte per byte of name (names stay under 128 bytes, so no length prefix widens).
+        let l0 = len();
+        made.push(trunk.fork_branch().unwrap().into_id());
+        let unnamed = len() - l0;
+        let l1 = len();
+        made.push(trunk.create_branch("pad-measure").unwrap());
+        let named_fixed = (len() - l1).checked_sub(11).expect("premise: a named create's frame holds its name");
+        assert!(unnamed < 58, "premise: an unnamed create's frame ({unnamed} bytes) fits the padding's slack");
+        let mut pads = 0u32;
+        loop {
+            let at = len();
+            assert!(at <= from, "premise: the padding overshot the held cut's offset {from} (at {at})");
+            let rem = from - at;
+            if rem == 0 {
+                break;
+            }
+            if rem > named_fixed + 64 {
+                made.push(trunk.fork_branch().unwrap().into_id());
+            } else {
+                let n = rem.checked_sub(named_fixed).filter(|n| *n >= 6).expect("premise: the padding left room for a named create") as usize;
+                pads += 1;
+                let name = format!("p{pads}-{}", "x".repeat(n));
+                made.push(trunk.create_branch(&name[..n]).unwrap());
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(90), "premise: the padding never reached the held cut's offset");
+        }
+        assert_eq!(db.branch_exception_counters()[2], inline, "premise: the padding compacted the log inline again");
+        made.push(trunk.fork_branch().unwrap().into_id());
+        db.branches.confirm_hold_for_test(0);
+        eventually("premise: the held background compaction never finished", || !db.branches.compaction_owed_for_test());
+        (made, db.incarnation)
+    };
+    let db = reopen(&path, opts(false, SyncClass::Fsync), incarnation);
+    let live = db.branch_ids().unwrap();
+    let lost: Vec<_> = made.iter().filter(|id| !live.contains(id)).collect();
+    assert!(
+        lost.is_empty(),
+        "CLAIM: {} of {} creates acknowledged after an inline compaction were lost to the stale background cut: {lost:?}",
+        lost.len(),
+        made.len()
+    );
+}
+
+/// L2 slope (budget create_allocates_no_table_of_every_branch_under_the_store_mutex): the create
+/// that allocates the most under the store mutex as a D0 snapshot store grows past 2^15 branches,
+/// and whether it compacted the log inline (a D0 compaction syncs nothing, so `maybe_compact` runs it
+/// in the create's own hold, encoding a snapshot of every branch: O(N) bytes). Per create: this
+/// thread's bytes allocated under a store mutex (`budget_probe::thread_allocs`, exact per thread)
+/// and the log's length before and after (a compaction shortens it). Budget: 64 KiB per create.
+#[test]
+fn a_d0_create_allocates_at_most_64_kib_under_the_store_mutex_as_branches_grow() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("growth-d0.db"), opts(false, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let (mut worst, mut worst_at, mut worst_compacted, mut compactions) = (0u64, 0u64, false, 0u64);
+    for n in 0..34_000u64 {
+        let len0 = db.branches.log_len_for_test();
+        let held0 = super::budget_probe::thread_allocs().3;
+        let _ = trunk.fork_branch().unwrap().into_id();
+        let held = super::budget_probe::thread_allocs().3 - held0;
+        let compacted = db.branches.log_len_for_test() < len0;
+        compactions += u64::from(compacted);
+        if held > worst {
+            (worst, worst_at, worst_compacted) = (held, n, compacted);
+        }
+    }
+    assert!(compactions > 0, "premise: the log was compacted while the store grew");
+    assert!(
+        worst <= 64 << 10,
+        "CLAIM: create {worst_at} allocated {worst} bytes under the store mutex (it compacted the log inline: \
+         {worst_compacted}; {compactions} compacting creates in 34,000); budget 64 KiB"
+    );
+}
+
+/// Lead order (2026-10-15T08:22:05Z, from the wire's default-stack raws; debug, lldb): the create
+/// path's frames were ensure_backing 797 KB, open_resolved 831 KB and start_name_filter at least
+/// 422 KB, so a create overflowed a 2 MiB thread (Rust's default spawn stack). On a 2 MiB thread, in
+/// its own process (an overflow aborts it): open, the first create (the catalog's creation in
+/// catalog mode), a named create, a write on it, a reopen and a connect by name. The frame BUDGET
+/// beside it is clippy's `large_stack_frames` (deny, 512,000 bytes, workspace lints), which `cargo
+/// clippy -p turso_core` now passes. A child that overflows prints "has overflowed its stack".
+#[cfg(unix)]
+#[test]
+fn a_create_runs_on_a_2_mib_thread() {
+    let Some(sentinel) = super::fork_driver::alone("branch::fastest_tests::a_create_runs_on_a_2_mib_thread") else {
+        return;
+    };
+    let ran = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            for catalog in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("stack.db");
+                let incarnation = {
+                    let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+                    let trunk = db.connect().unwrap();
+                    seed(&trunk);
+                    let _ = trunk.fork_branch().unwrap().into_id();
+                    let named = trunk.create_branch("small-stack").unwrap();
+                    assert_eq!(db.branch_named("small-stack").unwrap(), Some(named), "catalog={catalog}: premise");
+                    write_v(&db.connect_named("small-stack").unwrap(), 3, "deep");
+                    db.incarnation
+                };
+                let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+                assert_eq!(read_v(&db.connect_named("small-stack").unwrap(), 3), "deep", "catalog={catalog}: premise: the write is back");
+            }
+        })
+        .unwrap()
+        .join();
+    assert!(ran.is_ok(), "CLAIM: the create path failed on a 2 MiB thread");
+    super::fork_driver::finished(&sentinel);
+}
+
+/// Lead finding and order 5 (fastest DECISIONS, 2026-10-15T07:2xZ): in-place VACUUM builds its
+/// image in a target database (`etilqs_<name>`, on the source's IO), whose own WAL commit syncs a
+/// DIFFERENT file. A failure of that sync must not reach the trunk store's at-risk decision: the
+/// trunk's durability state is not that file's. Only the target's WAL armed (its first sync fails
+/// at issue), with x's Release undrained in the trunk store (the state in which a counted failure
+/// can fail-stop it): the VACUUM fails, the trunk store counts no sync failure, and the next fork
+/// is acknowledged. Both modes.
+#[test]
+fn a_failed_vacuum_target_wal_sync_leaves_the_trunk_store_untouched() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vacuum-target.db");
+        let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+            only: Some("/etilqs_vacuum-target.db-wal".to_string()),
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            armed: armed.clone(),
+            held: Arc::new(std::sync::Mutex::new(None)),
+        });
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            opts(catalog, SyncClass::Off).with_vacuum(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let failures = db.branches.sync_failures();
+        armed.store(1, O::Release);
+        let vacuumed = trunk.execute("VACUUM");
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the VACUUM target's WAL sync was reached");
+        assert!(vacuumed.is_err(), "{what}: premise: the failed target WAL sync failed the VACUUM");
+        assert_eq!(
+            db.branches.sync_failures(),
+            failures,
+            "CLAIM: {what}: the VACUUM target's WAL sync failure reached the trunk store"
+        );
+        let next = db.connect().unwrap().fork_branch().map(|x| x.into_id());
+        assert!(next.is_ok(), "CLAIM: {what}: the trunk store refused a fork after the VACUUM target's sync failed: {:?}", next.err());
+    }
+}
+
 /// Engine review 21 LOW 20: a raw-frame WAL header sync whose completion failed was reported
 /// twice: `watched` noted the completion, and `write_frame_raw_watched` reported the failed wait
 /// directly without taking that note, so the next check of the connection's noted syncs (the next
@@ -9570,6 +10520,56 @@ fn a_background_compaction_stopped_before_its_cut_loses_nothing() {
         "after",
         "CLAIM: the write made after the stopped compaction was lost"
     );
+}
+
+/// Lead order 1 (2026-10-15T07:29:43Z; gates ultrareview row 1): 1f70dde48 made recovery replay a
+/// snapshot store's OLDER log past the marker of the snapshot's generation. A binary from before
+/// it resets that log and loses every record past the marker (1f70dde48's own disclosed blind
+/// spot), so it must REFUSE such a store, never reset it: the format version moves with the
+/// replay. The crash image of `a_background_compaction_stopped_before_its_cut_loses_nothing`,
+/// read at the last default-arm format before the replay (15), is refused; read at this build's
+/// own, it recovers (the control).
+#[test]
+fn a_store_needing_the_older_log_replay_is_refused_by_an_older_format() {
+    use std::sync::atomic::Ordering as O;
+    const BEFORE_OLDER_LOG_REPLAY: u32 = 15;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("compact-format.db");
+    {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        super::store::COMPACT_STOP_BEFORE_CUT.store(true, O::Release);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.background_compactions() == 0 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction ran");
+        }
+        eventually("premise: the background compaction never stopped", || !db.branches.compaction_owed_for_test());
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 3, "after");
+    }
+    super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+    let files = super::journal::BranchFiles::for_db(path.to_str().unwrap());
+    assert!(files.snap.exists(), "premise: the stopped compaction installed no snapshot");
+    let old = super::journal::Journal::recover_as(&files, SyncClass::Fsync, BEFORE_OLDER_LOG_REPLAY);
+    assert!(
+        old.is_err(),
+        "CLAIM: a reader of format {BEFORE_OLDER_LOG_REPLAY}, which resets an older log, read a store \
+         whose records past the marker only the older-log replay keeps"
+    );
+    drop(old);
+    let own = super::journal::Journal::recover_as(&files, SyncClass::Fsync, super::journal::format_version(false));
+    assert!(matches!(own, Ok(Some(_))), "premise: this build does not recover the store: {:?}", own.err());
 }
 
 /// DECISIONS bd0d845f97: the cut's last pass copies under the mutex what flights wrote after its
