@@ -358,8 +358,8 @@ def after_problems(nm, sm, cols):
 
 def raw_problems(nm, d, sm):
     """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
-    per warm-up op, (competitors review 2 item 1) no measured row intended at or after tm1_ns, the window's end as
-    claim_op stamped it in intended time, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
+    per warm-up op, (competitors review 2 item 1) no measured row claimed (claim_ns; intended_ns when the raw has no
+    claim_ns) at or after tm1_ns, the window's end as claim_op stamped it, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
     (after_problems)."""
     p = os.path.join(d, "raw.tsv")
     try:
@@ -380,12 +380,16 @@ def raw_problems(nm, d, sm):
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
     else:
+        # the lead's claim_ns ruling: claim_op decides an op's phase at its CLAIM and stamps tm1 at a claim, so the window
+        # is judged on claim_ns when the raw has it. In closed loop intended_ns is the op's start, which at C > 1 can
+        # fall after tm1 for an op claimed before it (a false refusal); without claim_ns, intended_ns as before
+        key, word = ("claim_ns", "claimed") if "claim_ns" in cols else ("intended_ns", "intended")
         try:
-            late = sum(1 for r in rows if r["phase"] == "measure" and int(r["intended_ns"]) >= tm1)
-        except ValueError:
-            return why + [f"{nm} run's raw.tsv has an intended_ns that is not a count"]
+            late = sum(1 for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1)
+        except (ValueError, TypeError):
+            return why + [f"{nm} run's raw.tsv has an {key} that is not a count"]
         if late:
-            why.append(f"{nm} run measured {late} op(s) intended at or after tm1 {tm1}")
+            why.append(f"{nm} run measured {late} op(s) {word} at or after tm1 {tm1}")
     return why
 
 
