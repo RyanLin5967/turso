@@ -5241,6 +5241,33 @@ fn a_named_statement_keeps_its_described_parameter_types() {
     );
 }
 
+/// A statement's parameter types are inferred from the schema its compile uses, the newest one,
+/// not from a session's older snapshot: after another session replaces ft(k INT) with ft(k TEXT),
+/// a Describe of `count(*) ... WHERE k = $1` answers [25], and its executions return one row each,
+/// as PostgreSQL does. The inference read the session's snapshot before the compile adopted the
+/// newer schema, so it fixed int4 ([23]) and every Execute after was refused 0A000 against the
+/// text column it then saw (wire review 18 item 8).
+#[test]
+fn parameter_types_come_from_the_schema_the_compile_uses() {
+    let dir = Scratch::new("staletypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("SELECT count(*) FROM ft")
+        .ok("a's snapshot holds ft(k INT)");
+    b.q("DROP TABLE ft").ok("drop");
+    b.q("CREATE TABLE ft(k TEXT)").ok("ft as text");
+    b.q("INSERT INTO ft VALUES ('x')").ok("row");
+    let sql = "SELECT count(*) FROM ft WHERE k = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(r.params, Some(vec![25]), "{:?}", r.error);
+    for _ in 0..2 {
+        let r = a.xt(sql, &[(0, 0, b"x")]).ok(sql);
+        assert_eq!(r.rows, vec![vec![Some("1".to_string())]]);
+    }
+}
+
 /// A named statement's result types are fixed at its first Describe too: on a branch where its
 /// column is TEXT, its Describe and its Execute are refused, 0A000 "cached plan must not change
 /// result type", as PostgreSQL's RevalidateCachedQuery refuses both. Its rows went out as text
