@@ -1404,6 +1404,22 @@ impl Session {
                 _ => return Err(aborted_error()),
             }
         }
+        // Outside a block the client opened, a savepoint verb is refused (below) by its leading
+        // keywords, whatever its name's spelling (TxVerb::of_leading_keywords; wire review 14
+        // item 15).
+        let verb = match verb {
+            TxVerb::Other if !in_tx || st.implicit => {
+                TxVerb::of_leading_keywords(sql).unwrap_or(TxVerb::Other)
+            }
+            verb => verb,
+        };
+        // A block end inside an implicit block (a multi-statement query's, a pipeline's) ends that
+        // block through the engine, as below, and warns as PostgreSQL warns there: there is no
+        // transaction in progress, for the client (wire review 14 item 20).
+        if in_tx && st.implicit && matches!(verb, TxVerb::Commit | TxVerb::Rollback) {
+            st.notices
+                .push(warning("25P01", "there is no transaction in progress"));
+        }
         match verb {
             // PostgreSQL warns and carries on for these; the engine would refuse them. A BEGIN in
             // an implicit block makes the block the client's, unwarned (after_implicit). The
@@ -2238,11 +2254,7 @@ impl TxVerb {
                     TxVerb::Chain { commit: false }
                 } else if is(first, "ROLLBACK") && rest.first().is_some_and(|x| is(x, "TO")) {
                     let rest = &rest[1..];
-                    let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
-                        &rest[1..]
-                    } else {
-                        rest
-                    };
+                    let rest = savepoint_keyword(rest);
                     if name(rest) {
                         TxVerb::RollbackTo
                     } else {
@@ -2253,11 +2265,7 @@ impl TxVerb {
                 }
             }
             [first, rest @ ..] if is(first, "RELEASE") => {
-                let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
-                    &rest[1..]
-                } else {
-                    rest
-                };
+                let rest = savepoint_keyword(rest);
                 if name(rest) {
                     TxVerb::Release
                 } else {
@@ -2269,9 +2277,73 @@ impl TxVerb {
         }
     }
 
+    /// The savepoint verb a statement starts with, read by its leading keywords alone, whatever
+    /// follows: `SAVEPOINT x`, `RELEASE x`, `ROLLBACK [WORK | TRANSACTION] TO x`, x any non-blank
+    /// text. For the refusal outside a block (25P01), where a name the verb reader cannot hold as
+    /// one word (`U&"a"`, one after a \v) made the statement Other, and the engine then opened a
+    /// transaction with no BEGIN for SAVEPOINT, or answered XX000 (wire review 14 item 15).
+    /// Blind spot: a statement PostgreSQL refuses as a syntax error after those keywords
+    /// (`SAVEPOINT 1x`) is answered 25P01 here, a refusal either way.
+    fn of_leading_keywords(sql: &str) -> Option<Self> {
+        // The next word of letters at `*i`, then the blanks and comments after it, never a `;`
+        // (it would end the statement). A fn, not a closure, so its output borrows `sql` alone.
+        fn word<'s>(sql: &'s str, i: &mut usize) -> Option<&'s str> {
+            let b = sql.as_bytes();
+            let start = *i;
+            while *i < b.len() && b[*i].is_ascii_alphabetic() {
+                *i += 1;
+            }
+            let w = &sql[start..*i];
+            loop {
+                while *i < b.len() && pg_space(b[*i]) {
+                    *i += 1;
+                }
+                match sql_comment(&b[*i..]) {
+                    Some(len) => *i += len?,
+                    None => break,
+                }
+            }
+            (!w.is_empty()).then_some(w)
+        }
+        let b = sql.as_bytes();
+        let mut i = skip_blank(b, 0)?;
+        let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+        let verb = match word(sql, &mut i)? {
+            w if is(w, "SAVEPOINT") => TxVerb::Savepoint,
+            w if is(w, "RELEASE") => TxVerb::Release,
+            w if is(w, "ROLLBACK") => {
+                let mut next = word(sql, &mut i)?;
+                if is(next, "WORK") || is(next, "TRANSACTION") {
+                    next = word(sql, &mut i)?;
+                }
+                if !is(next, "TO") {
+                    return None;
+                }
+                TxVerb::RollbackTo
+            }
+            _ => return None,
+        };
+        // A name follows, whatever its spelling.
+        (i < b.len() && b[i] != b';').then_some(verb)
+    }
+
     /// The statements a failed block still accepts.
     fn ends_block(self) -> bool {
         matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
+    }
+}
+
+/// The words after `ROLLBACK ... TO` or `RELEASE`, with an optional SAVEPOINT keyword dropped: the
+/// keyword is dropped only when a name follows it, so `ROLLBACK TO SAVEPOINT` and `RELEASE
+/// SAVEPOINT` name a savepoint called savepoint, as PostgreSQL's grammar reads them (TO ColId,
+/// RELEASE ColId; recorded on PostgreSQL 18.6, wire review 14 item 21). The reader dropped it
+/// always, found no name and read Other, so a failed block refused the statement 25P02.
+fn savepoint_keyword<'a, 's>(rest: &'a [&'s str]) -> &'a [&'s str] {
+    match rest {
+        [first, name, ..] if first.eq_ignore_ascii_case("SAVEPOINT") && !name.is_empty() => {
+            &rest[1..]
+        }
+        _ => rest,
     }
 }
 
