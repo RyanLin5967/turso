@@ -2675,6 +2675,25 @@ fn infinities_and_negative_zero_are_written_as_postgresql_writes_them() {
     );
 }
 
+/// The infinities are written `Infinity` and `-Infinity` (float8 and float4) and a negative zero
+/// `-0`, as PostgreSQL 18.6 writes them (recorded, artie raw loud-20261015/pg18-diff/pg18-inf.out);
+/// the vendored pgwire wrote `inf`, `-inf` and `0`. NaN, which the engine cannot hold, is left to
+/// infinities_and_negative_zero_are_written_as_postgresql_writes_them (known red) (lead ruling
+/// 2026-10-15T07:40:59Z: pgwire's test_format moves to 'Infinity').
+#[test]
+fn infinities_and_negative_zero_are_written_without_nan() {
+    let dir = Scratch::new("floatinf2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let r = a
+        .q("SELECT 'Infinity'::float8, '-Infinity'::float8, 'Infinity'::float4")
+        .ok("infinities");
+    assert_eq!(r.rows, vec![vec![t("Infinity"), t("-Infinity"), t("Infinity")]]);
+    let r = a.q("SELECT '-0'::float8").ok("negative zero");
+    assert_eq!(r.rows, vec![vec![t("-0")]]);
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
