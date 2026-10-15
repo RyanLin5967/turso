@@ -980,6 +980,7 @@ extern "C" {
 
 #[cfg(target_vendor = "apple")]
 impl Drop for Suspended {
+    #[allow(deprecated)]
     fn drop(&mut self) {
         extern "C" {
             fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
@@ -995,6 +996,7 @@ impl Drop for Suspended {
 /// Suspend the one thread of this process whose pthread name is `name`; `None` unless exactly one
 /// has it, or if the suspend fails. Not for a measured window (it reads thread names).
 #[cfg(target_vendor = "apple")]
+#[allow(deprecated)]
 pub(crate) fn suspend_thread_named(name: &str) -> Option<Suspended> {
     extern "C" {
         fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
@@ -1056,6 +1058,7 @@ pub(crate) fn suspend_thread_named(name: &str) -> Option<Suspended> {
 /// be listed (off Apple). Mach traps and userspace only (the port list is given back with
 /// `mach_port_deallocate` and `vm_deallocate`), so it can run inside a measured window without moving
 /// the syscall count. `blocked` is the kernel's `TH_STATE_WAITING` for the thread.
+#[allow(deprecated)]
 fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
     #[cfg(target_vendor = "apple")]
     {

@@ -1,6 +1,6 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
-use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -948,9 +948,9 @@ pub fn translate_alter_table(
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
-            // Tables always have at least one column.
-            turso_assert_ne!(btree.columns().len(), 0);
-
+            // A table can have no columns (PostgreSQL's `CREATE TABLE t ()`): then the column to
+            // drop is not there, which the lookup below says. It was an assertion that killed the
+            // session (the crash batch, 2026-10-15).
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"

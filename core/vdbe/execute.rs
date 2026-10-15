@@ -1482,7 +1482,7 @@ pub fn op_vcreate(
 }
 
 pub fn op_vfilter(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -1505,6 +1505,14 @@ pub fn op_vfilter(
         let args = (0..*arg_count)
             .map(|i| state.registers[args_reg + i].get_value().try_clone())
             .try_collect::<Result<crate::alloc::Vec<_>>>()??;
+        // A dialect may refuse a table-valued function's arguments SQLite takes (PostgreSQL's
+        // infinite generate_series bound).
+        if let Some((_, CursorType::VirtualTable(vtab))) = program.cursor_ref.get(*cursor_id) {
+            program
+                .connection
+                .dialect()
+                .check_table_function_args(&vtab.name, *idx_num as i64, &args)?;
+        }
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
@@ -16216,7 +16224,7 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -16224,6 +16232,16 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
+    // A dialect may read a text as a float in its own way (PostgreSQL's 'Infinity').
+    if matches!(affinity, Affinity::Real) {
+        if let Some(text) = value.to_text() {
+            if let Some(float) = program.connection.dialect().cast_text_to_float(text) {
+                state.registers[*reg].set_value(Value::from_f64(float?));
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
