@@ -13,6 +13,8 @@
             implies stop_secs >= S, and OPS and S both met implies not capped (review 5 LOW 15),
           - drain_secs >= 0, secs == stop_secs + drain_secs (to print precision), ops == ops_at_stop (A23 counts
             claims, so nothing is counted after the claim that ended the warm-up; review 5 LOW 15).
+  driver_contract.py tie SUMMARY.json WARMUP-LIVE.json          the live warm-up record is that run's own warm-up
+                                                                (tie()); exit 0 kept, 1 broken, 2 unreadable
   driver_contract.py self-test                                  the checker on synthetic records; exit 0 iff all pass
 
 The fastest-gates release job runs the built driver with rules whose outcome is forced (1000000:0:2 must run to
@@ -90,6 +92,33 @@ def check(j, t, c, rule, by_client=None):
     return bad + stamp_problems(j)
 
 
+def tie(j, live):
+    """The live warm-up record (warmup-live.json) is the run's own warm-up (summary.json `warmup`): the replay in
+    warmup_conformance.py live shares warm_ends with the live loop, so only this ties the record to the run (fresh read
+    of 7a8c3a817..0802dd739, finding 2). One claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, the
+    stop's claim at stop_secs (printed to ms), the same capped and rule."""
+    if not isinstance(live, dict):
+        return ["no live warm-up record (warmup-live.json)"]
+    w = j.get("warmup") or {}
+    claims, st, wo, cap = live.get("claims_ns"), live.get("stop_at"), live.get("warm_ops"), live.get("capped")
+    bad = []
+    if not isinstance(claims, list) or not claims or any(type(c) is not int for c in claims):
+        return ["the live record's claims_ns is not a non-empty list of ints"]
+    if type(st) is not int or len(claims) != st + 1:
+        bad.append(f"{len(claims)} live claims for stop_at {st!r}: want one per warm-up op plus the stop's")
+    if not (st == wo == w.get("ops_at_stop") == w.get("ops")):
+        bad.append(f"live stop_at {st!r}, warm_ops {wo!r}; summary ops_at_stop {w.get('ops_at_stop')!r}, ops "
+                   f"{w.get('ops')!r}: not one warm-up")
+    ss = w.get("stop_secs")
+    if not isinstance(ss, (int, float)) or abs(claims[-1] / 1e9 - ss) > 0.0005 + 1e-9:
+        bad.append(f"the live stop's claim at {claims[-1] / 1e9:.6f} s, summary stop_secs {ss!r}")
+    if cap not in (0, 1) or bool(cap) != w.get("capped"):
+        bad.append(f"live capped {cap!r}, summary capped {w.get('capped')!r}")
+    if live.get("rule") != w.get("rule"):
+        bad.append(f"live rule {live.get('rule')!r}, summary rule {w.get('rule')!r}")
+    return bad
+
+
 STAMP_SLACK_S = 0.05  # a window's realtime span vs its monotonic secs: two clocks read a few calls apart
 
 
@@ -126,6 +155,10 @@ def stamp_problems(j):
                 if type(x) is not int or type(y) is not int or x < 0 or y < x:
                     bad.append(f"window {name}: exception counter {k} before {x!r} after {y!r}: not two non-negative "
                                "ints, never going back")
+    for k in ("tracerpid_tm0", "tracerpid_tm1"):
+        if k not in j or not (j[k] is None or (type(j[k]) is int and j[k] >= 0)):
+            bad.append(f"{k} {j.get(k, '(absent)')!r}: the driver's own TracerPid at the measured span's bound, an int "
+                       ">= 0, or null where there is no /proc")
     first, last = wins[0], wins[-1]
     for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
                     ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):
@@ -159,6 +192,8 @@ def self_test():
                         "secs": round(st + dr, 3), "capped": capped}, "windows": wins}
         if ready is not None:
             r["warmup"]["t0_after_ready_ns"] = ready
+        # TEST EDIT, flagged: the driver's own TracerPid at the measured span's open and close (0: untraced)
+        r["tracerpid_tm0"] = r["tracerpid_tm1"] = 0
         for k, v, x in (("tm0_realtime_s", tm[0], 0), ("tm1_realtime_s", tm[1], -1)):
             if v == "auto":
                 v = wins[x]["t0_realtime_s" if x == 0 else "t1_realtime_s"] if wins else None
@@ -167,6 +202,9 @@ def self_test():
         return r
 
     EC = {"before": {k: 7 for k in EXC}, "after": {k: 7 for k in EXC}}
+    # rec()'s warm-up as its live record: 5000 warm-up claims, then the stop's claim at 2.02 s, capped
+    LIVE = {"rule": "1000000:0:2", "claims_ns": [i * 400_000 for i in range(5000)] + [2_020_000_000], "stop_at": 5000,
+            "warm_ops": 5000, "capped": 1}
     W0 = {"window": "create", "secs": 0.5, "t0_realtime_s": 1000.0, "t1_realtime_s": 1000.5, "exception_counters": EC}
 
     cases = [
@@ -257,6 +295,25 @@ def self_test():
          check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
                                                       "after": EC["after"] | {"compaction_waits": 9}}}]), 33, 4,
                "1000000:0:2") == []),
+        # the driver records its own TracerPid at the measured span's open and close (/proc/self/status, as bbload's
+        # tracerpid_tm0/tm1): an int, or null where the platform has no /proc (summarize, for T3, requires 0)
+        ("tracerpid: no tracerpid_tm0 fails", check({k: v for k, v in rec().items() if k != "tracerpid_tm0"}, 33, 4,
+                                                    "1000000:0:2") != []),
+        ("tracerpid: tracerpid_tm1 as a string fails", check(rec() | {"tracerpid_tm1": "0"}, 33, 4, "1000000:0:2") != []),
+        ("tracerpid: null on a platform without /proc keeps the contract",
+         check(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, 33, 4, "1000000:0:2") == []),
+        # fresh read of 7a8c3a817..0802dd739, finding 2: the live record shares warm_ends with the replay, so replaying it
+        # alone can only catch a claim-handling split; it must also be the run's own warm-up (summary.json warmup):
+        # one claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, its last claim at stop_secs, capped
+        ("tie: a live record that is the summary's warm-up keeps the contract", tie(rec(), LIVE) == []),
+        ("tie: a live record missing a claim (5000 claims for stop_at 5000) fails",
+         tie(rec(), LIVE | {"claims_ns": LIVE["claims_ns"][1:]}) != []),
+        ("tie: a live stop_at other than ops_at_stop fails", tie(rec(), LIVE | {"stop_at": 4999, "warm_ops": 4999}) != []),
+        ("tie: a live last claim at 2.5 s beside stop_secs 2.02 fails",
+         tie(rec(), LIVE | {"claims_ns": LIVE["claims_ns"][:-1] + [2_500_000_000]}) != []),
+        ("tie: a live capped 0 beside the summary's capped true fails", tie(rec(), LIVE | {"capped": 0}) != []),
+        ("tie: a live rule other than the summary's fails", tie(rec(), LIVE | {"rule": "10:0:30"}) != []),
+        ("tie: no live record (None) fails", tie(rec(), None) != []),
     ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
@@ -268,6 +325,17 @@ def self_test():
 def main(a):
     if a[1:] == ["self-test"]:
         return self_test()
+    if a[1:2] == ["tie"] and len(a) == 4:
+        try:
+            j, live = json.load(open(a[2])), json.load(open(a[3]))
+        except (OSError, ValueError) as e:
+            print(f"driver contract tie: REFUSED: {type(e).__name__}: {e}")
+            return 2
+        bad = tie(j, live)
+        for b in bad:
+            print(f"driver contract tie: {a[3]}: {b}")
+        print(f"driver contract tie: {a[3]}: {'ok' if not bad else 'BROKEN'}")
+        return 0 if not bad else 1
     if a[1:2] == ["check"] and len(a) in (6, 7):
         j = json.load(open(a[2]))
         by = [int(x) for x in a[6].split(",")] if len(a) == 7 else None

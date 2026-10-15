@@ -18,16 +18,22 @@ arm() { local n=$1 want=$2 rc=0; shift 2; "$@" > "$OUT/contract-$n.txt" 2>&1 || 
   tail -1 "$OUT/contract-$n.txt"
   [ $rc -eq "$want" ] || { echo "arm $n: rc $rc, want $want ($OUT/contract-$n.txt)"; FAILED="$FAILED $n"; }; }
 arm selftest 0 python3 -B "$C" self-test
+# each run's record directory starts empty, so a rerun into the same OUT never replays a stale warmup-live.json (fresh
+# read of 7a8c3a817..0802dd739, finding 3)
+rm -rf "$OUT"/contract-k1 "$OUT"/contract-k2 "$OUT"/contract-k3
 arm k1 0 "$BIN" --dir "$d/k1" --class full --clients 4 --ops-total 33 --warmup 1000000:0:2 --out "$OUT/contract-k1"
 arm k1-check 0 python3 -B "$C" check "$OUT/contract-k1/summary.json" 33 4 1000000:0:2 9,8,8,8
 arm k1-live 0 python3 -B "$W" live "$BIN" "$OUT/contract-k1/warmup-live.json"
+arm k1-tie 0 python3 -B "$C" tie "$OUT/contract-k1/summary.json" "$OUT/contract-k1/warmup-live.json"
 arm k2 0 "$BIN" --dir "$d/k2" --class full --clients 16 --ops-total 20 --warmup 10:0:30 --mode cycle --out "$OUT/contract-k2"
 arm k2-check 0 python3 -B "$C" check "$OUT/contract-k2/summary.json" 20 16 10:0:30 2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1
 arm k2-live 0 python3 -B "$W" live "$BIN" "$OUT/contract-k2/warmup-live.json"
+arm k2-tie 0 python3 -B "$C" tie "$OUT/contract-k2/summary.json" "$OUT/contract-k2/warmup-live.json"
 # S > 0 (review 5 LOW 15): it must stop at a claim at or after 1 s with 10 ops claimed, not capped
 arm k3 0 "$BIN" --dir "$d/k3" --class full --clients 4 --ops-total 33 --warmup 10:1:30 --out "$OUT/contract-k3"
 arm k3-check 0 python3 -B "$C" check "$OUT/contract-k3/summary.json" 33 4 10:1:30 9,8,8,8
 arm k3-live 0 python3 -B "$W" live "$BIN" "$OUT/contract-k3/warmup-live.json"
+arm k3-tie 0 python3 -B "$C" tie "$OUT/contract-k3/summary.json" "$OUT/contract-k3/warmup-live.json"
 refuse() { local rc=0; "$BIN" --dir "$d/r$1" "${@:2}" > "$OUT/contract-refuse-$1.txt" 2>&1 || rc=$?
   [ $rc -eq 1 ] && grep -q '^NOT A RESULT' "$OUT/contract-refuse-$1.txt" ||
     { echo "refusal $1 (${*:2}): rc=$rc"; cat "$OUT/contract-refuse-$1.txt"; FAILED="$FAILED refuse-$1"; }; }

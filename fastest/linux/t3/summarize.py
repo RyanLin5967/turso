@@ -24,7 +24,8 @@ fastest_profile by sha256 (binaries.txt), and with no competitor warm-up claim j
 a loud_owed line (review 5 MED 6; PREREG annex A23).
 The engine's four branch exception counters (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): every
 window of ours' result/summary.json carries exception_counters {before, after} (hardcap_upgrades,
-header_raise_exclusive, inline_compaction_syncs, compaction_waits; fastest_profile must emit them: Rust, HELD);
+header_raise_exclusive, inline_compaction_syncs, compaction_waits; fastest_profile emits them from
+Database::branch_exception_counters() on a tree that has it: fork fastest-linux-exc, 588b59bbc);
 runs[].exception_counter_deltas holds each window's re-derived delta. A missing or unreadable record is a parity
 refusal; a nonzero delta labels the cell uncredited (runs[].counters_credited false, listed in uncredited_cells),
 which does not fail the package. Competitor runs are not the turso engine and carry none.
@@ -293,19 +294,19 @@ RUNNER_MODE, RUNNER_PHASES = "phases", len(PHASES)
 def exception_deltas(j):
     """({window: {counter: after - before}} or None, the refusals, absent) from ours' result/summary.json: every window carries
     exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
-    deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED). The windows
+    deltas are re-derived here from the raw reads; fastest_profile emits them where the engine has them (588b59bbc). The windows
     listed must be exactly, in order, the ones t3run asked for (RUNNER_MODE with RUNNER_PHASES phases, which the run's
     own mode and phases_run must also say: a run's claim alone never narrows the coverage), each named, and no counter
     may fall between one window's close and the next one's open. A rise between windows is not refused: the ruling
     credits a cell on zero INSIDE its windows, and the gaps hold unmeasured work (the branch connections closing
     before the delete window opens). ABSENT is true when the record is not there at all (no windows, or a window
-    with no exception_counters): what fastest_profile owes until it emits them (Rust, HELD), set LOUD-OWED."""
+    with no exception_counters): a driver built without Database::branch_exception_counters(), set LOUD-OWED."""
     if not isinstance(j, dict):
         return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"], False
     wins = j.get("windows")
     if not isinstance(wins, list) or not wins:
         return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
-                      "(fastest_profile must record them per window: Rust, HELD)"], True
+                      "(fastest_profile must record them per window)"], True
     pr = j.get("phases_run")
     if j.get("mode") != RUNNER_MODE or type(pr) is not int or pr != RUNNER_PHASES:
         return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} are not what t3run asked for "
@@ -328,7 +329,7 @@ def exception_deltas(j):
         ec = w.get("exception_counters")
         if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
             bad.append(f"window {name}: no exception_counters {{before, after}} (the engine's branch exception "
-                       "counters; fastest_profile must record them: Rust, HELD)")
+                       "counters; fastest_profile must record them)")
             prev, absent = None, True
             continue
         d = {}
@@ -358,9 +359,9 @@ def ours_sweeper(d, adapter_rc=None):
     (t3lib.sh ours_timed_record), its sweeper_cpu_s RE-DERIVED from the run's own timed.tracer.tsv over the run's own
     window by the one reader, gates/sweeper_record.py (the stored value is compared, never read as the answer). The
     record is held to the competitors' untraced-run rules by their own implementation, timedrun.py tracer_problems
-    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window; its
-    two checks of the load generator's own TracerPid at tm0 and tm1 are not asked of ours (fastest_profile records
-    none: Rust, HELD), so they are dropped by their field names (a reworded refusal there fails closed, as a refusal).
+    (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window, with
+    its two checks of the load generator's own TracerPid at tm0 and tm1 asked of fastest_profile's summary.json
+    tracerpid_tm0/tracerpid_tm1, which it records at the measured span's open and close, as bbload does.
     The window is fastest_profile's MEASURED span (bb96279f3): timed.json's t0/t1 are its result/summary.json
     tm0/tm1_realtime_s, inside the wrapper's process window, which timed.json carries as process_t0/process_t1 and which
     must be t3lib.sh's own timed.window record (t0, t1, rc); its rc is the cell's adapter rc.
@@ -405,9 +406,9 @@ def ours_sweeper(d, adapter_rc=None):
         return None, win, [f"{e.name} cannot be imported: the sweeper's record cannot be re-derived or judged"]
     finally:
         sys.path[:] = saved
-    tp = [x for x in timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
-                                              {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1")})
-          if not x.startswith(("the load generator's own tracerpid_tm0 ", "the load generator's own tracerpid_tm1 "))]
+    tp = timedrun.tracer_problems(os.path.join(d, "timed.tracer.tsv"),
+                                  {"tm0_realtime_s": tj.get("t0"), "tm1_realtime_s": tj.get("t1"),
+                                   "tracerpid_tm0": sj.get("tracerpid_tm0"), "tracerpid_tm1": sj.get("tracerpid_tm1")})
     if tp:  # tracer_problems also carries the shared reader's own refusals
         return None, win, [f"ours' timed run under the shared sweeper: {x}" for x in tp]
     lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
@@ -657,7 +658,8 @@ def summarize(out, sha, dry, manifest):
     if any(r.get("exception_counters_absent") for r in runs if r["measured"]):
         summary["loud_owed"].append("fastest_profile must emit exception_counters {before, after} in every window "
                                     "(Database::branch_exception_counters() read at each window's open and close; "
-                                    "Rust, HELD): until then every ours run is refused (routing ruling 05:16:51Z)")
+                                    "a driver built with the engine that has it, fastest-linux-exc): until then "
+                                    "every ours run is refused (routing ruling 05:16:51Z)")
     # lane review LOW 7 and 10: a failed competitor check and a package that measured nothing both fail the run
     summary["measured_runs"] = sum(r["measured"] for r in runs)
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
@@ -845,7 +847,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok"):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -879,6 +881,10 @@ def self_test():
                     # TEST EDIT, flagged (SPEC CHANGE, bb96279f3): the measured span ours' sweeper is read over
                     | ({} if ours_tm == "absent" else {"tm0_realtime_s": 100.12 if ours_tm == "differs" else 100.1,
                                                        "tm1_realtime_s": 100.3})
+                    # TEST EDIT, flagged: fastest_profile's own TracerPid at the measured span's open and close, as
+                    # the competitors' load generator records it (the checks summarize used to drop for ours)
+                    | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
+                                                       "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
                     | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
@@ -1120,13 +1126,19 @@ def self_test():
         # the lead's MED 12 ruling (DECISIONS 2026-10-15T04:21:48Z): SAME INSTRUMENT FOR EVERY SYSTEM. Every measured
         # run's timed.json records sweeper_cpu_s; ours' is re-derived from its own tracer record over its own window by
         # the one reader (gates/sweeper_record.py), never read from the stored value. Ours' window is its whole process
-        # until fastest_profile stamps its measured windows (Rust, HELD), so no ratio credits: sweeper_creditable false
+        # (before bb96279f3 ours' window was its whole process, so no ratio credited: sweeper_creditable false)
         # TEST EDIT, flagged as a SPEC CHANGE (bb96279f3: fastest_profile stamps its measured span, so ours' sweeper is
         # read over it as the competitors' is; the lead's 05:24:11Z ruling tied sweeper_creditable false to that gap)
         ("MED 12: ours with its sweeper record passes, carries sweeper_cpu_s 0.04 over its MEASURED span, creditable",
          {}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04] and s["runs"][0].get("sweeper_windows")
          == ["measured"] and s.get("sweeper_creditable") is True
          and not any("sweeper" in x and "process" in x for x in s.get("loud_owed") or [])),
+        # the tracer checks summarize dropped for ours (fastest_profile recorded no TracerPid of its own): it records
+        # them now, at the measured span's open and close, so the competitors' rule applies whole
+        ("tracerpid: ours whose own TracerPid at tm1 is 4321 fails, naming tracerpid_tm1", {"ours_tp": "traced"}, False,
+         lambda s: any("tracerpid_tm1" in x for x in s["parity_refusals"])),
+        ("tracerpid: ours recording no TracerPid of its own fails, naming tracerpid_tm0", {"ours_tp": "absent"}, False,
+         lambda s: any("tracerpid_tm0" in x for x in s["parity_refusals"])),
         ("measured span: a timed.json still naming the process window fails", {"ours_sweeper": "processwin"}, False,
          lambda s: any("'process'" in x for x in s["parity_refusals"])),
         ("measured span: summary.json's tm0 (100.12) other than timed.json's t0 (100.1) fails, naming tm0",
@@ -1279,7 +1291,8 @@ def self_test():
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
                                                                "ops_total_asked": int(ops), "mode": "phases",
                                                                "phases_run": 4, "tm0_realtime_s": 100.1,
-                                                               "tm1_realtime_s": 100.3,
+                                                               "tm1_realtime_s": 100.3, "tracerpid_tm0": 0,
+                                                               "tracerpid_tm1": 0,
                                                                "windows": ours_windows()}))  # TEST EDIT, flagged
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
