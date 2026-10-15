@@ -77,6 +77,8 @@ mod regexp;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
+#[cfg(all(test, unix))]
+mod stack_guard_tests;
 mod statement;
 mod stats;
 #[allow(dead_code)]
