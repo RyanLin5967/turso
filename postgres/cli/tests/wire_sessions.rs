@@ -2906,24 +2906,37 @@ fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
 }
 
 /// Describe of a statement whose parameters the client did not declare reports them all, $1 up to
-/// the highest $n used, as text, as PostgreSQL reports every parameter it infers. At 472023b72 it
-/// reported only the declared ones, so asyncpg, tokio-postgres and pgx (which declare none) saw no
-/// parameter and refused to bind (wire review 1 item 13).
+/// the highest $n used, each typed as PostgreSQL infers it: from the column it is compared with
+/// (int4 for id), text for the branch call's name. At 472023b72 it reported only the declared
+/// ones, so asyncpg, tokio-postgres and pgx (which declare none) saw no parameter and refused to
+/// bind (wire review 1 item 13). A parameter below the highest that the statement does not hold
+/// is 42P18, as PostgreSQL's Parse refuses a parameter it cannot type. The expected values were
+/// text throughout until the context typing landed; moved to PostgreSQL's answers, PROVISIONALLY
+/// (ruled c9c821dd8d, P6): a PostgreSQL 18 recording is LOUD-OWED, and if it differs the edit is
+/// reverted.
 #[test]
 fn describe_statement_reports_undeclared_parameters() {
     let dir = Scratch::new("describeparams");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
     const TEXT: u32 = 25;
+    const INT4: u32 = 23;
     for (sql, want) in [
         ("SELECT turso_branch_create($1)", vec![TEXT]),
-        ("SELECT v FROM t WHERE id = $1", vec![TEXT]),
-        ("SELECT v FROM t WHERE id = $2", vec![TEXT, TEXT]),
+        ("SELECT v FROM t WHERE id = $1", vec![INT4]),
         ("SELECT v FROM t", vec![]),
     ] {
         let r = a.describe_statement(sql).ok(sql);
         assert_eq!(r.params, Some(want), "{sql}");
     }
+    let gap = "SELECT v FROM t WHERE id = $2";
+    let r = a.describe_statement(gap);
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P18"),
+        "{gap}: $1 is not in the statement and nothing types it: {:?}",
+        r.params
+    );
 }
 
 /// Wire review 18 item 14, the deep arm: over v1..v1000, each reading the one before, a Describe
