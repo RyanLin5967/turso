@@ -4225,3 +4225,52 @@ fn trace_lifecycle_catalog() {
     probe::TRACE_CAT.store(false, Relaxed);
     eprintln!("=== END");
 }
+
+/// Diagnostic, not a budget (lead, 2026-10-15: is the open's free-table probing O(N)?): for N live
+/// named branches, checkpointed, then a tail of `FE_PROBE_TAIL` (default 16) first writes on
+/// branches made after the checkpoint and `FE_PROBE_TAIL` first writes on branches made before it,
+/// reopen and print the open's catalog queries, the free-table probes among them (one per touched
+/// slot below the checkpoint's high-water mark), the touched slots and the rows read. N from
+/// `FE_PROBE_NS` (default "10,10000,100000").
+#[test]
+#[ignore]
+fn open_free_probe_census() {
+    let tail = env_u64("FE_PROBE_TAIL", 16);
+    let ns = std::env::var("FE_PROBE_NS").unwrap_or_else(|_| "10,10000,100000".to_string());
+    for n in ns.split(',').map(|v| v.trim().parse::<u64>().unwrap()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("probe.db");
+        let inc = {
+            let db = open_at(&path);
+            let trunk = db.connect().unwrap();
+            seed(&trunk, false);
+            populate(&db, "pop", 0, n, true);
+            // Slots below the checkpoint's high-water mark for the tail to free: first writes on
+            // the first `tail` populated branches.
+            for i in 0..tail.min(n) {
+                let c = db.connect_named(&format!("pop-{i}")).unwrap();
+                exec(&c, &format!("UPDATE t SET v = 'p{i}' WHERE id = {}", 1 + i % 50));
+            }
+            db.branch_compact_now().unwrap();
+            db.branch_checkpoint_wait();
+            for i in 0..tail {
+                let old = db.connect_named(&format!("pop-{}", i % n)).unwrap();
+                exec(&old, &format!("UPDATE t SET v = 'o{i}' WHERE id = {}", 1 + i % 50));
+                drop(old);
+                let name = format!("tail-{i}");
+                trunk.create_branch(&name).unwrap();
+                let c = db.connect_named(&name).unwrap();
+                exec(&c, &format!("UPDATE t SET v = 'w{i}' WHERE id = {}", 1 + i % 50));
+            }
+            db.incarnation
+        };
+        let db = open_at(&path);
+        assert_ne!(db.incarnation, inc);
+        db.branch_wait_name_filter();
+        let s = db.branch_open_stats();
+        println!(
+            "PROBE n={n} tail={tail} cat_queries={} free_probes={} touched_slots={} cat_rows_read={} records={}",
+            s.cat_queries, s.free_probes, s.touched_slots, s.cat_rows_read, s.records
+        );
+    }
+}
