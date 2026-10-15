@@ -1440,17 +1440,28 @@ impl Drop for StoreGuard<'_> {
 
 /// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
 /// use) and at its first touch (`first`: in use), which LEAP L4 2b reads as its state at the
-/// checkpoint the tail follows.
+/// checkpoint the tail follows; and the slots first touched in use AFTER a parked Commit (C-R),
+/// whose state that does not settle (`after_park`): a parked Commit frees its pages' old slots
+/// only when its branch is loaded, so a slot it freed in the live process and a later record
+/// reused reads, at the open, as first touched in use, though it was in use at the checkpoint
+/// (the oracle's seed 1 at step 61, slot 13). Those are asked.
 #[derive(Default)]
 struct Touched {
     now: HashMap<Slot, bool>,
     first: HashMap<Slot, bool>,
+    after_park: HashSet<Slot>,
+    parked: bool,
 }
 
 impl Touched {
     fn set(&mut self, slot: Slot, used: bool) {
         self.now.insert(slot, used);
-        self.first.entry(slot).or_insert(used);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.first.entry(slot) {
+            e.insert(used);
+            if used && self.parked {
+                self.after_park.insert(slot);
+            }
+        }
     }
 }
 
@@ -4194,8 +4205,10 @@ impl BranchStore {
         inner.cat = Some(cat);
         let t = Instant::now();
         let mut touched = Touched::default();
+        let parked_before = inner.parked_records;
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
+            touched.parked = inner.parked_records > parked_before;
             match record {
                 Record::Commit { pages, .. } => {
                     for &(_, slot, _) in pages {
@@ -4381,7 +4394,8 @@ impl BranchStore {
         // in the tail, not a free-table probe. A Commit's or a TrunkRetain's slot is fresh, taken
         // from the free list or the reserved set, each of which the checkpoint lists free (a
         // reservation is written free: a crash loses it), or from past the high-water mark; a slot
-        // whose first touch frees it was in use at the checkpoint. Older formats probe, as before.
+        // whose first touch frees it was in use at the checkpoint; one first touched in use after a
+        // parked Commit is asked (see `Touched`). Older formats probe, as before.
         // Mutants (test builds only): `l4_free_probe_at_open` probes always; `l4_free_first_touch_
         // inverted` reads every first touch the wrong way round (the oracle's plant).
         let infer = super::journal::meta_carries_facts(meta.format) && !fe_mutant("l4_free_probe_at_open");
@@ -4398,7 +4412,7 @@ impl BranchStore {
             stats.touched_below_hw += u64::from(below);
             let listed = if !below {
                 false
-            } else if infer {
+            } else if infer && !touched.after_park.contains(&slot) {
                 let listed = touched.first[&slot] != inverted;
                 #[cfg(test)]
                 if check {
