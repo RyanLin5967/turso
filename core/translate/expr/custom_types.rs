@@ -1884,4 +1884,51 @@ mod tests {
             );
         }
     }
+
+    /// Codex C25 HIGH 3 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
+    /// a numeric ZERO kept any exponent the parser gave it, and the range check passed every zero,
+    /// so `'0e-2000000000' / x` asked `pg_numeric_div` for 10^1999999000 (and `'0e1000000' / x` for
+    /// 10^1000022). Expected values are PostgreSQL 18.6's for this exact SQL over this table (artie
+    /// raw frontier/fastest/lanes/engine/raw/pg18-numeric-zero-scale.txt d034bf749e), never ours:
+    /// a zero past 16383 fractional digits is refused, "value overflows numeric format"; a zero with
+    /// a positive exponent is 0. Each runs on a thread of its own within 10 s: a timeout is the red.
+    #[test]
+    fn a_numeric_zero_at_any_scale_computes_as_postgresql_does() {
+        let zeros = |n: usize| format!("0.{}", "0".repeat(n));
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT '0e-2000000000' / x FROM t", Err("value overflows numeric format")),
+            ("SELECT '0e-16384' / x FROM t", Err("value overflows numeric format")),
+            ("SELECT '0e1000000' / x FROM t", Ok(zeros(20))),
+            ("SELECT '0e-1000' / x FROM t", Ok(zeros(1000))),
+            ("SELECT '0e1000000' * x FROM t", Ok(zeros(2))),
+            ("SELECT '0e1000000' + x FROM t", Ok("1.00".to_string())),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let owned = sql.to_string();
+            std::thread::spawn(move || {
+                let got = (|| -> crate::Result<Option<String>> {
+                    let conn = open();
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")?;
+                    conn.execute("INSERT INTO t VALUES (1, 1)")?;
+                    let rows = conn.prepare(&owned)?.run_collect_rows()?;
+                    Ok(rows.first().and_then(|r| r[0].to_text().map(str::to_string)))
+                })();
+                let _ = tx.send(got.map_err(|e| e.to_string()));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            let ok = match (&got, &want) {
+                (Ok(Err(m)), Err(w)) => m.contains(w),
+                (Ok(Ok(Some(v))), Ok(w)) => v == w,
+                _ => false,
+            };
+            let shown = |g: &Result<Result<Option<String>, String>, _>| {
+                format!("{g:?}").chars().take(200).collect::<String>()
+            };
+            if !ok {
+                bad.push(format!("{sql} gave {}, not {}", shown(&got), format!("{want:?}").chars().take(60).collect::<String>()));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: numeric zero diverged from PostgreSQL 18 (a timeout: it never finished): {bad:?}");
+    }
 }
