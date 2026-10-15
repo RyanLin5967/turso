@@ -660,7 +660,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             });
             for t in 0..c {
                 let go = &go;
-                let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
+                let client = move || {
                     let trunk = db.connect();
                     while !go.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::yield_now();
@@ -688,7 +688,16 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                         delta(f0, probe::futile_leads()),
                         delta(g0, probe::fork_registrations()),
                     )
-                });
+                };
+                // A setup-failure plant (review C08 #3, `FE_MUTANT=budget_spawn_fails`, test builds
+                // only): the second client's spawn is refused, as resource exhaustion would refuse
+                // it, after the trunk writer started. Its outcome is a prompt crash naming the
+                // spawn, never a budget's kill.
+                let spawned = if commits && t == 1 && super::store::fe_mutant("budget_spawn_fails") {
+                    Err(std::io::Error::other("planted spawn failure (FE_MUTANT=budget_spawn_fails)"))
+                } else {
+                    std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, client)
+                };
                 match spawned {
                     Ok(h) => clients.push(h),
                     Err(e) => {
