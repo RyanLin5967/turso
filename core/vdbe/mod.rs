@@ -467,6 +467,10 @@ thread_local! {
     /// commit on this thread makes yield IO first, as a `merge_delta` that meets an uncached page
     /// would. Thread-local, so a parallel test is never affected.
     pub(crate) static VIEW_MERGE_YIELDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test instrument (engine review 19 LOW 15): at 1, the next materialized-view merge a commit on
+    /// this thread makes returns `Busy` instead; at n > 1, the n-th from now does (each merge counts
+    /// it down).
+    pub(crate) static VIEW_MERGE_BUSY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `err` ends an explicit transaction even when the failing statement wrote nothing. The
@@ -2335,6 +2339,15 @@ impl Program {
                             return Ok(IOResult::IO(crate::types::IOCompletions(
                                 crate::io::Completion::new_yield(),
                             )));
+                        }
+                        // Test instrument (engine review 19 LOW 15): this merge returns Busy.
+                        #[cfg(test)]
+                        if VIEW_MERGE_BUSY.with(|n| {
+                            let left = n.get();
+                            n.set(left.saturating_sub(1));
+                            left == 1
+                        }) {
+                            return Err(LimboError::Busy);
                         }
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {

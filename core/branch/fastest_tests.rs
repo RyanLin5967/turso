@@ -8661,3 +8661,61 @@ fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
         });
     }
 }
+
+/// The groups and totals view `view` (`grp`, `total`) holds, as `conn` reads them.
+fn view_totals(conn: &Arc<Connection>, view: &str) -> Vec<(Option<String>, Option<i64>)> {
+    conn.prepare(format!("SELECT grp, CAST(total AS INTEGER) FROM {view} ORDER BY grp"))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row[0].to_text().map(str::to_string), row[1].as_int()))
+        .collect()
+}
+
+/// Engine review 19 LOW 15: a COMMIT merges each materialized view's transaction delta in turn, and
+/// a merge that fails part-way (here the second view's returns Busy, `VIEW_MERGE_BUSY`) left the
+/// first view merged into the transaction's pages while its delta stayed in the connection's view
+/// states and the commit's progress stayed at the second view. A COMMIT run again as a new
+/// statement merged both views from the start (the first one twice); a held COMMIT re-stepped
+/// resumed at the second view, so a write made in between never reached the first. Two views over
+/// one table, both arms, both modes: each view counts every committed row once. Mutant
+/// `view_merge_restarts_merged`.
+#[test]
+fn a_view_merge_refused_part_way_merges_each_view_once() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for held in [false, true] {
+            let what = format!("catalog={catalog} held={held}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("view-busy.db"), opts(catalog, SyncClass::Fsync).with_views(true));
+            let a = db.connect().unwrap();
+            a.execute("CREATE TABLE counters(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)").unwrap();
+            a.execute("CREATE MATERIALIZED VIEW sums AS SELECT grp, SUM(val) AS total FROM counters GROUP BY grp")
+                .unwrap();
+            a.execute("CREATE MATERIALIZED VIEW counts AS SELECT grp, COUNT(*) AS total FROM counters GROUP BY grp")
+                .unwrap();
+            a.execute("BEGIN").unwrap();
+            a.execute("INSERT INTO counters VALUES (1, 'a', 5), (2, 'a', 7)").unwrap();
+            crate::vdbe::VIEW_MERGE_BUSY.with(|n| n.set(2));
+            let mut commit = a.prepare("COMMIT").unwrap();
+            let first = commit.run_ignore_rows();
+            let refused = crate::vdbe::VIEW_MERGE_BUSY.with(|n| n.replace(0)) == 0;
+            assert!(refused, "{what}: premise: the second view's merge was refused");
+            assert!(matches!(first, Err(LimboError::Busy)), "{what}: premise: the COMMIT was refused Busy: {first:?}");
+            assert!(!a.get_auto_commit(), "{what}: premise: the transaction is still open");
+            let second = if held {
+                a.execute("INSERT INTO counters VALUES (3, 'a', 1)").unwrap();
+                commit.run_ignore_rows()
+            } else {
+                drop(commit);
+                a.execute("COMMIT")
+            };
+            assert!(second.is_ok(), "{what}: the second COMMIT failed: {second:?}");
+            let b = db.connect().unwrap();
+            let (sum, count) = if held { (13, 3) } else { (12, 2) };
+            assert_eq!(view_totals(&b, "sums"), vec![(Some("a".to_string()), Some(sum))], "{what}: sums counts each row once");
+            assert_eq!(view_totals(&b, "counts"), vec![(Some("a".to_string()), Some(count))], "{what}: counts counts each row once");
+        }
+    }
+}
