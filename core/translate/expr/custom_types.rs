@@ -1479,6 +1479,37 @@ mod tests {
         }
     }
 
+    /// Engine review 20 item 8: an equality may use an index only where the type's '=' agrees with
+    /// equality of the encodings, which the index compares. tag's '=' is instr, coarser than byte
+    /// equality: with tag's column indexed, `w = 'b'` sought the key 'b', found nothing and the
+    /// re-check could only remove rows, while the scan (and the '=') finds 'abc'. The indexed
+    /// equality answers as the scan does. Mutant `eq_index_ignores_coarse_eq`.
+    #[test]
+    fn an_indexed_equality_under_a_coarser_eq_answers_as_the_scan_does() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, w tag(3)) STRICT").unwrap();
+        conn.execute("CREATE INDEX tw ON t(w)")
+            .unwrap_or_else(|e| panic!("premise: tag's column takes an index: {e}"));
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        for (pred, param) in [("w = 'b'", None), ("w = ?1", Some(Value::build_text("b")))] {
+            let by_scan = count(&conn, &format!("SELECT count(*) FROM t NOT INDEXED WHERE {pred}"), param.clone());
+            assert!(matches!(by_scan, Ok(1)), "premise: the scan finds 'abc' for {pred} (instr): {by_scan:?}");
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            let by_plan = count(&conn, &sql, param.clone());
+            assert!(
+                matches!(by_plan, Ok(1)),
+                "CLAIM: {pred} answered {by_plan:?} with the column indexed, where the scan finds the row ({:?})",
+                plan(&conn, &sql)
+            );
+        }
+    }
+
     /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
     /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
     /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
