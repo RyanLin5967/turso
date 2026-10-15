@@ -1696,8 +1696,54 @@ impl Session {
     }
 
     /// Run one statement on the session, `call` its branch call if it is one (already read), and
-    /// `portal` carrying its bound parameters (extended protocol).
+    /// `portal` carrying its bound parameters (extended protocol). Its transaction-control outcome
+    /// is reported to the connection's settings (turso_pg's GucScope; the C26 MED 3 class): a block
+    /// the statement ended, read from the engine (in a transaction before, in none after), is
+    /// committed only by a COMMIT that succeeded in a block that had not failed; a savepoint verb
+    /// that succeeded is reported as itself. The warnings the frontend raised go out as notices.
     fn run(
+        &self,
+        sql: &str,
+        call: Option<PgBranchCall>,
+        portal: Option<&Portal<Parsed>>,
+        format: &Format,
+    ) -> SqlResult<Response> {
+        let before = {
+            let mut st = self.state();
+            let aborted = st.aborted;
+            self.current(&mut st)
+                .ok()
+                .map(|conn| (conn.clone(), !conn.inner().get_auto_commit(), aborted))
+        };
+        let result = self.run_statement(sql, call, portal, format);
+        if let Some((conn, in_tx, aborted)) = before {
+            let verb = TxVerb::of_leading_keywords(sql).unwrap_or_else(|| TxVerb::of(sql));
+            if in_tx && conn.inner().get_auto_commit() {
+                let committed = result.is_ok() && verb == TxVerb::Commit && !aborted;
+                conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+            } else if result.is_ok() {
+                let event = match verb {
+                    TxVerb::Savepoint => Some(turso_pg::TxEvent::Savepoint),
+                    TxVerb::Release => Some(turso_pg::TxEvent::Release),
+                    TxVerb::RollbackTo => Some(turso_pg::TxEvent::RollbackTo),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    conn.tx_event(event, sql);
+                }
+            }
+            let warnings = conn.take_warnings();
+            if !warnings.is_empty() {
+                let mut st = self.state();
+                for (code, message) in warnings {
+                    st.notices.push(warning(code, &message));
+                }
+            }
+        }
+        result
+    }
+
+    fn run_statement(
         &self,
         sql: &str,
         call: Option<PgBranchCall>,

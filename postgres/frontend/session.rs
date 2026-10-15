@@ -51,6 +51,9 @@ struct PgConnectionInner {
     /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
     /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
     explicit_block: std::sync::atomic::AtomicBool,
+    /// Warnings a statement raised for the client ((SQLSTATE, message)), which the server sends as
+    /// WARNING notices ([`PgConnection::take_warnings`]).
+    warnings: parking_lot::Mutex<Vec<(&'static str, String)>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -105,6 +108,52 @@ pub fn message_rank(level: &str) -> Option<u8> {
     })
 }
 
+/// The name SHOW gives a client_min_messages rank ([`message_rank`]), PostgreSQL's spelling (`debug`
+/// is shown as debug2).
+fn message_level(rank: u8) -> &'static str {
+    match rank {
+        1 => "debug5",
+        2 => "debug4",
+        3 => "debug3",
+        4 => "debug2",
+        5 => "debug1",
+        6 => "log",
+        8 => "warning",
+        9 => "error",
+        _ => "notice",
+    }
+}
+
+/// A millisecond setting as SHOW gives it: 0, or the value in the largest of d, h, min, s and ms
+/// that divides it (recorded, pg18-settings.out: 1000ms is 1s, 90000 is 90s, 60000 is 1min, 1500ms
+/// stays 1500ms).
+fn shown_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, size) in [("d", 86_400_000), ("h", 3_600_000), ("min", 60_000), ("s", 1000)] {
+        if ms % size == 0 {
+            return format!("{}{unit}", ms / size);
+        }
+    }
+    format!("{ms}ms")
+}
+
+/// The savepoint a SAVEPOINT, RELEASE or ROLLBACK TO statement names, lowercased as PostgreSQL
+/// folds an unquoted name; None when it cannot be read.
+fn savepoint_name(sql: &str) -> Option<String> {
+    let parsed = turso_pg_parser::parse(sql).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
+    match stmt {
+        turso_pg_parser::pg_query::protobuf::node::Node::TransactionStmt(t)
+            if !t.savepoint_name.is_empty() =>
+        {
+            Some(t.savepoint_name.clone())
+        }
+        _ => None,
+    }
+}
+
 /// A time setting's value in milliseconds, as PostgreSQL reads one: a number, its unit ms by
 /// default, or followed by us, ms, s, min, h or d. None for a negative or unreadable value.
 fn setting_ms(text: &str) -> Option<u64> {
@@ -127,6 +176,14 @@ fn setting_ms(text: &str) -> Option<u64> {
 }
 
 impl PgConnectionInner {
+    /// Store the settings' effective values where the server reads them, lock-free.
+    fn publish(&self, gucs: Gucs) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.lock_timeout_ms.store(gucs.lock_timeout_ms, Relaxed);
+        self.statement_timeout_ms.store(gucs.statement_timeout_ms, Relaxed);
+        self.min_messages.store(gucs.min_messages, Relaxed);
+    }
+
     fn set_search_path(&self, path: Vec<String>) {
         let mut state = self.session_state.lock();
         state.search_path = path;
@@ -139,6 +196,79 @@ impl PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path: Vec<String>,
+    /// The settings this server acts on, scoped as PostgreSQL scopes a GUC (see [`GucScope`]).
+    gucs: GucScope,
+}
+
+/// The values of the settings this server acts on: lock_timeout and statement_timeout in
+/// milliseconds (0 none), client_min_messages as its rank ([`message_rank`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Gucs {
+    lock_timeout_ms: u64,
+    statement_timeout_ms: u64,
+    min_messages: u8,
+}
+
+impl Default for Gucs {
+    fn default() -> Self {
+        Self {
+            lock_timeout_ms: 0,
+            statement_timeout_ms: 0,
+            min_messages: 7,
+        }
+    }
+}
+
+/// A SET LOCAL's values, each until its block ends.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Locals {
+    lock_timeout_ms: Option<u64>,
+    statement_timeout_ms: Option<u64>,
+    min_messages: Option<u8>,
+}
+
+/// PostgreSQL's GUC scoping for [`Gucs`] (recorded, artie pg18-diff/pg18-settings.out and
+/// pg18-c26.out; the C26 MED 3 class: ours kept every SET for the session):
+/// - SET changes the session's value and replaces any SET LOCAL of it; a ROLLBACK of its block
+///   undoes it, a COMMIT keeps it;
+/// - SET LOCAL lasts until its block ends, however it ends; outside a block it warns (25P01) and
+///   changes nothing;
+/// - ROLLBACK TO a savepoint puts back what the settings were at it (the savepoint stays);
+///   RELEASE keeps them.
+#[derive(Default)]
+struct GucScope {
+    session: Gucs,
+    local: Locals,
+    /// The session's values when the block's first SET came; None outside a block, or before.
+    block_start: Option<Gucs>,
+    /// Each live savepoint's name (lowercased) and the values at it.
+    savepoints: Vec<(String, Gucs, Locals)>,
+}
+
+impl GucScope {
+    fn effective(&self) -> Gucs {
+        Gucs {
+            lock_timeout_ms: self.local.lock_timeout_ms.unwrap_or(self.session.lock_timeout_ms),
+            statement_timeout_ms: self
+                .local
+                .statement_timeout_ms
+                .unwrap_or(self.session.statement_timeout_ms),
+            min_messages: self.local.min_messages.unwrap_or(self.session.min_messages),
+        }
+    }
+}
+
+/// A transaction-control event the server reports to the connection's settings ([`GucScope`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxEvent {
+    /// The block ended: committed, or rolled back.
+    Ended { committed: bool },
+    /// A SAVEPOINT was defined.
+    Savepoint,
+    /// A RELEASE SAVEPOINT ran.
+    Release,
+    /// A ROLLBACK TO SAVEPOINT ran.
+    RollbackTo,
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -193,6 +323,7 @@ impl PgConnection {
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 explicit_block: std::sync::atomic::AtomicBool::new(false),
+                warnings: parking_lot::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -268,7 +399,14 @@ impl PgConnection {
     /// Run `tx` from the engine's AST: no SQL text is parsed, so an implicit block costs no
     /// libpg_query call.
     pub fn engine_tx(&self, tx: TxStmt) -> Result<()> {
-        run_tx(&self.inner.conn, tx)
+        let was_in_block = !self.inner.conn.get_auto_commit();
+        let r = run_tx(&self.inner.conn, tx);
+        // A block this ended, for the acted-on settings' scope (an implicit block's end comes here).
+        if was_in_block && self.inner.conn.get_auto_commit() {
+            let committed = r.is_ok() && matches!(tx, TxStmt::Commit);
+            self.tx_event(TxEvent::Ended { committed }, "");
+        }
+        r
     }
 
     /// Run `f` in a transaction of its own ([`own_transaction`]'s rule: an undo that fails breaks
@@ -291,10 +429,14 @@ impl PgConnection {
         if conn.get_auto_commit() {
             return Ok(());
         }
-        undo_failpoint()
+        let r = undo_failpoint()
             .and_then(|()| run_tx(conn, TxStmt::Rollback))
             .and_then(|()| held_after_undo(conn, false))
-            .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo))
+            .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo));
+        if conn.get_auto_commit() {
+            self.tx_event(TxEvent::Ended { committed: false }, "");
+        }
+        r
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
@@ -356,24 +498,73 @@ impl PgConnection {
         PgQueryRunner::new(&self.inner, sql)
     }
 
-    /// Take over `from`'s session settings (the search path): a wire session that moves to another
-    /// engine connection — onto a branch, or back to the trunk — keeps what it SET.
+    /// Take over `from`'s session settings (the search path, and the acted-on settings' session
+    /// values): a wire session that moves to another engine connection — onto a branch, or back to
+    /// the trunk — keeps what it SET. A switch runs outside any block, so no SET LOCAL or block
+    /// scope is open to carry.
     pub fn adopt_session_of(&self, from: &PgConnection) {
         if Arc::ptr_eq(&self.inner, &from.inner) {
             return;
         }
-        let path = from.inner.session_state.lock().search_path.clone();
+        let (path, gucs) = {
+            let state = from.inner.session_state.lock();
+            (state.search_path.clone(), state.gucs.effective())
+        };
         self.inner.set_search_path(path);
-        use std::sync::atomic::Ordering::Relaxed;
-        self.inner
-            .lock_timeout_ms
-            .store(from.inner.lock_timeout_ms.load(Relaxed), Relaxed);
-        self.inner
-            .statement_timeout_ms
-            .store(from.inner.statement_timeout_ms.load(Relaxed), Relaxed);
-        self.inner
-            .min_messages
-            .store(from.inner.min_messages.load(Relaxed), Relaxed);
+        {
+            let mut state = self.inner.session_state.lock();
+            state.gucs = GucScope {
+                session: gucs,
+                ..GucScope::default()
+            };
+        }
+        self.inner.publish(gucs);
+    }
+
+    /// A transaction-control event of the session's ([`TxEvent`]), for the acted-on settings'
+    /// scope: a block's end drops its SET LOCALs and, rolled back, undoes its SETs; a savepoint
+    /// keeps the values at it for a ROLLBACK TO. `sql` names the savepoint.
+    pub fn tx_event(&self, event: TxEvent, sql: &str) {
+        let mut state = self.inner.session_state.lock();
+        let gucs = &mut state.gucs;
+        match event {
+            TxEvent::Ended { committed } => {
+                if let (false, Some(start)) = (committed, gucs.block_start) {
+                    gucs.session = start;
+                }
+                gucs.local = Locals::default();
+                gucs.block_start = None;
+                gucs.savepoints.clear();
+            }
+            TxEvent::Savepoint | TxEvent::Release | TxEvent::RollbackTo => {
+                let Some(name) = savepoint_name(sql) else {
+                    return;
+                };
+                if event == TxEvent::Savepoint {
+                    if gucs.block_start.is_none() {
+                        gucs.block_start = Some(gucs.session);
+                    }
+                    gucs.savepoints.push((name, gucs.session, gucs.local));
+                } else if let Some(at) = gucs.savepoints.iter().rposition(|(n, ..)| *n == name) {
+                    if event == TxEvent::RollbackTo {
+                        let (_, session, local) = gucs.savepoints[at].clone();
+                        gucs.session = session;
+                        gucs.local = local;
+                        gucs.savepoints.truncate(at + 1);
+                    } else {
+                        gucs.savepoints.truncate(at);
+                    }
+                }
+            }
+        }
+        let effective = gucs.effective();
+        drop(state);
+        self.inner.publish(effective);
+    }
+
+    /// The warnings the last statements raised for the client, as (SQLSTATE, message).
+    pub fn take_warnings(&self) -> Vec<(&'static str, String)> {
+        std::mem::take(&mut *self.inner.warnings.lock())
     }
 }
 
@@ -1162,6 +1353,32 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 /// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
+    // The acted-on settings are scoped as PostgreSQL scopes them (GucScope); SET LOCAL outside a
+    // block warns and changes nothing, as PostgreSQL 18.6 answers it (recorded,
+    // pg18-settings.out). Their values are read below.
+    let scoped = matches!(
+        name.as_str(),
+        "lock_timeout" | "statement_timeout" | "client_min_messages"
+    );
+    let in_block = !pg_conn.conn.get_auto_commit();
+    if scoped && set_stmt.is_local && !in_block {
+        pg_conn.warnings.lock().push((
+            "25P01",
+            "SET LOCAL can only be used in transaction blocks".to_string(),
+        ));
+        return noop_statement(&pg_conn.conn);
+    }
+    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+        let mut state = pg_conn.session_state.lock();
+        let gucs = &mut state.gucs;
+        if in_block && gucs.block_start.is_none() {
+            gucs.block_start = Some(gucs.session);
+        }
+        apply(&mut gucs.session, &mut gucs.local, set_stmt.is_local);
+        let effective = gucs.effective();
+        drop(state);
+        pg_conn.publish(effective);
+    };
     // A ROLLBACK cannot undo these here: the search path and the engine's foreign_keys outlive the
     // block whatever ends it, so `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off, and a
     // rolled-back SET search_path sent later unqualified writes to another schema's table. So
@@ -1249,18 +1466,28 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             let Some(ms) = setting_ms(&text) else {
                 return invalid();
             };
-            pg_conn
-                .lock_timeout_ms
-                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            assign(&|session, local, is_local| {
+                if is_local {
+                    local.lock_timeout_ms = Some(ms);
+                } else {
+                    session.lock_timeout_ms = ms;
+                    local.lock_timeout_ms = None;
+                }
+            });
             true
         }
         "client_min_messages" => {
             let Some(rank) = message_rank(&text) else {
                 return invalid();
             };
-            pg_conn
-                .min_messages
-                .store(rank, std::sync::atomic::Ordering::Relaxed);
+            assign(&|session, local, is_local| {
+                if is_local {
+                    local.min_messages = Some(rank);
+                } else {
+                    session.min_messages = rank;
+                    local.min_messages = None;
+                }
+            });
             true
         }
         // The server stops a statement running past it (57014).
@@ -1268,9 +1495,14 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             let Some(ms) = setting_ms(&text) else {
                 return invalid();
             };
-            pg_conn
-                .statement_timeout_ms
-                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            assign(&|session, local, is_local| {
+                if is_local {
+                    local.statement_timeout_ms = Some(ms);
+                } else {
+                    session.statement_timeout_ms = ms;
+                    local.statement_timeout_ms = None;
+                }
+            });
             true
         }
         "idle_in_transaction_session_timeout" | "transaction_timeout" => {
@@ -1368,6 +1600,15 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
                 == Some(1);
             ("foreign_keys", if on { "on" } else { "off" }.to_string())
         }
+        "lock_timeout" => ("lock_timeout", shown_ms(pg_conn.session_state.lock().gucs.effective().lock_timeout_ms)),
+        "statement_timeout" => (
+            "statement_timeout",
+            shown_ms(pg_conn.session_state.lock().gucs.effective().statement_timeout_ms),
+        ),
+        "client_min_messages" => (
+            "client_min_messages",
+            message_level(pg_conn.session_state.lock().gucs.effective().min_messages).to_string(),
+        ),
         "transaction_read_only" => fixed("transaction_read_only", "off"),
         "default_transaction_read_only" => fixed("default_transaction_read_only", "off"),
         _ if setting.is_some() => {
