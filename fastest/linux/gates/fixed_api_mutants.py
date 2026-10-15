@@ -31,6 +31,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINUX = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import hostbin  # noqa: E402  "bash" below is hostbin's bash 4+, never the caller's PATH's (the platform class)
 PY = [sys.executable, "-B"]
 T3LIB = ["bash", "t3lib_test.sh"]
 ANALYZE = PY + ["analyze.py", "--self-test"]
@@ -98,7 +100,7 @@ def parses(path, text):
         except SyntaxError as e:
             return f"{e.msg}, line {e.lineno}"
         return None
-    r = subprocess.run(["bash", "-n", "/dev/stdin"], input=text, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([hostbin.bash(), "-n", "/dev/stdin"], input=text, capture_output=True, text=True, timeout=60)
     return None if r.returncode == 0 else r.stderr.strip()[:200]
 
 
@@ -141,7 +143,9 @@ def copy_of(d, top):
 
 def run_test(cwd, cmd, timeout=900):
     try:
-        r = subprocess.run(["timeout", str(timeout)] + cmd, cwd=cwd, capture_output=True, text=True)
+        cmd = [hostbin.bash()] + cmd[1:] if cmd[:1] == ["bash"] else cmd
+        r = subprocess.run(["timeout", str(timeout)] + cmd, cwd=cwd, capture_output=True, text=True,
+                           env=hostbin.env_with_bash())
     except OSError as e:
         return None, str(e)
     return r.returncode, r.stdout + r.stderr

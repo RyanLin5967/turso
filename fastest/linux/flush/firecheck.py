@@ -74,6 +74,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gates"))
+import hostbin  # noqa: E402  the strace wrapper's bash is hostbin's bash 4+, never the caller's PATH's (the platform class)
+
 KINDS = ["fsync", "fdatasync", "syncfs", "sync", "msync_SYNC", "osync_write", "odsync_write", "sfr_write_wait",
          "sfr_write", "sfr_wait", "msync_other", "FICLONE", "FICLONERANGE", "copy_file_range"]
 FLUSH, WRITEBACK, CLONE = KINDS[0:7], KINDS[7:11], KINDS[11:14]
@@ -212,7 +215,7 @@ def launch(run, argv, shim=None, strace=False, env_extra=None):
     cmd = [B + "/v1run", run] + argv
     if strace:
         so = os.path.join(OUT, run)
-        cmd = ["bash", "-c", 'source "$0" && out=$1 && shift && strace_run "$out" "$@"', T + "/trace.sh", so] + cmd
+        cmd = [hostbin.bash(), "-c", 'source "$0" && out=$1 && shift && strace_run "$out" "$@"', T + "/trace.sh", so] + cmd
     r = sh(cmd, env=env)
     save(run + ".probe.txt", "rc=%d\ncmd=%s\n--- stdout\n%s\n--- stderr\n%s" % (r.returncode, cmd, r.stdout, r.stderr))
     sj = None
