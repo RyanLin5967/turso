@@ -3369,9 +3369,9 @@ impl PostgreSQLTranslator {
                     let quoted = format!("'{}'", s.sval.replace('\'', "''"));
                     Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
-                pg_query::protobuf::a_const::Val::Fval(f) => {
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
-                }
+                pg_query::protobuf::a_const::Val::Fval(f) => Ok(ast::Expr::Literal(
+                    ast::Literal::Numeric(decimal_numeric_literal(&f.fval)),
+                )),
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
                     // SQLite uses 0/1 for booleans
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(
@@ -5168,6 +5168,42 @@ fn translate_create_enum(
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types.
+/// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
+/// the decimal form the engine's literal parser reads: PostgreSQL 16+'s base-2, -8 and -16 integers
+/// (`0b..`, `0o..`, `0x..`) and underscores between digits become decimal digits. The engine's
+/// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
+/// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
+/// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
+fn decimal_numeric_literal(text: &str) -> String {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let lower = body.to_ascii_lowercase();
+    let (radix, digits) = match lower.get(..2) {
+        Some("0x") => (16, &lower[2..]),
+        Some("0o") => (8, &lower[2..]),
+        Some("0b") => (2, &lower[2..]),
+        _ if lower.contains('_') => (10, lower.as_str()),
+        _ => return text.to_string(),
+    };
+    let digits: String = digits.chars().filter(|c| *c != '_').collect();
+    let sign = if negative { "-" } else { "" };
+    if radix == 10 {
+        return format!("{sign}{digits}");
+    }
+    match u128::from_str_radix(&digits, radix) {
+        Ok(v) => format!("{sign}{v}"),
+        Err(_) => {
+            let v = digits
+                .chars()
+                .filter_map(|c| c.to_digit(radix))
+                .fold(0f64, |acc, d| acc * f64::from(radix) + f64::from(d));
+            format!("{sign}{v:e}")
+        }
+    }
+}
+
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
