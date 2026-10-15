@@ -332,6 +332,10 @@ fn expression_type(node: &PgNode) -> Option<u32> {
     let boolean = match node.node.as_ref()? {
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
+        // NULLIF is its first argument's type.
+        Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
+            return e.lexpr.as_deref().and_then(operand_type);
+        }
         Node::AExpr(e) => match e.kind() {
             AExprKind::AexprOp => matches!(
                 e.name.as_slice(),
@@ -401,17 +405,57 @@ fn expression_type(node: &PgNode) -> Option<u32> {
                 .then(|| array_of(first))
                 .flatten();
         }
+        // A conditional expression is its arguments' one type (PostgreSQL's select_common_type,
+        // here only when every typed argument agrees; a NULL literal takes the others' type):
+        // over integers they were announced text (pg18-colnames.out).
         Node::CaseExpr(c) => {
-            let results = c.args.iter().map(|w| match w.node.as_ref() {
-                Some(Node::CaseWhen(w)) => w.result.as_deref().and_then(expression_type),
-                _ => None,
-            });
-            let default = c.defresult.as_deref().map(expression_type);
-            results.chain(default).all(|t| t == Some(BOOL))
+            let results: Vec<&PgNode> = c
+                .args
+                .iter()
+                .filter_map(|w| match w.node.as_ref() {
+                    Some(Node::CaseWhen(w)) => w.result.as_deref(),
+                    _ => None,
+                })
+                .chain(c.defresult.as_deref())
+                .collect();
+            return common_type(&results);
         }
+        Node::CoalesceExpr(c) => return common_type(&c.args.iter().collect::<Vec<_>>()),
+        Node::MinMaxExpr(m) => return common_type(&m.args.iter().collect::<Vec<_>>()),
+
         _ => false,
     };
     boolean.then_some(BOOL)
+}
+
+/// An operand's type for [`common_type`]: a grammar-fixed one ([`expression_type`]) or an integer
+/// literal's int4 (pg_query gives a literal past int4 as a float's text).
+fn operand_type(node: &PgNode) -> Option<u32> {
+    use turso_pg_parser::pg_query::protobuf::a_const::Val;
+    match node.node.as_ref()? {
+        Node::AConst(c) => match c.val.as_ref() {
+            Some(Val::Ival(_)) => Some(INT4),
+            Some(Val::Boolval(_)) => Some(BOOL),
+            _ => None,
+        },
+        _ => expression_type(node),
+    }
+}
+
+/// The one type every operand has, NULL literals aside; None when one is untyped or they differ.
+fn common_type(operands: &[&PgNode]) -> Option<u32> {
+    let mut common = None;
+    for operand in operands {
+        if matches!(operand.node.as_ref(), Some(Node::AConst(c)) if c.isnull) {
+            continue;
+        }
+        let ty = operand_type(operand)?;
+        if common.is_some_and(|c| c != ty) {
+            return None;
+        }
+        common = Some(ty);
+    }
+    common
 }
 
 /// The aggregate columns' types ([`aggregate_targets`]) out of the walk's types for the result
