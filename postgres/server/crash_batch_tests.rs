@@ -248,3 +248,105 @@ fn the_sqlite_dialect_still_casts_infinity_text_to_zero() {
         .unwrap();
     assert_eq!(rows, vec![vec![Value::from_f64(0.0); 3]]);
 }
+
+/// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
+fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
+    let joined = std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("crash.db").to_string_lossy().into_owned();
+            let opts = database_opts(turso_core::branch::BranchDurability::Catalog {
+                sync: turso_core::branch::SyncClass::Off,
+            });
+            let (_io, db) =
+                turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts)
+                    .unwrap();
+            let session = Session::new(Arc::new(Shared::new(
+                db,
+                path,
+                1,
+                std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+            )));
+            f(&session);
+        })
+        .unwrap()
+        .join();
+    if let Err(e) = joined {
+        let text = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        panic!("the session's thread panicked: {text}");
+    }
+}
+
+/// A chain of `n` views over `t`, v0 .. v{n-1}, each a SELECT of the one before. Creating one plans
+/// the chain under it, so a creation may itself be refused: the chain is made as far as it goes,
+/// and the depth reached is returned with the refusal, if any.
+fn view_chain(s: &Session, n: usize) -> (usize, Option<(String, String)>) {
+    ok(s, "CREATE TABLE t(a int)");
+    ok(s, "INSERT INTO t VALUES (1)");
+    ok(s, "CREATE VIEW v0 AS SELECT a FROM t");
+    for i in 1..n {
+        if let Some(e) = first_error(s, &format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1)) {
+            return (i, Some(e));
+        }
+    }
+    (n, None)
+}
+
+/// Lead, 2026-10-15: the view bound is the STACK, as PostgreSQL's (max_stack_depth), not a fixed
+/// depth: a 40-view chain answers on the default 8 MiB session stack, as it does in PostgreSQL
+/// (fastest-wire's a_view_chain_of_any_depth_is_typed). Expected RED with the fixed 32-deep cap.
+#[test]
+fn a_forty_view_chain_answers_on_the_session_stack() {
+    on_session(|s| {
+        let (made, refused) = view_chain(s, 40);
+        assert_eq!(refused, None, "the 40-view chain was refused at depth {made}");
+        ok(s, "SELECT a FROM v39");
+        alive(s);
+    });
+}
+
+/// A thousand views: refused 54001 at the default 8 MiB session stack and on a 2 MiB thread,
+/// whichever statement first plans too deep, never a stack overflow. Expected RED with the fixed cap
+/// on the 2 MiB thread: 32 views overflow 2 MiB in a debug build before the cap refuses.
+#[test]
+fn a_thousand_view_chain_is_refused_54001_on_8_and_on_2_mib() {
+    for stack in [8usize << 20, 2 << 20] {
+        on_session_with_stack(stack, move |s| {
+            let (made, refused) = view_chain(s, 1000);
+            let refusal = refused.or_else(|| first_error(s, "SELECT a FROM v999"));
+            let Some((code, message)) = refusal else {
+                panic!("a 1000-view chain was planned on a {} MiB stack", stack >> 20);
+            };
+            assert_eq!(code, "54001", "refused at depth {made} on {} MiB with {code} ({message})", stack >> 20);
+            alive(s);
+        });
+    }
+}
+
+/// The bound's boundary, swept: on a 2 MiB thread and on 8 MiB, a SELECT from every depth of a
+/// chain either answers or is refused 54001, never overflows (an overflow aborts the test process:
+/// RED), and once one depth is refused every deeper one is too.
+#[test]
+fn every_depth_of_a_view_chain_answers_or_is_refused_never_overflows() {
+    for (stack, n) in [(2usize << 20, 120usize), (8 << 20, 200)] {
+        on_session_with_stack(stack, move |s| {
+            let (made, _) = view_chain(s, n);
+            let mut refused_at = None;
+            for k in 0..made {
+                match first_error(s, &format!("SELECT a FROM v{k}")) {
+                    None => assert!(refused_at.is_none(), "v{k} answered after v{} was refused", refused_at.unwrap()),
+                    Some((code, m)) => {
+                        assert_eq!(code, "54001", "v{k} on {} MiB: {code} {m}", stack >> 20);
+                        refused_at.get_or_insert(k);
+                    }
+                }
+            }
+            alive(s);
+        });
+    }
+}
