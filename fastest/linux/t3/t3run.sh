@@ -65,10 +65,12 @@
 # on its controller, nothing mounted, held or claimed, no signature or partition table; review M4, devguard round-2
 # attack MED 2 and LOW 3), --plp is given, --fs is not (the manifest names the blocks; review M5), and every target
 # mounts with barriers. The device is resolved once at preflight (DEV_REAL) and the drive's identity recorded
-# (device-id.txt: wwid, MAJ:MIN, model, serial, firmware); every block re-checks, before its mkfs, its mount and the
-# cleanup's wipefs, that --device still resolves there to that same drive, still PLP-listed and registered, and
-# re-runs devguard before the mkfs; mkfs, mount and wipefs act on DEV_REAL only (devguard round-2 attack LOW 4,
-# review 5 MED 3). So a block starts from a disk that passes devguard:
+# (device-id.txt: wwid, MAJ:MIN, model, serial, firmware). Each block makes, mounts and wipes it only through
+# t3lib.sh's device_make and device_wipe (review 6 MED 1, tested by t3lib_test.sh): DEV_REAL held open throughout,
+# devguard, then the drive re-read (--device still resolves there, to that same drive, still registered), mkfs with
+# a UUID chosen here, the probe, the re-read, mount -t, the mount checked; the wipe re-reads the drive and the
+# probe first. mkfs, mount and wipefs act on DEV_REAL only (devguard round-2 attack LOW 4, review 5 MED 3, review 6
+# LOW 4 and 6). So a block starts from a disk that passes devguard:
 # block_cleanup wipes the filesystem its block made (after checking it is that one), and the operator wipes the
 # first by hand after reading what it holds.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
@@ -123,7 +125,8 @@ SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
 # settle_dev and settle (the quiet gap before every run); a missing file is caught by NEEDS before anything runs
 [ -f "$L/t3/settle.sh" ] && source "$L/t3/settle.sh"
-# drift_ok, fslist_ok, registered_ok, plp_listed: checks only a real run reaches, tested by t3lib_test.sh
+# drift_ok, fslist_ok, registered_ok, plp_listed, device_make, device_wipe: checks and the device branch only a real
+# run reaches, tested by t3lib_test.sh
 [ -f "$L/t3/t3lib.sh" ] && source "$L/t3/t3lib.sh"
 SETTLE_DEV=""
 if [ $DRY = 1 ]; then
@@ -241,17 +244,17 @@ preflight() {
     [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
     # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
-    local dn=$DEV_NAME fsl
+    local fsl
     # --plp yes names a registered drive: model and firmware (NVMe firmware_rev, SCSI/SATA rev) in t3/PLP-DRIVES
     if [ "$PLP" = yes ]; then
-      plp_listed /sys "$dn" "$L/t3/PLP-DRIVES" ||
-        { echo "REFUSED: --plp yes but $dn ($(plp_drive_id /sys "$dn" 2>&1)) is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
+      plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" ||
+        { echo "REFUSED: --plp yes but $DEV_NAME ($(plp_drive_id /sys "$DEV_NAME" 2>&1)) is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
     fi
     # the A17 registration (frame arm; the D0 threshold of every block on a write-back drive without PLP), before
     # deps, build and fire-checks are paid for (t3lib.sh registered_ok, tested by t3lib_test.sh)
     fsl=$(python3 -B "$L/t3/cells.py" fslist "$MAN") && fslist_ok "$fsl" ||
       { echo "REFUSED: the manifest names no filesystem block (cells.py fslist: '$fsl')"; return 2; }
-    registered_ok /sys "$L/v3/REGISTERED.tsv" "$dn" "$PLP" "$fsl" || return 2
+    registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$fsl" || return 2
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -450,17 +453,7 @@ v3l() { # v3l bK MNT
 
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
-FS_NOW="" V3CELL="" PLANT_NOW="" MADE_FS="" MADE_UUID=""
-# the drive preflight recorded, unmoved and unchanged, still allowed by devguard, still listed for its --plp and still
-# registered for this block's filesystem (review 5 MED 3: those were read at preflight only); every mkfs and mount
-dev_recheck() { # dev_recheck OUTFILE
-  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" >> "$1" 2>&1 || return 1
-  if [ "$PLP" = yes ]; then
-    plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" >> "$1" 2>&1 ||
-      { echo "REFUSED: $DEV_NAME is no longer a listed PLP drive" >> "$1"; return 1; }
-  fi
-  registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$FS_NOW" >> "$1" 2>&1 || return 1
-}
+FS_NOW="" V3CELL="" PLANT_NOW=""
 RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
@@ -476,28 +469,13 @@ fs_block() {
     brd)
       bash "$L/v3/mkbrd.sh" "$fs" "$mnt" > "$o/mkfs.txt" 2>&1 || return 1 ;;
     device)
-      # immediately before the mkfs: --device still names the node preflight checked, and devguard still allows it
-      # (hours may have passed; devguard round-2 attack LOW 4). mkfs and mount act on that node, never on the name
-      : > "$o/devguard.txt"
-      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: $DEV_REAL is not the drive preflight checked"; return 1; }
-      sudo -n python3 -B "$L/t3/devguard.py" check "$DEV_REAL" >> "$o/devguard.txt" 2>&1 ||
-        { cat "$o/devguard.txt"; echo "fs-$fs: devguard refuses $DEV_REAL before mkfs"; return 1; }
-      case $fs in
-        xfs) sudo mkfs.xfs -f -m reflink=1 "$DEV_REAL" ;;
-        btrfs) sudo mkfs.btrfs -f "$DEV_REAL" ;;
-        ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEV_REAL" ;;
-        *) echo "unknown fs $fs"; false ;;
-      esac > "$o/mkfs.txt" 2>&1 || return 1
-      # from here block_cleanup must wipe what this block made, so the next block's devguard check passes; the UUID
-      # this mkfs gave it is what lets the wipe tell it from another drive's filesystem of the same type (MED 3)
-      MADE_FS=$fs
-      MADE_UUID=$(t3_blkid UUID "$DEV_REAL" 2>> "$o/mkfs.txt")
-      echo "fs_uuid=$MADE_UUID" >> "$o/mkfs.txt"
-      [ -n "$MADE_UUID" ] || { echo "fs-$fs: blkid reads no UUID on the $fs just made on $DEV_REAL"; return 1; }
-      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: the drive changed before mount"; return 1; }
-      # btrfs defaults to discard=async on SSDs, which discards freed extents 10-120 s later, inside a later run
-      sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEV_REAL" "$mnt" &&
-        sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
+      # only through device_make (t3lib.sh, review 6 MED 1): DEV_REAL held open, devguard, the drive re-read, mkfs
+      # with this UUID (review 6 LOW 6: the UUID is chosen here, so the probe after mkfs checks it rather than
+      # reading it), the probe, the re-read, mount -t, the mount checked. o/made.txt names what block_cleanup wipes
+      device_make "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$PLP" "$L/v3/REGISTERED.tsv" \
+        "$fs" "$(cat /proc/sys/kernel/random/uuid)" "$mnt" "$o/made.txt" > "$o/mkfs.txt" 2>&1 ||
+        { cat "$o/mkfs.txt"; echo "fs-$fs: device_make refused or failed on $DEV_REAL"; return 1; }
+      sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
   esac
   findmnt -n -o SOURCE,FSTYPE,OPTIONS -T "$mnt" | tee -a "$o/mkfs.txt"
   # no online discard on the filesystem under test (fourth lane review MED 5): settle.sh fstrims between runs instead
@@ -578,19 +556,19 @@ block_unmount() {
   return 0
 }
 # Unmount (even when the block failed after its mkfs and before or after its mount), then on a device block wipe the
-# filesystem the block made, so the next block's devguard check before its mkfs sees a blank disk (devguard round-2
-# attack MED 2). It wipes only DEV_REAL, only while --device still resolves there to the drive preflight recorded
-# (t3lib.sh dev_unchanged: wwid, MAJ:MIN, model, serial, firmware), and only when blkid finds exactly the filesystem
-# this block made, type and UUID (fs_is_ours; review 5 MED 3); anything else stops the run with the device untouched.
+# filesystem the block made (o/made.txt, written by device_make before its mkfs), so the next block's devguard check
+# before its mkfs sees a blank disk (devguard round-2 attack MED 2). Only through device_wipe (t3lib.sh, review 6 MED
+# 1): DEV_REAL held open, --device still resolving there to the drive preflight recorded (dev_unchanged: wwid,
+# MAJ:MIN, model, serial, firmware), and blkid finding exactly the filesystem this block made, type and UUID
+# (fs_is_ours; review 5 MED 3); anything else stops the run with the device untouched.
 block_cleanup() {
-  local w=$OUT/fs-$FS_NOW/wipe.txt
+  local o=$OUT/fs-$FS_NOW mfs muuid
   block_unmount || return 1
-  [ "$BLOCK" = device ] && [ -n "$MADE_FS" ] || return 0
-  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" > "$w" 2>&1 &&
-    fs_is_ours "$DEVICE" "$DEV_REAL" "$MADE_FS" "$MADE_UUID" >> "$w" 2>&1 && sudo -n wipefs -a "$DEV_REAL" >> "$w" 2>&1 ||
-    { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$w")"; return 1; }
-  MADE_FS="" MADE_UUID=""
-  return 0
+  [ "$BLOCK" = device ] && [ -s "$o/made.txt" ] || return 0
+  read -r mfs muuid < "$o/made.txt"
+  device_wipe "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$mfs" "$muuid" > "$o/wipe.txt" 2>&1 ||
+    { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$o/wipe.txt")"; return 1; }
+  mv "$o/made.txt" "$o/made-wiped.txt"
 }
 
 # The quiet gap before every run: settle.sh (sourced after L is set), called at the top of each attempt.
