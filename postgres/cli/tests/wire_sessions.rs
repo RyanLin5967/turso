@@ -820,6 +820,37 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
     );
 }
 
+/// A failed domain CHECK answers 23514 with PostgreSQL's message and constraint name on every path,
+/// case for case as PostgreSQL 18.6 recorded them (artie lanes/engine/raw/pg18-domain-check-message.txt,
+/// 0673f158a3, every recorded statement replayed in order): CAST, a column's INSERT and UPDATE, a
+/// two-CHECK domain (each CHECK its own name), and a named CONSTRAINT. The SQLSTATE comes from the
+/// engine's error CODE, never the wording: mapped by the message's prefix, the engine's corrected
+/// PG-exact message (fastest-engine 814c05755) read as 23000 (the lead's class order, 2026-10-15).
+#[test]
+fn a_domain_check_failure_is_23514_with_postgresqls_message_on_every_path() {
+    let dir = Scratch::new("domaincheck");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let fails = |a: &mut Wire, sql: &str, message: &str| {
+        let e = a.q(sql).err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("23514", message), "{sql}");
+    };
+    a.q("CREATE DOMAIN dm AS integer CHECK (VALUE > 0)").ok("CREATE DOMAIN dm");
+    fails(&mut a, "SELECT CAST(-5 AS dm)", "value for domain dm violates check constraint \"dm_check\"");
+    a.q("CREATE TABLE tm(id integer PRIMARY KEY, x dm)").ok("CREATE TABLE tm");
+    fails(&mut a, "INSERT INTO tm VALUES (1, -5)", "value for domain dm violates check constraint \"dm_check\"");
+    a.q("CREATE DOMAIN d2 AS integer CHECK (VALUE > 0) CHECK (VALUE < 100)").ok("CREATE DOMAIN d2");
+    fails(&mut a, "SELECT CAST(500 AS d2)", "value for domain d2 violates check constraint \"d2_check1\"");
+    fails(&mut a, "SELECT CAST(-1 AS d2)", "value for domain d2 violates check constraint \"d2_check\"");
+    a.q("CREATE DOMAIN dn AS integer CONSTRAINT positive CHECK (VALUE > 0)").ok("CREATE DOMAIN dn");
+    fails(&mut a, "SELECT CAST(-5 AS dn)", "value for domain dn violates check constraint \"positive\"");
+    a.q("CREATE TABLE tn(id integer PRIMARY KEY, x dn)").ok("CREATE TABLE tn");
+    fails(&mut a, "INSERT INTO tn VALUES (1, -5)", "value for domain dn violates check constraint \"positive\"");
+    assert_eq!(a.q("UPDATE tm SET x = -1").ok("UPDATE of no row").tags, ["UPDATE 0"]);
+    assert_eq!(a.q("INSERT INTO tm VALUES (2, 5)").ok("INSERT").tags, ["INSERT 0 1"]);
+    fails(&mut a, "UPDATE tm SET x = -1 WHERE id = 2", "value for domain dm violates check constraint \"dm_check\"");
+}
+
 /// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
