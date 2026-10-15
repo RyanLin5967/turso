@@ -571,6 +571,24 @@ fn raise_nofile(want: u64) {
     }
 }
 
+/// Run `script` through the non-server CLI on `dir`'s database, as a test makes a schema before
+/// the server starts (the server refuses CREATE SCHEMA, and attaches a schema file present when a
+/// session opens).
+fn cli_script(dir: &Scratch, script: &[u8]) {
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin.take().unwrap().write_all(script).unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI ran the script"
+    );
+}
+
 fn seeded(server: &Server) -> Wire {
     let mut a = server.connect();
     a.q("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)")
@@ -3271,6 +3289,44 @@ fn an_explicit_public_qualifier_names_public() {
     let sql = "SELECT * FROM public.t";
     assert_eq!(a.q(sql).err(sql).code, "42P01", "public.t still there");
     assert_eq!(a.q("SELECT count(*) FROM s.t").single("s.t"), "1");
+}
+
+/// A parameter only in an ON CONFLICT clause is typed from the target's row, `excluded` included:
+/// with public.t(c int) and s.t(c text), `INSERT INTO s.t ... DO UPDATE SET c = $1` and `... DO
+/// UPDATE SET c = 'z' WHERE excluded.c = $1` are refused 42P18 (the walk cannot read an attached
+/// schema) or typed text, never int4 from public's t; and an UPDATE whose target has a CTE's name
+/// in scope is typed from the table (public p(name text): [25]), not the CTE (an int). The ON
+/// CONFLICT arm of a_parameter_is_typed_from_the_relation_the_engine_writes put its `$1` in VALUES,
+/// which refuses it first, so it never read `excluded` (wire review 17 item 14). The mutant that
+/// types `excluded` from rel.relname (public's t) must turn this red.
+#[test]
+fn a_parameter_in_on_conflict_is_typed_from_the_target() {
+    let dir = Scratch::new("onconflict");
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE TABLE p(name TEXT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "INSERT INTO s.t VALUES (2, 'y') ON CONFLICT (id) DO UPDATE SET c = $1",
+        "INSERT INTO s.t VALUES (2, 'y') ON CONFLICT (id) DO UPDATE SET c = 'z' WHERE excluded.c = $1",
+    ] {
+        let r = a.describe_statement(sql);
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "42P18");
+        assert!(
+            refused || r.params == Some(vec![25]),
+            "{sql}: {:?} {:?}, want 42P18 or [25], never [23]",
+            r.params,
+            r.error
+        );
+    }
+    let sql = "WITH p AS (SELECT 1 AS name) UPDATE p SET name = 'x' WHERE name = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(r.params, Some(vec![25]), "{sql}: {:?}", r.error);
 }
 
 /// A parameter is typed from the relation the engine will write, through its schema and the
