@@ -842,6 +842,10 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
 /// honest word into a word "while flights overlapped".
 const CONFIRM_LOAD_ARMS: [(u64, u64); 4] = [(1, 0), (8, 0), (64, 0), (8, 20)];
 
+/// The load cell's idle-hole control (DECISIONS 6d491917d2): 8 clients that all pause 20 ms
+/// together half-way through their creates.
+const LOAD_GAPPED: &str = "load_c8_gapped";
+
 /// The line name of a load arm.
 fn load_arm(c: u64, delay_ms: u64) -> String {
     if delay_ms == 0 {
@@ -874,14 +878,19 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     };
     // The population's own tail word is written before the first burst starts.
     settle();
-    for (c, delay_ms) in CONFIRM_LOAD_ARMS {
+    let gapped = (8, 0, true);
+    for (c, delay_ms, gap) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false)).chain([gapped]) {
         let rounds = shared_rounds(c);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
+        // The gapped control's pause: every client meets half-way, the last to arrive sleeps 20 ms and
+        // releases them all, so no create is in progress for those 20 ms (an idle hole on purpose).
+        // Atomics, not a Barrier: a client that failed to start must not leave the others waiting.
+        let (arrived, released) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicBool::new(false));
         let spans: Vec<Vec<(std::time::Instant, std::time::Instant)>> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             for t in 0..c {
-                let go = &go;
+                let (go, arrived, released) = (&go, &arrived, &released);
                 let spawned = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, move || {
                     let trunk = db.connect();
                     while !go.load(std::sync::atomic::Ordering::Acquire) {
@@ -890,6 +899,16 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                     let trunk = trunk.unwrap();
                     let mut spans = Vec::with_capacity(rounds as usize);
                     for i in 0..rounds {
+                        if gap && i == rounds / 2 {
+                            use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+                            if arrived.fetch_add(1, AcqRel) + 1 == c {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                released.store(true, Release);
+                            }
+                            while !released.load(Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
                         let started = std::time::Instant::now();
                         trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
                         spans.push((started, std::time::Instant::now()));
@@ -900,6 +919,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                     Ok(h) => clients.push(h),
                     Err(e) => {
                         go.store(true, std::sync::atomic::Ordering::Release);
+                        released.store(true, std::sync::atomic::Ordering::Release);
                         panic!("{cell}: a thread of {c} did not start: {e}");
                     }
                 }
@@ -928,7 +948,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         m.insert("tail_settled", u64::from(settled));
         m.insert("idle_holes", idle_holes(&spans, std::time::Duration::from_millis(CONFIRM_QUIET_MS_SHIPPED)));
         m.insert("wakeups_burst", delta(k0, k1));
-        line(out, cell, &load_arm(c, delay_ms), 0, &m);
+        line(out, cell, &if gap { LOAD_GAPPED.to_string() } else { load_arm(c, delay_ms) }, 0, &m);
     }
     hold_word(true);
 }
@@ -3655,30 +3675,63 @@ fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     for (c, delay_ms) in CONFIRM_LOAD_ARMS {
         let op = load_arm(c, delay_ms);
         let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
-        let (flights, burst, tail, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_tail"], s["confirms_total"], s["wakeups_burst"]);
-        assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
-        assert_eq!(burst + tail, total, "confirm_load: {op}: the words attributed do not add up");
         let _ = write!(
             seen,
-            " {op}: {} acks, {flights} flights, words {burst} in the burst and {tail} in the tail ({} by the parent's read), {} idle holes, {wakes} wake-ups;",
+            " {op}: {} acks, {} flights, words {} in the burst and {} in the tail ({} by the parent's read), {} idle holes, {} wake-ups;",
             s["acks"],
+            s["flights"],
+            s["confirms_burst"],
+            s["confirms_tail"],
             s["confirms_by_read"],
-            s["idle_holes"]
+            s["idle_holes"],
+            s["wakeups_burst"]
         );
-        if s["tail_settled"] != 1 {
-            let _ = writeln!(failures, "  {op}: the writer never settled in the idle tail (1 s); premise: the tail's words are all counted");
-        }
-        if c >= 8 && burst != 0 {
-            let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
-        }
-        if tail > 1 {
-            let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget <= 1");
-        }
-        if wakes > 2 * flights {
-            let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
-        }
+        judge_load_arm(c, &op, s, &mut failures);
     }
     assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
+}
+
+/// One `confirm_load` arm's judgement (`c` clients, line `op`): one failure line each, a premise's
+/// marked "premise refused".
+fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
+    let (flights, burst, tail, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_tail"], s["confirms_total"], s["wakeups_burst"]);
+    assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
+    assert_eq!(burst + tail, total, "confirm_load: {op}: the words attributed do not add up");
+    if s["tail_settled"] != 1 {
+        let _ = writeln!(failures, "  {op}: the writer never settled in the idle tail (1 s); premise refused: the tail's words are all counted");
+    }
+    if c >= 8 && burst != 0 {
+        let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
+    }
+    if tail > 1 {
+        let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget <= 1");
+    }
+    if wakes > 2 * flights {
+        let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
+    }
+}
+
+/// DECISIONS 6d491917d2 (proposal 1): a `confirm_load` arm whose burst had an idle hole (a gap of
+/// 5 ms or more with no create in progress) is REFUSED, a premise failure naming `idle_holes`, never
+/// judged by its burst words: a stall can cause the hole, and an allowance of one word per hole would
+/// excuse both. The control `load_c8_gapped` makes the hole on purpose (every client pauses together
+/// for 20 ms half-way through its creates); its judgement must be that refusal, whatever words the
+/// gap let the writer write. WRITTEN NOT RUN.
+#[test]
+fn the_load_judgement_refuses_an_arm_with_an_idle_hole() {
+    if in_child() {
+        return;
+    }
+    let data = cell("confirm_load");
+    let s = data.ops.get(LOAD_GAPPED).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {LOAD_GAPPED} line"));
+    assert!(s["idle_holes"] >= 1, "premise: {LOAD_GAPPED} made no idle hole (the clients' pause did not show)");
+    let mut failures = String::new();
+    judge_load_arm(8, LOAD_GAPPED, s, &mut failures);
+    assert!(
+        failures.lines().any(|l| l.contains("premise refused") && l.contains("idle_holes")),
+        "an arm with {} idle holes was not refused by its premise (DECISIONS 6d491917d2); its judgement read:\n{failures}",
+        s["idle_holes"]
+    );
 }
 
 // ---- the open's flushes, absolutely (lead order 2026-10-09, DECISIONS 1334833a4d; the open_* cells) ----
