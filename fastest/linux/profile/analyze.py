@@ -800,6 +800,28 @@ def self_test():
     cases.append(("MED 11: a base whose run failed is dropped: a partial base, the artifact on cpu-A: both premises "
                   "compare against the artifact and PASS, regression_green true, an info row names the dropped base",
                   guarded(case_m11_failed_base_dropped)))
+    # review 5 LOW 27 (mutant-kill cases, not red): a cpu label missing on BOTH sides is a refusal, never a match of
+    # None to None or "" to "" (a mutant comparing only baseline["cpu"] != cpu passed every case)
+    for label in ("", None):
+        def case_cpu_both(label=label):
+            why = artifact_refusal(dict(art, cpu=label), label, "ir_create", BASELINE_ARM, art_ident)
+            ins = by_id(gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, dict(art, cpu=label), cpu=label,
+                              identity=art_ident)).get("instructions/create")
+            return why is not None and "records no cpu" in why and ins is not None and ins[3] == "FAIL"
+        cases.append((f"LOW 27: the artifact's cpu and this runner's both {label!r}: refused (records no cpu), "
+                      "instructions/create FAIL", guarded(case_cpu_both)))
+
+    # review 5 LOW 28 (mutant-kill case): an in-job base with no Ir count and no artifact, while syscalls-vs-base PASSes
+    def case_no_ir_base():
+        nb = arm_of(trace(1), 10)
+        nb.pop("ir_per_op")
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": nb}, budget, None)
+        r = by_id(rows)
+        ins, sv = r.get("instructions/create"), r.get("syscalls-vs-base/full-snap-c1")
+        return (ins is not None and (ins[3], ins[4]) == ("INFO", "regression") and sv is not None and sv[3] == "PASS"
+                and not regression_green(rows))
+    cases.append(("LOW 28: no Ir base and no artifact, syscalls-vs-base PASS: instructions/create is ('INFO', "
+                  "'regression') and regression_green is false", guarded(case_no_ir_base)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
