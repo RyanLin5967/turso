@@ -290,7 +290,57 @@ def selftest():
         got = not why
         print(("PASS" if got == want else "FAIL"), name, "->", "ok" if got else "; ".join(why))
         bad += got != want
-    print(f"fixture selftest: {len(cases) - bad}/{len(cases)}")
+
+    # comp review 1 MED 10: write() itself refuses -- exits non-zero, after recording fixture.json -- a parent the
+    # engine read back otherwise than the generator wrote, a piped stream that is not the generator's, and a job with
+    # no read-back (the drivers' separate `gen_seed.py expect` pass is gone); and it makes ONE pass over the parent
+    # (facts), so a job generates the parent twice: the seed's stream, then this
+    import contextlib
+    import io
+    import tempfile
+    rb_ok = "2500|131727070|21429546430"  # what Dolt, Doltgres and PG 18 read back after this stream (gen_seed selftest)
+    sql_d = hashlib.sha256("".join(ln + "\n" for ln in gen_seed.sql_lines(2500)).encode()).hexdigest()
+    age_d = hashlib.sha256("".join(ln + "\n" for ln in gen_seed.age_lines(2500, 300, 1)).encode()).hexdigest()
+
+    def wr(readback, sqld=sql_d):
+        """(exit status 0 or 1, gen_seed.sql_lines calls) of one write() of a 2500-row parent aged 300"""
+        with tempfile.TemporaryDirectory() as td:
+            sp, ap = os.path.join(td, "seed-sql.sha256"), os.path.join(td, "seed-age.sha256")
+            for p, h in ((sp, sqld), (ap, age_d)):
+                with open(p, "w") as f:
+                    f.write(h + "\n")
+            av = [os.path.join(td, "fixture.json"), "--system", "pg18-d2", "--rows", "2500", "--age", "300",
+                  "--prebranch", "0", "--live", "0", "--engine-why", "selftest", "--maintenance", "selftest",
+                  "--streams", sp, ap] + ([] if readback is None else ["--readback", readback])
+            real, calls = gen_seed.sql_lines, []
+
+            def counted(*a, **k):
+                calls.append(a)
+                return real(*a, **k)
+            gen_seed.sql_lines = counted
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    write(av)
+                code = 0
+            except SystemExit as e:
+                code = 0 if e.code in (None, 0) else 1
+            finally:
+                gen_seed.sql_lines = real
+            return code, len(calls)
+    wcases = [
+        ("write: the engines' read-back and the generator's streams exit 0, after ONE pass over the parent",
+         wr(rb_ok), (0, 1)),
+        ("write: the engine read back another row hash", wr("2500|131727070|21429546431")[0], 1),
+        ("write: the engine read back another count", wr("2499|131727070|21429546430")[0], 1),
+        ("write: the piped parent stream is not the generator's", wr(rb_ok, sqld="cc" * 32)[0], 1),
+        ("write: no read-back", wr(None)[0], 1),
+        ("write: a read-back that is not three counts", wr("2500|x|21429546430")[0], 1),
+    ]
+    for name, got, want in wcases:
+        print(("PASS" if got == want else "FAIL"), name, "->", got)
+        bad += got != want
+    n = len(cases) + len(wcases)
+    print(f"fixture selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
 
