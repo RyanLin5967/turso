@@ -127,12 +127,46 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink
         ),
         Node::TypeCast(c) => {
-            let name = c.type_name.as_ref()?.names.last()?;
-            return match name.node.as_ref()? {
+            let type_name = c.type_name.as_ref()?;
+            // A cast to an array type is that array type (the translator keeps a literal or a
+            // bound parameter as the array, and refuses any other operand).
+            if !type_name.array_bounds.is_empty() {
+                let element = u32::try_from(sqlite_type_to_pg_oid(match type_name
+                    .names
+                    .last()?
+                    .node
+                    .as_ref()?
+                {
+                    Node::String(s) => s.sval.as_str(),
+                    _ => return None,
+                }))
+                .ok()?;
+                return array_of(element);
+            }
+            return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
                 Node::String(s) if s.sval == "float4" => Some(FLOAT4),
                 _ => None,
             };
+        }
+        // ARRAY[...] of integer or of string literals is int4[] or text[], as PostgreSQL types it
+        // (it was announced text; recorded 2026-10-15). Any other element mix is left untyped.
+        Node::AArrayExpr(e) => {
+            let element = |n: &PgNode| match n.node.as_ref() {
+                Some(Node::AConst(c)) => match c.val.as_ref() {
+                    Some(Val::Ival(_)) => Some(INT4),
+                    Some(Val::Sval(_)) => Some(TEXT),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let first = element(e.elements.first()?)?;
+            return e
+                .elements
+                .iter()
+                .all(|n| element(n) == Some(first))
+                .then(|| array_of(first))
+                .flatten();
         }
         Node::CaseExpr(c) => {
             let results = c.args.iter().map(|w| match w.node.as_ref() {

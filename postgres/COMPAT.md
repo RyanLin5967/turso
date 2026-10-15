@@ -126,7 +126,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
-| Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
+| Array support | 🟡 Partial | `type[]` columns, ARRAY[...] literals (announced int4[] / text[] when their elements are integer / string literals), subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays. A cast to an array type is kept for a string literal (`'{1,2}'::int[]`), a bound parameter and an ARRAY[...]; of any other expression it is refused 0A000 (the engine casts by the element's scalar type, which answered 0). A bound array parameter sent back in a result is the engine's record bytes, not its text (known red) |
 | ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |

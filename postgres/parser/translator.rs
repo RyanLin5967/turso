@@ -3025,6 +3025,34 @@ impl PostgreSQLTranslator {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
+                // A cast to an array type: the engine casts by the element's scalar affinity, so
+                // `'{1,2}'::int[]` was 0 and `$1::int[]` (a bound array) 0. A string literal or a
+                // bound parameter is kept as the array it is (a literal is read by the array
+                // column or result it reaches; the parameter was bound as the array), an ARRAY[...]
+                // is one already; any other operand is refused rather than cast by affinity
+                // (PostgreSQL 18.6 differential, 2026-10-15).
+                if type_cast
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|t| !t.array_bounds.is_empty())
+                {
+                    return match arg.node.as_ref() {
+                        Some(pg_query::protobuf::node::Node::AConst(c))
+                            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                        {
+                            self.translate_expr(arg)
+                        }
+                        Some(
+                            pg_query::protobuf::node::Node::ParamRef(_)
+                            | pg_query::protobuf::node::Node::AArrayExpr(_),
+                        ) => self.translate_expr(arg),
+                        _ => Err(ParseError::ParseError(
+                            "a cast of this expression to an array type is not supported: the \
+                             engine would cast it by the element's scalar type"
+                                .into(),
+                        )),
+                    };
+                }
                 // `type $n` is libpg_query's extension of PostgreSQL 17's grammar, a cast with no
                 // location; PostgreSQL 18 refuses it as a syntax error (wire review 14 item 14).
                 if type_cast.location < 0 {
