@@ -150,6 +150,26 @@ def self_test():
         os.remove(os.path.join(t, "a", "good.py"))
         rc, lines = run(t, "darwin")
         cases.append(("nothing run (every row N/A) is not a pass: rc 1", rc == 1))
+        # CLASS (the platform class, instance found 2026-10-15): a row's interpreter came from the CALLER's PATH, so the
+        # same tree passed under vm_dryblock.sh (homebrew first on PATH) and failed run by hand on the Mac (/bin/bash
+        # 3.2: t3lib.sh's coproc, fixed_api_mutants' bash -n). A planted `bash` first on PATH that is not bash 4+ must
+        # not be the one a row runs under, nor the one its children run under
+        fake = os.path.join(t, "fakebin")
+        os.makedirs(fake)
+        open(os.path.join(fake, "bash"), "w").write("#!/bin/sh\necho FAKE-BASH; exit 97\n")
+        os.chmod(os.path.join(fake, "bash"), 0o755)
+        open(os.path.join(t, "a", "v4_test.sh"), "w").write(
+            '[ "${BASH_VERSINFO[0]}" -ge 4 ] || exit 1\nbash -c \'[ "${BASH_VERSINFO[0]}" -ge 4 ]\' || exit 2\necho V4 ok\n')
+        tsv(("a/v4_test.sh", "", "any", "x"), ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = fake + os.pathsep + old_path
+        try:
+            rc, lines = run(t, "darwin")
+        finally:
+            os.environ["PATH"] = old_path
+        cases.append(("a non-bash-4 `bash` first on the caller's PATH runs neither a row nor its children: rc 0",
+                      rc == 0 and any(ln.startswith("PASS a/v4_test.sh") for ln in lines)))
+        os.remove(os.path.join(t, "a", "v4_test.sh"))
         rows, _ = table(os.path.dirname(HERE))
         cases.append(("the real table: every discovered entry point has a row",
                       set(discover(os.path.dirname(HERE))) <= {r[0] for r in rows}))
