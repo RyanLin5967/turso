@@ -10,6 +10,9 @@
 #                      BASE/nb/x.img is NOT the chain, nor is BASE/n10/), or is an image named v3fx-n1.img (the chain's
 #                      first image, on whatever directory, " (deleted)" or not).
 #   nest_loops BASE    loop_list | nest_match BASE; returns 2 when loop_list fails.
+#   nest_level_match DIR  a filter like nest_match: prints DEV for each backing file under DIR/ (anchored on DIR and its
+#                      slash, a trailing slash on DIR the same: /mnt/v3fx/n1 does not match n10/, n1x/ or a file named
+#                      n1 itself). teardown_nest's per-level sweep (V3 review 13 item 20: it kept its own copy).
 # BLIND SPOT, stated: a backing path holding runs of spaces is compared with single spaces (awk rebuilds the field).
 loop_list() {
   local err out rc
@@ -27,6 +30,9 @@ nest_match() {
   awk -v b="$1" '{ d = $1; $1 = ""; sub(/^ +/, ""); p = $0
     lvl = (index(p, b "/n") == 1 && substr(p, length(b) + 3, 1) ~ /^[1-4]$/ && substr(p, length(b) + 4, 1) == "/")
     if (lvl || p ~ /\/v3fx-n1\.img( \(deleted\))?$/) print d }'
+}
+nest_level_match() {
+  awk -v b="${1%/}/" '{ d = $1; $1 = ""; sub(/^ +/, ""); if (index($0, b) == 1) print d }'
 }
 nest_loops() {
   local l

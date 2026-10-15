@@ -1286,21 +1286,17 @@ def self_test():
         chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
-    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are) and a losetup that fails (which must
-    # never read as "nothing attached"); and neither script may keep a copy of the old prefix matcher
+    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are; a level's files, nest_level_match) and a
+    # losetup that fails (which must never read as "nothing attached")
+    # [V3 review 13 item 20, disclosed: the source-text check that followed ("one matcher": no `awk -v b="$base/n"`
+    # in either script) is DELETED as the review directs: it read text, and could not see the per-level sweep's own
+    # `awk -v b="$mp/"`; that sweep now calls nestloops.sh's nest_level_match, pinned by its canned cases above]
     import subprocess as _sp12
     nl = os.path.join(HERE, "nestloops.sh")
     r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
     chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
         "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
         and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
-    copies = []
-    for nm12 in ("mkfixtures.sh", "firecheck.sh"):
-        t12 = rd(os.path.join(HERE, nm12))
-        if t12 is None or 'awk -v b="$base/n"' in t12 or 'awk -v b="$FX/n"' in t12 or '/nestloops.sh"' not in t12:
-            copies.append(nm12)
-    chk("one matcher: mkfixtures.sh and firecheck.sh source nestloops.sh and keep no copy of the old prefix matcher",
-        not copies, copies)
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
