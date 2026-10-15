@@ -1656,8 +1656,9 @@ fn ddl_statements_report_their_command_tags() {
 }
 
 /// turso_branch_stats() reports the server process's own counters — unix system calls, mach
-/// traps, instructions retired, cycles — for the wire-versus-embedded budgets: one row of four
-/// int8 columns that never decrease, where a branch create between two reads costs system calls.
+/// traps, instructions retired, cycles — and the server's skipped CHECKPOINTs and the branch
+/// store's checkpoints, for the wire-versus-embedded budgets: one row of six int8 columns that
+/// never decrease, where a branch create between two reads costs system calls.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn branch_stats_reports_the_servers_counters() {
@@ -3137,25 +3138,11 @@ fn schema_ddl_is_refused_in_server_mode() {
 #[test]
 fn an_index_on_a_qualified_table_is_that_tables() {
     let dir = Scratch::new("qualindex");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c INT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c INT);\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -3246,26 +3233,12 @@ fn a_three_part_reference_resolves_through_its_schema() {
 #[test]
 fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
     let dir = Scratch::new("resolver");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE orders(id INT PRIMARY KEY);\n\
-              CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.u(id INT PRIMARY KEY, n INT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE orders(id INT PRIMARY KEY);\n\
+          CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.u(id INT PRIMARY KEY, n INT);\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -3321,22 +3294,7 @@ fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
 #[test]
 fn a_foreign_key_outside_public_is_refused() {
     let dir = Scratch::new("schemakeys");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(b"CREATE SCHEMA s;\nCREATE TABLE s.p(id INT PRIMARY KEY);\n")
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
-    );
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.p(id INT PRIMARY KEY);\n");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     let sql = "CREATE TABLE s.c(x INT REFERENCES s.p(id))";
@@ -3357,26 +3315,12 @@ fn a_foreign_key_outside_public_is_refused() {
 #[test]
 fn an_explicit_public_qualifier_names_public() {
     let dir = Scratch::new("publicqual");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
-              INSERT INTO s.t VALUES (1, 'one');\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
+          INSERT INTO s.t VALUES (1, 'one');\n",
     );
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -3493,26 +3437,12 @@ fn a_parameter_in_on_conflict_is_typed_from_the_target() {
 #[test]
 fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
     let dir = Scratch::new("schematarget");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(
-            b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
-              CREATE TABLE p(name TEXT);\n\
-              CREATE SCHEMA s;\n\
-              CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
-        )
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE TABLE p(name TEXT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n",
     );
     assert!(
         dir.0.join("turso-postgres-schema-s.db").exists(),
@@ -3597,22 +3527,7 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
 #[test]
 fn an_alias_list_over_an_unknown_star_stays_unknown() {
     let dir = Scratch::new("aliasstar");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(dir.db())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the CLI");
-    cli.stdin
-        .take()
-        .unwrap()
-        .write_all(b"CREATE SCHEMA s;\nCREATE TABLE s.u(k INT, n INT);\n")
-        .unwrap();
-    assert!(
-        cli.wait().unwrap().success(),
-        "premise: the CLI made the schema"
-    );
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.u(k INT, n INT);\n");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     let view = "CREATE VIEW vu(k, n) AS SELECT * FROM s.u";
@@ -5827,6 +5742,21 @@ fn every_statement_checks_its_bind_arity() {
         .ok("keep was not deleted");
 }
 
+/// The fixed-types tests' schemas: ft(k INT) holding 1 on main, and a branch textk where ft is
+/// (k TEXT) holding `branch_row`. The session is left on main.
+fn ft_text_on_a_branch(a: &mut Wire, branch_row: &str) {
+    a.q("CREATE TABLE ft(k INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1)").ok("row");
+    a.q("SELECT turso_branch_create('textk')").ok("branch");
+    a.q("SELECT turso_branch_switch('textk')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(k TEXT)")
+        .ok("ft as text on the branch");
+    a.q(&format!("INSERT INTO ft VALUES ('{branch_row}')"))
+        .ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+}
+
 /// A named statement keeps the types it had when it first met the engine (its first Describe or
 /// Execute), as PostgreSQL fixes a prepared statement's parameter and result types at Parse: on a
 /// branch where its column is TEXT, its Execute is refused (0A000, PostgreSQL's code for "cached
@@ -5839,15 +5769,7 @@ fn a_named_statement_keeps_its_described_parameter_types() {
     let dir = Scratch::new("frozentypes");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE ft(k INT)").ok("ft");
-    a.q("INSERT INTO ft VALUES (1)").ok("row");
-    a.q("SELECT turso_branch_create('textk')").ok("branch");
-    a.q("SELECT turso_branch_switch('textk')").ok("switch");
-    a.q("DROP TABLE ft").ok("drop on the branch");
-    a.q("CREATE TABLE ft(k TEXT)")
-        .ok("ft as text on the branch");
-    a.q("INSERT INTO ft VALUES ('1')").ok("row on the branch");
-    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    ft_text_on_a_branch(&mut a, "1");
     // s is fixed by its Describe: its parameter is int4 on main.
     a.send(b'P', b"s\0SELECT count(*) FROM ft WHERE k = $1\0\0\0");
     a.send(b'D', b"Ss\0");
@@ -6009,15 +5931,7 @@ fn a_named_statement_keeps_its_described_result_types() {
     let dir = Scratch::new("frozencols");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE ft(k INT)").ok("ft");
-    a.q("INSERT INTO ft VALUES (1)").ok("row");
-    a.q("SELECT turso_branch_create('textk')").ok("branch");
-    a.q("SELECT turso_branch_switch('textk')").ok("switch");
-    a.q("DROP TABLE ft").ok("drop on the branch");
-    a.q("CREATE TABLE ft(k TEXT)")
-        .ok("ft as text on the branch");
-    a.q("INSERT INTO ft VALUES ('x')").ok("row on the branch");
-    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    ft_text_on_a_branch(&mut a, "x");
     a.send(b'P', b"r\0SELECT k FROM ft\0\0\0");
     a.send(b'D', b"Sr\0");
     a.send(b'S', &[]);
