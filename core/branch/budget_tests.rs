@@ -3907,3 +3907,62 @@ fn contention_each_create_registers_once_at_any_client_count() {
     }
     assert!(failures.is_empty(), "creates registered more than once under contention (an internal retry):\n{failures}");
 }
+
+// ---- the counted exceptions (DECISIONS bd0d845f97: every run records them; a credited cell has all four at 0) ----
+
+/// The sample keys of `Database::branch_exception_counters()`, in its order: held-free upgrades a
+/// freeing operation led past the hard cap, held-free upgrades that took the flight slot to raise
+/// the header's class, compactions that synced inline on an operation, operations that waited
+/// behind a background compaction. Each is a window's delta.
+const EXC_KEYS: [&str; 4] = ["exc_hardcap_upgrades", "exc_header_raise_exclusive", "exc_inline_compaction_syncs", "exc_compaction_waits"];
+
+/// DECISIONS bd0d845f97 (the routing of `branch_exception_counters`): every run records the four
+/// counted exceptions, so every window of every engine cell carries all four keys. Checked here on
+/// the cells of each producer (the per-operation rounds, recovery, the checkpoint arm, the
+/// confirmation arm and the writer under load, a shared-flight arm, the first create, an open).
+/// Expected RED at this commit: no window records them. WRITTEN NOT RUN.
+#[test]
+fn every_window_records_the_four_exception_counters() {
+    if in_child() {
+        return;
+    }
+    let mut missing = String::new();
+    for spec in MAIN.iter().copied().chain(["ckpt_n10", "confirm_n10", "confirm_load", "shared_c8", "first_create", "open_d2_unconfirmed"]) {
+        let data = cell(spec);
+        for (op, samples) in &data.ops {
+            for (i, s) in samples.iter().enumerate() {
+                for key in EXC_KEYS {
+                    if !s.contains_key(key) {
+                        let _ = writeln!(missing, "  {spec}: {op} #{i}: no {key} recorded");
+                    }
+                }
+            }
+        }
+        assert!(!data.ops.is_empty(), "{spec}: no sample at all: the check saw nothing");
+    }
+    assert!(missing.is_empty(), "windows that do not record the counted exceptions (DECISIONS bd0d845f97):\n{missing}");
+}
+
+/// DECISIONS bd0d845f97: a cell whose window moved one of the four counted exceptions is not
+/// credited: the cell is refused, naming the counter and the window, before any budget reads it.
+/// The plant `exc_sharp` moves one for real, not by a planted line: a SHARP catalog store
+/// (`BranchCheckpoint::Sharp`) at the checkpoint arm's lowered threshold, whose creates cross it, so
+/// a create compacts inline and the engine counts it (`inline_compaction_syncs`; store.rs
+/// `maybe_compact`: a catalog store that is not fuzzy compacts on the operation). Its refusal must
+/// name `exc_inline_compaction_syncs` as moved (not as missing). The negative control is every other
+/// cell: refused only when one of its windows moved one. Expected RED at this commit: the child knows
+/// no cell `exc_sharp`, and nothing refuses a moved counter. WRITTEN NOT RUN.
+#[test]
+fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
+    if in_child() {
+        return;
+    }
+    let refused = std::panic::catch_unwind(|| cell("exc_sharp"))
+        .err()
+        .map(|e| e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
+    let text = refused.unwrap_or_else(|| panic!("exc_sharp was credited: no window's inline compaction was counted, or nothing refused it"));
+    assert!(
+        text.contains("not credited") && text.contains("exc_inline_compaction_syncs moved"),
+        "exc_sharp was refused, but not as a moved exception counter (DECISIONS bd0d845f97):\n{text}"
+    );
+}
