@@ -379,42 +379,68 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
-/// Returns the individual statement strings (without trailing semicolons).
+/// Split a multi-statement SQL string into its statements as PostgreSQL does for a simple Query:
+/// the whole text is parsed first (libpg_query's parser split), so a text any part of which does
+/// not parse is refused whole, and its caller runs none of it. Returns the statements' texts,
+/// trimmed; empty statements are none.
 ///
-/// The scanner emits a statement only where it saw a keyword, and skips every other stretch of the
-/// text: `COMMIT<NBSP>` (one identifier) between two statements was dropped, so `INSERT ..;
-/// COMMIT<NBSP>; INSERT ..` ran both INSERTs and nothing answered 42601. So every stretch before,
-/// between and after the statements must be blank (whitespace, comments, `;`), or the text is
-/// refused here: the caller then prepares it whole, and the parser refuses it, as PostgreSQL parses
-/// the whole string before it runs any of it (wire review 16 item 1).
+/// The scanner split this replaced emitted every stretch holding a keyword as a statement and
+/// skipped the rest: `INSERT ..; COMMIT<NBSP>; INSERT ..` ran both INSERTs (wire review 16 item 1),
+/// and `INSERT ..; COMMIT; SELEC * FROM t` committed the INSERT before the malformed part, which
+/// holds the keyword FROM, was refused (wire review 18 item 6). For the statement-at-a-time split
+/// a REPL wants, see [`split_statements_lenient`].
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
+        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    Ok(parts
+        .into_iter()
+        .map(|s| pg_trim(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Split a multi-statement SQL string statement by statement, as psql sends a script: libpg_query's
+/// scanner finds the statements (`;` inside a string literal, a comment or a dollar quote is no
+/// separator), and a stretch it skips that is not blank (whitespace, comments, `;`) is a part of
+/// its own, in its place, so it fails when it is run instead of vanishing. The scanner emits a
+/// statement only where it saw a keyword: `SELECT 1; selecgt 2` lost `selecgt 2`, and `INSERT ..;
+/// COMMIT<NBSP>; INSERT ..` lost its COMMIT (wire review 16 item 1). The non-server REPL and
+/// PgConnection::execute run their parts this way: the valid parts run, a malformed one fails
+/// (wire review 18 item 7). A simple Query over the wire uses [`split_statements`].
+pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
+    count_libpg_query_call();
+    let found =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
-    let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
+    let mut parts = Vec::with_capacity(found.len());
     let mut at = 0;
-    for part in &parts {
-        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`).
+    for part in &found {
+        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`); one that
+        // is not refuses the split, and its caller runs the text whole.
         let start = (part.as_ptr() as usize)
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
-            .ok_or_else(stray)?;
+            .ok_or_else(|| {
+                ParseError::ParseError("the scanner split lost its place".to_string())
+            })?;
         if !blank(&b[at..start]) {
-            return Err(stray());
+            parts.push(&sql[at..start]);
         }
+        parts.push(part);
         at = start + part.len();
     }
     if !blank(&b[at..]) {
-        return Err(stray());
+        parts.push(&sql[at..]);
     }
     Ok(parts
         .into_iter()
-        .map(|s| pg_trim(&s).to_string())
+        .map(|s| {
+            // A stray stretch keeps the `;` that ends it; a statement's is not in its slice.
+            let s = pg_trim(s);
+            pg_trim(s.trim_end_matches(';')).to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect())
 }

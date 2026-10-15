@@ -394,8 +394,10 @@ impl<'a> PgQueryRunner<'a> {
         let sql = str::from_utf8(sql).unwrap_or("");
         Self {
             conn,
-            stmts: split_statements(sql)
-                .unwrap_or_else(|_| vec![turso_pg_parser::pg_trim(sql).to_string()])
+            // Statement by statement, as psql runs a script: a malformed part fails in its place,
+            // the others run (wire review 18 item 7). A simple Query over the wire is parsed
+            // whole instead ([`split_statements`]).
+            stmts: split_script(sql)
                 .into_iter()
                 .filter(|stmt| !turso_pg_parser::pg_trim(stmt).is_empty())
                 .collect(),
@@ -416,6 +418,18 @@ impl Iterator for PgQueryRunner<'_> {
         self.index += 1;
         Some(prepare_statement(self.conn, sql).map(Some))
     }
+}
+
+/// A script's statements, one by one ([`turso_pg_parser::split_statements_lenient`]): a malformed
+/// part is a part of its own, which fails when run. Text with no separator but a trailing one is
+/// one statement, with no libpg_query call, as in [`split_statements`].
+fn split_script(sql: &str) -> Vec<String> {
+    let trimmed = turso_pg_parser::pg_trim(sql);
+    let body = turso_pg_parser::pg_trim(trimmed.strip_suffix(';').unwrap_or(trimmed));
+    if !body.contains(';') {
+        return vec![body.to_string()];
+    }
+    turso_pg_parser::split_statements_lenient(sql).unwrap_or_else(|_| vec![trimmed.to_string()])
 }
 
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
