@@ -961,6 +961,16 @@ impl Scanned {
                 } else {
                     class.max(synced_class)
                 };
+                // The class those records were made durable in outlives this process (engine review
+                // 18 MED 2: it lived in this open's memory only, so a second process in a weaker
+                // class over the compacted log, or over a header-only one, freed at written): noted
+                // as a raise, so every rewrite of this log, the open's own below included, and the
+                // next flight write it into the header (`header_class`). Mutant
+                // `synced_open_unpersisted` (test builds only): not noted, as before.
+                if class.syncs() && !super::store::fe_mutant("synced_open_unpersisted") {
+                    journal.note_class(class);
+                }
+                journal.settle_snapshot(class)?;
                 if let Some(at) = marker {
                     // F-FZ crash state S1: the catalog holds everything up to its checkpoint's
                     // marker. What follows it is replayed, and becomes the log of the catalog's
@@ -1053,7 +1063,11 @@ impl Scanned {
                     journal.synced_base = journal.synced_base.max(class);
                 }
             }
-            End::Reset => journal.reset_log(generation)?,
+            End::Reset => {
+                let class = journal.rewrite_class();
+                journal.settle_snapshot(class)?;
+                journal.reset_log(generation)?;
+            }
         }
         self.records.drain(..from);
         Ok(Recovered {
@@ -1190,6 +1204,11 @@ pub(crate) struct Journal {
     /// flight syncs the directory before its own log sync, so nothing is acknowledged before the
     /// rename is durable (review 2 #5: no directory sync under the store mutex).
     dir_dirty: bool,
+    /// The snapshot was written by a compaction that synced nothing (D0), in this process or a
+    /// dead one an open in a class that syncs nothing found: the next flight that syncs syncs it
+    /// first, a plain fsync before its directory's and its log's sync, so nothing is acknowledged
+    /// durable on top of a snapshot a power cut can tear (engine review 19 MED 7).
+    snap_dirty: bool,
     /// Every byte the log holds was synced before the next flight is written (engine review 16
     /// MED 5): set by a flight that syncs or is ordered (raised ones included: flights go one at a
     /// time), a syncing open and a synced rewrite; cleared by a flight, an open or a rewrite that
@@ -1318,6 +1337,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            snap_dirty: false,
             prev_synced: false,
             last_names_slots: false,
             compact_after: 0,
@@ -1521,6 +1541,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            snap_dirty: false,
             prev_synced: false,
             last_names_slots: false,
             compact_after: 0,
@@ -1861,7 +1882,7 @@ impl Journal {
             // the rename finds this lock, as it found the old one.
             lock_exclusive(&f, &tmp)?;
             // r13-compose S-3: the header carries THIS log's format (a splice-arm log stays 6).
-            write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.raised), 0)?;
+            write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.header_class()), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
                 // Synced with the rest below: the kept last flight is confirmed, when that sync
@@ -1936,7 +1957,7 @@ impl Journal {
             rewrites: self.rewrites,
             format: self.format,
             page_size: self.page_size,
-            raised: self.raised,
+            raised: self.header_class(),
             class: self.rewrite_class(),
             tmp: self.files.log_tmp(),
             nonce: self.nonce,
@@ -2014,8 +2035,8 @@ impl Journal {
         // A raise since the prep (review 5 #11) reaches the new header; one always comes with a
         // flight's frames, so the delta's sync below covers it. Mutant `cut_drops_raise` (test
         // builds only).
-        if self.raised > prep.raised && !super::store::fe_mutant("cut_drops_raise") {
-            write_at(&prep.file, &class_code(self.raised).to_le_bytes(), HEADER_RAISED_AT)?;
+        if self.header_class() > prep.raised && !super::store::fe_mutant("cut_drops_raise") {
+            write_at(&prep.file, &class_code(self.header_class()).to_le_bytes(), HEADER_RAISED_AT)?;
         }
         if self.len > prep.upto {
             let mut delta = vec![0u8; (self.len - prep.upto) as usize];
@@ -2111,9 +2132,33 @@ impl Journal {
         }
     }
 
+    /// Test builds (C15 ruling, the plant of exception (b)): the header's raised-class field is
+    /// stale, as after a raise no write has carried yet, so the next write that takes it (a
+    /// flight's, or a held-free upgrade's, which is then exclusive) rewrites it. It rewrites the
+    /// value it holds; nothing is raised.
+    #[cfg(test)]
+    pub(crate) fn stale_header_for_test(&mut self) {
+        self.header_stale = true;
+    }
+
     /// The header's raised-class field, if it must be rewritten by the write being prepared.
     fn take_header_patch(&mut self) -> Option<[u8; 4]> {
-        std::mem::take(&mut self.header_stale).then(|| (class_code(self.raised)).to_le_bytes())
+        std::mem::take(&mut self.header_stale).then(|| (class_code(self.header_class())).to_le_bytes())
+    }
+
+    /// What the header's raised-class field says (engine review 18 MED 2): the strongest class a
+    /// record of this log was made durable in, the store's own included, so a later process in a
+    /// weaker class, whatever the log then holds (a header-only log, a compacted one), reads that
+    /// the snapshot or catalog it inherits was synced in it, and holds its frees for it
+    /// (`StoreInner::free_class`). Written by every rewrite and every raise, and carried through
+    /// rewrites that sync nothing. Mutant `header_raised_only` (test builds only): the raised class
+    /// alone, as before (a D1 or D2 run wrote Off there).
+    fn header_class(&self) -> SyncClass {
+        if super::store::fe_mutant("header_raised_only") {
+            self.raised
+        } else {
+            self.raised.max(self.sync)
+        }
     }
 
     pub(crate) fn check_live(&self) -> Result<()> {
@@ -2177,6 +2222,13 @@ impl Journal {
                 return Err(e);
             }
         };
+        let snap = match self.take_dirty_snap(class) {
+            Ok(snap) => snap,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
@@ -2186,7 +2238,7 @@ impl Journal {
                 "failpoint: a branch log write failed".to_string(),
             ))
         } else {
-            self.write_frames(arena, class, &frames, header, dir.as_ref())
+            self.write_frames(arena, class, &frames, header, dir.as_ref(), snap.as_ref())
         };
         match written {
             Ok(()) => {
@@ -2211,6 +2263,7 @@ impl Journal {
         frames: &[u8],
         header: Option<[u8; 4]>,
         dir: Option<&File>,
+        snap: Option<&File>,
     ) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
@@ -2231,6 +2284,10 @@ impl Journal {
             write_at(&self.file, &raised, HEADER_RAISED_AT)?;
         }
         write_at(&self.file, frames, self.len)?;
+        // A D0 compaction's snapshot, before the log's sync drains it (`snap_dirty`).
+        if let Some(snap) = snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
+        }
         if let Some(dir) = dir {
             fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
@@ -2314,6 +2371,7 @@ impl Journal {
                 header: None,
                 ordered: false,
                 dir: None,
+                snap: None,
                 nonce: self.nonce,
                 base_syncs: self.base_synced(),
                 names_slots: false,
@@ -2355,9 +2413,17 @@ impl Journal {
                 return Err(e);
             }
         };
-        // A cut's rename is made durable by this flight, before its own log sync (`dir_dirty`).
+        // A cut's rename is made durable by this flight, before its own log sync (`dir_dirty`),
+        // and a D0 compaction's snapshot (`snap_dirty`).
         let dir = match self.take_dirty_dir(class) {
             Ok(dir) => dir,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
+        let snap = match self.take_dirty_snap(class) {
+            Ok(snap) => snap,
             Err(e) => {
                 self.set_poisoned();
                 return Err(e);
@@ -2394,6 +2460,7 @@ impl Journal {
             header,
             ordered: false,
             dir,
+            snap,
             nonce: self.nonce,
             base_syncs,
             names_slots,
@@ -2407,7 +2474,11 @@ impl Journal {
     /// that last flight's slot check, as for any ordered last flight, and a damaged slot is refused
     /// when read rather than dropped with the flight whose records the upgrade made durable (engine
     /// review 17 MED 5; its room is reserved here). One pwrite, no sync. Mutant
-    /// `ordered_upgrade_writes_no_end` (test builds only): no end frame, as before.
+    /// `ordered_upgrade_writes_no_end` (test builds only): no end frame, as before. With no arena to
+    /// barrier (a D1 flight, or a fuzzy checkpoint's settle, took the arena's mark and synced it),
+    /// it writes no end frame: its confirmation of the last flight, proved by the trunk commit's
+    /// flush, covers that flight instead (`Flight::write`; engine review 21 MED 7, which corrects
+    /// c8b12518d's message: the end frame does not cover the D1 route it claimed).
     pub(crate) fn take_ordered_flight(&mut self, arena: &mut Arena, class: SyncClass, upgrade: bool) -> Result<Flight> {
         let mut flight = self.take_flight(arena, class, upgrade)?;
         if flight.bytes.is_empty()
@@ -2420,7 +2491,10 @@ impl Journal {
             self.last_names_slots = false;
             flight.empty_end = true;
         }
-        Ok(flight)
+        // Returned ordered (engine review 21 LOW 27): the empty end frame's tag claims a barrier
+        // only an ordered flight writes, so a caller that forgot `Flight::ordered` cannot write
+        // one over an unbarriered arena.
+        Ok(flight.ordered())
     }
 
     /// A held-free upgrade (`BranchStore::sync_upgrade`; engine review 18 HIGH 1): a sync in
@@ -2433,8 +2507,9 @@ impl Journal {
     /// cost of one repeated plain fsync of each by the next syncing flight per upgrade. When the
     /// upgrade raises the class the header records, it writes that field, and is then `exclusive`
     /// (it holds the flight slot), so no flight's own header write can race it; the first raise of
-    /// a store only. A take that fails fail-stops the journal, as a flight's does.
-    pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass) -> Result<Upgrade> {
+    /// a store only. A take that fails fail-stops the journal, as a flight's does. `end_lsn` is the
+    /// group's written mark, where the log's last flight ends (its confirmation's, `Upgrade::sync`).
+    pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass, end_lsn: u64) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
         let taken = (|| -> Result<(File, Option<File>)> {
@@ -2465,32 +2540,45 @@ impl Journal {
                 return Err(e);
             }
         };
+        let snap = match self.dirty_snap_handle(class) {
+            Ok(snap) => snap,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         self.note_class(class);
         let header = self.take_header_patch();
         Ok(Upgrade {
             log,
             arena,
             dir,
+            snap,
             exclusive: header.is_some(),
             header,
             class,
             at: self.len,
+            end_lsn,
             rewrites: self.rewrites,
             fail: false,
         })
     }
 
-    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed. Returns whether
-    /// the log is still the one it synced (no rewrite ran since), the condition for its landing to
-    /// mark anything (engine review 21 MED 2). When no flight was taken either, every byte the log
-    /// holds was synced, so the next flight's end frame says so (`prev_synced`), as after an
-    /// upgrade flight.
-    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) -> bool {
-        let same_log = self.rewrites == rewrites;
-        if same_log && self.len == at {
+    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed. `None` when a
+    /// rewrite ran since: the log is not the one it synced, and its landing marks nothing (engine
+    /// review 21 MED 2). Otherwise whether no flight was taken since either (the log still ends at
+    /// `at`): then every byte the log holds was synced, so the next flight's end frame says so
+    /// (`prev_synced`), as after an upgrade flight, and the log's last flight is the one the
+    /// upgrade's confirmation names (engine review 21 MED 6).
+    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) -> Option<bool> {
+        if self.rewrites != rewrites {
+            return None;
+        }
+        let last = self.len == at;
+        if last {
             self.prev_synced = true;
         }
-        same_log
+        Some(last)
     }
 
     /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
@@ -2503,7 +2591,7 @@ impl Journal {
     /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
     fn take_dirty_dir(&mut self, class: SyncClass) -> Result<Option<File>> {
         let d = self.dirty_dir_handle(class)?;
-        if d.is_some() {
+        if d.is_some() || (class.syncs() && !dirs_sync()) {
             self.dir_dirty = false;
         }
         Ok(d)
@@ -2517,6 +2605,12 @@ impl Journal {
         if !self.dir_dirty || !class.syncs() || super::store::fe_mutant("no_cut_dir_sync") {
             return Ok(None);
         }
+        // Off unix no directory is synced (`fsync_dir_of` is a no-op there), and opening one as a
+        // file fails (Windows wants FILE_FLAG_BACKUP_SEMANTICS), which poisoned a fresh D0 store at
+        // its first syncing flight (engine review 19 MED 4): no handle.
+        if !dirs_sync() {
+            return Ok(None);
+        }
         let dir = match self.files.log.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
@@ -2524,6 +2618,57 @@ impl Journal {
         File::open(dir)
             .map(Some)
             .map_err(|e| io_error(e, "open branch directory"))
+    }
+
+    /// The snapshot, to sync before a log sync in `class` that follows a compaction that synced
+    /// nothing (`snap_dirty`; engine review 19 MED 7), the mark cleared.
+    fn take_dirty_snap(&mut self, class: SyncClass) -> Result<Option<File>> {
+        let s = self.dirty_snap_handle(class)?;
+        if s.is_some() {
+            self.snap_dirty = false;
+        }
+        Ok(s)
+    }
+
+    /// `take_dirty_snap`, leaving `snap_dirty` set (a held-free upgrade's, as `dirty_dir_handle`).
+    /// Mutant `snapshot_left_unsynced_by_flight` (test builds only): none, as before.
+    fn dirty_snap_handle(&self, class: SyncClass) -> Result<Option<File>> {
+        if !self.snap_dirty || !class.syncs() || super::store::fe_mutant("snapshot_left_unsynced_by_flight") {
+            return Ok(None);
+        }
+        self.open_snapshot().map(Some)
+    }
+
+    /// The snapshot file, opened to be synced (writable: Windows syncs only a handle that can write).
+    fn open_snapshot(&self) -> Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.files.snap)
+            .map_err(|e| io_error(e, "open branch snapshot"))
+    }
+
+    /// At an open (engine review 19 MED 7): the snapshot a compaction wrote may never have been
+    /// synced (a D0 run's compaction syncs nothing). In a `class` that syncs it is synced now, before
+    /// the open's own syncs and so before anything acknowledged on top of it: a plain fsync, which
+    /// the log's sync in `class` that follows drains with it when both are on one device, else a
+    /// sync in `class` of its own. In a class that syncs nothing it is left to the first flight
+    /// that syncs (`snap_dirty`). Nothing when there is no snapshot. Mutant
+    /// `snapshot_left_unsynced_at_open` (test builds only): not synced, as before.
+    fn settle_snapshot(&mut self, class: SyncClass) -> Result<()> {
+        if self.snapshot_len == 0 {
+            return Ok(());
+        }
+        if !class.syncs() {
+            self.snap_dirty = true;
+            return Ok(());
+        }
+        if super::store::fe_mutant("snapshot_left_unsynced_at_open") {
+            return Ok(());
+        }
+        let snap = self.open_snapshot()?;
+        let one = matches!((file_device(&snap), file_device(&self.file)), (Some(a), Some(b)) if a == b);
+        sync_snapshot(&snap, if one { SyncClass::Fsync } else { class })
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -2623,6 +2768,8 @@ impl Journal {
                 return Err(e);
             }
         }
+        // Synced above, or by the first flight that syncs (engine review 19 MED 7).
+        self.snap_dirty = !class.syncs();
         if fail_after_rename {
             self.set_poisoned();
             return Err(LimboError::InternalError(
@@ -2650,7 +2797,7 @@ impl Journal {
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let class = self.rewrite_class();
         let nonce = fresh_nonce(self.nonce);
-        let header = log_header(self.format, self.page_size, generation, nonce, self.raised);
+        let header = log_header(self.format, self.page_size, generation, nonce, self.header_class());
         self.rewrites += 1;
         self.compact_after = 0;
         if cfg!(unix) && !super::store::fe_mutant("reset_in_place") {
@@ -2780,11 +2927,47 @@ fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32
 pub(crate) struct Confirm {
     log: File,
     word: u32,
+    /// The journal's `lsn` at the end of the flight it confirms: a confirmation of a later flight
+    /// supersedes it (`supersedes`).
+    lsn: u64,
     /// The flight's sync proved stable storage (`proves_stable`); otherwise only a close, after a
     /// full flush of its own, may write the word.
     proved: bool,
     /// The `ConfirmWriteFails` failpoint.
     fail: bool,
+}
+
+/// The confirmation of a flight whose frames, its end frame last, are `bytes`, written at `at`
+/// (review 6 #1): bound to its end frame's checksum and to where it ends, the flight ending at `lsn`.
+fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
+    let crc = end_frame_crc(bytes[bytes.len() - END_FRAME_LEN..].try_into().unwrap());
+    Confirm {
+        word: confirm_word(crc, at + bytes.len() as u64),
+        lsn,
+        proved,
+        fail,
+        log,
+    }
+}
+
+/// The confirmation of the log's last flight, for a sync that wrote no frame of its own (engine
+/// review 21 MED 6: a zero-byte upgrade flight, a held-free upgrade; MED 7: an ordered one): read
+/// from `log`, which ends at `at`, where that flight's end frame ends (its checksum is the log's
+/// last 4 bytes, as `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log
+/// holds no flight, or the read fails: the word's absence proves nothing.
+fn confirm_last(log: File, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
+    if at < (LOG_HEADER_LEN + END_FRAME_LEN) as u64 {
+        return None;
+    }
+    let mut crc = [0u8; 4];
+    read_at(&log, &mut crc, at - 4).ok()?;
+    Some(Confirm {
+        word: confirm_word(u32::from_le_bytes(crc), at),
+        lsn,
+        proved,
+        fail,
+        log,
+    })
 }
 
 impl Journal {
@@ -2804,6 +2987,13 @@ impl Journal {
 }
 
 impl Confirm {
+    /// Test builds (fastest-budgets, review C08 #1): the word this confirmation writes, which names
+    /// its flight (bound to the flight's end frame and where it ends).
+    #[cfg(test)]
+    pub(crate) fn word_for_test(&self) -> u32 {
+        self.word
+    }
+
     /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
     /// the group, engine review 8 #9).
     #[cfg(test)]
@@ -2811,6 +3001,7 @@ impl Confirm {
         Self {
             log,
             word: 0,
+            lsn: 0,
             proved,
             fail: false,
         }
@@ -2819,6 +3010,27 @@ impl Confirm {
     /// Whether the word may be written as is (`proved`).
     pub(crate) fn proved(&self) -> bool {
         self.proved
+    }
+
+    /// Whether this confirmation replaces `held` as the one the confirmation writer holds: it
+    /// confirms a later flight, or the same one with the proof `held` lacks. A sync that wrote no
+    /// frame confirms the last flight landed before it, which a later flight's own confirmation may
+    /// already have replaced (engine review 21 MED 6).
+    pub(crate) fn supersedes(&self, held: &Confirm) -> bool {
+        self.lsn > held.lsn || (self.lsn == held.lsn && self.proved && !held.proved)
+    }
+
+    /// A trunk commit's WAL F_FULLFSYNC on the branch files' device returned, issued once every
+    /// journal byte below `frontier` was synced or ordered (`BranchStore::trunk_wal_synced`): it
+    /// drained the device after this flight's own sync or barrier returned, so its word may now be
+    /// written as proved, when the flight ends at or below `frontier` (engine review 21 MEDs 7 and
+    /// 8). Returns whether this proved it.
+    pub(crate) fn prove_below(&mut self, frontier: u64) -> bool {
+        if self.proved || self.lsn > frontier {
+            return false;
+        }
+        self.proved = true;
+        true
     }
 
     /// Write the word (unsynced: its absence proves nothing, its presence that the sync returned).
@@ -2950,6 +3162,9 @@ pub(crate) struct Flight {
     /// The log's directory after a cut renamed the log into place (`Journal::dir_dirty`): synced
     /// before the log, so the flight's own flush makes the rename durable too.
     dir: Option<File>,
+    /// The snapshot a compaction that synced nothing wrote (`Journal::snap_dirty`; engine review
+    /// 19 MED 7): synced before the log, so the flight's own flush makes it durable too.
+    snap: Option<File>,
     /// The log incarnation's nonce, for the end frame `write` builds.
     nonce: u32,
     /// Every byte before this flight was synced when it was taken (`Journal::base_synced`): its end
@@ -3006,6 +3221,9 @@ impl Flight {
         if let Some(raised) = &self.header {
             write_at(&log, raised, HEADER_RAISED_AT)?;
         }
+        // Whether the log's last flight, once this one is written, is closed by an ordered end
+        // frame (this flight's own, or an empty one): open then skips its slot check.
+        let mut tagged_ordered = false;
         if !self.bytes.is_empty() {
             // The end frame, built here with no lock held (review 2 #8), in the same write.
             // An ordered flight says so (review 6 #7): recovery takes its slots as there whenever
@@ -3016,8 +3234,12 @@ impl Flight {
             // checked at open. Mutants (test builds only): `ordered_tag_ignored` (tagged as a
             // synced flight, as before review 6 #7) and `ordered_tag_without_barrier` (tagged
             // ordered whatever the arena, as before review 17 MED 4).
-            let barriered = self.arena.is_some() || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
-            let kind = if self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored") {
+            // Mutant `ordered_tag_ignores_arena` (test builds only; engine review 21 LOW 22): the
+            // records alone decide, as if no flight ever carried the arena.
+            let own_barrier = self.arena.is_some() && !super::store::fe_mutant("ordered_tag_ignores_arena");
+            let barriered = own_barrier || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
+            tagged_ordered = self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored");
+            let kind = if tagged_ordered {
                 EndKind::ordered_by(self.base_syncs)
             } else {
                 EndKind::of_class(self.class, self.base_syncs)
@@ -3028,12 +3250,16 @@ impl Flight {
         } else if self.empty_end {
             // A zero-byte ordered upgrade's empty end frame (`Journal::take_ordered_flight`): its
             // own arena barrier above covers the slots the last flight's records name.
+            tagged_ordered = true;
             write_at(&log, &end_frame(self.nonce, EndKind::ordered_by(self.base_syncs), &[]), self.at)?;
         }
         super::store::kill_point("flight.log_written");
         after_pwrite();
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
+        if let Some(snap) = &self.snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
+        }
         if let Some(dir) = &self.dir {
             fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
@@ -3045,24 +3271,38 @@ impl Flight {
             // writer. Mutant `no_flight_confirm`: none. Mutant `confirm_in_ack_window` (test builds
             // only): written here, inside the acknowledgement window, as before (review 6 #1).
             if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
-                let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
-                let c = Confirm {
-                    word: confirm_word(crc, self.at + self.bytes.len() as u64),
-                    proved: proves_stable(self.class),
-                    fail: self.fail_confirm,
-                    log,
-                };
+                let c = flight_confirm(log, &self.bytes, self.at, self.end_lsn, proves_stable(self.class), self.fail_confirm);
                 if super::store::fe_mutant("confirm_in_ack_window") {
                     c.write()?;
                 } else {
                     confirm = Some(c);
                 }
+            } else if self.bytes.is_empty() && !super::store::fe_mutant("upgrade_confirms_nothing") {
+                // A zero-byte upgrade: its flush made the log's last flight durable, slots and
+                // records, and wrote no end frame of its own, so it confirms that flight (engine
+                // review 21 MED 6). Unconfirmed, a slot of it damaged after the acknowledgement had
+                // open drop the flight silently. Mutant `upgrade_confirms_nothing` (test builds
+                // only): no confirmation, as before.
+                confirm = confirm_last(log, self.at, self.end_lsn, proves_stable(self.class), self.fail_confirm);
             }
         }
         // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
         // log and the trunk's WAL removed. Caught by C1b.
         else if syncs && self.ordered && !super::store::fe_mutant("no_log_barrier") {
             barrier_file(&log, self.class)?;
+            // Barriered, not synced: durable once the trunk commit's WAL F_FULLFSYNC returns. A
+            // last flight its own ordered end frame does not close (one tagged as a synced flight
+            // for want of an arena barrier, or a zero-byte upgrade with no arena to barrier) is
+            // slot-checked at open, so it gets a confirmation, unproved until that flush proves it
+            // (`BranchStore::trunk_wal_synced`; engine review 21 MEDs 7 and 8). Mutant
+            // `ordered_confirms_nothing` (test builds only): none, as before.
+            if !tagged_ordered && !super::store::fe_mutant("ordered_confirms_nothing") {
+                confirm = if self.bytes.is_empty() {
+                    confirm_last(log, self.at, self.end_lsn, false, self.fail_confirm)
+                } else {
+                    Some(flight_confirm(log, &self.bytes, self.at, self.end_lsn, false, self.fail_confirm))
+                };
+            }
         }
         super::store::kill_point("flight.log_synced");
         Ok(confirm)
@@ -3094,6 +3334,8 @@ pub(crate) struct Upgrade {
     log: File,
     arena: Option<File>,
     dir: Option<File>,
+    /// A D0 compaction's snapshot (`Journal::snap_dirty`, left set; engine review 19 MED 7).
+    snap: Option<File>,
     /// The header's raised-class field, when this upgrade is the first sync in a stronger class.
     header: Option<[u8; 4]>,
     /// It writes `header`, so it holds the flight slot while it syncs (`take_upgrade`).
@@ -3102,6 +3344,9 @@ pub(crate) struct Upgrade {
     /// The log's length and its rewrite count when taken (`Journal::upgrade_landed`).
     pub(crate) at: u64,
     pub(crate) rewrites: u64,
+    /// The group's written mark when taken: where the log's last flight ends, as its confirmation
+    /// says (`Confirm::supersedes`).
+    end_lsn: u64,
     /// The `UpgradeSyncFails` failpoint (engine review 21 MED 4): the sync fails.
     pub(crate) fail: bool,
 }
@@ -3113,7 +3358,11 @@ impl Upgrade {
     /// sync left out; killed by `a_held_free_upgrade_syncs_the_arena_and_the_log`. No mutant drops
     /// the directory's sync: no test reaches a dirty directory under an upgrade (a raised store's
     /// rewrites sync and leave it clean), so one would have no killer.
-    pub(crate) fn sync(self) -> Result<()> {
+    ///
+    /// Returns the confirmation of the log's last flight, which the sync made durable (engine review
+    /// 21 MED 6): the store offers it only if that flight is still the last when the upgrade lands
+    /// (`Journal::upgrade_landed`).
+    pub(crate) fn sync(self) -> Result<Option<Confirm>> {
         if self.fail {
             return Err(LimboError::InternalError(
                 "failpoint: the held-free upgrade's sync failed".to_string(),
@@ -3127,13 +3376,17 @@ impl Upgrade {
         if let Some(raised) = &self.header {
             write_at(&self.log, raised, HEADER_RAISED_AT)?;
         }
+        if let Some(snap) = &self.snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
+        }
         if let Some(dir) = &self.dir {
             fsync_dir(dir, SyncClass::Fsync)?;
         }
         if super::store::fe_mutant("upgrade_no_log_sync") {
-            return Ok(());
+            return Ok(None);
         }
-        fsync_file(&self.log, self.class)
+        fsync_file(&self.log, self.class)?;
+        Ok(confirm_last(self.log, self.at, self.end_lsn, proves_stable(self.class), false))
     }
 }
 
@@ -3331,8 +3584,10 @@ fn synced_flight_over(
 /// The record frames of `kept` (whole frames of an incarnation of nonce `old`, from a flight boundary
 /// or a mark inside a flight, to a flight boundary) framed again for an incarnation of nonce `new`:
 /// one end frame per kept flight, so every flight's boundary is kept (review 2 #3), and none for a
-/// flight with no kept record. A frame that is not whole is refused: the region was written whole
-/// before it was read. Returns the bytes and the last flight's checksum (for `HEADER_CONFIRM_AT`).
+/// flight with no kept record, but for an empty ordered end frame closing a kept flight, kept in a
+/// synced rewrite (engine review 21 MED 9). A frame that is not whole is refused: the region was
+/// written whole before it was read. Returns the bytes and the last flight's checksum (for
+/// `HEADER_CONFIRM_AT`).
 ///
 /// `synced`: the rewrite is synced. A kept flight is tagged synced only when its old end frame said
 /// so AND the rewrite syncs (engine review 7 #1): a flight written unsynced named slots no sync
@@ -3386,6 +3641,21 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
             let class = if tag_synced { was_class.max(SyncClass::Fsync) } else { SyncClass::Off };
             let base = !(super::store::fe_mutant("reframe_keeps_raised") && was.is_some_and(|k| k.synced() && !k.by_syncing_writer()));
             let frame = end_frame(new, EndKind::of_class(class, base), &out[flight_at..]);
+            last_crc = end_frame_crc(&frame);
+            out.extend_from_slice(&frame);
+            flight_at = out.len();
+        } else if let Some(kind) =
+            was.filter(|k| synced && flight_at > 0 && k.ordered() && !super::store::fe_mutant("reframe_drops_empty_end"))
+        {
+            // An empty ordered end frame closing the kept flight before it (a zero-byte ordered
+            // upgrade's, `Journal::take_ordered_flight`): that upgrade barriered the flight's slots
+            // ahead of its records, so open skips the flight's slot check. Kept as it was, so the
+            // rewrite keeps that closure (engine review 21 MED 9): dropped, the flight came back
+            // tagged from its own end frame alone, slot-checked at open, and a damaged slot of a
+            // record the upgrade made durable dropped it silently. Only in a rewrite that syncs,
+            // so the closure is never claimed for bytes no sync covered. Mutant
+            // `reframe_drops_empty_end` (test builds only): skipped, as before.
+            let frame = end_frame(new, kind, &[]);
             last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
             flight_at = out.len();
@@ -3969,6 +4239,9 @@ thread_local! {
     /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
     /// durable once before the next acknowledgement, never once per flight).
     pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test builds: syncs of a snapshot no rewrite synced (a D0 compaction's), made on this thread
+    /// (engine review 19 MED 7).
+    pub(crate) static SNAP_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Test builds: branch-file syncs this thread asked for, by class (`[Fsync, FullFsync]`),
     /// whatever the platform makes of them (engine review 16 MED 7: off Apple both are fsync(2)).
     pub(crate) static CLASS_SYNCS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
@@ -3984,6 +4257,14 @@ fn open_dir_class(class: SyncClass) -> SyncClass {
     } else {
         SyncClass::Fsync
     }
+}
+
+/// Sync `snap`, the snapshot file, in `class`, counted (test builds; `SNAP_SYNCS`).
+fn sync_snapshot(snap: &File, class: SyncClass) -> Result<()> {
+    fsync_file(snap, class)?;
+    #[cfg(test)]
+    SNAP_SYNCS.with(|c| c.set(c.get() + 1));
+    Ok(())
 }
 
 /// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
@@ -4219,6 +4500,13 @@ pub(crate) fn fail_next_barrier(errno: i32) {
 #[cfg(test)]
 pub(crate) fn barrier_errno_pending() -> i32 {
     BARRIER_ERRNO.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether this target makes a rename durable by syncing the directory (`fsync_dir_of`): unix only.
+/// Mutant `dir_opened_off_unix` (test builds only; engine review 19 MED 4): every target, so a
+/// flight off unix opens its log's directory as a file, as before.
+fn dirs_sync() -> bool {
+    cfg!(unix) || super::store::fe_mutant("dir_opened_off_unix")
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
@@ -5646,6 +5934,74 @@ mod format_tests {
         );
     }
 
+    /// Engine review 19 LOW 18 (the review 16 MED 6 red asserted the flag, not the outcome): after
+    /// the same D0 open that reset a log a compaction left stale, the first flight that syncs syncs
+    /// the directory exactly once, on its thread (`DIR_SYNCS`). Mutant
+    /// `reset_unsynced_rename_left_clean`: 0.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_syncing_flight_after_a_d0_reset_open_syncs_the_directory_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        {
+            let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+            let stopped = journal.compact(&SnapshotState::default(), &mut Arena::new(512), true);
+            assert!(stopped.is_err(), "premise: the compaction stopped after its snapshot rename");
+        }
+        let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+        assert_eq!(journal.len, LOG_HEADER_LEN as u64, "premise: the open reset the stale log");
+        journal.buffer(&Record::Fork { child: 7, parent: 0 }).unwrap();
+        let dirs = DIR_SYNCS.with(|c| c.get());
+        journal.take_flight(&mut Arena::new(512), SyncClass::Fsync, false).unwrap().write().unwrap();
+        assert_eq!(
+            DIR_SYNCS.with(|c| c.get()) - dirs,
+            1,
+            "the first syncing flight after a D0 open that reset the log synced the directory a wrong number of times"
+        );
+    }
+
+    /// Engine review 19 LOW 18 (the review 16 MED 5 red took any Corrupt): the damage under raised
+    /// flight B, with whole raised flight C after it, is refused for that reason (the message says
+    /// it lies under a synced flight), and the same log undamaged keeps all three forks: the control.
+    /// Both openers. Mutant `prev_synced_ignored`.
+    #[test]
+    fn damage_under_a_raised_flight_is_refused_as_acknowledged_and_its_control_keeps_every_fork() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            for damaged in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+                let b_end;
+                {
+                    let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                    let mut arena = Arena::new(512);
+                    let mut ends = Vec::new();
+                    for child in 1..=3 {
+                        journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                        journal.raise_pending_class(SyncClass::FullFsync);
+                        journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                        ends.push(journal.len);
+                    }
+                    b_end = ends[1];
+                }
+                if damaged {
+                    overwrite(&files.log, b_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+                }
+                let got = Journal::recover(&files, opener);
+                if damaged {
+                    assert!(
+                        matches!(&got, Err(LimboError::Corrupt(m)) if m.contains("lies under a synced flight")),
+                        "{opener:?}: damage under a raised flight with a whole raised flight after it was not refused as acknowledged: {:?}",
+                        got.map(|r| r.map(|r| forks(&r.records)))
+                    );
+                } else {
+                    let kept = got.unwrap().map(|r| forks(&r.records));
+                    assert_eq!(kept, Some(vec![1, 2, 3]), "{opener:?}: the undamaged control lost a fork");
+                }
+            }
+        }
+    }
+
     /// Engine review 10 #3: a log a D1 run synced (acknowledged in Fsync) reopened in D0 has
     /// rewrite class Off: its header was never raised, and the class recovery decided for it was
     /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
@@ -5666,7 +6022,9 @@ mod format_tests {
             let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
             flights(&files, 0, &[1, 1], SyncClass::Fsync);
             let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
-            assert!(!journal.raised.syncs(), "arm={arm}: premise: the D1 run never raised the header");
+            // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the D1 run never raised the
+            // header; every run now writes its own class there (`header_class`), so it reads Fsync.
+            assert_eq!(journal.rewrite_class(), SyncClass::Fsync, "arm={arm}: premise: the open decided the D1 run's class");
             let (before, synced) = (dirs(), file_syncs());
             let end = journal.mark();
             let generation = journal.generation;
@@ -5689,7 +6047,10 @@ mod format_tests {
             let end = journal.mark();
             let generation = journal.generation;
             journal.rewrite_from(end, generation).unwrap();
-            assert_eq!(dirs(), before, "arm={arm}: the inherited floor outlived the rewrite that carried its records");
+            // FLAGGED TEST EDIT (engine review 18 MED 2, a claim reversed by the ruled design): the floor
+            // was to be dropped once its records were carried; the class now outlives every rewrite, so a
+            // later rewrite syncs its directory too (the stated cost of review 18 MED 2).
+            assert!(dirs() > before, "arm={arm}: a later rewrite of a log a D1 run synced synced no directory");
         }
     }
 
@@ -5707,7 +6068,9 @@ mod format_tests {
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         flights(&files, 0, &[1, 1], SyncClass::FullFsync);
         let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
-        assert!(!journal.raised.syncs(), "premise: the D2 run never raised the header");
+        // FLAGGED TEST EDIT (engine review 18 MED 2): the premise was that the D2 run never raised the
+        // header; every run now writes its own class there, so the D1 open reads FullFsync.
+        assert_eq!(journal.rewrite_class(), SyncClass::FullFsync, "premise: the open decided the D2 run's class");
         let before = full();
         journal.compact(&SnapshotState::default(), &mut Arena::new(512), false).unwrap();
         let synced = full() - before;
@@ -5987,6 +6350,27 @@ mod format_tests {
                 "names_slots={names_slots}: an ordered flight with no arena barrier was tagged {kind:?}"
             );
         }
+    }
+
+    /// Engine review 21 LOW 22: the file-arena arm that e792c363a's red lacks (a memory arena never
+    /// has a handle to carry). A flight taken in FullFsync over a FILE arena whose dirty mark is
+    /// set carries the arena's descriptor and barriers it itself, so a TrunkRetain naming a slot is
+    /// tagged ordered. Mutant `ordered_tag_ignores_arena` (the tag decided by the records alone)
+    /// must fail it.
+    #[test]
+    fn an_ordered_flight_whose_own_barrier_covers_named_slots_is_tagged_ordered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        let mut arena = Arena::open_file(&files.arena, 512, true, &[]).unwrap();
+        arena.mark_unsynced();
+        journal.buffer(&Record::TrunkRetain { page: 2, born: 0, died: 1, slot: 7, crc: 0 }).unwrap();
+        let flight = journal.take_flight(&mut arena, SyncClass::FullFsync, false).unwrap();
+        assert!(!arena.is_dirty(), "premise: the flight took the arena's dirty mark, and its descriptor");
+        flight.ordered().write().unwrap();
+        let bytes = std::fs::read(&files.log).unwrap();
+        let kind = EndKind::from_tag(bytes[bytes.len() - END_PAYLOAD_LEN]).expect("premise: the log ends with an end frame");
+        assert!(kind.ordered(), "an ordered flight that barriered the arena itself was tagged {kind:?}");
     }
 
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
