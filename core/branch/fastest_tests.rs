@@ -4965,6 +4965,45 @@ fn a_fuzzy_install_does_not_wait_for_the_held_free_upgrade() {
     assert_eq!(created, Ok(true), "{what}: a create waited behind the install for the upgrade (or failed)");
 }
 
+/// Wire review 18 HIGH 3, the store's half: a client's CHECKPOINT ran the sharp catalog checkpoint
+/// (`branch_compact_now`), which holds the store mutex across its settle, its catalog write and
+/// sync, its cut and the cut's directory fsync, so every create, switch and connect waited for it.
+/// `branch_checkpoint_now` runs the fuzzy one: held before its catalog commit, a create on another
+/// connection returns within 10 s, and once released the checkpoint installs. Mutant
+/// `checkpoint_now_sharp`.
+#[test]
+fn a_requested_checkpoint_lets_creates_run_while_it_writes() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("checkpoint-now.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let before = db.branch_checkpoint_counters();
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    let checkpoint = {
+        let db = db.clone();
+        std::thread::spawn(move || db.branch_checkpoint_now(std::time::Duration::from_secs(30)))
+    };
+    eventually("CLAIM: the requested checkpoint never paused before its catalog commit: it was not fuzzy", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let (created, create) = {
+        let db = db.clone();
+        within_10s(move || db.connect().and_then(|t| t.fork_branch()).map(|y| y.into_id()).is_ok())
+    };
+    db.branch_checkpoint_hold(0);
+    create.join().unwrap();
+    let installed = checkpoint.join().unwrap();
+    assert_eq!(created, Ok(true), "a create waited for the requested checkpoint (a timeout) or failed");
+    assert!(matches!(installed, Ok(true)), "the requested checkpoint did not install: {installed:?}");
+    let after = db.branch_checkpoint_counters();
+    assert!(
+        after[0] > before[0] && after[1] > before[1],
+        "the requested checkpoint installed no fuzzy flight: counters {before:?} -> {after:?}"
+    );
+}
+
 /// Engine review 21 MED 4: the held-free upgrade's sync is the only step that makes a raised D0
 /// store's held frees safe to reuse, and nothing could fail it. With its sync failing
 /// (`UpgradeSyncFails`), the store fail-stops, and the slots it was to free stay held. Both stores.

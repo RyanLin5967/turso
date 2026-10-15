@@ -1494,6 +1494,17 @@ impl Database {
         self.branches.compact_now()
     }
 
+    /// A branch catalog checkpoint for a client that asks for one (a wire CHECKPOINT; wire review
+    /// 18 HIGH 3), which leaves the store mutex free while it writes, so no create, switch or
+    /// connect waits for it: a catalog store's fuzzy checkpoint, retried with back-off while one is
+    /// in flight, until `deadline`, then waited for. A store with no catalog compacts as
+    /// [`Database::branch_compact_now`] does. `Ok(true)`: a checkpoint installed; `Ok(false)`: none
+    /// did before the deadline. A fail-stopped store refuses.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_now(&self, deadline: std::time::Duration) -> Result<bool> {
+        self.branches.checkpoint_now(deadline)
+    }
+
     /// Catalog checkpoint and settle counters (r11-restart-r2 instrument): `[checkpoints
     /// installed, fuzzy flights started, store-mutex hold ns inside checkpoints (sum, max), writer
     /// ns without the mutex, catalog statements under the mutex, settle batches, settle loads, most

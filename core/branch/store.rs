@@ -7228,6 +7228,48 @@ impl BranchStore {
         self.compact(&mut inner, fail)
     }
 
+    /// A catalog checkpoint for a caller that asks for one (a wire CHECKPOINT; wire review 18 HIGH 3)
+    /// that leaves the store mutex free while it writes: a catalog store starts a FUZZY checkpoint
+    /// (`checkpoint_fuzzy_now`), and while none can start (one is in flight, or parked Commits remain
+    /// after a bounded settle batch) waits for the one in flight and tries again, backing off, until
+    /// `deadline`; then waits for its install. The sharp checkpoint (`compact_now`) held the store
+    /// mutex across the settle of every parked branch, the catalog write and its sync, the cut and
+    /// its directory fsync, so every create, switch and connect waited for it. A store with no
+    /// catalog, or in the splice arm (which takes no fuzzy checkpoint), compacts as `compact_now`
+    /// does. `Ok(true)`: a checkpoint installed; `Ok(false)`: none did before the deadline (the
+    /// caller's Busy). A fail-stopped store refuses rather than return `Ok(false)` for ever. Mutant
+    /// `checkpoint_now_sharp` (test builds only): `compact_now` for every store, as the wire did.
+    pub(crate) fn checkpoint_now(&self, deadline: Duration) -> Result<bool> {
+        let fuzzy = {
+            let inner = self.inner.lock();
+            inner.cat.is_some() && !inner.splice && !fe_mutant("checkpoint_now_sharp")
+        };
+        if !fuzzy {
+            self.compact_now()?;
+            return Ok(true);
+        }
+        let installed = || *self.installs.0.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if self.group.poisoned() {
+                return Err(group_poisoned());
+            }
+            let before = installed();
+            if self.checkpoint_fuzzy_now()? {
+                self.join_flights();
+                return Ok(installed() > before);
+            }
+            // One in flight covers state older than this call: wait for it, then start our own.
+            self.join_flights();
+            let Some(left) = deadline.checked_sub(started.elapsed()) else {
+                return Ok(false);
+            };
+            crate::thread::sleep(pause.min(left));
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
+    }
+
     pub(crate) fn log_path(&self) -> Option<PathBuf> {
         self.inner
             .lock()
