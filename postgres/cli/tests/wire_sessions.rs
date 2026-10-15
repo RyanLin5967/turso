@@ -2942,6 +2942,24 @@ fn a_short_positional_values_list_fills_the_leading_columns() {
     );
 }
 
+/// A domain over numeric or a float type takes a quoted value, as PostgreSQL's input function reads
+/// it (the regress corpus's domain.sql: `INSERT INTO basictest VALUES (..., '123.12')`). Since the
+/// float types are stored FLOAT4 / FLOAT8 (0e4a259fb) a domain's base became the engine's custom
+/// float8 type, which refused the text ("cannot store TEXT value in REAL column").
+#[test]
+fn a_domain_over_numeric_takes_a_quoted_value() {
+    let dir = Scratch::new("domainnumeric");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create domain dn numeric(8,2)").ok("dn");
+    a.q("create domain dd double precision").ok("dd");
+    a.q("create table bt (n dn, d dd)").ok("bt");
+    a.q("insert into bt values ('123.5', '2.5')").ok("quoted values");
+    let r = a.q("select n, d from bt").ok("rows");
+    assert_eq!(r.rows, vec![vec![t("123.5"), t("2.5")]]);
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
