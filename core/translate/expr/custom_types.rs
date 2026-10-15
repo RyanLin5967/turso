@@ -1941,6 +1941,45 @@ mod tests {
         assert!(bad.is_empty(), "CLAIM: a numeric typmod outside PostgreSQL's range was not refused as PostgreSQL refuses it: {bad:?}");
     }
 
+    /// Found while making numeric one bounded type (class (a), DECISIONS 994f7d41e0): a typmod
+    /// rescale TRUNCATED (bigdecimal's `with_scale` drops digits), where PostgreSQL rounds half away
+    /// from zero, and a value that rounds past the precision is PostgreSQL's 22003 "numeric field
+    /// overflow". PG 18.6's answers for this exact SQL (artie raw frontier/fastest/lanes/engine/raw/
+    /// pg18-numeric-typmod-round.txt b4512c63d5): 1.005, -1.005, 1.004, 2.675 into numeric(10, 2)
+    /// read 1.01, -1.01, 1.00, 2.68; CAST('-0.125' AS numeric(4, 2)) is -0.13; 99999999.995 into
+    /// numeric(10, 2) overflows; 99999999.994 reads 99999999.99.
+    #[test]
+    fn a_numeric_typmod_rounds_half_away_from_zero_as_postgresql_does() {
+        let mut bad = Vec::new();
+        let table = |rows: &str, read: &str| {
+            vec![
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT".to_string(),
+                format!("INSERT INTO r VALUES {rows}"),
+                read.to_string(),
+            ]
+        };
+        for (steps, want) in [
+            (table("(1, '1.005')", "SELECT CAST(x AS TEXT) FROM r"), Ok("1.01")),
+            (table("(1, '-1.005')", "SELECT CAST(x AS TEXT) FROM r"), Ok("-1.01")),
+            (table("(1, '1.004')", "SELECT CAST(x AS TEXT) FROM r"), Ok("1.00")),
+            (table("(1, '2.675')", "SELECT CAST(x AS TEXT) FROM r"), Ok("2.68")),
+            (table("(1, '99999999.994')", "SELECT CAST(x AS TEXT) FROM r"), Ok("99999999.99")),
+            (table("(1, '99999999.995')", "SELECT CAST(x AS TEXT) FROM r"), Err("numeric field overflow")),
+            (vec!["SELECT CAST(CAST('-0.125' AS numeric(4, 2)) AS TEXT)".to_string()], Ok("-0.13")),
+        ] {
+            let got = run_bounded(steps.clone());
+            let ok = match (&got, &want) {
+                (Ok(Some(v)), Ok(w)) => v == w,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("{:?} gave {got:?}, not PostgreSQL 18's {want:?}", &steps[1..]));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric typmod rounded or overflowed unlike PostgreSQL: {bad:?}");
+    }
+
     /// Review 0e8b1cf18..0a4a127a1 numeric MED 1 (DECISIONS d1a8dcb982): a product's scale was the sum
     /// of the display scales uncapped (PostgreSQL caps it at 16383), and add, sub and mul did not
     /// refuse a result past 131072 integer digits (PostgreSQL: 22003, "value overflows numeric
