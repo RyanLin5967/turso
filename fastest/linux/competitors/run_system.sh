@@ -555,7 +555,7 @@ server_fixture() {
 }
 # jf FILE KEY -> one key of a JSON file (empty when unreadable)
 jf() { python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null; }
-# cap_plants -- PG only, before the cells (lead review 62430d8bf..b49fb656a MED 5): the registered cap's code path on
+# cap_plants -- PG only, after the cells since comp review 1 LOW 25 (lead review 62430d8bf..b49fb656a MED 5): the registered cap's code path on
 # the real binary, which CI otherwise never reaches. Three closed-loop runs ended by --max-window-s 1 (ops of about 0,
 # 5 and 20 ms) must each exit 0 with capped: true and verdict "capped", and timedrun.py must put them in the tiers
 # complete (>= 1000 ok), p50_only (100-999) and failed (< 100). Then the warm-up rule of PREREG annex A23 (the macOS
@@ -776,7 +776,6 @@ server_main() {
   if [ "$KIND" = pg ]; then
     expect "PGDG postgresql-18 package" "$(awk '$1 == "postgresql-18" {print $2}' "$RAW/version.txt")" \
       "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
-    cap_plants
   fi
   no_plant_before_cells
   for spec in $SPECLIST; do
@@ -784,6 +783,8 @@ server_main() {
       run_server_cell "$spec" "$c"
     done
   done
+  # comp review 1 LOW 25: PG's cap, warm-up and claim-time plants run AFTER the measured cells, so none perturbs them
+  if [ "$KIND" = pg ]; then cap_plants; fi
 
   fun "## functional checks ($SYSTEM on $(findmnt -n -o FSTYPE -T "$MNT"))"
   # Every cell deleted what it created (HIGH 1), so the count is still LIVE0 here; the designated branches below are
@@ -858,12 +859,10 @@ designate_b1() {
   [ "$(printf '%s\n' "$f" | awk 'NF {n++} END {print n + 0}')" = 1 ] || { echo "not one branch file in $dir: [$f]"; return 1; }
   echo "$f"
 }
-b1_main() {
-  local cell spec op sync c n d rc total ok created bdir
-  DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/prebranch/... (the cells', LOW 20)
-  mkdir -p "$ROOT/branches"
-  # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
-  # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
+# b1_plants -- B1's test plants on the real binaries (comp review 1 LOW 25: run after the cells): the stream
+# plant and its held-copy control (MED 12, comp review 1 MED 11), clonebench's capped path (MED 5), the A23
+# warm-up and claim-time plants, and the delete-durability plants (LOW 22)
+b1_plants() {
   # MED 12 plant: a 1e6-row parent (about 114 MB of SQL) built under a virtual-memory limit must succeed, since the
   # stream is piped and never held (the old feed held it about three times over). Comp review 1 MED 11: the limit is
   # 120000 KB, about the SQL itself, so it refuses even ONE held copy (the control below); at 300000 KB it passed one
@@ -891,27 +890,6 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
   else
     fail "stream plant control: one held copy of the 1e6-row SQL under ulimit -v $mem_kb: rc $hrc, $(tail -1 "$RAW/plant-held-1e6.err") (want MemoryError: the limit cannot tell a held feed from a streamed one)"
   fi
-  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
-    tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
-  # MED 3: the parent as SQLite reads it back (count, sum, row hash), which fixture.py write below compares with what
-  # the generator wrote (gen_seed.facts; comp review 1 MED 10: no separate `gen_seed.py expect` pass)
-  local rb
-  rb=$(python3 -B "$HERE/gen_seed.py" readback-sqlite "$ROOT/parent.db")
-  echo "$rb" >"$RAW/readback.txt"
-  # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
-  # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
-  # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
-  if [ "$PREBRANCH" -gt 0 ]; then
-    mkdir -p "$ROOT/branches/prebranch"
-    # LOW 21: at PREBRANCH_C clients with --no-drain (exactly PREBRANCH ops), bounded by PREBRANCH_S, duration recorded
-    timeout "$((PREBRANCH_S + 300))" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" \
-      --dir "$ROOT/branches/prebranch" --clients "$PREBRANCH_C" --max-ops "$PREBRANCH" --rows "$ROWS" \
-      --max-window-s "$PREBRANCH_S" --no-drain --out "$RAW/prebranch" \
-      >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
-    fun "prebranch: $PREBRANCH branches at C=$PREBRANCH_C in $(jf "$RAW/prebranch/summary.json" window_s) s (bound ${PREBRANCH_S} s, capped $(jf "$RAW/prebranch/summary.json" capped))"
-  fi
-  LIVE0=$(count_branches)
-  expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"
   # MED 5: clonebench's capped path on the real binary (a d0 closed loop ended by --max-window-s 1, every branch
   # dropped): rc 0, capped: true, verdict "capped"; the tiers themselves are timedrun.py's (selftest; PG cap plants)
   local cpd="$RAW/plants/cap-b1" rcp=0
@@ -990,6 +968,34 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
     done
   done
   expect "delete plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
+}
+b1_main() {
+  local cell spec op sync c n d rc total ok created bdir
+  DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/prebranch/... (the cells', LOW 20)
+  mkdir -p "$ROOT/branches"
+  # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
+  # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
+  python3 "$HERE/fixture.py" sqlite "$ROOT/parent.db" --rows "$ROWS" --age "$AGE" --sqlite3 "$SQ3" --digest-dir "$RAW" |
+    tee "$RAW/mkparent.json" || { fail "parent (fixture.py sqlite)"; return; }
+  # MED 3: the parent as SQLite reads it back (count, sum, row hash), which fixture.py write below compares with what
+  # the generator wrote (gen_seed.facts; comp review 1 MED 10: no separate `gen_seed.py expect` pass)
+  local rb
+  rb=$(python3 -B "$HERE/gen_seed.py" readback-sqlite "$ROOT/parent.db")
+  echo "$rb" >"$RAW/readback.txt"
+  # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
+  # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
+  # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
+  if [ "$PREBRANCH" -gt 0 ]; then
+    mkdir -p "$ROOT/branches/prebranch"
+    # LOW 21: at PREBRANCH_C clients with --no-drain (exactly PREBRANCH ops), bounded by PREBRANCH_S, duration recorded
+    timeout "$((PREBRANCH_S + 300))" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" \
+      --dir "$ROOT/branches/prebranch" --clients "$PREBRANCH_C" --max-ops "$PREBRANCH" --rows "$ROWS" \
+      --max-window-s "$PREBRANCH_S" --no-drain --out "$RAW/prebranch" \
+      >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
+    fun "prebranch: $PREBRANCH branches at C=$PREBRANCH_C in $(jf "$RAW/prebranch/summary.json" window_s) s (bound ${PREBRANCH_S} s, capped $(jf "$RAW/prebranch/summary.json" capped))"
+  fi
+  LIVE0=$(count_branches)
+  expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"
   if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
@@ -1051,6 +1057,8 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
         "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
     done
   done
+  # comp review 1 LOW 25: the test plants run AFTER the measured cells, so none perturbs them
+  b1_plants
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
   expect "branch files after every cell (every create deleted: LIVE0)" "$(count_branches)" "$LIVE0"
   expect "isolation: parent count|sum(v)" "$("$SQ3" "$ROOT/parent.db" "SELECT count(*), sum(v) FROM t")" "$ROWS|$PSUM"
