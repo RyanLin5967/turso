@@ -3717,7 +3717,8 @@ mod tests {
 
     /// COMPAT: a column declared REAL before the FLOAT4 / FLOAT8 split (both real and double
     /// precision were stored REAL then; here, engine DDL with no translator) reads as PostgreSQL's
-    /// real, float4 (700), and a DOUBLE one as float8 (701) (lead ruling 2026-10-15T07:40:59Z).
+    /// real, float4 (700), and one declared FLOAT8, as double precision is stored now, as float8
+    /// (701) (lead ruling 2026-10-15T07:40:59Z).
     #[test]
     fn an_old_real_declaration_reads_as_float4() {
         let temp_dir = tempdir().unwrap();
@@ -3731,10 +3732,10 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE old_real (r_old REAL, d_old DOUBLE)")
+        conn.execute("CREATE TABLE old_real (r_old REAL, d_new FLOAT8)")
             .unwrap();
         let conn = crate::Connection::new(conn);
-        for (column, oid) in [("r_old", 700), ("d_old", 701)] {
+        for (column, oid) in [("r_old", 700), ("d_new", 701)] {
             let mut stmt = conn
                 .prepare(format!(
                     "SELECT atttypid FROM pg_attribute WHERE attname = '{column}'"
