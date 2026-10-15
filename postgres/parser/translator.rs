@@ -32,6 +32,10 @@ pub struct PostgreSQLTranslator {
     /// The columns a relation declares, by (schema, name), when the caller can tell
     /// ([`PostgreSQLTranslator::with_columns`]).
     columns: Option<Box<ColumnLookup>>,
+    /// The CTEs in scope, one list per statement with a WITH, innermost last: each CTE's name and
+    /// the names of its output columns when its query names them all. An unqualified FROM name a
+    /// CTE holds is the CTE, not a table of the same name.
+    cte_scopes: std::cell::RefCell<Vec<Vec<(String, Option<Vec<String>>)>>>,
 }
 
 /// A relation's declared columns by (schema, as written or empty; name), or None when they cannot
@@ -145,6 +149,45 @@ impl PostgreSQLTranslator {
             }
             _ => out.push((String::new(), None)),
         }
+    }
+
+    /// Run `f` with the CTEs of `with` in scope: an unqualified FROM name one of them holds is that
+    /// CTE (see `translate_range_var`).
+    fn in_cte_scope<T>(
+        &self,
+        with: &Option<pg_query::protobuf::WithClause>,
+        f: impl FnOnce() -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        use pg_query::protobuf::node::Node;
+        let Some(with) = with else {
+            return f();
+        };
+        let ctes = with
+            .ctes
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(Node::CommonTableExpr(cte)) => Some((cte.ctename.clone(), cte_columns(cte))),
+                _ => None,
+            })
+            .collect();
+        self.cte_scopes.borrow_mut().push(ctes);
+        let r = f();
+        self.cte_scopes.borrow_mut().pop();
+        r
+    }
+
+    /// Some(the CTE's output columns, when known) when `rv` names a CTE in scope; None when it
+    /// names a relation.
+    fn cte_in_scope(&self, rv: &pg_query::protobuf::RangeVar) -> Option<Option<Vec<String>>> {
+        if !rv.schemaname.is_empty() {
+            return None;
+        }
+        self.cte_scopes.borrow().iter().rev().find_map(|scope| {
+            scope
+                .iter()
+                .find(|(name, _)| *name == rv.relname)
+                .map(|(_, columns)| columns.clone())
+        })
     }
 
     /// Run `f` in a LATERAL scope of its own: one SELECT's FROM names and inlined LATERAL columns,
@@ -1561,6 +1604,13 @@ impl PostgreSQLTranslator {
         &self,
         insert: &pg_query::protobuf::InsertStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        self.in_cte_scope(&insert.with_clause, || self.translate_insert_in_scope(insert))
+    }
+
+    fn translate_insert_in_scope(
+        &self,
+        insert: &pg_query::protobuf::InsertStmt,
+    ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
 
         // Extract table name
@@ -1770,6 +1820,13 @@ impl PostgreSQLTranslator {
         &self,
         update: &pg_query::protobuf::UpdateStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        self.in_cte_scope(&update.with_clause, || self.translate_update_in_scope(update))
+    }
+
+    fn translate_update_in_scope(
+        &self,
+        update: &pg_query::protobuf::UpdateStmt,
+    ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
 
         // Extract table name
@@ -1891,6 +1948,13 @@ impl PostgreSQLTranslator {
         &self,
         delete: &pg_query::protobuf::DeleteStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        self.in_cte_scope(&delete.with_clause, || self.translate_delete_in_scope(delete))
+    }
+
+    fn translate_delete_in_scope(
+        &self,
+        delete: &pg_query::protobuf::DeleteStmt,
+    ) -> Result<ast::Stmt, ParseError> {
         // Extract table name
         let relation = delete
             .relation
@@ -2009,6 +2073,13 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_select(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Select, ParseError> {
+        self.in_cte_scope(&select.with_clause, || self.translate_select_in_scope(select))
+    }
+
+    fn translate_select_in_scope(
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
@@ -2429,17 +2500,30 @@ impl PostgreSQLTranslator {
         // An alias's column list (`t AS a (x, y)`) renames the relation's first columns: read as a
         // subselect naming each column anew, under the alias. It was dropped, and the columns kept
         // their own names (PG 18.6 recorded, pg18-join1.out).
+        // A CTE in scope is read by its own columns: the table of the same name's were read, so
+        // the subselect named columns the CTE does not have (ultrareview of fastest-wire, finding
+        // 8).
         if let Some(a) = range_var.alias.as_ref().filter(|a| !a.colnames.is_empty()) {
-            let declared = self
-                .columns
-                .as_ref()
-                .and_then(|lookup| lookup(&range_var.schemaname, &range_var.relname))
-                .ok_or_else(|| {
+            let declared = match self.cte_in_scope(range_var) {
+                Some(columns) => columns.ok_or_else(|| {
                     ParseError::ParseError(
-                        "a FROM alias column list is supported only on a table of the main schema"
+                        "a FROM alias column list on a CTE is supported only when the CTE names \
+                         each of its columns"
                             .into(),
                     )
-                })?;
+                })?,
+                None => self
+                    .columns
+                    .as_ref()
+                    .and_then(|lookup| lookup(&range_var.schemaname, &range_var.relname))
+                    .ok_or_else(|| {
+                        ParseError::ParseError(
+                            "a FROM alias column list is supported only on a table of the main \
+                             schema"
+                                .into(),
+                        )
+                    })?,
+            };
             if a.colnames.len() > declared.len() {
                 return Err(ParseError::ParseError(format!(
                     "table \"{}\" has {} columns available but {} columns specified",
@@ -6963,6 +7047,46 @@ fn default_in_every_row(lists: &[pg_query::protobuf::Node]) -> bool {
             )
         })
     })
+}
+
+
+/// A CTE's output column names, as the engine names them: its column list over its query's own
+/// names. None when its query has a column whose name the engine would derive from the
+/// expression (anything but a named target or a plain column reference), or a `*`.
+fn cte_columns(cte: &pg_query::protobuf::CommonTableExpr) -> Option<Vec<String>> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::SelectStmt(select)) = cte.ctequery.as_ref().and_then(|q| q.node.as_ref()) else {
+        return None;
+    };
+    let mut columns = cte_output_names(select)?;
+    rename_columns(&mut columns, &cte.aliascolnames);
+    Some(columns)
+}
+
+fn cte_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+    use pg_query::protobuf::node::Node;
+    if let Some(left) = &select.larg {
+        return cte_output_names(left);
+    }
+    select
+        .target_list
+        .iter()
+        .map(|target| {
+            let Some(Node::ResTarget(target)) = &target.node else {
+                return None;
+            };
+            if !target.name.is_empty() {
+                return Some(target.name.clone());
+            }
+            match target.val.as_ref().and_then(|v| v.node.as_ref()) {
+                Some(Node::ColumnRef(column)) => match column.fields.last()?.node.as_ref()? {
+                    Node::String(name) => Some(name.sval.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
