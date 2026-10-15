@@ -568,6 +568,32 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
     }
 }
 
+/// The delete arms MCTS-shaped workloads make (lead, 2026-10-15, after LEAP L4 slice 3): per round,
+/// two named trunk children (`older-i`, then `newer-i`) and a child of `newer-i` (`kid-i`, made on a
+/// connection of it), all checkpointed into the catalog, then measured: the delete of `older-i`, a
+/// trunk child OLDER than the trunk's newest catalog child (`delete_older`), and the delete of
+/// `kid-i`, a child of a branch (`delete_grandchild`). `newer-i` is dropped unmeasured.
+fn deletes(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut String) {
+    let trunk = db.connect().unwrap();
+    for i in 0..WARMUP + k {
+        trunk.create_branch(&format!("older-{i:04}")).unwrap();
+        trunk.create_branch(&format!("newer-{i:04}")).unwrap();
+        {
+            let newer = db.connect_named(&format!("newer-{i:04}")).unwrap();
+            newer.create_branch(&format!("kid-{i:04}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        let (_, s_older) = measure(db, base, || db.drop_branch(&format!("older-{i:04}")).unwrap());
+        let (_, s_kid) = measure(db, base, || db.drop_branch(&format!("kid-{i:04}")).unwrap());
+        db.drop_branch(&format!("newer-{i:04}")).unwrap();
+        if i >= WARMUP {
+            line(out, cell, "delete_older", i - WARMUP, &s_older);
+            line(out, cell, "delete_grandchild", i - WARMUP, &s_kid);
+        }
+    }
+}
+
 /// The growth arm: from `N_LARGE` live branches, `GROWTH` more named creates by 16 threads, each
 /// create's allocations counted on its own thread (exact however many run). One line per thread:
 /// its creates, the largest allocation bytes one create made under the store mutex and in all,
@@ -1920,10 +1946,10 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "exc_sharp" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "del_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
-            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -1956,6 +1982,8 @@ fn budget_child() {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
+        } else if spec.starts_with("del_") {
+            deletes(&spec, &db, base, k, &mut text);
         } else if spec.starts_with("ckpt") || spec == "exc_sharp" {
             checkpoints(&spec, &db, base, &mut text);
         } else if named {
@@ -4273,4 +4301,29 @@ fn open_free_probe_census() {
             s.cat_queries, s.free_probes, s.touched_slots, s.cat_rows_read, s.records
         );
     }
+}
+
+/// LEAP L4 for the deletes an MCTS-shaped workload makes (lead, 2026-10-15): the delete of a trunk
+/// child older than the trunk's newest catalog child, and of a child of a branch, each with every
+/// branch involved in the catalog, ask the catalog nothing, at 10 and at 10^4 live branches (cells
+/// `del_n10`, `del_n1e4`). Expected RED after slice 3, whose neighbour fact covers only a trunk child
+/// newer than every catalog child: these ask the catalog for their neighbours. WRITTEN, red first.
+#[test]
+fn leap_l4_an_older_or_a_grandchild_delete_asks_the_catalog_nothing() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["del_n10", "del_n1e4"] {
+        let c = cell(spec);
+        for op in ["delete_older", "delete_grandchild"] {
+            let samples = quiet(&c, op);
+            for (i, v) in values(&c, op, &samples, "catalog_queries").into_iter().enumerate() {
+                if v != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {v} catalog queries; budget 0");
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached for the MCTS deletes:\n{failures}");
 }
