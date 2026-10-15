@@ -330,6 +330,8 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    float4(value real)|real||||
+    float8(value real)|real||||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -364,6 +366,8 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    float4(value real)|real||||
+    float8(value real)|real||||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
