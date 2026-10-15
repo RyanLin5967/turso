@@ -200,6 +200,31 @@ def selftest():
         ok(f"a row with ok not 0 or 1 is refused (got {got})", isinstance(got, str))
         got = counts("empty", cb_head)
         ok(f"control: a header-only raw.tsv is (0, 0, 0), which the cell then refuses (got {got})", got == (0, 0, 0))
+    # comp review 1 LOW 19: a PG server log's template waits apart from the DROP's (both run CountOtherDBBackends): the
+    # CREATE's 'source database "p"' error and autovacuum terminations on p are the template's; the DROP's 'database
+    # "b_..."' error and terminations on a branch are the delete's; a termination naming no database (no %d, no
+    # CONTEXT) is unattributed and stays in the template flag. Known answers by hand, in PG's log format with
+    # log_line_prefix '%m [%p] %d ' (an autovacuum worker's %d may be empty: then its CONTEXT names the table)
+    pw = globals().get("pg_waits")
+    T = "2026-10-15 03:00:00.100 UTC"
+    log = "".join(f"{T} {ln}\n" for ln in (
+        "[2001] p FATAL:  terminating autovacuum process due to administrator command",
+        "[2002] b_r1_0_3 FATAL:  terminating autovacuum process due to administrator command",
+        "[2003] postgres ERROR:  source database \"p\" is being accessed by other users",
+        "[2003] postgres DETAIL:  There is 1 other session using the database.",
+        "[2004] postgres ERROR:  database \"b_r1_0_4\" is being accessed by other users",
+        "[2005]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2005]  CONTEXT:  automatic vacuum of table \"p.public.t\"",
+        "[2006]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2006]  CONTEXT:  automatic analyze of table \"b_r1_0_5.public.t\"",
+        "[2007]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2008] postgres LOG:  checkpoint complete"))
+    want = {"template_autovacuum_terminated": 2, "template_busy_errors": 1, "delete_autovacuum_terminated": 2,
+            "delete_busy_errors": 1, "unattributed_autovacuum_terminated": 1}
+    got = pw(log) if pw else "no pg_waits() in fthelp.py"
+    ok(f"pg_waits: template 2+1, delete 2+1, unattributed 1 (got {got})", got == want)
+    got = pw("") if pw else None
+    ok(f"pg_waits: an empty log is all zeros (got {got})", got == {k: 0 for k in want})
     print(f"fthelp selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
