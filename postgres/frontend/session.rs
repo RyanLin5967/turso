@@ -530,6 +530,14 @@ fn prepare_statement_checked(
     if describe && performs_at_prepare(&parse_result) {
         return Ok(None);
     }
+    // Everything below reads the schema the compile will use: the engine adopts the database's
+    // newest (another session's DDL) in compile_cmd, which comes last, so it is adopted here first.
+    // Read from the session's older snapshot, a CREATE TABLE's key precheck refused a parent another
+    // session had just made, every retry alike, since a refused precheck compiles nothing (wire
+    // review 16 item 10); DELETE ... USING's column lookup missed a column; and the parameter types
+    // were fixed stale at the first Describe, every later Execute refused 0A000 (wire review 18
+    // item 8). compile_cmd's own adoption then finds nothing new.
+    pg_conn.conn.maybe_update_schema();
     // A statement this prepare performs, or whose prerequisites it runs (a SERIAL column's
     // sequence), reads no parameter: one holding a $n is refused before anything of it runs,
     // 42P02 "there is no parameter $n" on both protocols, as PostgreSQL answers a utility
@@ -559,11 +567,6 @@ fn prepare_statement_checked(
         None
     };
     if let Some(types) = types.as_deref_mut() {
-        // The schema the compile below will use: it adopts the database's newest (another
-        // session's DDL) in compile_cmd, after this; read before that, the types came from the
-        // session's older snapshot, were fixed at the first Describe, and every later Execute was
-        // refused 0A000 against the schema it then saw (wire review 18 item 8).
-        pg_conn.conn.maybe_update_schema();
         let schema = pg_conn.conn.current_schema();
         types.columns = crate::result_types::aggregate_types(&parse_result, &schema);
         if !used.is_empty() {
