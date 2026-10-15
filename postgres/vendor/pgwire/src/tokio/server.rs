@@ -327,6 +327,25 @@ enum SslNegotiationType {
     Postgres,
     Direct,
     None,
+    /// A second SSLRequest or GSSENCRequest, refused with FATAL as PostgreSQL refuses it (vendored
+    /// change 10): the connection ends.
+    Repeated,
+}
+
+/// PostgreSQL's answer to a negotiation request after its kind was already answered: it reads it as
+/// a startup packet of protocol `code` (ProcessStartupPacket), FATAL 0A000. Recorded for SSL on
+/// PostgreSQL 18.6 (artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-ssl2.out); the GSS code's
+/// text is the same with its own number (1234.5680), from PostgreSQL's source: a GSSAPI-enabled
+/// build accepts GSS, so the repeat could not be recorded.
+fn repeated_negotiation(code: &str) -> PgWireBackendMessage {
+    PgWireBackendMessage::ErrorResponse(
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            "0A000".to_string(),
+            format!("unsupported frontend protocol {code}: server supports 3.0 to 3.2"),
+        )
+        .into(),
+    )
 }
 
 async fn check_ssl_direct_negotiation(tcp_socket: &TcpStream) -> Result<bool, io::Error> {
@@ -356,6 +375,10 @@ where
                 Some(Ok(PgWireFrontendMessage::SslNegotiation(
                     SslNegotiationMetaMessage::PostgresSsl(_),
                 ))) => {
+                    if ssl_done {
+                        socket.send(repeated_negotiation("1234.5679")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     // ssl request
                     if ssl_supported {
                         socket
@@ -381,6 +404,10 @@ where
                 Some(Ok(PgWireFrontendMessage::SslNegotiation(
                     SslNegotiationMetaMessage::PostgresGss(_),
                 ))) => {
+                    if gss_done {
+                        socket.send(repeated_negotiation("1234.5680")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     socket
                         .send(PgWireBackendMessage::GssEncResponse(GssEncResponse::Refuse))
                         .await?;
@@ -477,7 +504,9 @@ impl AsyncWrite for MaybeTls {
 /// reactor, so a session thread driven by a plain executor makes no kevent (vendored change 9).
 /// While `deadline` is set, every read waits only until it (SO_RCVTIMEO, re-armed per read), so a
 /// client that trickles bytes cannot stretch it; a read that reaches it reads as the stream's end,
-/// with `timed_out` set.
+/// with `timed_out` set. Every write waits only until it too (SO_SNDTIMEO, re-armed per write;
+/// vendored change 10, C37 H1): a write that reaches it fails TimedOut, with `timed_out` set, so a
+/// client that never reads cannot hold the thread in a blocking write.
 pub struct BlockingTcp {
     pub socket: std::net::TcpStream,
     pub deadline: Option<std::time::Instant>,
@@ -527,9 +556,29 @@ impl AsyncWrite for BlockingTcp {
     ) -> Poll<io::Result<usize>> {
         use std::io::Write;
         let this = self.get_mut();
+        let timed_out = |this: &mut Self| {
+            this.timed_out = true;
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the startup deadline passed while writing to the client",
+            )))
+        };
+        if let Some(deadline) = this.deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return timed_out(this);
+            }
+            this.socket.set_write_timeout(Some(left))?;
+        }
         loop {
             match this.socket.write(buf) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if this.deadline.is_some()
+                        && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    return timed_out(this)
+                }
                 r => return Poll::Ready(r),
             }
         }
@@ -608,6 +657,9 @@ pub async fn negotiate_tls<S>(
     let direct = check_ssl_direct_negotiation(tcp_socket.get_ref()).await?;
     let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some(), direct).await?;
 
+    if ssl == SslNegotiationType::Repeated {
+        return Ok(None);
+    }
     let old_parts = tcp_socket.into_parts();
 
     if ssl == SslNegotiationType::None {

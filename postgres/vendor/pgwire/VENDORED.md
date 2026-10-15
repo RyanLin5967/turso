@@ -81,3 +81,9 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    `negotiate_tls(.., None)` on such a socket. `peek_for_sslrequest` takes any IO and is told
    whether the first byte began a direct TLS handshake. The server runs each session on one with
    no runtime, so the session thread makes no kevent (L5 step 3(a), lead 2026-10-15).
+10. `tokio/server.rs` (C37 H1): `BlockingTcp`'s startup deadline bounds writes as well as reads
+    (SO_SNDTIMEO re-armed per write; a write that reaches it fails TimedOut and sets `timed_out`), and
+    `peek_for_sslrequest` refuses a second SSLRequest or GSSENCRequest on one connection with
+    FATAL 0A000 "unsupported frontend protocol 1234.5679 (or 1234.5680): server supports 3.0 to 3.2",
+    as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl2.out), and the connection
+    ends. It answered every repeat with 'N'.

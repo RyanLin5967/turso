@@ -741,7 +741,10 @@ async fn serve_session(
             warn!("session ended before startup: TLS negotiation failed: {}", e);
         })?;
     let Some(mut socket) = socket else {
-        warn!("session ended before startup: TLS negotiation returned no socket");
+        warn!(
+            "session ended before startup: a direct TLS handshake, or a repeated SSLRequest or \
+             GSSENCRequest (refused with FATAL 0A000)"
+        );
         return Ok(());
     };
     // The handlers by their concrete types: the session, and pgwire's no-op ones for COPY FROM
@@ -766,6 +769,7 @@ async fn serve_session(
             if let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_mut() {
                 io.deadline = None;
                 io.socket.set_read_timeout(None)?;
+                io.socket.set_write_timeout(None)?;
             }
         }
         let msg = {
