@@ -17,11 +17,17 @@ class is guessed.
 Whether a flush REACHES that drive is recorded beside it (review of e11a3c993, finding 3): a loop device turns a flush
 into an fsync of its backing file, and a filesystem mounted nobarrier (or barrier=0) on the way sends neither a flush
 nor FUA down. "mounts" lists the filesystem of MNT and of every backing file (findmnt TARGET, SOURCE, FSTYPE,
-OPTIONS); flush_reaches_drive is false when any of them has barriers off.
+OPTIONS). Comp review 1 LOW 13 (v3floor.c's walk and cross-check): every loop and dm layer's own write_cache is read
+("layers"; a write-through layer strips the flush), and each leaf's write_cache is checked against the drive's own
+cache report (NVMe Identify Controller VWC through the admin ioctl, sd's cache_type, virtio_blk's cache_type;
+disks[].drive_report): a disagreement is REFUSED (one of them was overridden). flush_reaches_drive is one of FLUSH:
+"yes", "no" (barriers off, or a write-through layer), "n/a: write-through" (a write-through leaf is sent no flush),
+"n/a: volatile RAM", or "unknown" (the drive's report was not read), with flush_why.
 
-  drive.py record MNT OUT.json  OUT.json = {"mnt", "chain", "disks", "drive_class", "mounts", "flush_reaches_drive"};
-                                prints one line "drive_class=C flush_reaches_drive=yes|no disks=NAME(model)[,...]
-                                chain=A>B... [barrier_off=TARGET(FSTYPE),...]"; exit 2 (no OUT) when refused
+  drive.py record MNT OUT.json  OUT.json = {"mnt", "chain", "disks", "drive_class", "layers", "mounts",
+                                "flush_reaches_drive", "flush_why"}; prints one line "drive_class=C
+                                flush_reaches_drive=F disks=NAME(model)[,...] chain=A>B... [barrier_off=...]" (F
+                                without spaces); exit 2 (no OUT) when refused
   drive.py selftest             known-answer fixtures over a fake sysfs tree; exit 0 only if every verdict is as expected
 """
 import json
@@ -39,6 +45,90 @@ RAM_DISK = re.compile(r"^(ram|zram)\d+$")
 
 class Undetermined(Exception):
     pass
+
+
+class Unread(Exception):
+    """The drive's own cache report could not be read (comp review 1 LOW 13): the flush is then 'unknown'."""
+
+
+# comp review 1 LOW 13: whether a flush reaches the drive. "n/a: write-through": the kernel sends a write-through leaf
+# no flush (it has nothing to drain); "unknown": the drive's own cache report was not read, so the kernel's
+# write_cache (and so the class) may be an override hiding a volatile cache
+FLUSH = ("yes", "no", "n/a: write-through", "n/a: volatile RAM", "unknown")
+NVME_IOCTL_ADMIN_CMD = 0xC0484E41  # _IOWR('N', 0x41, struct nvme_admin_cmd), 72 bytes
+
+
+def nvme_report(d):
+    """An NVMe leaf's own cache report, as v3floor.c's nvme_vwc reads it (fastest/linux/v3/v3floor.c, ported):
+    Identify Controller (opcode 06h, CNS 01h) through NVME_IOCTL_ADMIN_CMD on every controller of the namespace
+    (/dev/nvmeN; a multipath subsystem's every path), each over a pcie transport, VWC bit 0 = a volatile write cache is
+    PRESENT. Returns ("write back" | "write through", source); Unread when it cannot be read (the node unreadable, a
+    fabrics or loopback transport); Undetermined when the controllers disagree. Blind spot, as v3floor's: whether the
+    cache is ENABLED is Get Features 06h, which needs CAP_SYS_ADMIN."""
+    import ctypes
+    import fcntl
+    import struct
+    r = os.path.realpath(os.path.join(d, "device"))
+    b = os.path.basename(r)
+    if re.fullmatch(r"nvme\d+", b):
+        ctrls = [b]
+    elif b.startswith("nvme-subsys"):
+        ctrls = sorted(e for e in os.listdir(r) if re.fullmatch(r"nvme\d+", e))
+    else:
+        ctrls = []
+    if not ctrls:
+        raise Unread(f"cannot map {os.path.basename(d)} to an NVMe controller ({r})")
+    vwc = set()
+    for c in ctrls:
+        tr = read(f"/sys/class/nvme/{c}/transport")
+        if tr != "pcie":
+            raise Unread(f"NVMe controller {c} has transport {tr!r}, not pcie: not a local drive")
+        node = f"/dev/{c}"
+        try:
+            fd = os.open(node, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as e:
+            raise Unread(f"open {node}: {e.strerror} (Identify Controller is unprivileged once the node is readable)")
+        try:
+            buf = ctypes.create_string_buffer(4096)
+            cmd = bytearray(struct.pack("=BBHIIIQQII6III", 0x06, 0, 0, 0, 0, 0, 0, ctypes.addressof(buf), 0, 4096,
+                                        1, 0, 0, 0, 0, 0, 0, 0))
+            rc = fcntl.ioctl(fd, NVME_IOCTL_ADMIN_CMD, cmd, True)
+        except OSError as e:
+            raise Unread(f"Identify Controller on {node}: {e.strerror}")
+        finally:
+            os.close(fd)
+        if rc != 0:
+            raise Unread(f"Identify Controller on {node}: NVMe status {rc}")
+        vwc.add(buf.raw[525] & 1)
+    if len(vwc) != 1:
+        raise Undetermined(f"the controllers of {os.path.basename(d)} disagree on VWC")
+    return ("write back" if vwc.pop() else "write through"), f"NVMe Identify Controller VWC bit 0 via /dev/{ctrls[0]}"
+
+
+NVME_REPORT = nvme_report  # (the selftest puts fake_nvme here: no ioctl off a real NVMe)
+
+
+def drive_report(d, name):
+    """A leaf disk's own cache report, ("write back" | "write through", source), or Unread: NVMe through NVME_REPORT;
+    sd through device/scsi_disk/*/cache_type (the kernel's copy of the drive's MODE SENSE caching page at probe: a
+    blind spot against v3floor, which sends MODE SENSE itself through SG_IO; an override written to queue/write_cache
+    leaves it, so the cross-check still sees one); virtio_blk through its cache_type."""
+    if name.startswith("nvme"):
+        return NVME_REPORT(d)
+    sd = os.path.join(d, "device", "scsi_disk")
+    if os.path.isdir(sd):
+        cts = [c for c in (read(os.path.join(sd, e, "cache_type")) for e in sorted(os.listdir(sd))) if c]
+        if len(cts) != 1:
+            raise Unread(f"{len(cts)} cache_type files under {sd}")
+        if cts[0].startswith("write back"):
+            return "write back", f"sd cache_type {cts[0]!r}"
+        if cts[0] in ("write through", "none"):
+            return "write through", f"sd cache_type {cts[0]!r}"
+        raise Unread(f"cannot parse sd cache_type {cts[0]!r}")
+    ct = read(os.path.join(d, "cache_type"))
+    if ct in ("write back", "write through"):
+        return ct, "virtio_blk cache_type"
+    raise Unread(f"no cache report for {name}: not NVMe, sd or virtio_blk")
 
 
 def read(path):
@@ -99,6 +189,19 @@ def disk_record(d):
            "write_cache": read(os.path.join(d, "queue", "write_cache")),
            "fua": read(os.path.join(d, "queue", "fua")), "rotational": read(os.path.join(d, "queue", "rotational"))}
     rec["class"] = classify(rec["write_cache"], rec["fua"], rec["name"])
+    if rec["class"] == "ram-volatile":
+        rec["drive_report"] = None  # no drive
+        return rec
+    try:  # comp review 1 LOW 13: the drive's own report beside the kernel's write_cache (v3floor's cross-check)
+        rep, src = drive_report(d, rec["name"])
+    except Unread as e:
+        rec["drive_report"] = {"unread": str(e)}
+        return rec
+    rec["drive_report"] = {"cache": rep, "source": src}
+    if rep != rec["write_cache"]:
+        raise Undetermined(f"the leaf {rec['name']}'s kernel queue/write_cache says {rec['write_cache']!r} but the drive "
+                           f"reports {rep!r} ({src}): one of them was overridden, so whether a flush reaches the drive "
+                           f"cannot be determined")
     return rec
 
 
@@ -114,8 +217,19 @@ def classify(write_cache, fua, name="?"):
     raise Undetermined(f"disk {name}: write_cache {write_cache!r} fua {fua!r} is not a known class")
 
 
-def leaves(sysfs, majmin, devof, chain, backs, depth=0):
-    """The leaf disks under block device MAJMIN (appending each step to CHAIN, each loop's backing file to BACKS)."""
+def layer_wc(d, name, layers):
+    """A loop or device-mapper layer's own queue/write_cache, appended to LAYERS (comp review 1 LOW 13: a write-through
+    layer strips a flush before it reaches anything below it)."""
+    wc = read(os.path.join(d, "queue", "write_cache"))
+    if wc not in ("write back", "write through"):
+        raise Undetermined(f"layer {name}: queue/write_cache {wc!r} is neither write back nor write through")
+    layers.append({"name": name, "write_cache": wc})
+
+
+def leaves(sysfs, majmin, devof, chain, backs, layers=None, depth=0):
+    """The leaf disks under block device MAJMIN (appending each step to CHAIN, each loop's backing file to BACKS, each
+    loop or device-mapper layer's write_cache to LAYERS)."""
+    layers = [] if layers is None else layers
     if depth > MAX_DEPTH:
         raise Undetermined(f"device chain deeper than {MAX_DEPTH}: {'>'.join(chain)}")
     link = os.path.join(sysfs, "dev", "block", majmin)
@@ -131,25 +245,50 @@ def leaves(sysfs, majmin, devof, chain, backs, depth=0):
         back = read(os.path.join(d, "loop", "backing_file"))
         if not back:
             raise Undetermined(f"loop {name} has no backing file")
+        layer_wc(d, name, layers)
         chain.append(back)
         backs.append(back)
-        return leaves(sysfs, devof(back), devof, chain, backs, depth + 1)
+        return leaves(sysfs, devof(back), devof, chain, backs, layers, depth + 1)
     sl = os.path.join(d, "slaves")
     slaves = sorted(os.listdir(sl)) if os.path.isdir(sl) else []
     if slaves:
+        layer_wc(d, name, layers)
         out = []
         for s in slaves:
             mm = read(os.path.join(sl, s, "dev"))
             if not mm:
                 raise Undetermined(f"{name}: slave {s} has no dev")
-            out += leaves(sysfs, mm, devof, chain, backs, depth + 1)
+            out += leaves(sysfs, mm, devof, chain, backs, layers, depth + 1)
         return out
     return [disk_record(d)]
 
 
+def flush_verdict(cls, disks, layers, mounts):
+    """(flush_reaches_drive, why), one of FLUSH (comp review 1 LOW 13), in this order: a RAM disk has no drive; a
+    write-through leaf is sent no flush ('unknown' when its own report was not read: the write-through may be an
+    override hiding a cache); a filesystem with barriers off sends none down; a write-through loop or dm layer strips
+    it; an unread report leaves it unknown; else it reaches the drive."""
+    unread = [f"{x['name']}: {x['drive_report']['unread']}" for x in disks if "unread" in (x.get("drive_report") or {})]
+    off = [f"{m['target']}({m['fstype']})" for m in mounts if m["barrier_off"]]
+    wt = [x["name"] for x in layers if x["write_cache"] == "write through"]
+    if cls == "ram-volatile":
+        return "n/a: volatile RAM", "a RAM disk: nothing survives power, and there is no drive to flush"
+    if cls == "write-through" and unread:
+        return "unknown", f"write-through leaf whose own cache report was not read ({'; '.join(unread)})"
+    if cls == "write-through":
+        return "n/a: write-through", "the leaf is write-through, as its own report says: the kernel sends it no flush"
+    if off:
+        return "no", f"barriers off on {', '.join(off)}: no flush or FUA is sent down"
+    if wt:
+        return "no", f"write-through layer {', '.join(wt)}: the kernel strips the flush there"
+    if unread:
+        return "unknown", f"the drive's own cache report was not read ({'; '.join(unread)})"
+    return "yes", "every layer is write-back, barriers are on, and the drive's own report agrees with its leaf"
+
+
 def resolve(mnt, sysfs="/sys", devof=dev_of, mountof=mount_of):
-    chain, backs = [], []
-    disks = leaves(sysfs, devof(mnt), devof, chain, backs)
+    chain, backs, layers = [], [], []
+    disks = leaves(sysfs, devof(mnt), devof, chain, backs, layers)
     classes = sorted({x["class"] for x in disks})
     if len(classes) != 1:
         raise Undetermined(f"leaf disks of different classes: {[(x['name'], x['class']) for x in disks]}")
@@ -159,13 +298,14 @@ def resolve(mnt, sysfs="/sys", devof=dev_of, mountof=mount_of):
         m["path"] = p
         m["barrier_off"] = barrier_off(m["options"])
         mounts.append(m)
-    return {"mnt": mnt, "chain": chain, "disks": disks, "drive_class": classes[0], "mounts": mounts,
-            "flush_reaches_drive": not any(m["barrier_off"] for m in mounts)}
+    flush, why = flush_verdict(classes[0], disks, layers, mounts)
+    return {"mnt": mnt, "chain": chain, "disks": disks, "drive_class": classes[0], "layers": layers, "mounts": mounts,
+            "flush_reaches_drive": flush, "flush_why": why}
 
 
 def summary(r):
     off = [f"{m['target']}({m['fstype']})" for m in r["mounts"] if m["barrier_off"]]
-    return (f"drive_class={r['drive_class']} flush_reaches_drive={'yes' if r['flush_reaches_drive'] else 'no'} disks=" +
+    return (f"drive_class={r['drive_class']} flush_reaches_drive={r['flush_reaches_drive'].replace(' ', '')} disks=" +
             ",".join(f"{x['name']}({x['model']})" for x in r["disks"]) + " chain=" + ">".join(r["chain"]) +
             (" barrier_off=" + ",".join(off) if off else ""))
 
@@ -236,10 +376,6 @@ def fake_nvme(disk_dir):
     if v in ("0", "1"):
         return ("write back" if v == "1" else "write through"), "fake Identify Controller VWC bit 0"
     raise Unread(v[len("unreadable: "):] if v and v.startswith("unreadable: ") else f"no fake VWC under {disk_dir}")
-
-
-class Unread(Exception):  # (the selftest's fake raises it; defined here so the red's fixtures run at its base)
-    pass
 
 
 def selftest():

@@ -257,18 +257,18 @@ def main(argv):
     bad += 1 if fwhy else 0
     # The drive class each job ran on (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3): run/drive.json from
     # drive.py, which run_system.sh writes before any cell; a present job without a readable one is not a pass.
-    # A class outside drive.CLASSES, or no flush_reaches_drive boolean, is not a record (review of e11a3c993, findings
-    # 3 and 11).
+    # A class outside drive.CLASSES, or a flush_reaches_drive outside drive.FLUSH, is not a record (review of e11a3c993,
+    # findings 3 and 11; comp review 1 LOW 13 made it "yes", "no", "n/a: ..." or "unknown", no longer a boolean).
     print("DRIVES\tartifact\tdrive_class\tflush_reaches_drive\tdisks\tchain")
     for name in names:
         if name not in present:
             continue
         try:
             dj = json.load(open(os.path.join(d, name, "run", "drive.json")))
-            if dj["drive_class"] not in drive.CLASSES or not isinstance(dj["flush_reaches_drive"], bool):
+            if dj["drive_class"] not in drive.CLASSES or dj["flush_reaches_drive"] not in drive.FLUSH:
                 raise ValueError(f"drive_class {dj['drive_class']!r}, flush_reaches_drive "
                                  f"{dj['flush_reaches_drive']!r}")
-            row = [dj["drive_class"], "yes" if dj["flush_reaches_drive"] else "no",
+            row = [dj["drive_class"], dj["flush_reaches_drive"],
                    ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
         except (OSError, ValueError, KeyError, TypeError) as e:
             print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__}: {e})")
