@@ -825,7 +825,7 @@ designate_b1() {
 }
 b1_main() {
   local cell spec op sync c n d rc total ok created bdir
-  DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/<cell>/...
+  DATA="$ROOT"  # stracecount classes are relative to ROOT: parent.db, branches/prebranch/... (the cells', LOW 20)
   mkdir -p "$ROOT/branches"
   # The parent from gen_seed.py like every other system (gate-6 review, t3run item 4: clonebench mkparent wrote its own
   # table and pad), through the pinned sqlite3: WAL, the SQL, the aging, a TRUNCATE checkpoint.
@@ -943,7 +943,9 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
       n=$(nops "$c")
       d="$RAW/cells/b1-$spec-c$c"
       over_budget "$d" "b1-$spec-c$c" && continue  # LOW 14
-      bdir="$ROOT/branches/$spec-c$c"
+      # LOW 20: both runs create in the prebranch directory, among its PREBRANCH live branches (clonebench names each
+      # branch b_<run tag>_<client>_<seq>.db with a per-run tag, so a cell's names never meet the prebranch's)
+      bdir="$ROOT/branches/prebranch"
       mkdir -p "$d" "$bdir"
       echo "=== b1 $spec C=$c N=$n"
       rc=0
@@ -968,20 +970,19 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
         --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" >"$d/cell.json"
       judge_cell "$d"
       python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/cycle', p.get('flushes'), 'create/op(C=1)', p.get('create'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
-      expect "b1-$spec-c$c branch files left (every created branch deleted)" \
-        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" 0
-      # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
-      # t3run item 2): the only latency file of the cell is timed/raw.tsv.
-      mkdir -p "$bdir.timed"
+      expect "b1-$spec-c$c branch files after the labelling run (every created branch deleted: the $PREBRANCH remain)" \
+        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
+      # The TIMED run: the identical clonebench command, untraced (gate-6 review, t3run item 2), in the same directory
+      # (LOW 20): the only latency file of the cell is timed/raw.tsv.
       expect "b1-$spec-c$c timed run creates where the $PREBRANCH live branches are (LOW 20)" \
-        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
+        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
       live_mark "$d" timed_before
-      cb_args "$op" "$sync" "$bdir.timed" "$c" "$n" "$d/timed"
+      cb_args "$op" "$sync" "$bdir" "$c" "$n" "$d/timed"
       timed_run "$d/timed" "" -- "${CBA[@]}" >/dev/null || true
       live_mark "$d" timed_after
       timedrun_check "$d" "$n" "b1-$spec-c$c"
-      expect "b1-$spec-c$c timed run branch files left (every created branch deleted)" \
-        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" 0
+      expect "b1-$spec-c$c branch files after the timed run (every created branch deleted: the $PREBRANCH remain)" \
+        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
     done
   done
   fun "## functional checks (b1 on $(findmnt -n -o FSTYPE -T "$MNT"))"
