@@ -3273,6 +3273,17 @@ impl Confirm {
         self.lsn > held.lsn || (self.lsn == held.lsn && self.proved && !held.proved)
     }
 
+    /// `supersedes`, against a confirmation known by its `key` (0: none).
+    pub(crate) fn supersedes_key(&self, key: u64) -> bool {
+        key == 0 || self.key() > key
+    }
+
+    /// `(lsn, proved)` as one number that orders as `supersedes` does: a later flight, or the same
+    /// flight proved where it was not. Never 0 (`supersedes_key`'s none).
+    pub(crate) fn key(&self) -> u64 {
+        (self.lsn.saturating_mul(2) | u64::from(self.proved)).saturating_add(1)
+    }
+
     /// A trunk commit's WAL F_FULLFSYNC on the branch files' device returned, issued once every
     /// journal byte below `frontier` was synced or ordered (`BranchStore::trunk_wal_synced`): it
     /// drained the device after this flight's own sync or barrier returned, so its word may now be
