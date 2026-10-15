@@ -80,7 +80,7 @@ seed)
   # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
   # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
   gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
-  gc_log0=$(stat -c %s "$LOG")
+  gc_log0=$(file_size "$LOG")
   gcrc=0
   my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
   tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"

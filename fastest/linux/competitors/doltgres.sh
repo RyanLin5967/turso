@@ -82,7 +82,7 @@ seed)
   # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
   # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
   gc_before=$(du -sB1 "$DATA/databases" | cut -f1)
-  gc_log0=$(stat -c %s "$LOG")
+  gc_log0=$(file_size "$LOG")
   gcrc=0
   psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
   tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
