@@ -262,7 +262,7 @@ pub fn parameter_types(
 /// k times was parsed k times (2^depth for a view joining the one before it twice; wire review 14
 /// item 10). Keyed by the snapshot itself, the Arc the connection hands out until DDL replaces it,
 /// which the cache holds so that it cannot be mistaken for a later one; a view read where the walk
-/// was cut (a cycle, the depth bound) is not kept.
+/// was cut (a cycle) is not kept.
 #[derive(Default)]
 pub struct ViewCache {
     schema: Option<std::sync::Arc<Schema>>,
@@ -393,8 +393,8 @@ struct Infer<'a> {
     search_path: Vec<String>,
     /// The views read so far for this snapshot ([`ViewCache`]), shared with every nested walk.
     view_memo: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
-    /// How many times a view was cut (a cycle, the depth bound), shared with every nested walk: a
-    /// view whose reading saw a cut is not memoised for the snapshot.
+    /// How many times a view was cut (a cycle), shared with every nested walk: a view whose
+    /// reading saw a cut is not memoised for the snapshot.
     cuts: std::rc::Rc<std::cell::Cell<usize>>,
     /// The views whose reading saw a cut, for this statement's walk only, shared with every nested
     /// walk ([`Infer::view_columns`]).
@@ -407,9 +407,11 @@ struct Infer<'a> {
     missing_rte: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
-/// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
-/// open.
-const MAX_VIEW_DEPTH: usize = 32;
+/// The stack a view's reading starts with, and the stack grown for it when less is left: each view
+/// inside a view is a level of the walk's recursion, so a chain of any depth is read on stacks
+/// grown as it goes, not cut, and never overflows the session thread's ([`Infer::view_columns`]).
+const VIEW_RED_ZONE: usize = 100 * 1024;
+const VIEW_STACK: usize = 1024 * 1024;
 
 /// The parameter number of a bare `$n`.
 fn param(node: &PgNode) -> Option<u32> {
@@ -740,17 +742,19 @@ impl Infer<'_> {
 
     /// A view's columns, typed by walking its query (stored as SQL text) as a statement of its own:
     /// the query sees no enclosing scope and none of this statement's CTEs. None for no view of
-    /// that name, one whose text does not parse as a view, one already being opened (a circular
-    /// view) and one nested past MAX_VIEW_DEPTH: the relation is then one the walk cannot open, and
-    /// a parameter compared with its columns fails closed (42P18 unless declared). A view was not
-    /// opened at all, so a parameter compared with its count(*) column fell to the text fallback,
-    /// and rows went missing (wire review 11 item 3); then a circular view recursed until the
-    /// session thread's stack overflowed, which aborts the process, every session with it, before
-    /// the engine's own "circularly defined" refusal could run (wire review 14 item 1).
+    /// that name, one whose text does not parse as a view, and one already being opened (a
+    /// circular view): the relation is then one the walk cannot open, and a parameter compared with
+    /// its columns fails closed (42P18 unless declared). A view was not opened at all, so a
+    /// parameter compared with its count(*) column fell to the text fallback, and rows went missing
+    /// (wire review 11 item 3); then a circular view recursed until the session thread's stack
+    /// overflowed, which aborts the process, every session with it, before the engine's own
+    /// "circularly defined" refusal could run (wire review 14 item 1). A view nested 32 deep was
+    /// cut too, against the stack, so whether a parameter over a deep chain was typed depended on
+    /// which of its views earlier statements had memoised (wire review 18 item 14): the cycle cut
+    /// bounds the depth by the views in the schema, and each reading runs on a stack grown when
+    /// less than VIEW_RED_ZONE is left.
     fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
-        if self.views.len() >= MAX_VIEW_DEPTH
-            || self.views.iter().any(|v| v.eq_ignore_ascii_case(relname))
-        {
+        if self.views.iter().any(|v| v.eq_ignore_ascii_case(relname)) {
             self.cuts.set(self.cuts.get() + 1);
             return None;
         }
@@ -759,19 +763,19 @@ impl Infer<'_> {
             return columns.clone();
         }
         // A view read with a cut is kept for this statement: a view sees a cut only inside a cycle
-        // through it, which any later reading of it meets too, or past the depth bound, where a
-        // shallower reading might not; either way its columns are fail-closed (whatever a cut
-        // relation held is unknown), so reusing them can only refuse more. Its reader counts the
-        // cut, so nothing read from it reaches the snapshot's memo. Not kept, every sibling FROM
-        // item read its view again: about e*(k-1)! parses for k views that each list all k (wire
-        // review 16 item 3).
+        // through it, which any later reading of it meets too; its columns are fail-closed
+        // (whatever a cut relation held is unknown), so reusing them can only refuse more. Its
+        // reader counts the cut, so nothing read from it reaches the snapshot's memo. Not kept,
+        // every sibling FROM item read its view again: about e*(k-1)! parses for k views that each
+        // list all k (wire review 16 item 3).
         if let Some(columns) = self.cut_views.borrow().get(&key) {
             self.cuts.set(self.cuts.get() + 1);
             return columns.clone();
         }
         let view = self.schema.get_view(relname)?;
         let cuts = self.cuts.get();
-        let columns = self.read_view(&view, relname);
+        let columns =
+            stacker::maybe_grow(VIEW_RED_ZONE, VIEW_STACK, || self.read_view(&view, relname));
         let memo = if self.cuts.get() == cuts {
             &self.view_memo
         } else {
