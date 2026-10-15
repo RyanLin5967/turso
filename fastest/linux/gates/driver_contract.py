@@ -188,6 +188,8 @@ def self_test():
                         "secs": round(st + dr, 3), "capped": capped}, "windows": wins}
         if ready is not None:
             r["warmup"]["t0_after_ready_ns"] = ready
+        # TEST EDIT, flagged: the driver's own TracerPid at the measured span's open and close (0: untraced)
+        r["tracerpid_tm0"] = r["tracerpid_tm1"] = 0
         for k, v, x in (("tm0_realtime_s", tm[0], 0), ("tm1_realtime_s", tm[1], -1)):
             if v == "auto":
                 v = wins[x]["t0_realtime_s" if x == 0 else "t1_realtime_s"] if wins else None
@@ -289,6 +291,13 @@ def self_test():
          check(rec(wins=[W0 | {"exception_counters": {"before": EC["before"],
                                                       "after": EC["after"] | {"compaction_waits": 9}}}]), 33, 4,
                "1000000:0:2") == []),
+        # the driver records its own TracerPid at the measured span's open and close (/proc/self/status, as bbload's
+        # tracerpid_tm0/tm1): an int, or null where the platform has no /proc (summarize, for T3, requires 0)
+        ("tracerpid: no tracerpid_tm0 fails", check({k: v for k, v in rec().items() if k != "tracerpid_tm0"}, 33, 4,
+                                                    "1000000:0:2") != []),
+        ("tracerpid: tracerpid_tm1 as a string fails", check(rec() | {"tracerpid_tm1": "0"}, 33, 4, "1000000:0:2") != []),
+        ("tracerpid: null on a platform without /proc keeps the contract",
+         check(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, 33, 4, "1000000:0:2") == []),
         # fresh read of 7a8c3a817..0802dd739, finding 2: the live record shares warm_ends with the replay, so replaying it
         # alone can only catch a claim-handling split; it must also be the run's own warm-up (summary.json warmup):
         # one claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, its last claim at stop_secs, capped
