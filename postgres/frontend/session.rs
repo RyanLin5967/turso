@@ -901,21 +901,43 @@ fn prepare_statement_checked(
     // lookup refuses one. An INSERT whose VALUES lists, with no column list, hold DEFAULT names its
     // positions from the in-memory schema alone (no catalog query). No other statement pays for a
     // lookup.
-    let translator = if is_delete_using(sql, &parse_result) {
-        let pg_conn = pg_conn.clone();
-        PostgreSQLTranslator::new()
-            .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
-    } else if is_positional_insert_default(sql, &parse_result) || has_alias_column_list(&parse_result)
-    {
-        let pg_conn = pg_conn.clone();
-        PostgreSQLTranslator::new()
-            .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
-    } else {
-        PostgreSQLTranslator::new()
+    let translator = || {
+        if is_delete_using(sql, &parse_result) {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
+        } else if is_positional_insert_default(sql, &parse_result)
+            || has_alias_column_list(&parse_result)
+        {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
+        } else {
+            PostgreSQLTranslator::new()
+        }
     };
-    let translated = translator
+    let first = translator();
+    let mut translated = first
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
+    // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
+    // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
+    // a statement that casts to such a name.
+    let unmapped = first.unmapped_cast_types();
+    if !unmapped.is_empty() {
+        let schema = pg_conn.conn.current_schema();
+        let known: std::collections::HashSet<String> = unmapped
+            .into_iter()
+            .filter(|name| schema.get_type_def_unchecked(name).is_some())
+            .collect();
+        if !known.is_empty() {
+            translated = translator()
+                .with_known_types(known)
+                .translate_with_prereqs(&parse_result)
+                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        }
+    }
     reject_catalog_dml(translated.cmd.stmt())?;
     drop(translating);
     // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) is performed below, keys

@@ -36,6 +36,15 @@ pub struct PostgreSQLTranslator {
     /// the names of its output columns when its query names them all. An unqualified FROM name a
     /// CTE holds is the CTE, not a table of the same name.
     cte_scopes: std::cell::RefCell<Vec<CteScope>>,
+    /// The cast targets the caller knows to be the engine's own types (domains, custom types),
+    /// lowercased ([`PostgreSQLTranslator::with_known_types`]): a cast to one is kept by name, so
+    /// the engine runs its checks.
+    known_types: Option<std::collections::HashSet<String>>,
+    /// The cast targets this translation met that are neither built-in nor known, lowercased, for
+    /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
+    /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
+    /// class's PG 18.6 replay, 2026-10-15).
+    unmapped_casts: std::cell::RefCell<Vec<String>>,
 }
 
 /// One WITH's CTEs: each name, with its output columns when its query names them all.
@@ -81,6 +90,20 @@ impl PostgreSQLTranslator {
     ) -> Self {
         self.columns = Some(Box::new(lookup));
         self
+    }
+
+    /// The translator, keeping a cast to any of `names` (the engine's own types, lowercased) by
+    /// its name, so the engine runs the type's checks and coercion.
+    pub fn with_known_types(mut self, names: std::collections::HashSet<String>) -> Self {
+        self.known_types = Some(names);
+        self
+    }
+
+    /// The cast targets the last translation met that are neither built-in nor in
+    /// [`PostgreSQLTranslator::with_known_types`]'s set: a caller that knows the engine's types
+    /// translates again with the ones it knows.
+    pub fn unmapped_cast_types(&self) -> Vec<String> {
+        self.unmapped_casts.borrow().clone()
     }
 
     /// The columns `rv` declares, renamed by its alias's column list; None when they cannot be
@@ -3390,10 +3413,10 @@ impl PostgreSQLTranslator {
                     }
                 }
                 let expr = Box::new(self.translate_expr(arg)?);
-                let type_name = type_cast
-                    .type_name
-                    .as_ref()
-                    .and_then(pg_type_name_to_ast_type);
+                let type_name = match type_cast.type_name.as_ref() {
+                    Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
+                    None => None,
+                };
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -5713,6 +5736,28 @@ fn decimal_numeric_literal(text: &str) -> String {
                 .fold(0f64, |acc, d| acc * f64::from(radix) + f64::from(d));
             format!("{sign}{v:e}")
         }
+    }
+}
+
+impl PostgreSQLTranslator {
+    /// A cast target that is not built-in: the engine's own type by its name when the caller said
+    /// it is one, else None (the cast is left to the operand's own type, as before), recorded for
+    /// the caller's lookup.
+    fn engine_type(&self, t: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+        use pg_query::protobuf::node::Node;
+        let name = t.names.iter().rev().find_map(|n| match &n.node {
+            Some(Node::String(s)) if s.sval != "pg_catalog" => Some(s.sval.to_lowercase()),
+            _ => None,
+        })?;
+        if self.known_types.as_ref().is_some_and(|k| k.contains(&name)) {
+            return Some(ast::Type {
+                name,
+                size: None,
+                array_dimensions: 0,
+            });
+        }
+        self.unmapped_casts.borrow_mut().push(name);
+        None
     }
 }
 
