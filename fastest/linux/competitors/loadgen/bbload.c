@@ -533,11 +533,24 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
 
 /* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
 static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
-    int s = -1, rc = 0;
-    if (x->pg) { int fd = PQsocket(x->pg); if (fd >= 0) s = dup(fd); PQfinish(x->pg); }
-    if (x->my) { int fd = (int)mysql_get_socket(x->my); if (fd >= 0) s = dup(fd); mysql_close(x->my); }
+    int s = -1, rc = 0, dup_errno = 0;
+    if (x->pg) {
+        int fd = PQsocket(x->pg);
+        if (fd >= 0 && (s = dup(fd)) < 0) dup_errno = errno;
+        PQfinish(x->pg);
+    }
+    if (x->my) {
+        int fd = (int)mysql_get_socket(x->my);
+        if (fd >= 0 && (s = dup(fd)) < 0) dup_errno = errno;
+        mysql_close(x->my);
+    }
     x->pg = NULL;
     x->my = NULL;
+    if (dup_errno) {
+        if (s >= 0) close(s);
+        snprintf(why, wsz, "close: dup: %s", strerror(dup_errno));
+        return -1;
+    }
     if (s < 0) return 0;
     uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     char b[512];
