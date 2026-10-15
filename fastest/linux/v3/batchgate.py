@@ -509,10 +509,12 @@ def post(out, cell, sha, mode, verdict_path):
             # V3 review 12 item 7: check.py's nosync25 rule, here too: nosync25 syncs nothing by definition, so its
             # windows hold no sync attributed to it (a nosync25 that owns an fd and syncs on it shows here only:
             # foreign_fd is then 0)
+            # V3 review 13 item 15: keyed on the batch having run nosync25, as check.py's rule is: a MISSING record (or
+            # a missing count) VOIDs like a non-zero one (it passed here, where check.py failed it)
             n0 = sarms.get("nosync25")
-            if isinstance(n0, dict) and n0.get("syncs") != 0:
+            if "nosync25" in (sj.get("arms") or {}) and (not isinstance(n0, dict) or n0.get("syncs") != 0):
                 voids.append("fsync: nosync25's windows hold %r sync(s) by the probe (it owns no fd by definition)"
-                             % (n0.get("syncs"),))
+                             % (n0.get("syncs") if isinstance(n0, dict) else "no record",))
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
             if ua.get("foreign_fd") != 0:
                 voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd)"
