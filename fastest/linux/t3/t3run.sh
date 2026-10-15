@@ -18,8 +18,10 @@
 #              the fire-check's statfs shim
 #   envchecks  firecheck.sh's environment with t3run's V3ENV, positive and negative (needs the build), and the
 #              three drivers' warm-up decision against PREREG annex A23 (gates/warmup_conformance.py run on the
-#              built bbload, clonebench and fastest_profile: all three must match every case, rc 0; fourth lane
-#              review LOW 14: a run whose drivers disagree on the warm-up is not creditable for it)
+#              built bbload, clonebench and fastest_profile: each one's --warmup-replay path must match every case,
+#              rc 0; fourth lane review LOW 14). That is the replay path only: the live loops' warm-ups are compared
+#              by live_check once the drivers record them (review 5 MED 8, LOUD-OWED; review 6 LOW 17), so rc 0 here
+#              does not yet mean an equal warm-up in the credited runs
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
@@ -205,6 +207,13 @@ preflight() {
   head=$(git -C "$SRC" rev-parse HEAD) || { echo "REFUSED: $SRC is not a git checkout"; return 2; }
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
+  # each driver's source has the --warmup-replay path envchecks runs, so a SHA without a port refuses here, not after
+  # deps and up to 2 h of build (review 6 LOW 18; envchecks stays the behavioural check)
+  for f in fastest/linux/competitors/loadgen/bbload.c fastest/linux/competitors/baselines/clonebench.c \
+           core/examples/fastest_profile/main.rs; do
+    git -C "$SRC" grep -q -F -e --warmup-replay "$head" -- "$f" ||
+      { echo "REFUSED: $f at $head has no --warmup-replay: envchecks' A23 conformance would fail after the build"; return 2; }
+  done
   # the WHOLE tree (lane review LOW 8: a modified core/ would be built and recorded as sha=$SHA)
   dirty=$(git -C "$SRC" status --porcelain --untracked-files=all)
   [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head: $(echo "$dirty" | head -5)"; return 2; }
@@ -692,12 +701,16 @@ stage hwid hwid
 stage v3fixtures v3fixtures
 # The checks that need the build (the V3 binaries): firecheck.sh's environment, positive and negative
 # the warm-up rule is one rule across the three drivers this run built (PREREG annex A23; fourth lane review LOW 14):
-# each replays its own live decision on the shared cases, and anything but rc 0 (all three, every case) fails the stage
+# each one's --warmup-replay path runs the shared cases, and anything but rc 0 (all three, every case) fails the
+# stage. The replay path only (review 6 LOW 17): the live loops are not compared here, and the record says so
 warmup_conformance() {
   local rc=0
   timeout 300 python3 -B "$L/gates/warmup_conformance.py" run --bbload "$DIST/bbload" --clonebench "$DIST/clonebench" \
     --fastest-profile "$DIST/fastest_profile" --record "$OUT/warmup-conformance.json" > "$OUT/warmup-conformance.txt" 2>&1 ||
     rc=$?
+  echo "LOUD-OWED: this compares each driver's --warmup-replay path only; the live loops' warm-ups are not compared" \
+    "until the drivers record them for live_check (review 5 MED 8: fastest_profile's ready/go barrier, the Linux ports'" \
+    "live records)" >> "$OUT/warmup-conformance.txt"
   [ $rc = 0 ] || { tail -5 "$OUT/warmup-conformance.txt"; echo "envchecks: warm-up conformance rc $rc, want 0"; return 1; }
 }
 envchecks() { fcenv_check && warmup_conformance; }
