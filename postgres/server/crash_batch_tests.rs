@@ -70,11 +70,14 @@ fn alive(s: &Session) {
 }
 
 /// Views nested 90 deep: planning the outermost overflowed the stack in
-/// `translate::planner::parse_table` (raw artie lanes/wire/raw/loud-20261015/viewchain-probe). It
-/// must be refused as PostgreSQL's stack depth limit (54001), at whichever statement first plans
-/// the whole chain, and a shallow chain must still answer.
+/// `translate::planner::parse_table` (raw artie lanes/wire/raw/loud-20261015/viewchain-probe). The
+/// bound is the stack (lead, 2026-10-15, as PostgreSQL's): the chain either answers or is refused
+/// 54001 (a debug build refuses it at 8 MiB; a release build, with smaller frames, may answer), at
+/// whichever statement first plans too deep, and never overflows. A shallow chain still answers.
+/// FLAGGED SPEC CHANGE (ruled): it read "must be refused" under the fixed 32-deep cap; the depth
+/// sweep (`every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`) is its oracle.
 #[test]
-fn a_ninety_view_chain_is_refused_with_54001() {
+fn a_ninety_view_chain_answers_or_is_refused_with_54001() {
     on_session(|s| {
         ok(s, "CREATE TABLE t(a int)");
         ok(s, "INSERT INTO t VALUES (1)");
@@ -87,10 +90,9 @@ fn a_ninety_view_chain_is_refused_with_54001() {
             }
         }
         let refusal = refusal.or_else(|| first_error(s, "SELECT a FROM v89").map(|e| (90, e)));
-        let Some((at, (code, message))) = refusal else {
-            panic!("a 90-view chain was planned without a refusal");
-        };
-        assert_eq!(code, "54001", "the chain was refused at depth {at} with {code} ({message}); want 54001");
+        if let Some((at, (code, message))) = refusal {
+            assert_eq!(code, "54001", "the chain was refused at depth {at} with {code} ({message}); want 54001");
+        }
         ok(s, "SELECT a FROM v5");
         alive(s);
     });
