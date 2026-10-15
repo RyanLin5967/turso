@@ -65,16 +65,26 @@ impl Server {
     }
 
     /// One attempt on `port`: the server, once it is ready, or None when it is not (it exited, or
-    /// never became ready), the child reaped.
+    /// never became ready), the child reaped. Ready means the server's own stdout line "PostgreSQL
+    /// server listening on ADDR", printed after its bind: a connect probe was answered by any
+    /// listener on the port, so a server that lost the bind race was handed out while it exited
+    /// (the startup flake). Its stdout and stderr go to `server_log_dir()`, one file each per
+    /// server.
     fn start_on(db: &Path, extra: &[&str], port: u16) -> Option<Self> {
+        use std::io::BufRead;
         let addr = format!("127.0.0.1:{port}");
+        let logs = server_log_dir();
+        let stderr = std::fs::File::create(logs.join(format!("server-{port}.stderr")))
+            .expect("server stderr log");
+        let mut stdout_log = std::fs::File::create(logs.join(format!("server-{port}.stdout")))
+            .expect("server stdout log");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tursopg"));
         cmd.arg(db)
             .arg("--server")
             .arg(&addr)
             .args(extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr));
         // Observation only: with WIRE_SERVER_TRACE_DIR set, each server writes its log there
         // (`-t`), so a session the server ends without a word says why (lead: find the cause
         // of "closed the connection during startup").
@@ -99,14 +109,31 @@ impl Server {
             });
         }
         let mut child = cmd.spawn().expect("failed to start tursopg server");
-        for _ in 0..100 {
+        // The reader copies every stdout line to the log until the server exits, and reports the
+        // listening line once; a server that never prints it, or exits first, is not ready.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let listening = format!("PostgreSQL server listening on {addr} ");
+        let stdout = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let _ = writeln!(stdout_log, "{line}");
+                if line.starts_with(&listening) {
+                    let _ = ready_tx.send(());
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match ready_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(()) => return Some(Self { child, port }),
+                // The reader ended: stdout closed, so the server is exiting.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
             if child.try_wait().unwrap().is_some() {
                 break;
             }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return Some(Self { child, port });
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
         child.kill().ok();
         child.wait().ok();
@@ -130,6 +157,21 @@ impl Server {
     fn pid(&self) -> u32 {
         self.child.id()
     }
+}
+
+/// Where each server's stdout and stderr logs go: WIRE_SERVER_LOG_DIR, or a directory per test
+/// process under the temp directory. Kept after the test (a Scratch is removed on drop, a failing
+/// test's included), so a failure's server side can be read.
+fn server_log_dir() -> PathBuf {
+    let dir = std::env::var_os("WIRE_SERVER_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tursopg_wire_server_logs")
+                .join(std::process::id().to_string())
+        });
+    std::fs::create_dir_all(&dir).expect("server log dir");
+    dir
 }
 
 impl Drop for Server {
