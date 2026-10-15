@@ -1382,6 +1382,18 @@ def self_test():
     chk("teardown outcome (review 13 item 8) T3: item 13's mutant (final sweep deleted) is killed -> rc 1, named",
         src8.count(sweep8) == 1 and t3[0] == 1 and "loops still backed by the chain: /dev/loopfake9" in t3[1],
         (src8.count(sweep8), t3))
+    # V3 review 13 item 9: the harness a verdict vouches for (harness_sha256: batchgate's bind check, harness:stable)
+    # must hold every file firecheck.sh reaches through "$HERE/..." and every file mkfixtures.sh sources from its own
+    # directory (nestloops.sh was missing, so a matcher change did not change harness_sha256); a reference to a
+    # directory is covered by the files under it (testdata/ is walked)
+    hf9 = set(harness_files())
+    fsrc9, msrc9 = rd(os.path.join(HERE, "firecheck.sh")) or "", rd(os.path.join(HERE, "mkfixtures.sh")) or ""
+    refs9 = set(re.findall(r'\$HERE/([A-Za-z0-9_.][A-Za-z0-9_./-]*)', fsrc9)) | \
+        set(re.findall(r'pwd\)/([A-Za-z0-9_.][A-Za-z0-9_./-]*)', msrc9))
+    miss9 = sorted(r for r in refs9 if r not in hf9 and not any(h.startswith(r.rstrip("/") + "/") for h in hf9))
+    chk("harness (review 13 item 9): every file firecheck.sh calls through $HERE and mkfixtures.sh sources from its "
+        "directory is in HARNESS", bool(fsrc9) and bool(msrc9) and "nestloops.sh" in refs9 and not miss9,
+        (miss9, sorted(refs9)))
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
