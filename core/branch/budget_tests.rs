@@ -933,6 +933,10 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     let gapped = (8, 0, true);
     for (c, delay_ms, gap) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false)).chain([gapped]) {
         let rounds = shared_rounds(c);
+        // The arm's line, and its creates' name prefix: three arms run at C = 8 on one database, so a
+        // prefix by C alone made the second arm's first create NameTaken (base16 at fb31e6153).
+        let arm = if gap { LOAD_GAPPED.to_string() } else { load_arm(c, delay_ms) };
+        let arm = arm.as_str();
         let e0 = exceptions(db);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
@@ -963,7 +967,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                             }
                         }
                         let started = std::time::Instant::now();
-                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                        trunk.create_branch(&format!("{arm}-{t}-{i:04}")).unwrap();
                         spans.push((started, std::time::Instant::now()));
                     }
                     spans
@@ -1003,7 +1007,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         m.insert("tail_settled", u64::from(settled));
         m.insert("idle_holes", idle_holes(&spans, std::time::Duration::from_millis(CONFIRM_QUIET_MS_SHIPPED)));
         m.insert("wakeups_burst", delta(k0, k1));
-        line(out, cell, &if gap { LOAD_GAPPED.to_string() } else { load_arm(c, delay_ms) }, 0, &m);
+        line(out, cell, arm, 0, &m);
     }
     hold_word(true);
 }
