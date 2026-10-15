@@ -320,6 +320,44 @@ fn date_arithmetic_that_wraps_answers_as_sqlite3_does() {
     assert_eq!(rows, vec![vec![Value::build_text("2000-01-01 00:00:00")]], "sqlite3 3.51.0's answer");
 }
 
+/// time-reviewer's 4 silent wrong values (lead, DECISIONS 2026-10-15, the checked-time class): a
+/// caller value narrowed with `as` wrapped to another value. Our own time functions (no SQLite
+/// counterpart) refuse a value past the type it narrows to: time_unix's nanoseconds past u32 and
+/// the time_fmt_* offsets past i32 are errors, and time_date's offset past i32 is NULL, as its other
+/// arguments past i32 are. strftime is SQLite's: '2000-01-01', '-5000000 days' is NULL in sqlite3
+/// 3.51.0 (/usr/bin/sqlite3; raw artie lanes/budgets/raw/sqlite3-date-oracle.txt), as date() is.
+/// Expected RED: each wrapped to a value.
+#[test]
+fn a_time_argument_past_its_type_is_refused_not_wrapped() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let run = |sql: &str| conn.prepare(sql).and_then(|mut st| st.run_collect_rows());
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT time_unix(0, 4294967297)",
+        "SELECT time_fmt_iso(time_date(2020, 1, 1), 4294967296)",
+        "SELECT time_fmt_datetime(time_date(2020, 1, 1), 4294967296)",
+        "SELECT time_fmt_date(time_date(2020, 1, 1), 4294967296)",
+        "SELECT time_fmt_time(time_date(2020, 1, 1), 4294967296)",
+    ] {
+        if let Ok(rows) = run(sql) {
+            wrong.push(format!("{sql}: answered {rows:?}; want an error"));
+        }
+    }
+    for sql in [
+        "SELECT time_date(2020, 1, 1, 0, 0, 0, 0, 4294971696)",
+        "SELECT strftime('%Y-%m-%d', '2000-01-01', '-5000000 days')",
+        "SELECT strftime('%s', '2000-01-01', '-5000000 days')",
+    ] {
+        match run(sql) {
+            Ok(rows) if rows == vec![vec![Value::Null]] => {}
+            other => wrong.push(format!("{sql}: {other:?}; want NULL")),
+        }
+    }
+    assert!(wrong.is_empty(), "values past their type were wrapped:\n{}", wrong.join("\n"));
+}
+
 /// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
 fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
     let joined = std::thread::Builder::new()
