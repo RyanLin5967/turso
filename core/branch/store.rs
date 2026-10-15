@@ -10549,6 +10549,7 @@ impl StoreInner {
             }
             return Err(e);
         }
+        held_trace("capture.snapshot");
         let (dirty, rows) = match early {
             Some(taken) => taken,
             None => {
@@ -10557,6 +10558,7 @@ impl StoreInner {
                 (dirty, rows)
             }
         };
+        held_trace("capture.rows");
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
@@ -10590,6 +10592,7 @@ impl StoreInner {
                 .flat_map(|id| branches[id].pending.values().copied())
                 .collect()
         };
+        held_trace("capture.trunk_and_reserved");
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if !marker_first {
             if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
@@ -10662,9 +10665,22 @@ impl StoreInner {
                 arena.in_use()
             );
         }
+        held_trace("capture.meta");
         cat.flight = true;
         let fail_arena_sync = (arena_file.is_some() || settle_arena)
             && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
+        let free_list = arena.free_list().to_vec();
+        held_trace("capture.free_list");
+        let child_keys: Vec<(u64, u64)> = self.children.map.keys().copied().collect();
+        let child_removed: Vec<(u64, u64)> = self.children.removed.keys().copied().collect();
+        held_trace("capture.child_keys");
+        let names_gone = if fe_mutant("names_taken_at_capture") {
+            std::mem::take(&mut self.names.gone)
+        } else {
+            self.names.gone.clone()
+        };
+        let names_fresh = self.names.fresh.clone();
+        held_trace("capture.names");
         Ok(Box::new(Captured {
             generation,
             log_from,
@@ -10676,13 +10692,13 @@ impl StoreInner {
             free_cursor: cat.free_cursor,
             fresh_arena: false,
             taken: cat.taken.iter().copied().collect(),
-            free_list: arena.free_list().to_vec(),
+            free_list,
             reserved,
             deferred,
             deferred_lsn,
             meta,
-            child_keys: self.children.map.keys().copied().collect(),
-            child_removed: self.children.removed.keys().copied().collect(),
+            child_keys,
+            child_removed,
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
@@ -10690,13 +10706,9 @@ impl StoreInner {
             settle_arena,
             fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
-            // C-F1, the capture takes the names out of the index.
-            names_gone: if fe_mutant("names_taken_at_capture") {
-                std::mem::take(&mut self.names.gone)
-            } else {
-                self.names.gone.clone()
-            },
-            names_fresh: self.names.fresh.clone(),
+            // C-F1, the capture takes the names out of the index (taken above).
+            names_gone,
+            names_fresh,
             lease_now: now,
             fail_after_commit,
             fail_write: self
