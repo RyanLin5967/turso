@@ -55,7 +55,8 @@ fn in_child(test: &str, kib: usize, sql: &str) -> String {
     let dir = tempfile::TempDir::new().unwrap();
     let file = dir.path().join("outcome");
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        // --include-ignored: the diagnostic is #[ignore]d, and its child runs it by name too.
+        .args([test, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, format!("{kib}|{sql}"))
         .env("FE_STACK_OUT", &file)
         .output()
