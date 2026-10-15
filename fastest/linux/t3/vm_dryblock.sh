@@ -25,6 +25,18 @@ command -v limactl > /dev/null || { echo "vm_dryblock: REFUSED: limactl is not i
 free_kb=$(df -k / | awk 'NR == 2 { print $4 }')
 host_room_ok "$free_kb" || exit 2
 mkdir -p "$OUTDIR" || exit 2
+# the same self-tests on THIS platform first, from the commit the VM will run (gates/run_everywhere.py over a git
+# archive of SHA): the Mac half of "every gate runs on both Mac and Linux"; t3run's selftests stage is the Linux half
+mac=$(mktemp -d)
+git -C "$HERE" archive "$SHA" fastest .github | tar -x -C "$mac" ||
+  { echo "vm_dryblock: REFUSED: cannot archive $SHA here for the Mac self-tests"; rm -rf "$mac"; exit 2; }
+gnu=""; for g in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreutils/libexec/gnubin; do [ -d "$g" ] && gnu=$g:; done
+PATH=$gnu/opt/homebrew/bin:$PATH timeout 3600 python3 -B "$mac/fastest/linux/gates/run_everywhere.py" "$mac/fastest/linux" \
+  > "$OUTDIR/mac-run-everywhere.txt" 2>&1 ||
+  { tail -6 "$OUTDIR/mac-run-everywhere.txt"; echo "vm_dryblock: REFUSED: the Mac self-tests at $SHA fail"; rm -rf "$mac"; exit 2; }
+tail -1 "$OUTDIR/mac-run-everywhere.txt"
+rm -rf "$mac"
+mkdir -p "$OUTDIR" || exit 2
 log=$OUTDIR/vm_dryblock.log
 exec > >(tee -a "$log") 2>&1
 echo "# vm_dryblock sha=$SHA fs=[$FSL] cpus=$CPUS mem=${MEM}GiB data=${DATA}GiB host_free_kb=$free_kb start=$(date -u +%FT%TZ)"

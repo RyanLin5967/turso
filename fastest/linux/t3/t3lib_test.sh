@@ -64,6 +64,10 @@ check "a model-only line does not list a drive" '! plp_listed "$T/sys" nvme0n1 "
 # devguard round-2 attack LOW 4: every mkfs and wipefs reaches the device preflight checked, by its resolved path.
 # A refusal is rc 2 exactly, so a missing function (127) or a crash cannot pass as one.
 refuses2() { "$@"; [ $? = 2 ]; }
+# a case that needs Linux (/proc, Linux device numbers, mkfs.ext4 with sudo) says so: off Linux it is N/A-on-<platform>,
+# printed and never counted as a pass (gates/platforms.tsv, the platform-inheritance class, 2026-10-15)
+na=0
+linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1)); echo "T3LIB self-test N/A-on-$(uname -s | tr A-Z a-z): $1"; fi; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
 REAL1=$(readlink -f "$T/dev/nvme1n1")
 ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
@@ -160,7 +164,7 @@ FAKE_RDEV=259:9
 check "LOW 5: the node's own MAJ:MIN (259:9) is not the recorded dev=259:5: refuses (rc 2), naming dev=" \
   'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" && grep -q "dev=259:5" "$T/out.txt"'
 FAKE_RDEV=""
-check "LOW 5: production t3_rdev reads a real node's MAJ:MIN in decimal (/dev/null is 1:3)" \
+linux_check "LOW 5: production t3_rdev reads a real node's MAJ:MIN in decimal (/dev/null is 1:3)" \
   '( source "$HERE/t3lib.sh"; [ "$(t3_rdev /dev/null)" = 1:3 ] )'
 # review 6 LOW 21: vpd_pg80's 4-byte header (its length byte is printable for a 32-126 byte serial) is not the serial
 mkdir -p "$T/sys/block/sdd/device"; echo 8:48 > "$T/sys/block/sdd/dev"; echo "naa.5000c501" > "$T/sys/block/sdd/device/wwid"
@@ -278,7 +282,7 @@ check "LOW 4: production t3_pin on a node it cannot open refuses (rc 2) and leav
   '( source "$HERE/t3lib.sh"; sudo() { shift; "$@"; }; t3_pin "$T/no-such-node"; [ $? = 2 ] && [ -z "${T3PIN_PID:-}" ] )'
 # the real probe on a real filesystem (review 6 LOW 6: the test replaced t3_blkid outright, so its body never ran)
 U6=0b9e2d6c-3f1a-4c7e-9a55-0d3c6a1f2e47
-check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
+linux_check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
   '( source "$HERE/t3lib.sh"; command -v mkfs.ext4 > /dev/null || { echo "mkfs.ext4 missing"; exit 1; }
      truncate -s 8M "$T/img" && mkfs.ext4 -q -F -U "$U6" "$T/img" &&
      [ "$(t3_blkid TYPE "$T/img")" = ext4 ] && [ "$(t3_blkid UUID "$T/img")" = "$U6" ] )'
@@ -295,11 +299,11 @@ swrun() { local d=$T/sw$1; shift; mkdir -p "$d"; ( source "$SW" && ours_timed_ru
 swnums() { awk '{for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "t0") a = kv[2]; if (kv[1] == "t1") b = kv[2] }}
                 END { print a, b }' "$1/timed.window"; awk '$1 == "SWEEP" { if (f == "") f = $3; l = $3 } END { print f, l }' \
                 "$1/timed.tracer.tsv"; }
-check "MED 12: ours_timed_run returns the command's rc (3) and records its window, t0 < t1, both inside the sweeps" \
+linux_check "MED 12: ours_timed_run returns the command's rc (3) and records its window, t0 < t1, both inside the sweeps" \
   'swrun 1 bash -c "sleep 0.5; exit 3"; [ $? = 3 ] && grep -q "^sweeper pid=[0-9]* nice=19 " "$T/sw1/timed.tracer.tsv" &&
    grep -q " rc=3$" "$T/sw1/timed.window" &&
    swnums "$T/sw1" | tr "\n" " " | awk "{ exit !(\$1 < \$2 && \$3 <= \$1 && \$2 <= \$4) }"'
-check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
+linux_check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
   'python3 -B "$SR" record "$T/sw1/timed.tracer.tsv" $(swnums "$T/sw1" | head -1)'
 # TEST EDIT, flagged as a SPEC CHANGE (bb96279f3: fastest_profile stamps its measured span): the record is read over
 # result/summary.json's tm0/tm1_realtime_s, here the wrapper's own bounds (inside the sweeps), not the process window
@@ -307,7 +311,7 @@ swsum() { mkdir -p "$1/result"; awk '{for (i = 1; i <= NF; i++) { split($i, kv, 
           if (kv[1] == "t1") b = kv[2] }} END { printf "{\"tm0_realtime_s\": %s, \"tm1_realtime_s\": %s}\n", a, b }' \
           "$1/timed.window" > "$1/result/summary.json"; }
 swsum "$T/sw1"
-check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number over the MEASURED span, the reader's own value" \
+linux_check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number over the MEASURED span, the reader's own value" \
   '( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw1" "$SR" ) && python3 -B -c "
 import json, sys; sys.path.insert(0, \"$HERE/../gates\"); import sweeper_record as s
 j = json.load(open(\"$T/sw1/timed.json\")); m = json.load(open(\"$T/sw1/result/summary.json\"))
@@ -322,7 +326,7 @@ check "MED 12: a sweeper whose start sweep never comes: refused (rc 2) within it
   '( mkdir -p "$T/sw3"; source "$SW"; sweeper_start() { SWEEPER_PID=""; }; sweeper_wait() { :; }
      ours_timed_run "$T/sw3" touch "$T/sw3/ran" ); [ $? = 2 ] && [ ! -e "$T/sw3/ran" ] &&
    grep -q "no start sweep" "$T/sw3/timed.window"'
-check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
+linux_check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
   'mkdir -p "$T/sw4" && sed "s/ nice=19 / nice=0 /" "$T/sw1/timed.tracer.tsv" > "$T/sw4/timed.tracer.tsv" &&
    cp "$T/sw1/timed.window" "$T/sw4/" && swsum "$T/sw4" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw4/timed.json\"))
@@ -336,7 +340,7 @@ cat > "$T/sw6-env.sh" << 'EOF'
 p=$(awk '$1 == "sweeper" { sub(/^pid=/, "", $2); print $2 }' "$1/timed.tracer.tsv")
 [ -n "$p" ] && tr '\0' '\n' < "/proc/$p/environ" | grep -qx "FASTEST_CELL=$2"
 EOF
-check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in its exec-time environ (sut, as theirs)" \
+linux_check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in its exec-time environ (sut, as theirs)" \
   '( export FASTEST_CELL=sw6-cell; ours_timed_exec "$T/sw6" bash "$T/sw6-env.sh" "$T/sw6" sw6-cell ) &&
    grep -q " rc=0$" "$T/sw6/timed.window"'
 check "MED 12: ours_timed_exec with no gates/sweeper.sh beside t3lib.sh refuses (rc 2), the command never ran" \
@@ -346,7 +350,7 @@ check "MED 12 fix 7: ours_timed_exec whose gates/sweeper.sh fails to source refu
   'mkdir -p "$T/lib8/t3" "$T/lib8/gates" "$T/sw8" && cp "$HERE/t3lib.sh" "$T/lib8/t3/" &&
    echo "return 1" > "$T/lib8/gates/sweeper.sh" &&
    ( source "$T/lib8/t3/t3lib.sh"; ours_timed_exec "$T/sw8" touch "$T/sw8/ran" ); [ $? = 2 ] && [ ! -e "$T/sw8/ran" ]'
-check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
+linux_check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
   'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"window\" in (j[\"sweeper_refused\"] or \"\")))"'
@@ -375,5 +379,5 @@ check "measured span: a span ending after the process window gives sweeper_cpu_s
 j = json.load(open(\"$T/rec3/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"outside\" in (j[\"sweeper_refused\"] or \"\")))"'
 
-echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
+echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A-on-$(uname -s | tr A-Z a-z))")"
 [ $fail = 0 ]
