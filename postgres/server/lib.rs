@@ -464,6 +464,40 @@ fn run_session(
 /// PostgreSQL's authentication_timeout's default).
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Before startup completes the session reads its startup's own messages alone: a malformed
+/// message of any kind, or any extended-protocol message (Parse, Bind, Close, Describe, Execute,
+/// Flush, Sync), is answered FATAL 08P01 and the session ends, as PostgreSQL ends a session that
+/// sends anything but its password response while it authenticates. A malformed P/B/C/D/E/H
+/// reached the extended protocol's skip to Sync, and the next Sync set ReadyForQuery: a session
+/// that served queries it never authenticated (wire review 16 item 22). Unreachable with
+/// NoopStartupHandler, which never waits in AuthenticationInProgress; this holds for the day a
+/// handler does. A well-formed simple Query there is left to the startup handler, as before.
+fn refused_before_startup(
+    state: &PgWireConnectionState,
+    msg: &PgWireFrontendMessage,
+) -> Option<ErrorInfo> {
+    let starting = matches!(
+        state,
+        PgWireConnectionState::AwaitingSslRequest
+            | PgWireConnectionState::AwaitingStartup
+            | PgWireConnectionState::AuthenticationInProgress
+    );
+    let refused = match msg {
+        PgWireFrontendMessage::Malformed(kind, code, message) => {
+            format!("{code}: malformed message of type '{}' ({message})", *kind as char)
+        }
+        msg if msg.is_extended_query() => "an extended-protocol message".to_string(),
+        _ => return None,
+    };
+    starting.then(|| {
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            "08P01".to_string(),
+            format!("invalid frontend message before startup completed: {refused}"),
+        )
+    })
+}
+
 /// pgwire's process_socket, plus the end of a session. pgwire drops a Terminate ('X') and serves
 /// on until the client's socket reaches EOF, so a session, its branch connection and its in-use
 /// entry outlived the client's close: bbload's synchronous close waits for the server's EOF and
@@ -554,6 +588,12 @@ async fn serve_session(
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
             break Ok(());
         }
+        if let Some(info) = refused_before_startup(&socket.state(), &msg) {
+            let _ = socket
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await;
+            break Ok(());
+        }
         // A Sync whose body is malformed ends any skip; a simple Query whose body is malformed is
         // ignored during one, as PostgreSQL ignores every message but Sync there before reading
         // its body (it ended the skip, and the extended messages after it ran: wire review 15
@@ -563,8 +603,9 @@ async fn serve_session(
         // ReadyForQuery carrying the session's real state, as PostgreSQL answers them. A malformed
         // Sync got no ReadyForQuery, so the client hung; a malformed Query's error never reached
         // the session's block, so COMMIT committed (wire review 12 items 6 and 7). Before startup
-        // completes there is no round: FATAL 08P01 (wire review 15 item 19). A malformed CopyFail
-        // outside COPY is ignored, as PostgreSQL ignores a stray CopyFail.
+        // completes there is no round: refused_before_startup ended the session above (wire
+        // review 15 item 19, review 16 item 22). A malformed CopyFail outside COPY is ignored, as
+        // PostgreSQL ignores a stray CopyFail.
         if let PgWireFrontendMessage::Malformed(kind, code, ref message) = msg {
             let state = socket.state();
             let copying = matches!(state, PgWireConnectionState::CopyInProgress(_));
@@ -576,19 +617,6 @@ async fn serve_session(
                     code,
                     message: message.clone(),
                 });
-                if matches!(
-                    state,
-                    PgWireConnectionState::AwaitingSslRequest
-                        | PgWireConnectionState::AwaitingStartup
-                        | PgWireConnectionState::AuthenticationInProgress
-                ) {
-                    let mut info = info;
-                    info.severity = "FATAL".to_string();
-                    let _ = socket
-                        .send(PgWireBackendMessage::ErrorResponse(info.into()))
-                        .await;
-                    break Ok(());
-                }
                 session.fail_block();
                 socket.set_state(PgWireConnectionState::ReadyForQuery);
                 let (notices, status) = session.end_round();
@@ -4747,6 +4775,53 @@ mod tests {
         );
         ok(&s, "SELECT turso_branch_switch('h')");
         assert_eq!(on(&s), old, "the switch left the session's branch");
+    }
+
+    /// Wire review 16 item 22, a pin (no red: NoopStartupHandler never authenticates, so no client
+    /// reaches the state; serve_session's concrete handler types admit no password-requiring stub):
+    /// before startup completes, a malformed message of any kind and every extended-protocol
+    /// message is FATAL 08P01, never the extended skip whose Sync set ReadyForQuery; a simple Query
+    /// is left to the startup handler, and once ready nothing is refused here. LOUD-OWED mutants:
+    /// deleting the guard's call, or its `is_extended_query` arm, must let a session pass.
+    #[test]
+    fn nothing_but_startup_is_read_before_startup_completes() {
+        use PgWireConnectionState as St;
+        let malformed = |kind: u8| PgWireFrontendMessage::Malformed(kind, "08P01", "short".into());
+        let parse = || PgWireFrontendMessage::Parse(Parse::new(None, "SELECT 1".into(), vec![]));
+        let query = || {
+            PgWireFrontendMessage::Query(pgwire::messages::simplequery::Query::new(
+                "SELECT 1".to_string(),
+            ))
+        };
+        for state in [St::AwaitingStartup, St::AuthenticationInProgress] {
+            for msg in [
+                malformed(b'P'),
+                malformed(b'B'),
+                malformed(b'H'),
+                malformed(b'S'),
+                malformed(b'Q'),
+                parse(),
+                PgWireFrontendMessage::Sync(PgSync::new()),
+            ] {
+                let info = refused_before_startup(&state, &msg)
+                    .unwrap_or_else(|| panic!("{state:?}: {msg:?} was not refused"));
+                assert_eq!(
+                    (info.severity.as_str(), info.code.as_str()),
+                    ("FATAL", "08P01"),
+                    "{state:?}: {msg:?}"
+                );
+            }
+            assert!(
+                refused_before_startup(&state, &query()).is_none(),
+                "{state:?}: a simple Query is the startup handler's"
+            );
+        }
+        for msg in [malformed(b'P'), parse(), query()] {
+            assert!(
+                refused_before_startup(&St::ReadyForQuery, &msg).is_none(),
+                "ready: {msg:?}"
+            );
+        }
     }
 
     /// The errors `sql` answers, as (code, severity).
