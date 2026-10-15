@@ -4404,7 +4404,10 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
     // collected and all are asserted at the end, so a run shows which arms are red, where the first
     // panic hid the rest. Premises still stop the test. No claim or expected value changed.
     let mut failed = Vec::new();
-    for (catalog, written) in [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)] {
+    // Lead ruling 46628e056e on LOW 9: a planted failure in EACH arm must still fail the test,
+    // planted by FE_MUTANT=low9_plant_arm<i> (test builds only: a fake reused slot in arm i alone).
+    let arms = [(false, SyncClass::Fsync), (true, SyncClass::Fsync), (false, SyncClass::FullFsync), (true, SyncClass::FullFsync)];
+    for (arm, (catalog, written)) in arms.into_iter().enumerate() {
         let what = format!("catalog={catalog} written={written:?}");
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("synced-open.db");
@@ -4425,7 +4428,10 @@ fn a_d0_open_of_a_synced_log_holds_frees_past_its_first_rewrite() {
         assert!(db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the synced class outlives the first rewrite");
         let trunk = db.connect().unwrap();
         db.branch(id).unwrap().reap().unwrap();
-        let took = reused_by_a_new_branch(&trunk, &slots);
+        let mut took = reused_by_a_new_branch(&trunk, &slots);
+        if super::store::fe_mutant(&format!("low9_plant_arm{arm}")) {
+            took.push(u32::MAX);
+        }
         if !took.is_empty() {
             failed.push(format!("{what}: slots {took:?}"));
         }
