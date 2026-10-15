@@ -1563,18 +1563,10 @@ impl BusyCommit {
         self.commit.as_mut().expect("a held COMMIT").run_ignore_rows()
     }
 
-    /// The WAL commit frames written since the fixture's first BEGIN.
+    /// The WAL commit frames written since the fixture's first BEGIN, by any connection
+    /// (`commit_frames_since`'s fresh-connection view: FLAGGED TEST EDIT, the same instrument fix).
     fn commit_frames(&self) -> usize {
-        let now = self.a.wal_state().unwrap();
-        assert_eq!(
-            now.checkpoint_seq_no, self.checkpoint_seq,
-            "catalog={}: premise: no checkpoint restarted the WAL in between",
-            self.catalog
-        );
-        let mut frame = vec![0u8; 24 + self.page_size];
-        (self.from_frame + 1..=now.max_frame)
-            .filter(|&n| self.a.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
-            .count()
+        commit_frames_since(&self.a, self.from_frame, self.checkpoint_seq, self.page_size)
     }
 
     /// Row `id`'s value as a fresh trunk connection reads it: what is committed.
@@ -1836,11 +1828,18 @@ fn a_busy_commit_whose_view_merge_yielded_commits_once() {
 /// The WAL commit frames `conn` reads past frame `from`, with no checkpoint since (`seq`).
 #[cfg(feature = "conn_raw_api")]
 fn commit_frames_since(conn: &Arc<Connection>, from: u64, seq: u32, page_size: usize) -> usize {
-    let now = conn.wal_state().unwrap();
+    // FLAGGED TEST EDIT (an instrument reaching what it counts; for the lead's ruling): `wal_state`
+    // is the connection's own view (its last read mark or commit), so another connection's commit
+    // was invisible to it: the attached half committed through the main connection read 0 on aux's
+    // direct connection (red at bb6af4d94 and 9d27592bf, artie raws l1-branch*). The frames are
+    // counted on a fresh connection to the same database, after a read installs the newest mark.
+    let fresh = conn.db.connect().unwrap();
+    fresh.execute("SELECT count(*) FROM sqlite_schema").unwrap();
+    let now = fresh.wal_state().unwrap();
     assert_eq!(now.checkpoint_seq_no, seq, "premise: no checkpoint restarted the WAL in between");
     let mut frame = vec![0u8; 24 + page_size];
     (from + 1..=now.max_frame)
-        .filter(|&n| conn.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+        .filter(|&n| fresh.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
         .count()
 }
 
@@ -4844,6 +4843,12 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
         };
         let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
         let trunk = db.connect().unwrap();
+        // FLAGGED TEST EDIT (engine review 19 LOW 12's assertion, its count moved; for the lead's
+        // ruling): the upgrade count is read before the reap. Read after it, it raced an upgrade the
+        // reap had already armed (taken before the read, landing after the held-slot premise): the
+        // count read 0 in the catalog arm at bb6af4d94 and 9d27592bf (artie raws l1-branch*), and in
+        // the snapshot arm in a dev-tree run. The claim, exactly one upgrade, is unchanged.
+        let upgrades = db.branches.group_counters()[4];
         db.branch(id).unwrap().reap().unwrap();
         // FLAGGED TEST EDIT (engine review 19 LOW 10, a premise added): the slots are held after the
         // reap, deterministically: a release never matures frees, so nothing arms the upgrade
@@ -4853,7 +4858,6 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
             assert!(!db.branch_slot_is_free(s), "{what}: premise: slot {s} is held after x's reap");
         }
         let syncs = super::store::thread_syncs();
-        let upgrades = db.branches.group_counters()[4];
         let _y = trunk.fork_branch().unwrap().into_id();
         assert_eq!(
             super::store::thread_syncs() - syncs,
@@ -5649,6 +5653,38 @@ fn a_d0_cut_confirms_no_flight() {
     assert_eq!(word, 0, "a D0 cut confirmed a flight no sync proved");
 }
 
+/// Review 6 #1's rule where the second guard does not hide it (the 2026-10-15 mutant sweep:
+/// `cut_confirms_unsynced` survived `a_d0_cut_confirms_no_flight`, whose D0 flights are written
+/// unsynced, so `all_synced` refused the word anyway): on Apple a D1 cut's fsync(2) proves no stable
+/// storage, though every flight it keeps is tagged synced. The D1 cut leaves the last flight it
+/// keeps unconfirmed. Mutant `cut_confirms_unsynced`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d1_cut_on_apple_confirms_no_flight() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("d1cut.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let installed = db.branch_checkpoint_counters()[0];
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let _second = trunk.fork_branch().unwrap().into_id();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "premise: the checkpoint installed");
+    let (word, _, len) = log_confirmation(&db);
+    assert!(len > 40, "premise: the cut log keeps the flight after the capture");
+    assert_eq!(word, 0, "CLAIM: a D1 cut on Apple confirmed a flight its fsync(2) did not prove");
+}
+
 /// Engine review 7 #4: a snapshot store's open deep-copied the whole recovered snapshot state
 /// before its replay whenever the last flight was unconfirmed (every D0 open whose last flight
 /// names a slot), to replay again only if that flight's check failed. The copy is O(state) and
@@ -5840,6 +5876,9 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
 struct FailWalSyncIo {
     inner: Arc<dyn IO>,
     armed: Arc<std::sync::atomic::AtomicU8>,
+    /// Only a WAL whose path ends with this (`/<file name>-wal`) is armed (`None`: every `-wal`
+    /// file): `open_failing_source_wal`. A suffix, as the IO sees the path canonicalized.
+    only: Option<String>,
     /// Mode 3's sync, failed at the next `step`.
     held: Arc<std::sync::Mutex<Option<crate::Completion>>>,
 }
@@ -5863,7 +5902,8 @@ impl IO for FailWalSyncIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
         Ok(Arc::new(FailWalSyncFile {
             inner: self.inner.open_file(path, flags, direct)?,
-            armed: path.ends_with("-wal").then(|| self.armed.clone()),
+            armed: (path.ends_with("-wal") && self.only.as_deref().is_none_or(|only| path.ends_with(only)))
+                .then(|| self.armed.clone()),
             held: self.held.clone(),
         }))
     }
@@ -5939,9 +5979,25 @@ impl crate::io::File for FailWalSyncFile {
 }
 
 /// A store opened through `FailWalSyncIo`, its WAL's next sync failing once `armed` is set.
+/// `open_failing_wal`, arming only the database's own WAL: the WAL of a database it opens on the
+/// same IO (an in-place VACUUM's target build) is left alone.
+fn open_failing_source_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std::sync::atomic::AtomicU8>) {
+    let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+        only: Some(format!("/{}-wal", path.file_name().unwrap().to_str().unwrap())),
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        armed: armed.clone(),
+        held: Arc::new(std::sync::Mutex::new(None)),
+    });
+    let db = Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
+        .unwrap();
+    (db, armed)
+}
+
 fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std::sync::atomic::AtomicU8>) {
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+        only: None,
         inner: Arc::new(PlatformIO::new().unwrap()),
         armed: armed.clone(),
         held: Arc::new(std::sync::Mutex::new(None)),
@@ -6338,6 +6394,12 @@ fn a_frameless_trunk_commit_that_ordered_a_release_stalls_no_waiter() {
         trunk.execute("PRAGMA synchronous = FULL").unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
         let x = trunk.fork_branch().unwrap();
+        // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): a FULL commit first
+        // leaves the WAL synced. The seed's commits ran before the PRAGMA, unsynced, so the WAL was
+        // dirty, and a commit with no frames still syncs a dirty WAL (pager WaitSync: frames or
+        // `wal.is_dirty()`, for write_frame_raw's barrier): the commit below took an F_FULLFSYNC and
+        // the test died on its premise at bb6af4d94 and 9d27592bf (artie raws l1-branch*).
+        write_v(&trunk, 1, "clean");
         let hold = db.branches.trunk_commit_hold.clone();
         hold.store(super::store::HOLD_RELEASE_BUFFERED, std::sync::atomic::Ordering::Release);
         let release = std::thread::spawn(move || x.reap().map(|_| ()));
@@ -7325,6 +7387,7 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -7378,6 +7441,7 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync-d2.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -7428,6 +7492,7 @@ fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
         std::path::PathBuf::from("cat-sync-late.db-branch-cat"),
         Arc::new(FailWalSyncIo {
+            only: None,
             inner: Arc::new(PlatformIO::new().unwrap()),
             armed: armed.clone(),
             held: Arc::new(std::sync::Mutex::new(None)),
@@ -7829,6 +7894,66 @@ fn a_damaged_slot_of_an_ordered_last_flight_is_refused_when_read() {
         assert!(
             got.is_err(),
             "catalog={catalog}: a damaged slot of an ordered last flight was dropped silently, the child read {got:?}"
+        );
+    }
+}
+
+/// Review 6 #7's rule where the confirmation does not hide it (the 2026-10-15 mutant sweep:
+/// `ordered_tag_ignored` survived the test above, whose clean close writes the ordered flight's
+/// word, proved by the trunk's WAL flush since engine review 21 MEDs 7-8, so the open checks no slot
+/// whatever the tag). The same schedule, the word cleared from the log's header after the close, as
+/// a crash before the confirmation writer wrote it leaves it: the ordered tag alone keeps the open
+/// from dropping the flight on its damaged slot, and the read is refused. Mutant
+/// `ordered_tag_ignored`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_damaged_slot_of_an_unconfirmed_ordered_last_flight_is_refused_when_read() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ordered-unconfirmed.db");
+        let (id, incarnation, log) = {
+            let db = open_at(&path, opts(catalog, SyncClass::FullFsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            let x = trunk.fork_branch().unwrap();
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            let barriers = sync_counts().barrier;
+            write_v(&trunk, 3, "new");
+            assert!(sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
+            let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the trunk commit kept one pre-image for x");
+            let arena = arena_path(&db);
+            let log = db.branch_log_path().expect("a durable store");
+            let id = x.into_id();
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&arena).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact_at(&mut byte, kept[0] as u64 * 4096 + 100).unwrap();
+            f.write_all_at(&[byte[0] ^ 0xFF], kept[0] as u64 * 4096 + 100).unwrap();
+            (id, incarnation, log)
+        };
+        // As a crash before the confirmation writer: no word in the header.
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+            f.write_all_at(&[0u8; 4], 36).unwrap();
+        }
+        assert_eq!(log_confirmation_at(&log).0, 0, "catalog={catalog}: premise: the log's last flight is unconfirmed");
+        let db = reopen(&path, opts(catalog, SyncClass::FullFsync), incarnation);
+        let got = db
+            .branch(id)
+            .unwrap()
+            .connect()
+            .and_then(|c| c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows()));
+        assert!(
+            got.is_err(),
+            "catalog={catalog}: CLAIM: a damaged slot of an unconfirmed ordered last flight was dropped silently, the child read {got:?}"
         );
     }
 }
@@ -8392,7 +8517,12 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
         for header in [true, false] {
             let what = format!("catalog={catalog} header={header}");
             let dir = tempfile::TempDir::new().unwrap();
-            let (db, armed) = open_failing_wal(
+            // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): only the source's
+            // WAL is armed. Run at 9d27592bf (artie raw l1-branch_9d27592bf.txt), the armed sync was
+            // the VACUUM target build's own commit (a database opened on the same IO, its WAL also
+            // `-wal`; backtrace through vacuum_target_build_step, dev tree, unbanked), synced in
+            // Fsync, which drains nothing on Apple: never the two syncs this test is about.
+            let (db, armed) = open_failing_source_wal(
                 &dir.path().join("vacuum-sync.db"),
                 opts(catalog, SyncClass::Off).with_vacuum(true),
             );
@@ -8626,6 +8756,19 @@ fn a_failed_truncate_wal_sync_at_issue_fail_stops_a_d0_store() {
 fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): `PRAGMA
+    // wal_autocheckpoint = 1` below is accepted and does nothing here (the WAL's threshold is a
+    // fixed 1000 frames), so no auto-checkpoint ran (red at bb6af4d94 and 9d27592bf on the premise
+    // "the auto-checkpoint's WAL sync was reached", artie raws l1-branch*). The threshold is set
+    // through the test seam `AUTO_CHECKPOINT_FRAMES_FOR_TEST`, restored by a guard; the PRAGMA stays.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::storage::wal::AUTO_CHECKPOINT_FRAMES_FOR_TEST.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    crate::storage::wal::AUTO_CHECKPOINT_FRAMES_FOR_TEST.store(1, O::Release);
     for catalog in [false, true] {
         let what = format!("catalog={catalog}");
         let dir = tempfile::TempDir::new().unwrap();
@@ -8655,14 +8798,20 @@ fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
 }
 
 /// Engine review 19 LOW 11 (a cost regime, pinned): past UPGRADE_HARD_CAP (4) times the hold
-/// bound in held frees, the background writer has fallen behind, and the next freeing operation, a
-/// delete or a branch commit, leads the held-free upgrade on its own thread after its own wait and
-/// before it returns (`upgrade_if_overdue`), so 5dc0a1a3c's "0 syncs on create, connect, first
+/// bound in held frees, the background writer has fallen behind, and the freeing operations, a
+/// delete or a branch commit, lead the held-free upgrade on their own thread after their own wait
+/// and before they return (`upgrade_if_overdue`), so 5dc0a1a3c's "0 syncs on create, connect, first
 /// write and delete" does not hold for a delete there. The bound forced to 1, the writer held where
-/// it found the upgrade due, four branches of two slots each reaped (8 held; a release matures
-/// nothing), one fork (its mature arms the upgrade and marks it overdue), then one more delete: it
-/// leads exactly one upgrade and syncs on its own thread. Both modes. Expected PASS: it pins the
-/// regime the record now states.
+/// it found the upgrade due, four branches of two slots each reaped and one more fork and delete,
+/// all on this thread: at least one upgrade is led, all of them here (the writer is held), and this
+/// thread synced. Both modes.
+///
+/// FLAGGED TEST EDIT (fixture; for the lead's ruling): its premise "a release matures nothing, so
+/// only the last delete leads" was false, and the test was red at bb6af4d94 already (artie raw
+/// l1-branch-base_bb6af4d94.txt: "more than 4 slots are held (8)", slots had come free): a reap
+/// past the cap already led the upgrade. The counts are taken across the whole freeing sequence
+/// instead of around the last delete; the claim (operations past the cap lead it on their own
+/// thread) is unchanged.
 #[test]
 fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
     let _s = serial();
@@ -8680,27 +8829,20 @@ fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
             })
             .collect();
         db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        let (upgrades, syncs) = (db.branches.group_counters()[4], super::store::thread_syncs());
         x.reap().unwrap();
         for b in others {
             held.extend(b.owned_slots());
             b.reap().unwrap();
         }
         let d = trunk.fork_branch().unwrap();
-        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
-            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
-        });
-        assert!(
-            held.len() > 4 && held.iter().all(|&s| !db.branch_slot_is_free(s)),
-            "{what}: premise: more than 4 slots are held ({}), past the hard cap",
-            held.len()
-        );
-        let (upgrades, syncs) = (db.branches.group_counters()[4], super::store::thread_syncs());
         d.reap().unwrap();
         let led = db.branches.group_counters()[4] - upgrades;
         let synced = super::store::thread_syncs() - syncs;
         db.branches.confirm_hold_for_test(0);
-        assert_eq!(led, 1, "{what}: a delete past the hard cap led {led} held-free upgrades, not one");
-        assert!(synced > 0, "{what}: the upgrade the delete led did not sync on its thread");
+        assert!(held.len() > 4, "{what}: premise: more than 4 slots were freed ({}), past the hard cap", held.len());
+        assert!(led >= 1, "{what}: no freeing operation past the hard cap led a held-free upgrade");
+        assert!(synced > 0, "{what}: the upgrades the freeing operations led did not sync on their thread");
         eventually(&format!("{what}: the held slots never came free"), || {
             held.iter().all(|&s| db.branch_slot_is_free(s))
         });
@@ -8854,18 +8996,32 @@ fn a_compaction_past_the_hard_limit_runs_inline_and_is_counted() {
     }
 }
 
-/// DECISIONS c9c821dd8d: the background compaction holds the store mutex while it syncs, so an
-/// operation arriving meanwhile waits behind it, and is counted (`branch_exception_counters()[3]`).
-/// The writer held inside that hold (`HOLD_COMPACT_LOCKED`), a create from another thread is
-/// counted as it arrives, waits, and completes once the hold ends. The creates before the hold,
-/// the one that owed the compaction among them, moved no counter (the control).
+/// DECISIONS c9c821dd8d: an operation arriving while the background compaction holds the store
+/// mutex for a step that may sync waits behind it, and is counted (`branch_exception_counters()[3]`).
+/// The writer held inside that hold, a create from another thread is counted as it arrives, waits,
+/// and completes once the hold ends. The creates before the hold, the one that owed the compaction
+/// among them, moved no counter (the control).
+///
+/// FLAGGED TEST EDIT (DECISIONS bd0d845f97, a premise the fix changes; for the lead's ruling): since
+/// the compaction syncs outside the mutex, the only such hold is its cut's last pass, which copies
+/// what flights left after the catch-ups. The plant takes it every time (`COMPACT_CATCH_UPS_OFF`,
+/// restored by a guard) and holds the writer inside it (`HOLD_COMPACT_TAIL`), where it held it at
+/// `HOLD_COMPACT_LOCKED` before. The assertions are unchanged.
 #[test]
 fn a_create_behind_a_background_compaction_is_counted() {
     let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_CATCH_UPS_OFF.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_CATCH_UPS_OFF.store(true, std::sync::atomic::Ordering::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-wait.db"), false, true);
     let _x = x.into_id();
-    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_LOCKED);
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_TAIL);
     let _t = Threshold::set(8 << 10);
     let base = db.branch_exception_counters();
     let t = std::time::Instant::now();
@@ -8874,7 +9030,7 @@ fn a_create_behind_a_background_compaction_is_counted() {
         assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
     }
     eventually("premise: the background compaction never reached its hold", || {
-        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_LOCKED | super::store::HOLD_ARRIVED
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_TAIL | super::store::HOLD_ARRIVED
     });
     let before = db.branch_exception_counters();
     let other = {
@@ -8896,12 +9052,16 @@ fn a_create_behind_a_background_compaction_is_counted() {
     eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
 }
 
-/// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: the
-/// schedule of `a_delete_past_the_hard_cap_leads_one_held_free_upgrade` (the bound forced to 1, the
-/// background writer held where it found the upgrade due, eight slots held), where the next delete
-/// leads the upgrade on its own thread, is counted exactly once (`branch_exception_counters()[0]`).
-/// The reaps and the fork before it, which held the frees, armed the upgrade and marked it overdue,
-/// moved no counter (the control). Both modes.
+/// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: with
+/// the bound forced to 1 and the background writer held where it found the upgrade due, every
+/// held-free upgrade is led by a freeing operation past the hard cap, and each is counted
+/// (`branch_exception_counters()[0]` moves exactly as the upgrade count does, at least once) across
+/// `a_delete_past_the_hard_cap_leads_one_held_free_upgrade`'s schedule. The control: below the cap
+/// (x's two slots, and a fork), no upgrade is led and nothing is counted. Both modes.
+///
+/// FLAGGED TEST EDIT (fixture; for the lead's ruling; this session's own test, red at 9d27592bf,
+/// artie raw l1-branch_9d27592bf.txt, left [1, 0, 0, 0]): it took its control as "the operations
+/// before the last delete", which already lead past the cap. The control is now below the cap.
 #[test]
 fn a_hard_cap_upgrade_is_counted() {
     let _s = serial();
@@ -8918,26 +9078,26 @@ fn a_hard_cap_upgrade_is_counted() {
                 b
             })
             .collect();
-        let base = db.branch_exception_counters();
         db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        let (base, upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        let (below, below_upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         for b in others {
             held.extend(b.owned_slots());
             b.reap().unwrap();
         }
         let d = trunk.fork_branch().unwrap();
-        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
-            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
-        });
-        assert!(held.len() > 4, "{what}: premise: more than 4 slots are held ({}), past the hard cap", held.len());
-        let before = db.branch_exception_counters();
         d.reap().unwrap();
-        let after = db.branch_exception_counters();
+        let (after, after_upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         db.branches.confirm_hold_for_test(0);
-        assert_eq!(before, base, "{what}: the operations before the hard-cap delete moved an exception counter");
-        assert_eq!(after[0] - before[0], 1, "{what}: CLAIM: the delete that led the hard-cap upgrade was not counted once: {before:?} -> {after:?}");
+        assert!(held.len() > 4, "{what}: premise: more than 4 slots were freed ({}), past the hard cap", held.len());
+        assert_eq!((below, below_upgrades), (base, upgrades), "{what}: below the hard cap an upgrade was led or counted");
+        let led = after_upgrades - below_upgrades;
+        assert!(led >= 1, "{what}: premise: no freeing operation past the hard cap led a held-free upgrade");
+        assert_eq!(after[0] - below[0], led, "{what}: CLAIM: hard-cap upgrades counted {:?} -> {after:?}, led {led}", below);
         for i in [1, 2, 3] {
-            assert_eq!(after[i], before[i], "{what}: exception counter {i} moved: {before:?} -> {after:?}");
+            assert_eq!(after[i], below[i], "{what}: exception counter {i} moved: {below:?} -> {after:?}");
         }
     }
 }
@@ -9304,6 +9464,186 @@ fn a_connect_racing_a_failed_drop_is_not_refused_as_no_such_branch() {
             connected.is_err() && !matches!(connected, Err(LimboError::NoSuchBranch(_))),
             "{what}: CLAIM: a connect racing a drop whose Release failed was answered {connected:?}: \
              the name was never freed, so it is not NoSuchBranch"
+        );
+    }
+}
+
+/// DECISIONS bd0d845f97 (lead, ordered after c9c821dd8d): the background writer synced the snapshot
+/// compaction holding the store mutex, so `compaction_waits` counted a stall it did not remove: at
+/// C=1 the next operation after the threshold-crossing create waited behind the compaction's syncs.
+/// With the writer held mid-compaction (`HOLD_COMPACT_LOCKED`, the stage that held the mutex at
+/// c9c821dd8d), a create on another connection is acknowledged at once, having waited for nothing
+/// and synced nothing on its thread; released, the compaction completes (the log shrinks), and no
+/// operation was counted waiting behind it. Raised D0 snapshot store. Mutant
+/// `compaction_syncs_under_mutex`.
+#[test]
+fn a_create_does_not_wait_for_a_background_compaction() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-no-wait.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_LOCKED);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let longest = db.branches.log_len_for_test();
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never reached its hold", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_LOCKED | super::store::HOLD_ARRIVED
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let (waits, syncs) = (super::store::thread_waits(), super::store::thread_syncs());
+            let created = db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id());
+            let _ = tx.send((created.is_ok(), super::store::thread_waits() - waits, super::store::thread_syncs() - syncs));
+        })
+    };
+    let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+    db.branches.confirm_hold_for_test(0);
+    creator.join().unwrap();
+    assert_eq!(
+        created,
+        Ok((true, 0, 0)),
+        "CLAIM: a create during the background compaction was not acknowledged at once \
+         (created, waits, syncs on its thread; a timeout: it waited behind the compaction)"
+    );
+    eventually("the background compaction never shrank the log", || {
+        !db.branches.compaction_owed_for_test() && db.branches.log_len_for_test() < longest.max(8 << 10)
+    });
+    let after = db.branch_exception_counters();
+    assert_eq!(after[3], base[3], "an operation was counted waiting behind the background compaction");
+    assert_eq!(after[2], base[2], "a compaction synced inline on an operation");
+}
+
+/// DECISIONS bd0d845f97, the recovery rule the background compaction rests on: it renames its
+/// snapshot in before it cuts the log, so a crash between the two leaves the snapshot of generation
+/// g + 1 beside the log of generation g, whose records past the compaction's `Record::Checkpoint`
+/// marker follow the snapshot. Recovery replays them (as a catalog store's older log), where a
+/// snapshot store reset an older log before. A D1 snapshot store whose compaction stops there
+/// (`COMPACT_STOP_BEFORE_CUT`), then branches created and written after it, then a reopen: every
+/// branch is back, and the one written after reads its row. Mutant `snapshot_older_log_reset`.
+#[test]
+fn a_background_compaction_stopped_before_its_cut_loses_nothing() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("compact-stop.db");
+    let (ids, written, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        super::store::COMPACT_STOP_BEFORE_CUT.store(true, O::Release);
+        let _t = Threshold::set(8 << 10);
+        let t = std::time::Instant::now();
+        while db.branches.background_compactions() == 0 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no background compaction ran");
+        }
+        eventually("premise: the background compaction never stopped", || !db.branches.compaction_owed_for_test());
+        // After the stopped compaction: created and written into the older log only.
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 3, "after");
+        let written = y.into_id();
+        let ids = db.branch_ids().unwrap();
+        assert!(ids.contains(&written), "premise: the branch written after the compaction is live");
+        (ids, written, db.incarnation)
+    };
+    super::store::COMPACT_STOP_BEFORE_CUT.store(false, O::Release);
+    let db = reopen(&path, opts(false, SyncClass::Fsync), incarnation);
+    let back = db.branch_ids().unwrap();
+    let lost: Vec<_> = ids.iter().filter(|id| !back.contains(id)).collect();
+    assert!(lost.is_empty(), "CLAIM: branches lost after a compaction stopped before its cut: {lost:?}");
+    assert_eq!(
+        read_v(&db.branch(written).unwrap().connect().unwrap(), 3),
+        "after",
+        "CLAIM: the write made after the stopped compaction was lost"
+    );
+}
+
+/// DECISIONS bd0d845f97: the cut's last pass copies under the mutex what flights wrote after its
+/// catch-ups, and syncs it only when a flight there claimed a sync. A raised D0 store's flights are
+/// only written, so that copy syncs nothing, and no operation is counted waiting behind it. With no
+/// catch-up pass (`COMPACT_NO_CATCH_UP`), the writer held once its cut is prepared
+/// (`HOLD_COMPACT_PREPARED`), one create's flight lands in the old log; released, the compaction
+/// completes with that tail, having synced nothing under the store mutex
+/// (`syncs_under_store_mutex`), and `compaction_waits` has not moved. Mutant
+/// `cut_tail_always_synced` (the tail synced whatever it claims).
+#[test]
+fn a_raised_d0_cut_tail_is_copied_without_a_counted_sync() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_NO_CATCH_UP.store(false, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_NO_CATCH_UP.store(true, O::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-tail.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_PREPARED);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never prepared its cut", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_PREPARED | super::store::HOLD_ARRIVED
+    });
+    let len = db.branches.log_len_for_test();
+    let _ = trunk.fork_branch().unwrap().into_id();
+    assert!(db.branches.log_len_for_test() > len, "premise: a create's flight wrote past the prepared cut");
+    let under = super::store::syncs_under_store_mutex();
+    db.branches.confirm_hold_for_test(0);
+    eventually("the background compaction never completed", || !db.branches.compaction_owed_for_test());
+    let synced_under = super::store::syncs_under_store_mutex() - under;
+    let after = db.branch_exception_counters();
+    assert!(db.branches.log_len_for_test() < len, "premise: the log was cut");
+    assert_eq!(synced_under, 0, "CLAIM: the cut synced {synced_under} times under the store mutex for a tail of only-written flights");
+    assert_eq!(after[3], base[3], "an operation was counted waiting behind the compaction: {base:?} -> {after:?}");
+}
+
+/// A commit's WAL fsync covers the frames it wrote, so the WAL is not left dirty after it: the WAL
+/// published the commit's frames AFTER its sync (`commit_prepared_frames` -> `complete_append_frame`
+/// set `dirty` again), so the next commit with no frames of its own at synchronous FULL synced the
+/// WAL once more for nothing (pager WaitSync: `need_fsync = frames || wal.is_dirty()`): one extra
+/// F_FULLFSYNC per frameless FULL commit. Two FULL commits in a row (the first leaves the WAL
+/// synced), then an UPDATE matching no row: it makes no sync. Trunk only, both stores.
+#[test]
+fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("frameless-clean.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        write_v(&trunk, 1, "a");
+        write_v(&trunk, 2, "b");
+        let before = sync_counts();
+        trunk.execute("UPDATE t SET v = v WHERE id = -1").unwrap();
+        let after = sync_counts();
+        assert_eq!(
+            (after.fsync - before.fsync, after.full_fsync - before.full_fsync),
+            (0, 0),
+            "catalog={catalog}: CLAIM: a commit with no frames after a synced one synced the WAL (fsync, full fsync)"
         );
     }
 }

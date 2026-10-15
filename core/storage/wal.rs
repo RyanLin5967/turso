@@ -616,6 +616,12 @@ trait WalCoordination: Debug + Send + Sync {
     }
 }
 
+/// Test builds (fastest-engine, engine review 19 LOW 9's auto-checkpoint arm): the auto-checkpoint
+/// threshold in frames when set (0: the WAL's own, 1000). `PRAGMA wal_autocheckpoint` is not
+/// implemented here, so a test cannot lower it otherwise.
+#[cfg(test)]
+pub(crate) static AUTO_CHECKPOINT_FRAMES_FOR_TEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 thread_local! {
     /// Test builds: the trunk WAL sync site this thread issued a sync at last (engine review 10 #5:
@@ -795,6 +801,11 @@ pub trait Wal: Debug + Send + Sync {
     /// may be reported durable, even when the committer itself has no dirty
     /// pages to write (e.g. frames inserted through [Wal::write_frame_raw]).
     fn is_dirty(&self) -> bool;
+    /// Frames were written into the WAL that no fsync covers yet: it is dirty from here until a
+    /// successful WAL sync (fastest-engine: a commit's prepared frames are marked when their writes
+    /// are submitted, not when they are published after the commit's own sync, which left a synced
+    /// WAL dirty and cost the next frameless FULL commit one more sync).
+    fn note_frames_written(&self) {}
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
@@ -4053,7 +4064,14 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
         let snapshot = self.load_coordination_snapshot();
-        snapshot.max_frame as usize > self.checkpoint_threshold + snapshot.nbackfills as usize
+        #[cfg(test)]
+        let threshold = match AUTO_CHECKPOINT_FRAMES_FOR_TEST.load(std::sync::atomic::Ordering::Acquire) {
+            0 => self.checkpoint_threshold,
+            n => n,
+        };
+        #[cfg(not(test))]
+        let threshold = self.checkpoint_threshold;
+        snapshot.max_frame as usize > threshold + snapshot.nbackfills as usize
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4162,6 +4180,10 @@ impl Wal for WalFile {
 
     fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
+    }
+
+    fn note_frames_written(&self) {
+        self.dirty.store(true, Ordering::Release);
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -4585,8 +4607,16 @@ impl Wal for WalFile {
     fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
         for batch in batches {
             for (page, frame_id, checksum) in &batch.metadata {
-                // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                // Update WAL index mapping page -> frame. Not `complete_append_frame`: these
+                // frames' writes marked the WAL dirty when they were submitted
+                // (`note_frames_written`), and a commit's sync, which may have covered them since,
+                // must not be undone by their publication. Mutant `publish_marks_wal_dirty`
+                // (test builds only): marked again here, as before.
+                if crate::branch::store::fe_mutant("publish_marks_wal_dirty") {
+                    self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                } else {
+                    self.publish_frame(page.get().id as u64, *frame_id, *checksum);
+                }
             }
             // Update rolling checksum
             *self.last_checksum.write() = batch.final_checksum;
@@ -4876,6 +4906,11 @@ impl WalFile {
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         self.dirty.store(true, Ordering::Release);
+        self.publish_frame(page_id, frame_id, checksums);
+    }
+
+    /// A written frame made visible: the rolling checksum, `max_frame` and the frame cache.
+    fn publish_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);

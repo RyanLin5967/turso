@@ -453,7 +453,8 @@ fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resol
     typed_operand_compatible(expr, value_input_type)
         || (value_input_type.eq_ignore_ascii_case("any")
             && !matches!(expr, ast::Expr::Literal(_) | ast::Expr::Collate(..))
-            && expr.is_constant(resolver))
+            && expr.is_constant(resolver)
+            && !crate::branch::store::fe_mutant("any_input_takes_no_constant"))
         || (crate::branch::store::fe_mutant("operand_any_constant")
             && !matches!(expr, ast::Expr::Literal(_))
             && expr.is_constant(resolver))
@@ -829,8 +830,10 @@ mod tests {
     /// column got the plain comparison, not the type's operator, so a numeric column (stored
     /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
     /// as a literal of the type's value input type: passed to the operator as given (2fa04254c;
-    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is vestigial since then,
-    /// no operand being encoded, and stays as written. Mutant `param_skips_type_operator`.
+    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is not vestigial (engine
+    /// review 20 LOW 28): no comparison operand is encoded, but an index seek's key is, with the
+    /// column's typmod (1d8bf442e), and the column's own values are. Mutant
+    /// `param_skips_type_operator`.
     #[test]
     fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
         let conn = open();
@@ -1155,6 +1158,106 @@ mod tests {
                 "CLAIM: the seek answered {by_seek:?} for {pred}, where the scan raises {by_scan:?}"
             );
         }
+    }
+
+    /// The crash batch, item 8 (lead, 2026-10-15; the wire's 4 reds at artie 512c7c17bb wait on it):
+    /// FLOAT4 and FLOAT8 are built-in types of a STRICT table, base real with REAL affinity, as
+    /// boolean and uuid are; `CREATE TABLE fw(r FLOAT4) STRICT` was refused "unknown datatype".
+    #[test]
+    fn float4_and_float8_are_builtin_types_of_a_strict_table() {
+        let conn = open();
+        conn.execute("CREATE TABLE fw(r FLOAT4, d float8) STRICT").unwrap();
+        conn.execute("INSERT INTO fw VALUES (1.5, 2.25)").unwrap();
+        conn.execute("INSERT INTO fw VALUES (3, 4)").unwrap();
+        let rows = conn
+            .prepare("SELECT r, d, typeof(r), typeof(d) FROM fw ORDER BY r")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::from_f64(1.5), Value::from_f64(2.25), Value::build_text("real"), Value::build_text("real")],
+                vec![Value::from_f64(3.0), Value::from_f64(4.0), Value::build_text("real"), Value::build_text("real")],
+            ]
+        );
+    }
+
+    /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
+    /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
+    /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)
+    /// raised 'value too long', `s = 40000` on smallint 'out of range', where a scan, and
+    /// PostgreSQL, answer 0 rows. Both through `answers_by_both_plans`. Mutant
+    /// `seek_key_encodes_raising_plain`.
+    #[test]
+    fn an_indexed_equality_on_a_length_or_range_checked_built_in_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(3), s smallint) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tv ON t(v)").unwrap();
+        conn.execute("CREATE INDEX ts ON t(s)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 7)").unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tv",
+            &[
+                ("v = 'abc'", None, 1),
+                ("v = 'abcdef'", None, 0),
+                ("v = ?1", Some(Value::build_text("abcdef")), 0),
+            ],
+        );
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "ts",
+            &[
+                ("s = 7", None, 1),
+                ("s = 40000", None, 0),
+                ("s = ?1", Some(Value::from_i64(40000)), 0),
+            ],
+        );
+    }
+
+    /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
+    /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
+    /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
+    /// Mutant `any_input_takes_no_constant` (the arm off).
+    #[test]
+    fn a_numeric_column_compares_a_constant_expression_through_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2), (3, 7)").unwrap();
+        for (pred, want) in [("x = abs(-1.5)", 1), ("x = 1 + 1", 1), ("x = abs(-7) + 0", 1)] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {pred}"), None);
+            assert!(matches!(got, Ok(n) if n == want), "CLAIM: {pred} answered {got:?}, not {want}");
+        }
+    }
+
+    /// Engine review 20 LOW 27 (a): the optimizer half of 1d8bf442e (an equality on a column whose
+    /// type has a function '=' leaves its WHERE term to re-check each row the seek returns) had no
+    /// discriminating mutant. A TEXT join column against an indexed numeric column takes the plain
+    /// comparison in the WHERE, which the seek's encoded key does not decide: the indexed join
+    /// answers as the NOT INDEXED one. Mutant `seek_term_consumed`.
+    #[test]
+    fn a_text_join_against_an_indexed_numeric_column_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5), (2, 2)").unwrap();
+        conn.execute("INSERT INTO u VALUES (1, '1.5'), (2, '1.50'), (3, '2'), (4, 'x')").unwrap();
+        let joined = count(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s", None);
+        let scanned = count(&conn, "SELECT count(*) FROM u JOIN t NOT INDEXED ON t.x = u.s", None);
+        assert!(scanned.is_ok(), "premise: the scan answers: {scanned:?}");
+        assert_eq!(
+            joined.ok(),
+            scanned.ok(),
+            "CLAIM: the indexed join answered differently from the scan ({:?})",
+            plan(&conn, "SELECT count(*) FROM u JOIN t ON t.x = u.s")
+        );
     }
 
     /// Register the type `sql` creates as a built-in type, as the wire registers its bpchar.
@@ -1620,8 +1723,9 @@ mod tests {
     /// zero), not bigdecimal's. The expectations are DERIVED from PostgreSQL's select_div_scale by
     /// reading its source, not from our output (100.00 / 10: the first base-10000 digits give a
     /// quotient weight of 0, so 16 decimal places; 1.00 / 3: 1 <= 3 lowers the weight to -1, so
-    /// 20). LOUD-OWED: replace each expectation by PostgreSQL 18's output for the same query,
-    /// verbatim. Mutant `div_scale_bigdecimal`.
+    /// 20). CONFIRMED by PostgreSQL 18.6 for the same queries, verbatim (artie raw
+    /// lanes/engine/raw/rpgdiv-pg18.6.txt, 2026-10-15): every expectation below is its output.
+    /// Mutant `div_scale_bigdecimal`.
     #[test]
     fn numeric_division_takes_postgresqls_result_scale() {
         let conn = open();
@@ -1639,6 +1743,38 @@ mod tests {
             assert!(
                 matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
                 "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
+
+    /// Engine review 21 MED 13's rows that no in-tree regression file covered, from PostgreSQL 18.6
+    /// verbatim (artie raw lanes/engine/raw/rpgdiv-pg18.6.txt): an operand below 1 (the weight's
+    /// div_euclid), an exact quotient padded to the result scale, an operand of display scale 1, and
+    /// one of display scale above 16 (the result takes it). A display scale above 1000 has no row:
+    /// PostgreSQL refuses numeric(1200, 1100) ("precision 1200 must be between 1 and 1000"), so its
+    /// arm needs another construction. Mutant `div_scale_bigdecimal`.
+    #[test]
+    fn numeric_division_matches_postgresql_18() {
+        let conn = open();
+        // Each column holds the PostgreSQL query's dividend at its display scale (`0.5::numeric(10,
+        // 2)`, `1::numeric`, `2.5::numeric(10,1)`, `1.00000000000000000001::numeric`).
+        conn.execute(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a numeric(10, 2), b numeric(10, 0), c numeric(10, 1), \
+             e numeric(30, 20)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO d VALUES (1, '0.5', '1', '2.5', '1.00000000000000000001')")
+            .unwrap();
+        for (sql, want) in [
+            ("SELECT a / 3 FROM d", "0.16666666666666666667"),
+            ("SELECT b / 8 FROM d", "0.12500000000000000000"),
+            ("SELECT c / 2 FROM d", "1.25000000000000000000"),
+            ("SELECT e / 3 FROM d", "0.33333333333333333334"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "CLAIM: {sql} gave {got:?}, not PostgreSQL 18's {want}"
             );
         }
     }

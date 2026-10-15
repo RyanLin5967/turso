@@ -598,6 +598,12 @@ fn emit_notnull_constraint_check(
 /// a bound NULL, or `SET rowid = NULL`) raises the NOT NULL constraint on the alias column, under
 /// the UPDATE's OR clause as any NOT NULL column. Emitted where `MustBeInt` would otherwise raise
 /// "datatype mismatch" for the NULL, so nothing else moves. No-op for every other table.
+///
+/// ORDER (engine review 20 LOW 25): unlike the other NOT NULL columns, whose checks wait for the
+/// BEFORE UPDATE triggers (`emit_deferred_notnull_checks`, `skip_notnull_checks`), the key's runs
+/// here, BEFORE those triggers, since the new key is made an integer (`MustBeInt`) at once: a BEFORE
+/// trigger cannot rescue a NULL key, where PostgreSQL lets it set NEW's key. A known divergence, as
+/// SQLite raises "datatype mismatch" for a NULL rowid at the same point.
 fn emit_rowid_alias_not_null_check(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -612,7 +618,9 @@ fn emit_rowid_alias_not_null_check(
     let Some(btree) = column_ctx.target_table.table.btree() else {
         return Ok(());
     };
-    if !btree.rowid_alias_refuses_null() {
+    // Mutant `null_key_update_unchecked` (test builds only; engine review 20 LOW 26): this path
+    // alone unchecked.
+    if !btree.rowid_alias_refuses_null() || crate::branch::store::fe_mutant("null_key_update_unchecked") {
         return Ok(());
     }
     let Some(alias) = btree.columns().iter().find(|c| c.is_rowid_alias()) else {

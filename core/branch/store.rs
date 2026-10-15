@@ -314,8 +314,11 @@ pub(crate) struct BranchStore {
     drain_parent: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
-    /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
-    /// (see `pause_at`), so a test can act on the store with the gate open.
+    /// Test hook (see `pause_at`): the stage it holds pauses the operation that reaches it, so a test
+    /// can act on the store meanwhile. `HOLD_TRUNK_DECIDED` (a trunk commit inside its commit gate),
+    /// `HOLD_TRUNK_BARRIER_DONE`, `HOLD_FORK_REGISTERING`, `HOLD_LOCKED_FLUSH`,
+    /// `HOLD_RELEASE_BUFFERED`, `HOLD_SCHEMA_PUBLISH`, `HOLD_DROP_LOOKED_UP` and
+    /// `HOLD_CONNECT_LOOKED_UP` (engine review 20 LOW 30: the doc named only the first).
     #[cfg(test)]
     pub(crate) trunk_commit_hold: Arc<AtomicU8>,
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
@@ -391,6 +394,10 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// The confirmation the writer last took to write (`Confirm::key`, 0 for none; raised by
+    /// `fetch_max`, as keys order as `supersedes` does): an offer it does not supersede is refused
+    /// (`offer_confirm`; DECISIONS ba515419c3). Atomic, so the write path takes no lock for it.
+    confirm_done: AtomicU64,
     /// Observation only (review 6 #1): confirmation words written into the log's header, and those
     /// whose write failed; counted without the group's lock (engine review 8 #11).
     confirms_written: AtomicU64,
@@ -472,10 +479,25 @@ const COMPACT_RUNNING: u8 = 2;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_DUE: u8 = 16;
 
-/// Test hook stage (`Group::confirm_hold`): the background compaction holds the store mutex and
-/// has not yet compacted (DECISIONS c9c821dd8d).
+/// Test hook stage (`Group::confirm_hold`): the background compaction has taken what it syncs
+/// and written its marker, and syncs nothing yet; it holds no lock (DECISIONS bd0d845f97).
 #[cfg(test)]
-pub(crate) const HOLD_COMPACT_LOCKED: u8 = 17;
+pub(crate) const HOLD_COMPACT_TAKEN: u8 = 17;
+
+/// `HOLD_COMPACT_TAKEN`'s name at c9c821dd8d, when the stage was inside the store mutex (the
+/// bd0d845f97 red names it).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_LOCKED: u8 = HOLD_COMPACT_TAKEN;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut copies what is left of
+/// the log under the store mutex, counted (`compaction_waits`; DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
+
+/// Test hook stage (`Group::confirm_hold`): the background compaction's cut is prepared off the
+/// mutex and has not been caught up or installed (DECISIONS bd0d845f97).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
 
 #[derive(Default)]
 struct GroupState {
@@ -598,6 +620,7 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
+            confirm_done: AtomicU64::new(0),
             confirms_written: AtomicU64::new(0),
             confirm_failures: AtomicU64::new(0),
             upgrade_due: AtomicU64::new(0),
@@ -783,6 +806,13 @@ impl Group {
         if g.confirm.as_ref().is_some_and(|(_, held)| !confirm.supersedes(held)) {
             return Some(confirm);
         }
+        // Nor one the writer already took to write, held or not (DECISIONS ba515419c3): a re-offer
+        // of the same flight's word, as proved as it was (a held-free upgrade's landing with no
+        // flight since; a proved ordered flight upgraded), was queued again once the slot was empty
+        // and written a second time. Mutant `reoffer_written_word` (test builds only): queued.
+        if !confirm.supersedes_key(self.confirm_done.load(Ordering::Acquire)) && !fe_mutant("reoffer_written_word") {
+            return Some(confirm);
+        }
         // The writer sleeps without a deadline while it holds nothing it may write: woken when that
         // changes.
         let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
@@ -948,12 +978,19 @@ impl Group {
         self.confirm_cv.notify_all();
         // The writer may be waiting for a flight on the group's condition variable.
         self.cv.notify_all();
-        g.confirm.take().map(|(_, c)| c)
+        let left = g.confirm.take().map(|(_, c)| c);
+        if let Some(c) = left.as_ref() {
+            self.confirm_done.fetch_max(c.key(), Ordering::AcqRel);
+        }
+        left
     }
 
     /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
     /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
+        // The writer and the close record it as they take it, under the group's lock; recorded here
+        // too, for any other caller, with no lock (DECISIONS ba515419c3).
+        self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
         // Counted without the group's lock (engine review 8 #11).
         match written {
@@ -1118,6 +1155,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
+        group.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
@@ -1137,6 +1175,64 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// Catch-up passes of a background compaction's cut before it copies what is left under the store
+/// mutex (`BranchStore::cut_in_background`; DECISIONS bd0d845f97).
+const COMPACT_CATCH_UPS: usize = 3;
+
+/// Test builds: no catch-up pass, so the cut always takes the counted tail path (the plant of
+/// `compaction_waits`).
+#[cfg(test)]
+pub(crate) static COMPACT_CATCH_UPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: a background compaction stops once its snapshot is installed and synced, before
+/// it cuts the log, as a crash there would leave it (DECISIONS bd0d845f97's recovery rule).
+#[cfg(test)]
+pub(crate) static COMPACT_STOP_BEFORE_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Test builds: no catch-up pass, nothing else changed: what flights wrote after the prep reaches
+/// the last pass, under the mutex.
+#[cfg(test)]
+pub(crate) static COMPACT_NO_CATCH_UP: AtomicBool = AtomicBool::new(false);
+
+fn compact_no_catch_up() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_NO_CATCH_UP.load(Ordering::Acquire) || COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn compact_catch_ups_off() -> bool {
+    #[cfg(test)]
+    {
+        COMPACT_CATCH_UPS_OFF.load(Ordering::Acquire)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A background compaction's mutex hold that may sync, counted (`StoreMutex::compacting` odd)
+/// from before it locks to after it unlocks.
+struct Compacting<'a>(&'a StoreMutex);
+
+impl<'a> Compacting<'a> {
+    fn begin(store: &'a StoreMutex) -> Self {
+        store.compacting.fetch_add(1, Ordering::AcqRel);
+        Self(store)
+    }
+}
+
+impl Drop for Compacting<'_> {
+    fn drop(&mut self) {
+        self.0.compacting.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1266,14 +1362,16 @@ thread_local! {
 /// instrument — a flush inside the store mutex stalls every operation behind it).
 struct StoreMutex {
     inner: Mutex<StoreInner>,
-    /// Odd while the background writer's compaction holds, or is about to take, this mutex
-    /// (`BranchStore::lead_compaction`; DECISIONS c9c821dd8d): set before it locks and cleared after
-    /// it unlocks, so every operation that waited behind its syncs found it odd as it arrived.
+    /// Odd while the background compaction holds, or is about to take, this mutex for a step that
+    /// may sync under it (DECISIONS c9c821dd8d, bd0d845f97: only its cut's last pass, `Compacting`,
+    /// and the whole compaction under mutant `compaction_syncs_under_mutex`): set before it locks
+    /// and cleared after it unlocks, so every operation that waited behind such a sync found it odd
+    /// as it arrived.
     compacting: AtomicU64,
     /// Lock acquisitions that arrived while `compacting` was odd: operations that waited behind a
-    /// background compaction's syncs (an exception counter, `BranchStore::exception_counters`). One
-    /// that arrived in the margins (before the writer locked, or after it unlocked) and did not wait
-    /// is counted too: an overcount, never a miss.
+    /// background compaction's sync under the mutex (an exception counter,
+    /// `BranchStore::exception_counters`). One that arrived in the margins (before the writer
+    /// locked, or after it unlocked) and did not wait is counted too: an overcount, never a miss.
     compaction_waits: AtomicU64,
 }
 
@@ -5532,12 +5630,10 @@ impl BranchStore {
     }
 
     /// The compaction an operation owed to the background writer (`Group::compact_due`; DECISIONS
-    /// c9c821dd8d), led by it under the store mutex, off every acknowledgement path. Nothing is
-    /// done if the log no longer wants one (an operation past the hard limit compacted it inline).
-    /// A failure backs off as an operation's does (`defer_compaction`). The store's `unsynced` hint
-    /// is left as it was: a trunk barrier then takes the lock and finds nothing to flush.
-    /// Operations that arrive while it holds the mutex wait behind its syncs, and are counted
-    /// (`StoreMutex::compaction_waits`).
+    /// c9c821dd8d), led by it off every acknowledgement path (`compact_in_background`). A failure
+    /// backs off as an operation's does (`defer_compaction`). Mutant `compaction_syncs_under_mutex`
+    /// (test builds only): the whole compaction under the store mutex, as at c9c821dd8d, with every
+    /// operation arriving meanwhile counted (`compaction_waits`).
     fn lead_compaction(store: &StoreMutex, group: &Group) {
         if group
             .compact_due
@@ -5546,26 +5642,190 @@ impl BranchStore {
         {
             return;
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
-        {
+        let led = if fe_mutant("compaction_syncs_under_mutex") {
+            store.compacting.fetch_add(1, Ordering::AcqRel);
             let mut inner = store.lock_uncounted();
             #[cfg(test)]
-            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_LOCKED);
-            if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
-                #[cfg(test)]
-                {
-                    group.lock().background_compactions += 1;
-                }
-                if let Err(e) = Self::compact_snapshot(&mut inner, group, false) {
-                    tracing::warn!("branch store compaction failed: {e}");
-                    if let Some(journal) = inner.journal.as_mut() {
-                        journal.defer_compaction();
-                    }
-                }
+            pause_at(Some(&group.confirm_hold), HOLD_COMPACT_TAKEN);
+            let led = if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                Self::compact_snapshot(&mut inner, group, false)
+            } else {
+                Ok(())
+            };
+            drop(inner);
+            store.compacting.fetch_add(1, Ordering::AcqRel);
+            led
+        } else {
+            Self::compact_in_background(store, group)
+        };
+        if let Err(e) = led {
+            tracing::warn!("branch store compaction failed: {e}");
+            if let Some(journal) = store.lock().journal.as_mut() {
+                journal.defer_compaction();
             }
         }
-        store.compacting.fetch_add(1, Ordering::AcqRel);
         group.compact_due.store(COMPACT_IDLE, Ordering::Release);
+    }
+
+    /// A snapshot store's syncing compaction with no sync under the store mutex (DECISIONS
+    /// bd0d845f97), the held-free upgrade's shape: what it syncs is taken under the mutex, synced
+    /// holding no lock, and landed under the mutex only over the log it was taken from (the
+    /// journal's rewrites count, nonce and generation). Operations go on throughout, their group
+    /// flights included.
+    ///
+    /// 1. Capture (mutex): the state's snapshot, a `Record::Checkpoint` marker of the next
+    ///    generation buffered after it, the arena's handle (`Journal::begin_bg_compaction`).
+    /// 2. The marker written (holding no lock; a flight is led if none does it).
+    /// 3. The arena and the snapshot's temp file synced (no lock).
+    /// 4. The snapshot renamed in (mutex, if the log is unchanged); from here a crash leaves an
+    ///    older log whose records past the marker recovery replays over the snapshot.
+    /// 5. Its directory synced (no lock); everything below the marker is then durable in the class.
+    /// 6. The log cut to what follows the marker: copied and synced into a temp log holding no
+    ///    lock (`prepare_cut`), caught up likewise with what flights wrote meanwhile
+    ///    (`extend_cut`, up to `COMPACT_CATCH_UPS` passes), then renamed in under the mutex
+    ///    (`finish_cut`) once nothing is left to copy. Only if flights still landed after the last
+    ///    pass is that tail copied and synced under the mutex: counted (`compaction_waits`).
+    ///
+    /// Test hooks (`Group::confirm_hold`): `HOLD_COMPACT_TAKEN` after step 2, and
+    /// `HOLD_COMPACT_TAIL` inside the counted tail's mutex hold.
+    fn compact_in_background(store: &StoreMutex, group: &Group) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let bg = {
+            let mut inner = store.lock();
+            if inner.cat.is_some() || !inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
+                return Ok(());
+            }
+            let snapshot = inner.snapshot();
+            let StoreInner { journal, arena, .. } = &mut *inner;
+            let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            journal.begin_bg_compaction(&snapshot, arena)?
+        };
+        #[cfg(test)]
+        {
+            group.lock().background_compactions += 1;
+        }
+        let landed = (|| -> Result<()> {
+            Self::wait_durable_on(store, group, None, bg.lsn(), SyncClass::Off)?;
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_TAKEN);
+            bg.sync_snapshot()?;
+            let installed = match store.lock().journal.as_mut() {
+                Some(journal) => journal.install_bg_snapshot(&bg)?,
+                None => false,
+            };
+            if !installed {
+                return Ok(());
+            }
+            bg.sync_dir()?;
+            group.mark_committed(bg.lsn(), bg.class());
+            // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
+            // would (`COMPACT_STOP_BEFORE_CUT`).
+            #[cfg(test)]
+            if COMPACT_STOP_BEFORE_CUT.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            Self::cut_in_background(store, group, &bg)
+        })();
+        bg.discard();
+        landed
+    }
+
+    /// Step 6 of `compact_in_background`: the log cut to what follows the marker.
+    fn cut_in_background(store: &StoreMutex, group: &Group, bg: &super::journal::BgCompaction) -> Result<()> {
+        #[cfg(test)]
+        let hold = Some(&group.confirm_hold);
+        let (from, generation) = (bg.from(), bg.generation());
+        let source = {
+            let inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_ref() else {
+                return Ok(());
+            };
+            match journal.bg_cut_source(bg)? {
+                Some(source) => source,
+                None => return Ok(()),
+            }
+        };
+        let mut prep = Journal::prepare_cut(source, from, generation)?;
+        #[cfg(test)]
+        pause_at(hold, HOLD_COMPACT_PREPARED);
+        let passes = if compact_no_catch_up() { 0 } else { COMPACT_CATCH_UPS };
+        // The last pass copies under the mutex whatever is left. When that copy must be synced (a
+        // flight left in it claimed a sync), the hold is counted from before it locks to after it
+        // unlocks (`Compacting`, declared before `inner`, so dropped after it): the pass locks
+        // again counted. Under `COMPACT_CATCH_UPS_OFF` (the plant) it is counted every time.
+        let mut counted: Option<Compacting<'_>> = None;
+        let mut pass = 0;
+        loop {
+            let last = pass >= passes;
+            if last && compact_catch_ups_off() && counted.is_none() {
+                counted = Some(Compacting::begin(store));
+            }
+            let mut inner = Self::lock_quiesced(store, group)?;
+            let Some(journal) = inner.journal.as_mut() else {
+                break;
+            };
+            if !journal.cut_usable(&prep, from, generation) {
+                break;
+            }
+            let to = journal.log_len();
+            if to > prep.upto() && !last {
+                let fail = journal.take_replacement_sync_failure();
+                drop(inner);
+                Journal::extend_cut(&mut prep, to, fail)?;
+                pass += 1;
+                continue;
+            }
+            if counted.is_none() && journal.cut_tail_syncs(&prep)? {
+                drop(inner);
+                counted = Some(Compacting::begin(store));
+                continue;
+            }
+            #[cfg(test)]
+            if counted.is_some() {
+                pause_at(hold, HOLD_COMPACT_TAIL);
+            }
+            journal.finish_cut(prep, from, generation)?;
+            journal.set_snapshot_len(bg.snapshot_len());
+            // What the flights after the marker wrote is durable only in their own class: the cut's
+            // rename waits for the next flight's directory sync, as a catalog store's install's.
+            let written = journal.lsn() - journal.pending_len();
+            let class = journal.sync_class();
+            group.mark_durable(written, class);
+            let durable = group.durable(inner.free_class());
+            inner.mature_frees(durable);
+            drop(inner);
+            drop(counted);
+            return Ok(());
+        }
+        // The log changed under the cut: the snapshot stays installed, the older log is replayed
+        // past its marker, and the next compaction cuts it.
+        Ok(())
+    }
+
+    /// The store mutex with no group flight in the air (a cut's copy must end a flight): waited for
+    /// holding no lock, then re-checked under it. Fails once the store is fail-stopped.
+    fn lock_quiesced<'a>(store: &'a StoreMutex, group: &Group) -> Result<StoreGuard<'a>> {
+        loop {
+            {
+                let mut g = group.lock();
+                while g.flushing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let inner = store.lock_uncounted();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if !group.lock().flushing {
+                return Ok(inner);
+            }
+        }
     }
 
     /// Whether this process's background writer runs (`start_confirm_writer`): not when it could
@@ -8083,17 +8343,18 @@ fn name_taken(name: &str) -> LimboError {
 /// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
 /// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
 pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
-    if !fe_mutant("untyped_branch_errors") {
-        return e;
-    }
+    // Per kind too (engine review 20 LOW 20: the all-kinds mutant failed its test at the first
+    // assertion, NameTaken, so the other two were never shown to fail): mutants
+    // `untyped_branch_errors_no_such`, `_name_taken` and `_in_use` untype one kind each.
+    let all = fe_mutant("untyped_branch_errors");
     match e {
-        LimboError::NoSuchBranch(name) => {
+        LimboError::NoSuchBranch(name) if all || fe_mutant("untyped_branch_errors_no_such") => {
             LimboError::InvalidArgument(format!("no branch is named {name:?}"))
         }
-        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
-            "branch name {name:?} already names an unreleased branch"
-        )),
-        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+        LimboError::NameTaken(name) if all || fe_mutant("untyped_branch_errors_name_taken") => {
+            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch"))
+        }
+        LimboError::BranchInUse { id, .. } if all || fe_mutant("untyped_branch_errors_in_use") => LimboError::InvalidArgument(format!(
             "branch {id} already has an open connection; a branch serves one connection at a \
              time, because a second one's page cache would silently miss the first one's commits"
         )),
@@ -11993,6 +12254,36 @@ mod sota_tree_tests {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    /// DECISIONS ba515419c3 (found by fastest-budgets reading bb6af4d94): `offer_confirm` compared
+    /// an offered confirmation only with the one the writer HOLDS. Once the writer had taken and
+    /// written flight N's proved word, the slot was empty, so a re-offer of that same word (a
+    /// held-free upgrade's landing, `mark_upgraded`, with no flight since; a proved ordered flight
+    /// upgraded) was queued again and written a second time: one extra pwrite. Here flight N lands
+    /// proved, the writer's step is done by hand (take, write), and the upgrade re-offers N's word:
+    /// nothing is queued, and the word was written once. Mutant `reoffer_written_word`.
+    #[test]
+    fn a_reoffer_of_a_written_word_writes_it_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log(), true))), "premise: flight N landed");
+        let (_, taken) = group.lock().confirm.take().expect("premise: N's proved word is queued");
+        group.write_confirm(&taken, false);
+        drop(taken);
+        assert_eq!(group.confirms_written.load(Ordering::Relaxed), 1, "premise: N's word was written");
+        let left = group.mark_upgraded(10, SyncClass::FullFsync, Some(Confirm::for_test(log(), true)));
+        if let Some((_, again)) = group.lock().confirm.take() {
+            group.write_confirm(&again, false);
+        }
+        drop(left);
+        assert_eq!(
+            group.confirms_written.load(Ordering::Relaxed),
+            1,
+            "CLAIM: a re-offer of the word already written was queued and written again"
+        );
+    }
 
     /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
     /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
