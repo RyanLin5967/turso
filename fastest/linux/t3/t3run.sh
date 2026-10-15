@@ -700,6 +700,10 @@ selftests() {
   timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
   timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
     { echo "self-test warmup_conformance FAILED"; return 1; }
+  # every self-test entry point, each on the platform it states (gates/platforms.tsv; the platform-inheritance class):
+  # one runner, the same one vm_dryblock.sh runs on the Mac first, and it refuses an entry point with no row
+  timeout 3600 python3 -B "$L/gates/run_everywhere.py" "$L" > "$OUT/run-everywhere.txt" 2>&1 ||
+    { tail -5 "$OUT/run-everywhere.txt"; echo "self-test run_everywhere FAILED"; return 1; }
   # the shared sweeper's one reader, every refusal planted (MED 12 ruling; t3lib_test.sh runs ours_timed_run on /proc)
   timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest > "$OUT/sweeper-record-selftest.txt" 2>&1 ||
     { echo "self-test sweeper_record FAILED"; return 1; }
