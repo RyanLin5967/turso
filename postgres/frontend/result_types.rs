@@ -74,23 +74,172 @@ pub fn aggregate_targets(parse: &ParseResult) -> Vec<bool> {
 /// cast float8; PostgreSQL 18 announces bool and float4 (recorded 2026-10-15, artie
 /// lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out).
 pub fn expression_types(parse: &ParseResult) -> Vec<Option<u32>> {
-    if aggregate_targets(parse).is_empty() {
-        return Vec::new();
-    }
     let [raw] = parse.protobuf.stmts.as_slice() else {
         return Vec::new();
     };
     let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
         return Vec::new();
     };
-    select
-        .target_list
-        .iter()
-        .map(|target| match target.node.as_ref() {
-            Some(Node::ResTarget(t)) => t.val.as_deref().and_then(expression_type),
-            _ => None,
-        })
-        .collect()
+    if select.larg.is_some() || select.rarg.is_some() || select.target_list.is_empty() {
+        return Vec::new();
+    }
+    let columns = select_fixed(select, &[]);
+    // A `*` left unexpanded: the list does not line up with the result columns.
+    if columns.iter().any(|(name, ty)| name == "*" && ty.is_none()) {
+        return Vec::new();
+    }
+    columns.into_iter().map(|(_, ty)| ty).collect()
+}
+
+/// One derived FROM item's output columns as [`select_fixed`] names and types them, a `*` it could
+/// not expand kept as an entry named "*" (a name lookup skips it; a `*` over the item does not
+/// expand); `None` columns for a table, whose columns are the engine's to type.
+struct Derived {
+    alias: String,
+    columns: Option<Vec<(String, Option<u32>)>>,
+}
+
+/// A SELECT's result columns, each named as PostgreSQL names it and typed when its grammar fixes the
+/// type ([`expression_type`]), reading a column of a derived table or a CTE as that item's own
+/// column (a boolean `true AS linked` read through a join stayed boolean in PostgreSQL and was
+/// announced bytea here: the regress corpus's join.sql). A `*` expands over the FROM items when
+/// every one is a derived table or a CTE; otherwise it stays one untyped entry, so the list does not
+/// line up with the result and is not used. `outer` holds the enclosing statements' CTEs.
+fn select_fixed(select: &SelectStmt, outer: &[(String, Vec<(String, Option<u32>)>)]) -> Vec<(String, Option<u32>)> {
+    let mut ctes: Vec<(String, Vec<(String, Option<u32>)>)> = outer.to_vec();
+    if let Some(with) = &select.with_clause {
+        for cte in &with.ctes {
+            if let Some(Node::CommonTableExpr(c)) = cte.node.as_ref() {
+                if let Some(Node::SelectStmt(q)) = c.ctequery.as_ref().and_then(|q| q.node.as_ref()) {
+                    let mut columns = select_fixed(q, &ctes);
+                    for (column, name) in columns.iter_mut().zip(&c.aliascolnames) {
+                        if let Some(Node::String(n)) = name.node.as_ref() {
+                            column.0.clone_from(&n.sval);
+                        }
+                    }
+                    ctes.push((c.ctename.clone(), columns));
+                }
+            }
+        }
+    }
+    let mut derived = Vec::new();
+    for item in &select.from_clause {
+        from_derived(item, &ctes, &mut derived);
+    }
+    let lookup = |c: &turso_pg_parser::pg_query::protobuf::ColumnRef| -> Option<u32> {
+        let fields: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let (rel, column) = match fields.as_slice() {
+            [column] => (None, *column),
+            [rel, column] => (Some(*rel), *column),
+            _ => return None,
+        };
+        let mut found = derived.iter().filter(|d| rel.is_none_or(|r| d.alias == r)).filter_map(|d| {
+            d.columns.as_ref()?.iter().find(|(n, _)| n == column).map(|(_, t)| *t)
+        });
+        let first = found.next()?;
+        // A bare name two derived items share is ambiguous: left untyped.
+        if rel.is_none() && found.next().is_some() {
+            return None;
+        }
+        first
+    };
+    let mut out = Vec::new();
+    for target in &select.target_list {
+        let Some(Node::ResTarget(t)) = target.node.as_ref() else {
+            out.push(("?column?".to_string(), None));
+            continue;
+        };
+        let Some(val) = t.val.as_deref() else {
+            out.push(("?column?".to_string(), None));
+            continue;
+        };
+        if let Some(Node::ColumnRef(c)) = val.node.as_ref() {
+            let star = matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_)));
+            if star {
+                let rel = match c.fields.as_slice() {
+                    [only] if matches!(only.node, Some(Node::AStar(_))) => None,
+                    [r, _] => match r.node.as_ref() {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let items: Vec<&Derived> = derived.iter().filter(|d| rel.is_none_or(|r| d.alias == r)).collect();
+                // Only a FROM list of derived items alone (no join's USING merge) expands.
+                let plain = rel.is_some() || select.from_clause.iter().all(|i| !matches!(i.node, Some(Node::JoinExpr(_))));
+                // An item holding a `*` of its own (a table's) cannot be listed.
+                let listed = |d: &&Derived| {
+                    d.columns.clone().filter(|c| !c.iter().any(|(n, _)| n == "*"))
+                };
+                match items.iter().map(listed).collect::<Option<Vec<_>>>() {
+                    Some(lists) if plain && !items.is_empty() => out.extend(lists.into_iter().flatten()),
+                    _ => out.push(("*".to_string(), None)),
+                }
+                continue;
+            }
+            let name = if t.name.is_empty() { target_name(val) } else { t.name.clone() };
+            out.push((name, lookup(c)));
+            continue;
+        }
+        let name = if t.name.is_empty() { target_name(val) } else { t.name.clone() };
+        out.push((name, expression_type(val)));
+    }
+    out
+}
+
+/// The derived items `item` brings into scope: a subselect, a CTE read by name, and a join's sides.
+fn from_derived(item: &PgNode, ctes: &[(String, Vec<(String, Option<u32>)>)], out: &mut Vec<Derived>) {
+    let rename = |columns: &mut Vec<(String, Option<u32>)>, names: &[PgNode]| {
+        for (column, name) in columns.iter_mut().zip(names) {
+            if let Some(Node::String(n)) = name.node.as_ref() {
+                column.0.clone_from(&n.sval);
+            }
+        }
+    };
+    match item.node.as_ref() {
+        Some(Node::RangeSubselect(r)) => {
+            let Some(alias) = r.alias.as_ref() else { return };
+            let columns = match r.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(Node::SelectStmt(q)) if !r.lateral => {
+                    let mut columns = select_fixed(q, ctes);
+                    rename(&mut columns, &alias.colnames);
+                    Some(columns)
+                }
+                _ => None,
+            };
+            out.push(Derived { alias: alias.aliasname.clone(), columns });
+        }
+        Some(Node::RangeVar(rv)) => {
+            let alias = rv.alias.as_ref().map_or(rv.relname.clone(), |a| a.aliasname.clone());
+            let columns = (rv.schemaname.is_empty())
+                .then(|| ctes.iter().rev().find(|(n, _)| *n == rv.relname))
+                .flatten()
+                .map(|(_, columns)| {
+                    let mut columns = columns.clone();
+                    if let Some(a) = &rv.alias {
+                        rename(&mut columns, &a.colnames);
+                    }
+                    columns
+                });
+            out.push(Derived { alias, columns });
+        }
+        Some(Node::JoinExpr(j)) => {
+            if let Some(l) = j.larg.as_deref() {
+                from_derived(l, ctes, out);
+            }
+            if let Some(r) = j.rarg.as_deref() {
+                from_derived(r, ctes, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The result columns of a plain SELECT (as [`expression_types`] lines them up) that are a bare

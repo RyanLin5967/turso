@@ -842,6 +842,10 @@ fn prepare_statement_checked(
             for (column, fixed) in types.columns.iter_mut().zip(fixed) {
                 *column = column.or(fixed);
             }
+        } else if types.columns.is_empty() {
+            // A `*` over derived tables and CTEs alone, which expression_types expanded (the
+            // aggregate list cannot line up with a `*`, so it is empty).
+            types.columns = fixed;
         }
         types.used = used;
     }
