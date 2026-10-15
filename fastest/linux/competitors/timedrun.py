@@ -380,10 +380,12 @@ def raw_problems(nm, d, sm):
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
     else:
-        # the lead's claim_ns ruling: claim_op decides an op's phase at its CLAIM and stamps tm1 at a claim, so the window
-        # is judged on claim_ns when the raw has it. In closed loop intended_ns is the op's start, which at C > 1 can
-        # fall after tm1 for an op claimed before it (a false refusal); without claim_ns, intended_ns as before
-        key, word = ("claim_ns", "claimed") if "claim_ns" in cols else ("intended_ns", "intended")
+        # the lead's claim_ns ruling: the window is judged on the field claim_op stamped tm1 with. Closed loop: the
+        # claim's clock reading (claim_ns); intended_ns is the op's start there, which at C > 1 can fall after tm1 for an
+        # op claimed before it (a false refusal). Open loop: the claimed arrival's intended time (intended_ns), whatever
+        # the claim's clock read (a backlogged client claims late, a free one early). Without claim_ns, intended_ns.
+        closed = sm.get("loop") == "closed"
+        key, word = ("claim_ns", "claimed") if closed and "claim_ns" in cols else ("intended_ns", "intended")
         try:
             late = sum(1 for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1)
         except (ValueError, TypeError):
