@@ -8599,3 +8599,56 @@ fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
         );
     }
 }
+
+/// Engine review 19 LOW 11 (a cost regime, pinned): past UPGRADE_HARD_CAP (4) times the hold
+/// bound in held frees, the background writer has fallen behind, and the next freeing operation, a
+/// delete or a branch commit, leads the held-free upgrade on its own thread after its own wait and
+/// before it returns (`upgrade_if_overdue`), so 5dc0a1a3c's "0 syncs on create, connect, first
+/// write and delete" does not hold for a delete there. The bound forced to 1, the writer held where
+/// it found the upgrade due, four branches of two slots each reaped (8 held; a release matures
+/// nothing), one fork (its mature arms the upgrade and marks it overdue), then one more delete: it
+/// leads exactly one upgrade and syncs on its own thread. Both modes. Expected PASS: it pins the
+/// regime the record now states.
+#[test]
+fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, mut held) = raised_d0_with_a_kept_pre_image(&dir.path().join("hard-cap.db"), catalog, true);
+        let others: Vec<Branch> = (0..3i64)
+            .map(|i| {
+                let b = trunk.fork_branch().unwrap();
+                write_v(&b.connect().unwrap(), 20 + i, "b");
+                write_v(&b.connect().unwrap(), 45 + i, "b");
+                b
+            })
+            .collect();
+        db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        x.reap().unwrap();
+        for b in others {
+            held.extend(b.owned_slots());
+            b.reap().unwrap();
+        }
+        let d = trunk.fork_branch().unwrap();
+        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+        });
+        assert!(
+            held.len() > 4 && held.iter().all(|&s| !db.branch_slot_is_free(s)),
+            "{what}: premise: more than 4 slots are held ({}), past the hard cap",
+            held.len()
+        );
+        let (upgrades, syncs) = (db.branches.group_counters()[4], super::store::thread_syncs());
+        d.reap().unwrap();
+        let led = db.branches.group_counters()[4] - upgrades;
+        let synced = super::store::thread_syncs() - syncs;
+        db.branches.confirm_hold_for_test(0);
+        assert_eq!(led, 1, "{what}: a delete past the hard cap led {led} held-free upgrades, not one");
+        assert!(synced > 0, "{what}: the upgrade the delete led did not sync on its thread");
+        eventually(&format!("{what}: the held slots never came free"), || {
+            held.iter().all(|&s| db.branch_slot_is_free(s))
+        });
+    }
+}
