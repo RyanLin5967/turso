@@ -1213,7 +1213,12 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         m.insert("threads", c);
         m.insert("acks", c * rounds);
         m.insert("flights", delta(f0, f1));
-        m.insert("confirms_burst", total.saturating_sub(tail));
+        // C29 MED: the burst's words counted directly (the writer's log, taken before the burst's
+        // last create returned), so `burst + tail == total` below is a check, not an identity.
+        m.insert(
+            "confirms_burst",
+            logged.iter().filter(|(at, _)| spans.iter().flatten().map(|s| s.1).max().is_some_and(|l| *at <= l)).count() as u64,
+        );
         m.insert("confirms_tail", tail);
         m.insert("confirms_total", total);
         // The old reading, words by the time the parent read them (reported only).
@@ -3113,9 +3118,10 @@ fn recovery_appends_nothing_to_the_log() {
 // ---- checkpoints: the threshold lowered so creates and first writes start them ----
 
 /// What the operations that started a checkpoint cost beyond the same operation's steady cost
-/// (`ckpt_started == 0`), summed per counter, with the checkpoints installed. Refuses fewer than
-/// three.
-fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
+/// (`ckpt_started == 0`), summed for each of `keys` (the counters the caller budgets: C36 MED, a
+/// fixed list asked for `syscalls`, which no sample off Apple has), with the checkpoints installed.
+/// Refuses fewer than three, and a sample without one of `keys`.
+fn checkpoint_excess(spec: &str, keys: &[&'static str]) -> (u64, BTreeMap<&'static str, i64>) {
     let c = cell(spec);
     let mut excess: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut installed = 0;
@@ -3125,7 +3131,7 @@ fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
         assert!(calm.len() * 2 >= samples.len(), "{spec}: {op}: most operations started a checkpoint");
         for s in samples.iter().filter(|s| s["ckpt_started"] > 0) {
             installed += s["ckpt_installed"];
-            for k in ["syscalls", "held_syscalls", "held_syncs", "fsync", "full_fsync", "barrier", "locks_process", "catalog_queries"] {
+            for &k in keys {
                 // DECISIONS 994f7d41e0: a counter the sample lacks is refused, not skipped.
                 let v = *s.get(k).unwrap_or_else(|| panic!("{spec}: {op}: a sample has no {k}"));
                 let base = calm.iter().map(|m| m[k]).min().unwrap();
@@ -3148,7 +3154,7 @@ fn a_checkpoint_issues_no_sync_under_the_store_mutex() {
     }
     for spec in ["ckpt_n10", "ckpt_n1e4"] {
         let c = cell(spec);
-        let (n, _) = checkpoint_excess(spec);
+        let (n, _) = checkpoint_excess(spec, &[]);
         for op in ["ckpt_create", "ckpt_first_write"] {
             let held: u64 = values(&c, op, &quiet(&c, op), "held_syncs").iter().sum();
             assert_eq!(held, 0, "{spec}: {op}: {held} syncs under the store mutex over {n} checkpoints [review 1 #7]");
@@ -3168,7 +3174,7 @@ fn a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
         return;
     }
     for spec in ["ckpt_n10", "ckpt_n1e4"] {
-        let (n, excess) = checkpoint_excess(spec);
+        let (n, excess) = checkpoint_excess(spec, &["held_syscalls"]);
         let held = excess["held_syscalls"];
         assert!(
             held <= 2 * n as i64,
@@ -3187,7 +3193,7 @@ fn a_checkpoint_flushes_at_most_three_times() {
         return;
     }
     for spec in ["ckpt_n10", "ckpt_n1e4"] {
-        let (n, excess) = checkpoint_excess(spec);
+        let (n, excess) = checkpoint_excess(spec, &[FULL, NOT_FULL, "barrier"]);
         let full = excess[FULL];
         let other = excess[NOT_FULL] + excess["barrier"];
         assert!(
@@ -3208,8 +3214,13 @@ fn a_checkpoint_costs_the_same_at_10_and_at_10_000_live_branches() {
         return;
     }
     const CKPT_SYSCALL_SLACK: f64 = 1.10;
-    let (na, a) = checkpoint_excess("ckpt_n10");
-    let (nb, b) = checkpoint_excess("ckpt_n1e4");
+    // The kernel's syscall count exists on Apple only (`probe::unix_syscalls`): asked there, named.
+    let mut keys = vec!["fsync", "full_fsync", "barrier", "catalog_queries", "held_syncs"];
+    if cfg!(target_vendor = "apple") {
+        keys.push("syscalls");
+    }
+    let (na, a) = checkpoint_excess("ckpt_n10", &keys);
+    let (nb, b) = checkpoint_excess("ckpt_n1e4", &keys);
     assert_eq!(na, nb, "premise: as many checkpoints at both N");
     let mut failures = String::new();
     for k in ["fsync", "full_fsync", "barrier", "catalog_queries", "held_syncs"] {
@@ -3217,7 +3228,8 @@ fn a_checkpoint_costs_the_same_at_10_and_at_10_000_live_branches() {
             let _ = writeln!(failures, "  {k}: N=10 {:?}, N=10^4 {:?}", a.get(k), b.get(k));
         }
     }
-    if let (Some(&x), Some(&y)) = (a.get("syscalls"), b.get("syscalls")) {
+    if cfg!(target_vendor = "apple") {
+        let (x, y) = (a["syscalls"], b["syscalls"]);
         let ratio = y as f64 / x.max(1) as f64;
         // Two comparisons, not a range's `contains`: a NaN ratio must not read as outside it.
         #[allow(clippy::manual_range_contains)]
@@ -4565,6 +4577,26 @@ fn a_d1_open_makes_two_plain_fsyncs() {
     let v = open_premises(&c, Some(1), &mut failures);
     open_exact(&c, &v, [0, 2, 0, 2, 1], "the log's bytes and its name, nothing proven at D1 on Apple", &mut failures);
     assert!(failures.is_empty(), "a D1 open:\n{failures}");
+}
+
+/// C29 MED (a Claude review, 2026-10-15): a_d1_open_makes_two_plain_fsyncs' [0, 2, 0, 2, 1] rests on
+/// the engine's own arm choice (the class, not the word). Re-derived as the D2 confirmed case is: the
+/// log's bytes are already proven by the word, which the clean close wrote after a full flush of its
+/// own (`Confirm::write_at_close`, a81058160), so the open must make durable only the log's NAME (a
+/// rename it may not have synced), and at D1 that is one plain fsync of the directory: (full_fsync,
+/// fsync, thread_full, thread_plain, dir_syncs) = (0, 1, 0, 1, 1). Expected RED: the engine issues 2
+/// (it syncs the log too). The older test stays beside it until the lead rules which stands.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d1_open_of_a_confirmed_log_syncs_only_its_directory() {
+    if in_child() {
+        return;
+    }
+    let c = cell("open_d1");
+    let mut failures = String::new();
+    let v = open_premises(&c, Some(1), &mut failures);
+    open_exact(&c, &v, [0, 1, 0, 1, 1], "the word proves the bytes; only the name, one plain directory fsync at D1", &mut failures);
+    assert!(failures.is_empty(), "a D1 open of a confirmed log:\n{failures}");
 }
 
 /// Review 2 M5: an internal retry (a refusal the caller never sees, retried inside the engine) shows
