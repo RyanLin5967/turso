@@ -8093,6 +8093,44 @@ fn a_key_the_translator_refuses_is_refused_before_the_rebuild() {
     assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "2");
 }
 
+/// A foreign key onto a rowid name the parent does not declare (`REFERENCES p(rowid)`, `_rowid_`,
+/// `oid`) is 42703, as PostgreSQL answers, by the precheck: before a CREATE TABLE runs and before an
+/// ALTER's rebuild, so while another session holds the trunk's write lock the ALTER is answered at
+/// once, status I, not 55P03 after the lock wait. A key onto a declared column named rowid is
+/// refused 0A000: the engine never resolves a key onto a rowid name (ForeignKey::validate). The
+/// precheck took any rowid name as the parent's rowid, so the CREATE was refused after it ran and
+/// the ALTER after its lock-held copies (wire review 16 item 16). The server's lock wait is 300 ms.
+#[test]
+fn a_key_onto_a_rowid_name_is_refused_before_anything_runs() {
+    let dir = Scratch::new("fkrowid");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    for name in ["rowid", "_rowid_", "oid"] {
+        let sql = format!("CREATE TABLE k(x INT REFERENCES p({name}))");
+        assert_eq!(a.q(&sql).err(&sql).code, "42703", "{sql}");
+    }
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9)")
+        .ok("another session takes the write lock");
+    let alter = "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(rowid)";
+    let r = a.q(alter);
+    assert_eq!(r.err(alter).code, "42703", "not 55P03 after the lock wait");
+    assert_eq!(r.status, b'I');
+    w.q("ROLLBACK").ok("end");
+    a.q("INSERT INTO c VALUES (7)")
+        .ok("c is unchanged: no key was added");
+    a.q("CREATE TABLE q(rowid INT UNIQUE)")
+        .ok("q declares a column named rowid");
+    let declared = "CREATE TABLE k(x INT REFERENCES q(rowid))";
+    assert_eq!(a.q(declared).err(declared).code, "0A000", "{declared}");
+    a.q("CREATE TABLE k(x INT REFERENCES p(id))")
+        .ok("control: no k was left behind, and a key onto p(id) is accepted");
+}
+
 /// ALTER TABLE ADD CONSTRAINT's rebuild leaves the deferred foreign keys' pending count as it found
 /// it. Its copy-back ran with foreign keys enforced, so it counted rows again: (i) a block's
 /// deferred orphan was cancelled by a valid child the copy re-inserted, and COMMIT kept the
