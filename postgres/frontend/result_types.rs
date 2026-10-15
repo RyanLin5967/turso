@@ -1718,8 +1718,14 @@ pub fn element_of(array: u32) -> Option<u32> {
 
 /// (element type, its array type) from pg_type: bool, bytea, int2, int4, int8, text, varchar,
 /// bpchar, float4, float8, numeric, json, jsonb, uuid, date, time, timestamp, timestamptz.
-const ARRAYS: [(u32, u32); 18] = [
+const ARRAYS: [(u32, u32); 22] = [
     (16, 1000),
+    // inet, cidr, macaddr and oid (wire review 13 item 18: without them a parameter against such
+    // an array column was 42P18).
+    (869, 1041),
+    (650, 651),
+    (829, 1040),
+    (26, 1028),
     (17, 1001),
     (21, 1005),
     (23, 1007),
