@@ -43,8 +43,10 @@ Gates (any failure makes the measurement VOID, and the block with it):
   - the drive's queue/write_cache reads "write back" or "write through" (anything else VOIDs); on "write back" the flush
     counter rises by at least 10,000 across the timed fsync run AND across the strace-checked labelling run (a lower
     bound: another process's flushes can pad it, never shrink it; T3 runner review item 3), and the timed run's
-    flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, provisional until
-    registered); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
+    flushes per fsync are at least the labelling run's x (1 - SLACK) (item 18; SLACK = 0.05, registered as PREREG
+    annex A27 and bound to a measurement: the fsync arm takes two labelling runs back to back, and a real run refuses
+    before any timed run when their drive flush counts differ by more than SLACK/2 of the larger; a dry run records
+    the pair); on "write through" it reads 0 in both runs. Every LOOP layer is gated the same way on its own
     counter (gate-6 review M3), so a write-through layer above the drive shows as a drive counter that did not rise;
   - the leaf's queue/iostats reads 1 (recorded in leaf.iostats; measure() refuses otherwise, and gates() VOIDs a
     record without it on its own text): the sectors-written counter moves only with iostats on (review 5 MED 2);
@@ -86,10 +88,10 @@ import time
 from fractions import Fraction
 
 N = 10000
-SLACK = Fraction("0.05")  # provisional until registered: the floor rule's allowance, timed vs labelling flushes per fsync
-# the PREREG annex row that registers SLACK (review 5 LOW 29); None until the lead registers it, and while it is None a
-# real run (V3L_REAL=1) refuses, because SLACK would gate a billed run unregistered
-SLACK_REGISTERED = None
+SLACK = Fraction("0.05")  # registered: annex A27. The floor rule's allowance, timed vs labelling flushes per fsync
+# the PREREG annex row that registers SLACK (review 5 LOW 29); while it is None a real run (V3L_REAL=1) refuses. A27
+# (DECISIONS cb6074aa3a) binds SLACK to a labelling pair (lab_pair_problem); SLACK changes only by an appended row
+SLACK_REGISTERED = "A27"
 V1L = ["strace", "-f", "-y", "-ttt",
        "-e", "trace=%file,%desc,ioctl,copy_file_range,sync_file_range,syncfs,msync,fallocate"]
 WRITES = ("write", "pwrite64", "writev", "pwritev", "pwritev2")
@@ -410,7 +412,7 @@ def counter_gate(what, wc, timed, lab):
       fsyncs cannot pass on a stack that makes 2 per fsync, nor ~47% of them at 1.9 per fsync as the whole-number
       floor lab // N let it (gate-6 review 7, lane review MED 3, T3 runner review item 18). Exact rationals, so the
       edge (timed = 0.95 x labelling) passes. SLACK absorbs the labelling run's padding by another process's
-      flushes; its value is provisional until registered. Blind spot, stated: a record with NO labelling count
+      flushes; its value is registered (annex A27) and bound to the labelling pair. Blind spot, stated: a record with NO labelling count
       (None) gets the timed rule only; measure() has written one for the drive and every loop layer since 7dc4d4c04,
       so only a record from before then, or a hand-made one, is judged that way;
     write through: the counter must read 0 in both runs (the block layer sends no flush; a count contradicts the
@@ -455,6 +457,20 @@ def real_mode_problem(real, chain, disk, leafrec):
     if not leafrec:
         return "a real run needs the V3 batch's leaf record (LEAFREC): the drive's own cache report is cross-checked"
     return registration_problem()
+
+
+def lab_pair_problem(first, second):
+    """Annex A27: why two back-to-back labelling runs' drive flush counts do not bind SLACK, or None. They may differ
+    by at most SLACK/2 of the larger, so the padding SLACK allows sits well inside the allowance it justifies; a
+    count that is not an int cannot bind it."""
+    if any(not isinstance(v, int) or isinstance(v, bool) for v in (first, second)):
+        return f"the labelling pair's flush counts are unreadable ({first!r}, {second!r}): SLACK is not bound (annex A27)"
+    big = max(first, second)
+    if Fraction(abs(first - second)) > SLACK / 2 * big:
+        return (f"the two labelling runs' drive flush counts {first} and {second} differ by {abs(first - second)}, more "
+                f"than SLACK/2 ({float(SLACK / 2)}) of the larger ({big}): the padding SLACK allows is not bound "
+                "(annex A27); refused before any timed run")
+    return None
 
 
 def registration_problem():
@@ -521,6 +537,27 @@ def measure(d, out, leafrec=None):
         a["labelling_fio"] = fio_numbers(lj)
         a["labelling_fio"].pop("fsync_bins_ns", None)
         os.unlink(f)
+        if fs:
+            # annex A27: a second labelling run, back to back (its own sync first, A24), binds SLACK to a measurement:
+            # the two runs' drive flush counts may differ by at most SLACK/2 of the larger. A real run refuses here,
+            # before any timed run; a dry run records the pair, so this path runs on every dry run before a paid box
+            tr2, lj2 = os.path.join(out, f"{arm}-2.v1l"), os.path.join(out, f"{arm}-labelling-2.json")
+            cmd2 = V1L + ["-o", tr2] + fio_cmd(f"v3l-{arm}", f, fs, lj2)
+            rec["argv"][f"{arm}/labelling-2"] = cmd2
+            sy_lab2 = sync_record(paths=sync_paths)
+            h0 = flush_ios(disk)
+            r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=3600)
+            h1 = flush_ios(disk)
+            if r2.returncode != 0:
+                raise RuntimeError(f"second labelling {arm} run rc {r2.returncode}: {r2.stderr[-400:]}")
+            a["v1l_2"] = parse_v1l(open(tr2).read(), f)
+            os.unlink(f)
+            pair = {"first": g1 - g0, "second": h1 - h0, "allowance": f"SLACK/2 = {float(SLACK / 2)} of the larger",
+                    "sync": sy_lab2}
+            pair["problem"] = lab_pair_problem(pair["first"], pair["second"])
+            a["lab_pair"] = pair
+            if pair["problem"] and os.environ.get("V3L_REAL") == "1":
+                raise RuntimeError(pair["problem"])
         tj = os.path.join(out, f"{arm}-timed.json")
         cmd = fio_cmd(f"v3l-{arm}", f, fs, tj)
         rec["argv"][f"{arm}/timed"] = cmd
@@ -577,7 +614,7 @@ def publish(rec):
                        for lay in rec["leaf"].get("layers") or []},
             "floor_slack": float(SLACK),
             "floor_rule": "write back: timed flushes per fsync >= labelling flushes per fsync x (1 - floor_slack); "
-                          "the slack is provisional until registered"}
+                          "the slack is annex A27, bound to a labelling pair within floor_slack/2"}
 
 
 def floor_kind(rec):
@@ -817,18 +854,27 @@ def _block_of(r):
         os.rmdir(d)
 
 
-def _measure_with(patches, env=None):
+def _measure_with(patches, env=None, leaf=None):
     """measure() on a fake box (review 5 LOW 25, review 6 LOW 10): PATCHES replaces module functions (resolve_leaf,
-    disk_attr, sh) for one call and ENV sets variables; returns (the exception's text or None, whether OUT was made).
-    Both are restored, and the temp dir removed, whatever the call did."""
+    disk_attr, sh, ...) for one call and ENV sets variables; LEAF, when given, is written as the V3 leaf record and
+    passed as LEAFREC. Returns (the exception's text or None, whether OUT was made). Both are restored, and the temp
+    dir removed, whatever the call did."""
     g, d = globals(), tempfile.mkdtemp(prefix="v3l-m-")
     saved, env0 = {k: g[k] for k in patches}, {k: os.environ.get(k) for k in (env or {})}
     out = os.path.join(d, "out")
+    lr = None
+    if leaf is not None:
+        lr = os.path.join(d, "leaf.json")
+        with open(lr, "w") as f:
+            json.dump(leaf, f)
     try:
         g.update(patches)
         os.environ.update(env or {})
         try:
-            measure(os.path.join(d, "dir"), out)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):  # measure() prints its summary line
+                measure(os.path.join(d, "dir"), out, lr)
             return None, os.path.exists(out)
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}", os.path.exists(out)
@@ -840,6 +886,44 @@ def _measure_with(patches, env=None):
             else:
                 os.environ[k] = v
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _runs_box(lab1, lab2, calls):
+    """_fake_box plus the runs (annex A27's labelling pair): a fake subprocess whose run() records each command in
+    CALLS and writes what the command would (the trace, fio's JSON, the data file), a flush counter that rises LAB1
+    across the first labelling run and LAB2 across the second (then N + 3 per timed run, 0 on the control), and a
+    passing sync record. Nothing real runs."""
+    import types
+    fio = {"jobs": [{"write": {"total_ios": N, "lat_ns": {"percentile": {"50.000000": 100000.0}}},
+                     "sync": {"lat_ns": {"N": N - 1, "percentile": {"50.000000": 300000.0, "99.000000": 900000.0},
+                                         "bins": {"300000": N - 1}}}}]}
+
+    def run(cmd, **_k):
+        calls.append(list(cmd))
+        for x in cmd:
+            if x.startswith("--output="):
+                with open(x[len("--output="):], "w") as f:
+                    json.dump(fio, f)
+            if x.startswith("--filename="):
+                open(x[len("--filename="):], "w").close()
+        if "-o" in cmd:
+            open(cmd[cmd.index("-o") + 1], "w").close()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    seq = iter([0, lab1, lab1, lab1 + lab2, lab1 + lab2, lab1 + lab2 + N + 3])
+    last = [0]
+
+    def flush(_disk):
+        last[0] = next(seq, last[0])
+        return last[0]
+    box = _fake_box()
+    box.update({"subprocess": types.SimpleNamespace(run=run, CompletedProcess=subprocess.CompletedProcess,
+                                                    TimeoutExpired=subprocess.TimeoutExpired),
+                "flush_ios": flush, "sectors_written": lambda _d: 0,
+                "sync_record": lambda **_k: {"ran": True, "rc": 0, "layers": [{"path": "/fs0", "rc": 0, "secs": 0.0}]}})
+    return box
+
+
+_LEAF = {"leaf": {"disk": "nvme1n1", "drive_reports": "write back"}, "virtualization": {"virtualized": False}}
 
 
 def _with_global(name, value, f):
@@ -854,6 +938,16 @@ def _with_global(name, value, f):
             g[name] = old
         else:
             g.pop(name, None)
+
+
+def _main_out(argv):
+    """main(ARGV) with its stdout captured: (rc, stdout)"""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue()
 
 
 def _fake_box(iostats="1", chain=("nvme1n1",), disk="nvme1n1"):
@@ -1069,8 +1163,9 @@ def self_test():
          gates(_lab(rec(delta=19000), 20000)) == []),
         ("item 18: labelling 2 per fsync (20000), timed 18999 (just under 0.95 of it) VOIDs",
          _has(gates(_lab(rec(delta=18999), 20000)), "per fsync the labelling run showed")),
-        ("item 18: SLACK is one named constant, 0.05, marked provisional until registered",
-         _ok(lambda: float(SLACK) == 0.05 and re.search(r"^SLACK = .*provisional until registered",
+        # TEST EDIT, flagged as a SPEC CHANGE (annex A27 registers SLACK): the constant's comment now names its row
+        ("item 18: SLACK is one named constant, 0.05, marked registered as annex A27",
+         _ok(lambda: float(SLACK) == 0.05 and re.search(r"^SLACK = .*registered: annex A27",
                                                          open(__file__).read(), re.M) is not None)),
         ("item 18: the record publishes both ratios and the slack (drive 2.0003 timed, 2.0004 labelling; layer 1.5, 2.0)",
          _ok(lambda: (lambda p: p["flush_ios_per_fsync"] == 2.0003 and p["lab_flush_ios_per_fsync"] == 2.0004
@@ -1225,14 +1320,40 @@ def self_test():
              _measure_with(_fake_box(chain=("loop0", "sda1"), disk="sda"), env={"V3L_REAL": "1"})))),
         # review 5 LOW 29: SLACK can gate a billed run, so a real run refuses until a PREREG annex row registers it;
         # the registration check is also t3run's preflight (v3l.py registration), before deps and build are paid for
+        # TEST EDIT, flagged as a SPEC CHANGE (annex A27 registers SLACK): the two LOW 29 cases that read the
+        # unregistered state now set SLACK_REGISTERED to None for their call; expectations unchanged
         ("LOW 29: a real run on a drive with its leaf record refuses while SLACK is unregistered",
-         _ok(lambda: "SLACK" in (real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json") or ""))),
+         _ok(lambda: "SLACK" in (_with_global("SLACK_REGISTERED", None,
+                                              lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json"))
+                                 or ""))),
         ("LOW 29: with SLACK registered (an annex row named), the same real run is allowed",
          _ok(lambda: _with_global("SLACK_REGISTERED", "A99 (self-test)",
                                   lambda: real_mode_problem("1", ["nvme1n1"], "nvme1n1", "leaf.json")) is None)),
         ("LOW 29: registration_problem() names the unregistered SLACK; with a row named it is None",
-         _ok(lambda: "unregistered" in (registration_problem() or "")
+         _ok(lambda: "unregistered" in (_with_global("SLACK_REGISTERED", None, registration_problem) or "")
              and _with_global("SLACK_REGISTERED", "A99 (self-test)", registration_problem) is None)),
+        # annex A27 (the lead's ruling, DECISIONS cb6074aa3a): SLACK = 0.05 is registered, bound to a measurement: every
+        # real run takes two labelling runs back to back and refuses (rc 2, before any timed run) when their drive
+        # flush counts differ by more than SLACK/2 of the larger
+        ("A27: SLACK_REGISTERED is 'A27', so registration_problem() is None",
+         _ok(lambda: SLACK_REGISTERED == "A27" and registration_problem() is None)),
+        ("A27: `v3l.py registration` exits 0 and names A27",
+         _ok(lambda: (lambda r: r[0] == 0 and "A27" in r[1])(_main_out(["v3l.py", "registration"])))),
+        ("A27: a labelling pair of 20000 and 20000 binds SLACK", _ok(lambda: lab_pair_problem(20000, 20000) is None)),
+        ("A27: 20000 and 20500 (500 <= 0.025 x 20500 = 512.5) binds SLACK",
+         _ok(lambda: lab_pair_problem(20000, 20500) is None)),
+        ("A27: 20000 and 20600 (600 > 0.025 x 20600 = 515) refuses, naming A27",
+         _ok(lambda: "A27" in (lab_pair_problem(20000, 20600) or ""))),
+        ("A27: 0 and 0 (a write-through drive) binds SLACK", _ok(lambda: lab_pair_problem(0, 0) is None)),
+        ("A27: a pair with a count that is not an int refuses", _ok(lambda: lab_pair_problem("20000", 20000) is not None)),
+        ("A27: measure(), real, a labelling pair 20000 and 21000 refuses (A27) after exactly the two labelling runs",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "A27" in r[0] and len(calls) == 2
+                                     and all(c[0] == "strace" for c in calls))(
+             _measure_with(_runs_box(20000, 21000, calls), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        ("A27: measure(), real, a labelling pair 20000 and 20000 goes on: the third run is the timed fio",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is None and len(calls) >= 3 and calls[0][0] == calls[1][0] == "strace"
+                                     and calls[2][0] == "fio")(
+             _measure_with(_runs_box(20000, 20000, calls), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
         # review 5 LOW 23: a write-back record whose flush counts VOID never reads as "flush requests completed"
         ("LOW 23: floor_kind of a write-back record with 0 flushes is the VOID text",
          _ok(lambda: floor_kind(rec(delta=0)) == "write-back drive with flushes short (VOID)")),
