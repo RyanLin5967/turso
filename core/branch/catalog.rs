@@ -486,6 +486,9 @@ pub(crate) struct Catalog {
     pub(crate) prewarm: PrewarmStats,
     meta_all: Stmt,
     meta_put: Stmt,
+    /// LEAP L4: the facts' keys, deleted when a meta row of a format without them is written over
+    /// one that had them, so no stale fact is left behind.
+    meta_del_facts: Stmt,
     branch_get: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
@@ -590,6 +593,7 @@ impl Catalog {
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
+            meta_del_facts: p("DELETE FROM meta WHERE k >= 10")?,
             branch_get: p(
                 "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
             )?,
@@ -1018,6 +1022,8 @@ impl Catalog {
                 self.meta_put
                     .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
             }
+        } else {
+            self.meta_del_facts.exec(&[], &mut self.counters)?;
         }
         Ok(())
     }
