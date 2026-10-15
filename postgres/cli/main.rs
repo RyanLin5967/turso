@@ -712,24 +712,26 @@ fn execute_sql(
     expanded: bool,
     w: &mut dyn Write,
 ) -> bool {
-    let runner = conn.query_runner(sql.as_bytes());
+    let mut runner = conn.query_runner(sql.as_bytes());
     let mut had_error = false;
-    for mut output in runner {
+    while let Some(output) = runner.next_typed() {
         match output {
-            Ok(Some(ref mut stmt)) => {
+            Ok((mut stmt, types)) => {
                 let result = if expanded {
-                    print_result_set_expanded(stmt, w)
+                    print_result_set_expanded(&mut stmt, w)
                 } else {
-                    print_result_set(stmt, table_config, w)
+                    print_result_set(&mut stmt, table_config, w)
                 };
                 if let Err(e) = result {
+                    conn.statement_failed();
                     let _ = writeln!(w, "Error: {e}");
                     had_error = true;
                     break;
                 }
+                conn.statement_completed(&types);
             }
-            Ok(None) => {}
             Err(ref e) => {
+                conn.statement_failed();
                 let _ = writeln!(w, "Error: {e}");
                 had_error = true;
                 break;

@@ -16,6 +16,7 @@ use turso_pg_parser::translator::{
 };
 
 use crate::copy::parse_copy_text_format;
+use crate::settings::{Setting, Settings, SettingsTransaction, Values};
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -27,7 +28,7 @@ struct PgConnectionInner {
     /// A parking_lot lock, as is the view cache's: std's Mutex on Apple boxes its pthread mutex at
     /// the first lock, one allocation per new connection paid inside the branch switch that opens
     /// it (L5's switch budget).
-    session_state: parking_lot::Mutex<SessionState>,
+    session_state: parking_lot::Mutex<Settings>,
     /// A statement failed and undoing it failed too: the engine connection holds a transaction in
     /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
     /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
@@ -47,10 +48,7 @@ struct PgConnectionInner {
     /// A stamp of the last assignment to the search path, unique across connections, 0 before any
     /// ([`PgConnection::search_path_stamp`]).
     search_path_stamp: std::sync::atomic::AtomicU64,
-    /// The statement being prepared runs in a transaction block the client opened (BEGIN), as the
-    /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
-    /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
-    explicit_block: std::sync::atomic::AtomicBool,
+
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -127,18 +125,30 @@ fn setting_ms(text: &str) -> Option<u64> {
 }
 
 impl PgConnectionInner {
-    fn set_search_path(&self, path: Vec<String>) {
-        let mut state = self.session_state.lock();
-        state.search_path = path;
+    fn publish_settings(&self, values: &Values, path_changed: bool) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.search_path_stamp
-            .store(SEARCH_PATH_ASSIGNMENTS.fetch_add(1, Relaxed), Relaxed);
+        self.lock_timeout_ms.store(values.lock_timeout_ms, Relaxed);
+        self.statement_timeout_ms
+            .store(values.statement_timeout_ms, Relaxed);
+        self.min_messages.store(values.min_messages, Relaxed);
+        self.conn.set_foreign_keys_enabled(values.foreign_keys);
+        if path_changed {
+            self.search_path_stamp
+                .store(SEARCH_PATH_ASSIGNMENTS.fetch_add(1, Relaxed), Relaxed);
+        }
     }
-}
 
-#[derive(Default)]
-struct SessionState {
-    search_path: Vec<String>,
+    fn assign_setting(&self, setting: Setting, local: bool) {
+        let mut state = self.session_state.lock();
+        let changed = state.assign(setting, local, !self.conn.get_auto_commit());
+        self.publish_settings(&state.current, changed);
+    }
+
+    fn settings_transaction(&self, operation: &SettingsTransaction) {
+        let mut state = self.session_state.lock();
+        let changed = state.transaction(operation);
+        self.publish_settings(&state.current, changed);
+    }
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -185,14 +195,13 @@ impl PgConnection {
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
-                session_state: parking_lot::Mutex::new(SessionState::default()),
+                session_state: parking_lot::Mutex::new(Settings::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
                 view_cache: parking_lot::Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
-                explicit_block: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -237,26 +246,17 @@ impl PgConnection {
     /// connection moves the stamp whatever the path is, and the server asks this before it pays
     /// for [`PgConnection::shown_search_path`] (L5).
     pub fn search_path_is(&self, path: &[String]) -> bool {
-        self.inner.session_state.lock().search_path == path
+        self.inner.session_state.lock().current.search_path == path
     }
 
     /// The session's search path, as SET gave it.
     pub fn search_path(&self) -> Vec<String> {
-        self.inner.session_state.lock().search_path.clone()
+        self.inner.session_state.lock().current.search_path.clone()
     }
 
     /// The session's search path as SHOW search_path gives it.
     pub fn shown_search_path(&self) -> String {
-        shown_search_path(&self.inner.session_state.lock().search_path)
-    }
-
-    /// Whether the statements prepared next run in a transaction block the client opened (true)
-    /// or outside one or in an implicit block (false): the server, which alone tells the two
-    /// kinds of block apart, says so before each statement (see `PgConnectionInner::explicit_block`).
-    pub fn set_explicit_block(&self, explicit: bool) {
-        self.inner
-            .explicit_block
-            .store(explicit, std::sync::atomic::Ordering::Relaxed);
+        shown_search_path(&self.inner.session_state.lock().current.search_path)
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
@@ -268,7 +268,32 @@ impl PgConnection {
     /// Run `tx` from the engine's AST: no SQL text is parsed, so an implicit block costs no
     /// libpg_query call.
     pub fn engine_tx(&self, tx: TxStmt) -> Result<()> {
-        run_tx(&self.inner.conn, tx)
+        run_tx(&self.inner.conn, tx)?;
+        let operation = match tx {
+            TxStmt::Begin => SettingsTransaction::Begin,
+            TxStmt::Commit => SettingsTransaction::Commit,
+            TxStmt::Rollback => SettingsTransaction::Rollback,
+            TxStmt::Savepoint(n) => SettingsTransaction::Savepoint(n.to_owned()),
+            TxStmt::Release(n) => SettingsTransaction::Release(n.to_owned()),
+            TxStmt::RollbackTo(n) => SettingsTransaction::RollbackTo(n.to_owned()),
+        };
+        self.inner.settings_transaction(&operation);
+        Ok(())
+    }
+
+    /// Apply setting-scope transitions after a statement from prepare_typed/next_typed succeeds.
+    pub fn statement_completed(&self, types: &StatementTypes) {
+        if let Some(operation) = &types.settings_transaction {
+            self.inner.settings_transaction(operation);
+        }
+    }
+
+    /// An engine error that ended the transaction also rolls back its settings.
+    pub fn statement_failed(&self) {
+        if self.inner.conn.get_auto_commit() {
+            self.inner
+                .settings_transaction(&SettingsTransaction::Rollback);
+        }
     }
 
     /// Run `f` in a transaction of its own ([`own_transaction`]'s rule: an undo that fails breaks
@@ -289,12 +314,15 @@ impl PgConnection {
     pub fn roll_back_or_break(&self) -> Result<()> {
         let conn = &self.inner.conn;
         if conn.get_auto_commit() {
+            self.inner.settings_transaction(&SettingsTransaction::Rollback);
             return Ok(());
         }
         undo_failpoint()
             .and_then(|()| run_tx(conn, TxStmt::Rollback))
             .and_then(|()| held_after_undo(conn, false))
-            .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo))
+            .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo))?;
+        self.inner.settings_transaction(&SettingsTransaction::Rollback);
+        Ok(())
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
@@ -334,9 +362,16 @@ impl PgConnection {
     }
 
     pub fn execute(&self, sql: impl AsRef<str>) -> Result<()> {
-        for stmt in self.query_runner(sql.as_ref().as_bytes()) {
-            if let Some(mut stmt) = stmt? {
+        let mut runner = self.query_runner(sql.as_ref().as_bytes());
+        while let Some(prepared) = runner.next_typed() {
+            let result = prepared.and_then(|(mut stmt, types)| {
                 stmt.run_ignore_rows()?;
+                self.statement_completed(&types);
+                Ok(())
+            });
+            if let Err(e) = result {
+                self.statement_failed();
+                return Err(e);
             }
         }
         Ok(())
@@ -356,24 +391,16 @@ impl PgConnection {
         PgQueryRunner::new(&self.inner, sql)
     }
 
-    /// Take over `from`'s session settings (the search path): a wire session that moves to another
+    /// Take over all of `from`'s session settings: a wire session that moves to another
     /// engine connection — onto a branch, or back to the trunk — keeps what it SET.
     pub fn adopt_session_of(&self, from: &PgConnection) {
         if Arc::ptr_eq(&self.inner, &from.inner) {
             return;
         }
-        let path = from.inner.session_state.lock().search_path.clone();
-        self.inner.set_search_path(path);
-        use std::sync::atomic::Ordering::Relaxed;
-        self.inner
-            .lock_timeout_ms
-            .store(from.inner.lock_timeout_ms.load(Relaxed), Relaxed);
-        self.inner
-            .statement_timeout_ms
-            .store(from.inner.statement_timeout_ms.load(Relaxed), Relaxed);
-        self.inner
-            .min_messages
-            .store(from.inner.min_messages.load(Relaxed), Relaxed);
+        let values = from.inner.session_state.lock().current.clone();
+        let mut state = self.inner.session_state.lock();
+        state.adopt(values);
+        self.inner.publish_settings(&state.current, true);
     }
 }
 
@@ -581,6 +608,16 @@ pub struct PgQueryRunner<'a> {
 }
 
 impl<'a> PgQueryRunner<'a> {
+    /// Like the iterator, with the transaction metadata needed after execution. Call
+    /// PgConnection::statement_completed on success, or statement_failed on an execution error.
+    pub fn next_typed(&mut self) -> Option<Result<(Statement, StatementTypes)>> {
+        let sql = self.stmts.get(self.index)?;
+        self.index += 1;
+        let mut types = StatementTypes::default();
+        Some(prepare_statement_typed(self.conn, sql, Some(&mut types)).map(|stmt| (stmt, types)))
+    }
+
+
     fn new(conn: &'a Arc<PgConnectionInner>, sql: &'a [u8]) -> Self {
         let sql = str::from_utf8(sql).unwrap_or("");
         Self {
@@ -821,6 +858,12 @@ fn prepare_statement_checked(
     if let Some(n) = first_param.filter(|_| performs) {
         return Err(parameter_refused(n));
     }
+    if let Some(types) = types.as_deref_mut() {
+        types.local_setting_outside_block = matches!(
+            &special,
+            Some(Special::Set(set)) if set.is_local && pg_conn.conn.get_auto_commit()
+        );
+    }
     if let Some(stmt) = try_prepare_special(pg_conn, special)? {
         return Ok(Some(stmt));
     }
@@ -843,7 +886,7 @@ fn prepare_statement_checked(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().search_path.clone();
+            let search_path = pg_conn.session_state.lock().current.search_path.clone();
             // Which attached schema holds a name, probed only when the walk resolves an
             // unqualified name through one, once per (schema, name) per statement (wire review 17
             // item 3).
@@ -928,6 +971,7 @@ fn prepare_statement_checked(
             new_table_keys.clone()
         };
         types.performed = performs;
+        types.settings_transaction = SettingsTransaction::from_stmt(translated.cmd.stmt());
         types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
         types.rolls_back = matches!(
             translated.cmd.stmt(),
@@ -946,7 +990,7 @@ fn prepare_statement_checked(
 
     let options = {
         let state = pg_conn.session_state.lock();
-        let path = state.search_path.clone();
+        let path = state.current.search_path.clone();
         PrepareOptions {
             unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
         }
@@ -1140,28 +1184,6 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 /// the engine.
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
-    // A ROLLBACK cannot undo these here: the search path and the engine's foreign_keys outlive the
-    // block whatever ends it, so `BEGIN; SET foreign_keys = off; ROLLBACK` left keys off, and a
-    // rolled-back SET search_path sent later unqualified writes to another schema's table. So
-    // they are refused where PostgreSQL would undo them: in a block the client opened, and as SET
-    // LOCAL (wire review 16 item 18; review 17 folded search_path into it). An implicit block's
-    // SET (`SET search_path TO s; SELECT ..`) acts, as before.
-    if matches!(name.as_str(), "search_path" | "foreign_keys") {
-        if set_stmt.is_local {
-            return Err(LimboError::ParseError(format!(
-                "SET LOCAL {name} is not supported: this server cannot scope it to the block"
-            )));
-        }
-        if pg_conn
-            .explicit_block
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(LimboError::ParseError(format!(
-                "SET {name} is not supported inside a transaction block: a ROLLBACK could not \
-                 undo it here; set it before BEGIN"
-            )));
-        }
-    }
     if name == "search_path" {
         let path = set_stmt
             .values
@@ -1169,7 +1191,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             .map(|value| value.as_search_path_name().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
+        pg_conn.assign_setting(Setting::SearchPath(path), set_stmt.is_local);
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
@@ -1183,11 +1205,6 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         return Err(LimboError::InvalidArgument(format!(
             "SET {name} takes only one argument"
         )));
-    }
-    if name == "foreign_keys" {
-        return pg_conn
-            .conn
-            .prepare(format!("PRAGMA foreign_keys = {}", value.to_sql_string()));
     }
     let value_text = |value: &PgSetValue| match value {
         PgSetValue::Identifier(v)
@@ -1219,6 +1236,13 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         )))
     };
     let accepted = match name.as_str() {
+        "foreign_keys" => {
+            let Some(on) = pg_bool(&lower) else {
+                return invalid();
+            };
+            pg_conn.assign_setting(Setting::ForeignKeys(on), set_stmt.is_local);
+            true
+        }
         // These change answers PostgreSQL gives, so they act, or are refused, rather than being
         // accepted as no-ops (wire review 16 item 12): lock_timeout is the session's lock wait
         // (0 the server's), client_min_messages filters the messages sent, and the two timeouts
@@ -1227,18 +1251,14 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             let Some(ms) = setting_ms(&text) else {
                 return invalid();
             };
-            pg_conn
-                .lock_timeout_ms
-                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            pg_conn.assign_setting(Setting::LockTimeout(ms), set_stmt.is_local);
             true
         }
         "client_min_messages" => {
             let Some(rank) = message_rank(&text) else {
                 return invalid();
             };
-            pg_conn
-                .min_messages
-                .store(rank, std::sync::atomic::Ordering::Relaxed);
+            pg_conn.assign_setting(Setting::MinMessages(rank), set_stmt.is_local);
             true
         }
         // The server stops a statement running past it (57014).
@@ -1246,20 +1266,14 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             let Some(ms) = setting_ms(&text) else {
                 return invalid();
             };
-            pg_conn
-                .statement_timeout_ms
-                .store(ms, std::sync::atomic::Ordering::Relaxed);
+            pg_conn.assign_setting(Setting::StatementTimeout(ms), set_stmt.is_local);
             true
         }
-        "idle_in_transaction_session_timeout" | "transaction_timeout" => {
-            match setting_ms(&text) {
-                Some(0) => true,
-                Some(_) => {
-                    return unsupported("this server enforces no such timeout; 0 is accepted")
-                }
-                None => return invalid(),
-            }
-        }
+        "idle_in_transaction_session_timeout" | "transaction_timeout" => match setting_ms(&text) {
+            Some(0) => true,
+            Some(_) => return unsupported("this server enforces no such timeout; 0 is accepted"),
+            None => return invalid(),
+        },
         // A pg_dump header's settings, each accepted at the value that changes nothing here (wire
         // review 16 item 17): XML values are content (this server has no XML type), the default
         // tablespace is none and every table is the engine's own.
@@ -1333,7 +1347,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         .find(|(n, _)| n.eq_ignore_ascii_case(&name));
     let (column, value) = match name.as_str() {
         "search_path" => {
-            let shown = shown_search_path(&pg_conn.session_state.lock().search_path);
+            let shown = shown_search_path(&pg_conn.session_state.lock().current.search_path);
             ("search_path", shown)
         }
         "foreign_keys" => {
@@ -1345,6 +1359,32 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
                 .and_then(|v| v.as_int())
                 == Some(1);
             ("foreign_keys", if on { "on" } else { "off" }.to_string())
+        }
+        "lock_timeout" => (
+            "lock_timeout",
+            show_timeout(
+                pg_conn
+                    .lock_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        ),
+        "statement_timeout" => (
+            "statement_timeout",
+            show_timeout(
+                pg_conn
+                    .statement_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        ),
+        "client_min_messages" => {
+            let rank = pg_conn
+                .min_messages
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let level = [
+                "", "debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning",
+                "error",
+            ][usize::from(rank)];
+            fixed("client_min_messages", level)
         }
         "transaction_read_only" => fixed("transaction_read_only", "off"),
         "default_transaction_read_only" => fixed("default_transaction_read_only", "off"),
@@ -1373,6 +1413,24 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         value.replace('\'', "''"),
         column
     ))
+}
+
+fn show_timeout(ms: u64) -> String {
+    if ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, scale) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("min", 60_000),
+        ("s", 1000),
+        ("ms", 1),
+    ] {
+        if ms % scale == 0 {
+            return format!("{}{unit}", ms / scale);
+        }
+    }
+    unreachable!()
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -2333,7 +2391,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
 /// first entry holding the table wins, and none holding it is 42P01. None with no path set, where
 /// the engine's default order (main, then the attached schemas) applies.
 fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Result<Option<String>> {
-    let path = pg_conn.session_state.lock().search_path.clone();
+    let path = pg_conn.session_state.lock().current.search_path.clone();
     if path.is_empty() {
         return Ok(None);
     }
@@ -2421,7 +2479,7 @@ fn resident_relation_columns(
     match turso_pg_parser::schema_qualifier(schema) {
         SchemaQualifier::Main => columns_in("main"),
         SchemaQualifier::Unqualified => {
-            let path = pg_conn.session_state.lock().search_path.clone();
+            let path = pg_conn.session_state.lock().current.search_path.clone();
             pg_conn
                 .conn
                 .resident_unqualified_table_columns(table, &path)

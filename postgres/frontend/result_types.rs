@@ -514,6 +514,8 @@ pub struct StatementTypes {
     /// (wire review 13 item 1).
     pub commits: bool,
     pub rolls_back: bool,
+    pub settings_transaction: Option<crate::SettingsTransaction>,
+    pub local_setting_outside_block: bool,
     /// The table a CREATE TABLE creates with foreign keys: the server resolves every key once the
     /// table exists, in the CREATE's own transaction, and refuses the CREATE (42830) if one does
     /// not (turso_pg::check_table_keys; wire review 13 item 2). None for one the frontend performed

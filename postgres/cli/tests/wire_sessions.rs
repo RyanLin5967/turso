@@ -3915,11 +3915,84 @@ fn setting_scope_round_trip(setting: &str, value: &str, local: bool, end: &str, 
     a.q(&format!("BEGIN; SET {qualifier}{setting} = {value}; {end}"))
         .ok("setting transaction");
     if setting == "client_min_messages" {
-        let r = a.q("DROP TABLE IF EXISTS c41_missing_table").ok("notice after block");
-        assert_eq!(r.notices.len(), 1, "the default notice level must be restored");
+        let r = a
+            .q("DROP TABLE IF EXISTS c41_missing_table")
+            .ok("notice after block");
+        assert_eq!(
+            r.notices.len(),
+            1,
+            "the default notice level must be restored"
+        );
     }
     let show = format!("SHOW {setting}");
     assert_eq!(a.q(&show).single(&show), expected);
+}
+
+#[test]
+fn setting_scope_mixed_assignments_and_savepoints_match_pg18() {
+    for (sql, expected) in [
+        ("BEGIN; SET client_min_messages=warning; SET LOCAL client_min_messages=error; SHOW client_min_messages; COMMIT; SHOW client_min_messages", vec!["error", "warning"]),
+        ("BEGIN; SET LOCAL client_min_messages=error; SET client_min_messages=warning; COMMIT; SHOW client_min_messages", vec!["warning"]),
+        ("BEGIN; SET client_min_messages=warning; SAVEPOINT a; SET client_min_messages=error; SAVEPOINT b; SET LOCAL client_min_messages=debug1; SHOW client_min_messages; ROLLBACK TO b; SHOW client_min_messages; ROLLBACK TO a; SHOW client_min_messages; RELEASE a; COMMIT; SHOW client_min_messages", vec!["debug1", "error", "warning", "warning"]),
+        ("BEGIN; SAVEPOINT a; SET client_min_messages=error; COMMIT; SHOW client_min_messages", vec!["error"]),
+        ("BEGIN; SET client_min_messages=warning; SAVEPOINT a; SET LOCAL client_min_messages=error; RELEASE a; SHOW client_min_messages; COMMIT; SHOW client_min_messages", vec!["error", "warning"]),
+        ("BEGIN; SET search_path TO pg_catalog; SHOW search_path; ROLLBACK; SHOW search_path", vec!["pg_catalog", "\"$user\", public"]),
+        ("BEGIN; SET LOCAL search_path TO pg_catalog; SHOW search_path; COMMIT; SHOW search_path", vec!["pg_catalog", "\"$user\", public"]),
+        ("BEGIN; SET LOCAL statement_timeout='100ms'; SHOW statement_timeout; COMMIT; SHOW statement_timeout", vec!["100ms", "0"]),
+        ("BEGIN; SET statement_timeout='100ms'; ROLLBACK; SHOW statement_timeout", vec!["0"]),
+    ] {
+        let dir = Scratch::new("setting-scope-pg18");
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = seeded(&server);
+        let result = a.q(sql).ok(sql);
+        let rows: Vec<_> = expected.into_iter().map(|s| vec![Some(s.to_string())]).collect();
+        assert_eq!(result.rows, rows, "{sql}");
+        assert_eq!(result.status, b'I', "{sql}");
+    }
+}
+
+#[test]
+fn setting_scope_local_outside_a_block_warns_and_changes_nothing() {
+    let dir = Scratch::new("setting-scope-outside");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let r = a
+        .q("SET LOCAL client_min_messages=error")
+        .ok("local outside block");
+    assert_eq!(r.notices.len(), 1);
+    assert_eq!(r.notices[0].code, "25P01");
+    assert_eq!(
+        a.q("SHOW client_min_messages").single("unchanged setting"),
+        "notice"
+    );
+}
+
+#[test]
+fn setting_scope_foreign_keys_restore_and_follow_plain_set_at_commit() {
+    let dir = Scratch::new("setting-scope-keys");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE p(id INT PRIMARY KEY); CREATE TABLE c(id INT REFERENCES p(id))")
+        .ok("tables");
+    for sql in [
+        "BEGIN; SET foreign_keys=off; ROLLBACK",
+        "BEGIN; SET LOCAL foreign_keys=off; COMMIT",
+        "BEGIN; SAVEPOINT a; SET foreign_keys=off; ROLLBACK TO a; RELEASE a; COMMIT",
+    ] {
+        a.q(sql).ok(sql);
+        assert_eq!(a.q("SHOW foreign_keys").single(sql), "on");
+        assert_eq!(a.q("INSERT INTO c VALUES (1)").err(sql).code, "23503");
+    }
+    a.q("BEGIN; SET foreign_keys=off; COMMIT")
+        .ok("persistent setting");
+    assert_eq!(a.q("SHOW foreign_keys").single("committed setting"), "off");
+    a.q("INSERT INTO c VALUES (2)")
+        .ok("keys explicitly disabled");
+    a.q("SET foreign_keys=on").ok("restore keys");
+    assert_eq!(
+        a.q("INSERT INTO c VALUES (3)").err("keys restored").code,
+        "23503"
+    );
 }
 
 /// C41 lead ruling (2026-10-15T21:16:18Z): scope is now implemented. PostgreSQL 18.6's
@@ -3934,7 +4007,12 @@ fn a_setting_in_a_block_is_restored_at_its_scope_boundary() {
     a.q("CREATE TABLE c(x INT REFERENCES p(id))").ok("c");
     for (sql, show, changed, original) in [
         ("SET foreign_keys = off", "SHOW foreign_keys", "off", "on"),
-        ("SET search_path TO s, public", "SHOW search_path", "s, public", "\"$user\", public"),
+        (
+            "SET search_path TO s, public",
+            "SHOW search_path",
+            "s, public",
+            "\"$user\", public",
+        ),
     ] {
         assert_eq!(a.q(show).single(show), original);
         a.q("BEGIN").ok("begin");
@@ -3946,8 +4024,18 @@ fn a_setting_in_a_block_is_restored_at_its_scope_boundary() {
     let orphan = "INSERT INTO c VALUES (5)";
     assert_eq!(a.q(orphan).err(orphan).code, "23503", "keys still on");
     for (sql, show, changed, original) in [
-        ("SET LOCAL foreign_keys = off", "SHOW foreign_keys", "off", "on"),
-        ("SET LOCAL search_path TO public", "SHOW search_path", "public", "\"$user\", public"),
+        (
+            "SET LOCAL foreign_keys = off",
+            "SHOW foreign_keys",
+            "off",
+            "on",
+        ),
+        (
+            "SET LOCAL search_path TO public",
+            "SHOW search_path",
+            "public",
+            "\"$user\", public",
+        ),
     ] {
         a.q("BEGIN").ok("begin local scope");
         a.q(sql).ok(sql);

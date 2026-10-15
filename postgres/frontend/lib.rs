@@ -8,6 +8,8 @@ pub mod phase;
 mod result_types;
 pub use result_types::{element_of, StatementTypes};
 mod session;
+mod settings;
+pub use settings::SettingsTransaction;
 
 pub use session::PgConnection as Connection;
 pub use session::{

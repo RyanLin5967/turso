@@ -1671,9 +1671,6 @@ impl Session {
         self.min_messages
             .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
-        // Which kind of block the statement runs in, for the settings a ROLLBACK cannot undo here
-        // (turso_pg's handle_pg_set; wire review 16 item 18).
-        conn.set_explicit_block(in_tx && !st.implicit);
         if st.aborted {
             match verb {
                 TxVerb::Commit | TxVerb::Rollback => {
@@ -1856,6 +1853,7 @@ impl Session {
             r => r,
         };
         if result.is_err() {
+            conn.statement_failed();
             // The block's end is read from the verb the reader saw or the parse the engine ran,
             // whichever says COMMIT or ROLLBACK, never from the text alone (wire review 14 item 7).
             let verb = parsed.unwrap_or(verb);
@@ -2217,6 +2215,17 @@ impl Session {
                 other => other,
             })
         };
+        if r.is_ok() {
+            conn.statement_completed(&types);
+            if types.local_setting_outside_block {
+                self.state().notices.push(warning(
+                    "25P01",
+                    "SET LOCAL can only be used in transaction blocks",
+                ));
+            }
+        } else {
+            conn.statement_failed();
+        }
         r.map_err(|e| StatementFailure {
             prepared: true,
             rerunnable: stmt.n_change() == 0 && !(types.commits || types.rolls_back),
