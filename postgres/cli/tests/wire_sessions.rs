@@ -3280,6 +3280,59 @@ fn a_long_statement_stops_on_cancel_and_on_statement_timeout() {
     a.q("SELECT 1").ok("the session after the timeout");
 }
 
+/// A CancelRequest stops a statement only when it names the session's process id AND its secret
+/// key: one with a wrong secret, or with the right process id and a wrong secret, or another
+/// session's key, cancels nothing (the statement ran on until the right key came, 1.5 s later);
+/// two sessions' keys differ (lead's condition on the cancel fix, 2026-10-15).
+#[test]
+fn a_cancel_must_name_the_sessions_pid_and_secret() {
+    let dir = Scratch::new("cancelkey");
+    let server = Server::start(&dir.db(), &[]);
+    let slow = "SELECT count(*) FROM generate_series(1, 1000000000000000)";
+    let mut a = server.connect();
+    let other = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let key = a.key.clone().expect("BackendKeyData");
+    let other_key = other.key.clone().expect("BackendKeyData");
+    assert_eq!(key.len(), 8, "a 3.0 BackendKeyData: process id and a 4-byte secret");
+    assert_ne!(key, other_key, "two sessions share a key");
+    let cancel = |body: &[u8]| {
+        let mut c = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        let mut m = ((8 + body.len()) as i32).to_be_bytes().to_vec();
+        m.extend_from_slice(&80877102i32.to_be_bytes());
+        m.extend_from_slice(body);
+        c.write_all(&m).unwrap();
+    };
+    let mut wrong_secret = key.clone();
+    wrong_secret[7] ^= 0x5a;
+    let mut wrong_pid = key.clone();
+    wrong_pid[3] ^= 0x5a;
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((slow.len() + 5) as i32).to_be_bytes());
+    q.extend_from_slice(slow.as_bytes());
+    q.push(0);
+    let started = Instant::now();
+    a.s.write_all(&q).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    for body in [&wrong_secret, &wrong_pid, &other_key] {
+        cancel(body);
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    // Nothing has answered yet: the statement still runs (a byte waiting here is its reply).
+    a.s.set_nonblocking(true).unwrap();
+    let early = a.s.peek(&mut [0u8; 1]);
+    a.s.set_nonblocking(false).unwrap();
+    assert!(
+        early.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "a wrong key stopped the statement: {early:?} after {:?}",
+        started.elapsed()
+    );
+    cancel(&key);
+    let r = a.read_reply();
+    assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("57014"), "{:?}", r.error);
+    a.q("SELECT 1").ok("the session after");
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
