@@ -282,7 +282,7 @@ typedef struct {
     uint32_t client, seq;
     uint8_t phase, ok, nsteps, pad;
     int16_t err;
-    uint64_t claim, start, end, after_end, clone_done, ticket, flight; /* claim: raw.tsv intended_ns */
+    uint64_t claim, start, end, after_end, clone_done, ticket, flight; /* claim: raw.tsv claim_ns */
     uint64_t step_end[3];
 } rec_t;
 typedef struct { uint64_t t0, t1, riders, last_ticket; } flight_t;
@@ -871,16 +871,17 @@ static int cmd_run(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/raw.tsv", out);
     FILE *f = fopen(p, "w");
     if (!f) die("raw.tsv");
-    /* intended_ns (raw_schema.py CORE; VM --dry-block defect 2): closed loop only, so an op is intended at its claim --
-     * the time claim_op read under the lock, which orders it against tm1 (a later start could fall past tm1) */
-    fprintf(f, "client\tseq\tphase\tok\tintended_ns\tstart_ns\tclone_done_ns\tend_ns\tlat_ns\tcreate_ns\topen_ns\twrite_ns\tafter_ns\tticket\tflight\terr\n");
+    /* raw_schema.py CORE (VM --dry-block defect 2; the lead's ruling, one meaning per field): claim_ns is the time claim_op
+     * read under the lock, which orders an op against tm1; intended_ns is the intended start, and in this closed loop an
+     * op starts when claimed, so it is the start, as bbload writes it */
+    fprintf(f, "client\tseq\tphase\tok\tclaim_ns\tintended_ns\tstart_ns\tclone_done_ns\tend_ns\tlat_ns\tcreate_ns\topen_ns\twrite_ns\tafter_ns\tticket\tflight\terr\n");
     for (size_t i = 0; i < total; i++) {
         rec_t *o = &all[i];
         uint64_t s1 = o->nsteps >= 1 ? o->step_end[0] - o->start : 0, s2 = o->nsteps >= 2 ? o->step_end[1] - o->step_end[0] : 0,
                  s3 = o->nsteps >= 3 ? o->step_end[2] - o->step_end[1] : 0;
-        fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n", o->client, o->seq,
+        fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n", o->client, o->seq,
                 o->phase == PH_MEAS ? "measure" : o->phase == PH_WARM ? "warmup" : "drain", o->ok, (unsigned long long)o->claim,
-                (unsigned long long)o->start,
+                (unsigned long long)o->start, (unsigned long long)o->start,
                 (unsigned long long)o->clone_done, (unsigned long long)o->end, (unsigned long long)(o->end - o->start),
                 (unsigned long long)s1, (unsigned long long)s2, (unsigned long long)s3, (unsigned long long)(o->after_end - o->end),
                 (unsigned long long)o->ticket, (unsigned long long)o->flight, o->err);
