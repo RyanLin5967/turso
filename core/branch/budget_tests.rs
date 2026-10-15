@@ -3366,6 +3366,42 @@ fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
     assert!(failures.is_empty(), "LEAP L4 not reached at a written tail's open (budget: 1 query, the meta row):\n{failures}");
 }
 
+/// LEAP L4 2b, batched (lead, DECISIONS 81152ec501): over the written tail (`wtail_n10`,
+/// `wtail_n1e4`), the slots the first-touch rule cannot settle (first used after a parked Commit) are
+/// asked in ONE statement per fixed-size chunk, not one each: at most 2 catalog queries at WTAIL = 8
+/// (the meta row and one chunk). Expected RED at 6991d6296: 1 + one probe per such slot (9).
+/// leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row stays registered beside it.
+#[test]
+fn leap_l4_an_open_after_a_written_tail_asks_its_reused_slots_in_one_statement() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wtail_n10", "wtail_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["recovery"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 2 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} slots asked, {} touched below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "the written tail's reused slots are not asked in one statement (budget: 2 queries, the meta row and one chunk):\n{failures}");
+}
+
 /// LEAP L4 2b, the case its first-touch rule settles: an open over a tail of creates, first writes
 /// and rewrites that take slots the checkpoint lists free (`fresh_written_tail`; cells `wfresh_n10`,
 /// `wfresh_n1e4`) reads the catalog for its meta row only. Premise: the tail touched at least
