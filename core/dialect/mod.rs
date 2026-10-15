@@ -1315,6 +1315,36 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// Engine review 20 item 12: the NOT NULL key check's statement-journal term matters only where
+    /// nothing else opens the journal: under statement-level OR REPLACE (default ABORT already does).
+    /// `INSERT OR REPLACE` of two rows whose second key is NULL raises NOT NULL (OR REPLACE has no
+    /// default to substitute for a key), and undoes only its own first row: after COMMIT the
+    /// table holds the earlier statement's row alone. Mutant `notnull_key_journal_dropped`.
+    #[test]
+    fn an_or_replace_insert_with_a_null_key_undoes_only_its_own_rows() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "pgkey-replace.db", Arc::new(PgKeyTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO k VALUES (3, 'three')").unwrap();
+        let replaced = conn.execute("INSERT OR REPLACE INTO k VALUES (5, 'five'), (NULL, 'n')");
+        assert!(
+            matches!(&replaced, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+            "premise: the NULL key raised NOT NULL under OR REPLACE: {replaced:?}"
+        );
+        conn.execute("COMMIT").unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM k ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        assert_eq!(ids, vec![3], "CLAIM: the failed OR REPLACE INSERT did not undo its own first row");
+    }
+
     /// Engine review 20 HIGH 1, the branch arm: a branch forked after ALTER TABLE ADD COLUMN on a
     /// frontend table refuses an explicit NULL key as the trunk does. A lock-free fork that sees a
     /// trunk commit parses the stored schema at its first connect (678b18ba4; review 20 #19), which
