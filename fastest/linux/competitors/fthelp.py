@@ -146,9 +146,13 @@ def gc_settings_problem(text):
         return "the GC settings record is empty"
     if any(re.match(r"rc=\d+ \(not read\)", ln) or ln.startswith("ERROR") for ln in rows):
         return f"the GC settings query failed: {rows[-1][:160]!r}"
-    names = [re.split(r"[\t|]", ln, 1)[0].strip().lower() for ln in rows]
-    if not any("gc" in nm for nm in names):
-        return f"no GC setting among {names[:8]}"
+    kv = {re.split(r"[\t|]", ln, 1)[0].strip().lower(): (re.split(r"[\t|]", ln, 1) + [""])[1].strip() for ln in rows}
+    if not any("gc" in nm for nm in kv):
+        return f"no GC setting among {list(kv)[:8]}"
+    # the probe (artie runs/loud-20261015/probe-dolt-gc): Dolt 2.4.1 and Doltgres 1.4.0 default it on, and dolt.sh /
+    # doltgres.sh now pin it on in config.yaml; the record must show that setting at that value
+    if kv.get("dolt_auto_gc_enabled", "").upper() not in ("ON", "1"):
+        return f"dolt_auto_gc_enabled is {kv.get('dolt_auto_gc_enabled')!r}, not on (the pinned vendor default)"
     return None
 
 
