@@ -820,6 +820,59 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
     );
 }
 
+/// A branch call waiting for another session to leave its branch (the in-use wait, up to 5 s) is
+/// the session's statement: statement_timeout ends it with 57014, and so does a CancelRequest
+/// (Claude C37 M1: both got 55006 after the whole 5 s, scripts/inuse.py; PostgreSQL's equivalent
+/// wait, CountOtherDBBackends, checks for interrupts; recorded cancel and timeout answers,
+/// pg18-cancel.out: 57014 with "canceling statement due to statement timeout" and "... due to user
+/// request").
+#[test]
+fn the_branch_in_use_wait_stops_on_statement_timeout_and_on_cancel() {
+    let dir = Scratch::new("inusewait");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT)").ok("create");
+    a.q("SELECT turso_branch_create('x')").ok("create x");
+    a.q("SELECT turso_branch_switch('x')").ok("A on x");
+    let mut b = server.connect();
+    b.q("SET statement_timeout = 200").ok("statement_timeout");
+    let started = Instant::now();
+    let e = b.q("SELECT turso_branch_switch('x')").err("B's switch while A is on x");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to statement timeout"),
+        "after {:?}",
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(2), "the timeout took {:?}", started.elapsed());
+    b.q("SET statement_timeout = 0").ok("statement_timeout off");
+    let key = b.key.clone().expect("BackendKeyData");
+    let sql = "SELECT turso_branch_switch('x')";
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+    q.extend_from_slice(sql.as_bytes());
+    q.push(0);
+    let started = Instant::now();
+    b.s.write_all(&q).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut cancel = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102i32.to_be_bytes());
+    m.extend_from_slice(&key);
+    cancel.write_all(&m).unwrap();
+    drop(cancel);
+    let r = b.read_reply();
+    let e = r.error.expect("the cancelled switch's error");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to user request"),
+        "after {:?}",
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(3), "the cancel took {:?}", started.elapsed());
+    b.q("SELECT 1").ok("B after the cancel");
+}
+
 /// A failed domain CHECK answers 23514 with PostgreSQL's message and constraint name on every path,
 /// case for case as PostgreSQL 18.6 recorded them (artie lanes/engine/raw/pg18-domain-check-message.txt,
 /// 0673f158a3, every recorded statement replayed in order): CAST, a column's INSERT and UPDATE, a
