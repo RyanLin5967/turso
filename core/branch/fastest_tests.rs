@@ -8753,8 +8753,12 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
         let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
         let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
         assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread table");
-        let me = tables.first().and_then(|(_, t)| t.iter().find(|x| x.me)).map_or(0, |x| x.id);
+        // Each span is skipped for the thread that recorded its end (capture points are the caller's,
+        // install points the checkpoint thread's).
+        let recorder = |j: usize| tables[j].1.iter().find(|x| x.me).map_or(0, |x| x.id);
         let at = |label: &str| points.iter().position(|(l, _)| *l == label);
+        // The original test's five spans and its arithmetic (each span minus one reading), for the
+        // over-budget verdict; the finer install sub-spans printed as raw deltas.
         let spans = [
             ("capture.begin", "capture.matured"),
             ("capture.matured", "capture.captured"),
@@ -8762,9 +8766,16 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
             ("install.quiesced", "install.installed"),
             ("install.installed", "install.marked"),
         ];
+        let fine = [
+            ("install.quiesced", "install.snapshot_ended"),
+            ("install.snapshot_ended", "install.before_cut"),
+            ("install.before_cut", "install.cut_finished"),
+            ("install.cut_finished", "install.installed"),
+        ];
         let mut total = 0u64;
         let mut line = format!("round {round}:");
         let mut spans_over = Vec::new();
+        let names = |ran: &[(u64, String, u64)]| ran.iter().map(|(id, name, ns)| format!("{name}#{id}:{ns}ns")).collect::<Vec<_>>();
         for (a, b) in spans {
             let (Some(i), Some(j)) = (at(a), at(b)) else {
                 line += &format!(" [{a}..{b} missing]");
@@ -8772,10 +8783,17 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
             };
             let n = (points[j].1 - points[i].1).saturating_sub(1);
             total += n;
-            let ran = ran_between(&tables[i].1, &tables[j].1, me);
-            line += &format!(" {a}..{b}={n} ran={:?}", ran.iter().map(|(id, name, ns)| format!("{name}#{id}:{ns}ns")).collect::<Vec<_>>());
+            let ran = ran_between(&tables[i].1, &tables[j].1, recorder(j));
+            line += &format!(" {a}..{b}={n} ran={:?}", names(&ran));
             if n > 0 {
                 spans_over.push((a, b, n, ran.is_empty()));
+            }
+        }
+        line += " | raw:";
+        for (a, b) in fine {
+            if let (Some(i), Some(j)) = (at(a), at(b)) {
+                let ran = ran_between(&tables[i].1, &tables[j].1, recorder(j));
+                line += &format!(" {a}..{b}={} ran={:?}", points[j].1 - points[i].1, names(&ran));
             }
         }
         line += &format!(" total={total}");
@@ -8789,6 +8807,9 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
         }
         rows.push(line);
     }
+    let r0 = super::budget_probe::unix_syscalls().unwrap();
+    let r1 = super::budget_probe::unix_syscalls().unwrap();
+    println!("one reading of the task's syscall count costs {} BSD syscalls (two back-to-back readings)", r1 - r0);
     for r in &rows {
         println!("{r}");
     }

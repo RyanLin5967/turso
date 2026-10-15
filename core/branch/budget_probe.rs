@@ -111,7 +111,9 @@ pub(crate) fn record_allocs(on: bool, trace_from: usize) {
 }
 
 /// What `record_allocs` recorded on this thread: the count, the first 16 sizes, the backtraces.
+/// Stops the recorder first: the copies made here allocate.
 pub(crate) fn recorded_allocs() -> (usize, Vec<usize>, Vec<String>) {
+    T_REC_ON.with(|r| r.set(false));
     let n = T_REC_N.with(|n| n.get());
     let sizes = T_REC.with(|r| r.get())[..n.min(16)].to_vec();
     (n, sizes, T_TRACES.with(|t| t.borrow().clone()))
