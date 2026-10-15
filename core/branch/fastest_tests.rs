@@ -7822,3 +7822,181 @@ fn a_damaged_slot_an_ordered_upgrade_made_durable_is_refused_when_read() {
         );
     }
 }
+
+// ---- engine review 21 MEDs 6-9: every route by which a slot-naming last flight is made durable
+// confirms it, or closes it ordered ----
+
+/// Flip one byte of arena slot `slot` in the file at `arena` (a slot damaged on the device).
+fn flip_slot_byte(arena: &Path, slot: u32) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(arena).unwrap();
+    let at = slot as u64 * 4096 + 100;
+    let mut byte = [0u8; 1];
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.read_exact(&mut byte).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&[byte[0] ^ 0xFF]).unwrap();
+}
+
+/// What branch `id` reads for row `row` of `t` in `db`.
+fn read_row_of(db: &Arc<Database>, id: BranchId, row: i64) -> crate::Result<Vec<Vec<crate::Value>>> {
+    db.branch(id)
+        .unwrap()
+        .connect()
+        .and_then(|c| c.prepare(format!("SELECT v FROM t WHERE id = {row}")).and_then(|mut s| s.run_collect_rows()))
+}
+
+/// Engine review 21 MED 6 (a): a trunk commit's barrier finds its TrunkRetain already written by a
+/// concurrent D0 flight (a branch commit on z, led in the window between the commit's decision and
+/// its barrier), and its WAL is not F_FULLFSYNCed on the branch files' device (`fullfsync` off; off
+/// Apple, always), so the barrier is a zero-byte UPGRADE flight: it syncs the arena and the log,
+/// which makes z's flight durable, and writes no end frame and no confirmation. The last flight
+/// stayed z's unsynced one, slot-checked at open, so a damaged slot of the acknowledged TrunkRetain
+/// dropped the flight silently and x read the trunk's newer page. The upgrade's confirmation of the
+/// log's last flight, written by the confirmation writer or at the close, makes open keep that
+/// flight's records: the damaged slot is refused when x reads it. Every target (84e7826f9's arm is
+/// Apple's ordered one), both modes. Mutant `upgrade_confirms_nothing`.
+#[test]
+fn a_damaged_slot_a_zero_byte_upgrade_made_durable_is_refused_when_read() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("zero-byte-upgrade.db");
+        let (id, kept, arena, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
+            trunk.execute("PRAGMA fullfsync = OFF").unwrap();
+            let x = trunk.fork_branch().unwrap();
+            let z = trunk.fork_branch().unwrap();
+            let zc = z.connect().unwrap();
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_TRUNK_DECIDED, O::Release);
+            let committing = std::thread::spawn(move || {
+                write_v(&trunk, 3, "new");
+                trunk
+            });
+            eventually(&format!("{what}: premise: the trunk commit never decided"), || {
+                hold.load(O::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED
+            });
+            // z's commit leads a D0 flight in the window: it carries the trunk commit's TrunkRetain.
+            write_v(&zc, 40, "z");
+            assert!(db.branches.arena_dirty_for_test(), "{what}: premise: z's D0 flight left the arena unsynced");
+            let upgrades = db.branches.group_counters()[4];
+            hold.store(0, O::Release);
+            let trunk = committing.join().unwrap();
+            assert!(
+                db.branches.group_counters()[4] > upgrades,
+                "{what}: premise: the trunk commit's barrier was a zero-byte upgrade"
+            );
+            let z_slots: std::collections::HashSet<u32> = z.owned_slots().into_iter().collect();
+            let kept: Vec<u32> = db
+                .branch_slots_in_use()
+                .into_iter()
+                .filter(|s| !before.contains(s) && !z_slots.contains(s))
+                .collect();
+            assert_eq!(kept.len(), 1, "{what}: premise: the trunk commit kept one pre-image for x");
+            let arena = arena_path(&db);
+            let id = x.into_id();
+            let _z = z.into_id();
+            drop(zc);
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            (id, kept[0], arena, incarnation)
+        };
+        flip_slot_byte(&arena, kept);
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        let got = read_row_of(&db, id, 3);
+        assert!(
+            got.is_err(),
+            "{what}: a damaged slot a zero-byte upgrade made durable was dropped silently, x read {got:?}"
+        );
+    }
+}
+
+/// Engine review 21 MED 6 (b): as (a), but z's flight is made durable by a raised D0 store's
+/// held-free upgrade (its bound forced to 1, `HoldBound`), led by the background writer after z's
+/// flight and landed before the trunk commit's barrier, which then finds the TrunkRetain durable and
+/// takes its no-flight path. The upgrade syncs the arena and the log and confirms nothing, so the
+/// last flight stayed z's unsynced one, slot-checked at open, and a damaged slot of the TrunkRetain
+/// dropped it silently. Every target, both modes. Mutant `held_free_upgrade_confirms_nothing`.
+#[test]
+fn a_damaged_slot_a_held_free_upgrade_made_durable_is_refused_when_read() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("held-free-upgrade.db");
+        let (id, kept, arena, incarnation) = {
+            let (db, trunk, w, w_slots) = raised_d0_with_a_kept_pre_image(&path, catalog, true);
+            assert_eq!(w_slots.len(), 2, "{what}: premise: w's release frees two slots, past the bound");
+            let x = trunk.fork_branch().unwrap();
+            let z = trunk.fork_branch().unwrap();
+            let zc = z.connect().unwrap();
+            // w's release arms the upgrade; the writer is held where it found it due, so the upgrade
+            // is taken only after z's flight.
+            db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+            w.reap().unwrap();
+            let _armed = trunk.fork_branch().unwrap().into_id();
+            eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
+                db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
+            });
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_TRUNK_DECIDED, O::Release);
+            let committing = std::thread::spawn(move || {
+                write_v(&trunk, 5, "new");
+                trunk
+            });
+            eventually(&format!("{what}: premise: the trunk commit never decided"), || {
+                hold.load(O::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED
+            });
+            // z's commit leads a D0 flight in the window: it carries the trunk commit's TrunkRetain.
+            write_v(&zc, 40, "z");
+            assert!(db.branches.arena_dirty_for_test(), "{what}: premise: z's D0 flight left the arena unsynced");
+            let upgrades = db.branches.group_counters()[4];
+            db.branches.confirm_hold_for_test(0);
+            eventually(&format!("{what}: premise: the held-free upgrade never landed"), || {
+                w_slots.iter().all(|&s| db.branch_slot_is_free(s))
+            });
+            assert!(db.branches.group_counters()[4] > upgrades, "{what}: premise: a held-free upgrade ran");
+            let flights = db.branches.group_counters()[0];
+            hold.store(0, O::Release);
+            let trunk = committing.join().unwrap();
+            assert_eq!(
+                db.branches.group_counters()[0],
+                flights,
+                "{what}: premise: the trunk commit's barrier led no flight (the upgrade made its TrunkRetain durable)"
+            );
+            let z_slots: std::collections::HashSet<u32> = z.owned_slots().into_iter().collect();
+            let kept: Vec<u32> = db
+                .branch_slots_in_use()
+                .into_iter()
+                .filter(|s| !before.contains(s) && !z_slots.contains(s))
+                .collect();
+            assert_eq!(kept.len(), 1, "{what}: premise: the trunk commit kept one pre-image for x");
+            let arena = arena_path(&db);
+            let id = x.into_id();
+            let _z = z.into_id();
+            drop(zc);
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            (id, kept[0], arena, incarnation)
+        };
+        flip_slot_byte(&arena, kept);
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        let got = read_row_of(&db, id, 5);
+        assert!(
+            got.is_err(),
+            "{what}: a damaged slot a held-free upgrade made durable was dropped silently, x read {got:?}"
+        );
+    }
+}
