@@ -8764,6 +8764,36 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
 }
 
+/// Lead conditions on the name filter (DECISIONS, the acceptance of the one-state fix): the table
+/// listing the regrowth tests read (`per_branch_tables_for_test`) prices the filter's tables at their
+/// REAL bytes (8 per slot; 4cb167221 listed them at 0, which blinded the regrowth test), and a growth
+/// records how many entries it moved (`moved_max`, which the churn check reads). A catalog store's
+/// filter grown past one doubling, waited out.
+#[test]
+fn the_name_filter_lists_its_real_bytes_and_records_its_growth() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-bytes.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..1_500u32 {
+        trunk.create_branch(&format!("b{i:05}")).unwrap();
+    }
+    db.branch_wait_name_filter();
+    let (built, entries, moved_max, builds, _) = db.branches.name_filter_stats();
+    assert!(built && entries >= 1_500, "premise: the filter holds the 1,500 names ({entries})");
+    assert!(builds >= 1, "premise: the filter grew past its first table ({builds} growths)");
+    let listed: Vec<_> = db
+        .branches
+        .per_branch_tables_for_test()
+        .into_iter()
+        .filter(|(name, ..)| name.starts_with("names.filter"))
+        .collect();
+    let priced = listed.iter().any(|(_, cap, bytes)| *cap > 0 && *bytes == *cap * 8);
+    assert!(priced, "CLAIM: the filter's table is not listed at its real bytes (8 per slot): {listed:?}");
+    assert!(moved_max > 0, "CLAIM: a growth of the filter recorded no entries moved (moved_max {moved_max})");
+}
+
 /// The name filter's concurrency oracle (lead condition on the filter, and review REVIEW-claude-namefilter
 /// M3): since `says_absent` lets a create skip the catalog, a name the filter loses is a DUPLICATE
 /// name. Four threads create named branches while a growth is held at each of its stages (1-5,
