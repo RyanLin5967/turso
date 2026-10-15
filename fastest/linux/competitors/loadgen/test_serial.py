@@ -38,8 +38,11 @@ def main():
         sm = json.loads((root / "out/summary.json").read_text())
         with (root / "out/raw.tsv").open() as f:
             rows = list(csv.DictReader(f, delimiter="\t"))
-        # (merge into fastest-linux-comp: claim_op's drain ops, comp review 1 LOW 40, add rows after the 40 measured)
-        assert sum(r["phase"] == "measure" for r in rows) == 40 and all(r["ok"] == "1" for r in rows), rows
+        # (merge into fastest-linux-comp: claim_op's drain ops, comp review 1 LOW 40, add rows after the 40 measured;
+        # lead ruling: count the measured rows, every one ok, and every other row is a drain row)
+        meas = [r for r in rows if r["phase"] == "measure"]
+        assert len(meas) == 40 and all(r["ok"] == "1" for r in meas), rows
+        assert all(r["phase"] == "drain" for r in rows if r["phase"] != "measure"), rows
         assert all("serial_wait_ns" in r for r in rows), "missing per-op serial_wait_ns"
         assert all("serial_waits" in r for r in rows), "missing serial wait intervals"
         if serial:
