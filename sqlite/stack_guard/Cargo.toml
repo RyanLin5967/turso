@@ -15,3 +15,4 @@ name = "turso_stack_guard"
 
 [dependencies]
 stacker = "0.1"
+libc = { version = "0.2.172" }

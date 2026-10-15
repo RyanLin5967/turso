@@ -237,8 +237,8 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-    crate::error::check_stack()?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -1596,9 +1596,7 @@ pub fn emit_from_clause_subquery(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
-    // Emitted recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15), and
-    // the stack-guard class's check (fastest-engine); one primitive for both follows the merge.
-    crate::error::check_stack()?;
+    // Emitted recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
     let _nest = crate::stack::NestGuard::enter("subqueries")?;
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
@@ -1903,8 +1901,8 @@ pub fn emit_non_from_clause_subquery(
     is_correlated: bool,
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-    crate::error::check_stack()?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {

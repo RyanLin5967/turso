@@ -11,7 +11,7 @@ pub enum ParseError {
     #[error("{0}")]
     ParseError(String),
     /// A recursive entry of the translator found its thread's stack nearly spent
-    /// (`turso_stack_guard::check`): PostgreSQL's 54001, which the frontend reports as the engine's
+    /// (`turso_stack_guard::NestGuard`): PostgreSQL's 54001, which the frontend reports as the engine's
     /// `LimboError::StackDepthLimitExceeded`.
     #[error("stack depth limit exceeded")]
     StackDepthLimitExceeded,
@@ -50,9 +50,9 @@ fn pg_query_error(e: pg_query::Error) -> ParseError {
     }
 }
 
-/// The translator's stack check at a recursive entry: `?` it first.
-pub(crate) fn check_stack() -> Result<(), ParseError> {
-    turso_stack_guard::check().map_err(|_| ParseError::StackDepthLimitExceeded)
+/// One of the translator's recursive steps (`turso_stack_guard::NestGuard`), held for the step.
+pub(crate) fn nest() -> Result<turso_stack_guard::NestGuard, ParseError> {
+    turso_stack_guard::NestGuard::enter().map_err(|_| ParseError::StackDepthLimitExceeded)
 }
 
 thread_local! {

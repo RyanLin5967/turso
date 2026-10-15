@@ -89,92 +89,91 @@ pub(crate) fn trace_scope_with_detail(_label: &'static str, _detail: &'static st
 #[inline]
 pub(crate) fn trace_remaining(_label: &'static str) {}
 
-/// PostgreSQL's message for a statement nested past what its stack allows (SQLSTATE 54001, which the
-/// PostgreSQL frontend reads from this prefix).
-pub(crate) const STACK_DEPTH_EXCEEDED: &str = "stack depth limit exceeded";
-
-/// The stack a recursive step of planning, optimizing or emitting a nested query may still need
-/// below a check: one level of each phase, the deepest of which (a debug build's view expansion)
-/// takes about 93 KiB (a 90-view chain overflowed 8 MiB), with margin. Measured by
-/// `every_depth_of_a_view_chain_answers_or_is_refused_never_overflows` (postgres/server), which
-/// sweeps every depth on 2 and 8 MiB threads and must never overflow.
-const STACK_MARGIN: usize = 512 << 10;
-
-/// Where no stack bound is known (no platform answer): nested views and subqueries are refused past
-/// this depth instead, the only bound left.
-const FALLBACK_DEPTH: usize = 64;
-
-std::thread_local! {
-    /// The lowest address of this thread's stack, read once (`None` where the platform does not say).
-    static STACK_BOTTOM: Option<usize> = stack_bottom();
-    /// Nested steps in progress on this thread, for the fallback bound.
-    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(target_vendor = "apple")]
-fn stack_bottom() -> Option<usize> {
-    // SAFETY: pthread_self is always valid for the calling thread; the two getters read its
-    // attributes and allocate nothing.
-    unsafe {
-        let me = libc::pthread_self();
-        let top = libc::pthread_get_stackaddr_np(me) as usize;
-        let size = libc::pthread_get_stacksize_np(me);
-        top.checked_sub(size)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn stack_bottom() -> Option<usize> {
-    let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
-    // SAFETY: getattr initializes `attr` on success, which getstack then reads and destroy frees.
-    unsafe {
-        if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
-            return None;
-        }
-        let mut addr = std::ptr::null_mut();
-        let mut size = 0;
-        let got = libc::pthread_attr_getstack(attr.as_ptr(), &mut addr, &mut size);
-        libc::pthread_attr_destroy(attr.as_mut_ptr());
-        (got == 0).then_some(addr as usize)
-    }
-}
-
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn stack_bottom() -> Option<usize> {
-    None
-}
-
-/// The bytes of stack left on this thread below the caller, where the platform says.
-pub(crate) fn remaining_stack() -> Option<usize> {
-    let here = 0u8;
-    let sp = std::ptr::addr_of!(here) as usize;
-    STACK_BOTTOM.with(|b| b.and_then(|bottom| sp.checked_sub(bottom)))
-}
-
 /// One recursive step of a nested query (a view's expansion, a subquery's planning, optimizing or
-/// emission) in progress: entered only with `STACK_MARGIN` of stack left, so a statement nested
-/// past what the thread's stack allows is refused, as PostgreSQL's check_stack_depth refuses it
-/// (54001), instead of overflowing (the crash batch, 2026-10-15). Where the stack is unknown, the
-/// bound is `FALLBACK_DEPTH` nested steps. Leaving it, on every exit, pops it.
-pub(crate) struct NestGuard;
+/// emission; the crash batch, 2026-10-15) in progress: `turso_stack_guard::NestGuard`, the one
+/// primitive the parser, the engine and the PostgreSQL translator share (fastest-engine's
+/// stack-guard class, built on this guard as revised on fastest-wire through 17572da73). A refusal
+/// is `LimboError::StackDepthLimitExceeded`, PostgreSQL's 54001. Leaving it, on every exit, pops it.
+pub(crate) struct NestGuard(#[allow(dead_code)] turso_stack_guard::NestGuard);
 
 impl NestGuard {
-    pub(crate) fn enter(what: &'static str) -> crate::Result<Self> {
-        let depth = DEPTH.with(|d| d.get());
-        let refuse = match remaining_stack() {
-            Some(left) => left < STACK_MARGIN,
-            None => depth >= FALLBACK_DEPTH,
-        };
-        if refuse {
-            crate::bail_parse_error!("{STACK_DEPTH_EXCEEDED}: {what} nested too deep for this thread's stack");
-        }
-        DEPTH.with(|d| d.set(depth + 1));
-        Ok(Self)
+    /// `what` names the step for a reader of the call site; PostgreSQL's message names none.
+    #[inline]
+    pub(crate) fn enter(_what: &'static str) -> crate::Result<Self> {
+        turso_stack_guard::NestGuard::enter()
+            .map(Self)
+            .map_err(|_| crate::LimboError::StackDepthLimitExceeded)
     }
 }
 
-impl Drop for NestGuard {
-    fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get() - 1));
+/// A statement stepping on this thread (`Program::step`): a statement prepared meanwhile (a schema
+/// reparse, a callback running SQL, a trigger compiled at its first fire) is checked from its
+/// outermost step.
+pub(crate) use turso_stack_guard::Executing;
+
+#[cfg(test)]
+mod tests {
+    use turso_stack_guard::test_hooks;
+
+    /// The stack between two consecutive nested checks, over views, FROM subqueries, WHERE and
+    /// scalar subqueries and a mix of them, stays under LEVEL_COST (fastest-wire 17572da73,
+    /// measured in debug on an 8 MiB thread: 73,584 B at most). A lower bound on a level's cost.
+    #[test]
+    fn two_consecutive_nested_checks_are_less_than_one_level_cost_apart() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+                let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect)).unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1)").unwrap();
+                conn.execute("CREATE VIEW v0 AS SELECT a FROM t").unwrap();
+                for i in 1..12 {
+                    conn.execute(format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1)).unwrap();
+                }
+                let mut from = "SELECT a FROM t".to_string();
+                let mut scalar = "SELECT a FROM t".to_string();
+                let mut mixed = "SELECT a FROM v3".to_string();
+                for _ in 0..12 {
+                    from = format!("SELECT a FROM ({from})");
+                    scalar = format!("SELECT a FROM t WHERE a = ({scalar})");
+                    mixed = format!("SELECT a FROM ({mixed}) WHERE a IN (SELECT a FROM v2 WHERE a = ({mixed}))");
+                }
+                test_hooks::arm(true);
+                test_hooks::take_worst();
+                let mut over = Vec::new();
+                for sql in ["SELECT a FROM v11".to_string(), from, scalar, mixed] {
+                    conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+                    let worst = test_hooks::take_worst();
+                    if worst == 0 || worst >= turso_stack_guard::LEVEL_COST {
+                        over.push(format!("{worst} B between two checks: {sql}"));
+                    }
+                }
+                test_hooks::arm(false);
+                assert!(over.is_empty(), "CLAIM: checks further apart than LEVEL_COST {}: {over:?}", turso_stack_guard::LEVEL_COST);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside
+    /// `Program::step` (op_parse_schema), and that statement's outermost step is seen as entered
+    /// while a statement steps; a flat SELECT is not (fastest-wire 17572da73).
+    #[test]
+    fn a_schema_reparse_inside_a_step_is_a_reentered_prepare() {
+        let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        test_hooks::arm(true);
+        test_hooks::take_reentered();
+        conn.execute("CREATE TABLE r(a INTEGER)").unwrap();
+        let reparse = test_hooks::take_reentered();
+        conn.execute("SELECT a FROM r").unwrap();
+        let flat = test_hooks::take_reentered();
+        test_hooks::arm(false);
+        assert!(reparse > 0, "the schema reparse's prepare was not seen inside a step");
+        assert_eq!(flat, 0, "a flat SELECT counted as re-entered");
     }
 }

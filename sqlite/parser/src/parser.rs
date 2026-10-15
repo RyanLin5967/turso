@@ -707,8 +707,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
             TK_BEGIN,
@@ -2096,8 +2096,8 @@ impl<'a> Parser<'a> {
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
             self.expr_nesting_depth -= 1;
@@ -3007,8 +3007,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
             TK_ID,
@@ -3173,8 +3173,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_one_select(&mut self) -> Result<OneSelect> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
@@ -3223,8 +3223,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let select = self.parse_one_select()?;
         let mut compounds = vec![];
         while let Some(tok) = self.peek()? {
@@ -3358,8 +3358,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
@@ -3398,8 +3398,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        turso_stack_guard::check().map_err(|_| Error::StackDepthLimitExceeded)?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)
     }

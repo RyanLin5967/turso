@@ -7645,6 +7645,7 @@ dependencies = [
 name = "turso_stack_guard"
 version = "0.8.0-pre.7"
 dependencies = [
+ "libc",
  "stacker",
 ]
 
