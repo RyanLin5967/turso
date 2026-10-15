@@ -173,6 +173,15 @@ def selftest():
        check_pg("shared_buffers\t511616\tkB\tconfiguration file\n", mem) != [])
     ok("check-pg: no unit column refused", check_pg("shared_buffers\t511616\n", mem) != [])
     ok("check-pg: no shared_buffers row refused", check_pg("fsync\ton\t\tdefault\n", mem) != [])
+    # comp review 1 LOW 34: ONE reader of shared_buffers' size, shared by check_pg and smoke_table (which guessed 8 kB)
+    sbb = globals().get("shared_buffers_bytes")
+    for name, text, want in (("8kB pages", good, (511616 * 8192, None)),
+                             ("a kB unit is not guessed", "shared_buffers\t511616\tkB\tconfiguration file\n", (None, "unit")),
+                             ("no unit column", "shared_buffers\t511616\n", (None, "unit")),
+                             ("no row", "fsync\ton\t\tdefault\n", (None, "no shared_buffers row"))):
+        got = sbb(text) if sbb else (None, "no shared_buffers_bytes() in pins.py")
+        ok(f"shared_buffers_bytes: {name} -> {got!r}",
+           got[0] == want[0] and (want[1] is None) == (got[1] is None) and (want[1] is None or want[1] in got[1]))
     ok("check-pg: no MemTotal refused", check_pg(good, "MemFree: 1 kB\n") != [])
     print(f"pins selftest: {n - bad}/{n}")
     return 1 if bad else 0
