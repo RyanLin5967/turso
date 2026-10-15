@@ -475,10 +475,12 @@ impl AsyncWrite for MaybeTls {
 /// A std TCP socket in blocking mode as an AsyncRead/AsyncWrite whose every poll completes: the
 /// read or write blocks the calling thread in the system call, and nothing is registered with a
 /// reactor, so a session thread driven by a plain executor makes no kevent (vendored change 9).
-/// A read that times out (SO_RCVTIMEO, the server's startup timeout) is read as the stream's end,
+/// While `deadline` is set, every read waits only until it (SO_RCVTIMEO, re-armed per read), so a
+/// client that trickles bytes cannot stretch it; a read that reaches it reads as the stream's end,
 /// with `timed_out` set.
 pub struct BlockingTcp {
     pub socket: std::net::TcpStream,
+    pub deadline: Option<std::time::Instant>,
     pub timed_out: bool,
 }
 
@@ -490,6 +492,14 @@ impl AsyncRead for BlockingTcp {
     ) -> Poll<io::Result<()>> {
         use std::io::Read;
         let this = self.get_mut();
+        if let Some(deadline) = this.deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                this.timed_out = true;
+                return Poll::Ready(Ok(()));
+            }
+            this.socket.set_read_timeout(Some(left))?;
+        }
         loop {
             match this.socket.read(buf.initialize_unfilled()) {
                 Ok(n) => {
@@ -539,14 +549,19 @@ impl AsyncWrite for BlockingTcp {
 
 /// [`negotiate_tls`] with no TLS, on a std socket in blocking mode ([`BlockingTcp`]): the SSL and
 /// GSS requests are refused, as `negotiate_tls(.., None)` refuses them, and a direct TLS handshake
-/// gets `Ok(None)`. The peek for a direct handshake blocks until the client's first byte (or the
-/// socket's read timeout). Vendored change 9.
+/// gets `Ok(None)`. Every read, the peek for a direct handshake's first byte included, ends at
+/// `deadline`, which the returned socket keeps until the caller clears it. Vendored change 9.
 pub async fn negotiate_blocking<S>(
     tcp_socket: std::net::TcpStream,
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<Framed<MaybeTls, PgWireMessageServerCodec<S>>>> {
     let addr = tcp_socket.peer_addr()?;
     tcp_socket.set_nodelay(true)?;
     tcp_socket.set_nonblocking(false)?;
+    if let Some(deadline) = deadline {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        tcp_socket.set_read_timeout(Some(left.max(std::time::Duration::from_nanos(1))))?;
+    }
     let mut first = [0u8; 1];
     let direct = loop {
         match tcp_socket.peek(&mut first) {
@@ -562,6 +577,7 @@ pub async fn negotiate_blocking<S>(
     let client_info = DefaultClient::new(addr, false);
     let io = BlockingTcp {
         socket: tcp_socket,
+        deadline,
         timed_out: false,
     };
     let mut socket = Framed::new(MaybeTls::Blocking(io), PgWireMessageServerCodec::new(client_info));

@@ -694,14 +694,13 @@ async fn serve_session(
     socket: std::net::TcpStream,
     session: Arc<Session>,
 ) -> Result<(), std::io::Error> {
-    // The startup timeout is the socket's read timeout until startup completes: a read that times
-    // out reads as the stream's end (BlockingTcp), so a client that never finishes its startup
-    // cannot hold the thread.
-    let startup_timeout = session.shared.startup_timeout;
-    socket.set_read_timeout(Some(startup_timeout))?;
+    // The whole startup must end by one deadline: a read that reaches it reads as the stream's end
+    // (BlockingTcp), so a client that never finishes its startup, or trickles it a byte at a time,
+    // cannot hold the thread and its max_connections slot.
+    let startup_deadline = std::time::Instant::now() + session.shared.startup_timeout;
     // Every way a session ends before its startup completes is logged: the client sees only the
     // socket close (the "closed the connection during startup" flake, lead).
-    let socket = pgwire::tokio::server::negotiate_blocking(socket)
+    let socket = pgwire::tokio::server::negotiate_blocking(socket, Some(startup_deadline))
         .await
         .inspect_err(|e| {
             warn!("session ended before startup: TLS negotiation failed: {}", e);
@@ -729,7 +728,8 @@ async fn serve_session(
         );
         if !starting && !started {
             started = true;
-            if let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_ref() {
+            if let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_mut() {
+                io.deadline = None;
                 io.socket.set_read_timeout(None)?;
             }
         }
