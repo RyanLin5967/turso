@@ -9624,7 +9624,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
         })
         .collect();
     println!("FE_STALL worst create {name}: {total} allocations to its last trace point [{}]; {over_64} of 16384 creates over 64", steps.join(" "));
-    // Confirmed at 9c1f... (raw l82): 6,283 of the worst create's 6,288 held allocations were its
+    // Confirmed at f48184da2 (raw l82): 6,283 of the worst create's 6,288 held allocations were its
     // checkpoint start. After L2(d) slice 1 (raw l92) the worst create allocates 60 (the capture's
     // read snapshot 26, its rows 14, its hand-off 12) and none of 16,384 passes 64; the claim is now
     // that bound, which the rows and the snapshot (slices 2-3) must bring to 0.
