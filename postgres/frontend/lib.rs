@@ -3,6 +3,7 @@ mod catalog;
 mod copy;
 mod functions;
 mod information_schema;
+mod pg_settings;
 mod result_types;
 pub use result_types::{element_of, StatementTypes};
 mod session;

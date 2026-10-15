@@ -1063,11 +1063,21 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 .store(rank, std::sync::atomic::Ordering::Relaxed);
             true
         }
-        "statement_timeout" | "idle_in_transaction_session_timeout" => match setting_ms(&text) {
-            Some(0) => true,
-            Some(_) => return unsupported("this server enforces no such timeout; 0 is accepted"),
-            None => return invalid(),
-        },
+        "statement_timeout" | "idle_in_transaction_session_timeout" | "transaction_timeout" => {
+            match setting_ms(&text) {
+                Some(0) => true,
+                Some(_) => {
+                    return unsupported("this server enforces no such timeout; 0 is accepted")
+                }
+                None => return invalid(),
+            }
+        }
+        // A pg_dump header's settings, each accepted at the value that changes nothing here (wire
+        // review 16 item 17): XML values are content (this server has no XML type), the default
+        // tablespace is none and every table is the engine's own.
+        "xmloption" => lower == "content",
+        "default_tablespace" => text.is_empty(),
+        "default_table_access_method" => lower == "heap",
         "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
             Some(false) => true,
             _ => {
@@ -1098,6 +1108,11 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         n if NOOP_PARAMETERS.contains(&n) || n.starts_with("enable_") => true,
         n if n.contains('.') => {
             return unsupported("custom configuration parameters are not supported")
+        }
+        // One PostgreSQL knows is refused as one this server does not act on, not as one nobody
+        // knows: 42704 claimed PostgreSQL would not know it (wire review 16 item 17).
+        n if crate::pg_settings::is_postgresql_parameter(n) => {
+            return unsupported("this server does not act on it")
         }
         _ => {
             return Err(LimboError::ParseError(format!(
@@ -1153,6 +1168,11 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
             return Err(LimboError::ParseError(
                 "SHOW ALL is not supported".to_string(),
             ))
+        }
+        _ if crate::pg_settings::is_postgresql_parameter(&name) => {
+            return Err(LimboError::ParseError(format!(
+                "SHOW {name} is not supported: this server does not act on it"
+            )))
         }
         _ => {
             return Err(LimboError::ParseError(format!(
