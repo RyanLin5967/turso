@@ -2491,6 +2491,12 @@ fn array_results_are_typed_or_refused() {
     );
     let sql = "SELECT CAST(id AS int[]) FROM ar";
     assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    // A cast to an array of a domain is refused too: its check or coercion would not run
+    // (PostgreSQL truncates ARRAY['too long']::vc4[] to {"too "}; domain.sql of the regression
+    // corpus caught the identity storing 'too long').
+    a.q("CREATE DOMAIN vc4 AS varchar(4)").ok("vc4");
+    let sql = "SELECT ARRAY['too long']::vc4[]";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
 }
 
 /// KNOWN RED (known-red.txt): a bound array parameter sent back in a result (`SELECT $1::text[]`,
