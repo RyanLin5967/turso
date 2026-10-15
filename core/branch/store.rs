@@ -7694,12 +7694,24 @@ impl BranchStore {
                 self.join_flights();
                 return Ok(installed() > before);
             }
-            // One in flight covers state older than this call: wait for it, then start our own.
-            self.join_flights();
+            // One in flight covers state older than this call: wait for its install, then start our
+            // own; never past the deadline (Codex C15 MED 2: the join here waited for the flight
+            // however long it took, before the clock was read). A flight that ends without an
+            // install (it failed) leaves the next start free: the wait is a pause, not a join.
+            // Mutant `checkpoint_now_joins_unbounded` (test builds only): the join, as before.
+            if fe_mutant("checkpoint_now_joins_unbounded") {
+                self.join_flights();
+            }
             let Some(left) = deadline.checked_sub(started.elapsed()) else {
                 return Ok(false);
             };
-            crate::thread::sleep(pause.min(left));
+            let (lock, cv) = &*self.installs;
+            let count = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if *count == before {
+                #[cfg(test)]
+                note_wait();
+                drop(cv.wait_timeout(count, pause.min(left)).unwrap_or_else(|e| e.into_inner()));
+            }
             pause = (pause * 2).min(Duration::from_millis(50));
         }
     }
