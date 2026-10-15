@@ -2478,7 +2478,8 @@ impl FilterTable {
         h.max(1)
     }
 
-    /// Insert `h`; `false` if the table is full (7/8 of its slots), which allocates nothing.
+    /// Insert `h`; `false` if the table is full: a probe that meets a taken slot once 7/8 of the
+    /// slots are taken refuses (so a probe is bounded). Allocates nothing.
     fn insert(&self, h: u64) -> bool {
         let k = Self::key(h);
         let mask = self.cap() - 1;
@@ -2486,9 +2487,7 @@ impl FilterTable {
         loop {
             match self.slots[i].compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    if self.len.fetch_add(1, Ordering::AcqRel) + 1 > self.cap() / 8 * 7 {
-                        // The key is in, but no further one may come: the next insert refuses.
-                    }
+                    self.len.fetch_add(1, Ordering::AcqRel);
                     return true;
                 }
                 Err(v) if v == k => return true,
@@ -8395,10 +8394,11 @@ impl BranchStore {
                 // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
                 // scanned names are inserted under the mutex, as before.
                 let under = fe_mutant("name_filter_built_under_mutex");
-                // Sized for the scanned names with as many again to come, so the first growth is
-                // owed only once the store has doubled.
+                // Sized for the scanned names and half as many again (at most half full then), so
+                // a growth is owed only after the store has grown by a third or more; the table is
+                // 16-32 bytes per name (`for_keys`: a power of two of at least 2n slots).
                 let scanned = scanned.map(|hashes| {
-                    let table = FilterTable::for_keys(hashes.len().saturating_mul(2));
+                    let table = FilterTable::for_keys(hashes.len().saturating_add(hashes.len() / 2));
                     if under {
                         (table, hashes)
                     } else {
