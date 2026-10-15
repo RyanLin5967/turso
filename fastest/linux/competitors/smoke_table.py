@@ -10,8 +10,10 @@ per_op.flushes), with
   !  the idle-subtracted estimate went below zero (read the raw count)
   #  some creates in the window waited on the template (CountOtherDBBackends; see the cell's template_waits)
   FAIL  the cell's verdict was not ok;  MISSING  no cell.json (or no such job)
-Then the PG deferred table (the CHECKPOINT after each cell: flushes the creates left for later, per op) and the
-per-role split of the load windows (raw flushes per op by role, no subtraction).
+Then the PG deferred table (the CHECKPOINT after each cell, per op: about 0 at C=1, since every cycle's DROP discards
+its branch's dirty pages before any checkpoint writes them; comp review 1 MED 8), at C=1 the kept-arm table (deferred
+flushes per KEPT create: K creates with no DROP, then one CHECKPOINT), and the per-role split of the load windows (raw
+flushes per op by role, no subtraction).
 
 The PostgreSQL, Dolt and Doltgres labels name the version EVERY job of that system ran (LOW 25), read from the first
 line of each job's run/version.txt in the version command's own form (pins.FIRST_LINE). The tables are refused
