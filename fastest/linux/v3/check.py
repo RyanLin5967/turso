@@ -1383,10 +1383,11 @@ def real_selftest(chk):
             sy0 = (rj(os.path.join(HERE, "testdata", fx, "F3", "blkflush", "report.json")) or {}).get("syscalls") or {}
             ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
             n00 = (sy0.get("arms") or {}).get("nosync25") or {}
-            chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
-                "no_fd, inside_foreign_fd, inside_no_fd present and 0; every arm's windows_over 0, review 12 item 8)" % fx,
-                n00.get("syncs_inside_any_fd") == 0 and sorted(ua0) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
-                and all(v == 0 for v in ua0.values()) and bool(sy0.get("arms"))
+            # [V3 review 13 item 19, disclosed: the shape is now unattributed exactly {foreign_fd: 0} and no
+            # syncs_inside_any_fd key; the hand-written list is codex card C05's to replace with regen_f3.py --check]
+            chk("real: %s's report has the current sync record (unattributed exactly {foreign_fd: 0}, no "
+                "syncs_inside_any_fd key, review 13 item 19; every arm's windows_over 0, review 12 item 8)" % fx,
+                "syncs_inside_any_fd" not in n00 and ua0 == {"foreign_fd": 0} and bool(sy0.get("arms"))
                 and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in (sy0.get("arms") or {}).values()),
                 (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
@@ -1529,20 +1530,20 @@ def real_selftest(chk):
             # fsync on fd 7 inside a nosync25 window, which the fd rule alone gives to no window)
             # [amended at V3 review 12 item 6, disclosed: such a sync is counted in foreign_fd too (a wholly-inside
             # event on an fd its window's arm does not own has no owning candidate), so the plant is made consistent
-            # (foreign_fd 1) and the one gate is foreign_fd/no_fd == 0; the "wholly inside" counts are descriptive]
+            # (foreign_fd 1) and the one gate is foreign_fd == 0]
+            # [V3 review 13 item 19, disclosed: the descriptive keys this plant also set (syncs_inside_any_fd,
+            # inside_foreign_fd) are deleted, and the gate's text no longer says "or on none" (no_fd cannot fire)]
             ("an fsync on fd 7 wholly inside a nosync25 window",
-             {"report": lambda j: (j["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1),
-                                   j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1, inside_foreign_fd=1))},
-             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)},
+             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             # V3 review 12 item 6: a sync on an fd no arm owns at a nosync25 window's EDGE (t0 + 200 ns: its +-500 ns
-            # interval is not wholly inside, so every "inside" count stays 0 and only foreign_fd sees it), a sync
-            # naming no fd, and a report without foreign_fd (a missing count is not a zero)
-            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
-            ("a sync naming no fd (no_fd 1)",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(no_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            # interval is not wholly inside any window, and foreign_fd counts it all the same), and a report without
+            # foreign_fd (a missing count is not a zero). [V3 review 13 item 19: the no_fd plant is deleted with the
+            # count; it could not fire, since every sync event carries a parsed fd]
+            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             ("a report whose unattributed lacks foreign_fd",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             # eleventh review MED 2: the F1b cross-check refuses without its trace, and compares the probe's sync_fds
             # with the fds strace saw synced INSIDE each arm's timed windows, as sets (setup syncs excluded)
             ("no F1b real-all trace", {"f1b": "absent"}, "F3:devflush",
@@ -2456,12 +2457,12 @@ def check_real(o3, rc, kv, leaf):
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
             # eleventh review MED 1, V3 review 12 item 6: nosync25 owns no fd, so the fd rule can never give it a sync;
             # every sync of the probe's that no overlapping window's arm owns (foreign_fd: a nosync25 window's
-            # included, wholly inside or at its edge) or that names no fd (no_fd) must be 0 (a missing count is not a
-            # zero). The "wholly inside" counts (syncs_inside_any_fd, inside_*) are strictly weaker and stay
-            # descriptive: an edge or sub-us-window sync shows only in foreign_fd
+            # included, wholly inside or at its edge) must be 0 (a missing count is not a zero). V3 review 13 item 19:
+            # the one gate; no_fd could not fire (every sync event carries a parsed fd) and is deleted with the
+            # descriptive "wholly inside" counts
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
-            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
-                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns, or on none",
+            if ua.get("foreign_fd") != 0:
+                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns",
                              sy.get("unattributed")))
         dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
         rec["device_flushes_per_op"] = dfp

@@ -502,20 +502,21 @@ def post(out, cell, sha, mode, verdict_path):
                     voids.append("fsync: %s's windows over their own syncs (by fd): %r of %r" %
                                  (a, r.get("windows_over"), r.get("ops")))
             # eleventh review MED 1, V3 review 12 item 6: every sync of the probe's that no overlapping window's arm
-            # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) or that names no fd (no_fd) VOIDs
-            # the batch; a missing count is not a zero. (The nosync25-only lookup that stood here VOIDed any smoke
-            # batch without nosync25 as "None sync(s)"; the "wholly inside" counts stay descriptive.)
+            # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) VOIDs the batch; a missing count is
+            # not a zero (V3 review 13 item 19: the one gate; no_fd could not fire and is deleted, with the descriptive
+            # "wholly inside" counts). (The nosync25-only lookup that stood here VOIDed any smoke batch without
+            # nosync25 as "None sync(s)".)
             # V3 review 12 item 7: check.py's nosync25 rule, here too: nosync25 syncs nothing by definition, so its
-            # windows hold no sync attributed to it (a nosync25 that owns an fd and syncs on it shows here only: every
-            # unattributed count is then 0)
+            # windows hold no sync attributed to it (a nosync25 that owns an fd and syncs on it shows here only:
+            # foreign_fd is then 0)
             n0 = sarms.get("nosync25")
             if isinstance(n0, dict) and n0.get("syncs") != 0:
                 voids.append("fsync: nosync25's windows hold %r sync(s) by the probe (it owns no fd by definition)"
                              % (n0.get("syncs"),))
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
-            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
-                voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd), %r "
-                             "naming no fd (no_fd)" % (ua.get("foreign_fd"), ua.get("no_fd")))
+            if ua.get("foreign_fd") != 0:
+                voids.append("fsync: %r sync(s) by the probe on an fd no overlapping window's arm owns (foreign_fd)"
+                             % (ua.get("foreign_fd"),))
             # review 11 LOW 2 / review 12 item 7: the probe's own sync_fds against the arm definitions (check.OP), the
             # same half of check.py's sync_fds_problems; post trusted the record attribution reads by
             import check as _ck
@@ -696,13 +697,13 @@ def _post_batch(d, sha, mod):
     rep = {"proves": "planted", "devices": {},
            "windows": {"arms": {"append25": {"ops": 5, "devices": {} if wt else {"nvme0n1": win}},
                                 "nosync25": {"ops": 5, "devices": {}}}},
-           # [tenth review HIGH 1: a current report carries windows_short; eleventh review MED 1: and the syncs wholly
-           # inside each arm's windows on any fd, and the events unattributed inside a window]
+           # [tenth review HIGH 1: a current report carries windows_short; V3 review 12 item 8: windows_over; V3 review
+           # 13 item 19: unattributed is exactly {foreign_fd} (no_fd and the "wholly inside" counts are deleted)]
            "syscalls": {"pid": 4242, "arms": {"append25": {"ops": 5, "syncs": 5, "windows_without_a_sync": 0, "windows_short": 0,
-                                                           "syncs_inside_any_fd": 5, "windows_over": 0},
+                                                           "windows_over": 0},
                                                "nosync25": {"ops": 5, "syncs": 0, "windows_without_a_sync": 5, "windows_short": 0,
-                                                            "syncs_inside_any_fd": 0, "windows_over": 0}},
-                        "unattributed": {"foreign_fd": 0, "no_fd": 0, "inside_foreign_fd": 0, "inside_no_fd": 0}}}
+                                                            "windows_over": 0}},
+                        "unattributed": {"foreign_fd": 0}}}
     if mod == "fuaonly":  # one append25 window holds only a FUA write: a request, but none that flushes
         rep["windows"]["arms"]["append25"]["devices"]["nvme0n1"]["flush_carrying_zero_windows"] = 1
     if mod == "leafkind":
@@ -711,18 +712,14 @@ def _post_batch(d, sha, mod):
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
     if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
         rep["syscalls"]["arms"]["append25"].update(windows_over=1)
-    # [the three eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an
-    # fd its arm does not own is counted in foreign_fd as well, so each plant now carries the foreign_fd/no_fd a real
-    # report would, and the gate is foreign_fd/no_fd == 0]
+    # [the eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an fd its
+    # arm does not own is counted in foreign_fd as well, so each plant carries the foreign_fd a real report would.
+    # AMENDED again at V3 review 13 item 19, disclosed: the descriptive keys they also set are deleted, and the two
+    # no_fd plants (inside-nofd, nofd-only) are removed: no_fd could not fire, every sync event carrying a parsed fd]
     if mod == "nosync-anyfd":  # eleventh review MED 1: an fsync on fd 7 (no arm's) wholly inside a nosync25 window
-        rep["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1)
-        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1)
     if mod == "inside-foreign":  # ... a sync on an fd its window's arm does not own, wholly inside an append25 window
-        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
-        rep["syscalls"]["unattributed"].update(foreign_fd=1, inside_foreign_fd=1)
-    if mod == "inside-nofd":  # ... a sync naming no fd, wholly inside an append25 window
-        rep["syscalls"]["arms"]["append25"].update(syncs_inside_any_fd=6)
-        rep["syscalls"]["unattributed"].update(no_fd=1, inside_no_fd=1)
+        rep["syscalls"]["unattributed"].update(foreign_fd=1)
     if mod == "nosync-ownfd":  # V3 review 12 item 7: nosync25 OWNS an fd and syncs on it, every unattributed count 0
         sj["sync_fds"]["nosync25"] = {"9": 5}
         rep["syscalls"]["arms"]["nosync25"].update(syncs=5, windows_without_a_sync=0)
@@ -730,8 +727,6 @@ def _post_batch(d, sha, mod):
         sj["sync_fds"]["append25"] = {}
     if mod == "foreign-edge":  # V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge: foreign_fd only
         rep["syscalls"]["unattributed"].update(foreign_fd=1)
-    if mod == "nofd-only":  # ... a sync naming no fd outside every window's interior: no_fd only
-        rep["syscalls"]["unattributed"].update(no_fd=1)
     if mod == "unattr-nokey":  # ... a report whose unattributed lacks foreign_fd (a missing count is not a zero)
         rep["syscalls"]["unattributed"].pop("foreign_fd")
     if mod in ("nosync", "wt-nosync"):  # one append25 window with no fsync by the probe
@@ -796,11 +791,8 @@ def post_selftest(chk):
              "VOID fsync:", {}),
             ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,
              "VOID fsync:", {}),
-            ("eleventh review MED 1: a sync naming no fd wholly inside an append25 window", "inside-nofd", "smoke", 3,
-             "VOID fsync:", {}),
-            ("V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
+            ("V3 review 12 item 6: an unowned-fd sync at a nosync25 window's edge (foreign_fd 1)",
              "foreign-edge", "smoke", 3, "VOID fsync:", {}),
-            ("V3 review 12 item 6: a sync naming no fd (no_fd 1)", "nofd-only", "smoke", 3, "VOID fsync:", {}),
             ("V3 review 12 item 6: a report whose unattributed lacks foreign_fd", "unattr-nokey", "smoke", 3, "VOID fsync:", {}),
             ("MED 3: a write-back loop layer's window without a flush-carrying request", "loopflush", "smoke", 3,
              "VOID flush-carrying:", {}),
