@@ -4,6 +4,10 @@
 # t3run's selftests stage runs it. Exit 0 iff every case holds.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# TEST EDIT, flagged (the first --dry-block run, 2026-10-15: t3run exports T3_IDENTITY_MODE=virtio and its selftests
+# stage ran this file under it, so the default-refusal case saw the virtio identity): every case starts from no mode,
+# and the cases that need it set it themselves
+unset T3_IDENTITY_MODE
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 source "$HERE/t3lib.sh"
