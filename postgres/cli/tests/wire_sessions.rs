@@ -4836,6 +4836,45 @@ fn a_parameter_its_type_cannot_read_is_refused_with_its_types_code() {
     );
 }
 
+/// A branch call checks what an engine statement checks first before it refuses a bad result
+/// format code: two result codes for its one column are 08P01, as `SELECT 1` bound with them is,
+/// and an unknown branch function is 42883, whatever the codes; code 2 alone is still 22023,
+/// before the call changes anything (no branch z). The 22023 came first, so codes [0, 2] answered
+/// 22023 where an engine SELECT answers 08P01 (wire review 17 item 9).
+#[test]
+fn a_branch_call_checks_its_shape_before_its_result_codes() {
+    let dir = Scratch::new("branchcodes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let code = |a: &mut Wire, sql: &str, rcodes: &[i16]| {
+        let (_, error) = a.bind_round(sql, &[], &[], rcodes);
+        error.map(|e| e.code)
+    };
+    assert_eq!(
+        code(&mut a, "SELECT 1", &[0, 2]).as_deref(),
+        Some("08P01"),
+        "premise: an engine SELECT"
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_current()", &[0, 2]).as_deref(),
+        Some("08P01")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_nosuch()", &[2]).as_deref(),
+        Some("42883")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_current()", &[2]).as_deref(),
+        Some("22023")
+    );
+    assert_eq!(
+        code(&mut a, "SELECT turso_branch_create('z')", &[2]).as_deref(),
+        Some("22023")
+    );
+    let sql = "SELECT turso_branch_switch('z')";
+    assert!(a.q(sql).error.is_some(), "the refused create left branch z");
+}
+
 /// A Bind PostgreSQL refuses is refused AT the Bind, before BindComplete, so the Execute after it
 /// runs nothing: a parameter format code other than 0 or 1 (22023 "unsupported format code: 2",
 /// even for a NULL value), a parameter-format list that is neither 0, 1 nor one per parameter
