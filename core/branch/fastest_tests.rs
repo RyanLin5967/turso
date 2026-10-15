@@ -1563,18 +1563,10 @@ impl BusyCommit {
         self.commit.as_mut().expect("a held COMMIT").run_ignore_rows()
     }
 
-    /// The WAL commit frames written since the fixture's first BEGIN.
+    /// The WAL commit frames written since the fixture's first BEGIN, by any connection
+    /// (`commit_frames_since`'s fresh-connection view: FLAGGED TEST EDIT, the same instrument fix).
     fn commit_frames(&self) -> usize {
-        let now = self.a.wal_state().unwrap();
-        assert_eq!(
-            now.checkpoint_seq_no, self.checkpoint_seq,
-            "catalog={}: premise: no checkpoint restarted the WAL in between",
-            self.catalog
-        );
-        let mut frame = vec![0u8; 24 + self.page_size];
-        (self.from_frame + 1..=now.max_frame)
-            .filter(|&n| self.a.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
-            .count()
+        commit_frames_since(&self.a, self.from_frame, self.checkpoint_seq, self.page_size)
     }
 
     /// Row `id`'s value as a fresh trunk connection reads it: what is committed.
@@ -1836,11 +1828,18 @@ fn a_busy_commit_whose_view_merge_yielded_commits_once() {
 /// The WAL commit frames `conn` reads past frame `from`, with no checkpoint since (`seq`).
 #[cfg(feature = "conn_raw_api")]
 fn commit_frames_since(conn: &Arc<Connection>, from: u64, seq: u32, page_size: usize) -> usize {
-    let now = conn.wal_state().unwrap();
+    // FLAGGED TEST EDIT (an instrument reaching what it counts; for the lead's ruling): `wal_state`
+    // is the connection's own view (its last read mark or commit), so another connection's commit
+    // was invisible to it: the attached half committed through the main connection read 0 on aux's
+    // direct connection (red at bb6af4d94 and 9d27592bf, artie raws l1-branch*). The frames are
+    // counted on a fresh connection to the same database, after a read installs the newest mark.
+    let fresh = conn.db.connect().unwrap();
+    fresh.execute("SELECT count(*) FROM sqlite_schema").unwrap();
+    let now = fresh.wal_state().unwrap();
     assert_eq!(now.checkpoint_seq_no, seq, "premise: no checkpoint restarted the WAL in between");
     let mut frame = vec![0u8; 24 + page_size];
     (from + 1..=now.max_frame)
-        .filter(|&n| conn.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
+        .filter(|&n| fresh.wal_get_frame(n, &mut frame).unwrap().is_commit_frame())
         .count()
 }
 
