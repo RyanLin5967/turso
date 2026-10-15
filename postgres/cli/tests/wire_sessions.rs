@@ -215,6 +215,8 @@ struct Reply {
     rows: Vec<Vec<Option<String>>>,
     /// The type OIDs of the last RowDescription, if one came.
     oids: Option<Vec<u32>>,
+    /// The column names of the last RowDescription, if one came.
+    names: Option<Vec<String>>,
     tags: Vec<String>,
     error: Option<WireError>,
     /// The parameter type OIDs of the last ParameterDescription, if one came.
@@ -508,8 +510,11 @@ impl Wire {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     let mut p = 2;
                     let mut oids = Vec::with_capacity(n);
+                    let mut names = Vec::with_capacity(n);
                     for _ in 0..n {
-                        p += body[p..].iter().position(|&c| c == 0).unwrap() + 1;
+                        let end = p + body[p..].iter().position(|&c| c == 0).unwrap();
+                        names.push(String::from_utf8_lossy(&body[p..end]).into_owned());
+                        p = end + 1;
                         oids.push(u32::from_be_bytes([
                             body[p + 6],
                             body[p + 7],
@@ -519,6 +524,7 @@ impl Wire {
                         p += 18;
                     }
                     r.oids = Some(oids);
+                    r.names = Some(names);
                 }
                 b'D' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
@@ -2958,6 +2964,38 @@ fn a_domain_over_numeric_takes_a_quoted_value() {
     a.q("insert into bt values ('123.5', '2.5')").ok("quoted values");
     let r = a.q("select n, d from bt").ok("rows");
     assert_eq!(r.rows, vec![vec![t("123.5"), t("2.5")]]);
+}
+
+/// A FROM alias's column list renames the relation's columns, the first ones, in order, as in
+/// PostgreSQL 18.6 (recorded, artie raw loud-20261015/pg18-diff/pg18-join1.out): `j1 AS t1 (a, b,
+/// c)` is read as a, b, c and named so in the result, `j1 t1 (a)` renames only the first, and a
+/// NATURAL JOIN joins on the new names. The list was dropped: the result kept i, j, t (the regress
+/// corpus's join.sql) and `t1.a` was 42703. A list longer than the relation is 42P10.
+#[test]
+fn a_from_alias_column_list_renames_the_columns() {
+    let dir = Scratch::new("aliascols");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE j1 (i int, j int, t text)").ok("j1");
+    a.q("CREATE TABLE j2 (i int, k int)").ok("j2");
+    a.q("INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two')").ok("j1 rows");
+    a.q("INSERT INTO j2 VALUES (1, -1), (5, -5)").ok("j2 rows");
+    let r = a.q("SELECT * FROM j1 AS t1 (a, b, c) ORDER BY a").ok("all renamed");
+    assert_eq!(r.names, names(&["a", "b", "c"]));
+    assert_eq!(r.rows, vec![vec![t("1"), t("4"), t("one")], vec![t("2"), t("3"), t("two")]]);
+    let r = a.q("SELECT t1.a, c FROM j1 t1 (a, b, c) ORDER BY a").ok("qualified");
+    assert_eq!((r.names, r.rows), (names(&["a", "c"]), vec![vec![t("1"), t("one")], vec![t("2"), t("two")]]));
+    let r = a.q("SELECT * FROM j1 t1 (a) ORDER BY a").ok("first renamed");
+    assert_eq!(r.names, names(&["a", "j", "t"]));
+    let r = a
+        .q("SELECT * FROM j1 t1 (a, b, c) NATURAL JOIN j2 t2 (a, d) ORDER BY a")
+        .ok("natural join on the new names");
+    assert_eq!(r.names, names(&["a", "b", "c", "d"]));
+    assert_eq!(r.rows, vec![vec![t("1"), t("4"), t("one"), t("-1")]]);
+    let sql = "SELECT * FROM j2 t2 (a, b, c)";
+    assert_eq!(a.q(sql).err(sql).code, "42P10", "{sql}");
 }
 
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
