@@ -121,10 +121,12 @@ static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c;
 #endif
 #include <math.h>
 #include <mysql.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <time.h>
 
 #define MAXSTEPS 8
@@ -178,6 +180,7 @@ static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
 static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
 static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static const double CLOSE_TIMEOUT_S = 5;
 static char WARM_RULE[64] = "";
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
 static char RUNTAG[64];
@@ -528,12 +531,39 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
     return 0;
 }
 
-static void conn_close(conn_t *x) {
-    if (x->pg) PQfinish(x->pg);
-    if (x->my) mysql_close(x->my);
+/* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
+static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
+    int s = -1, rc = 0;
+    if (x->pg) { int fd = PQsocket(x->pg); if (fd >= 0) s = dup(fd); PQfinish(x->pg); }
+    if (x->my) { int fd = (int)mysql_get_socket(x->my); if (fd >= 0) s = dup(fd); mysql_close(x->my); }
     x->pg = NULL;
     x->my = NULL;
+    if (s < 0) return 0;
+    uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
+    char b[512];
+    for (;;) {
+        uint64_t n = now_ns();
+        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection within %.1f s", CLOSE_TIMEOUT_S); rc = -1; break; }
+        struct pollfd pf = {s, POLLIN, 0};
+        int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
+        if (pr < 0) { if (errno == EINTR) continue; snprintf(why, wsz, "close: poll: %s", strerror(errno)); rc = -1; break; }
+        if (pr == 0) continue;
+        ssize_t r = read(s, b, sizeof b);
+        if (r == 0) break;
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == ECONNRESET) break; /* the server reset it: closed all the same */
+            snprintf(why, wsz, "close: read: %s", strerror(errno));
+            rc = -1;
+            break;
+        }
+    }
+    struct linger lg = {1, 0};
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(s);
+    return rc;
 }
+static void conn_close(conn_t *x) { char w[256]; (void)conn_close_sync(x, w, sizeof w); }
 static int conn_alive(conn_t *x) {
     if (x->proto == P_PG) return x->pg && PQstatus(x->pg) == CONNECTION_OK;
     return x->my != NULL;
@@ -587,12 +617,15 @@ static void note_backend(client_t *c, uint32_t seq, uint8_t kind, conn_t *x) {
 static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st, ctx_t *x, char *why, size_t wsz) {
     char text[8192], w[256];
     if (st->k == K_CLOSE) {
-        if (*have_branch) { conn_close(cur); *have_branch = 0; }
+        if (*have_branch) { *have_branch = 0; return conn_close_sync(cur, why, wsz); }
         return 0;
     }
     if (expand(st->t, x, text, sizeof text, w) != 0) { snprintf(why, wsz, "%s", w); return -1; }
     if (st->k == K_CONNECT) {
-        if (*have_branch) conn_close(cur);
+        if (*have_branch) {
+            *have_branch = 0;
+            if (conn_close_sync(cur, why, wsz) != 0) return -1;
+        }
         *have_branch = 0;
         char ci[4096];
         if (expand(S.connect, x, ci, sizeof ci, w) != 0) { snprintf(why, wsz, "%s", w); return -1; }
@@ -832,7 +865,10 @@ static void *client_main(void *arg) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
             }
-        if (have_branch) conn_close(&cur);
+        if (have_branch && conn_close_sync(&cur, w, sizeof w) != 0) {
+            int e = err_index(w);
+            if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
+        }
         r.after_end = now_ns();
         if (!conn_alive(&c->home)) reconnect_home(c);
         record(c, &r);
