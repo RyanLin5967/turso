@@ -11891,14 +11891,25 @@ mod recorded {
         }
     }
 
-    /// A RowDescription line compares without its names when PostgreSQL's line has none.
+    /// A RowDescription line compares without its names when PostgreSQL's line has none, and the
+    /// one-letter lines of the earliest recordings (pgproto.py printed `1`, `2`, `n` before it
+    /// named them) compare as the names it prints now.
     fn same(want: &[String], got: &[String]) -> bool {
+        let named = |w: &str| match w {
+            "1" => "ParseComplete",
+            "2" => "BindComplete",
+            "n" => "NoData",
+            "3" => "CloseComplete",
+            "s" => "PortalSuspended",
+            other => other,
+        }
+        .to_string();
         want.len() == got.len()
-            && want.iter().zip(got).all(|(w, g)| {
+            && want.iter().map(|w| named(w)).zip(got).all(|(w, g)| {
                 if w.starts_with("T oids=") && !w.contains(" names=") {
                     g.split(" names=").next() == Some(w.as_str())
                 } else {
-                    w == g
+                    &w == g
                 }
             })
     }
@@ -12360,3 +12371,4 @@ replays_postgresql!(
     []
 );
 replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
+replays_postgresql!(pg18_c33_intrange_replays_as_postgresql_answered, "pg18-c33-intrange.out", []);
