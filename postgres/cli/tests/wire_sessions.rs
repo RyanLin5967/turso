@@ -4628,12 +4628,15 @@ fn a_clients_value_never_chooses_the_sqlstate() {
     let dir = Scratch::new("valuecode");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    for sql in [
-        "SET bytea_output = 'is ambiguous'",
-        "SET bytea_output = 'specified more than once'",
-        "SET bytea_output = 'escape'",
+    // C44 lead ruling: invalid values are PG 18.6's 22023. The valid escape mode remains
+    // an unsupported feature here; its existing 0A000 expectation is unchanged.
+    // Fresh oracle: c44-pg18-errors-r2.txt beside this test.
+    for (sql, expected) in [
+        ("SET bytea_output = 'is ambiguous'", "22023"),
+        ("SET bytea_output = 'specified more than once'", "22023"),
+        ("SET bytea_output = 'escape'", "0A000"),
     ] {
-        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+        assert_eq!(a.q(sql).err(sql).code, expected, "{sql}");
     }
 }
 
