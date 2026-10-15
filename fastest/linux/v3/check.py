@@ -1403,10 +1403,15 @@ def self_test():
     # `awk -v b="$mp/"`; that sweep now calls nestloops.sh's nest_level_match, pinned by its canned cases above]
     import subprocess as _sp12
     nl = os.path.join(HERE, "nestloops.sh")
-    r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
-    chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
-        "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
-        and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
+    # Linux-only (gates/platforms.tsv: GNU readlink -m, and a /var that is not a symlink): off Linux it is N/A, never a
+    # pass (the platform-inheritance class, 2026-10-15); on Linux it must pass as before
+    if not sys.platform.startswith("linux"):
+        print(f"N/A-on-{sys.platform}: nestloops.sh --self-test (GNU readlink -m, and a /var that is not a symlink)", flush=True)
+    else:
+        r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
+        chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
+            "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
+            and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
     # V3 review 13 item 8: teardown_nest's OUTCOME check (no loop still backed by the chain at the end) had never fired
     # alone, and item 13's red was not isolating. mkfixtures.sh --teardown-nest runs here on a temp BASE with PATH
     # shims (nestloops.sh's technique): sudo runs its command, mountpoint and findmnt say nothing is mounted, and
