@@ -5294,6 +5294,27 @@ fn a_named_statement_keeps_its_described_parameter_types() {
     );
 }
 
+/// A CREATE TABLE's foreign keys are checked against the newest schema, not a session's older
+/// snapshot: after session b creates p, session a's `CREATE TABLE c(x INT REFERENCES p(id))`
+/// succeeds and keeps its key (an orphan is 23503). The key precheck read a's snapshot, from
+/// before p existed, and refused 42P01, and since a refused precheck compiles nothing the snapshot
+/// never moved, so every retry was refused the same way (wire review 16 item 10).
+#[test]
+fn a_foreign_key_is_checked_against_the_newest_schema() {
+    let dir = Scratch::new("stalekeys");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE z(id INT)")
+        .ok("a's snapshot, from before p");
+    b.q("CREATE TABLE p(id INT PRIMARY KEY)")
+        .ok("p, by another session");
+    let sql = "CREATE TABLE c(x INT REFERENCES p(id))";
+    a.q(sql).ok(sql);
+    let orphan = "INSERT INTO c VALUES (5)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "c's key was kept");
+}
+
 /// A statement's parameter types are inferred from the schema its compile uses, the newest one,
 /// not from a session's older snapshot: after another session replaces ft(k INT) with ft(k TEXT),
 /// a Describe of `count(*) ... WHERE k = $1` answers [25], and its executions return one row each,
