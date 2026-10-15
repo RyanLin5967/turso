@@ -423,14 +423,15 @@ def per_arm(events, w):
 
 def sync_fds_of(summary_path):
     """The probe's own record of the fds each arm's ops sync (summary.json sync_fds, tenth review HIGH 1) -> arm ->
-    {fd: syncs per op}. Refuses (Refuse) when it is missing, overflowed, or a count is not a whole multiple of n."""
+    {fd: syncs per op}. Refuses (Refuse) when it is missing, when sync_fds_overflow is anything but exactly false (V3
+    review 11 LOW 1: it refused only true), or when a count is not a whole multiple of n."""
     try:
         with open(summary_path) as f:
             sj = json.load(f)
     except (OSError, ValueError) as e:
         raise Refuse("no probe summary for the sync fds (%s): %r" % (summary_path, e))
     n, raw = sj.get("n"), sj.get("sync_fds")
-    if not isinstance(n, int) or n <= 0 or not isinstance(raw, dict) or sj.get("sync_fds_overflow") is True:
+    if not isinstance(n, int) or n <= 0 or not isinstance(raw, dict) or sj.get("sync_fds_overflow") is not False:
         raise Refuse("the probe summary has no usable sync_fds (n %r, sync_fds %r, overflow %r)"
                      % (n, type(raw).__name__, sj.get("sync_fds_overflow")))
     out = {}
