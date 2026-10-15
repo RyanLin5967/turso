@@ -9,7 +9,7 @@
 #                                     to the cwd, and with no config it serves $HOME/doltgres/databases)
 #   doltgres.sh start DATA [V1RUN]    run `doltgres -config DATA/config.yaml` with cwd DATA, detached; pid ->
 #                                     DATA.ftpid, log -> DATA.log; waits until SELECT 1 answers
-#   doltgres.sh seed  DATA ROWS [AGE] t(ROWS rows) in database postgres, dolt_commit; AGE>0: aged, dolt_commit, dolt_gc
+#   doltgres.sh seed  DATA ROWS [AGE] t(ROWS rows) in database postgres, dolt_commit, aged by AGE (0: none), dolt_commit, dolt_gc (always)
 #   doltgres.sh sql   DATA SQL        one statement through psql
 #   doltgres.sh stop  DATA            SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): dolt_checkout('-b', b) [BranchBench's create, includes the switch], or

@@ -9,7 +9,7 @@
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
 #   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
 #                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main, aged by AGE (0: none), DOLT_COMMIT, DOLT_GC (always)
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
