@@ -1546,6 +1546,16 @@ def real_selftest(chk):
             m = re.match(r"^(\d+)\s", ls[c0])
             return "\n".join(ls[:c0 + 1] + ["%s  fsync(3) = 0" % m.group(1)] + ls[c0 + 1:])
 
+        def f1b_insync(path_of):  # V3 review 13 item 18: an in-window fsync of path_of(W) right after the first
+            # in-loop pwrite64, on fd 99; W is the work directory of the trace's own setup (cfr2b.src's directory)
+            def f(t):
+                ls, c0 = f1b_lines(t)
+                m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\((\d+)<([^>]*/cfr2b\.src)>\)", l) for l in ls[:c0]) if mm)
+                j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(", ls[k]))
+                return "\n".join(ls[:j + 1] + ["%s  fsync(99<%s>) = 0" % (m.group(1), path_of(os.path.dirname(m.group(3))))]
+                                 + ls[j + 1:])
+            return f
+
         def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
             # in-loop pwrite64, inside a timed window: a file that is no arm's own
             ls, c0 = f1b_lines(t)
@@ -1673,6 +1683,15 @@ def real_selftest(chk):
             # V3 review 12 item 11: an in-window sync on a path that is no arm's file (<work>/cfr2b.src) was keyed
             # "cfr2b.src" and never compared (the loop ran over rows only)
             ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
+            # V3 review 13 item 18: the arm is judged against the arms that RAN (rows) and the work directory W: an
+            # arm of ALL that did not run here (clone2b, on this ext4 fixture) was keyed and dropped, and a path off W
+            # named like an arm's clone was keyed as that arm
+            ("an F1b trace with an in-window fsync of <work>/clone2b.clones (clone2b did not run on ext4)",
+             {"f1b": f1b_insync(lambda w: w + "/clone2b.clones")}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
+            ("an F1b trace with an in-window fsync of /tmp/q/cfr2b.clones/c7 (off the work directory)",
+             {"f1b": f1b_insync(lambda w: "/tmp/q/cfr2b.clones/c7")}, "F3:devflush",
              ["an F1b in-window sync on a file that is no arm's own"]),
             # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
             # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
