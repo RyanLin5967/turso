@@ -90,7 +90,56 @@ fn bump(cell: &'static std::thread::LocalKey<Cell<u64>>, by: u64) {
     let _ = cell.try_with(|c| c.set(c.get().wrapping_add(by)));
 }
 
+thread_local! {
+    /// The allocation recorder (`record_allocs`): on, this thread's allocation sizes in order (the
+    /// first 16), and from the `T_TRACE_FROM`-th on a backtrace of each (taken with the recorder off,
+    /// so its own allocations are not recorded). Diagnostics only.
+    static T_REC_ON: Cell<bool> = const { Cell::new(false) };
+    static T_REC: Cell<[usize; 16]> = const { Cell::new([0; 16]) };
+    static T_REC_N: Cell<usize> = const { Cell::new(0) };
+    static T_TRACE_FROM: Cell<usize> = const { Cell::new(usize::MAX) };
+    static T_TRACES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Start (or stop) recording this thread's allocations, cleared: sizes, and a backtrace of each
+/// from the `trace_from`-th (0-based) on. Diagnostics only: a backtrace costs milliseconds.
+pub(crate) fn record_allocs(on: bool, trace_from: usize) {
+    T_REC_N.with(|n| n.set(0));
+    T_TRACES.with(|t| t.borrow_mut().clear());
+    T_TRACE_FROM.with(|t| t.set(trace_from));
+    T_REC_ON.with(|r| r.set(on));
+}
+
+/// What `record_allocs` recorded on this thread: the count, the first 16 sizes, the backtraces.
+pub(crate) fn recorded_allocs() -> (usize, Vec<usize>, Vec<String>) {
+    let n = T_REC_N.with(|n| n.get());
+    let sizes = T_REC.with(|r| r.get())[..n.min(16)].to_vec();
+    (n, sizes, T_TRACES.with(|t| t.borrow().clone()))
+}
+
+fn record_alloc(bytes: usize) {
+    if !T_REC_ON.try_with(|r| r.get()).unwrap_or(false) {
+        return;
+    }
+    let n = T_REC_N.with(|n| n.get());
+    T_REC_N.with(|c| c.set(n + 1));
+    if n < 16 {
+        T_REC.with(|r| {
+            let mut a = r.get();
+            a[n] = bytes;
+            r.set(a);
+        });
+    }
+    if n >= T_TRACE_FROM.with(|t| t.get()) {
+        T_REC_ON.with(|r| r.set(false));
+        let trace = format!("alloc #{n} of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture());
+        T_TRACES.with(|t| t.borrow_mut().push(trace));
+        T_REC_ON.with(|r| r.set(true));
+    }
+}
+
 fn note_alloc(bytes: usize) {
+    record_alloc(bytes);
     ALLOCS.fetch_add(1, Relaxed);
     ALLOC_BYTES.fetch_add(bytes as u64, Relaxed);
     bump(&T_ALLOCS, 1);
@@ -758,6 +807,109 @@ fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
         let _ = &mut each;
         None
     }
+}
+
+/// One thread at a moment (`thread_table`): the kernel's thread id, its CPU time so far (user plus
+/// system, ns), whether it is the caller, and its name (NUL-padded, cut at 31 bytes).
+#[derive(Clone, Copy)]
+pub(crate) struct ThreadCpu {
+    pub(crate) id: u64,
+    pub(crate) cpu_ns: u64,
+    pub(crate) me: bool,
+    pub(crate) name: [u8; 32],
+}
+
+impl ThreadCpu {
+    pub(crate) const EMPTY: ThreadCpu = ThreadCpu { id: 0, cpu_ns: 0, me: false, name: [0; 32] };
+
+    pub(crate) fn name(&self) -> String {
+        let end = self.name.iter().position(|b| *b == 0).unwrap_or(self.name.len());
+        String::from_utf8_lossy(&self.name[..end]).into_owned()
+    }
+}
+
+/// Every thread of this process now, into `out` (the first `out.len()`), and how many there are;
+/// `None` off Apple. Mach traps and userspace only, as `each_thread`, with no allocation, so it can
+/// be read inside a window whose BSD syscalls and allocations are counted. What it is for: the
+/// syscall counters here are the task's (`unix_syscalls`), so a window's count is its thread's
+/// own only if no other thread ran in it: compare two tables (`ran_between`).
+pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+        }
+        let mut list: libc::thread_act_array_t = std::ptr::null_mut();
+        let mut count: libc::mach_msg_type_number_t = 0;
+        // SAFETY: as `each_thread`.
+        let task = unsafe { libc::mach_task_self() };
+        // SAFETY: as `each_thread`.
+        if unsafe { libc::task_threads(task, &mut list, &mut count) } != 0 {
+            return None;
+        }
+        // SAFETY: as `each_thread`.
+        let me = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        for i in 0..count as usize {
+            // SAFETY: `list` holds `count` ports.
+            let port = unsafe { *list.add(i) };
+            if let Some(slot) = out.get_mut(i) {
+                // SAFETY: zeroes are valid for both flavors' structs; each count is its size in
+                // integers; the port is a thread of this task.
+                let mut ext: libc::thread_extended_info = unsafe { std::mem::zeroed() };
+                let mut n = libc::THREAD_EXTENDED_INFO_COUNT;
+                let kr = unsafe {
+                    libc::thread_info(port, libc::THREAD_EXTENDED_INFO as libc::thread_flavor_t, (&mut ext as *mut libc::thread_extended_info).cast(), &mut n)
+                };
+                // SAFETY: as above.
+                let mut ident: libc::thread_identifier_info = unsafe { std::mem::zeroed() };
+                let mut m = libc::THREAD_IDENTIFIER_INFO_COUNT;
+                let ki = unsafe {
+                    libc::thread_info(port, libc::THREAD_IDENTIFIER_INFO as libc::thread_flavor_t, (&mut ident as *mut libc::thread_identifier_info).cast(), &mut m)
+                };
+                let mut name = [0u8; 32];
+                if kr == 0 {
+                    for (d, c) in name.iter_mut().zip(ext.pth_name.iter().take(31)) {
+                        *d = *c as u8;
+                    }
+                }
+                *slot = ThreadCpu {
+                    id: if ki == 0 { ident.thread_id } else { u64::from(port) },
+                    cpu_ns: if kr == 0 { ext.pth_user_time + ext.pth_system_time } else { 0 },
+                    me: port == me,
+                    name,
+                };
+            }
+            // SAFETY: as `each_thread`.
+            unsafe { mach_port_deallocate(task, port) };
+        }
+        // SAFETY: as `each_thread`.
+        unsafe {
+            libc::vm_deallocate(
+                task,
+                list as libc::vm_address_t,
+                count as libc::vm_size_t * std::mem::size_of::<libc::thread_act_t>() as libc::vm_size_t,
+            )
+        };
+        Some(count as usize)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = out;
+        None
+    }
+}
+
+/// The threads, other than `skip` (a thread id), that ran between two `thread_table` readings:
+/// `(id, name, CPU ns)`, a thread new in `b` counted with all its time. Allocates: call it outside
+/// a measured window.
+pub(crate) fn ran_between(a: &[ThreadCpu], b: &[ThreadCpu], skip: u64) -> Vec<(u64, String, u64)> {
+    b.iter()
+        .filter(|t| t.id != skip && t.id != 0)
+        .filter_map(|t| {
+            let before = a.iter().find(|x| x.id == t.id).map_or(0, |x| x.cpu_ns);
+            (t.cpu_ns > before).then(|| (t.id, t.name(), t.cpu_ns - before))
+        })
+        .collect()
 }
 
 /// The threads this process has now, the live persistent store threads (`PERSISTENT_LIVE`) left out:

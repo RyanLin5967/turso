@@ -505,6 +505,51 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
     (db.unwrap(), base)
 }
 
+/// Lead order (2026-10-15, attribution item 1): `create_allocates_at_most_once_under_the_store_mutex`
+/// and `create_is_independent_of_live_branches` flip between runs (n1e4_small's steady create
+/// allocates 2 when red, 1 when green). The allocation counters are this thread's own
+/// (`t_allocs`), so the extra allocation is the creating thread's. This diagnostic builds the
+/// n1e4_small cell four times in one process (each build its own hash keys), reopens it as the
+/// budget does, and runs the budget's rounds' create and delete, recording each create's
+/// allocations on this thread with a backtrace of every one past the first
+/// (`budget_probe::record_allocs`). Printed only: the per-build counts, and each distinct
+/// backtrace of an extra allocation with how often it was seen.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_n1e4_create_allocations_by_site() {
+    for build_no in 0..4 {
+        let mut built = build("diag_n1e4_small", 10_000, false, true);
+        let mut out = String::new();
+        let (db, _base) = recover("diag_n1e4_small", &mut built, 1, &mut out);
+        let trunk = db.connect().unwrap();
+        let mut counts: std::collections::BTreeMap<usize, u32> = Default::default();
+        let mut sites: std::collections::BTreeMap<String, u32> = Default::default();
+        for i in 0..40u64 {
+            let name = format!("m-{i:04}");
+            probe::record_allocs(true, 1);
+            trunk.create_branch(&name).unwrap();
+            let (n, sizes, traces) = probe::recorded_allocs();
+            probe::record_allocs(false, usize::MAX);
+            *counts.entry(n).or_default() += 1;
+            for t in traces {
+                // The frames inside this crate, the allocator's own left out: the site.
+                let frames: Vec<&str> = t
+                    .lines()
+                    .filter(|l| l.contains("turso_core::") || l.contains("alloc::collections") || l.contains("hashbrown"))
+                    .filter(|l| !l.contains("budget_probe"))
+                    .take(8)
+                    .collect();
+                *sites.entry(format!("{} sizes={sizes:?}\n    {}", t.lines().next().unwrap_or(""), frames.join("\n    "))).or_default() += 1;
+            }
+            db.drop_branch(&name).unwrap();
+        }
+        println!("build {build_no}: allocations per create (count: creates) {counts:?}");
+        for (site, n) in &sites {
+            println!("  x{n} {site}");
+        }
+    }
+}
+
 /// `k` rounds, each on a fresh named branch: create, connect by name, first write, disconnect,
 /// delete; with a trunk connect and disconnect (the reference a branch connect is held to) and an
 /// empty window (the instruction count's control).

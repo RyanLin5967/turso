@@ -3225,10 +3225,25 @@ pub(crate) static INSTALL_REWRITES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// Test builds: while armed, every thread's CPU time at each `ckpt_held` point, read just after
+/// its syscall count (`budget_probe::thread_table`; Mach traps only, so the count does not move),
+/// so a test can tell which threads ran inside a held span. Diagnostics only; the test reserves
+/// the vector's room first, so pushing allocates nothing.
+#[cfg(test)]
+pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<Vec<(&'static str, [super::budget_probe::ThreadCpu; 48])>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn ckpt_held(label: &'static str) {
     #[cfg(test)]
     if let Some(n) = super::budget_probe::unix_syscalls() {
         CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+        if CKPT_THREADS_ARMED.load(Ordering::Acquire) {
+            let mut table = [super::budget_probe::ThreadCpu::EMPTY; 48];
+            let _ = super::budget_probe::thread_table(&mut table);
+            CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, table));
+        }
     }
     #[cfg(not(test))]
     let _ = label;

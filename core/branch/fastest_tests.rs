@@ -8711,6 +8711,147 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
     assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
 }
 
+/// Lead order (2026-10-15, attribution item 1): `a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_
+/// the_store_mutex` fails about 3 runs in 10 at one sha (raws l28-ckpt-r*), its extra syscalls in
+/// the capture spans. Its instrument is the TASK's syscall count, so a span counts every thread's.
+/// This diagnostic runs its schedule for 20 rounds with every thread's CPU time read at each point
+/// as well (`CKPT_HELD_THREADS`, Mach traps only), and prints each round's spans with the threads
+/// other than the checkpoint thread that ran in them. The hypothesis under test, as its CLAIM: every
+/// span holding more syscalls than the reading's own had another thread running in it. Blind spot:
+/// a table is read just after its point's syscall count, so a thread that ran between the count and
+/// the table at the span's START is missed, and one between them at its END is charged to the span.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
+    use super::budget_probe::ran_between;
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CKPT_THREADS_ARMED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _d = Disarm;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-diag.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    super::store::CKPT_THREADS_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    let (mut over, mut unexplained, mut rows) = (0u32, Vec::new(), Vec::new());
+    for round in 0..20 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
+            t.clear();
+            t.reserve(32);
+        }
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
+        let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
+        assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread table");
+        let me = tables.first().and_then(|(_, t)| t.iter().find(|x| x.me)).map_or(0, |x| x.id);
+        let at = |label: &str| points.iter().position(|(l, _)| *l == label);
+        let spans = [
+            ("capture.begin", "capture.matured"),
+            ("capture.matured", "capture.captured"),
+            ("install.locked", "install.quiesced"),
+            ("install.quiesced", "install.installed"),
+            ("install.installed", "install.marked"),
+        ];
+        let mut total = 0u64;
+        let mut line = format!("round {round}:");
+        let mut spans_over = Vec::new();
+        for (a, b) in spans {
+            let (Some(i), Some(j)) = (at(a), at(b)) else {
+                line += &format!(" [{a}..{b} missing]");
+                continue;
+            };
+            let n = (points[j].1 - points[i].1).saturating_sub(1);
+            total += n;
+            let ran = ran_between(&tables[i].1, &tables[j].1, me);
+            line += &format!(" {a}..{b}={n} ran={:?}", ran.iter().map(|(id, name, ns)| format!("{name}#{id}:{ns}ns")).collect::<Vec<_>>());
+            if n > 0 {
+                spans_over.push((a, b, n, ran.is_empty()));
+            }
+        }
+        line += &format!(" total={total}");
+        if total > 2 {
+            over += 1;
+            for (a, b, n, alone) in &spans_over {
+                if *alone {
+                    unexplained.push(format!("round {round} {a}..{b}: {n} syscalls with no other thread running"));
+                }
+            }
+        }
+        rows.push(line);
+    }
+    for r in &rows {
+        println!("{r}");
+    }
+    assert!(over > 0, "premise: no round went over two held syscalls in 20, so the attribution was not exercised");
+    assert!(unexplained.is_empty(), "CLAIM: ATTRIBUTION: an over-budget span's syscalls were the checkpoint thread's own: {unexplained:?}");
+}
+
+/// Lead finding (artie 79ef7d2caf, the wire's per-window data): the embedded create, write and
+/// delete are bimodal in syscalls (create 8 or 10). The task's syscall count per operation, with
+/// every OTHER thread's CPU time read around it (`budget_probe::thread_table`, Mach traps only),
+/// at D2 over a catalog store and a snapshot store: each operation's count grouped by value, and
+/// for each value how many of its operations had another thread run inside them, and which.
+/// Printed only: which mode is foreign is what this measures.
+#[test]
+#[ignore = "diagnostic (lead attribution order): run by name with --ignored --nocapture"]
+fn diag_create_write_delete_syscalls_by_thread() {
+    use super::budget_probe::{ran_between, thread_table, unix_syscalls, ThreadCpu};
+    let _s = serial();
+    for catalog in [true, false] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ops-diag.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut by: std::collections::BTreeMap<(&str, u64), (u32, u32, std::collections::BTreeMap<String, u32>)> = Default::default();
+        let mut measure = |op: &'static str, f: &mut dyn FnMut()| {
+            let mut t0 = [ThreadCpu::EMPTY; 48];
+            let mut t1 = [ThreadCpu::EMPTY; 48];
+            let s0 = unix_syscalls().unwrap();
+            let _ = thread_table(&mut t0);
+            f();
+            let s1 = unix_syscalls().unwrap();
+            let _ = thread_table(&mut t1);
+            let me = t0.iter().find(|x| x.me).map_or(0, |x| x.id);
+            let ran = ran_between(&t0, &t1, me);
+            let e = by.entry((op, (s1 - s0).saturating_sub(1))).or_default();
+            e.0 += 1;
+            if !ran.is_empty() {
+                e.1 += 1;
+            }
+            for (_, name, _) in ran {
+                *e.2.entry(name).or_default() += 1;
+            }
+        };
+        for i in 0..200 {
+            let name = format!("d-{i:04}");
+            measure("create", &mut || {
+                trunk.create_branch(&name).unwrap();
+            });
+            let c = db.connect_named(&name).unwrap();
+            measure("write", &mut || {
+                c.execute(&format!("UPDATE t SET v = 'w{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+            });
+            drop(c);
+            measure("delete", &mut || {
+                db.drop_branch(&name).unwrap();
+            });
+        }
+        for ((op, n), (count, foreign, names)) in &by {
+            println!("catalog={catalog} {op}: {n} syscalls x{count}, {foreign} with another thread running {names:?}");
+        }
+    }
+}
+
 /// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
 /// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
 /// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`, the
