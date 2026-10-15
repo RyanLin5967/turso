@@ -521,6 +521,19 @@ def selftest():
         print(("PASS" if got == want else "FAIL"), f"barrier_off({opts!r}) = {got}")
         bad += got != want
         n += 1
+    # comp review 1 LOW 35: a REAL run (FT_DRY=0) refuses a volatile RAM disk and any loop device in the chain
+    rp = globals().get("real_problem")
+    for name, rec, want_ok in (
+            ("a data disk", {"drive_class": "write-back+fua", "chain": ["nvme1n1"]}, True),
+            ("a RAM disk", {"drive_class": "ram-volatile", "chain": ["ram0"]}, False),
+            ("a loop device in the chain", {"drive_class": "write-through", "chain": ["loop0", "/x.img", "sda1", "sda"]},
+             False),
+            ("a partition of a data disk", {"drive_class": "write-back+fua", "chain": ["nvme1n1p1", "nvme1n1"]}, True)):
+        why = rp(rec) if rp else "no real_problem() in drive.py"
+        ok_ = (why is None) == want_ok
+        print(("PASS" if ok_ else "FAIL"), f"real run on {name} -> {why or 'allowed'}")
+        bad += not ok_
+        n += 1
     print(f"drive selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
