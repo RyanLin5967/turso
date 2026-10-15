@@ -362,6 +362,14 @@ ops_line_ok() {
 }
 # timedrun_check CELLDIR N LABEL -- the timed run must stand (timedrun.py check: untraced at both ends, rc 0, exactly
 # N ops); its created branches go to CELLDIR/timed.ops.txt for the branch-count check. Anything else FAILS the job.
+# no_plant_before_cells -- comp review 1 LOW 25: no test plant (the stream, cap, warm-up, claim-time or delete plants)
+# has run on MNT before the measured cells, so none perturbs them (a real run's cells must meet the store as the seed
+# and the prebranch left it); their output dirs are the evidence
+no_plant_before_cells() {
+  local ran=none
+  { [ -e "$RAW/plants" ] || [ -e "$RAW/plant-stream-1e6.txt" ]; } && ran="ran: $(ls -d "$RAW"/plants "$RAW"/plant-* 2>/dev/null | tr '\n' ' ')"
+  expect "no test plant ran on MNT before the measured cells (LOW 25)" "$ran" none
+}
 timedrun_check() {
   # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
   # exploratory, never credited
@@ -770,6 +778,7 @@ server_main() {
       "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
     cap_plants
   fi
+  no_plant_before_cells
   for spec in $SPECLIST; do
     for c in $CLIENTS; do
       run_server_cell "$spec" "$c"
@@ -992,6 +1001,7 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
     fail "fixture.json: $(tail -1 "$RAW/fixture-write.err")"
   fi
   { "$SQ3" --version; sha256sum "$CB" "$SQ3"; } >"$RAW/version.txt"
+  no_plant_before_cells
   for spec in $SPECLIST; do
     op=${spec%-*} sync=${spec#*-}
     for c in $CLIENTS; do
