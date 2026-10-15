@@ -3111,7 +3111,10 @@ impl Flight {
             // checked at open. Mutants (test builds only): `ordered_tag_ignored` (tagged as a
             // synced flight, as before review 6 #7) and `ordered_tag_without_barrier` (tagged
             // ordered whatever the arena, as before review 17 MED 4).
-            let barriered = self.arena.is_some() || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
+            // Mutant `ordered_tag_ignores_arena` (test builds only; engine review 21 LOW 22): the
+            // records alone decide, as if no flight ever carried the arena.
+            let own_barrier = self.arena.is_some() && !super::store::fe_mutant("ordered_tag_ignores_arena");
+            let barriered = own_barrier || !self.names_slots || super::store::fe_mutant("ordered_tag_without_barrier");
             tagged_ordered = self.ordered && self.class.syncs() && barriered && !super::store::fe_mutant("ordered_tag_ignored");
             let kind = if tagged_ordered {
                 EndKind::ordered_by(self.base_syncs)
@@ -6130,6 +6133,27 @@ mod format_tests {
                 "names_slots={names_slots}: an ordered flight with no arena barrier was tagged {kind:?}"
             );
         }
+    }
+
+    /// Engine review 21 LOW 22: the file-arena arm that e792c363a's red lacks (a memory arena never
+    /// has a handle to carry). A flight taken in FullFsync over a FILE arena whose dirty mark is
+    /// set carries the arena's descriptor and barriers it itself, so a TrunkRetain naming a slot is
+    /// tagged ordered. Mutant `ordered_tag_ignores_arena` (the tag decided by the records alone)
+    /// must fail it.
+    #[test]
+    fn an_ordered_flight_whose_own_barrier_covers_named_slots_is_tagged_ordered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        let mut arena = Arena::open_file(&files.arena, 512, true, &[]).unwrap();
+        arena.mark_unsynced();
+        journal.buffer(&Record::TrunkRetain { page: 2, born: 0, died: 1, slot: 7, crc: 0 }).unwrap();
+        let flight = journal.take_flight(&mut arena, SyncClass::FullFsync, false).unwrap();
+        assert!(!arena.is_dirty(), "premise: the flight took the arena's dirty mark, and its descriptor");
+        flight.ordered().write().unwrap();
+        let bytes = std::fs::read(&files.log).unwrap();
+        let kind = EndKind::from_tag(bytes[bytes.len() - END_PAYLOAD_LEN]).expect("premise: the log ends with an end frame");
+        assert!(kind.ordered(), "an ordered flight that barriered the arena itself was tagged {kind:?}");
     }
 
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
