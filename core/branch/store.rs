@@ -9527,6 +9527,10 @@ impl StoreInner {
                     // A catalog made now holds no trunk version (LEAP L4).
                     cat.trunk_all_complete = !fe_mutant("l4_probe_always");
                     self.cat = Some(cat);
+                    // A new catalog holds no name: its mirror is exact, empty, at once (LEAP L4).
+                    if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
+                        self.names.catalog = Some(HashMap::default());
+                    }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
                         let mut built = HashSet::default();
