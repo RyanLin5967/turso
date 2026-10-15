@@ -1578,9 +1578,21 @@ impl Infer<'_> {
                 }
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                // A side with no type types the expression only when it is a parameter, which
+                // takes the other side's type (`$1 + 1`); any other untyped operand (a function the
+                // walk does not know) leaves the expression untyped, so a parameter compared with
+                // it fails closed (42P18): `sqrt(n) + 1` was typed by the 1 alone, int4, where
+                // PostgreSQL types it float8 (wire review 14 item 17).
+                let param = |x: Option<&PgNode>| {
+                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::ParamRef(_)))
+                };
                 match (l, r) {
                     (Some(a), Some(b)) => Some(wider(a, b)),
-                    (a, b) => a.or(b),
+                    (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
+                    (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
+                    // A unary operator (`-x`) has no left side.
+                    (None, Some(b)) if e.lexpr.is_none() => Some(b),
+                    _ => None,
                 }
             }
             Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => Some(BOOL),
