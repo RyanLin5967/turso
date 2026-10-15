@@ -8609,6 +8609,43 @@ fn no_per_branch_table_regrows_past_64_kib_inside_a_create() {
     assert!(over.is_empty(), "CLAIM: a create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
 }
 
+/// The NAMED twin of `no_per_branch_table_regrows_past_64_kib_inside_a_create`: budgets' growth cell
+/// still measured 1,638,591 bytes under the store mutex at 22c5c5da3 (artie raw
+/// l10-branch_22c5c5da3.txt), about one regrowth of a 65,536-bucket map of (Arc<str>, BranchId), so
+/// the name index is measured here: 34,000 named creates, both modes, every per-branch table and the
+/// name filter's sets priced at each growth.
+#[test]
+fn no_name_table_regrows_past_64_kib_inside_a_named_create() {
+    let _s = serial();
+    let mut over = Vec::new();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("named-growth.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let mut last = db.branches.per_branch_tables_for_test();
+        let mut worst: std::collections::BTreeMap<&str, usize> = Default::default();
+        for n in 0..34_000u32 {
+            let _ = trunk.create_branch(&format!("g{n}")).unwrap();
+            let now = db.branches.per_branch_tables_for_test();
+            for (name, cap, bytes) in &now {
+                let grew = last.iter().find(|(m, ..)| m == name).is_none_or(|(_, c, _)| cap > c);
+                if grew && *bytes > 0 {
+                    let e = worst.entry(name).or_default();
+                    *e = (*e).max(*bytes);
+                }
+            }
+            last = now;
+        }
+        for (name, bytes) in worst {
+            if bytes > 64 << 10 {
+                over.push(format!("catalog={catalog} {name}: {bytes} bytes"));
+            }
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a named create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
+}
+
 /// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex: 7 held allocations per
 /// create in every cell, budget 1): a steady create's allocations under a store mutex, attributed to
 /// its steps by the `held_trace` points (fork_trunk's hold and the flight lead's hold), for both

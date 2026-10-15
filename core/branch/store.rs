@@ -7781,6 +7781,12 @@ impl BranchStore {
             map("names.fresh", &inner.names.fresh),
             map("names.gone", &inner.names.gone),
         ];
+        if let Some(built) = inner.names.filter.built.as_ref() {
+            out.push(set("names.filter.built", built));
+        }
+        if let Some(pending) = inner.names.filter.pending.as_ref() {
+            out.push(set("names.filter.pending", pending));
+        }
         if let Some(cat) = inner.cat.as_ref() {
             // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
             out.push(("cat.dirty", cat.dirty.len(), 0));
