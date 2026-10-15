@@ -3054,6 +3054,69 @@ impl Connection {
         })
     }
 
+    /// The column names of the table an unqualified `table` names, resolved as the engine's
+    /// resolver resolves it (`resolve_unqualified_existing_database_id`): TEMP first when a temp
+    /// schema exists; then, with a search path, each entry naming public (main) or an attached
+    /// database; without one, main and then the attached databases. The first schema holding any
+    /// table-like object of the name decides; None when that object is not a B-tree table (a
+    /// view), or nothing holds the name. Read from the in-memory schemas, no catalog query.
+    pub fn resident_unqualified_table_columns(
+        &self,
+        table: &str,
+        search_path: &[String],
+    ) -> Option<Vec<String>> {
+        let holds = |id| {
+            self.with_schema(id, |schema| {
+                schema.get_table(table).is_some()
+                    || schema.get_view(table).is_some()
+                    || schema.get_materialized_view(table).is_some()
+            })
+        };
+        let columns = |id| {
+            self.with_schema(id, |schema| {
+                schema
+                    .get_btree_table(table)
+                    .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+            })
+        };
+        if self.temp.database.read().is_some() && holds(crate::TEMP_DB_ID) {
+            return columns(crate::TEMP_DB_ID);
+        }
+        let attached: Vec<usize> = if search_path.is_empty() {
+            self.attached_databases
+                .read()
+                .index_to_data
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            let attached = self.attached_databases.read();
+            search_path
+                .iter()
+                .filter_map(|entry| {
+                    if entry.eq_ignore_ascii_case("public") {
+                        Some(crate::MAIN_DB_ID)
+                    } else {
+                        attached
+                            .get_database_by_name(&crate::util::normalize_ident(entry))
+                            .map(|(id, _)| id)
+                    }
+                })
+                .collect()
+        };
+        let order = search_path
+            .is_empty()
+            .then_some(crate::MAIN_DB_ID)
+            .into_iter()
+            .chain(attached);
+        for id in order {
+            if holds(id) {
+                return columns(id);
+            }
+        }
+        None
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
     }
