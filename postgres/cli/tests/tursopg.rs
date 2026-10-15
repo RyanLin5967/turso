@@ -959,31 +959,55 @@ fn start_tursopg_server() -> (Child, u16) {
             .local_addr()
             .unwrap()
             .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
-            .arg("--server")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursopg server");
-
-        // Wait for the server to be ready by polling TCP connect, bailing out
-        // to a new port if the child exited (lost a bind race).
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(child) = start_tursopg_server_on(port) {
+            return (child, port);
         }
+    }
+    panic!("tursopg server did not start");
+}
+
+/// One attempt on `port`: the ready child, or None (it exited, or never became ready), reaped.
+fn start_tursopg_server_on(port: u16) -> Option<Child> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(":memory:")
+        .arg("--server")
+        .arg(&addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start tursopg server");
+
+    // Wait for the server to be ready by polling TCP connect, bailing out
+    // to a new port if the child exited (lost a bind race).
+    for _ in 0..50 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
+            return Some(child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    None
+}
+
+/// The harness takes a server as ready only from the server itself: a listener another process
+/// holds on the port must not pass for it (the startup race; wire_sessions.rs has the twin).
+#[test]
+fn a_foreign_listener_on_the_port_is_not_taken_for_the_server() {
+    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let child = start_tursopg_server_on(port);
+    let taken = child.is_some();
+    if let Some(mut child) = child {
         child.kill().ok();
         child.wait().ok();
     }
-    panic!("tursopg server did not start");
+    assert!(!taken, "a server that could not bind {port} was taken as ready");
+    drop(foreign);
 }
 
 /// Minimal PG wire protocol client for testing.
