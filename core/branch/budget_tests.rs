@@ -600,7 +600,7 @@ fn mirror_bytes(cell: &str, out: &mut String) {
     for (i, &n) in MIRROR_NS.iter().enumerate() {
         let before = probe::live_heap_bytes();
         let pairs: Vec<(Arc<str>, u64)> = (0..n).map(|i| (Arc::from(format!("pop-{i}").as_str()), 16 + i)).collect();
-        let mirror = super::store::name_mirror_from_pairs(pairs);
+        let mirror = super::store::name_mirror_from_pairs(pairs, Default::default()).expect("premise: not refused");
         let after = probe::live_heap_bytes();
         assert_eq!(mirror.len() as u64, n, "{cell}: premise: every name mirrored");
         let kept = u64::try_from(after - before).expect("the mirror's heap is negative: the count is broken");
@@ -613,15 +613,15 @@ fn mirror_bytes(cell: &str, out: &mut String) {
     for (i, &n) in MIRROR_WORST_NS.iter().enumerate() {
         let before = probe::live_heap_bytes();
         let pairs: Vec<(Arc<str>, u64)> = (0..n).map(|i| (Arc::from(format!("pop-{i}").as_str()), 16 + i)).collect();
-        let mut mirror = super::store::name_mirror_from_pairs(pairs);
-        mirror.insert("pop-extra", BranchId(1));
+        let mut mirror = super::store::name_mirror_from_pairs(pairs, Default::default()).expect("premise: not refused");
+        mirror.insert("pop-extra", BranchId(1)).expect("premise: not refused");
         let kept = u64::try_from(probe::live_heap_bytes() - before).expect("negative heap: the count is broken");
         line(out, cell, "mirror_worst_insert", i as u64, &Sample::from([("names", n + 1), ("kept_bytes", kept)]));
         for j in (0..n).step_by(2) {
             mirror.remove(&format!("pop-{j}"));
         }
         for j in 0..n.div_ceil(2) {
-            mirror.insert(&format!("churn-{j}"), BranchId(16 + n + j));
+            mirror.insert(&format!("churn-{j}"), BranchId(16 + n + j)).expect("premise: not refused");
         }
         let kept = u64::try_from(probe::live_heap_bytes() - before).expect("negative heap: the count is broken");
         line(out, cell, "mirror_worst_churn", i as u64, &Sample::from([("names", mirror.len() as u64), ("kept_bytes", kept)]));

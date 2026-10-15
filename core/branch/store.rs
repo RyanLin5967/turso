@@ -1457,10 +1457,15 @@ impl Drop for StoreGuard<'_> {
 /// LEAP L4 slice 4's name mirror (`NameIndex::catalog`): every name in the catalog's `branch_name`,
 /// with its branch, interned compactly (`name_mirror`).
 pub(crate) use super::name_mirror::NameMirror;
+use super::name_mirror::Refused;
 
-/// A mirror of a scan's `(name, id)` pairs (consumed: the scan's `Arc`s are freed here).
-pub(crate) fn name_mirror_from_pairs(pairs: Vec<(Arc<str>, u64)>) -> NameMirror {
-    NameMirror::from_pairs(pairs.iter().map(|(name, id)| (&**name, *id)))
+/// A mirror of a scan's `(name, id)` pairs, hashed with `hasher` (consumed: the scan's `Arc`s are
+/// freed here). `None`: refused (`name_mirror::MAX_PROBE`).
+pub(crate) fn name_mirror_from_pairs(
+    pairs: Vec<(Arc<str>, u64)>,
+    hasher: std::collections::hash_map::RandomState,
+) -> Option<NameMirror> {
+    NameMirror::from_pairs(hasher, pairs.iter().map(|(name, id)| (&**name, *id))).ok()
 }
 
 /// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
@@ -2542,7 +2547,7 @@ struct NameIndex {
     /// (`start_name_filter`) and kept by every install, which applies the names the checkpoint
     /// wrote and deleted. Under the overlays (`map`, `gone`) it answers a lookup the catalog would,
     /// asking nothing; `None` until built (the catalog answers). Oracle: `l4_facts_check_for_test`.
-    catalog: Option<NameMirror>,
+    catalog: Option<Arc<NameMirror>>,
     /// The name the last lookup found, with its branch, so that branch's load reads no name (names
     /// and ids are each unique, and an id's name never changes).
     last_found: Option<(BranchId, Arc<str>)>,
@@ -2554,6 +2559,9 @@ struct NameIndex {
     /// Mirrors built and discarded, a checkpoint having committed while their scan ran (review L4
     /// L1): the mirror then stays unbuilt and the catalog answers lookups (instrument).
     mirror_misses: u64,
+    /// Mirrors dropped because a table would have needed a probe past `name_mirror::MAX_PROBE`
+    /// (the mirror adversary's MED-1; instrument).
+    mirror_refusals: u64,
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -3179,6 +3187,12 @@ struct Captured {
     /// then names created since (rows written), as swapped out of the index at the capture.
     names_gone: HashMap<Arc<str>, u64>,
     names_fresh: HashMap<Arc<str>, BranchId>,
+    /// The name mirror, when its fresh names would grow it (`NameMirror::needs_room`): the copy the
+    /// checkpoint thread makes room in, off the store mutex.
+    mirror_base: Option<Arc<NameMirror>>,
+    /// That copy with room, and the address of the mirror it was made from (`checkpoint_install`
+    /// swaps it in only over that same mirror).
+    mirror_grown: Option<(usize, std::result::Result<NameMirror, Refused>)>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -3458,6 +3472,13 @@ fn run_flight(
                 None
             })
     });
+    // The mirror adversary's class (4): room for the fresh names in the name mirror, made here, off
+    // the store mutex; `base` (the mirror it was made from) is held until after the install, so
+    // the old mirror is freed below, off the mutex too.
+    let base = cap.mirror_base.take();
+    if let Some(m) = base.as_ref() {
+        cap.mirror_grown = Some((Arc::as_ptr(m) as usize, m.with_room(cap.names_fresh.len())));
+    }
     let installed = {
         let mut guard = inner.lock();
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
@@ -3511,6 +3532,8 @@ fn run_flight(
     };
     // Flights go on, into the new log.
     drop(cut);
+    // The mirror the install replaced, if it grew one, is freed here, off the mutex.
+    drop(base);
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
@@ -8150,8 +8173,9 @@ impl BranchStore {
                 let (scanned, mirror) = match scanned {
                     Ok(pairs) => {
                         let hashes: Vec<u64> = pairs.iter().map(|(name, _)| hasher.hash_one(&**name)).collect();
-                        let mirror = name_mirror_from_pairs(pairs);
-                        (Ok(hashes), Some(mirror))
+                        // Keyed as the filter is (a per-process random key: the mirror adversary's MED-1).
+                        let mirror = name_mirror_from_pairs(pairs, hasher.clone());
+                        (Ok(hashes), mirror)
                     }
                     Err(e) => (Err(e), None),
                 };
@@ -8200,7 +8224,7 @@ impl BranchStore {
                     if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation)
                         || fe_mutant("l4_mirror_ignores_generation")
                     {
-                        inner.names.catalog = Some(mirror);
+                        inner.names.catalog = Some(Arc::new(mirror));
                     } else {
                         inner.names.mirror_misses += 1;
                         discarded = Some(mirror);
@@ -9815,7 +9839,7 @@ impl StoreInner {
                     self.cat = Some(cat);
                     // A new catalog holds no name: its mirror is exact, empty, at once (LEAP L4).
                     if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
-                        self.names.catalog = Some(NameMirror::default());
+                        self.names.catalog = Some(Arc::new(NameMirror::default()));
                     }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
@@ -10300,6 +10324,8 @@ impl StoreInner {
                 self.names.gone.clone()
             },
             names_fresh: self.names.fresh.clone(),
+            mirror_base: self.names.catalog.as_ref().filter(|m| m.needs_room(self.names.fresh.len())).cloned(),
+            mirror_grown: None,
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -10357,14 +10383,40 @@ impl StoreInner {
         // LEAP L4 slice 4: the mirror takes what the writer did to `branch_name` (its gone names
         // deleted, then its fresh ones put). Mutant `l4_names_stale` (test builds only): the fresh
         // names are not put (the oracle's plant).
-        if let Some(mirror) = self.names.catalog.as_mut() {
-            for name in cap.names_gone.keys() {
-                mirror.remove(name);
+        // The mirror adversary's class (4): the room its fresh names need was made off the mutex by
+        // the checkpoint thread (`Captured::mirror_grown`) and is swapped in here; the copy it was
+        // made from is still held by that thread, so the old mirror is freed there, after the
+        // mutex. The capture's own reference goes first, so the mirror is changed in place.
+        if let Some((from, grown)) = cap.mirror_grown.take() {
+            if self.names.catalog.as_ref().is_some_and(|m| Arc::as_ptr(m) as usize == from) {
+                self.names.catalog = match grown {
+                    Ok(grown) => Some(Arc::new(grown)),
+                    Err(Refused) => {
+                        self.names.mirror_refusals += 1;
+                        None
+                    }
+                };
             }
-            if !fe_mutant("l4_names_stale") {
-                for (name, id) in &cap.names_fresh {
-                    mirror.insert(name, *id);
+        }
+        drop(cap.mirror_base.take());
+        if let Some(arc) = self.names.catalog.as_mut() {
+            let applied = match Arc::get_mut(arc) {
+                Some(mirror) => {
+                    for name in cap.names_gone.keys() {
+                        mirror.remove(name);
+                    }
+                    if fe_mutant("l4_names_stale") {
+                        Ok(())
+                    } else {
+                        cap.names_fresh.iter().try_for_each(|(name, id)| mirror.insert(name, *id))
+                    }
                 }
+                // Another holder of the mirror (none should exist here): drop it, the catalog answers.
+                None => Err(Refused),
+            };
+            if applied.is_err() {
+                self.names.mirror_refusals += 1;
+                self.names.catalog = None;
             }
         }
         // The catalog holds the captured names now: drop each entry no release or create since
