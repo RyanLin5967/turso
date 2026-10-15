@@ -949,6 +949,10 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
       rc=0
       # --drop: every op's branch is deleted, durably and untimed (HIGH 1), so N stays LIVE0; the labelling run is
       # split by op phase at C=1 like the servers' (lead ruling on HIGH 1's flush attribution)
+      # comp review 1 LOW 20: B1's N is a directory's population as well as a count, so its creates must meet the
+      # PREBRANCH live branches the record says they run at (a fresh directory measured the directory at N=0)
+      expect "b1-$spec-c$c creates where the $PREBRANCH live branches are (branch files in its directory)" \
+        "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
       live_mark "$d" label_before
       cb_args "$op" "$sync" "$bdir" "$c" "$n" "$d/bb"
       strace_run "$d/load" "${CBA[@]}" >"$d/bb.txt" 2>&1 || rc=$?
@@ -969,6 +973,8 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
       # The TIMED run: the identical clonebench command, untraced, into its own branch directory (gate-6 review,
       # t3run item 2): the only latency file of the cell is timed/raw.tsv.
       mkdir -p "$bdir.timed"
+      expect "b1-$spec-c$c timed run creates where the $PREBRANCH live branches are (LOW 20)" \
+        "$(find "$bdir.timed" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
       live_mark "$d" timed_before
       cb_args "$op" "$sync" "$bdir.timed" "$c" "$n" "$d/timed"
       timed_run "$d/timed" "" -- "${CBA[@]}" >/dev/null || true
