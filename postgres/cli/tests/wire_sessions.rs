@@ -2859,6 +2859,30 @@ fn insert_values_lists_are_checked_as_postgresql_checks_them() {
     );
 }
 
+/// A DEFAULT in only some rows of a multi-row VALUES, named or positional, takes the column's
+/// default, as PostgreSQL's does (core's resolve_defaults_in_row replaces the translator's
+/// Expr::Default); pinned while the all-DEFAULT positions are dropped by the translator instead.
+#[test]
+fn a_default_in_some_rows_takes_the_column_default() {
+    let dir = Scratch::new("partialdefault");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table pd (k int, v text default 'dflt')").ok("pd");
+    a.q("insert into pd (k, v) values (1, DEFAULT), (2, 'y')").ok("named");
+    a.q("insert into pd values (3, DEFAULT), (4, 'z')").ok("positional");
+    let r = a.q("select * from pd order by k").ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![t("1"), t("dflt")],
+            vec![t("2"), t("y")],
+            vec![t("3"), t("dflt")],
+            vec![t("4"), t("z")],
+        ]
+    );
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
