@@ -511,9 +511,9 @@ pub(crate) const CONFIRM_PARK_FLIGHT: u8 = 2;
 #[cfg(test)]
 pub(crate) const CONFIRM_PARK_QUIET: u8 = 3;
 
+#[cfg(test)]
 impl GroupState {
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
-    #[cfg(test)]
     fn confirm_wait_left(&mut self) {
         self.confirm_parked = 0;
     }
