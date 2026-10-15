@@ -2319,6 +2319,35 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag and row count, as
+/// PostgreSQL 18 answers them (`INSERT 0 n`, `UPDATE n`, `DELETE n`; recorded in artie
+/// lanes/wire/raw/loud-20261015/pg18-diff), on both protocols: drivers read the affected count from
+/// the tag. Their rows went out through the query path, whose tag is `SELECT n` (found by the
+/// PG 18 differential of 2026-10-15).
+#[test]
+fn dml_returning_is_tagged_by_its_verb() {
+    let dir = Scratch::new("returningtag");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)").ok("r");
+    for (sql, tag) in [
+        ("INSERT INTO r VALUES (1, 'a'), (2, 'b') RETURNING id", "INSERT 0 2"),
+        ("UPDATE r SET v = 'c' WHERE id = 1 RETURNING v", "UPDATE 1"),
+        ("DELETE FROM r WHERE id = 2 RETURNING id", "DELETE 1"),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.tags, vec![tag.to_string()], "{sql}: rows {:?}", r.rows);
+    }
+    for (sql, tag) in [
+        ("INSERT INTO r VALUES ($1, 'x') RETURNING id", "INSERT 0 1"),
+        ("UPDATE r SET v = 'y' WHERE id = $1 RETURNING v", "UPDATE 1"),
+        ("DELETE FROM r WHERE id = $1 RETURNING id", "DELETE 1"),
+    ] {
+        let r = a.xt(sql, &[(23, 0, b"7")]).ok(sql);
+        assert_eq!(r.tags, vec![tag.to_string()], "extended {sql}: rows {:?}", r.rows);
+    }
+}
+
 /// A refused CREATE TABLE leaves nothing behind, its SERIAL column's sequence included, as in
 /// PostgreSQL: one whose key onto itself does not resolve (42830, after the CREATE), and one whose
 /// table already exists. The sequence's `CREATE SEQUENCE IF NOT EXISTS` ran and committed at prepare,
