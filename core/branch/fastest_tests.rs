@@ -8565,6 +8565,45 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     }
 }
 
+/// Lead order (2026-10-15T08:22:05Z, from the wire's default-stack raws; debug, lldb): the create
+/// path's frames were ensure_backing 797 KB, open_resolved 831 KB and start_name_filter at least
+/// 422 KB, so a create overflowed a 2 MiB thread (Rust's default spawn stack). On a 2 MiB thread, in
+/// its own process (an overflow aborts it): open, the first create (the catalog's creation in
+/// catalog mode), a named create, a write on it, a reopen and a connect by name. The frame BUDGET
+/// beside it is clippy's `large_stack_frames` (deny, 512,000 bytes, workspace lints), which `cargo
+/// clippy -p turso_core` now passes. A child that overflows prints "has overflowed its stack".
+#[cfg(unix)]
+#[test]
+fn a_create_runs_on_a_2_mib_thread() {
+    let Some(sentinel) = super::fork_driver::alone("branch::fastest_tests::a_create_runs_on_a_2_mib_thread") else {
+        return;
+    };
+    let ran = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            for catalog in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("stack.db");
+                let incarnation = {
+                    let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+                    let trunk = db.connect().unwrap();
+                    seed(&trunk);
+                    let _ = trunk.fork_branch().unwrap().into_id();
+                    let named = trunk.create_branch("small-stack").unwrap();
+                    assert_eq!(db.branch_named("small-stack").unwrap(), Some(named), "catalog={catalog}: premise");
+                    write_v(&db.connect_named("small-stack").unwrap(), 3, "deep");
+                    db.incarnation
+                };
+                let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+                assert_eq!(read_v(&db.connect_named("small-stack").unwrap(), 3), "deep", "catalog={catalog}: premise: the write is back");
+            }
+        })
+        .unwrap()
+        .join();
+    assert!(ran.is_ok(), "CLAIM: the create path failed on a 2 MiB thread");
+    super::fork_driver::finished(&sentinel);
+}
+
 /// Lead finding and order 5 (fastest DECISIONS, 2026-10-15T07:2xZ): in-place VACUUM builds its
 /// image in a target database (`etilqs_<name>`, on the source's IO), whose own WAL commit syncs a
 /// DIFFERENT file. A failure of that sync must not reach the trunk store's at-risk decision: the
