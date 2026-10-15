@@ -1363,6 +1363,24 @@ def self_test():
                   f"(RUNNER_MODE {RUNNER_MODE!r}, RUNNER_PHASES {RUNNER_PHASES})",
                   RUNNER_MODE == "phases" and RUNNER_PHASES == len(PHASES)
                   and any("--mode phases" in ln for ln in fp) and not any("--phases" in ln for ln in fp), fp))
+    # CLASS (Ryan's class rule): summarize re-parsed records whose writers had changed, with nothing tying the two. The
+    # first full --dry-block run (2026-10-15) showed three instances on every competitor cell: timed.json's measured
+    # ops are "timed_measured_ops" now (summarize read "ops": "measured None ops"); a dry package's timedrun verdict is
+    # "ok-smoke" (summarize required "ok"); functional.txt's last line is "VERDICT PASS (dolt)" (summarize required the
+    # bare "VERDICT PASS", so a passing cell was listed in failed_checks with no FAIL line). The fix reads the
+    # writers' own format, and this case runs it on a REAL cell's records from that run (testdata, bytes as run)
+    td = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "dryblock-20261015-dolt-xfs")
+    rp = run_parity(td, "dolt")
+    cases.append(("writer formats: a real dolt cell's timed runs measure 30 ops each, as its plan row asks",
+                  bool(rp["ops_measured"]) and all(x == 30 for x in rp["ops_measured"]), rp["ops_measured"]))
+    cases.append(("writer formats: 'ok-smoke' stands in a dry package and never in a real one",
+                  timed_verdict_ok("ok-smoke", "1") and not timed_verdict_ok("ok-smoke", "0") and timed_verdict_ok("ok", "0")
+                  and not timed_verdict_ok("REFUSED: x", "1"), None))
+    fv = functional_verdict(open(os.path.join(td, "result", "functional.txt")).read())
+    cases.append(("writer formats: the real functional.txt's 'VERDICT PASS (dolt)' reads as PASS", fv == "PASS", fv))
+    cases.append(("writer formats: a last VERDICT FAIL (dolt) after a PASS reads as FAIL; no VERDICT line reads as None",
+                  functional_verdict("VERDICT PASS (dolt)\nFAIL F1\nVERDICT FAIL (dolt): 1 check(s) failed\n") == "FAIL"
+                  and functional_verdict("PASS F1\n") is None, None))
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
