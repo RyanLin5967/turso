@@ -970,6 +970,7 @@ impl Scanned {
                 if class.syncs() && !super::store::fe_mutant("synced_open_unpersisted") {
                     journal.note_class(class);
                 }
+                journal.settle_snapshot(class)?;
                 if let Some(at) = marker {
                     // F-FZ crash state S1: the catalog holds everything up to its checkpoint's
                     // marker. What follows it is replayed, and becomes the log of the catalog's
@@ -1062,7 +1063,11 @@ impl Scanned {
                     journal.synced_base = journal.synced_base.max(class);
                 }
             }
-            End::Reset => journal.reset_log(generation)?,
+            End::Reset => {
+                let class = journal.rewrite_class();
+                journal.settle_snapshot(class)?;
+                journal.reset_log(generation)?;
+            }
         }
         self.records.drain(..from);
         Ok(Recovered {
@@ -1199,6 +1204,11 @@ pub(crate) struct Journal {
     /// flight syncs the directory before its own log sync, so nothing is acknowledged before the
     /// rename is durable (review 2 #5: no directory sync under the store mutex).
     dir_dirty: bool,
+    /// The snapshot was written by a compaction that synced nothing (D0), in this process or a
+    /// dead one an open in a class that syncs nothing found: the next flight that syncs syncs it
+    /// first, a plain fsync before its directory's and its log's sync, so nothing is acknowledged
+    /// durable on top of a snapshot a power cut can tear (engine review 19 MED 7).
+    snap_dirty: bool,
     /// Every byte the log holds was synced before the next flight is written (engine review 16
     /// MED 5): set by a flight that syncs or is ordered (raised ones included: flights go one at a
     /// time), a syncing open and a synced rewrite; cleared by a flight, an open or a rewrite that
@@ -1327,6 +1337,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            snap_dirty: false,
             prev_synced: false,
             last_names_slots: false,
             compact_after: 0,
@@ -1530,6 +1541,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            snap_dirty: false,
             prev_synced: false,
             last_names_slots: false,
             compact_after: 0,
@@ -2201,6 +2213,13 @@ impl Journal {
                 return Err(e);
             }
         };
+        let snap = match self.take_dirty_snap(class) {
+            Ok(snap) => snap,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + END_FRAME_LEN);
         frames.extend_from_slice(&self.pending);
@@ -2210,7 +2229,7 @@ impl Journal {
                 "failpoint: a branch log write failed".to_string(),
             ))
         } else {
-            self.write_frames(arena, class, &frames, header, dir.as_ref())
+            self.write_frames(arena, class, &frames, header, dir.as_ref(), snap.as_ref())
         };
         match written {
             Ok(()) => {
@@ -2235,6 +2254,7 @@ impl Journal {
         frames: &[u8],
         header: Option<[u8; 4]>,
         dir: Option<&File>,
+        snap: Option<&File>,
     ) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
@@ -2255,6 +2275,10 @@ impl Journal {
             write_at(&self.file, &raised, HEADER_RAISED_AT)?;
         }
         write_at(&self.file, frames, self.len)?;
+        // A D0 compaction's snapshot, before the log's sync drains it (`snap_dirty`).
+        if let Some(snap) = snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
+        }
         if let Some(dir) = dir {
             fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
@@ -2338,6 +2362,7 @@ impl Journal {
                 header: None,
                 ordered: false,
                 dir: None,
+                snap: None,
                 nonce: self.nonce,
                 base_syncs: self.base_synced(),
                 names_slots: false,
@@ -2379,9 +2404,17 @@ impl Journal {
                 return Err(e);
             }
         };
-        // A cut's rename is made durable by this flight, before its own log sync (`dir_dirty`).
+        // A cut's rename is made durable by this flight, before its own log sync (`dir_dirty`),
+        // and a D0 compaction's snapshot (`snap_dirty`).
         let dir = match self.take_dirty_dir(class) {
             Ok(dir) => dir,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
+        let snap = match self.take_dirty_snap(class) {
+            Ok(snap) => snap,
             Err(e) => {
                 self.set_poisoned();
                 return Err(e);
@@ -2418,6 +2451,7 @@ impl Journal {
             header,
             ordered: false,
             dir,
+            snap,
             nonce: self.nonce,
             base_syncs,
             names_slots,
@@ -2497,12 +2531,20 @@ impl Journal {
                 return Err(e);
             }
         };
+        let snap = match self.dirty_snap_handle(class) {
+            Ok(snap) => snap,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         self.note_class(class);
         let header = self.take_header_patch();
         Ok(Upgrade {
             log,
             arena,
             dir,
+            snap,
             exclusive: header.is_some(),
             header,
             class,
@@ -2567,6 +2609,57 @@ impl Journal {
         File::open(dir)
             .map(Some)
             .map_err(|e| io_error(e, "open branch directory"))
+    }
+
+    /// The snapshot, to sync before a log sync in `class` that follows a compaction that synced
+    /// nothing (`snap_dirty`; engine review 19 MED 7), the mark cleared.
+    fn take_dirty_snap(&mut self, class: SyncClass) -> Result<Option<File>> {
+        let s = self.dirty_snap_handle(class)?;
+        if s.is_some() {
+            self.snap_dirty = false;
+        }
+        Ok(s)
+    }
+
+    /// `take_dirty_snap`, leaving `snap_dirty` set (a held-free upgrade's, as `dirty_dir_handle`).
+    /// Mutant `snapshot_left_unsynced_by_flight` (test builds only): none, as before.
+    fn dirty_snap_handle(&self, class: SyncClass) -> Result<Option<File>> {
+        if !self.snap_dirty || !class.syncs() || super::store::fe_mutant("snapshot_left_unsynced_by_flight") {
+            return Ok(None);
+        }
+        self.open_snapshot().map(Some)
+    }
+
+    /// The snapshot file, opened to be synced (writable: Windows syncs only a handle that can write).
+    fn open_snapshot(&self) -> Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.files.snap)
+            .map_err(|e| io_error(e, "open branch snapshot"))
+    }
+
+    /// At an open (engine review 19 MED 7): the snapshot a compaction wrote may never have been
+    /// synced (a D0 run's compaction syncs nothing). In a `class` that syncs it is synced now, before
+    /// the open's own syncs and so before anything acknowledged on top of it: a plain fsync, which
+    /// the log's sync in `class` that follows drains with it when both are on one device, else a
+    /// sync in `class` of its own. In a class that syncs nothing it is left to the first flight
+    /// that syncs (`snap_dirty`). Nothing when there is no snapshot. Mutant
+    /// `snapshot_left_unsynced_at_open` (test builds only): not synced, as before.
+    fn settle_snapshot(&mut self, class: SyncClass) -> Result<()> {
+        if self.snapshot_len == 0 {
+            return Ok(());
+        }
+        if !class.syncs() {
+            self.snap_dirty = true;
+            return Ok(());
+        }
+        if super::store::fe_mutant("snapshot_left_unsynced_at_open") {
+            return Ok(());
+        }
+        let snap = self.open_snapshot()?;
+        let one = matches!((file_device(&snap), file_device(&self.file)), (Some(a), Some(b)) if a == b);
+        sync_snapshot(&snap, if one { SyncClass::Fsync } else { class })
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -2666,6 +2759,8 @@ impl Journal {
                 return Err(e);
             }
         }
+        // Synced above, or by the first flight that syncs (engine review 19 MED 7).
+        self.snap_dirty = !class.syncs();
         if fail_after_rename {
             self.set_poisoned();
             return Err(LimboError::InternalError(
@@ -3051,6 +3146,9 @@ pub(crate) struct Flight {
     /// The log's directory after a cut renamed the log into place (`Journal::dir_dirty`): synced
     /// before the log, so the flight's own flush makes the rename durable too.
     dir: Option<File>,
+    /// The snapshot a compaction that synced nothing wrote (`Journal::snap_dirty`; engine review
+    /// 19 MED 7): synced before the log, so the flight's own flush makes it durable too.
+    snap: Option<File>,
     /// The log incarnation's nonce, for the end frame `write` builds.
     nonce: u32,
     /// Every byte before this flight was synced when it was taken (`Journal::base_synced`): its end
@@ -3143,6 +3241,9 @@ impl Flight {
         after_pwrite();
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
+        if let Some(snap) = &self.snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
+        }
         if let Some(dir) = &self.dir {
             fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
@@ -3217,6 +3318,8 @@ pub(crate) struct Upgrade {
     log: File,
     arena: Option<File>,
     dir: Option<File>,
+    /// A D0 compaction's snapshot (`Journal::snap_dirty`, left set; engine review 19 MED 7).
+    snap: Option<File>,
     /// The header's raised-class field, when this upgrade is the first sync in a stronger class.
     header: Option<[u8; 4]>,
     /// It writes `header`, so it holds the flight slot while it syncs (`take_upgrade`).
@@ -3256,6 +3359,9 @@ impl Upgrade {
         }
         if let Some(raised) = &self.header {
             write_at(&self.log, raised, HEADER_RAISED_AT)?;
+        }
+        if let Some(snap) = &self.snap {
+            sync_snapshot(snap, SyncClass::Fsync)?;
         }
         if let Some(dir) = &self.dir {
             fsync_dir(dir, SyncClass::Fsync)?;
@@ -4135,6 +4241,14 @@ fn open_dir_class(class: SyncClass) -> SyncClass {
     } else {
         SyncClass::Fsync
     }
+}
+
+/// Sync `snap`, the snapshot file, in `class`, counted (test builds; `SNAP_SYNCS`).
+fn sync_snapshot(snap: &File, class: SyncClass) -> Result<()> {
+    fsync_file(snap, class)?;
+    #[cfg(test)]
+    SNAP_SYNCS.with(|c| c.set(c.get() + 1));
+    Ok(())
 }
 
 /// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
