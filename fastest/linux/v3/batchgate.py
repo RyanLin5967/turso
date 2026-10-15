@@ -501,6 +501,13 @@ def post(out, cell, sha, mode, verdict_path):
                 if r.get("windows_over") != 0:  # ... and no more than its own (V3 review 12 item 8)
                     voids.append("fsync: %s's windows over their own syncs (by fd): %r of %r" %
                                  (a, r.get("windows_over"), r.get("ops")))
+            # V3 review 13 item 17: windows_over on every OTHER arm of the sync record too (an extra sync attributed to
+            # an ungated arm's window was read by nothing); a missing count is not a zero
+            for a, r in sorted(sarms.items()):
+                if a not in gated and (not isinstance(r, dict) or r.get("windows_over") != 0):
+                    voids.append("fsync: %s's windows over their own syncs (by fd): %r of %r" %
+                                 (a, (r or {}).get("windows_over") if isinstance(r, dict) else "no record",
+                                  (r or {}).get("ops") if isinstance(r, dict) else None))
             # eleventh review MED 1, V3 review 12 item 6: every sync of the probe's that no overlapping window's arm
             # owns (foreign_fd: nosync25's, wholly inside a window or at its edge) VOIDs the batch; a missing count is
             # not a zero (V3 review 13 item 19: the one gate; no_fd could not fire and is deleted, with the descriptive

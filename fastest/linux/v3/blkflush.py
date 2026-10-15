@@ -43,7 +43,8 @@ SYNC event is attributed by its fd (sync_windows): to the overlapping window who
 HIGH 1); see sync_windows for the rule and its one blind spot. A sync of the pid that overlaps a window but whose fd
 no overlapping window's arm owns is counted unattributed (foreign_fd), whether it lies wholly inside a window or
 straddles an edge; nosync25 owns no fd, so any sync in its windows lands there. The gates (check.py F3:devflush,
-batchgate post) require foreign_fd == 0. Every sync event carries its parsed fd (a syscall line whose fd does not
+batchgate post) require foreign_fd == 0, and windows_over == 0 on EVERY arm of the record (V3 review 13 item 17; it
+was read on the flush-gated arms only). Every sync event carries its parsed fd (a syscall line whose fd does not
 parse refuses the record), so there is no fd-less count: V3 review 13 item 19 deleted no_fd, which could not fire, and
 the descriptive "wholly inside" counts (syncs_inside_any_fd, inside_foreign_fd, inside_no_fd), which fed nothing.
 """
