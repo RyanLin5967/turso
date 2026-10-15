@@ -18,12 +18,16 @@
 #                                       check (review 5 MED 3); dev_unchanged is. Returns 2 on a refusal
 #   dev_identity SYS DEV                the drive behind DEV, one field per line: wwid (block/wwid, else device/wwid:
 #                                       the NVMe EUI/NGUID or SCSI VPD 0x83 name), dev (MAJ:MIN), model, serial
-#                                       (device/serial, else the printable part of device/vpd_pg80), firmware
-#                                       (firmware_rev, else rev). Any empty field refuses (rc 2, naming it)
-#   dev_unchanged PATH REAL SYS DEV ID  PATH is unmoved AND the drive behind DEV is the one preflight recorded in ID
-#                                       (device-id.txt). A controller reset keeps the instance number (inferred); a
-#                                       remove plus re-add can give the name to another drive, which only the identity
-#                                       shows. t3run re-checks it before every mkfs, mount and wipefs. Returns 2
+#                                       (device/serial, else the printable part of device/vpd_pg80 after its 4-byte
+#                                       header, review 6 LOW 21), firmware (firmware_rev, else rev). Any empty field
+#                                       refuses (rc 2, naming it)
+#   t3_rdev NODE                        NODE's own MAJ:MIN (st_rdev), in decimal; t3lib_test.sh redefines it
+#   dev_unchanged PATH REAL SYS DEV ID  PATH is unmoved, the drive behind DEV is the one preflight recorded in ID
+#                                       (device-id.txt), AND the node REAL is that drive's MAJ:MIN (st_rdev against
+#                                       the recorded dev=; review 6 LOW 5: a node elsewhere carrying another disk's
+#                                       numbers is not the drive). A controller reset keeps the instance number
+#                                       (inferred); a remove plus re-add can give the name to another drive, which
+#                                       only the identity shows. device_make and device_wipe run it. Returns 2
 #   t3_blkid TAG DEV                    one tag's value from blkid's low-level probe of DEV (`sudo -n blkid -p`);
 #                                       t3lib_test.sh redefines the function, production reads no override (LOW 22)
 #   fs_probe_is REAL FS UUID            the probe finds exactly FS and UUID on REAL (an empty UUID refuses). Returns 2
@@ -105,7 +109,7 @@ dev_identity() { # dev_identity SYS DEV
   dev=$(t3_first_line "$b/dev")
   model=$(t3_first_line "$d/model")
   serial=$(t3_first_line "$d/serial")
-  [ -n "$serial" ] || serial=$(tr -cd '[:print:]' 2>/dev/null < "$d/vpd_pg80" | awk '{ gsub(/^ +| +$/, ""); print }')
+  [ -n "$serial" ] || serial=$(tail -c +5 "$d/vpd_pg80" 2>/dev/null | tr -cd '[:print:]' | awk '{ gsub(/^ +| +$/, ""); print }')
   fw=$(t3_first_line "$d/firmware_rev"); [ -n "$fw" ] || fw=$(t3_first_line "$d/rev")
   for f in wwid dev model serial fw; do
     [ -n "${!f}" ] || { echo "REFUSED: cannot read $2's ${f/fw/firmware} under $1/block/$2" >&2; return 2; }
@@ -113,14 +117,24 @@ dev_identity() { # dev_identity SYS DEV
   printf 'wwid=%s\ndev=%s\nmodel=%s\nserial=%s\nfirmware=%s\n' "$wwid" "$dev" "$model" "$serial" "$fw"
 }
 
+t3_rdev() { # t3_rdev NODE
+  local ma mi
+  read -r ma mi < <(stat -L -c '%t %T' "$1" 2> /dev/null) && [ -n "$mi" ] || return 1
+  echo "$((16#$ma)):$((16#$mi))"
+}
+
 dev_unchanged() { # dev_unchanged PATH REAL SYS DEV ID
-  local now
+  local now want rd
   dev_unmoved "$1" "$2" || return 2
   [ -s "$5" ] || { echo "REFUSED: no identity recorded for $4 ($5)"; return 2; }
   now=$(dev_identity "$3" "$4") || return 2
   [ "$now" = "$(cat "$5")" ] ||
     { echo "REFUSED: $4 is not the drive preflight recorded in $5; now: $(printf '%s\n' "$now" | grep -vxF -f "$5" | tr '\n' ' ')"
       return 2; }
+  want=$(sed -n 's/^dev=//p' "$5")
+  rd=$(t3_rdev "$2")
+  [ -n "$want" ] && [ "$rd" = "$want" ] ||
+    { echo "REFUSED: $2 is device '$rd' (its st_rdev), not the dev=$want preflight recorded for $4"; return 2; }
 }
 
 t3_blkid() { # t3_blkid TAG DEV

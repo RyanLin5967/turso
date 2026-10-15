@@ -236,6 +236,8 @@ preflight() {
     DEV_NAME=$(basename "$DEV_REAL")
     dev_identity /sys "$DEV_NAME" > "$OUT/device-id.txt" 2> "$OUT/device-id.err" ||
       { cat "$OUT/device-id.err"; echo "REFUSED: cannot record $DEV_NAME's identity"; return 2; }
+    # and the node itself is that drive: its st_rdev is the recorded dev= (review 6 LOW 5)
+    dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" || return 2
     # V3L's write rule reads the drive's sectors-written counter, which moves only with iostats on (review 5 MED 2)
     [ "$(cat "/sys/block/$DEV_NAME/queue/iostats" 2>/dev/null)" = 1 ] ||
       { echo "REFUSED: $DEV_NAME's queue/iostats is not 1: its sectors-written counter does not advance, so every V3L would VOID"; return 2; }
