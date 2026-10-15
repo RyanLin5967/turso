@@ -1182,12 +1182,17 @@ pub fn translate_insert(
     {
         let has_statement_conflict = ctx.statement_on_conflict.is_some();
         // A NOT NULL rowid alias (fastest-engine 4c) can abort a row after earlier rows of the
-        // same statement were written, as any NOT NULL column can.
+        // same statement were written, as any NOT NULL column can: only a key given through the
+        // alias, where the check is emitted (`emit_check_for_user_provided_rowid`), not a literal
+        // `rowid` key (engine review 20 item 12). Mutant `notnull_key_journal_dropped` (test builds
+        // only): the term is not counted.
         let notnull_col_exists = insertion
             .col_mappings
             .iter()
             .any(|m| m.column.notnull() && !m.column.is_rowid_alias())
-            || (has_user_provided_rowid && ctx.table.rowid_alias_refuses_null());
+            || (matches!(insertion.key, InsertionKey::RowidAlias(_))
+                && ctx.table.rowid_alias_refuses_null()
+                && !crate::branch::store::fe_mutant("notnull_key_journal_dropped"));
         let has_unique = !constraints.constraints_to_check.is_empty();
         let has_triggers = has_before_triggers || has_after_triggers;
         let has_upsert_do_update = upsert_actions
