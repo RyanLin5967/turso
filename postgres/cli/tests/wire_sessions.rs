@@ -8438,6 +8438,37 @@ fn an_added_foreign_key_needs_a_unique_parent_key() {
     a.q("INSERT INTO c VALUES (5)").ok("a matching child");
 }
 
+/// A refused ALTER TABLE ADD FOREIGN KEY leaves the child's rows exactly as they were, in
+/// autocommit and inside a block the refusal fails (then ROLLBACK): `SELECT x FROM c` is ["5"]
+/// after each. an_added_foreign_key_needs_a_unique_parent_key checked only that c still takes rows,
+/// so a refusal that lost or doubled the existing ones passed (wire review 13 item 21).
+#[test]
+fn a_refused_foreign_key_leaves_the_childs_rows() {
+    let dir = Scratch::new("fkrows");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("INSERT INTO p VALUES (1, 5), (2, 5)").ok("p rows");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    a.q("INSERT INTO c VALUES (5)").ok("c row");
+    let rows = |a: &mut Wire| -> Vec<Option<String>> {
+        a.q("SELECT x FROM c").ok("c").rows.into_iter().map(|r| r[0].clone()).collect()
+    };
+    for sql in [
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(code)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id, code)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES nosuch(id)",
+        "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(id)",
+    ] {
+        assert!(a.q(sql).error.is_some(), "premise: {sql} is refused");
+        assert_eq!(rows(&mut a), vec![Some("5".to_string())], "after {sql}");
+        a.q("BEGIN").ok("begin");
+        assert_eq!(a.q(sql).status, b'E', "{sql} fails the block");
+        a.q("ROLLBACK").ok("end");
+        assert_eq!(rows(&mut a), vec![Some("5".to_string())], "after {sql} in a block");
+    }
+}
+
 /// ALTER TABLE ADD FOREIGN KEY checks each key it adds on its own, in PostgreSQL's order
 /// (ATAddForeignKeyConstraint): a second added key onto a non-unique parent column is 42830 naming
 /// that key's parent; a parent column or a key column that does not exist is 42703 "column ...
