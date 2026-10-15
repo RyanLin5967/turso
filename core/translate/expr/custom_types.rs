@@ -1700,8 +1700,9 @@ mod tests {
     /// zero), not bigdecimal's. The expectations are DERIVED from PostgreSQL's select_div_scale by
     /// reading its source, not from our output (100.00 / 10: the first base-10000 digits give a
     /// quotient weight of 0, so 16 decimal places; 1.00 / 3: 1 <= 3 lowers the weight to -1, so
-    /// 20). LOUD-OWED: replace each expectation by PostgreSQL 18's output for the same query,
-    /// verbatim. Mutant `div_scale_bigdecimal`.
+    /// 20). CONFIRMED by PostgreSQL 18.6 for the same queries, verbatim (artie raw
+    /// lanes/engine/raw/rpgdiv-pg18.6.txt, 2026-10-15): every expectation below is its output.
+    /// Mutant `div_scale_bigdecimal`.
     #[test]
     fn numeric_division_takes_postgresqls_result_scale() {
         let conn = open();
@@ -1719,6 +1720,38 @@ mod tests {
             assert!(
                 matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
                 "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
+
+    /// Engine review 21 MED 13's rows that no in-tree regression file covered, from PostgreSQL 18.6
+    /// verbatim (artie raw lanes/engine/raw/rpgdiv-pg18.6.txt): an operand below 1 (the weight's
+    /// div_euclid), an exact quotient padded to the result scale, an operand of display scale 1, and
+    /// one of display scale above 16 (the result takes it). A display scale above 1000 has no row:
+    /// PostgreSQL refuses numeric(1200, 1100) ("precision 1200 must be between 1 and 1000"), so its
+    /// arm needs another construction. Mutant `div_scale_bigdecimal`.
+    #[test]
+    fn numeric_division_matches_postgresql_18() {
+        let conn = open();
+        // Each column holds the PostgreSQL query's dividend at its display scale (`0.5::numeric(10,
+        // 2)`, `1::numeric`, `2.5::numeric(10,1)`, `1.00000000000000000001::numeric`).
+        conn.execute(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a numeric(10, 2), b numeric(10, 0), c numeric(10, 1), \
+             e numeric(30, 20)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO d VALUES (1, '0.5', '1', '2.5', '1.00000000000000000001')")
+            .unwrap();
+        for (sql, want) in [
+            ("SELECT a / 3 FROM d", "0.16666666666666666667"),
+            ("SELECT b / 8 FROM d", "0.12500000000000000000"),
+            ("SELECT c / 2 FROM d", "1.25000000000000000000"),
+            ("SELECT e / 3 FROM d", "0.33333333333333333334"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "CLAIM: {sql} gave {got:?}, not PostgreSQL 18's {want}"
             );
         }
     }
