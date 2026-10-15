@@ -155,6 +155,7 @@ typedef struct {
     uint8_t phase, ok, nsteps, pad;
     int16_t err;
     uint64_t intended, start, end, after_end;
+    uint64_t serial_wait_ns;
     uint64_t step_end[MAXSTEPS];
 } oprec;
 
@@ -347,7 +348,7 @@ static int load_spec(const char *path, char **text) {
 }
 
 /* Expand {c} {i} {run} {rand:a:b} {var}. Returns -1 on an unknown or malformed placeholder. */
-typedef struct { int c; uint32_t i; uint64_t *rng; char *vval[MAXLIST]; int nv; } ctx_t;
+typedef struct { int c; uint32_t i; uint64_t *rng; char *vval[MAXLIST]; int nv; uint64_t *serial_wait_ns; } ctx_t;
 static const char *lookup(const char *key, const ctx_t *x) {
     for (int v = 0; v < x->nv; v++) if (!strcmp(S.vname[v], key)) return x->vval[v];
     for (int v = 0; v < NSET; v++) if (!strcmp(SETK[v], key)) return SETV[v];
@@ -605,7 +606,10 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
     /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
      * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
+    uint64_t waited = now_ns() - wait_start;
+    if (x->serial_wait_ns) *x->serial_wait_ns += waited;
     int rc = conn_exec(target, text, 0, why, wsz);
     pthread_mutex_unlock(&g_serial_mu);
     return rc;
@@ -792,7 +796,7 @@ static void *client_main(void *arg) {
                 if (MAX_OPS && k >= MAX_OPS) goto done;
             }
         }
-        ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar};
+        ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar, .serial_wait_ns = &r.serial_wait_ns};
         char vbuf[MAXLIST][1024];
         int bad = 0;
         for (int v = 0; v < S.nvar && !bad; v++) {
@@ -1052,7 +1056,7 @@ int main(int argc, char **argv) {
     if (!f) { fprintf(stderr, "bbload: raw.tsv: %s\n", strerror(errno)); return 2; }
     fprintf(f, "client\tseq\tphase\tok\tintended_ns\tstart_ns\tend_ns\tlat_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
-    fprintf(f, "\tafter_ns\terr\n");
+    fprintf(f, "\tafter_ns\tserial_wait_ns\terr\n");
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
         fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu", o->client, o->seq,
@@ -1064,7 +1068,8 @@ int main(int argc, char **argv) {
             if (s < o->nsteps) { fprintf(f, "\t%llu", (unsigned long long)(o->step_end[s] - prev)); prev = o->step_end[s]; }
             else fprintf(f, "\t");
         }
-        fprintf(f, "\t%llu\t%d\n", (unsigned long long)(o->after_end - o->end), o->err);
+        fprintf(f, "\t%llu\t%llu\t%d\n", (unsigned long long)(o->after_end - o->end),
+                (unsigned long long)o->serial_wait_ns, o->err);
     }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: raw.tsv close failed\n"); return 2; }
     snprintf(p, sizeof p, "%s/errors.txt", out);
@@ -1089,8 +1094,14 @@ int main(int argc, char **argv) {
     for (int s = 0; s < S.nstep; s++) hdr_init(1, INT64_C(3600000000000), 3, &hs[s]);
     uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0;
     double sum = 0;
+    long double inflight_ns = 0;
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
+        /* Integrate actual timed work, including warm-up/drain/error intervals that
+         * overlap the window. Intended-time queueing and after-steps are excluded. */
+        uint64_t lo = o->start > g_tm0 ? o->start : g_tm0;
+        uint64_t hi = o->end < g_tm1 ? o->end : g_tm1;
+        if (hi > lo) inflight_ns += hi - lo;
         if (o->end >= g_tm0 && o->end <= g_tm1 && o->ok) in_window_done++;
         if (o->phase != PH_MEAS) continue;
         meas++;
@@ -1105,6 +1116,11 @@ int main(int argc, char **argv) {
     hdr_out(ht, out, "hdr_total.txt");
     for (int s = 0; s < S.nstep; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_step%d.txt", s + 1); hdr_out(hs[s], out, nm); }
     double win = (g_tm1 - g_tm0) / 1e9;
+    double mean_inflight = g_tm1 > g_tm0 ? (double)(inflight_ns / (g_tm1 - g_tm0)) : 0;
+    int sql_serial = 0;
+    for (int s = 0; s < S.nstep; s++) sql_serial |= S.step[s].serial;
+    for (int s = 0; s < S.nafter; s++) sql_serial |= S.after[s].serial;
+    int reduced_concurrency = sql_serial && C > 1 && mean_inflight < C;
     double cpu = (ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
                  (ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = 0;
@@ -1116,6 +1132,8 @@ int main(int argc, char **argv) {
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
     else if (short_window && MAX_OPS) verdict = "capped";
     else if (short_window && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
+    /* Keep the observations, but timedrun.check must not grant C-labelled credit. */
+    if (rc == 0 && reduced_concurrency) verdict = "REDUCED-CONCURRENCY";
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"spec\":\"%s\",\"run_tag\":\"%s\",\"clients\":%d,\"mode\":\"%s\",\"rate\":%.3f,"
@@ -1131,6 +1149,12 @@ int main(int argc, char **argv) {
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
+    fprintf(f, "\"tm0_ns\":%llu,\"tm1_ns\":%llu,\"mean_inflight\":%.12f,\"sql_serial\":%s,"
+               "\"concurrency_label\":\"%s\",\"c_label_credit\":%s,\"serial_delete_note\":\"%s\",",
+            (unsigned long long)g_tm0, (unsigned long long)g_tm1, mean_inflight,
+            sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
+            reduced_concurrency ? "false" : "true",
+            sql_serial && C > 1 ? "Dolt 2.4.1 concurrent-delete panic: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;
