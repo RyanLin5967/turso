@@ -1011,6 +1011,65 @@ pub fn select_star(
     right_join_swapped: bool,
     long_names: bool,
 ) -> crate::Result<()> {
+    // A two-table RIGHT JOIN the planner swapped into a LEFT JOIN (`tables` = [right, left]): `*`
+    // lists the tables as written, left first. A USING column (which the swap put on the left
+    // table's join_info) stands at the LEFT table's place but holds the RIGHT table's value, the
+    // side every row has; the right table's own copy is left out. As PostgreSQL 18.6 and sqlite3
+    // 3.51.0 answer (the crash batch, 2026-10-15: it listed the swapped order, j, t, i, k for
+    // `j1 RIGHT JOIN j2 USING (i)`, where both list i, j, t, k).
+    if right_join_swapped && tables.len() == 2 {
+        let (right, left) = (&tables[0], &tables[1]);
+        let using: Vec<&str> = left
+            .join_info
+            .as_ref()
+            .map(|ji| ji.using.iter().map(|u| u.as_str()).collect())
+            .unwrap_or_default();
+        let in_using = |name: &Option<String>| {
+            name.as_ref()
+                .is_some_and(|n| using.iter().any(|u| u.eq_ignore_ascii_case(n)))
+        };
+        let column = |table: &JoinedTable, alias_table: &JoinedTable, i: usize| {
+            let col = &table.columns()[i];
+            let alias = col.name.as_ref().map(|col_name| {
+                if long_names {
+                    format!("{}.{}", alias_table.identifier, col_name)
+                } else {
+                    col_name.clone()
+                }
+            });
+            ResultSetColumn {
+                alias,
+                implicit_column_name: None,
+                expr: ast::Expr::Column {
+                    database: None,
+                    table: table.internal_id,
+                    column: i,
+                    is_rowid_alias: col.is_rowid_alias(),
+                },
+                contains_aggregates: false,
+            }
+        };
+        if left.identifier == right.identifier {
+            // A self-join: the general path below names its ambiguity.
+        } else {
+            for (i, col) in left.columns().iter().enumerate().filter(|(_, c)| !c.hidden()) {
+                let from_right = in_using(&col.name).then(|| {
+                    right.columns().iter().position(|rc| {
+                        !rc.hidden()
+                            && rc.name.as_ref().zip(col.name.as_ref()).is_some_and(|(r, l)| r.eq_ignore_ascii_case(l))
+                    })
+                });
+                match from_right.flatten() {
+                    Some(ri) => out_columns.push(column(right, left, ri)),
+                    None => out_columns.push(column(left, left, i)),
+                }
+            }
+            for (i, _) in right.columns().iter().enumerate().filter(|(_, c)| !c.hidden() && !in_using(&c.name)) {
+                out_columns.push(column(right, right, i));
+            }
+            return Ok(());
+        }
+    }
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
     let table_iter: Vec<&JoinedTable> = if right_join_swapped {
         tables.iter().rev().collect()
