@@ -1280,10 +1280,18 @@ def self_test():
              False),
             ("a block cell whose rebuild ignored V3_NEST_DIR", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
              "/v3fx-n1.img", False),
+            # V3 review 13 item 6: the first build off the cell's directory, the rebuild on it (the suite had only the
+            # reverse); item 2's ext4 case (cell dir on '/') belongs to codex card C06, which changes the judge to
+            # "same filesystem"
+            ("a block cell whose FIRST build ignored V3_NEST_DIR, its rebuild on the cell dir", "/mnt/fastest-v3-xfs",
+             "/v3fx-n1.img", "/mnt/fastest-v3-xfs/v3fx-n1.img", False),
             ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
             ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
         got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
-        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
+        # [V3 review 13 item 6, disclosed STRENGTHENING: with the function absent, got was a one-element placeholder,
+        # so `(got == []) is ok` passed every ok=False case at 167dd51be; an absent function now fails every case]
+        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), nnp is not None and ((got == []) is ok),
+            got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
     # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are; a level's files, nest_level_match) and a
