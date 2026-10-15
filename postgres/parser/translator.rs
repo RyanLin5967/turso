@@ -3025,6 +3025,16 @@ impl PostgreSQLTranslator {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
+                // `type $n` is libpg_query's extension of PostgreSQL 17's grammar, a cast with no
+                // location; PostgreSQL 18 refuses it as a syntax error (wire review 14 item 14).
+                if type_cast.location < 0 {
+                    if let Some(pg_query::protobuf::node::Node::ParamRef(p)) = arg.node.as_ref() {
+                        return Err(ParseError::ParseError(format!(
+                            "syntax error at or near \"${}\"",
+                            p.number
+                        )));
+                    }
+                }
                 let expr = Box::new(self.translate_expr(arg)?);
                 let type_name = type_cast
                     .type_name
@@ -6365,7 +6375,9 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
                 Some(PgBranchArg::Param(p.number as usize))
             }
-            Node::TypeCast(cast) if to_text(cast.type_name.as_ref()?) => {
+            // A cast with no location is libpg_query's `type $n`, which PostgreSQL 18's grammar
+            // refuses (42601, by the ordinary path): no call (wire review 14 item 14).
+            Node::TypeCast(cast) if cast.location >= 0 && to_text(cast.type_name.as_ref()?) => {
                 match arg(cast.arg.as_deref()?)? {
                     PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string())),
                     other => Some(other),
