@@ -5125,6 +5125,80 @@ mod tests {
         )))
     }
 
+    /// L5's allocation budget in process (lead 2026-10-15; budget.py work's pre-registered rule,
+    /// DECISIONS 2f239db68a, at one statement): a branch call allocates, beyond what the engine's
+    /// own call allocates (create_branch, connect_named, drop_branch; none for current and for a
+    /// switch back to the kept trunk), no more than the empty query does. Counted per thread
+    /// (counters::thread_allocations) around Session::on_query with a client that stores the reply
+    /// messages in reserved room, as the socket's codec encodes them into its reused buffer. At
+    /// 154e357e6 the wire paid 15 to 36 allocations a call over the engine.
+    #[test]
+    fn a_branch_call_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "SELECT turso_branch_create('b')");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let mut wire = |sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(&mut c, q)).unwrap();
+            let used = n() - a0;
+            assert!(
+                !c.replies.iter().any(|m| matches!(m, PgWireBackendMessage::ErrorResponse(_))),
+                "{sql}: {:?}",
+                c.replies
+            );
+            used
+        };
+        // Warm: every statement once, so a first use's one-time setup is not counted.
+        for sql in [
+            ";",
+            "SELECT turso_branch_current()",
+            "SELECT turso_branch_switch('b')",
+            "SELECT turso_branch_switch('main')",
+            "SELECT turso_branch_create('w')",
+            "SELECT turso_branch_delete('w')",
+        ] {
+            wire(sql);
+        }
+        let empty = wire(";");
+        let engine = s.shared.db.connect().unwrap();
+        let measure_engine = |f: &dyn Fn()| {
+            let a0 = n();
+            f();
+            n() - a0
+        };
+        let mut over = Vec::new();
+        let mut check = |what: &str, wire_cost: u64, engine_cost: u64| {
+            let excess = wire_cost.saturating_sub(engine_cost);
+            if excess > empty {
+                over.push(format!(
+                    "{what}: wire {wire_cost}, engine {engine_cost}, excess {excess} > the empty query's {empty}"
+                ));
+            }
+        };
+        check("current", wire("SELECT turso_branch_current()"), 0);
+        // The engine's connect first: the session on b would hold it (BranchInUse).
+        let engine_switch = measure_engine(&|| drop(s.shared.db.connect_named("b").unwrap()));
+        check("switch b", wire("SELECT turso_branch_switch('b')"), engine_switch);
+        check("switch main", wire("SELECT turso_branch_switch('main')"), 0);
+        let engine_create = measure_engine(&|| {
+            engine.create_branch("e1").unwrap();
+        });
+        let engine_delete = measure_engine(&|| {
+            s.shared.db.drop_branch("e1").unwrap();
+        });
+        check("create", wire("SELECT turso_branch_create('c')"), engine_create);
+        check("delete", wire("SELECT turso_branch_delete('c')"), engine_delete);
+        assert!(over.is_empty(), "over the budget: {over:#?}");
+    }
+
     fn ok(session: &Session, sql: &str) {
         for r in session.simple(sql) {
             if let Response::Error(e) = r {
