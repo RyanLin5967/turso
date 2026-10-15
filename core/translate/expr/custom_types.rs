@@ -1157,6 +1157,42 @@ mod tests {
         }
     }
 
+    /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
+    /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
+    /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)
+    /// raised 'value too long', `s = 40000` on smallint 'out of range', where a scan, and
+    /// PostgreSQL, answer 0 rows. Both through `answers_by_both_plans`. Mutant
+    /// `seek_key_encodes_raising_plain`.
+    #[test]
+    fn an_indexed_equality_on_a_length_or_range_checked_built_in_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(3), s smallint) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tv ON t(v)").unwrap();
+        conn.execute("CREATE INDEX ts ON t(s)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 7)").unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tv",
+            &[
+                ("v = 'abc'", None, 1),
+                ("v = 'abcdef'", None, 0),
+                ("v = ?1", Some(Value::build_text("abcdef")), 0),
+            ],
+        );
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "ts",
+            &[
+                ("s = 7", None, 1),
+                ("s = 40000", None, 0),
+                ("s = ?1", Some(Value::from_i64(40000)), 0),
+            ],
+        );
+    }
+
     /// Register the type `sql` creates as a built-in type, as the wire registers its bpchar.
     fn register_built_in(conn: &Arc<crate::Connection>, sql: &str) {
         let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
