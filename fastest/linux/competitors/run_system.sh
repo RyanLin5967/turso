@@ -758,11 +758,15 @@ prebranch_server() {
 }
 
 server_main() {
-  local spec c rc
+  local spec c rc=0
+  # comp review 1 LOW 33: a failed init stops the job as an init failure (pg18.sh's shared_buffers refusal, LOW 22,
+  # used to surface as a misleading start failure)
   case $KIND in
-    pg) srv init "$DATA" "$MODE" "$PORT" ;;
-    *) srv init "$DATA" "$PORT" ;;
+    pg) srv init "$DATA" "$MODE" "$PORT" >"$RAW/server-init.txt" 2>&1 || rc=$? ;;
+    *) srv init "$DATA" "$PORT" >"$RAW/server-init.txt" 2>&1 || rc=$? ;;
   esac
+  cat "$RAW/server-init.txt"
+  [ "$rc" = 0 ] || { fail "server init (rc $rc): $(tail -1 "$RAW/server-init.txt")"; return; }
   if [ "$KIND" = pg ]; then
     # What Linux lacks: wal_sync_method=fsync_writethrough (macOS's F_FULLFSYNC; also Windows). Measured, not assumed:
     # this postgres binary is asked to accept it and must refuse (on Linux fsync/fdatasync themselves send the device
