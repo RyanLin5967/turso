@@ -5268,6 +5268,46 @@ fn parameter_types_come_from_the_schema_the_compile_uses() {
     }
 }
 
+/// A statement's result columns are fixed as PostgreSQL's equalRowTypes compares them, names with
+/// types: on a branch where ft is (b int, a int), a `SELECT * FROM ft` described on main as
+/// (a int, b int) is refused 0A000 "cached plan must not change result type". Compared by type
+/// alone it ran, and its rows went out in (b, a) order under the (a, b) RowDescription the client
+/// had, each value in the other's column, silently (wire review 18 item 9; equalRowTypes read in
+/// PostgreSQL's tupdesc.c, REL_19_BETA1).
+#[test]
+fn a_named_statement_keeps_its_described_column_names() {
+    let dir = Scratch::new("fixednames");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ft(a INT, b INT)").ok("ft");
+    a.q("INSERT INTO ft VALUES (1, 2)").ok("row");
+    a.q("SELECT turso_branch_create('swapped')").ok("branch");
+    a.q("SELECT turso_branch_switch('swapped')").ok("switch");
+    a.q("DROP TABLE ft").ok("drop on the branch");
+    a.q("CREATE TABLE ft(b INT, a INT)").ok("ft swapped");
+    a.q("INSERT INTO ft VALUES (2, 1)").ok("row on the branch");
+    a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    a.send(b'P', b"r\0SELECT * FROM ft\0\0\0");
+    a.send(b'D', b"Sr\0");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(r.oids, Some(vec![23, 23]), "premise: {:?}", r.error);
+    a.q("SELECT turso_branch_switch('swapped')")
+        .ok("onto the branch");
+    a.send(b'B', b"\0r\0\0\0\0\0\0\0");
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert_eq!(
+        r.error
+            .as_ref()
+            .map(|e| (e.code.as_str(), e.message.as_str())),
+        Some(("0A000", "cached plan must not change result type")),
+        "rows {:?}",
+        r.rows
+    );
+}
+
 /// A named statement's result types are fixed at its first Describe too: on a branch where its
 /// column is TEXT, its Describe and its Execute are refused, 0A000 "cached plan must not change
 /// result type", as PostgreSQL's RevalidateCachedQuery refuses both. Its rows went out as text
