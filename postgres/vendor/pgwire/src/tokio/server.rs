@@ -336,11 +336,15 @@ async fn check_ssl_direct_negotiation(tcp_socket: &TcpStream) -> Result<bool, io
     Ok(n > 0 && buf[0] == 0x16)
 }
 
-async fn peek_for_sslrequest<ST>(
-    socket: &mut Framed<TcpStream, PgWireMessageServerCodec<ST>>,
+async fn peek_for_sslrequest<IO, ST>(
+    socket: &mut Framed<IO, PgWireMessageServerCodec<ST>>,
     ssl_supported: bool,
-) -> Result<SslNegotiationType, io::Error> {
-    if check_ssl_direct_negotiation(socket.get_ref()).await? {
+    direct: bool,
+) -> Result<SslNegotiationType, io::Error>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    if direct {
         Ok(SslNegotiationType::Direct)
     } else {
         let mut ssl_done = false;
@@ -423,6 +427,8 @@ fn check_alpn_for_direct_ssl<IO>(tls_socket: &TlsStream<IO>) -> Result<(), io::E
 #[non_exhaustive]
 pub enum MaybeTls {
     Plain(TcpStream),
+    /// A std socket in blocking mode, driven with no runtime (vendored change 9).
+    Blocking(BlockingTcp),
     #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
     Tls(Box<TlsStream<TcpStream>>),
 }
@@ -431,6 +437,7 @@ macro_rules! maybe_tls {
     ($self:ident, $poll_x:ident($($args:expr),*)) => {
         match $self.get_mut() {
             MaybeTls::Plain(io) => Pin::new(io).$poll_x($($args),*),
+            MaybeTls::Blocking(io) => Pin::new(io).$poll_x($($args),*),
             #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
             MaybeTls::Tls(io) => Pin::new(io).$poll_x($($args),*),
         }
@@ -465,6 +472,107 @@ impl AsyncWrite for MaybeTls {
     }
 }
 
+/// A std TCP socket in blocking mode as an AsyncRead/AsyncWrite whose every poll completes: the
+/// read or write blocks the calling thread in the system call, and nothing is registered with a
+/// reactor, so a session thread driven by a plain executor makes no kevent (vendored change 9).
+/// A read that times out (SO_RCVTIMEO, the server's startup timeout) is read as the stream's end,
+/// with `timed_out` set.
+pub struct BlockingTcp {
+    pub socket: std::net::TcpStream,
+    pub timed_out: bool,
+}
+
+impl AsyncRead for BlockingTcp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use std::io::Read;
+        let this = self.get_mut();
+        loop {
+            match this.socket.read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    this.timed_out = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for BlockingTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        use std::io::Write;
+        let this = self.get_mut();
+        loop {
+            match this.socket.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                r => return Poll::Ready(r),
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(match self.socket.shutdown(std::net::Shutdown::Write) {
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+            r => r,
+        })
+    }
+}
+
+/// [`negotiate_tls`] with no TLS, on a std socket in blocking mode ([`BlockingTcp`]): the SSL and
+/// GSS requests are refused, as `negotiate_tls(.., None)` refuses them, and a direct TLS handshake
+/// gets `Ok(None)`. The peek for a direct handshake blocks until the client's first byte (or the
+/// socket's read timeout). Vendored change 9.
+pub async fn negotiate_blocking<S>(
+    tcp_socket: std::net::TcpStream,
+) -> io::Result<Option<Framed<MaybeTls, PgWireMessageServerCodec<S>>>> {
+    let addr = tcp_socket.peer_addr()?;
+    tcp_socket.set_nodelay(true)?;
+    tcp_socket.set_nonblocking(false)?;
+    let mut first = [0u8; 1];
+    let direct = loop {
+        match tcp_socket.peek(&mut first) {
+            Ok(n) => break n > 0 && first[0] == 0x16,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // A read timeout before any byte: the stream reads as ended below.
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                break false
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let client_info = DefaultClient::new(addr, false);
+    let io = BlockingTcp {
+        socket: tcp_socket,
+        timed_out: false,
+    };
+    let mut socket = Framed::new(MaybeTls::Blocking(io), PgWireMessageServerCodec::new(client_info));
+    let ssl = peek_for_sslrequest(&mut socket, false, direct).await?;
+    if ssl != SslNegotiationType::None {
+        return Ok(None);
+    }
+    socket.set_state(PgWireConnectionState::AwaitingStartup);
+    Ok(Some(socket))
+}
+
 /// Negotiate TLS with the given client stream.
 ///
 /// Returns `Ok(None)` if the client sent a direct TLS negotiation but
@@ -481,7 +589,8 @@ pub async fn negotiate_tls<S>(
 
     // this function will process postgres ssl negotiation and consume the first
     // SslRequest packet if detected.
-    let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some()).await?;
+    let direct = check_ssl_direct_negotiation(tcp_socket.get_ref()).await?;
+    let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some(), direct).await?;
 
     let old_parts = tcp_socket.into_parts();
 

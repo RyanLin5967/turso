@@ -106,7 +106,13 @@ pub struct TursoPgServer {
     address: String,
     shared: Arc<Shared>,
     interrupt_count: Arc<AtomicUsize>,
+    /// Every session thread started and not yet joined; the finished ones are reaped at each
+    /// admission, and the shutdown joins the rest.
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
+
+/// How long the shutdown waits for the session threads it ended to finish.
+const SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One statement's waits on a lock another session holds: SQLite's default busy schedule (1, 2,
 /// 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) up to the server's lock wait. The clock is
@@ -199,6 +205,45 @@ struct Shared {
     cancels: Mutex<std::collections::HashMap<(i32, i32), std::sync::Weak<Interrupts>>>,
     /// The next session's process id.
     next_pid: std::sync::atomic::AtomicI32,
+    /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
+    startup_timeout: std::time::Duration,
+    /// Every live session's socket, for the shutdown that ends them.
+    sessions: SessionSockets,
+}
+
+/// A handle on each live session's socket (a dup of its descriptor), so the server's shutdown can
+/// shut them: a session thread blocked reading its socket then reads the stream's end and ends.
+#[derive(Default)]
+struct SessionSockets {
+    next: AtomicU64,
+    open: Mutex<std::collections::HashMap<u64, std::net::TcpStream>>,
+}
+
+impl SessionSockets {
+    fn register(&self, socket: std::net::TcpStream) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, socket);
+        id
+    }
+
+    fn deregister(&self, id: u64) {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    /// Shut every live session's socket both ways; returns how many.
+    fn shut_all(&self) -> usize {
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        for socket in open.values() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        open.len()
+    }
 }
 
 /// A session's requests to stop its running statement: a CancelRequest, and SET statement_timeout's
@@ -321,6 +366,8 @@ impl Shared {
             in_use_wait: IN_USE_WAIT,
             cancels: Mutex::new(std::collections::HashMap::new()),
             next_pid: std::sync::atomic::AtomicI32::new(1),
+            startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
+            sessions: SessionSockets::default(),
         }
     }
 
@@ -419,7 +466,48 @@ impl TursoPgServer {
             address,
             shared: Arc::new(Shared::new(db, db_file, max_connections, lock_wait)),
             interrupt_count,
+            threads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// How long a client has to complete its startup (PostgreSQL's authentication_timeout).
+    pub fn with_startup_timeout(mut self, timeout: std::time::Duration) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("set before the server runs")
+            .startup_timeout = timeout;
+        self
+    }
+
+    /// End every session and join its thread: each running statement is cancelled (57014) and
+    /// each session's socket is shut, so a thread blocked reading it reads the stream's end and
+    /// ends. Waits up to SHUTDOWN_JOIN; returns (sessions shut, threads joined, threads left).
+    fn end_sessions(&self) -> (usize, usize, usize) {
+        for interrupts in self
+            .shared
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            interrupts.cancel.store(true, Ordering::Relaxed);
+        }
+        let shut = self.shared.sessions.shut_all();
+        let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = std::time::Instant::now() + SHUTDOWN_JOIN;
+        let (mut joined, mut left) = (0, 0);
+        for t in threads {
+            while !t.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+                joined += 1;
+            } else {
+                left += 1;
+            }
+        }
+        (shut, joined, left)
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
@@ -468,7 +556,12 @@ impl TursoPgServer {
                 break;
             }
         }
-
+        drop(listener);
+        let (shut, joined, left) = self.end_sessions();
+        println!(
+            "PostgreSQL server stopped: {shut} sessions shut, {joined} session threads joined, \
+             {left} still running"
+        );
         Ok(())
     }
 
@@ -494,8 +587,13 @@ impl TursoPgServer {
             .name("pg-session".to_string())
             .stack_size(SESSION_STACK)
             .spawn(move || run_session(shared, socket, addr, slot));
-        if let Err(e) = spawned {
-            error!("Error starting a session thread for {}: {}", addr, e);
+        match spawned {
+            Ok(handle) => {
+                let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                threads.retain(|t| !t.is_finished());
+                threads.push(handle);
+            }
+            Err(e) => error!("Error starting a session thread for {}: {}", addr, e),
         }
     }
 }
@@ -521,47 +619,36 @@ impl Drop for SessionSlot {
     }
 }
 
-/// The body of a session thread: the protocol on a runtime of this thread alone, until the client
-/// goes. The session's connections close when it returns.
+/// The body of a session thread: the protocol on this thread's own blocking socket, until the
+/// client goes. The session's connections close when it returns.
+///
+/// No runtime (L5 step 3(a), lead 2026-10-15): the socket is a std socket in blocking mode
+/// (vendored pgwire change 9, BlockingTcp) and the protocol's futures run on a plain executor
+/// whose every poll completes, so the thread reads and writes in the system calls themselves.
+/// Under tokio's current-thread runtime the session thread made 6 to 8 kevents in every
+/// statement's window, the empty query's included (scshim, artie DECISIONS 88b959382d).
 fn run_session(
     shared: Arc<Shared>,
     socket: std::net::TcpStream,
     addr: std::net::SocketAddr,
     _slot: SessionSlot,
 ) {
-    // IO and timers only: a signal driver would cost every session a socket pair.
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!(
-                "Error starting the runtime of the session from {}: {}",
-                addr, e
-            );
-            return;
-        }
-    };
-    rt.block_on(async move {
-        let socket = match tokio::net::TcpStream::from_std(socket) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Error attaching connection from {}: {}", addr, e);
-                return;
-            }
-        };
-        let session = Arc::new(Session::new(shared));
-        if let Err(e) = serve_session(socket, session).await {
-            error!("Error processing connection from {}: {}", addr, e);
-        }
-    });
+    // A handle on the socket for the server's shutdown, which shuts it so a blocked read returns.
+    let registered = socket
+        .try_clone()
+        .map(|handle| shared.sessions.register(handle));
+    let session = Arc::new(Session::new(shared.clone()));
+    if let Err(e) = futures::executor::block_on(serve_session(socket, session)) {
+        error!("Error processing connection from {}: {}", addr, e);
+    }
+    if let Ok(id) = registered {
+        shared.sessions.deregister(id);
+    }
 }
 
-/// How long a client has to finish its startup, as pgwire's process_socket allows (and
-/// PostgreSQL's authentication_timeout's default).
-const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a client has to finish its startup by default, in seconds, as pgwire's process_socket
+/// allows (and PostgreSQL's authentication_timeout's default); `--authentication-timeout` sets it.
+pub const DEFAULT_AUTHENTICATION_TIMEOUT_S: u64 = 60;
 
 /// Before startup completes the session reads its startup's own messages alone: a malformed
 /// message of any kind, or any extended-protocol message (Parse, Bind, Close, Describe, Execute,
@@ -604,22 +691,21 @@ fn refused_before_startup(
 /// items 3 and 4). Here a Terminate ends the session, and on every way out the session releases
 /// its branch and its in-use entry BEFORE the socket closes (the socket is dropped on return).
 async fn serve_session(
-    socket: tokio::net::TcpStream,
+    socket: std::net::TcpStream,
     session: Arc<Session>,
 ) -> Result<(), std::io::Error> {
-    let startup_timeout = tokio::time::sleep(STARTUP_TIMEOUT);
-    tokio::pin!(startup_timeout);
+    // The startup timeout is the socket's read timeout until startup completes: a read that times
+    // out reads as the stream's end (BlockingTcp), so a client that never finishes its startup
+    // cannot hold the thread.
+    let startup_timeout = session.shared.startup_timeout;
+    socket.set_read_timeout(Some(startup_timeout))?;
     // Every way a session ends before its startup completes is logged: the client sees only the
     // socket close (the "closed the connection during startup" flake, lead).
-    let socket = tokio::select! {
-        _ = &mut startup_timeout => {
-            warn!("session ended before startup: the startup timeout passed during TLS negotiation");
-            return Ok(());
-        }
-        socket = pgwire::tokio::server::negotiate_tls(socket, None) => socket.inspect_err(|e| {
+    let socket = pgwire::tokio::server::negotiate_blocking(socket)
+        .await
+        .inspect_err(|e| {
             warn!("session ended before startup: TLS negotiation failed: {}", e);
-        })?,
-    };
+        })?;
     let Some(mut socket) = socket else {
         warn!("session ended before startup: TLS negotiation returned no socket");
         return Ok(());
@@ -634,17 +720,20 @@ async fn serve_session(
     let copy_handler = Arc::new(NoopHandler);
     let cancel_handler = Arc::new(CancelSessions(session.shared.clone()));
     let error_handler = NoopHandler;
+    let mut started = false;
     let result = loop {
-        let msg = if matches!(
+        let starting = matches!(
             socket.state(),
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
-        ) {
-            tokio::select! {
-                _ = &mut startup_timeout => None,
-                msg = socket.next() => msg,
+        );
+        if !starting && !started {
+            started = true;
+            if let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_ref() {
+                io.socket.set_read_timeout(None)?;
             }
-        } else {
+        }
+        let msg = {
             let _reading = turso_pg::phase::enter(turso_pg::phase::Phase::Read);
             socket.next().await
         };
@@ -672,15 +761,14 @@ async fn serve_session(
                 break Ok(());
             }
             None => {
-                if matches!(
-                    socket.state(),
-                    PgWireConnectionState::AwaitingStartup
-                        | PgWireConnectionState::AuthenticationInProgress
-                ) {
-                    warn!(
-                        "session ended before startup: the client's stream ended, or the startup \
-                         timeout passed"
-                    );
+                if starting {
+                    let timed_out = matches!(socket.get_ref(),
+                        pgwire::tokio::server::MaybeTls::Blocking(io) if io.timed_out);
+                    if timed_out {
+                        warn!("session ended before startup: the startup timeout passed");
+                    } else {
+                        warn!("session ended before startup: the client's stream ended");
+                    }
                 }
                 break Ok(());
             }
@@ -832,9 +920,8 @@ async fn serve_session(
 }
 
 /// Raise this process's open-file soft limit so `max_connections` sessions fit. A session holds
-/// its socket and its runtime's descriptors (tokio's I/O driver: 4 measured with tokio 1.47 on
-/// macOS, a kqueue among them; 5 per session in all, read with lsof on a live server), so 6 are
-/// budgeted per session. A limit that cannot be raised that far is reported, and the server then
+/// its socket and the shutdown's dup of it (2; with tokio's runtime per session it held 5, read
+/// with lsof on a live server), and 6 stay budgeted per session. A limit that cannot be raised that far is reported, and the server then
 /// refuses connections the kernel cannot open.
 fn raise_open_file_limit(max_connections: usize) {
     const FDS_PER_SESSION: u64 = 6;

@@ -109,6 +109,15 @@ struct Opts {
 
     #[clap(
         long,
+        default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
+        value_parser = clap::value_parser!(u64).range(1..=600),
+        help = "With --server: how long a client has to complete its startup before the session \
+                ends, in seconds (PostgreSQL's authentication_timeout: 1 to 600, default 60)"
+    )]
+    authentication_timeout: u64,
+
+    #[clap(
+        long,
         value_enum,
         default_value_t = BranchStore::Catalog,
         help = "Where named branches live: a catalog store beside the database (the default), a \
@@ -1070,7 +1079,8 @@ fn main() -> anyhow::Result<()> {
             opts.max_connections,
             std::time::Duration::from_millis(opts.lock_timeout_ms),
             interrupt_count,
-        );
+        )
+        .with_startup_timeout(std::time::Duration::from_secs(opts.authentication_timeout));
         return server.run();
     }
 

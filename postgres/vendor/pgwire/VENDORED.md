@@ -74,4 +74,9 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
    is; its extended loop refuses one (a pre-encoded reply holds a RowDescription, which Execute
    never sends). The server checks the bytes equal pgwire's encoding of the same reply
    (inline_replies_are_the_messages_pgwire_encodes).
-
+9. `tokio/server.rs`: `MaybeTls::Blocking(BlockingTcp)`, a std socket in blocking mode whose
+   AsyncRead/AsyncWrite polls always complete (the read or write blocks in the system call; a read
+   timeout, SO_RCVTIMEO, reads as the stream's end with `timed_out` set), and `negotiate_blocking`,
+   `negotiate_tls(.., None)` on such a socket. `peek_for_sslrequest` takes any IO and is told
+   whether the first byte began a direct TLS handshake. The server runs each session on one with
+   no runtime, so the session thread makes no kevent (L5 step 3(a), lead 2026-10-15).
