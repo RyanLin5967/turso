@@ -130,6 +130,7 @@ pub(crate) mod id_set;
 pub use id_set::id_set_census;
 pub(crate) mod journal;
 pub mod merge;
+pub(crate) mod name_mirror;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
 pub(crate) mod store;

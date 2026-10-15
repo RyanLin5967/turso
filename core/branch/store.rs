@@ -1455,12 +1455,12 @@ impl Drop for StoreGuard<'_> {
 }
 
 /// LEAP L4 slice 4's name mirror (`NameIndex::catalog`): every name in the catalog's `branch_name`,
-/// with its branch.
-pub(crate) type NameMirror = HashMap<Arc<str>, BranchId>;
+/// with its branch, interned compactly (`name_mirror`).
+pub(crate) use super::name_mirror::NameMirror;
 
-/// A mirror of a scan's `(name, id)` pairs.
+/// A mirror of a scan's `(name, id)` pairs (consumed: the scan's `Arc`s are freed here).
 pub(crate) fn name_mirror_from_pairs(pairs: Vec<(Arc<str>, u64)>) -> NameMirror {
-    pairs.into_iter().map(|(name, id)| (name, BranchId(id))).collect()
+    NameMirror::from_pairs(pairs.iter().map(|(name, id)| (&**name, *id)))
 }
 
 /// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
@@ -8619,12 +8619,16 @@ impl BranchStore {
             let stop = std::sync::atomic::AtomicBool::new(false);
             let rows = cat.catalog.name_pairs(&stop).map_err(|e| format!("name_pairs: {e}"))?;
             let asked: HashMap<Arc<str>, BranchId> = rows.into_iter().map(|(n, id)| (n, BranchId(id))).collect();
-            if *mirror != asked {
+            if !mirror.same_as(&asked) {
+                let first = asked
+                    .iter()
+                    .find(|(n, id)| mirror.get(n) != Some(**id))
+                    .map(|(n, id)| (n.to_string(), *id))
+                    .or_else(|| mirror.iter().find(|(n, id)| asked.get(*n) != Some(id)).map(|(n, id)| (n.to_string(), id)));
                 return Err(format!(
-                    "the name mirror holds {} names, the catalog {}; first difference: {:?}",
+                    "the name mirror holds {} names, the catalog {}; first difference: {first:?}",
                     mirror.len(),
-                    asked.len(),
-                    asked.iter().find(|(n, id)| mirror.get(*n) != Some(id)).or_else(|| mirror.iter().find(|(n, id)| asked.get(*n) != Some(id)))
+                    asked.len()
                 ));
             }
         }
@@ -9216,7 +9220,7 @@ impl StoreInner {
             }
             // The catalog's names, mirrored exactly (LEAP L4 slice 4).
             if let Some(mirror) = self.names.catalog.as_ref().filter(|_| !fe_mutant("l4_probe_always")) {
-                let found = mirror.get(name).copied();
+                let found = mirror.get(name);
                 if let Some(id) = found {
                     self.names.last_found = Some((id, Arc::from(name)));
                 }
@@ -9811,7 +9815,7 @@ impl StoreInner {
                     self.cat = Some(cat);
                     // A new catalog holds no name: its mirror is exact, empty, at once (LEAP L4).
                     if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
-                        self.names.catalog = Some(HashMap::default());
+                        self.names.catalog = Some(NameMirror::default());
                     }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
@@ -10359,7 +10363,7 @@ impl StoreInner {
             }
             if !fe_mutant("l4_names_stale") {
                 for (name, id) in &cap.names_fresh {
-                    mirror.insert(name.clone(), *id);
+                    mirror.insert(name, *id);
                 }
             }
         }
