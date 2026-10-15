@@ -476,8 +476,39 @@ struct GroupState {
     /// proved confirmation pending and went back to waiting.
     #[cfg(test)]
     confirm_wakeups: u64,
+    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer is in one of its
+    /// condition-variable waits (set as it enters one, cleared as the wait returns, both under this
+    /// lock; `BranchStore::confirm_park_for_test`), and the waits it has entered.
+    #[cfg(test)]
+    confirm_parked: bool,
+    #[cfg(test)]
+    confirm_parks: u64,
 }
 
+<<<<<<< 96ccc4a6872aa22e4fb9bfd21391971c7d262a94
+=======
+impl GroupState {
+    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer enters a wait.
+    #[cfg(test)]
+    fn confirm_wait_entered(&mut self) {
+        self.confirm_parked = true;
+        self.confirm_parks += 1;
+    }
+
+    /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
+    #[cfg(test)]
+    fn confirm_wait_left(&mut self) {
+        self.confirm_parked = false;
+    }
+
+    /// A sync is in the air outside any flight: a checkpoint's arena sync (`arena_syncing`) or a
+    /// held-free upgrade's (`upgrading`). Neither holds the flight slot.
+    fn syncing_outside_flight(&self) -> bool {
+        self.arena_syncing || self.upgrading
+    }
+}
+
+>>>>>>> fork/fastest-budgets
 fn class_index(class: SyncClass) -> usize {
     match class {
         SyncClass::Off => 0,
@@ -850,7 +881,11 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         let landed = match g.confirm.as_ref() {
             Some((at, c)) if c.proved() && !group.poisoned() => *at,
             _ => {
+                #[cfg(test)]
+                g.confirm_wait_entered();
                 g = group.confirm_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                #[cfg(test)]
+                g.confirm_wait_left();
                 continue;
             }
         };
@@ -860,7 +895,11 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         // the lock its leader and riders need (engine review 8 #10). Mutant `confirm_poll_100us`
         // (test builds only): every 100 us, as before.
         if (g.flushing || g.cutting) && !fe_mutant("confirm_poll_100us") {
+            #[cfg(test)]
+            g.confirm_wait_entered();
             g = group.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            g.confirm_wait_left();
             #[cfg(test)]
             {
                 g.confirm_wakeups += 1;
@@ -869,7 +908,11 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         if idle < confirm_quiet() || g.flushing || g.cutting {
             let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
+            #[cfg(test)]
+            g.confirm_wait_entered();
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
+            #[cfg(test)]
+            g.confirm_wait_left();
             #[cfg(test)]
             {
                 g.confirm_wakeups += 1;
@@ -7300,6 +7343,19 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn confirm_wakeups_for_test(&self) -> u64 {
         self.group.lock().confirm_wakeups
+    }
+
+    /// Test builds (fastest-budgets, review 2 L3): whether this store's confirmation writer is in
+    /// one of its waits, whether a proved word is pending, and the waits it has entered; `None` while
+    /// anyone holds the group's lock (a measuring thread spins on this: blocking on the lock would add
+    /// a syscall to its window). The writer sets the flag before it waits and clears it as the wait
+    /// returns, holding the lock, so while it reads true here the writer has finished its work and is
+    /// in the wait. BLIND SPOT: if the condition variable releases the lock in userspace before its
+    /// wait syscall, that one syscall can land just after a reader saw the flag.
+    #[cfg(test)]
+    pub(crate) fn confirm_park_for_test(&self) -> Option<(bool, bool, u64)> {
+        let g = self.group.state.try_lock().ok()?;
+        Some((g.confirm_parked, g.confirm.as_ref().is_some_and(|(_, c)| c.proved()), g.confirm_parks))
     }
 
     /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
