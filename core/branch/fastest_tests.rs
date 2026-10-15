@@ -7471,6 +7471,18 @@ fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
 fn a_raised_d0_fuzzy_checkpoint_waits_out_an_ordered_flight_in_the_air() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (engine review 18 MED 4, a strengthening; for the lead's ruling): at the
+    // 100 ms default bound the checkpoint failed Busy about 1.9 s before the trunk commit's armed
+    // WAL failure ran, so the doc's path (the flush fails, the store fail-stops) was never reached
+    // and a Busy-at-once settle passed. The bound is 60 s here, and the fail-stop is asserted.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::PENDING_FULL_WAIT_MS.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::PENDING_FULL_WAIT_MS.store(60_000, O::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let (db, armed) = open_failing_wal(&dir.path().join("settle-ordered.db"), opts(true, SyncClass::Off));
     let trunk = db.connect().unwrap();
@@ -7516,6 +7528,10 @@ fn a_raised_d0_fuzzy_checkpoint_waits_out_an_ordered_flight_in_the_air() {
         db.branch_checkpoint_counters()[0],
         installed,
         "a fuzzy checkpoint installed over an ordered flight whose WAL flush failed"
+    );
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        "the next fork after the ordered flight's WAL flush failed under the settling checkpoint",
     );
 }
 
