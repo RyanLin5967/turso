@@ -1935,7 +1935,7 @@ mod tests {
         let control = run_bounded(vec![
             "CREATE TABLE w(id INTEGER PRIMARY KEY, x numeric(1000, 1000)) STRICT".to_string(),
             "INSERT INTO w VALUES (1, '0.5')".to_string(),
-            "SELECT count(*) FROM w".to_string(),
+            "SELECT CAST(count(*) AS TEXT) FROM w".to_string(),
         ]);
         assert_eq!(control, Ok(Some("1".to_string())), "premise: numeric(1000, 1000) does not hold 0.5, as PostgreSQL's does");
         assert!(bad.is_empty(), "CLAIM: a numeric typmod outside PostgreSQL's range was not refused as PostgreSQL refuses it: {bad:?}");
@@ -1945,7 +1945,9 @@ mod tests {
     /// of the display scales uncapped (PostgreSQL caps it at 16383), and add, sub and mul did not
     /// refuse a result past 131072 integer digits (PostgreSQL: 22003, "value overflows numeric
     /// format"). Expected values are PG 18.6's for this exact SQL over these tables (artie raw
-    /// pg18-numeric-typmod-range.txt 7a1d98f8d2): t.x = 1, u.x = 10, both numeric(10, 2).
+    /// pg18-numeric-typmod-range.txt 7059fd299c): t.x = 1, u.x = 10, both numeric(10, 2). Add and sub
+    /// past the range are reached through a 131072-digit text operand: here a product's result does
+    /// not stay numeric, so `(a * x) + (b * x)` is SQLite arithmetic, not numeric's.
     #[test]
     fn a_numeric_result_outside_postgresqls_range_is_refused() {
         let setup = || {
@@ -1957,16 +1959,21 @@ mod tests {
             ]
         };
         let overflow = "value overflows numeric format";
+        // 131072 nines: the most integer digits PostgreSQL holds; one more digit overflows.
+        let nines = "9".repeat(131_072);
         let mut bad = Vec::new();
         for (sql, want) in [
-            ("SELECT '0e-16383' * x FROM t", Ok(16385usize)),
-            ("SELECT '1e131070' * x FROM u", Ok(131075)),
-            ("SELECT '1e131071' * x FROM u", Err(overflow)),
-            ("SELECT ('9e131071' * x) + ('9e131071' * x) FROM t", Err(overflow)),
-            ("SELECT ('-9e131071' * x) - ('9e131071' * x) FROM t", Err(overflow)),
+            ("SELECT '0e-16383' * x FROM t".to_string(), Ok(16385usize)),
+            ("SELECT '1e131070' * x FROM u".to_string(), Ok(131075)),
+            ("SELECT '1e131071' * x FROM u".to_string(), Err(overflow)),
+            (format!("SELECT '{nines}' + x FROM u"), Err(overflow)),
+            (format!("SELECT x + '{nines}' FROM u"), Err(overflow)),
+            (format!("SELECT '-{nines}' - x FROM u"), Err(overflow)),
+            (format!("SELECT '{nines}' - x FROM u"), Ok(131075)),
         ] {
             let mut steps = setup();
-            steps.push(sql.to_string());
+            steps.push(sql.clone());
+            let sql: String = sql.chars().take(60).collect();
             let got = run_bounded(steps);
             let ok = match (&got, &want) {
                 (Ok(Some(v)), Ok(len)) => v.len() == *len,
