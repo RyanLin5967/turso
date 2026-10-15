@@ -12429,22 +12429,14 @@ replays_postgresql!(
     "pg18-audit2-set_reads_every_value_it_is_given.out",
     [
         (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET DateStyle TO ISO, DMY refused 0A000"),
-        (5, "PGDIV-SHOW-TAG protocol [wire]: SHOW DateStyle completes with tag 'SELECT 1' where PG sends 'SHOW' (value 'ISO, MDY' agrees)"),
     ]
 );
 replays_postgresql!(
     pg18_audit2_show_answers_from_the_settings_set_keeps_replays_as_postgresql_answered,
     "pg18-audit2-show_answers_from_the_settings_set_keeps.out",
     [
-        (1, "PGDIV-SHOW-TAG protocol [wire]: SHOW search_path completes with tag 'SELECT 1' where PG sends 'SHOW' (value agrees)"),
-        (3, "PGDIV-SHOW-TAG protocol [wire]: SHOW search_path tag 'SELECT 1' vs 'SHOW' (value 's, public' agrees)"),
-        (4, "PGDIV-SHOW-TAG protocol [wire]: SHOW client_encoding tag 'SELECT 1' vs 'SHOW'"),
-        (5, "PGDIV-SHOW-TAG protocol [wire]: SHOW standard_conforming_strings tag 'SELECT 1' vs 'SHOW'"),
         (6, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW DateStyle: PG cluster's config file sets 'ISO, YMD', ours default 'ISO, MDY'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
-        (7, "PGDIV-SHOW-TAG protocol [wire]: SHOW IntervalStyle tag 'SELECT 1' vs 'SHOW'"),
         (8, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW TimeZone: PG cluster's 'America/Toronto' vs ours 'UTC'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
-        (9, "PGDIV-SHOW-TAG protocol [wire]: SHOW bytea_output tag 'SELECT 1' vs 'SHOW'"),
-        (10, "PGDIV-SHOW-TAG protocol [wire]: SHOW transaction_read_only tag 'SELECT 1' vs 'SHOW'"),
         (11, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
         (12, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
         (13, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
@@ -12718,8 +12710,6 @@ replays_postgresql!(
     pg18_c33_engineerr_replays_as_postgresql_answered,
     "pg18-c33-engineerr.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS big: ours omits PG's NOTICE"),
-        (2, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS t: ours omits PG's NOTICE"),
         (7, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
         (8, "PGDIV-INT-RANGE value [engine]: SILENT: v + 1 past int8 answers '9.223372036854776e+18' typed 23; PG 20 then 22003"),
         (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
@@ -12744,13 +12734,11 @@ replays_postgresql!(
     pg18_c33_replays_as_postgresql_answered,
     "pg18-c33.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists pd: ours omits PG's NOTICE"),
         (13, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
         (17, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 9223372036854775808 answers '9.223372036854776e+18' typed 701; PG exact numeric 9223372036854775808"),
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
-        (23, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists rr: ours omits PG's NOTICE"),
         (25, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e39 into a real column succeeds (stored as Infinity); PG 22003 out of range for type real"),
         (26, "PGDIV-REAL-RANGE value [engine]: SILENT: insert '1e39' into real succeeds (Infinity); PG 22003"),
         (27, "PGDIV-REAL-RANGE value [engine]: SILENT: insert -1e39 into real succeeds (-Infinity); PG 22003"),
@@ -12765,7 +12753,6 @@ replays_postgresql!(
     pg18_colnames_replays_as_postgresql_answered,
     "pg18-colnames.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 'table \"cn\" does not exist, skipping'"),
         (4, "PGDIV-NAN ours-only [ours-only]: 'nan'::numeric refused 0A000 (engine holds no NaN); PG answers the whole row"),
         (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: CASE WHEN true THEN a ELSE a END typed 25 text; PG 23 int4 (values agree)"),
         (6, "PGDIV-ROW-CONSTRUCTOR value [wire]: SELECT ARRAY[1], ROW(1, 2), EXISTS ..., ...: ours errors 42601 'row value misused' where PG answers one row"),
@@ -12776,9 +12763,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_derivedbool_replays_as_postgresql_answered,
     "pg18-derivedbool.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_float_replays_as_postgresql_answered,
@@ -12812,15 +12797,12 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_gsstar_replays_as_postgresql_answered,
     "pg18-gsstar.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS gt: ours omits PG's NOTICE 'does not exist, skipping'"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_ident_replays_as_postgresql_answered,
     "pg18-ident.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS idt, idb, gv: ours omits PG's three NOTICEs"),
         (6, "PGDIV-VIRTUAL-GENERATED value [wire]: create table with b ... GENERATED ALWAYS AS (a * 2) VIRTUAL: ours errors 42601 syntax error at \"virtual\" where PG creates it (a refusal should be 0A000)"),
         (7, "PGDIV-VIRTUAL-GENERATED cascade [wire]: insert into gv: 42P01 no such table (cascade of #6)"),
         (10, "PGDIV-VIRTUAL-GENERATED cascade [wire]: select * from gv: 42P01 no such table (cascade of #6)"),
@@ -12845,7 +12827,6 @@ replays_postgresql!(
     pg18_inherits_replays_as_postgresql_answered,
     "pg18-inherits.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS ich, ipa: ours omits PG's two NOTICEs 'does not exist, skipping'"),
         (3, "PGDIV-INHERITS ours-only [ours-only]: CREATE TABLE ... INHERITS refused 0A000"),
         (4, "PGDIV-INHERITS cascade [ours-only]: INSERT INTO ich: 42P01 no such table (cascade of #3)"),
         (5, "PGDIV-INHERITS cascade [ours-only]: SELECT FROM ich: 42P01 (cascade of #3)"),
@@ -12857,7 +12838,6 @@ replays_postgresql!(
     pg18_insdef_replays_as_postgresql_answered,
     "pg18-insdef.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS it: ours omits PG's NOTICE"),
         (3, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
         (4, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
         (8, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
@@ -12866,9 +12846,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_join1_replays_as_postgresql_answered,
     "pg18-join1.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_join1b_replays_as_postgresql_answered,
@@ -12881,7 +12859,6 @@ replays_postgresql!(
     pg18_join2_replays_as_postgresql_answered,
     "pg18-join2.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
         (8, "PGDIV-FULL-JOIN-USING value [wire]: FULL JOIN ... USING (i): ours errors 42601 'FULL OUTER JOIN requires an equality condition in the ON clause' where PG answers 4 rows"),
         (10, "PGDIV-FULL-JOIN-USING value [wire]: SELECT i FROM j1 FULL JOIN j2 USING (i): ours errors 42601 where PG answers 4 rows"),
         (12, "PGDIV-FULL-JOIN-USING value [wire]: NATURAL FULL JOIN: ours errors 42601 where PG answers 4 rows"),
@@ -12891,7 +12868,6 @@ replays_postgresql!(
     pg18_nullorder_replays_as_postgresql_answered,
     "pg18-nullorder.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists nt: ours omits PG's NOTICE"),
         (9, "PGDIV-EXPR-TYPE-TEXT value [wire]: row_number() OVER typed 25 text; PG 20 int8 (rows agree)"),
     ]
 );
@@ -12933,16 +12909,13 @@ replays_postgresql!(
     pg18_short_replays_as_postgresql_answered,
     "pg18-short.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS s3: ours omits PG's NOTICE"),
         (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
     ]
 );
 replays_postgresql!(
     pg18_tablestar_replays_as_postgresql_answered,
     "pg18-tablestar.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_types_replays_as_postgresql_answered,
@@ -12976,7 +12949,6 @@ replays_postgresql!(
     pg18_c33_intrange_replays_as_postgresql_answered,
     "pg18-c33-intrange.out",
     [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 00000 'table \"big\" does not exist, skipping'"),
         (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
         (5, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (6, "PGDIV-INT-RANGE value [engine]: SILENT: '9223372036854775808'::int8 clamps to 9223372036854775807 typed 23; PG 22003 out of range for type bigint"),
