@@ -1088,6 +1088,23 @@ def self_test():
                      ("a scsi_debug kind", dict(sd, kind="scsi_debug", creditable=False)), ("driver dm", dict(nv, driver="dm"))):
         chk("leaf refused: %s" % name, leaf_problems(lf, False) != [], lf)
     chk("leaf refused: a drive leaf on a brd cell", leaf_problems(sd, True) != [])
+    # the lead's gate item 6 amendment (a --dry-block run on a VM's virtio disk, 2026-10-15): F4:R_leaf_remote plants a
+    # remote sd host or NVMe transport, so on a virtio_blk leaf there is nothing to plant. It is not applicable there
+    # ONLY when the F3 leaf is virtio_blk AND the probe ruled the run virtualized (a virtualized leaf is never
+    # credited); every other "neither sd nor nvme" stays a failure, and an sd or NVMe leaf keeps the plant's rule
+    vio = {"leaf": {"driver": "virtio_blk", "kind": "drive"}, "virtualization": {"virtualized": True}}
+    neither = ("missing", "the leaf disk vdb is neither sd nor nvme\n", "", "", False)
+    chk("leaf remote: a virtio_blk leaf the probe ruled virtualized is not applicable (passes, saying why)",
+        leaf_remote_ok(*neither, vio)[0] and "not applicable" in leaf_remote_ok(*neither, vio)[1])
+    chk("leaf remote: a virtio_blk leaf NOT ruled virtualized fails",
+        not leaf_remote_ok(*neither, dict(vio, virtualization={"virtualized": None}))[0])
+    chk("leaf remote: another driver with no plant fails (brd, dm: neither sd nor nvme)",
+        not leaf_remote_ok(*neither, dict(vio, leaf={"driver": "brd"}))[0])
+    chk("leaf remote: a virtio_blk leaf whose plant somehow ran is judged by the plant's rule (rc 0: fails)",
+        not leaf_remote_ok(0, "", "faked=sd_host host0", "", False, vio)[0])
+    chk("leaf remote: an sd plant refused as wanted passes (the old rule)",
+        leaf_remote_ok(2, "the leaf sda is on SCSI host 'tcm_loopback'", "faked=sd_host host0",
+                       "proc_name=tcm_loopback", False, {"leaf": {"driver": "sd"}})[0])
     ev = ["leaf: drive model 'Virtual Disk' names 'Virtual'"]
     chk("virt: a VM with evidence and detect-virt microsoft passes",
         virt_problems({"virtualized": True, "evidence": ev}, "microsoft", "aarch64") == [])
