@@ -1885,6 +1885,35 @@ mod tests {
         }
     }
 
+    /// Found fixing Codex C25 HIGH 3: a numeric product's scale is the sum of its operands' DISPLAY
+    /// scales in PostgreSQL (numeric.c `mul_var`'s rscale = dscale1 + dscale2, each at least 0), but
+    /// bigdecimal's product of a zero is a plain 0 and a negative-scale operand subtracts from the
+    /// scale. Expected values are PostgreSQL 18.6's for this exact SQL over this table (artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-numeric-mul-scale.txt 69b25bea64), never ours.
+    #[test]
+    fn a_numeric_product_keeps_postgresqls_display_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("SELECT 0 * x FROM t", "0.00"),
+            ("SELECT '0' * x FROM t", "0.00"),
+            ("SELECT '1e5' * x FROM t", "100000.00"),
+            ("SELECT '0.000' * x FROM t", "0.00000"),
+            ("SELECT x * '0e-3' FROM t", "0.00000"),
+            ("SELECT '1e5' + x FROM t", "100001.00"),
+            ("SELECT '0e5' - x FROM t", "-1.00"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)) {
+                bad.push(format!("{sql} gave {got:?}, not {want}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a numeric result's display scale diverged from PostgreSQL 18: {bad:?}");
+    }
+
     /// Codex C25 HIGH 3 (artie frontier/fastest/reviews/REVIEW-codex-11-engine-2f480432a..0e8b1cf18.md):
     /// a numeric ZERO kept any exponent the parser gave it, and the range check passed every zero,
     /// so `'0e-2000000000' / x` asked `pg_numeric_div` for 10^1999999000 (and `'0e1000000' / x` for
