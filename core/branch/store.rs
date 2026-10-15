@@ -394,9 +394,11 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
-    /// The confirmation the writer last took to write (`Confirm::key`, 0 for none; raised by
-    /// `fetch_max`, as keys order as `supersedes` does): an offer it does not supersede is refused
-    /// (`offer_confirm`; DECISIONS ba515419c3). Atomic, so the write path takes no lock for it.
+    /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
+    /// order as `supersedes` does), only once its write returned (lead ruling f329b0d2a8: it was
+    /// raised as the word was taken, so a failed write counted as done). An offer that supersedes
+    /// neither it nor `GroupState::confirm_taken` is refused (`offer_confirm`; DECISIONS
+    /// ba515419c3). Atomic, so the write path takes no lock for it.
     confirm_done: AtomicU64,
     /// Observation only (review 6 #1): confirmation words written into the log's header, and those
     /// whose write failed; counted without the group's lock (engine review 8 #11).
@@ -562,6 +564,10 @@ struct GroupState {
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// The confirmation the writer or the close last took to write (`Confirm::key`, 0 for none):
+    /// an offer of it while its write runs is refused too, or it would be written twice
+    /// (DECISIONS ba515419c3). A taken word is written, or its failure fail-stops the store.
+    confirm_taken: u64,
     /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
     /// settling its capture, from the start of its wait for what the capture covers to the end of
     /// that step (`run_flight`).
@@ -810,7 +816,8 @@ impl Group {
         // of the same flight's word, as proved as it was (a held-free upgrade's landing with no
         // flight since; a proved ordered flight upgraded), was queued again once the slot was empty
         // and written a second time. Mutant `reoffer_written_word` (test builds only): queued.
-        if !confirm.supersedes_key(self.confirm_done.load(Ordering::Acquire)) && !fe_mutant("reoffer_written_word") {
+        let floor = self.confirm_done.load(Ordering::Acquire).max(g.confirm_taken);
+        if !confirm.supersedes_key(floor) && !fe_mutant("reoffer_written_word") {
             return Some(confirm);
         }
         // The writer sleeps without a deadline while it holds nothing it may write: woken when that
@@ -980,17 +987,21 @@ impl Group {
         self.cv.notify_all();
         let left = g.confirm.take().map(|(_, c)| c);
         if let Some(c) = left.as_ref() {
-            self.confirm_done.fetch_max(c.key(), Ordering::AcqRel);
+            g.confirm_taken = g.confirm_taken.max(c.key());
         }
         left
     }
 
-    /// Write `confirm`'s word, counted, holding no lock; a failure changes no flight's outcome
-    /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
+    /// Write `confirm`'s word, counted, holding no lock. Written, it is recorded done
+    /// (`confirm_done`). A failure FAIL-STOPS the store (lead ruling f329b0d2a8, reversing review
+    /// 6 #1's "a failure changes no flight's outcome"), the rule of a failed WAL sync: the word is
+    /// what lets recovery tell damage from a lost write, and nothing names the one that failed.
+    /// Mutants (test builds only): `confirm_done_at_take`, recorded done before the write, as
+    /// before; `confirm_error_goes_on`, a failure only counted, as review 6 #1 had it.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
-        // The writer and the close record it as they take it, under the group's lock; recorded here
-        // too, for any other caller, with no lock (DECISIONS ba515419c3).
-        self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        if fe_mutant("confirm_done_at_take") {
+            self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        }
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
         // Counted without the group's lock (engine review 8 #11).
         match written {
@@ -999,12 +1010,13 @@ impl Group {
                 if confirm.word_for_test() == self.confirm_last_landed.load(Ordering::Relaxed) {
                     self.confirm_last_landed_writes.fetch_add(1, Ordering::Relaxed);
                 }
+                self.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
                 self.confirms_written.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.confirm_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
-                if fe_mutant("confirm_error_fails_flight") {
+                tracing::error!("branch log: a flight's confirmation word was not written; the store fail-stops: {e}");
+                if !fe_mutant("confirm_error_goes_on") {
                     let mut g = self.lock();
                     self.fail(&mut g);
                 }
@@ -1155,7 +1167,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
-        group.confirm_done.fetch_max(confirm.key(), Ordering::AcqRel);
+        g.confirm_taken = g.confirm_taken.max(confirm.key());
         // The word names a flight whose sync has returned, and on unix every replacement of the
         // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
         // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one

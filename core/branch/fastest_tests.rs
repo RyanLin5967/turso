@@ -5575,28 +5575,10 @@ fn a_create_does_not_wait_for_a_confirmation_word_being_written() {
     assert_eq!(created, Ok(true), "a create waited for the confirmation writer's word (or failed)");
 }
 
-/// Review 6 #1: a confirmation word that cannot be written changes no flight's outcome. The flight
-/// is durable once its sync returned; its word only lets recovery tell damage from a lost write,
-/// so a failure to write it is counted and the store goes on.
-#[test]
-fn a_confirmation_that_cannot_be_written_fails_no_flight() {
-    let _s = serial();
-    let _q = ConfirmQuiet::set(1);
-    for catalog in [false, true] {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("confirmfail.db"), opts(catalog, SyncClass::FullFsync));
-        let trunk = db.connect().unwrap();
-        seed(&trunk);
-        let _first = trunk.fork_branch().unwrap().into_id();
-        db.branch_failpoint(Some(BranchFailpoint::ConfirmWriteFails));
-        let created = trunk.fork_branch().map(|b| b.into_id());
-        assert!(created.is_ok(), "catalog={catalog}: a durable create failed with its confirmation word: {:?}", created.err());
-        eventually(&format!("catalog={catalog}: the failed confirmation was not counted"), || {
-            db.branch_confirm_counts()[1] == 1
-        });
-        trunk.fork_branch().unwrap_or_else(|e| panic!("catalog={catalog}: the store stopped over a confirmation word: {e}"));
-    }
-}
+// FLAGGED TEST EDIT (lead ruling f329b0d2a8 reverses review 6 #1): the test
+// `a_confirmation_that_cannot_be_written_fails_no_flight`, which asserted that the store goes on
+// after a failed confirmation word, is REMOVED. Its injection (ConfirmWriteFails on the second
+// create, both arms, D2) now asserts the opposite, below.
 
 /// Lead ruling f329b0d2a8 (order 2, 2026-10-15T07:29:43Z; gates ultrareview row 1), reversing
 /// review 6 #1: a confirmation word that cannot be written FAIL-STOPS the store, the rule of a
