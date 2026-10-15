@@ -154,6 +154,19 @@ fn text_infinity_casts_to_infinity_and_nan_is_refused() {
     });
 }
 
+/// An INSERT naming more columns than its VALUES row gives, every value DEFAULT (insert.sql statement
+/// 7; found by find_killer): the translated VALUES had no row, and `values[0]` panicked at
+/// core/translate/select.rs:868, killing the session. PostgreSQL refuses it 42601 ("INSERT has more
+/// target columns than expressions").
+#[test]
+fn an_insert_whose_values_translate_to_no_row_is_42601() {
+    on_session(|s| {
+        ok(s, "create table inserttest (col1 int4, col2 int4 NOT NULL, col3 text default 'testing')");
+        refused(s, "insert into inserttest (col1, col2, col3) values (DEFAULT, DEFAULT)", "42601");
+        alive(s);
+    });
+}
+
 /// Diagnostic, not a budget: run a PostgreSQL regress script statement by statement (the
 /// fastest-wire find_killer.py split) and name the first statement whose reply panics the session.
 /// `CRASH_SCRIPT=insert cargo test -p turso_pg_server crash_batch_tests::find_killer -- --ignored
