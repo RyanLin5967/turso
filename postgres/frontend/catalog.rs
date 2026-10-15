@@ -203,6 +203,27 @@ impl Dialect for PostgresDialect {
     /// surrounding blanks, as the infinities, where SQLite's rules read 0 (the crash batch,
     /// 2026-10-15). The engine has no NaN value, so 'NaN' is refused 0A000, as the translator's
     /// literal path refuses it.
+    /// PostgreSQL refuses an infinite generate_series bound (22023, "stop value cannot be
+    /// infinity"; recording pg18-gsinf), where SQLite clamps it to i64::MAX: an infinite stop then
+    /// generated ~10^18 rows and wedged the session thread (the crash batch, 2026-10-15). The
+    /// arguments are the present ones of start, stop and step, in that order (`idx_num` bits 1, 2, 4).
+    fn check_table_function_args(&self, name: &str, idx_num: i64, args: &[Value]) -> Result<()> {
+        if !name.eq_ignore_ascii_case("generate_series") {
+            return Ok(());
+        }
+        let present = [(1, "start value"), (2, "stop value"), (4, "step size")]
+            .into_iter()
+            .filter(|(bit, _)| idx_num & bit != 0)
+            .map(|(_, what)| what);
+        for (what, v) in present.zip(args) {
+            // An integer is finite; only a float can be an infinity (the engine has no NaN).
+            if !v.to_float_or_zero().is_finite() {
+                return Err(LimboError::ExtensionError(format!("{what} cannot be infinity")));
+            }
+        }
+        Ok(())
+    }
+
     fn cast_text_to_float(&self, text: &str) -> Option<Result<f64>> {
         match text.trim().to_ascii_lowercase().as_str() {
             "infinity" | "+infinity" | "inf" | "+inf" => Some(Ok(f64::INFINITY)),

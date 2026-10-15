@@ -3,7 +3,6 @@ use crate::sync::Arc;
 use turso_ext::{
     Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtensionApi, IndexInfo,
     OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
-    ValueType,
 };
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
@@ -171,16 +170,9 @@ impl VTabCursor for GenerateSeriesCursor {
         // SQLite default for stop when it is omitted
         const DEFAULT_STOP_OMITTED: Option<i64> = Some(u32::MAX as i64);
 
-        // A non-finite float bound (an infinity: the engine has no NaN) saturated to i64::MAX or
-        // MIN, so an infinite stop generated ~10^18 rows and an infinite step one. Refused before
-        // any row, as PostgreSQL refuses it (22023; the crash batch, 2026-10-15). SQLite clamps
-        // instead; no series that bound gives is one a caller can read to its end.
-        if args
-            .iter()
-            .any(|v| v.value_type() == ValueType::Float && v.to_float().is_some_and(|f| !f.is_finite()))
-        {
-            return ResultCode::OutOfRange;
-        }
+        // An infinite float bound clamps to i64::MAX or MIN, as SQLite's does; the PostgreSQL
+        // dialect refuses it before this filter runs (`Dialect::check_table_function_args`; the
+        // crash batch, 2026-10-15).
         if let Some((_, idx_num)) = idx_info {
             let mut arg_idx = 0;
             // For the semantics of `idx_num`, see the comment in the `best_index` method.
@@ -329,19 +321,19 @@ mod tests {
         }
     }
     // Helper function to collect all values from a cursor, returns Result with error code
-    /// The crash batch (lead, 2026-10-15): an infinite bound saturated to i64::MAX/MIN, so an
-    /// infinite stop generated ~10^18 rows (a session thread spun) and an infinite step one row.
-    /// PostgreSQL refuses each with 22023; here the filter refuses (OutOfRange) every non-finite
-    /// float bound, start, stop or step, before any row.
+    /// An infinite bound clamps, as SQLite's generate_series does (sqlite3_value_int64 of an
+    /// infinity): the filter accepts it. The refusal PostgreSQL makes (22023) is the PostgreSQL
+    /// dialect's, before the filter (lead, 2026-10-15). FLAGGED TEST CHANGE by that ruling: this test
+    /// asserted the filter's refusal (OutOfRange) at 180ed6097.
     #[test]
-    fn an_infinite_bound_is_refused_before_any_row() {
+    fn an_infinite_bound_clamps_as_sqlite_does() {
         let tbl = GenerateSeriesTable {};
-        for (at, bad) in [(0usize, f64::NEG_INFINITY), (1, f64::INFINITY), (2, f64::INFINITY), (1, f64::NEG_INFINITY)] {
+        for (at, bad) in [(0usize, f64::NEG_INFINITY), (1, f64::INFINITY), (2, f64::INFINITY)] {
             let mut args = vec![Value::from_integer(0), Value::from_integer(100), Value::from_integer(10)];
             args[at] = Value::from_float(bad);
             let mut cursor = tbl.open(None).unwrap();
             let rc = cursor.filter(&args, Some(("idx", 1 | 2 | 4)));
-            assert_eq!(rc, ResultCode::OutOfRange, "argument {at} = {bad}: {rc:?}");
+            assert!(matches!(rc, ResultCode::OK | ResultCode::EOF), "argument {at} = {bad}: {rc:?}");
         }
         // A finite float bound still truncates as before.
         let mut cursor = tbl.open(None).unwrap();

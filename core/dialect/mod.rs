@@ -175,6 +175,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn cast_text_to_float(&self, _text: &str) -> Option<crate::Result<f64>> {
         None
     }
+
+    /// Check a table-valued function's arguments before its filter runs: `name` the function,
+    /// `idx_num` its plan's argument mask, `args` the values in the order the filter gets them.
+    /// The default checks nothing (SQLite's rules); PostgreSQL's refuses an infinite
+    /// generate_series bound, which SQLite clamps (the crash batch, 2026-10-15).
+    fn check_table_function_args(&self, _name: &str, _idx_num: i64, _args: &[crate::Value]) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
