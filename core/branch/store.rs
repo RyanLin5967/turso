@@ -246,7 +246,7 @@ pub(crate) struct BranchStore {
     /// if it could not be started (the close then writes the last word).
     confirm_writer: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
-    name_filter_build: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    name_filter_build: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
     name_filter_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Test and harness hook (F-FZ): while it holds `HOLD_BEFORE_COMMIT` or `HOLD_AFTER_COMMIT`, a
     /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
@@ -2559,35 +2559,59 @@ impl FilterTable {
 /// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
 /// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
 /// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
-/// the build ran (`pending`); until then, lookups query the catalog as before. Empty and built at
-/// once for a store with no catalog yet.
+/// the build ran; until then, lookups query the catalog as before. Empty and built at once for a
+/// store with no catalog yet.
 ///
 /// A create allocates NOTHING here, by construction (lead ruling 2026-10-15; before, a B-tree bulk-
 /// built with full leaves split a node in 37-39 of 40 creates, raws l35-diag-alloc): the tables are
 /// fixed-size (`FilterTable`), a note fills a slot, and a table past half full owes a growth, which
-/// `BranchStore::grow_name_filter` makes off the mutex into a table twice the size and swaps in.
-/// While it copies, notes go to a pending table as well, consulted beside the new one until it too
-/// is copied. A table that fills before its growth lands stops the filter answering (`overflowed`):
-/// lookups ask the catalog again, correct and slower.
+/// `BranchStore::grow_name_filter` makes off the mutex into a table twice the size.
+///
+/// ONE state (`FilterState`, review REVIEW-claude-namefilter H1, DECISIONS: the class of a half-
+/// updated filter): the tables, and what a note and a lookup do with them, are a single value,
+/// replaced only by one assignment inside one store-mutex hold, and the filter answers "absent" ONLY
+/// in `Ready`. Before, `built`, `pending`, `draining` and `overflowed` were four fields set in
+/// separate holds, and between two of them a lookup read "absent" for a name only a draining table
+/// held. A growth or a build that comes back to a state other than the one it left (an overflow
+/// meanwhile) changes nothing (`Arc::ptr_eq`).
 #[derive(Default)]
 struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
-    built: Option<Arc<FilterTable>>,
-    /// The names noted while a build scans or a growth copies, inserted beside `built`.
-    pending: Option<Arc<FilterTable>>,
-    /// A growth's pending table after its swap: consulted, no longer inserted into, until the
-    /// growth has copied it.
-    draining: Option<Arc<FilterTable>>,
-    /// A table refused a key: the filter answers nothing until rebuilt.
-    overflowed: bool,
-    /// `built` is past half full and no growth runs: the next create's caller starts one.
-    grow_owed: bool,
-    growing: bool,
+    state: FilterState,
+    /// Work the next create's caller starts once it has dropped the mutex: a growth (owed in
+    /// `Ready` past half full) or a rebuild (owed once, on entering `Overflowed`).
+    owed: Option<FilterWork>,
     /// Observation (review 3 #7): the most entries one growth copied, builds and growths
-    /// installed, and catalog scans that failed.
+    /// installed, catalog scans that failed, and rebuilds started after an overflow.
     moved_max: u64,
     builds: u64,
     failed_scans: u64,
+    rebuilds: u64,
+}
+
+/// The name filter's one state (`NameFilter`).
+#[derive(Default)]
+enum FilterState {
+    /// No table: lookups ask the catalog (not built yet, or a failed scan).
+    #[default]
+    Unbuilt,
+    /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`.
+    Building { pending: Arc<FilterTable> },
+    /// The filter answers from `table`.
+    Ready { table: Arc<FilterTable> },
+    /// A growth copies `table` into a larger one off the mutex; notes go into both.
+    Growing { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A new `table` is installed and `pending` (a build's or a growth's) is being copied into it;
+    /// notes go into `table`.
+    Draining { table: Arc<FilterTable>, pending: Arc<FilterTable> },
+    /// A table refused a key: lookups ask the catalog until the owed rebuild lands.
+    Overflowed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterWork {
+    Grow,
+    Rebuild,
 }
 
 impl NameFilter {
@@ -2606,63 +2630,79 @@ impl NameFilter {
     }
 
     fn note_inner(&mut self, name: &str) {
-        if self.built.is_none() && self.pending.is_none() {
-            return;
-        }
         let h = self.hash(name);
         // Mutant `name_filter_grows_in_note` (test builds only): a table past half full is grown
         // here, under the store mutex, as a resizing set would.
         if fe_mutant("name_filter_grows_in_note") {
-            if let Some(built) = self.built.as_ref().filter(|b| b.wants_room()) {
-                let grown = FilterTable::for_keys(built.len() * 2);
-                built.copy_into(&grown);
-                self.built = Some(Arc::new(grown));
+            if let FilterState::Ready { table } = &self.state {
+                if table.wants_room() {
+                    let grown = FilterTable::for_keys(table.len() * 2);
+                    table.copy_into(&grown);
+                    self.state = FilterState::Ready { table: Arc::new(grown) };
+                }
             }
         }
-        for table in [self.built.as_ref(), self.pending.as_ref()].into_iter().flatten() {
-            if !table.insert(h) {
-                self.overflowed = true;
+        let fits = match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => true,
+            FilterState::Building { pending } => pending.insert(h),
+            FilterState::Ready { table } => {
+                let fits = table.insert(h);
+                if fits && table.wants_room() && self.owed.is_none() {
+                    self.owed = Some(FilterWork::Grow);
+                }
+                fits
             }
-        }
-        // Not while a build or growth still has a pending table in use (its own or draining).
-        if !self.growing
-            && self.pending.is_none()
-            && self.draining.is_none()
-            && self.built.as_ref().is_some_and(|b| b.wants_room())
-        {
-            self.grow_owed = true;
-        }
-    }
-
-    /// Whether a growth is owed (and now taken by the caller, which starts it off the mutex).
-    fn take_grow_owed(&mut self) -> bool {
-        let owed = std::mem::take(&mut self.grow_owed);
-        if owed {
-            self.growing = true;
-        }
-        owed
-    }
-
-    /// No branch ever held `name` (`false` while the filter is not built: ask the catalog).
-    fn says_absent(&self, name: &str) -> bool {
-        // fastest-engine mutant `filter_says_absent` (test builds only).
-        if fe_mutant("filter_says_absent") {
-            return self.built.is_some();
-        }
-        let Some(built) = self.built.as_ref() else {
-            return false;
+            // Both, whatever the first answers.
+            FilterState::Growing { table, pending } => table.insert(h) & pending.insert(h),
+            FilterState::Draining { table, .. } => table.insert(h),
         };
-        if self.overflowed {
-            return false;
+        if !fits {
+            self.overflow();
         }
-        let h = self.hash(name);
-        !built.contains(h)
-            && !self.pending.as_ref().is_some_and(|p| p.contains(h))
-            && !self.draining.as_ref().is_some_and(|d| d.contains(h))
+    }
+
+    /// A table refused a key: stop answering, and owe one rebuild (never a growth per create).
+    fn overflow(&mut self) {
+        self.state = FilterState::Overflowed;
+        self.owed = Some(FilterWork::Rebuild);
+    }
+
+    /// The work owed, taken by the caller, which starts it once it has dropped the mutex.
+    fn take_owed(&mut self) -> Option<FilterWork> {
+        self.owed.take()
+    }
+
+    /// No branch ever held `name`: answered only in `Ready`; every other state asks the catalog.
+    fn says_absent(&self, name: &str) -> bool {
+        // fastest-engine mutant `filter_says_absent` (test builds only): "absent" whenever a table
+        // exists.
+        if fe_mutant("filter_says_absent") {
+            return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed);
+        }
+        match &self.state {
+            FilterState::Ready { table } => !table.contains(self.hash(name)),
+            FilterState::Unbuilt
+            | FilterState::Building { .. }
+            | FilterState::Growing { .. }
+            | FilterState::Draining { .. }
+            | FilterState::Overflowed => false,
+        }
+    }
+
+    /// The table a lookup will answer from once the filter is `Ready`, and the pending one in use.
+    fn tables(&self) -> (Option<&Arc<FilterTable>>, Option<&Arc<FilterTable>>) {
+        match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed => (None, None),
+            FilterState::Building { pending } => (None, Some(pending)),
+            FilterState::Ready { table } => (Some(table), None),
+            FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
+                (Some(table), Some(pending))
+            }
+        }
     }
 
     fn entries(&self) -> u64 {
-        self.built.as_ref().map_or(0, |b| b.len() as u64)
+        self.tables().0.map_or(0, |t| t.len() as u64)
     }
 }
 
@@ -6523,11 +6563,9 @@ impl BranchStore {
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         held_trace("fork.done");
-        let grow = inner.names.filter.take_grow_owed();
+        let work = inner.names.filter.take_owed();
         drop(inner);
-        if grow {
-            self.grow_name_filter();
-        }
+        self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
 
@@ -6607,11 +6645,9 @@ impl BranchStore {
         inner.note_fork_lsn(id, lsn);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        let grow = inner.names.filter.take_grow_owed();
+        let work = inner.names.filter.take_owed();
         drop(inner);
-        if grow {
-            self.grow_name_filter();
-        }
+        self.start_filter_work(work);
         Ok((id, lsn))
     }
 
@@ -8176,7 +8212,7 @@ impl BranchStore {
         let inner = self.inner.lock();
         let f = &inner.names.filter;
         (
-            f.built.is_some() && !f.overflowed,
+            f.tables().0.is_some(),
             f.entries(),
             f.moved_max,
             f.builds,
@@ -8285,15 +8321,16 @@ impl BranchStore {
             ("names.fresh", inner.names.fresh.len(), 0),
             ("names.gone", inner.names.gone.len(), 0),
         ];
-        // The name filter's tables are listed at 0 bytes, as its B-trees were: no create grows them.
-        // They are fixed-size and grown by `grow_name_filter` on its own thread, off the mutex (a
-        // create's own allocations in the filter: `FILTER_NOTE_ALLOCS`, zero by construction), so a
-        // capacity rise seen between two creates is that thread's, not a create's.
-        if let Some(built) = inner.names.filter.built.as_ref() {
-            out.push(("names.filter.built", built.cap(), 0));
+        // The name filter's tables at their real bytes (8 per slot; lead condition, review MED-2: the
+        // 0-byte listing of 4cb167221 blinded the regrowth test). They are grown by
+        // `grow_name_filter` on its own thread, off the mutex, which the regrowth test attributes
+        // by the create's own held allocations.
+        let (table, pending) = inner.names.filter.tables();
+        if let Some(t) = table {
+            out.push(("names.filter.table", t.cap(), t.cap() * 8));
         }
-        if let Some(pending) = inner.names.filter.pending.as_ref() {
-            out.push(("names.filter.pending", pending.cap(), 0));
+        if let Some(p) = pending {
+            out.push(("names.filter.pending", p.cap(), p.cap() * 8));
         }
         if let Some(cat) = inner.cat.as_ref() {
             // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).
@@ -8365,24 +8402,54 @@ impl BranchStore {
     }
 
     pub(crate) fn wait_name_filter(&self) {
-        if let Some(build) = self.name_filter_build.lock().take() {
-            let _ = build.join();
+        // Review REVIEW-claude-namefilter M2: a fork(2) child inherits the handle of a thread it
+        // does not have; it is joined only by the process that spawned it.
+        if let Some((pid, build)) = self.name_filter_build.lock().take() {
+            if pid == std::process::id() {
+                let _ = build.join();
+            }
         }
     }
 
-    /// Build a catalog store's name filter (`NameFilter`) after open, off the store mutex: the
-    /// names in the catalog, read on a connection of its own, plus every name applied while the
-    /// read ran — those held now (the resident and since-checkpoint names, seeded here under the
-    /// mutex) and those created from now on (`NameFilter::note`). A failed read leaves the filter
-    /// unbuilt: lookups keep asking the catalog.
+    /// Start the work the filter owes (`NameFilter::take_owed`), with the store mutex let go.
+    fn start_filter_work(&self, work: Option<FilterWork>) {
+        match work {
+            Some(FilterWork::Grow) => self.grow_name_filter(),
+            Some(FilterWork::Rebuild) => {
+                self.inner.lock().names.filter.rebuilds += 1;
+                self.start_name_filter();
+            }
+            None => {}
+        }
+    }
+
+    fn keep_filter_thread(&self, handle: crate::thread::JoinHandle<()>) {
+        *self.name_filter_build.lock() = Some((std::process::id(), handle));
+    }
+
+    /// Build a catalog store's name filter (`NameFilter`) off the store mutex, after open or as an
+    /// overflow's rebuild: the names in the catalog, read on a connection of its own, plus every
+    /// name applied while the read ran (the resident and since-checkpoint names, seeded under the
+    /// mutex, and those noted from then on into the `Building` state's pending table). A failed read
+    /// leaves the filter `Unbuilt`: lookups keep asking the catalog.
     fn start_name_filter(&self) {
+        // The pending table is allocated with the mutex let go: room for the names held now and as
+        // many again created while the scan runs.
+        let held = {
+            let inner = self.inner.lock();
+            if inner.cat.is_none() || !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+                return;
+            }
+            inner.names.map.len() + inner.names.fresh.len()
+        };
+        let pending = Arc::new(FilterTable::for_keys(held.saturating_mul(2).max(8192)));
         let reader = {
             let mut inner = self.inner.lock();
             let StoreInner { cat, names, sync, .. } = &mut *inner;
             let Some(cat) = cat.as_ref() else {
                 return;
             };
-            if names.filter.built.is_some() {
+            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
                 return;
             }
             let reader = match cat.catalog.writer(*sync) {
@@ -8392,15 +8459,15 @@ impl BranchStore {
                     return;
                 }
             };
-            // At open, not in a create: the pending table's one allocation is made here, with room
-            // for the names held now and as many again created while the scan runs (a table that
-            // fills stops the filter answering, `NameFilter::overflowed`).
-            let held = names.map.len() + names.fresh.len();
-            let pending = FilterTable::for_keys(held.saturating_mul(2).max(8192));
+            let mut fits = true;
             for name in names.map.keys().chain(names.fresh.keys()) {
-                pending.insert(names.filter.hash(name));
+                fits &= pending.insert(names.filter.hash(name));
             }
-            names.filter.pending = Some(Arc::new(pending));
+            if !fits {
+                tracing::warn!("branch name filter not built: its pending table filled at the seed");
+                return;
+            }
+            names.filter.state = FilterState::Building { pending: pending.clone() };
             reader
         };
         let hasher = self.inner.lock().names.filter.hasher.clone();
@@ -8410,6 +8477,7 @@ impl BranchStore {
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
+        let mine = pending.clone();
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
@@ -8421,139 +8489,165 @@ impl BranchStore {
                 } else {
                     reader.name_hashes(|name| hasher.hash_one(name), &stop)
                 };
-                // The set of the scanned names is built here, off the store mutex: its one table of
-                // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
-                // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
-                // byte). Under the mutex only the names applied while the scan ran join it, and it
-                // is installed. Mutant `name_filter_built_under_mutex` (test builds only): the
-                // scanned names are inserted under the mutex, as before.
+                // The table of the scanned names is built here, off the store mutex: its N inserts
+                // were the O(N) background hold (LEAP L4's build guard: 147,464 B held at 10^4
+                // branches, 1,179,656 B at 10^5). Sized for the scanned names AND the pending ones,
+                // half as many again (24-48 bytes per name: `for_keys` is a power of two of at least
+                // 2n slots). Mutant `name_filter_built_under_mutex` (test builds only): the scanned
+                // names are inserted under the mutex, as before.
                 let under = fe_mutant("name_filter_built_under_mutex");
-                // Sized for the scanned names AND the pending ones (names held but not yet in the
-                // catalog, and those noted since; it is copied in after the install), half as many
-                // again: a growth is owed only after the store has grown by a third or more; 16-32
-                // bytes per name (`for_keys`: a power of two of at least 2n slots).
-                let pending_len = shared.lock().names.filter.pending.as_ref().map_or(0, |p| p.len());
                 let scanned = scanned.map(|hashes| {
-                    let n = hashes.len().saturating_add(pending_len);
+                    let n = hashes.len().saturating_add(pending.len());
                     let table = FilterTable::for_keys(n.saturating_add(n / 2));
                     if under {
                         (table, hashes)
                     } else {
-                        for h in &hashes {
-                            table.insert(*h);
-                        }
-                        (table, Vec::new())
+                        let fits = hashes.iter().all(|h| table.insert(*h));
+                        (table, if fits { Vec::new() } else { hashes })
                     }
                 });
-                // The pending table is consulted beside the new one from its install on, and copied
-                // into it after, off the mutex: under the mutex only two pointers move.
-                let pending = {
+                let table = {
                     let mut inner = shared.lock();
-                    let filter = &mut inner.names.filter;
-                    let pending = filter.pending.take();
+                    let f = &mut inner.names.filter;
+                    if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
+                        return;
+                    }
                     match scanned {
-                        Ok((built, unbuilt)) => {
-                            for h in unbuilt {
-                                built.insert(h);
+                        Ok((table, unbuilt)) => {
+                            if !unbuilt.iter().all(|h| table.insert(*h)) {
+                                f.overflow();
+                                return;
                             }
-                            filter.built = Some(Arc::new(built));
-                            filter.draining = pending.clone();
-                            filter.builds += 1;
-                            pending
+                            let table = Arc::new(table);
+                            f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
+                            f.builds += 1;
+                            table
                         }
                         Err(e) => {
-                            filter.failed_scans += 1;
+                            f.failed_scans += 1;
+                            f.state = FilterState::Unbuilt;
                             tracing::debug!("branch name filter not built: {e}");
-                            None
+                            return;
                         }
                     }
                 };
-                if let Some(pending) = pending {
-                    let built = shared.lock().names.filter.built.clone();
-                    let copied = built.as_ref().is_some_and(|b| pending.copy_into(b));
-                    let mut inner = shared.lock();
-                    let filter = &mut inner.names.filter;
+                let copied = pending.copy_into(&table);
+                let mut inner = shared.lock();
+                let f = &mut inner.names.filter;
+                if matches!(&f.state, FilterState::Draining { table: t, pending: p } if Arc::ptr_eq(t, &table) && Arc::ptr_eq(p, &pending)) {
                     if copied {
-                        filter.draining = None;
+                        f.state = FilterState::Ready { table: table.clone() };
                     } else {
-                        filter.overflowed = true;
+                        f.overflow();
                     }
                 }
             });
         match spawned {
-            Ok(handle) => *self.name_filter_build.lock() = Some(handle),
+            Ok(handle) => self.keep_filter_thread(handle),
             Err(e) => {
                 tracing::warn!("branch name filter thread not started: {e}");
-                self.inner.lock().names.filter.pending = None;
+                let mut inner = self.inner.lock();
+                let f = &mut inner.names.filter;
+                if matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &mine)) {
+                    f.state = FilterState::Unbuilt;
+                }
             }
         }
     }
 
-    /// Grow the name filter off the store mutex (`NameFilter`, lead ruling 2026-10-15), started by the
-    /// create whose note left its table past half full, once that create has let the mutex go. On a
-    /// thread of its own: a table twice the size and a pending table are allocated here; the pending
-    /// one is installed (notes go to both from then on), the old table and then the pending one are
-    /// copied into the new, the new is swapped in with the pending one still consulted, the pending
-    /// one is copied again (what was noted between the copy and the swap) and dropped. Under the
-    /// mutex: three pointer moves. The tables are freed here, after the last unlock.
+    /// Grow the name filter off the store mutex (`NameFilter`, lead ruling 2026-10-15), owed by the
+    /// create whose note left its `Ready` table past half full and started once that create has let
+    /// the mutex go. On a thread of its own: a table twice the size and a pending table are
+    /// allocated here; `Ready` becomes `Growing` (notes go to both); the old table and then the
+    /// pending one are copied into the new; `Growing` becomes `Draining` with the new table; the
+    /// pending one is copied again (what was noted between the copy and the swap); `Draining`
+    /// becomes `Ready`. Each change is one assignment in one hold, made only if the state is still
+    /// the one this growth left (an overflow meanwhile ends it); a copy that fails overflows the
+    /// filter in the same hold that would have installed it (review H1). The tables are freed here,
+    /// after the last unlock. Hooks (test builds): `filter_pause` stages 1-5, `filter_drain_fails`.
+    /// Mutant `name_filter_swap_skips_pending` (test builds only): `Growing` becomes `Ready` with the
+    /// new table and no pending copy, the planted race the concurrency oracle must catch.
     fn grow_name_filter(&self) {
         let shared = self.inner.clone();
         let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
-            let done = |shared: &StoreMutex, overflowed: bool| {
-                let mut inner = shared.lock();
-                let f = &mut inner.names.filter;
-                f.growing = false;
-                f.overflowed |= overflowed;
-            };
-            let Some(old) = shared.lock().names.filter.built.clone() else {
-                return done(&shared, false);
+            let old = match &shared.lock().names.filter.state {
+                FilterState::Ready { table } => table.clone(),
+                _ => return,
             };
             let grown = FilterTable::for_keys(old.cap());
             let pending = Arc::new(FilterTable::for_keys(old.cap() / 2));
             {
                 let mut inner = shared.lock();
                 let f = &mut inner.names.filter;
-                if f.pending.is_some() || f.draining.is_some() || f.overflowed {
-                    f.growing = false;
+                if !matches!(&f.state, FilterState::Ready { table } if Arc::ptr_eq(table, &old)) {
                     return;
                 }
-                f.pending = Some(pending.clone());
+                f.state = FilterState::Growing { table: old.clone(), pending: pending.clone() };
             }
-            let copied = old.copy_into(&grown) && pending.copy_into(&grown);
+            filter_pause(1);
+            let mut copied = old.copy_into(&grown);
+            filter_pause(2);
+            let skip = fe_mutant("name_filter_swap_skips_pending");
+            if !skip {
+                copied = copied && pending.copy_into(&grown);
+            }
             let grown = Arc::new(grown);
             filter_pause(3);
             {
                 let mut inner = shared.lock();
                 let f = &mut inner.names.filter;
-                f.pending = None;
-                if !copied {
-                    f.overflowed = true;
-                    f.growing = false;
+                if !matches!(&f.state, FilterState::Growing { table, pending: p } if Arc::ptr_eq(table, &old) && Arc::ptr_eq(p, &pending)) {
                     return;
                 }
-                f.built = Some(grown.clone());
-                f.draining = Some(pending.clone());
+                if !copied {
+                    f.overflow();
+                    return;
+                }
+                f.state = if skip {
+                    FilterState::Ready { table: grown.clone() }
+                } else {
+                    FilterState::Draining { table: grown.clone(), pending: pending.clone() }
+                };
                 f.builds += 1;
                 f.moved_max = f.moved_max.max(old.len() as u64);
+                if skip {
+                    return;
+                }
             }
+            filter_pause(4);
             // The failpoint stops the copy before it starts, as a copy refused at the name does.
             let copied = !filter_drain_fails() && pending.copy_into(&grown);
-            {
-                let mut inner = shared.lock();
-                inner.names.filter.draining = None;
-            }
             filter_pause(5);
-            done(&shared, !copied);
+            let mut inner = shared.lock();
+            let f = &mut inner.names.filter;
+            if matches!(&f.state, FilterState::Draining { table, pending: p } if Arc::ptr_eq(table, &grown) && Arc::ptr_eq(p, &pending)) {
+                if copied {
+                    f.state = FilterState::Ready { table: grown.clone() };
+                } else {
+                    f.overflow();
+                }
+            }
         });
         match spawned {
-            // Joined by `wait_name_filter` (and so at the store's drop), as the build is. A finished
-            // build's handle it replaces is only detached.
-            Ok(handle) => *self.name_filter_build.lock() = Some(handle),
-            Err(e) => {
-                tracing::warn!("branch name filter growth not started: {e}");
-                self.inner.lock().names.filter.growing = false;
-            }
+            Ok(handle) => self.keep_filter_thread(handle),
+            Err(e) => tracing::warn!("branch name filter growth not started: {e}"),
         }
+    }
+
+    /// Test builds: the name filter's state's name, and the rebuilds started after an overflow.
+    #[cfg(test)]
+    pub(crate) fn name_filter_state_for_test(&self) -> (&'static str, u64) {
+        let inner = self.inner.lock();
+        let f = &inner.names.filter;
+        let name = match f.state {
+            FilterState::Unbuilt => "Unbuilt",
+            FilterState::Building { .. } => "Building",
+            FilterState::Ready { .. } => "Ready",
+            FilterState::Growing { .. } => "Growing",
+            FilterState::Draining { .. } => "Draining",
+            FilterState::Overflowed => "Overflowed",
+        };
+        (name, f.rebuilds)
     }
 
     /// Test builds: the name filter's own answer for `name` ("absent, ask no catalog"), the step
@@ -9945,14 +10039,14 @@ impl StoreInner {
                     }
                     self.cat = Some(CatState::new(catalog, self.sync, 0)?);
                     // A new catalog holds no name: the filter is built, empty, at once.
-                    if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
+                    if matches!(self.names.filter.state, FilterState::Unbuilt) {
                         // The catalog's creation (the first create of a catalog store) makes the
                         // table, once; every later create only fills it.
-                        let built = FilterTable::for_keys(self.names.map.len());
+                        let table = FilterTable::for_keys(self.names.map.len());
                         for name in self.names.map.keys() {
-                            built.insert(self.names.filter.hash(name));
+                            table.insert(self.names.filter.hash(name));
                         }
-                        self.names.filter.built = Some(Arc::new(built));
+                        self.names.filter.state = FilterState::Ready { table: Arc::new(table) };
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;

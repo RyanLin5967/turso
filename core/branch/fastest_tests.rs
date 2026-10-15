@@ -8656,11 +8656,18 @@ fn no_name_table_regrows_past_64_kib_inside_a_named_create() {
         let mut last = db.branches.per_branch_tables_for_test();
         let mut worst: std::collections::BTreeMap<&str, usize> = Default::default();
         for n in 0..34_000u32 {
+            // FLAGGED TEST EDIT, lead-ordered (the name-filter acceptance condition, DECISIONS
+            // 2026-10-15): a table's growth counts against this create only if it happened under the
+            // store mutex on this create's thread, which its held allocations measure: a growth of
+            // `bytes` needs at least `bytes` allocated in the create's holds. A table grown on
+            // another thread (the name filter's, off the mutex) is not this create's.
+            let held0 = super::budget_probe::thread_allocs().3;
             let _ = trunk.create_branch(&format!("g{n}")).unwrap();
+            let held = super::budget_probe::thread_allocs().3 - held0;
             let now = db.branches.per_branch_tables_for_test();
             for (name, cap, bytes) in &now {
                 let grew = last.iter().find(|(m, ..)| m == name).is_none_or(|(_, c, _)| cap > c);
-                if grew && *bytes > 0 {
+                if grew && *bytes > 0 && held >= *bytes as u64 {
                     let e = worst.entry(name).or_default();
                     *e = (*e).max(*bytes);
                 }
@@ -8755,6 +8762,92 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     FILTER_PAUSE_AT.store(0, Release);
     db.branch_wait_name_filter();
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
+}
+
+/// The name filter's concurrency oracle (lead condition on the filter, and review REVIEW-claude-namefilter
+/// M3): since `says_absent` lets a create skip the catalog, a name the filter loses is a DUPLICATE
+/// name. Four threads create named branches while a growth is held at each of its stages (1-5,
+/// `FILTER_PAUSE_AT`), and once with the drain copy failing (`FILTER_DRAIN_FAILS`: the filter
+/// overflows, and its owed rebuild must restore it). Once everything has settled, every name any
+/// thread created is asked of the FILTER itself (`name_filter_says_absent_for_test`), so the resident
+/// names (`names.map`, which `name_lookup` consults first) cannot answer for it: none may be
+/// "absent". Mutant `name_filter_swap_skips_pending` (the planted race: the swap installs the new
+/// table without copying the pending one) must turn it red.
+#[test]
+fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
+    use super::store::{FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let mut lost = Vec::new();
+    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("filter-oracle.db"), opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("first").unwrap();
+        FILTER_PAUSED.store(0, Release);
+        FILTER_DRAIN_FAILS.store(drain_fails, Release);
+        FILTER_PAUSE_AT.store(stage, Release);
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|k| {
+                let (db, stop) = (db.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let conn = db.connect().unwrap();
+                    let mut made = Vec::new();
+                    let mut i = 0u32;
+                    while !stop.load(Acquire) && i < 4000 {
+                        let name = format!("s{stage}-t{k}-{i}");
+                        conn.create_branch(&name).unwrap();
+                        made.push(name);
+                        i += 1;
+                    }
+                    made
+                })
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        while FILTER_PAUSED.load(Acquire) != stage {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no growth reached the stage");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        FILTER_PAUSE_AT.store(0, Release);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.store(true, Release);
+        let made: Vec<String> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+        FILTER_DRAIN_FAILS.store(false, Release);
+        // One more create starts whatever the filter owes (a rebuild after the overflow), then all
+        // filter work is waited out.
+        trunk.create_branch(&format!("s{stage}-last")).unwrap();
+        db.branch_wait_name_filter();
+        let (state, rebuilds) = db.branches.name_filter_state_for_test();
+        assert_eq!(state, "Ready", "premise: stage {stage} (drain fails: {drain_fails}): the filter did not settle Ready");
+        if drain_fails {
+            assert!(rebuilds >= 1, "premise: the failed drain did not overflow the filter into a rebuild");
+        }
+        for name in made.iter().chain(std::iter::once(&"first".to_string())) {
+            if db.branches.name_filter_says_absent_for_test(name) {
+                lost.push(format!("stage {stage} (drain fails: {drain_fails}): {name}"));
+            }
+        }
+        assert!(made.len() > 512, "premise: stage {stage}: too few creates to grow the filter ({})", made.len());
+    }
+    assert!(
+        lost.is_empty(),
+        "CLAIM: the name filter answered absent for {} names it was given (a create would make a duplicate): {:?}",
+        lost.len(),
+        &lost[..lost.len().min(8)]
+    );
 }
 
 /// Lead ruling (DECISIONS 2026-10-15, after the attribution: the n1e4 create's extra allocation is
