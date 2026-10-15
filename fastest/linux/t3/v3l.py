@@ -888,26 +888,48 @@ def _measure_with(patches, env=None, leaf=None):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def _runs_box(lab1, lab2, calls):
+def _runs_box(lab1, lab2, calls, bad_second=None):
     """_fake_box plus the runs (annex A27's labelling pair): a fake subprocess whose run() records each command in
-    CALLS and writes what the command would (the trace, fio's JSON, the data file), a flush counter that rises LAB1
-    across the first labelling run and LAB2 across the second (then N + 3 per timed run, 0 on the control), and a
-    passing sync record. Nothing real runs."""
+    CALLS and writes what the command would: a VALID trace (N writes to the data file, and N fsyncs of it on the fsync
+    arm), fio's JSON (N writes; N - 1 syncs on the fsync arm) and the data file. BAD_SECOND ("empty" or "uring") spoils
+    only the A27 second labelling run's trace. A flush counter rises LAB1 across the first labelling run and LAB2
+    across the second (then N + 3 per timed run, 0 on the control), and the sync record passes. Nothing real runs.
+    TEST EDIT, flagged (review 7 finding 3): the traces were empty, so the control proved command order only"""
     import types
-    fio = {"jobs": [{"write": {"total_ios": N, "lat_ns": {"percentile": {"50.000000": 100000.0}}},
-                     "sync": {"lat_ns": {"N": N - 1, "percentile": {"50.000000": 300000.0, "99.000000": 900000.0},
-                                         "bins": {"300000": N - 1}}}}]}
+
+    def fio(fsync):
+        job = {"write": {"total_ios": N, "lat_ns": {"percentile": {"50.000000": 100000.0}}}}
+        if fsync:
+            job["sync"] = {"lat_ns": {"N": N - 1, "percentile": {"50.000000": 300000.0, "99.000000": 900000.0},
+                                      "bins": {"300000": N - 1}}}
+        return {"jobs": [job]}
+
+    def trace(data, fsync, bad):
+        if bad == "empty":
+            return ""
+        lines = []
+        for i in range(N):
+            lines.append(f'4100  1700000000.{i:06d} write(3<{data}>, "\\0"..., 4096) = 4096')
+            if fsync:
+                lines.append(f"4100  1700000000.{i:06d} fsync(3<{data}>) = 0")
+        if bad == "uring":
+            lines.append("4100  1700000001.000000 io_uring_setup(8, 0x7ff) = 3<anon_inode:[io_uring]>")
+        return "\n".join(lines) + "\n"
 
     def run(cmd, **_k):
         calls.append(list(cmd))
+        fsync, data = "--fsync=1" in cmd, None
         for x in cmd:
             if x.startswith("--output="):
                 with open(x[len("--output="):], "w") as f:
-                    json.dump(fio, f)
+                    json.dump(fio(fsync), f)
             if x.startswith("--filename="):
-                open(x[len("--filename="):], "w").close()
+                data = x[len("--filename="):]
+                open(data, "w").close()
         if "-o" in cmd:
-            open(cmd[cmd.index("-o") + 1], "w").close()
+            tr = cmd[cmd.index("-o") + 1]
+            with open(tr, "w") as f:
+                f.write(trace(data, fsync, bad_second if tr.endswith("-2.v1l") else None))
         return subprocess.CompletedProcess(cmd, 0, "", "")
     seq = iter([0, lab1, lab1, lab1 + lab2, lab1 + lab2, lab1 + lab2 + N + 3])
     last = [0]
@@ -1350,6 +1372,20 @@ def self_test():
          _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "A27" in r[0] and len(calls) == 2
                                      and all(c[0] == "strace" for c in calls))(
              _measure_with(_runs_box(20000, 21000, calls), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        # review 7 finding 3: A27's second labelling run is judged AS a labelling run (V1L and fio) before it can bind
+        # SLACK or start a timed run; a subprocess rc 0 is not that proof
+        ("finding 3: measure(), real, pair 20000/20000 but the second labelling trace empty: refuses naming the "
+         "second labelling run, after only the two labelling runs",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "second labelling" in r[0] and len(calls) == 2)(
+             _measure_with(_runs_box(20000, 20000, calls, "empty"), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        ("finding 3: measure(), real, the second labelling run shows io_uring_setup: refuses before the timed run",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "second labelling" in r[0] and len(calls) == 2)(
+             _measure_with(_runs_box(20000, 20000, calls, "uring"), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        ("finding 3: a record whose second labelling run made 9,999 data fsyncs VOIDs on the second run's text",
+         _ok(lambda: _has(gates(dict(rec(), arms=dict(rec()["arms"], fsync=dict(
+             rec()["arms"]["fsync"], v1l_2=dict(rec()["arms"]["fsync"]["v1l"], data_fsyncs=N - 1),
+             labelling_fio_2=dict(rec()["arms"]["fsync"]["labelling_fio"]))))),
+             "V1L fsync (A27 second labelling):", "fsync of the data file"))),
         ("A27: measure(), real, a labelling pair 20000 and 20000 goes on: the third run is the timed fio",
          _ok(lambda: (lambda calls: (lambda r: r[0] is None and len(calls) >= 3 and calls[0][0] == calls[1][0] == "strace"
                                      and calls[2][0] == "fio")(
