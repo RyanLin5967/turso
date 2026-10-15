@@ -568,6 +568,20 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
     }
 }
 
+/// LEAP L4 slice 4's arm (lead, 2026-10-15): in a reopened store, `connect_named` of a populated
+/// branch no connection has touched since the open (`pop-<i>`, not resident: its state is read from
+/// the catalog on demand), one per round, after `WARMUP` unmeasured ones (`connect_cold`). The
+/// connection is dropped unmeasured. At most `n` rounds in all.
+fn cold_connects(cell: &str, db: &Arc<Database>, base: Option<u64>, n: u64, k: u64, out: &mut String) {
+    for i in 0..(WARMUP + k).min(n) {
+        let (c, s) = measure(db, base, || db.connect_named(&format!("pop-{i}")).unwrap());
+        drop(c);
+        if i >= WARMUP {
+            line(out, cell, "connect_cold", i - WARMUP, &s);
+        }
+    }
+}
+
 /// The delete arms MCTS-shaped workloads make (lead, 2026-10-15, after LEAP L4 slice 3): per round,
 /// two named trunk children (`older-i`, then `newer-i`) and a child of `newer-i` (`kid-i`, made on a
 /// connection of it), all checkpointed into the catalog, then measured: the delete of `older-i`, a
@@ -1946,10 +1960,10 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "exc_sharp" | "del_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
-            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" => (N_LARGE, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -1982,6 +1996,8 @@ fn budget_child() {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
+        } else if spec.starts_with("cold_") {
+            cold_connects(&spec, &db, base, n, k, &mut text);
         } else if spec.starts_with("del_") {
             deletes(&spec, &db, base, k, &mut text);
         } else if spec.starts_with("ckpt") || spec == "exc_sharp" {
@@ -4326,4 +4342,27 @@ fn leap_l4_an_older_or_a_grandchild_delete_asks_the_catalog_nothing() {
         }
     }
     assert!(failures.is_empty(), "LEAP L4 not reached for the MCTS deletes:\n{failures}");
+}
+
+/// LEAP L4 slice 4 (lead, 2026-10-15): a `connect_named` of a branch that is not resident reads
+/// from the catalog its own state and nothing else: the three statements of its load (its branch
+/// row, its current pages, its retained ones), no name lookup (`name_get`) and no name read
+/// (`name_of`), at 10 and at 10^4 live branches (cells `cold_n10`, `cold_n1e4`). Expected RED: the
+/// name is asked twice (5 statements). WRITTEN, red first.
+#[test]
+fn leap_l4_a_cold_connect_named_reads_only_its_branch_state() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["cold_n10", "cold_n1e4"] {
+        let c = cell(spec);
+        let samples = quiet(&c, "connect_cold");
+        for (i, v) in values(&c, "connect_cold", &samples, "catalog_queries").into_iter().enumerate() {
+            if v != 3 {
+                let _ = writeln!(failures, "  {spec}: connect_cold #{i}: {v} catalog queries; budget 3 (the branch's load)");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached for a cold connect_named:\n{failures}");
 }
