@@ -1800,12 +1800,29 @@ fn check_foreign_key(
     {
         return Err(missing(column));
     }
+    // A key onto a rowid name is one the engine never resolves, declared column or not (core's
+    // ForeignKey::validate refused it after the CREATE ran, or after the ALTER's lock-held copies):
+    // 42703 for a name the parent does not declare, as PostgreSQL answers, and 0A000 for a declared
+    // column of the name (wire review 16 item 16).
     let is_rowid = |c: &str| ROWID_NAMES.iter().any(|r| c.eq_ignore_ascii_case(r));
+    if let Some(column) = key.parent_columns.iter().find(|p| is_rowid(p)) {
+        let declared = match &parent {
+            Some(parent) => parent.get_column(column).is_some(),
+            None => child_columns.iter().any(|c| c.eq_ignore_ascii_case(column)),
+        };
+        if !declared {
+            return Err(missing(column));
+        }
+        return Err(LimboError::ParseError(format!(
+            "a foreign key onto a column named {column} is not supported: the engine reads the \
+             name as the rowid"
+        )));
+    }
     let Some(parent) = parent else {
         if let Some(column) = key
             .parent_columns
             .iter()
-            .find(|p| !is_rowid(p) && !child_columns.iter().any(|c| c.eq_ignore_ascii_case(p)))
+            .find(|p| !child_columns.iter().any(|c| c.eq_ignore_ascii_case(p)))
         {
             return Err(missing(column));
         }
@@ -1824,7 +1841,7 @@ fn check_foreign_key(
         if let Some(column) = key
             .parent_columns
             .iter()
-            .find(|p| parent.get_column(p).is_none() && !is_rowid(p))
+            .find(|p| parent.get_column(p).is_none())
         {
             return Err(missing(column));
         }
@@ -1848,12 +1865,12 @@ fn check_foreign_key(
     Ok(parent_columns)
 }
 
-/// Whether the engine resolves `columns` of `parent` as a parent key, as core's
-/// Schema::resolve_fk does with unique keys required: the rowid (a single rowid name, or the
-/// column an INTEGER PRIMARY KEY makes the rowid), or a UNIQUE index with no WHERE on exactly those
-/// columns in that order. A key it does not resolve made every INSERT into the child fail
-/// 'foreign key mismatch'. PostgreSQL also accepts a unique key's columns in another order (wire
-/// review 13 item 20).
+/// Whether the engine resolves `columns` of `parent` as a parent key, as core's Schema::resolve_fk
+/// does with unique keys required: the rowid (the column an INTEGER PRIMARY KEY makes the rowid; a
+/// rowid name, which ForeignKey::validate refuses, is refused before this by check_foreign_key), or
+/// a UNIQUE index with no WHERE on exactly those columns in that order. A key it does not resolve
+/// made every INSERT into the child fail 'foreign key mismatch'. PostgreSQL also accepts a unique
+/// key's columns in another order (wire review 13 item 20).
 fn parent_key_resolves(
     schema: &turso_core::schema::Schema,
     parent: &turso_core::schema::BTreeTable,
@@ -1866,7 +1883,7 @@ fn parent_key_resolves(
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(column))
         });
-        if rowid_alias || ROWID_NAMES.iter().any(|r| column.eq_ignore_ascii_case(r)) {
+        if rowid_alias {
             return true;
         }
     }
