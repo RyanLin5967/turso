@@ -393,6 +393,12 @@ timedrun_check() {
   # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
   # exploratory, never credited
   echo "prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S" >"$1/prebranch.txt"
+  # the one raw.tsv schema (raw_schema.py; VM --dry-block defect 2), checked on what each run actually wrote
+  local rs
+  for rs in "$1/bb/raw.tsv" "$1/timed/raw.tsv"; do
+    [ -e "$rs" ] || continue
+    python3 -B "$HERE/raw_schema.py" header "$rs" >"$rs.schema.txt" 2>&1 || fail "$3: $rs: $(tail -1 "$rs.schema.txt")"
+  done
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" "$DRY" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" 1 >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS

@@ -282,7 +282,7 @@ typedef struct {
     uint32_t client, seq;
     uint8_t phase, ok, nsteps, pad;
     int16_t err;
-    uint64_t start, end, after_end, clone_done, ticket, flight;
+    uint64_t claim, start, end, after_end, clone_done, ticket, flight; /* claim: raw.tsv intended_ns */
     uint64_t step_end[3];
 } rec_t;
 typedef struct { uint64_t t0, t1, riders, last_ticket; } flight_t;
@@ -545,7 +545,7 @@ static int warmup_decide(const char *rule) {
  * op has completed (op_done), and then claims stop. self_tracerpid() runs after the unlock (review 2 item 6). CID:
  * the claiming client, used only by the PLANT_CLAIM_TIME_EARLY build (build.sh clonebench-plant-claim-early), which
  * reads the time before the lock and sleeps 20-200 us on odd clients (the defect 0138d2128 fixed). */
-typedef struct { int ph, stop, opened, closed; } claim_t;
+typedef struct { int ph, stop, opened, closed; uint64_t t; } claim_t; /* t: the claim's time, read under the lock */
 
 static void all_done_locked(void) {
     if (!g_all_done) __atomic_store_n(&g_all_done, 1, __ATOMIC_RELEASE);
@@ -566,6 +566,7 @@ static claim_t claim_op(int cid) {
 #else
     uint64_t t = now_ns();
 #endif
+    k.t = t;
     int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
     if (ph == PH_DRAIN && g_meas_done >= g_meas_final) { k.stop = 1; goto out; }
     if (ph == PH_WARM) {
@@ -635,6 +636,7 @@ static void *client_main(void *arg) {
         r.phase = (uint8_t)ph;
         r.ok = 1;
         r.err = -1;
+        r.claim = kc.t;
         char dst[2100];
         snprintf(dst, sizeof dst, "%s/b_%s_%d_%u.db", BDIR, RUN_TAG, c->id, seq);
         if (V1 && C == 1) v1_set_mark(V1, MARKB + seq + 1);
@@ -869,13 +871,16 @@ static int cmd_run(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/raw.tsv", out);
     FILE *f = fopen(p, "w");
     if (!f) die("raw.tsv");
-    fprintf(f, "client\tseq\tphase\tok\tstart_ns\tclone_done_ns\tend_ns\tlat_ns\tcreate_ns\topen_ns\twrite_ns\tafter_ns\tticket\tflight\terr\n");
+    /* intended_ns (raw_schema.py CORE; VM --dry-block defect 2): closed loop only, so an op is intended at its claim --
+     * the time claim_op read under the lock, which orders it against tm1 (a later start could fall past tm1) */
+    fprintf(f, "client\tseq\tphase\tok\tintended_ns\tstart_ns\tclone_done_ns\tend_ns\tlat_ns\tcreate_ns\topen_ns\twrite_ns\tafter_ns\tticket\tflight\terr\n");
     for (size_t i = 0; i < total; i++) {
         rec_t *o = &all[i];
         uint64_t s1 = o->nsteps >= 1 ? o->step_end[0] - o->start : 0, s2 = o->nsteps >= 2 ? o->step_end[1] - o->step_end[0] : 0,
                  s3 = o->nsteps >= 3 ? o->step_end[2] - o->step_end[1] : 0;
-        fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n", o->client, o->seq,
-                o->phase == PH_MEAS ? "measure" : o->phase == PH_WARM ? "warmup" : "drain", o->ok, (unsigned long long)o->start,
+        fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n", o->client, o->seq,
+                o->phase == PH_MEAS ? "measure" : o->phase == PH_WARM ? "warmup" : "drain", o->ok, (unsigned long long)o->claim,
+                (unsigned long long)o->start,
                 (unsigned long long)o->clone_done, (unsigned long long)o->end, (unsigned long long)(o->end - o->start),
                 (unsigned long long)s1, (unsigned long long)s2, (unsigned long long)s3, (unsigned long long)(o->after_end - o->end),
                 (unsigned long long)o->ticket, (unsigned long long)o->flight, o->err);
