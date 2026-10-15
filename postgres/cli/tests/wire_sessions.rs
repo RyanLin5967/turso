@@ -2343,6 +2343,41 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// AND CHAIN where PostgreSQL 18.6 answers it (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-r15.out; wire review 13 item 13, review 15 item 23): in an implicit block (`SELECT 1;
+/// COMMIT AND CHAIN`) it is 25P01 "... can only be used in transaction blocks" and the session ends
+/// idle, as outside a block (it was 0A000); in a failed block it ends the block, answered
+/// ROLLBACK, and chains a new one (status T, and the next statement runs in it), as a failed
+/// block's COMMIT or ROLLBACK ends it (it was 25P02, the block left failed). In a live block it
+/// stays refused 0A000 (no chain support; COMPAT).
+#[test]
+fn and_chain_answers_as_postgresql_in_implicit_and_failed_blocks() {
+    let dir = Scratch::new("andchain");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for verb in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+        let sql = format!("SELECT 1; {verb}");
+        let r = a.q(&sql);
+        assert_eq!(r.err(&sql).code, "25P01", "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+    }
+    for verb in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'two')").ok("a write");
+        assert_eq!(a.q("SELECT * FROM nosuch").status, b'E', "premise: the block failed");
+        let r = a.q(verb).ok(verb);
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{verb}");
+        assert_eq!(r.status, b'T', "{verb}: a chained block is open");
+        assert_eq!(a.q("SELECT 1").single("in the chained block"), "1");
+        a.q("ROLLBACK").ok("end the chained block");
+        assert_eq!(
+            a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+            "0",
+            "{verb}: the failed block's write was rolled back"
+        );
+    }
+}
+
 /// Portals as PostgreSQL 18.6 keeps them (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-r15.out; wire review 15 items 16, 17 and 20):
 /// - an unnamed portal suspended by a row limit continues at its next Execute, in a block, after
