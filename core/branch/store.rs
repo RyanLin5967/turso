@@ -9936,6 +9936,7 @@ impl StoreInner {
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
+        ckpt_held("install.snapshot_ended");
         cat.flight = false;
         if let Err(e) = written {
             // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
@@ -9981,7 +9982,12 @@ impl StoreInner {
         // A failure before its rename leaves the old log in use, whose checkpoint marker says
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
-            Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
+            Some(prep) => {
+                ckpt_held("install.before_cut");
+                let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
+                ckpt_held("install.cut_finished");
+                cut
+            }
             None => journal.rewrite_from(cap.log_from, cap.generation),
         };
         if rewritten.is_err() {

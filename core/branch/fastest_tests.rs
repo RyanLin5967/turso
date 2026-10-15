@@ -8736,10 +8736,18 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             span("install.installed", "install.marked"),
         );
         let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
+        // Inside the install: the catalog read snapshot's end, and the cut's finish (each point a
+        // call of its own, subtracted).
+        let inside = (
+            span("install.quiesced", "install.snapshot_ended"),
+            span("install.snapshot_ended", "install.before_cut"),
+            span("install.before_cut", "install.cut_finished"),
+            span("install.cut_finished", "install.installed"),
+        );
         if total > 2 {
             over.push(format!(
-                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {}, mark {}]",
-                capture.0, capture.1, install.0, install.1, install.2
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
+                capture.0, capture.1, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
             ));
         }
     }
