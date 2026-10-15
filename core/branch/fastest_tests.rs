@@ -8841,13 +8841,14 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
             }
         }
         assert!(made.len() > 512, "premise: stage {stage}: too few creates to grow the filter ({})", made.len());
+        // Judged per stage, so a later stage's premise cannot hide what an earlier one lost.
+        assert!(
+            lost.is_empty(),
+            "CLAIM: the name filter answered absent for {} names it was given (a create would make a duplicate): {:?}",
+            lost.len(),
+            &lost[..lost.len().min(8)]
+        );
     }
-    assert!(
-        lost.is_empty(),
-        "CLAIM: the name filter answered absent for {} names it was given (a create would make a duplicate): {:?}",
-        lost.len(),
-        &lost[..lost.len().min(8)]
-    );
 }
 
 /// Lead ruling (DECISIONS 2026-10-15, after the attribution: the n1e4 create's extra allocation is
