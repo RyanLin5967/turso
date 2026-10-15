@@ -2767,25 +2767,26 @@ fn boolean_and_float4_results_are_typed_as_postgresql_types_them() {
     assert_eq!(r.oids, Some(vec![16]), "a comparison over a parameter");
 }
 
-/// An arithmetic expression one of whose operands the walk cannot type (a function it does not
-/// know) types nothing, so a parameter compared with it is refused 42P18 unless declared, as for
-/// any expression the walk does not type (COMPAT's Parameters row): `sqrt(2) + 1 > $1` typed $1
-/// int4 from the literal alone, where PostgreSQL 18.6 types it float8 (recorded, artie raw
-/// loud-20261015/pg18-diff/pg18-r14.out), so a value '1.5' was refused 22P02. A parameter operand
-/// still takes the other side's type (`$1 + 1 > 2`, int4) (wire review 14 item 17).
+/// A float8 math function types its result as PostgreSQL resolves it, so an arithmetic over it and
+/// a parameter compared with that are float8: `sqrt(2) + 1` announces 701 and `sqrt(2) + 1 > $1`
+/// types $1 float8, as PostgreSQL 18.6 does (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-r14.out), so a value '1.5' runs. RULED SPEC CHANGE (lead, DECISIONS
+/// 9d8c1c38ef, item 17): this test was `an_operand_the_walk_cannot_type_types_nothing` and pinned
+/// the 42P18 refusal, a divergence. A parameter operand still takes the other side's type
+/// (`$1 + 1 > 2`, int4) (wire review 14 item 17).
 #[test]
-fn an_operand_the_walk_cannot_type_types_nothing() {
+fn a_float8_math_function_types_its_comparison_parameter() {
     let dir = Scratch::new("untypedoperand");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    let r = a.q("SELECT sqrt(2) + 1").ok("result");
+    assert_eq!(r.oids, Some(vec![701]), "sqrt(2) + 1: rows {:?}", r.rows);
     let sql = "SELECT 1 WHERE sqrt(2) + 1 > $1";
-    let r = a.describe_statement(sql);
-    assert_eq!(
-        r.error.as_ref().map(|e| e.code.as_str()),
-        Some("42P18"),
-        "{sql}: params {:?}",
-        r.params
-    );
+    let r = a.describe_statement(sql).ok(sql);
+    assert_eq!(r.params, Some(vec![701]), "{sql}");
+    let r = a.xt(sql, &[(0, 0, b"1.5")]).ok("1.5");
+    assert_eq!(r.rows, vec![vec![t("1")]], "{sql} with 1.5");
     let r = a.describe_statement("SELECT 1 WHERE $1 + 1 > 2").ok("control");
     assert_eq!(r.params, Some(vec![23]), "a parameter operand takes the other side's type");
 }
