@@ -2577,6 +2577,30 @@ fn portals_live_as_postgresql_keeps_them() {
     a.q("ROLLBACK").ok("end");
 }
 
+/// A result column that is a bare parameter is announced as the parameter's type, declared or
+/// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
+/// statement's and the portal's Describe; it was text whatever the declaration (the PG 18
+/// differential's finding (c)).
+#[test]
+fn a_bare_parameter_result_takes_the_parameters_type() {
+    let dir = Scratch::new("paramresult");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    for (oid, value, text) in [
+        (700, &b"1.5"[..], "1.5"),
+        (16, b"t", "t"),
+        (23, b"42", "42"),
+        (25, b"x", "x"),
+    ] {
+        let r = a.xt("SELECT $1", &[(oid, 0, value)]).ok("SELECT $1");
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "declared {oid}");
+    }
+    let r = a.describe_statement("SELECT $1::int4 + 1, $1").ok("describe");
+    assert_eq!(r.oids, Some(vec![23, 23]), "the second column is the parameter, inferred int4");
+}
+
 /// A result column whose expression is boolean in PostgreSQL's grammar (a boolean literal, a
 /// comparison, AND / OR / NOT, IS [NOT] NULL, IN, BETWEEN, LIKE, EXISTS, a cast to bool, a CASE
 /// whose every result is boolean) is announced bool (16) and sent as t / f, and a cast to float4 or
