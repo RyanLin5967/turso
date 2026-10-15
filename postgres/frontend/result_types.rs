@@ -1765,8 +1765,8 @@ fn view_columns_traced(schema: &Schema, select: &turso_parser::ast::Select) -> b
         }
         _ => false,
     };
-    a_table(&from.select)
-        && from.joins.iter().all(|join| a_table(&join.table))
+    a_table(&*from.select)
+        && from.joins.iter().all(|join| a_table(&*join.table))
         && columns.iter().all(|column| match column {
             ResultColumn::Star | ResultColumn::TableStar(_) => true,
             ResultColumn::Expr(expr, _) => matches!(

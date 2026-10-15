@@ -428,7 +428,7 @@ pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
         if !blank(&b[at..start]) {
             parts.push(&sql[at..start]);
         }
-        parts.push(part);
+        parts.push(*part);
         at = start + part.len();
     }
     if !blank(&b[at..]) {
