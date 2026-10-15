@@ -7673,6 +7673,45 @@ fn a_named_statement_keeps_its_described_result_types() {
     assert!(r.rows.is_empty(), "rows {:?}", r.rows);
 }
 
+// C40: expected rows recorded with PostgreSQL 18.6 (C26 MED 1).
+#[test]
+fn parameter_count_after_an_empty_statement() {
+    parameter_lexer_round_trip(";SELECT $1::int", "41");
+}
+
+#[test]
+fn parameter_count_after_comments_and_empty_statements() {
+    parameter_lexer_round_trip(" ; /* c */ ; SELECT $1::int", "41");
+}
+
+#[test]
+fn parameter_count_in_a_continued_escape_string() {
+    parameter_lexer_round_trip("SELECT E'one'\n'\\'$2' || $1::text", "one'$241");
+}
+
+fn parameter_lexer_round_trip(sql: &str, expected: &str) {
+    let dir = Scratch::new("parameter-lexer");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = seeded(&server);
+    let mut parse = vec![0];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(&[0, 0, 0]);
+    w.send(b'P', &parse);
+    // Unnamed portal and statement, text format, one value "41", text result.
+    w.send(b'B', b"\0\0\0\0\0\x01\0\0\0\x0241\0\0");
+    w.send(b'E', &[0, 0, 0, 0, 0]);
+    w.send(b'S', &[]);
+    let r = w.read_reply();
+    assert_eq!(r.status, b'I', "{sql}: {:?}", r.error);
+    assert_eq!(r.single(sql), expected);
+
+    let (messages, err) = w.bind_round(sql, &[], &[Some(b"41"), Some(b"42")], &[]);
+    let err = err.expect("two values for a statement requiring one must fail");
+    assert_eq!(err.code, "08P01", "{sql}: {err:?}");
+    assert!(err.message.contains("requires 1"), "{sql}: {err:?}");
+    assert!(!messages.contains(&b'2'), "BindComplete before the count refusal");
+}
+
 /// A Bind's value count is checked at Bind for every statement, its parameters counted as
 /// PostgreSQL counts them (wire review 17 item 2): a `$` that is no parameter (in a comment, a quoted
 /// identifier) leaves a SET with the parameters Parse declared, none, so one value is 08P01 at Bind
