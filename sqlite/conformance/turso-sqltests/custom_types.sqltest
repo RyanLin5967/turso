@@ -170,6 +170,17 @@ expect {
     4200
 }
 
+# A built-in type with no ENCODE converts as its base type's affinity, as the same CAST does with
+# custom types off (SQLite's name rules). The CAST was left a no-op, so CAST('1.5' AS float8)
+# returned the text unconverted (ultrareview of fastest-wire, finding 7).
+@requires strict "uses STRICT tables"
+test cast-to-builtin-type-without-encode-converts-by-its-base {
+    SELECT CAST('1.5' AS float8), typeof(CAST('1.5' AS float8)), typeof(CAST(1 AS float4)), typeof(CAST('7' AS bigint));
+}
+expect {
+    1.5|real|real|integer
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));
