@@ -449,10 +449,14 @@ mod census_tests {
     }
 }
 
-/// Test builds: the IO the next `Catalog::open` uses instead of a platform IO, taken once (engine
-/// review 17 MED 3: a catalog whose WAL sync fails).
+/// Test builds: the IO the next `Catalog::open` of a catalog whose path ends with the given one
+/// uses instead of a platform IO, taken once (engine review 17 MED 3: a catalog whose WAL sync
+/// fails). Keyed by that path (engine review 21 LOW 21): every test binary module shares this
+/// static and `serial()` orders only fastest_tests, so an open of any other catalog leaves it
+/// alone, and the setting test's "taken" premise can only be its own catalog's open.
 #[cfg(test)]
-pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<Arc<dyn IO>>> = std::sync::Mutex::new(None);
+pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<(std::path::PathBuf, Arc<dyn IO>)>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) struct Catalog {
     _db: Arc<Database>,
@@ -514,7 +518,14 @@ impl Catalog {
     /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
     pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
         #[cfg(test)]
-        let hooked = NEXT_CATALOG_IO.lock().unwrap().take();
+        let hooked = {
+            let mut next = NEXT_CATALOG_IO.lock().unwrap();
+            if next.as_ref().is_some_and(|(key, _)| path.ends_with(key)) {
+                next.take().map(|(_, io)| io)
+            } else {
+                None
+            }
+        };
         #[cfg(not(test))]
         let hooked: Option<Arc<dyn IO>> = None;
         let io: Arc<dyn IO> = match hooked {

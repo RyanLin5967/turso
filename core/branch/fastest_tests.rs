@@ -7284,11 +7284,15 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some(Arc::new(FailWalSyncIo {
-        inner: Arc::new(PlatformIO::new().unwrap()),
-        armed: armed.clone(),
-        held: Arc::new(std::sync::Mutex::new(None)),
-    }));
+    // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
+    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
+        std::path::PathBuf::from("cat-sync.db-branch-cat"),
+        Arc::new(FailWalSyncIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            armed: armed.clone(),
+            held: Arc::new(std::sync::Mutex::new(None)),
+        }),
+    ));
     let db = open_at(&dir.path().join("cat-sync.db"), opts(true, SyncClass::Off));
     let trunk = db.connect().unwrap();
     seed_wide(&trunk);
@@ -7327,11 +7331,15 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some(Arc::new(FailWalSyncIo {
-        inner: Arc::new(PlatformIO::new().unwrap()),
-        armed: armed.clone(),
-        held: Arc::new(std::sync::Mutex::new(None)),
-    }));
+    // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
+    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
+        std::path::PathBuf::from("cat-sync-d2.db-branch-cat"),
+        Arc::new(FailWalSyncIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            armed: armed.clone(),
+            held: Arc::new(std::sync::Mutex::new(None)),
+        }),
+    ));
     let db = open_at(&dir.path().join("cat-sync-d2.db"), opts(true, SyncClass::FullFsync));
     let trunk = db.connect().unwrap();
     seed(&trunk);
@@ -7373,11 +7381,15 @@ fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some(Arc::new(FailWalSyncIo {
-        inner: Arc::new(PlatformIO::new().unwrap()),
-        armed: armed.clone(),
-        held: Arc::new(std::sync::Mutex::new(None)),
-    }));
+    // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
+    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some((
+        std::path::PathBuf::from("cat-sync-late.db-branch-cat"),
+        Arc::new(FailWalSyncIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            armed: armed.clone(),
+            held: Arc::new(std::sync::Mutex::new(None)),
+        }),
+    ));
     let db = open_at(&dir.path().join("cat-sync-late.db"), opts(true, SyncClass::FullFsync));
     let trunk = db.connect().unwrap();
     seed(&trunk);
