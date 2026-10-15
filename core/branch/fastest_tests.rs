@@ -4838,6 +4838,7 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
             assert!(!db.branch_slot_is_free(s), "{what}: premise: slot {s} is held after x's reap");
         }
         let syncs = super::store::thread_syncs();
+        let upgrades = db.branches.group_counters()[4];
         let _y = trunk.fork_branch().unwrap().into_id();
         assert_eq!(
             super::store::thread_syncs() - syncs,
@@ -4847,6 +4848,14 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
         eventually(&format!("{what}: the held slots never came free"), || {
             slots.iter().all(|&s| db.branch_slot_is_free(s))
         });
+        // FLAGGED TEST EDIT (engine review 19 LOW 12, an assertion added): where the upgrade's flush
+        // went, the store's own count (PREREG §4 V2 credits a flush off the operation's thread only
+        // to a registered background writer): exactly one upgrade, the background writer's.
+        assert_eq!(
+            db.branches.group_counters()[4] - upgrades,
+            1,
+            "{what}: the held slots came free by other than one held-free upgrade"
+        );
     }
 }
 
