@@ -8536,7 +8536,8 @@ impl BranchStore {
                 f.builds += 1;
                 f.moved_max = f.moved_max.max(old.len() as u64);
             }
-            let copied = pending.copy_into(&grown) && !filter_drain_fails();
+            // The failpoint stops the copy before it starts, as a copy refused at the name does.
+            let copied = !filter_drain_fails() && pending.copy_into(&grown);
             {
                 let mut inner = shared.lock();
                 inner.names.filter.draining = None;
