@@ -1178,6 +1178,10 @@ pub(crate) struct Journal {
     fail_next_take: bool,
     /// See [`Journal::fail_next_confirm`].
     fail_next_confirm: bool,
+    /// One duplicate of `file` that every flight and confirmation of this incarnation shares
+    /// (`Journal::shared_log`): made once, dropped when `file` is replaced, so taking a flight
+    /// under the store mutex issues no dup(2) (budget create_issues_no_syscall_under_the_store_mutex).
+    shared: Option<Arc<File>>,
     /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
     /// run off the store mutex (`prepare_cut`, through its `CutSource`).
     fail_next_replacement_sync: AtomicBool,
@@ -1449,6 +1453,7 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            shared: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
@@ -1653,6 +1658,7 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            shared: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
@@ -1924,6 +1930,16 @@ impl Journal {
         self.fail_next_write = true;
     }
 
+    /// The incarnation's shared duplicate of the log (`shared`), made on first use.
+    fn shared_log(&mut self) -> Result<Arc<File>> {
+        if let Some(log) = &self.shared {
+            return Ok(log.clone());
+        }
+        let log = Arc::new(self.file.try_clone().map_err(|e| io_error(e, "dup branch log"))?);
+        self.shared = Some(log.clone());
+        Ok(log)
+    }
+
     /// Fail the confirmation word of the next flight as an I/O error would (the
     /// `ConfirmWriteFails` failpoint; review 6 #1).
     pub(crate) fn fail_next_confirm(&mut self) {
@@ -2037,6 +2053,7 @@ impl Journal {
         }
         // From here the new file is the log.
         self.file = f;
+        self.shared = None;
         self.rewrites += 1;
         // A rewrite ends any back-off. Mutant `no_backoff_reset` (test builds only; engine review 8
         // #3): it keeps it, measured in the old log's length.
@@ -2192,6 +2209,7 @@ impl Journal {
         super::store::kill_point("cut.renamed");
         // From here the new file is the log.
         self.file = prep.file;
+        self.shared = None;
         self.rewrites += 1;
         // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
         if !super::store::fe_mutant("no_backoff_reset") {
@@ -2638,22 +2656,27 @@ impl Journal {
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
         // applied in memory and will never be durable, so nothing may be written after them.
         let fail_take = std::mem::take(&mut self.fail_next_take);
-        let taken = (|| -> Result<(File, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<File>)> {
             if fail_take {
                 return Err(LimboError::InternalError(
                     "failpoint: the flight's log descriptor could not be duplicated".to_string(),
                 ));
             }
-            let on_disk = file_len(&self.file)?;
-            if on_disk != self.len {
-                return Err(corrupt(
-                    "the branch log changed under this journal; another store instance wrote it",
-                ));
-            }
-            let log = self
-                .file
-                .try_clone()
-                .map_err(|e| io_error(e, "dup branch log"))?;
+            // The log's length is checked by the flight's write, holding no lock (review R8's
+            // guard; flights are taken one at a time, each once the last landed, so the file then
+            // ends at the flight's `at`). Mutant `flight_take_stats_and_dups` (test builds only):
+            // checked and duplicated here, under the store mutex, as before.
+            let log = if super::store::fe_mutant("flight_take_stats_and_dups") {
+                let on_disk = file_len(&self.file)?;
+                if on_disk != self.len {
+                    return Err(corrupt(
+                        "the branch log changed under this journal; another store instance wrote it",
+                    ));
+                }
+                Arc::new(self.file.try_clone().map_err(|e| io_error(e, "dup branch log"))?)
+            } else {
+                self.shared_log()?
+            };
             // A flight that syncs nothing (D0) leaves the arena's mark set, so a later flight in a
             // syncing class (an upgrade) still syncs the slots these frames name.
             let arena = if class.syncs() {
@@ -2769,17 +2792,14 @@ impl Journal {
     pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass, end_lsn: u64) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
-        let taken = (|| -> Result<(File, Option<File>)> {
+        let taken = (|| -> Result<(Arc<File>, Option<File>)> {
             let on_disk = file_len(&self.file)?;
             if on_disk != self.len {
                 return Err(corrupt(
                     "the branch log changed under this journal; another store instance wrote it",
                 ));
             }
-            let log = self
-                .file
-                .try_clone()
-                .map_err(|e| io_error(e, "dup branch log"))?;
+            let log = self.shared_log()?;
             let arena = if arena.is_dirty() { arena.sync_handle()? } else { None };
             Ok((log, arena))
         })();
@@ -3080,6 +3100,7 @@ impl Journal {
                 return Err(io_error(e, "rename branch log reset"));
             }
             self.file = f;
+            self.shared = None;
             if class.syncs() {
                 fsync_dir_of(&self.files.log, class)?;
             }
@@ -3182,7 +3203,7 @@ fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32
 /// acknowledgement window. The log may since have been replaced by a cut: the word then goes to
 /// the old file, which no recovery reads, and matches nothing in the new one.
 pub(crate) struct Confirm {
-    log: File,
+    log: Arc<File>,
     word: u32,
     /// The journal's `lsn` at the end of the flight it confirms: a confirmation of a later flight
     /// supersedes it (`supersedes`).
@@ -3196,7 +3217,7 @@ pub(crate) struct Confirm {
 
 /// The confirmation of a flight whose frames, its end frame last, are `bytes`, written at `at`
 /// (review 6 #1): bound to its end frame's checksum and to where it ends, the flight ending at `lsn`.
-fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
+fn flight_confirm(log: Arc<File>, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail: bool) -> Confirm {
     let crc = end_frame_crc(bytes[bytes.len() - END_FRAME_LEN..].try_into().unwrap());
     Confirm {
         word: confirm_word(crc, at + bytes.len() as u64),
@@ -3212,7 +3233,7 @@ fn flight_confirm(log: File, bytes: &[u8], at: u64, lsn: u64, proved: bool, fail
 /// from `log`, which ends at `at`, where that flight's end frame ends (its checksum is the log's
 /// last 4 bytes, as `confirm_at_open` reads it), the flight ending at `lsn`. `None` when the log
 /// holds no flight, or the read fails: the word's absence proves nothing.
-fn confirm_last(log: File, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
+fn confirm_last(log: Arc<File>, at: u64, lsn: u64, proved: bool, fail: bool) -> Option<Confirm> {
     if at < (LOG_HEADER_LEN + END_FRAME_LEN) as u64 {
         return None;
     }
@@ -3256,7 +3277,7 @@ impl Confirm {
     #[cfg(test)]
     pub(crate) fn for_test(log: File, proved: bool) -> Self {
         Self {
-            log,
+            log: Arc::new(log),
             word: 0,
             lsn: 0,
             proved,
@@ -3412,7 +3433,7 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
 /// by [`Flight::write`] with no lock held; the journal already counts the region as written, so a
 /// failed write must fail-stop it.
 pub(crate) struct Flight {
-    log: Option<File>,
+    log: Option<Arc<File>>,
     arena: Option<File>,
     bytes: Vec<u8>,
     at: u64,
@@ -3467,6 +3488,14 @@ impl Flight {
         let Some(log) = self.log else {
             return Ok(None);
         };
+        // Review R8's guard, holding no lock (it ran at the take, under the store mutex, before):
+        // flights are taken one at a time, each once the last landed, so the log ends where this
+        // one writes, unless another store instance wrote it.
+        if !super::store::fe_mutant("flight_take_stats_and_dups") && file_len(&log)? != self.at {
+            return Err(corrupt(
+                "the branch log changed under this journal; another store instance wrote it",
+            ));
+        }
         // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
         // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
         let syncs = self.class.syncs() && !super::store::fe_mutant("no_flight_sync");
@@ -3599,7 +3628,7 @@ impl Flight {
 /// through a handle of its own, synced by `Upgrade::sync` holding no lock. It writes no frame and
 /// holds no flight slot, unless `exclusive`.
 pub(crate) struct Upgrade {
-    log: File,
+    log: Arc<File>,
     arena: Option<File>,
     dir: Option<File>,
     /// A D0 compaction's snapshot (`Journal::snap_dirty`, left set; engine review 19 MED 7).
