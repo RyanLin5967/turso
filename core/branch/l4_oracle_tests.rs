@@ -52,6 +52,9 @@ struct Seen {
     /// facts used in a flight.
     flight_ops: u64,
     facts_in_flight: u64,
+    /// Review L4 M1: fact use sites reached under a held flight, each asserting the facts equal
+    /// their queries (counted for the last store of a history).
+    site_checks: u64,
 }
 
 impl Seen {
@@ -67,6 +70,7 @@ impl Seen {
         self.trims += o.trims;
         self.flight_ops += o.flight_ops;
         self.facts_in_flight += o.facts_in_flight;
+        self.site_checks += o.site_checks;
     }
 }
 
@@ -170,6 +174,9 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
                     db.branch_checkpoint_held() == stage | super::store::HOLD_ARRIVED
                 });
                 seen.in_flight += 1;
+                // Every fact use site the operations reach under the hold asserts the facts equal
+                // their queries (`CatState::assert_facts_in_flight`).
+                super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(true));
                 for _ in 0..1 + rng.below(4) {
                     match rng.below(3) {
                         0 => {
@@ -193,13 +200,11 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
                     seen.flight_ops += 1;
                     // The facts a flight keeps the store from using, checked in the flight anyway
                     // (does the guard protect anything?).
-                    super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(true));
-                    let r = db.branches.l4_facts_check_for_test();
-                    super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(false));
-                    if let Err(e) = r {
+                    if let Err(e) = db.branches.l4_facts_check_for_test() {
                         panic!("seed {seed} step {step} (in flight): an L4 fact disagrees with the catalog: {e}");
                     }
                 }
+                super::store::CHECK_FACTS_IN_FLIGHT.with(|c| c.set(false));
             }
             db.branch_checkpoint_hold(0);
             db.branch_checkpoint_wait();
@@ -262,6 +267,7 @@ fn history(seed: u64, steps: u32, legacy: bool, cap: Option<usize>) -> Seen {
     // Trims are counted per process lifetime of the store; the last one's count is read here.
     seen.trims += db.branches.mirror_misses_and_trims_for_test().1;
     seen.facts_in_flight += db.branches.facts_used_in_flight_for_test();
+    seen.site_checks += db.branches.in_flight_fact_checks_for_test();
     seen
 }
 
@@ -296,8 +302,8 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
     premise("format 19", &total);
     println!("L4 oracle, format 19: {total:?}");
     assert!(
-        total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0,
-        "premise: an open inferred a slot's state, a step ran under a held flight, and a held name scan's mirror was discarded: {total:?}"
+        total.free_inferred > 0 && total.in_flight > 0 && total.mirror_held > 0 && total.site_checks > 0,
+        "premise: an open inferred a slot's state, a step ran under a held flight, a held name scan's mirror was discarded, and a fact use site was reached under a held flight: {total:?}"
     );
     // Review L4 M2: with a small resident cap the trunk-version cache is trimmed, and the facts
     // still hold after every trim.

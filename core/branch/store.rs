@@ -1844,6 +1844,9 @@ struct CatState {
     /// Slice 3's facts used while a checkpoint was in flight (only under mutant
     /// `l4_child_facts_in_flight`; instrument).
     facts_used_in_flight: u64,
+    /// Test builds (review L4 M1): see `CatState::assert_facts_in_flight`.
+    #[cfg(test)]
+    in_flight_fact_checks: u64,
     /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
     /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
     /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
@@ -2168,6 +2171,34 @@ fn fuzzy_checkpoints() -> bool {
 }
 
 impl CatState {
+    /// Review L4 M1, the construction argument for slice 3's `!flight` guards, checked where the
+    /// facts are used (test builds, with `CHECK_FACTS_IN_FLIGHT` set on the thread). Inside a flight
+    /// the facts cannot be stale against `catalog`: (1) they change only at an install (which ends
+    /// the flight in the same mutex hold: `checkpoint_install` clears them, then sets them from its
+    /// writer's transaction) or at these use sites when unknown; (2) `catalog` reads the snapshot
+    /// the capture pinned (`begin_read_snapshot`, ended at the install), and writes nothing in a
+    /// flight, so what it answers cannot move until the install either; (3) out of a flight the
+    /// oracle's check (4) holds them equal to their queries, so they are equal at the capture. So
+    /// a fact used in a flight answers what the guarded path's own catalog query answers, and the
+    /// guard changes no decision: mutant `l4_child_facts_in_flight` is equivalent. This asserts
+    /// (1)-(3)'s conclusion at the use site itself.
+    #[cfg(test)]
+    fn assert_facts_in_flight(&mut self) -> Result<()> {
+        if !self.flight || !CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        self.in_flight_fact_checks += 1;
+        if let Some(known) = self.trunk_child_max {
+            let asked = self.catalog.children_below(0, u64::MAX, 1)?.first().copied();
+            assert_eq!(known, asked, "in a flight, the trunk's newest catalog child is known stale");
+        }
+        if let Some(known) = self.trunk_versions {
+            let asked = !self.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty();
+            assert_eq!(known, asked, "in a flight, whether the catalog holds a trunk version is known stale");
+        }
+        Ok(())
+    }
+
     fn new(catalog: Catalog, sync: SyncClass, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
         Ok(Self {
@@ -2184,6 +2215,8 @@ impl CatState {
             trunk_complete: HashSet::new(),
             trunk_trims: 0,
             facts_used_in_flight: 0,
+            #[cfg(test)]
+            in_flight_fact_checks: 0,
             // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
@@ -8578,6 +8611,13 @@ impl BranchStore {
         (inner.names.mirror_misses, inner.cat.as_ref().map_or(0, |c| c.trunk_trims))
     }
 
+    /// Test builds (review L4 M1): use sites of slice 3's facts reached inside a flight with
+    /// `CHECK_FACTS_IN_FLIGHT` set, each of which asserted the known facts equal their queries.
+    #[cfg(test)]
+    pub(crate) fn in_flight_fact_checks_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.in_flight_fact_checks)
+    }
+
     /// Test builds (review L4 M1): slice 3's facts used while a checkpoint was in flight.
     #[cfg(test)]
     pub(crate) fn facts_used_in_flight_for_test(&self) -> u64 {
@@ -9478,7 +9518,10 @@ impl StoreInner {
         };
         // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
         // unknown, never while a checkpoint is in the air).
-        // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too.
+        // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too
+        // (equivalent: `CatState::assert_facts_in_flight`).
+        #[cfg(test)]
+        cat.assert_facts_in_flight()?;
         if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
             cat.facts_used_in_flight += u64::from(cat.flight);
             if cat.trunk_versions.is_none() {
@@ -10013,6 +10056,10 @@ impl StoreInner {
         }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
+        } else if fe_mutant("l4_capture_pins_no_snapshot") {
+            // Mutant (test builds only): the catalog connection reads the live catalog in a flight,
+            // so a fact goes stale once the writer commits (fires `assert_facts_in_flight`).
+            Ok(())
         } else {
             cat.catalog.begin_read_snapshot()
         };
@@ -10725,6 +10772,10 @@ impl StoreInner {
                 )));
             }
             let catalog_mode = self.cat.is_some();
+            #[cfg(test)]
+            if let (Some(cat), true) = (self.cat.as_mut(), parent.is_trunk()) {
+                cat.assert_facts_in_flight()?;
+            }
             // LEAP L4 slice 3: the trunk's newest child row in the catalog, known (asked once while
             // unknown) whenever no checkpoint is in the air.
             let newest = match self.cat.as_mut() {
