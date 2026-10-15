@@ -2577,6 +2577,61 @@ fn portals_live_as_postgresql_keeps_them() {
     a.q("ROLLBACK").ok("end");
 }
 
+/// A float's text is PostgreSQL's float8out / float4out at the default extra_float_digits (1): the
+/// shortest exact digits, in fixed notation while the decimal exponent is in [-4, 15) for float8
+/// and [-4, 6) for float4, else `d.ddde+XX` with a sign and at least two exponent digits; no
+/// trailing `.0`; Infinity spelled out (PostgreSQL 18.6 recorded, artie raw loud-20261015/
+/// pg18-diff/pg18-float.out). pgwire's ryu text was `1.0`, `100.0`, `1e16`, `0.00001` and `inf`
+/// (the PG 18 differential's finding (d)).
+#[test]
+fn floats_are_written_as_postgresql_writes_them() {
+    let dir = Scratch::new("floattext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE f(id INT, d DOUBLE PRECISION)").ok("f");
+    let cases = [
+        ("1", "1"),
+        ("-1", "-1"),
+        ("100", "100"),
+        ("0.1", "0.1"),
+        ("1234567", "1234567"),
+        ("100000000000000", "100000000000000"),
+        ("1e15", "1e+15"),
+        ("1e20", "1e+20"),
+        ("0.0001", "0.0001"),
+        ("1e-5", "1e-05"),
+        ("1.5e-5", "1.5e-05"),
+        ("3.4028235e38", "3.4028235e+38"),
+        ("0.30000000000000004", "0.30000000000000004"),
+        ("1234567890123456", "1.234567890123456e+15"),
+    ];
+    for (i, (literal, _)) in cases.iter().enumerate() {
+        a.q(&format!("INSERT INTO f VALUES ({i}, {literal})")).ok(literal);
+    }
+    let got: Vec<String> = a
+        .q("SELECT d FROM f ORDER BY id")
+        .ok("read")
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    let want: Vec<String> = cases.iter().map(|(_, w)| w.to_string()).collect();
+    assert_eq!(got, want);
+    let r = a
+        .q("SELECT 1234567::float4, 123456::float4, 1e-5::float4, 'Infinity'::float8, '-Infinity'::float8")
+        .ok("float4 and infinities");
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Some("1.234567e+06".to_string()),
+            Some("123456".to_string()),
+            Some("1e-05".to_string()),
+            Some("Infinity".to_string()),
+            Some("-Infinity".to_string()),
+        ]]
+    );
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
