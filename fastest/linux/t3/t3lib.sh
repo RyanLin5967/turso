@@ -375,3 +375,61 @@ print("timed.json: sweeper_cpu_s", rec["sweeper_cpu_s"], rec["sweeper_refused"] 
 sys.exit(0 if rec["sweeper_cpu_s"] is not None else 1)
 EOF
 }
+
+# host_quiet REC / host_unquiet REC -- the class "the host acts during a measured window" (second full --dry-block
+# run, 2026-10-15: apt-daily.timer's unattended-upgrade voided a cell as foreign CPU; lima-guestagent's SyncTime
+# stepped CLOCK_REALTIME every 10-20 s and stracecount refused the windows). Before the first cell, host_quiet stops
+# EVERY active systemd timer (no allowlist: nothing scheduled may start mid-run), the service each one activates when
+# it is running, and every active clock adjuster in T3_CLOCK_ADJUSTERS, recording each as "<kind>\t<unit>" in REC.
+# Then it judges the OUTCOME, not the list: CLOCK_REALTIME minus CLOCK_MONOTONIC (T3_CLOCKDELTA) must move by at most
+# T3_QUIET_MAX_S over a watch of T3_QUIET_WATCH_S, or it refuses, naming the movement; so an adjuster nobody listed
+# is caught by its effect. Refuses (rc 1) also when list-timers fails, a stopped unit is still active, or a clock
+# sample is unreadable. host_unquiet starts the recorded timers and clock adjusters again (a timer starts its own
+# service). Blind spots, stated: cron and anacron jobs and non-systemd daemons are seen only by foreign_cpu.py
+# (VOID). A slew (adjtime, the kernel PLL) moves CLOCK_REALTIME and CLOCK_MONOTONIC together, so it is invisible here
+# and equally to stracecount's realtime-against-monotonic check; only a step (clock_settime, ADJ_SETOFFSET) moves the
+# difference, and that is what both refuse.
+T3_CLOCK_ADJUSTERS=${T3_CLOCK_ADJUSTERS:-"systemd-timesyncd chrony chronyd ntp ntpd ntpsec openntpd lima-guestagent"}
+host_quiet() {
+  local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} timers u svc bad="" d0 d1
+  local clk=${T3_CLOCKDELTA:-python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'}
+  : > "$rec" || return 1
+  timers=$(${sc} list-timers --all --no-legend --plain) || { echo "REFUSED: host_quiet: systemctl list-timers failed"; return 1; }
+  while read -r u svc; do
+    [ -n "$u" ] || continue
+    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+      ${sc} stop "$u"; printf 'timer\t%s\n' "$u" >> "$rec"
+    fi
+    if [ -n "$svc" ] && [ "$(${sc} is-active "$svc" 2> /dev/null)" = active ]; then
+      ${sc} stop "$svc"; printf 'service\t%s\n' "$svc" >> "$rec"
+    fi
+  done < <(printf '%s\n' "$timers" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\.timer$/) { print $i, $(i + 1); break } }')
+  for u in $T3_CLOCK_ADJUSTERS; do
+    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+      ${sc} stop "$u"; printf 'clock\t%s\n' "$u" >> "$rec"
+    fi
+  done
+  while IFS=$'\t' read -r _ u; do
+    [ "$(${sc} is-active "$u" 2> /dev/null)" = active ] && bad="$bad $u"
+  done < "$rec"
+  [ -z "$bad" ] || { echo "REFUSED: host_quiet: still active after stop:$bad"; return 1; }
+  d0=$(eval "$clk") && sleep "${T3_QUIET_WATCH_S:-30}" && d1=$(eval "$clk") && [ -n "$d0" ] && [ -n "$d1" ] ||
+    { echo "REFUSED: host_quiet: cannot sample the clocks ('${d0:-}' then '${d1:-}')"; return 1; }
+  python3 -B -c 'import sys
+d0, d1, w, m = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+if abs(d1 - d0) > m:
+    sys.exit(f"REFUSED: host_quiet: CLOCK_REALTIME moved {d1 - d0:+.6f} s against CLOCK_MONOTONIC in {w} s with every"
+             f" timer and listed clock adjuster stopped (limit {m} s): something still adjusts the clock")
+print(f"host_quiet: CLOCK_REALTIME - CLOCK_MONOTONIC held within {abs(d1 - d0):.6f} s over {w} s")' \
+    "$d0" "$d1" "${T3_QUIET_WATCH_S:-30}" "${T3_QUIET_MAX_S:-0.002}" 2>&1 || return 1
+  echo "host_quiet: stopped $(grep -c . "$rec") unit(s) (recorded in $rec)"
+}
+
+host_unquiet() {
+  local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} kind u rc=0
+  [ -f "$rec" ] || return 0
+  while IFS=$'\t' read -r kind u; do
+    case $kind in timer|clock) ${sc} start "$u" || rc=1 ;; esac
+  done < "$rec"
+  return $rc
+}
