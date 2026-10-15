@@ -3305,6 +3305,19 @@ impl Drop for Backpressure<'_> {
     }
 }
 
+/// A trunk commit's barrier that relied on the commit's own WAL F_FULLFSYNC (`ordered`; engine
+/// review 18 MED 3): it does not wait in back-pressure for a fuzzy checkpoint's install. That
+/// checkpoint can be waiting in `settle_ordered` for exactly this commit's flush (`pending_full`),
+/// which comes only after the barrier returns: the two waited on each other until the settle bound
+/// broke it, the checkpoint failed Busy and the commit stalled under the WAL write lock. The log
+/// past the hard limit is waited out by the next operation instead. Mutant
+/// `ordered_commit_backpressured` (test builds only): it waits, as before.
+fn skip_backpressure(backpressure: Backpressure<'_>, ordered: bool) {
+    if ordered && !fe_mutant("ordered_commit_backpressured") {
+        std::mem::forget(backpressure);
+    }
+}
+
 /// r13-compose's runtime ablation knobs (PREREG A2.0 step 7: I1, I2, I10): `R13_FW1=off` lists by the
 /// scan and catalog query under the mutex at every listing (the store before F-W1), `R13_FW2=off`
 /// makes a checkpoint walk every resident state for reserved slots (before F-W2), and
@@ -6714,8 +6727,9 @@ impl BranchStore {
         {
             return Ok(false);
         }
-        // F-FZ back-pressure: dropped after the guard below.
-        let _backpressure = Backpressure(self);
+        // F-FZ back-pressure: dropped after the guard below, except after an ORDERED barrier (see
+        // `skip_backpressure`).
+        let backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         self.barrier_locks.fetch_add(1, Ordering::Relaxed);
         // Re-read under the lock: `begin_trunk_commit` sets it while holding it.
@@ -6802,6 +6816,7 @@ impl BranchStore {
                 kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
+                skip_backpressure(backpressure, ordered);
                 Ok(ordered)
             }
             // Only stamps were at stake: a trunk commit does not fail because its stamp could not
@@ -6809,6 +6824,8 @@ impl BranchStore {
             // flight poisoned the store, as every failed flush does.
             Err(e) if self.group.durable(class) >= required => {
                 tracing::warn!("branch lease clock not stamped at a trunk commit: {e}");
+                drop(inner);
+                skip_backpressure(backpressure, ordered);
                 Ok(ordered)
             }
             Err(e) => Err(e),
