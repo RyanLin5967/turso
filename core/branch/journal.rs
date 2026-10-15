@@ -5918,6 +5918,74 @@ mod format_tests {
         );
     }
 
+    /// Engine review 19 LOW 18 (the review 16 MED 6 red asserted the flag, not the outcome): after
+    /// the same D0 open that reset a log a compaction left stale, the first flight that syncs syncs
+    /// the directory exactly once, on its thread (`DIR_SYNCS`). Mutant
+    /// `reset_unsynced_rename_left_clean`: 0.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_syncing_flight_after_a_d0_reset_open_syncs_the_directory_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 0, &[1, 1], SyncClass::Off);
+        {
+            let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+            let stopped = journal.compact(&SnapshotState::default(), &mut Arena::new(512), true);
+            assert!(stopped.is_err(), "premise: the compaction stopped after its snapshot rename");
+        }
+        let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+        assert_eq!(journal.len, LOG_HEADER_LEN as u64, "premise: the open reset the stale log");
+        journal.buffer(&Record::Fork { child: 7, parent: 0 }).unwrap();
+        let dirs = DIR_SYNCS.with(|c| c.get());
+        journal.take_flight(&mut Arena::new(512), SyncClass::Fsync, false).unwrap().write().unwrap();
+        assert_eq!(
+            DIR_SYNCS.with(|c| c.get()) - dirs,
+            1,
+            "the first syncing flight after a D0 open that reset the log synced the directory a wrong number of times"
+        );
+    }
+
+    /// Engine review 19 LOW 18 (the review 16 MED 5 red took any Corrupt): the damage under raised
+    /// flight B, with whole raised flight C after it, is refused for that reason (the message says
+    /// it lies under a synced flight), and the same log undamaged keeps all three forks: the control.
+    /// Both openers. Mutant `prev_synced_ignored`.
+    #[test]
+    fn damage_under_a_raised_flight_is_refused_as_acknowledged_and_its_control_keeps_every_fork() {
+        for opener in [SyncClass::Off, SyncClass::Fsync] {
+            for damaged in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+                let b_end;
+                {
+                    let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+                    let mut arena = Arena::new(512);
+                    let mut ends = Vec::new();
+                    for child in 1..=3 {
+                        journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                        journal.raise_pending_class(SyncClass::FullFsync);
+                        journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+                        ends.push(journal.len);
+                    }
+                    b_end = ends[1];
+                }
+                if damaged {
+                    overwrite(&files.log, b_end - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+                }
+                let got = Journal::recover(&files, opener);
+                if damaged {
+                    assert!(
+                        matches!(&got, Err(LimboError::Corrupt(m)) if m.contains("lies under a synced flight")),
+                        "{opener:?}: damage under a raised flight with a whole raised flight after it was not refused as acknowledged: {:?}",
+                        got.map(|r| r.map(|r| forks(&r.records)))
+                    );
+                } else {
+                    let kept = got.unwrap().map(|r| forks(&r.records));
+                    assert_eq!(kept, Some(vec![1, 2, 3]), "{opener:?}: the undamaged control lost a fork");
+                }
+            }
+        }
+    }
+
     /// Engine review 10 #3: a log a D1 run synced (acknowledged in Fsync) reopened in D0 has
     /// rewrite class Off: its header was never raised, and the class recovery decided for it was
     /// a local of the open. The first runtime rewrite, a catalog checkpoint's cut or a snapshot
