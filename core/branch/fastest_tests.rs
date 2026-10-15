@@ -8727,3 +8727,49 @@ fn a_view_merge_refused_part_way_merges_each_view_once() {
         }
     }
 }
+
+/// DECISIONS c9c821dd8d (lead, 2026-10-15T04:28:01Z; the cost 82fa78c66 stated): a raised D0 store's
+/// rewrites sync in its raised class, and in a snapshot store the compaction ran inline, under the
+/// store mutex, on the operation that crossed the threshold: a create whose own work syncs nothing
+/// paid the snapshot's, the arena's and the directory's syncs before it returned. It must leave the
+/// acknowledgement path: led by the background writer, the counted hard cap aside. With the
+/// threshold lowered, creates on this thread run until the log has been compacted (it shrank), and
+/// none of them synced on this thread. The catalog store is the control: its fuzzy checkpoint
+/// syncs on a thread of its own already. Mutant `compaction_on_ack_path`.
+#[test]
+fn a_raised_d0_compaction_syncs_off_the_acknowledgement_path() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("raised-compact.db"), catalog, true);
+        // x is kept: nothing is freed, so no held-free upgrade runs.
+        let _x = x.into_id();
+        let _t = Threshold::set(8 << 10);
+        let mut longest = db.branches.log_len_for_test();
+        let mut synced = Vec::new();
+        let t = std::time::Instant::now();
+        loop {
+            let syncs = super::store::thread_syncs();
+            let _ = trunk.fork_branch().unwrap().into_id();
+            let n = super::store::thread_syncs() - syncs;
+            if n > 0 {
+                synced.push(n);
+            }
+            let len = db.branches.log_len_for_test();
+            if len < longest {
+                break;
+            }
+            longest = len;
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(30),
+                "{what}: premise: the log was never compacted ({len} bytes)"
+            );
+        }
+        assert!(db.branches.rewrite_class_for_test().syncs(), "{what}: premise: the compaction synced (a raised log)");
+        assert!(
+            synced.is_empty(),
+            "{what}: creates synced on their own thread ({synced:?} syncs): one ran the raised log's compaction inline"
+        );
+    }
+}
