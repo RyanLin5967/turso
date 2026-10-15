@@ -124,6 +124,7 @@ pub struct NestGuard(());
 
 impl NestGuard {
     #[inline]
+    #[track_caller]
     pub fn enter() -> Result<Self, StackDepthExceeded> {
         let depth = DEPTH.with(|d| d.get());
         let checked = depth > 0 || EXECUTING.with(|e| e.get()) > 0;
@@ -134,7 +135,7 @@ impl NestGuard {
         if refuse {
             return Err(StackDepthExceeded);
         }
-        test_hooks::record(depth);
+        test_hooks::record(depth, std::panic::Location::caller());
         DEPTH.with(|d| d.set(depth + 1));
         Ok(Self(()))
     }
@@ -181,8 +182,9 @@ pub fn with_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
 pub mod test_hooks {
     std::thread_local! {
         static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        static LEFT_AT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+        static LEFT_AT: std::cell::RefCell<Vec<(usize, &'static std::panic::Location<'static>)>> = const { std::cell::RefCell::new(Vec::new()) };
         static WORST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static WORST_AT: std::cell::Cell<Option<(&'static std::panic::Location<'static>, &'static std::panic::Location<'static>)>> = const { std::cell::Cell::new(None) };
         static REENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
@@ -205,12 +207,17 @@ pub mod test_hooks {
     /// take: what one level costs, which the margin must cover. A lower bound on a level's cost:
     /// what the innermost level uses below its own check is not measured.
     pub fn take_worst() -> usize {
+        take_worst_at().0
+    }
+
+    /// `take_worst`, with the two checks (outer, inner) it was measured between.
+    pub fn take_worst_at() -> (usize, Option<(&'static std::panic::Location<'static>, &'static std::panic::Location<'static>)>) {
         LEFT_AT.with(|at| at.borrow_mut().clear());
-        WORST.with(|w| w.replace(0))
+        (WORST.with(|w| w.replace(0)), WORST_AT.with(|w| w.replace(None)))
     }
 
     #[inline]
-    pub(super) fn record(depth: usize) {
+    pub(super) fn record(depth: usize, site: &'static std::panic::Location<'static>) {
         if !ARMED.with(|a| a.get()) {
             return;
         }
@@ -223,10 +230,14 @@ pub mod test_hooks {
             if depth == 0 && super::EXECUTING.with(|e| e.get()) > 0 {
                 REENTERED.with(|r| r.set(r.get() + 1));
             }
-            if let Some(&outer) = at.last() {
-                WORST.with(|w| w.set(w.get().max(outer.saturating_sub(left))));
+            if let Some(&(outer, outer_site)) = at.last() {
+                let gap = outer.saturating_sub(left);
+                if gap > WORST.with(|w| w.get()) {
+                    WORST.with(|w| w.set(gap));
+                    WORST_AT.with(|w| w.set(Some((outer_site, site))));
+                }
             }
-            at.push(left);
+            at.push((left, site));
         });
     }
 }

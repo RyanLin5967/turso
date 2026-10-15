@@ -2089,6 +2089,9 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     eval_at: EvalAt,
     should_emit: impl FnMut(&NonFromClauseSubquery) -> bool,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
+    let _nest = crate::stack::NestGuard::enter("emission")?;
     emit_non_from_clause_subqueries_for_phase(
         program,
         resolver,

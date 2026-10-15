@@ -1676,6 +1676,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
+        // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         // Height of the operand. Leaves keep this default; branches that recurse
         // into sub-expressions overwrite it with `1 + max(child heights)` so the
         // enclosing chain guard (see `parse_expr_inner`) sees their true depth.
@@ -2111,6 +2115,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
+        // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
+        let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let mut result = self.parse_expr_operand()?;
         // Running height of `result`, maintained bottom-up so that a left-deep
         // chain (`a OR b OR c ...`), which this loop consumes iteratively, is

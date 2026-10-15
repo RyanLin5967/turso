@@ -99,6 +99,7 @@ pub(crate) struct NestGuard(#[allow(dead_code)] turso_stack_guard::NestGuard);
 impl NestGuard {
     /// `what` names the step for a reader of the call site; PostgreSQL's message names none.
     #[inline]
+    #[track_caller]
     pub(crate) fn enter(_what: &'static str) -> crate::Result<Self> {
         turso_stack_guard::NestGuard::enter()
             .map(Self)
@@ -145,9 +146,10 @@ mod tests {
                 let mut over = Vec::new();
                 for sql in ["SELECT a FROM v11".to_string(), from, scalar, mixed] {
                     conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
-                    let worst = test_hooks::take_worst();
+                    let (worst, at) = test_hooks::take_worst_at();
                     if worst == 0 || worst >= turso_stack_guard::LEVEL_COST {
-                        over.push(format!("{worst} B between two checks: {sql}"));
+                        let at = at.map(|(o, i)| format!("{o} -> {i}"));
+                        over.push(format!("{worst} B between two checks {at:?}: {}", &sql[..sql.len().min(60)]));
                     }
                 }
                 test_hooks::arm(false);
