@@ -5072,6 +5072,22 @@ pub mod tests {
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use turso_parser::parser::Parser;
 
+    /// The crash batch (lead, 2026-10-15): text that is neither an integer nor a float reached
+    /// `unreachable!()` here when a caller skipped SQLite's grammar (the PostgreSQL translator sent
+    /// '0b1000...' and hex past i64). It must be a parse error, never a panic.
+    #[test]
+    fn a_numeric_literal_that_is_no_number_is_a_parse_error() {
+        for text in ["0b1000", "0o17", "1_000", "abc", "", "0x", "1e", "--1"] {
+            match std::panic::catch_unwind(|| parse_numeric_literal(text)) {
+                Ok(Err(LimboError::ParseError(_))) => {}
+                Ok(other) => panic!("{text:?}: {other:?}; want a ParseError"),
+                Err(_) => panic!("{text:?}: parse_numeric_literal panicked"),
+            }
+        }
+        assert_eq!(parse_numeric_literal("12").unwrap(), Value::from_i64(12));
+        assert_eq!(parse_numeric_literal("1.5").unwrap(), Value::from_f64(1.5));
+    }
+
     #[test]
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");

@@ -4450,6 +4450,9 @@ fn is_create_table_as(upper: &str) -> bool {
 }
 
 #[cfg(test)]
+mod crash_batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
