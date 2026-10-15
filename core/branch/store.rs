@@ -402,6 +402,15 @@ pub(crate) struct Group {
     /// the group's lock just before it is sent (`confirm_notified`).
     #[cfg(test)]
     confirm_notifies: AtomicU64,
+    /// Test builds (fastest-budgets, review C08 #1): the word of the last flight that landed with a
+    /// confirmation (set under the group's lock at its landing), and the words written since that
+    /// landing that are that flight's own (`confirm_tail_words_for_test`). At the end of a burst those
+    /// are the idle tail's words, however late anyone reads them; every other word written was a
+    /// burst's. Atomics only: the writer's write path allocates and locks nothing more in a window.
+    #[cfg(test)]
+    confirm_last_landed: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    confirm_last_landed_writes: AtomicU64,
 }
 
 /// `Group::upgrade_due` while the upgrade it named is being led.
@@ -537,6 +546,10 @@ impl Group {
             confirm_hold: AtomicU8::new(0),
             #[cfg(test)]
             confirm_notifies: AtomicU64::new(0),
+            #[cfg(test)]
+            confirm_last_landed: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            confirm_last_landed_writes: AtomicU64::new(0),
         }
     }
 
@@ -668,6 +681,11 @@ impl Group {
                 // The writer sleeps without a deadline while it holds nothing it may write: woken
                 // when that changes.
                 let wake = confirm.proved() && g.confirm.as_ref().is_none_or(|(_, c)| !c.proved());
+                #[cfg(test)]
+                {
+                    self.confirm_last_landed.store(confirm.word_for_test(), Ordering::Relaxed);
+                    self.confirm_last_landed_writes.store(0, Ordering::Relaxed);
+                }
                 replaced = g.confirm.replace((Instant::now(), confirm));
                 if wake {
                     #[cfg(test)]
@@ -800,6 +818,10 @@ impl Group {
         // Counted without the group's lock (engine review 8 #11).
         match written {
             Ok(()) => {
+                #[cfg(test)]
+                if confirm.word_for_test() == self.confirm_last_landed.load(Ordering::Relaxed) {
+                    self.confirm_last_landed_writes.fetch_add(1, Ordering::Relaxed);
+                }
                 self.confirms_written.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
@@ -7369,6 +7391,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn confirm_wakeups_for_test(&self) -> u64 {
         self.group.lock().confirm_wakeups
+    }
+
+    /// Test builds (fastest-budgets, review C08 #1): the words written since the last landing that
+    /// left a confirmation, of that flight itself (the idle tail's, at a burst's end).
+    #[cfg(test)]
+    pub(crate) fn confirm_tail_words_for_test(&self) -> u64 {
+        self.group.confirm_last_landed_writes.load(Ordering::Relaxed)
     }
 
     /// Test builds (fastest-budgets, review 2 L3, review C14): which wait this store's confirmation

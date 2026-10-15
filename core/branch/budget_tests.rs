@@ -829,29 +829,31 @@ fn load_arm(c: u64, delay_ms: u64) -> String {
 /// Review 2 H1: the confirmation writer under load, with the shipped quiet period (the word NOT
 /// held). For each arm of `CONFIRM_LOAD_ARMS`, C clients make back-to-back creates
 /// (`shared_rounds(C)` each, started together), then the cell waits out the idle tail: at most 1 s
-/// for the word the tail owes, and 20 ms more for a second one that must not come (wall time only to
-/// settle; nothing timed is measured). One line per arm (`load_c{C}`, `load_c{C}_delayed`):
-/// acknowledgements, flights (`group_counters()[0]`),
-/// words written during the burst (`confirms_burst`) and by the end of the tail
-/// (`confirms_total`), and the writer's wake-ups with a word pending
-/// (`confirm_wakeups_for_test`) during the burst.
+/// for the writer to settle with the tail's word written (`writer_settled`), and 20 ms more for a
+/// second one that must not come (wall time only to settle; nothing timed is measured). One line
+/// per arm (`load_c{C}`, `load_c{C}_delayed`): acknowledgements, flights (`group_counters()[0]`),
+/// the words by the flight they confirm (the burst's, `confirms_burst`; the idle tail's,
+/// `confirms_tail`; review C08 #1) and in all (`confirms_total`), the old reading by the time the
+/// parent read them (`confirms_by_read`, reported only), whether the tail settled, the burst's idle
+/// holes (`idle_holes`), and the writer's wake-ups with a word pending (`confirm_wakeups_for_test`)
+/// by the time the parent read them (the delayed arm's include the first of its tail's).
 fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     hold_word(false);
     let words = || db.branch_confirm_counts()[0];
-    let settle = |since: u64| {
-        let t = std::time::Instant::now();
-        while words() == since && t.elapsed() < std::time::Duration::from_secs(1) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    // The idle tail: the writer parked with nothing pending (its word written, `writer_settled`),
+    // then 20 ms more for a second word that must not come. Whether the writer settled.
+    let settle = || {
+        let settled = writer_settled(db, std::time::Duration::from_secs(1));
         std::thread::sleep(std::time::Duration::from_millis(20));
+        settled
     };
     // The population's own tail word is written before the first burst starts.
-    settle(words());
+    settle();
     for (c, delay_ms) in CONFIRM_LOAD_ARMS {
         let rounds = shared_rounds(c);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|s| {
+        let spans: Vec<Vec<(std::time::Instant, std::time::Instant)>> = std::thread::scope(|s| {
             let mut clients = Vec::new();
             for t in 0..c {
                 let go = &go;
@@ -861,9 +863,13 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                         std::thread::yield_now();
                     }
                     let trunk = trunk.unwrap();
+                    let mut spans = Vec::with_capacity(rounds as usize);
                     for i in 0..rounds {
+                        let started = std::time::Instant::now();
                         trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                        spans.push((started, std::time::Instant::now()));
                     }
+                    spans
                 });
                 match spawned {
                     Ok(h) => clients.push(h),
@@ -874,25 +880,55 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                 }
             }
             go.store(true, std::sync::atomic::Ordering::Release);
-            for h in clients {
-                h.join().unwrap();
-            }
+            clients.into_iter().map(|h| h.join().unwrap()).collect()
         });
         // The delayed arm's parent, descheduled on purpose (review C08 #1's schedule).
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
-        settle(w1);
-        let w2 = words();
+        let settled = settle();
+        // Review C08 #1: the words are attributed by the flight they confirm, not by when the parent
+        // read them. The tail's are the last landed flight's own (`confirm_tail_words_for_test`,
+        // counted by the writer as it writes them); every other word written was a burst's.
+        let (w2, tail) = (words(), db.branches.confirm_tail_words_for_test());
+        let total = delta(w0, w2);
         let mut m = Sample::new();
         m.insert("threads", c);
         m.insert("acks", c * rounds);
         m.insert("flights", delta(f0, f1));
-        m.insert("confirms_burst", delta(w0, w1));
-        m.insert("confirms_total", delta(w0, w2));
+        m.insert("confirms_burst", total.saturating_sub(tail));
+        m.insert("confirms_tail", tail);
+        m.insert("confirms_total", total);
+        // The old reading, words by the time the parent read them (reported only).
+        m.insert("confirms_by_read", delta(w0, w1));
+        m.insert("tail_settled", u64::from(settled));
+        m.insert("idle_holes", idle_holes(&spans, std::time::Duration::from_millis(CONFIRM_QUIET_MS_SHIPPED)));
         m.insert("wakeups_burst", delta(k0, k1));
         line(out, cell, &load_arm(c, delay_ms), 0, &m);
     }
     hold_word(true);
+}
+
+/// The shipped quiet period of the confirmation writer, in ms (`CONFIRM_QUIET`, store.rs).
+const CONFIRM_QUIET_MS_SHIPPED: u64 = 5;
+
+/// Review C08 #1: the gaps of at least `quiet` in the union of the creates' spans, each client's
+/// create from its call to its return. Such a gap is an idle period the writer may honestly fill
+/// with a word while the burst still has creates to make; reported, not budgeted (a create stalled
+/// for that long before it joins a flight is one too, and is not seen here).
+fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: std::time::Duration) -> u64 {
+    let mut all: Vec<(std::time::Instant, std::time::Instant)> = spans.iter().flatten().copied().collect();
+    all.sort_by_key(|s| s.0);
+    let Some(&(_, mut end)) = all.first() else {
+        return 0;
+    };
+    let mut holes = 0;
+    for &(start, stop) in &all[1..] {
+        if start > end && start - end >= quiet {
+            holes += 1;
+        }
+        end = end.max(stop);
+    }
+    holes
 }
 
 /// The open-flush cells (lead order, DECISIONS 1334833a4d; review 16 LOW 11's a9ba5adb8): a store's
@@ -3528,8 +3564,15 @@ fn contention_no_flight_waiter_leads_in_vain_at_any_client_count() {
 ///   landing that wakes the group's condition variable, and at most once on its quiet-period timer
 ///   between two flights (a stated constant: a poll wakes many times per flight).
 /// At C = 1 the burst's words are reported and not budgeted: one client's creates do not overlap,
-/// and a gap of 5 ms between two of them is a legitimate idle tail. Mutants `confirm_quiet_zero`,
-/// env `confirm_poll_100us` and `confirm_holds_slot`. WRITTEN NOT RUN.
+/// and a gap of 5 ms between two of them is a legitimate idle tail. Review C08 #1: a word is the
+/// tail's when it is the burst's last landed flight's own and a burst's otherwise (the writer counts
+/// them as it writes them, `confirm_tail_words_for_test`), so a parent descheduled past the quiet
+/// period does not move the idle tail's honest word into the burst; `load_c8_delayed` is that
+/// schedule, a control that must read like `load_c8` (red at a46f64caf, which read the words when
+/// the parent did). The burst's idle holes (`idle_holes`: gaps of 5 ms or more with no create in
+/// progress) are reported beside it: the C >= 8 clause assumes the creates kept a flight in the air,
+/// which a scheduler can break. Mutants `confirm_quiet_zero`, env `confirm_poll_100us` and
+/// `confirm_holds_slot`. WRITTEN NOT RUN.
 #[test]
 fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     if in_child() {
@@ -3541,14 +3584,24 @@ fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     for (c, delay_ms) in CONFIRM_LOAD_ARMS {
         let op = load_arm(c, delay_ms);
         let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
-        let (flights, burst, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_total"], s["wakeups_burst"]);
+        let (flights, burst, tail, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_tail"], s["confirms_total"], s["wakeups_burst"]);
         assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
-        let _ = write!(seen, " {op}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
+        assert_eq!(burst + tail, total, "confirm_load: {op}: the words attributed do not add up");
+        let _ = write!(
+            seen,
+            " {op}: {} acks, {flights} flights, words {burst} in the burst and {tail} in the tail ({} by the parent's read), {} idle holes, {wakes} wake-ups;",
+            s["acks"],
+            s["confirms_by_read"],
+            s["idle_holes"]
+        );
+        if s["tail_settled"] != 1 {
+            let _ = writeln!(failures, "  {op}: the writer never settled in the idle tail (1 s); premise: the tail's words are all counted");
+        }
         if c >= 8 && burst != 0 {
             let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
         }
-        if total - burst > 1 {
-            let _ = writeln!(failures, "  {op}: {} words in the idle tail after the burst; budget <= 1", total - burst);
+        if tail > 1 {
+            let _ = writeln!(failures, "  {op}: {tail} words in the idle tail after the burst; budget <= 1");
         }
         if wakes > 2 * flights {
             let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
