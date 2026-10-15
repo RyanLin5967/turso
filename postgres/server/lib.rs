@@ -5082,6 +5082,64 @@ mod tests {
         );
     }
 
+    /// Wire review 18 item 14 and its appendix: the parameter-type walk opens a view chain of any
+    /// depth. Over v1..v40, each reading the one before, `SELECT * FROM v40 WHERE x = $1` types
+    /// `$1` int4 at its first Describe, with at most 41 libpg_query calls (each view once and the
+    /// statement), and again after a Sync. The walk cut every view past 32 levels
+    /// (MAX_VIEW_DEPTH, a bound against the session thread's stack), so the same Describe was
+    /// 42P18 cold and int4 once a shallower statement had memoised the views: the answer depended
+    /// on what the connection had prepared before.
+    #[test]
+    fn a_view_chain_of_any_depth_is_typed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "CREATE VIEW v1 AS SELECT id AS x FROM t");
+        for k in 2..=40 {
+            ok(
+                &s,
+                &format!("CREATE VIEW v{k} AS SELECT x FROM v{p}", p = k - 1),
+            );
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            let sql = "SELECT * FROM v40 WHERE x = $1";
+            s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                .await
+                .unwrap();
+            for round in 0..2 {
+                let before = turso_pg_parser::libpg_query_calls();
+                if let Err(e) = s
+                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await
+                {
+                    panic!("round {round}: Describe refused: {e:?}");
+                }
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
+                let params: Vec<Vec<u32>> = c
+                    .replies
+                    .drain(..)
+                    .filter_map(|reply| match reply {
+                        PgWireBackendMessage::ParameterDescription(d) => Some(d.types),
+                        PgWireBackendMessage::ErrorResponse(e) => panic!("round {round}: {e:?}"),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(params, vec![vec![23]], "round {round}");
+                if round == 0 {
+                    assert!(
+                        calls <= 41,
+                        "{calls} libpg_query calls at the first Describe"
+                    );
+                }
+            }
+        });
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
