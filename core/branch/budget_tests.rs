@@ -910,7 +910,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                             }
                         }
                         let started = std::time::Instant::now();
-                        trunk.create_branch(&format!("load{c}-{t}-{i:04}")).unwrap();
+                        trunk.create_branch(&format!("load{c}-d{delay_ms}-g{}-{t}-{i:04}", u8::from(gap))).unwrap();
                         spans.push((started, std::time::Instant::now()));
                     }
                     spans
