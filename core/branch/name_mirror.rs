@@ -20,6 +20,11 @@ use std::hash::Hasher;
 /// Unused arena bytes below which the arena is never rewritten.
 const COMPACT_FLOOR: usize = 1 << 20;
 
+/// The longest probe a lookup may make (the mirror adversary's MED-1): a table that would need a
+/// longer one is refused, and the catalog answers instead. Linear probing at load 3/4 over 2^21
+/// buckets expects a longest run of about 400 (ln n / (a - 1 - ln a)).
+pub(crate) const MAX_PROBE: usize = 4096;
+
 /// The smallest table.
 const MIN_BUCKETS: usize = 16;
 
@@ -36,9 +41,17 @@ pub(crate) struct NameMirror {
     /// Bytes in `free` (or otherwise unused).
     garbage: usize,
     len: usize,
+    /// Test builds (the mirror adversary's MED-1/MED-2 reds): a hash in place of the real one, and
+    /// the arena rewrite's floor in place of `COMPACT_FLOOR`; the rewrites done.
+    #[cfg(test)]
+    pub(crate) hash_override: Option<fn(&[u8]) -> u64>,
+    #[cfg(test)]
+    pub(crate) floor_override: Option<usize>,
+    #[cfg(test)]
+    pub(crate) rewrites: u64,
 }
 
-fn hash(name: &[u8]) -> u64 {
+fn fx_hash(name: &[u8]) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     h.write(name);
     // FxHash's low bits are weak for short keys; fold the high half in for the bucket index.
@@ -60,6 +73,31 @@ fn leb_len(mut n: usize) -> usize {
 }
 
 impl NameMirror {
+    fn hash(&self, name: &[u8]) -> u64 {
+        #[cfg(test)]
+        if let Some(h) = self.hash_override {
+            return h(name);
+        }
+        fx_hash(name)
+    }
+
+    /// Test builds: whether the mirror refused a table it could not bound (none yet: the red).
+    #[cfg(test)]
+    pub(crate) fn refused(&self) -> bool {
+        false
+    }
+
+    /// Test builds: the longest probe from a name's home bucket to its entry.
+    #[cfg(test)]
+    pub(crate) fn max_probe(&self) -> usize {
+        let mask = self.tags.len().saturating_sub(1);
+        (0..self.tags.len())
+            .filter(|&b| self.tags[b] != 0)
+            .map(|b| b.wrapping_sub(self.hash(self.name_bytes(self.entries[b][0])) as usize) & mask)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// A mirror of a scan's `(name, id)` pairs (each name once, as `branch_name` holds it), sized
     /// exactly: one arena allocation and one table, nothing grown.
     pub(crate) fn from_pairs<S: AsRef<str>>(pairs: impl ExactSizeIterator<Item = (S, u64)> + Clone) -> Self {
@@ -92,7 +130,7 @@ impl NameMirror {
             self.resize(buckets_for(self.len + 1).max(self.tags.len() * 2));
         }
         let off = self.intern(name.as_bytes());
-        let h = hash(name.as_bytes());
+        let h = self.hash(name.as_bytes());
         let mask = self.tags.len() - 1;
         let mut b = h as usize & mask;
         while self.tags[b] != 0 {
@@ -116,7 +154,7 @@ impl NameMirror {
             if self.tags[j] == 0 {
                 break;
             }
-            let k = hash(self.name_bytes(self.entries[j][0])) as usize & mask;
+            let k = self.hash(self.name_bytes(self.entries[j][0])) as usize & mask;
             let stays = if i <= j { i < k && k <= j } else { i < k || k <= j };
             if !stays {
                 self.tags[i] = self.tags[j];
@@ -127,7 +165,11 @@ impl NameMirror {
         self.tags[i] = 0;
         self.entries[i] = [0; 3];
         self.len -= 1;
-        if self.garbage > COMPACT_FLOOR && self.garbage > self.bytes.len() - self.garbage {
+        #[cfg(test)]
+        let floor = self.floor_override.unwrap_or(COMPACT_FLOOR);
+        #[cfg(not(test))]
+        let floor = COMPACT_FLOOR;
+        if self.garbage > floor && self.garbage > self.bytes.len() - self.garbage {
             self.compact();
         }
         Some(id)
@@ -149,7 +191,7 @@ impl NameMirror {
         if self.tags.is_empty() {
             return None;
         }
-        let h = hash(name);
+        let h = self.hash(name);
         let (mask, t) = (self.tags.len() - 1, tag(h));
         let mut b = h as usize & mask;
         loop {
@@ -245,6 +287,10 @@ impl NameMirror {
         self.bytes = bytes;
         self.free = HashMap::new();
         self.garbage = 0;
+        #[cfg(test)]
+        {
+            self.rewrites += 1;
+        }
     }
 
     fn resize(&mut self, buckets: usize) {
@@ -255,7 +301,7 @@ impl NameMirror {
             if t == 0 {
                 continue;
             }
-            let mut b = hash(self.name_bytes(e[0])) as usize & mask;
+            let mut b = self.hash(self.name_bytes(e[0])) as usize & mask;
             while self.tags[b] != 0 {
                 b = (b + 1) & mask;
             }
@@ -337,6 +383,84 @@ mod tests {
             assert_eq!(m.get(n), Some(BranchId(i as u64)));
         }
         assert_eq!(m.get(&names[0]), None);
+    }
+
+    /// MED-1 (the mirror adversary): 10^4 names that all hash alike (a planted hash) are refused, or
+    /// every lookup stays within `MAX_PROBE`. Red before the bound: the probes grow with the names.
+    #[test]
+    fn colliding_names_are_refused_or_bounded() {
+        let mut m = NameMirror { hash_override: Some(|_| 0x1234_5678), ..NameMirror::default() };
+        for i in 0..10_000u64 {
+            m.insert(&format!("flood-{i}"), BranchId(i));
+            if m.refused() {
+                break;
+            }
+        }
+        assert!(
+            m.refused() || m.max_probe() <= MAX_PROBE,
+            "10^4 colliding names: longest probe {}, refused {}; budget {MAX_PROBE} or a refusal",
+            m.max_probe(),
+            m.refused()
+        );
+    }
+
+    /// The homes the wrap cases plant: names "a", "b" and "c" at buckets 15, 15 and 0 of 16.
+    fn planted(name: &[u8]) -> u64 {
+        match name {
+            b"a" | b"b" => 15,
+            b"c" => 0,
+            _ => 7,
+        }
+    }
+
+    /// MED-2: a probe run that crosses index 0. Removing the run's first entry (at 15) shifts the
+    /// two after it back across the wrap; removing the one that wrapped (at 0) shifts the third.
+    #[test]
+    fn a_removal_shifts_a_run_back_across_index_0() {
+        for gone in ["a", "b", "c"] {
+            let mut m = NameMirror { hash_override: Some(planted), ..NameMirror::default() };
+            m.resize(16);
+            for (i, n) in ["a", "b", "c"].iter().enumerate() {
+                m.insert(n, BranchId(i as u64 + 1));
+            }
+            assert_eq!(m.tags.len(), 16, "premise: one table of 16 buckets");
+            assert!(m.tags[15] != 0 && m.tags[0] != 0 && m.tags[1] != 0, "premise: the run is 15, 0, 1");
+            m.remove(gone);
+            for (i, n) in ["a", "b", "c"].iter().enumerate() {
+                let want = (*n != gone).then_some(BranchId(i as u64 + 1));
+                assert_eq!(m.get(n), want, "after removing {gone}: {n}");
+            }
+            assert_eq!(m.max_probe() <= 1, true, "after removing {gone}: the run was not shifted back");
+        }
+    }
+
+    /// MED-2: the random operations with the rewrite's floor lowered to 256 bytes, so the arena is
+    /// rewritten many times and freed spans are reused after each rewrite; equal to a std map
+    /// throughout, and the rewrites are counted (a run with none fails).
+    #[test]
+    fn the_mirror_equals_a_std_map_across_arena_rewrites() {
+        for seed in [3u64, 11, 0xfeed] {
+            let mut s = seed;
+            let mut m = NameMirror { floor_override: Some(256), ..NameMirror::default() };
+            let mut model: HashMap<Arc<str>, BranchId> = HashMap::new();
+            for step in 0..40_000u64 {
+                let r = next(&mut s);
+                let k = r % 1_500;
+                let name = if (r >> 20) % 7 == 0 { format!("{k}-{}", "y".repeat(140)) } else { format!("r{k}") };
+                if (r >> 40) % 2 == 0 {
+                    assert_eq!(m.remove(&name), model.remove(name.as_str()), "seed {seed} step {step}: remove {name}");
+                } else {
+                    let id = BranchId(next(&mut s));
+                    m.insert(&name, id);
+                    model.insert(Arc::from(name.as_str()), id);
+                }
+                if step % 97 == 0 {
+                    assert!(m.same_as(&model), "seed {seed} step {step}: the mirror differs from the model");
+                }
+            }
+            assert!(m.same_as(&model));
+            assert!(m.rewrites > 0, "seed {seed}: premise: the arena was rewritten");
+        }
     }
 
     /// Ids above 2^32 survive the split into two halves.

@@ -607,7 +607,30 @@ fn mirror_bytes(cell: &str, out: &mut String) {
         line(out, cell, "mirror", i as u64, &Sample::from([("names", n), ("kept_bytes", kept)]));
         drop(mirror);
     }
+    // The mirror adversary's MED-3: the WORST states, at a load of exactly 3/4 (3 * 2^k / 4 names):
+    // straight after one more insert (the table and the arena each grow once), and after a churn
+    // cycle (every other name removed, as many new ones put).
+    for (i, &n) in MIRROR_WORST_NS.iter().enumerate() {
+        let before = probe::live_heap_bytes();
+        let pairs: Vec<(Arc<str>, u64)> = (0..n).map(|i| (Arc::from(format!("pop-{i}").as_str()), 16 + i)).collect();
+        let mut mirror = super::store::name_mirror_from_pairs(pairs);
+        mirror.insert("pop-extra", BranchId(1));
+        let kept = u64::try_from(probe::live_heap_bytes() - before).expect("negative heap: the count is broken");
+        line(out, cell, "mirror_worst_insert", i as u64, &Sample::from([("names", n + 1), ("kept_bytes", kept)]));
+        for j in (0..n).step_by(2) {
+            mirror.remove(&format!("pop-{j}"));
+        }
+        for j in 0..n.div_ceil(2) {
+            mirror.insert(&format!("churn-{j}"), BranchId(16 + n + j));
+        }
+        let kept = u64::try_from(probe::live_heap_bytes() - before).expect("negative heap: the count is broken");
+        line(out, cell, "mirror_worst_churn", i as u64, &Sample::from([("names", mirror.len() as u64), ("kept_bytes", kept)]));
+        drop(mirror);
+    }
 }
+
+/// Load-3/4 name counts for the worst-state readings: 3/4 of 2^14, 2^17 and 2^20.
+const MIRROR_WORST_NS: [u64; 3] = [12_288, 98_304, 786_432];
 
 /// Branches the written tail rewrites and first-writes (`written_tail`).
 const WTAIL: u64 = 8;
@@ -991,6 +1014,19 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     put_exceptions(&mut s, [0; 4], exc);
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
+    // The first install after the mirror's build, with one new name in it: its largest hold.
+    let e0 = exceptions(&db);
+    let _ = probe::take_hold_maxima();
+    let trunk = db.connect().unwrap();
+    trunk.create_branch("mirror-install-0").unwrap();
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    let maxima = probe::take_hold_maxima();
+    let mut m = Sample::new();
+    put_exceptions(&mut m, e0, exceptions(&db));
+    m.insert("max_hold_alloc_bytes", maxima.all.0);
+    m.insert("max_bg_hold_alloc_bytes", maxima.background.0);
+    line(out, cell, "mirror_install", 0, &m);
 }
 
 /// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
@@ -3458,6 +3494,53 @@ fn leap_l4_the_name_mirror_keeps_at_most_48_bytes_per_name() {
         }
     }
     assert!(failures.is_empty(), "the name mirror is over budget (all:{seen}):\n{failures}");
+}
+
+/// The mirror adversary's MED-3 (DECISIONS f398de1ff0): the name mirror at its WORST states keeps at
+/// most 56 B per name: right after the insert that grows a table at load 3/4, and after a churn
+/// cycle (cell `mirror_bytes`, `MIRROR_WORST_NS`). Registered before the first reading, from the
+/// design: 13 B per bucket at the lowest load after growth (3/8) is 34.7 B, and the arena may hold
+/// as much garbage as live bytes (2 x an 8-10 B name with its length): 34.7 + 20 = 54.7, rounded up.
+#[test]
+fn leap_l4_the_name_mirror_keeps_at_most_56_bytes_per_name_at_its_worst() {
+    if in_child() {
+        return;
+    }
+    let c = cell("mirror_bytes");
+    let mut failures = String::new();
+    let mut seen = String::new();
+    for op in ["mirror_worst_insert", "mirror_worst_churn"] {
+        let s = &c.ops[op];
+        assert_eq!(s.len(), MIRROR_WORST_NS.len(), "premise: one {op} line per name count");
+        for m in s {
+            let (n, kept) = (m["names"], m["kept_bytes"]);
+            let per = kept as f64 / n as f64;
+            let _ = write!(seen, " {op} {n}: {per:.1} B/name;");
+            if per > 56.0 {
+                let _ = writeln!(failures, "  {op}, {n} names: {per:.1} B per name ({kept} B); budget 56");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "the name mirror at its worst is over budget (all:{seen}):\n{failures}");
+}
+
+/// The mirror adversary's LOW-1 / class (4) (DECISIONS f398de1ff0): the first checkpoint install after
+/// the mirror is built, carrying one new name, allocates no more in its largest store-mutex hold at
+/// 10^5 named branches than at 10^4 (+ 4 KiB): no O(N) grow, rehash or rewrite of the mirror under
+/// the mutex (cells `mem_n1e4`, `mem_n1e5`, line `mirror_install`). Expected RED: the mirror's arena,
+/// built exactly, doubles under the mutex at that insert.
+#[test]
+fn the_first_install_after_the_mirror_grows_nothing_under_the_store_mutex() {
+    if in_child() {
+        return;
+    }
+    let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
+    let (sa, sb) = (&a.ops["mirror_install"][0], &b.ops["mirror_install"][0]);
+    let (ha, hb) = (sa["max_hold_alloc_bytes"], sb["max_hold_alloc_bytes"]);
+    assert!(
+        hb <= ha + 4096,
+        "the first install after the mirror's build: largest hold allocates {ha} B at {N_LARGE}, {hb} B at {N_HUGE}; budget the same + 4 KiB"
+    );
 }
 
 /// LEAP L4 2b, batched (lead, DECISIONS 81152ec501): over the written tail (`wtail_n10`,
