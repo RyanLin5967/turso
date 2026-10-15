@@ -306,10 +306,39 @@ def record_problems(nm, sm):
     return why
 
 
+def after_problems(nm, sm, cols):
+    """Comp review 1 MED 9: a bbload run (mode closed or open) times each after-step apart, as the macOS bbload does
+    (4010ff3b06:1183): raw.tsv columns after1_ns .. afterK_ns, K its spec's after_steps, and none when --skip-after ran
+    no after-step (skip_after); and it names what its tput_* count (tput_unit): 'cycle' -- an op plus its untimed
+    after-steps, which run inside the client's loop before its next claim -- when after-steps ran, else 'op'.
+    clonebench (mode b1, b0) runs no after-step and has no after record; any other mode is record_problems' refusal."""
+    if sm.get("mode") not in ("closed", "open"):
+        return []
+    na, skip = sm.get("after_steps"), sm.get("skip_after")
+    why = []
+    if not _count(na):
+        why.append(f"{nm} run has no after_steps record ({na!r})")
+    if not isinstance(skip, bool):
+        why.append(f"{nm} run has no skip_after record ({skip!r})")
+    if why:
+        return why
+    k = 0 if skip else na
+    got = {c for c in cols if re.fullmatch(r"after\d+_ns", c)}
+    want = {f"after{i + 1}_ns" for i in range(k)}
+    if got != want:
+        why.append(f"{nm} run ran {k} after-step(s) (after_steps {na}, skip_after {skip}) but its raw.tsv's after "
+                   f"columns are {sorted(got) or 'none'}, not {sorted(want) or 'none'}")
+    unit = "cycle" if k else "op"
+    if sm.get("tput_unit") != unit:
+        why.append(f"{nm} run's tput_unit {sm.get('tput_unit')!r} is not {unit!r} ({k} after-step(s) ran per op)")
+    return why
+
+
 def raw_problems(nm, d, sm):
     """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
-    per warm-up op, and (competitors review 2 item 1) no measured row intended at or after tm1_ns, the window's end as
-    claim_op stamped it in intended time."""
+    per warm-up op, (competitors review 2 item 1) no measured row intended at or after tm1_ns, the window's end as
+    claim_op stamped it in intended time, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
+    (after_problems)."""
     p = os.path.join(d, "raw.tsv")
     try:
         with open(p) as f:
@@ -320,7 +349,7 @@ def raw_problems(nm, d, sm):
         return [f"{nm} run has no raw.tsv"]
     if "phase" not in cols or "intended_ns" not in cols:
         return [f"{nm} run's raw.tsv has no phase or intended_ns column"]
-    why = []
+    why = after_problems(nm, sm, cols)
     wo = sm.get("warmup_ops")
     nwarm = sum(1 for r in rows if r["phase"] == "warmup")
     if _count(wo) and nwarm != wo:

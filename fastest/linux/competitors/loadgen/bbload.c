@@ -73,7 +73,8 @@
  *   step write <sql>              timed; must succeed AND affect >= 1 row
  *   step connect <overrides>      timed; open a new connection (home conninfo + overrides) that becomes current
  *   step close                    timed; close the current non-home connection
- *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns
+ *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns (all of
+ *                                 them and the closing of a branch connection) and each apart as after<k>_ns
  *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
  *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
  *   teardown <sql>                once per connection at the end, untimed
@@ -82,8 +83,9 @@
  *                                 (tools/c1b); label = "<phase>:<detail>", templates allowed
  * A non-home connection still open at the end of an op is closed, untimed.
  *
- * Output (OUT must not exist): spec.txt, raw.tsv (one row per op), hdr_total.txt and hdr_step<k>.txt (HDR
- * percentile distributions of the measured ops), errors.txt, summary.json.
+ * Output (OUT must not exist): spec.txt, raw.tsv (one row per op), hdr_total.txt, hdr_step<k>.txt and
+ * hdr_after<k>.txt (HDR percentile distributions of the measured ops; no after-step file under --skip-after),
+ * errors.txt, summary.json (tput_unit: "cycle" when after-steps ran, so tput_* count an op and its after-steps; "op").
  * V1 marks (--v1-run): a server stays attached to one V1 run for its whole life, so each invocation marks in its
  * own namespace B (default: (epoch seconds & 0x7fffff) << 32, written to summary.json as v1_mark_base). C=1: op seq
  * k is marked B+k+1 from just before its first byte to its acknowledgement, then V1_MARK_IDLE|(B+k+1) until the
@@ -172,11 +174,12 @@ typedef struct { int proto; PGconn *pg; MYSQL *my; } conn_t;
 
 typedef struct {
     uint32_t client, seq, arrival; /* arrival: the open-loop arrival index (0 closed loop), as the macOS oprec */
-    uint8_t phase, ok, nsteps, pad;
+    uint8_t phase, ok, nsteps, nafter; /* nafter: the after-steps run (0 under --skip-after) */
     int16_t err;
     uint64_t free, claim; /* the client's free time (its previous op's after_end, or t0) and the claim's time */
     uint64_t intended, start, end, after_end;
     uint64_t step_end[MAXSTEPS];
+    uint64_t aft_start, aft_end[MAXAFTER]; /* comp review 1 MED 9: the after-steps' start and each one's end */
 } oprec;
 
 typedef struct {
@@ -899,7 +902,10 @@ static void *client_main(void *arg) {
         }
         r.end = now_ns();
         if (V1 && C == 1) v1_set_mark(V1, V1_MARK_IDLE | (MARKB + seq + 1));
-        for (int k = 0; !SKIP_AFTER && k < S.nafter; k++)
+        /* comp review 1 MED 9: each after-step timed apart, as the macOS bbload does (4010ff3b06:1027-1035): it ends at
+         * aft_end[k], after<k+1>_ns in raw.tsv, hdr_after<k+1>.txt and summary after_us; nafter: the after-steps run */
+        r.aft_start = now_ns();
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k)
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
@@ -1172,7 +1178,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < C; i++) pthread_join(CL[i].th, NULL);
     if (V1) v1_set_mark(V1, 0);
 
-    /* Raw first. */
+    /* Raw first. NA: the after-steps every op ran (none under --skip-after), each timed apart (comp review 1 MED 9) */
+    const int NA = SKIP_AFTER ? 0 : S.nafter;
     size_t total = 0;
     for (int i = 0; i < C; i++) total += CL[i].nrec;
     oprec *all = malloc((total ? total : 1) * sizeof *all);
@@ -1186,6 +1193,7 @@ int main(int argc, char **argv) {
      * start - max(intended, free), empty in closed loop (0 by construction there) */
     fprintf(f, "client\tseq\tphase\tok\tarrival\tfree_ns\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\tsend_late_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
+    for (int s = 0; s < NA; s++) fprintf(f, "\tafter%d_ns", s + 1); /* the macOS columns (4010ff3b06:1183) */
     fprintf(f, "\tafter_ns\terr\n");
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
@@ -1198,6 +1206,11 @@ int main(int argc, char **argv) {
         uint64_t prev = o->start;
         for (int s = 0; s < S.nstep; s++) {
             if (s < o->nsteps) { fprintf(f, "\t%llu", (unsigned long long)(o->step_end[s] - prev)); prev = o->step_end[s]; }
+            else fprintf(f, "\t");
+        }
+        prev = o->aft_start;
+        for (int s = 0; s < NA; s++) {
+            if (s < o->nafter) { fprintf(f, "\t%llu", (unsigned long long)(o->aft_end[s] - prev)); prev = o->aft_end[s]; }
             else fprintf(f, "\t");
         }
         fprintf(f, "\t%llu\t%d\n", (unsigned long long)(o->after_end - o->end), o->err);
@@ -1220,9 +1233,10 @@ int main(int argc, char **argv) {
     if (fclose(f) != 0) { fprintf(stderr, "bbload: backends.tsv close failed\n"); return 2; }
 
     /* Summary from the raw records. */
-    struct hdr_histogram *ht, *hs[MAXSTEPS];
+    struct hdr_histogram *ht, *hs[MAXSTEPS], *ha[MAXAFTER];
     hdr_init(1, INT64_C(3600000000000), 3, &ht);
     for (int s = 0; s < S.nstep; s++) hdr_init(1, INT64_C(3600000000000), 3, &hs[s]);
+    for (int s = 0; s < NA; s++) hdr_init(1, INT64_C(3600000000000), 3, &ha[s]);
     uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0, drain = 0;
     double sum = 0;
     uint64_t *late = malloc((total ? total : 1) * sizeof *late);
@@ -1242,9 +1256,12 @@ int main(int argc, char **argv) {
         hdr_record_value(ht, (int64_t)lat);
         uint64_t prev = o->start;
         for (int s = 0; s < o->nsteps; s++) { hdr_record_value(hs[s], (int64_t)(o->step_end[s] - prev)); prev = o->step_end[s]; }
+        prev = o->aft_start;
+        for (int s = 0; s < o->nafter && s < NA; s++) { hdr_record_value(ha[s], (int64_t)(o->aft_end[s] - prev)); prev = o->aft_end[s]; }
     }
     hdr_out(ht, out, "hdr_total.txt");
     for (int s = 0; s < S.nstep; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_step%d.txt", s + 1); hdr_out(hs[s], out, nm); }
+    for (int s = 0; s < NA; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_after%d.txt", s + 1); hdr_out(ha[s], out, nm); }
     qsort(late, nlate, sizeof *late, cmp_u64);
     double late_p50 = pct(late, nlate, 50) / 1e3, late_p99 = pct(late, nlate, 99) / 1e3, late_max = nlate ? late[nlate - 1] / 1e3 : 0;
     free(late);
@@ -1325,6 +1342,12 @@ int main(int argc, char **argv) {
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
+    /* comp review 1 MED 9: what tput_* count. A client claims its next op only after this op's untimed after-steps,
+     * so with after-steps run they count CYCLES (an op and its after-steps), not ops. A branch connection's close
+     * with no after-step (--skip-after, or pg18-m1-c1b) is also untimed client work before the next claim, and is
+     * not in this label: no throughput is read from those runs (the driver's designated branches, the kept arm and
+     * the C1b helper) */
+    fprintf(f, "\"tput_unit\":\"%s\",", NA ? "cycle" : "op");
     /* claim_op's window, stamped at claims on the run's clock (t0, tm0, tm1), the measured count it fixed, and the
      * drain ops it ran after tm1 (comp review 1 LOW 40, review 2 item 1); the arrival stream's identity (seed always;
      * schedule_hash and schedule_arrivals in open loop) and its lateness record (review 2 items 2 and 3) */
@@ -1368,6 +1391,14 @@ int main(int argc, char **argv) {
         fprintf(f, "%s{\"step\":%d,\"kind\":\"%s\",\"p50\":%.1f,\"p99\":%.1f}", s ? "," : "", s + 1,
                 S.step[s].k == K_SQL ? "sql" : S.step[s].k == K_WRITE ? "write" : S.step[s].k == K_CONNECT ? "connect" : "close",
                 hdr_value_at_percentile(hs[s], 50) / 1e3, hdr_value_at_percentile(hs[s], 99) / 1e3);
+    /* comp review 1 MED 9: each after-step apart over the measured ok ops, as the macOS after_us (4010ff3b06:1470) --
+     * M4's separately timed delete; a sql-serial step's time includes its wait for the one-at-a-time lock */
+    fprintf(f, "],\"after_us\":[");
+    for (int s = 0; s < NA; s++)
+        fprintf(f, "%s{\"after\":%d,\"kind\":\"%s\",\"p50\":%.1f,\"p99\":%.1f}", s ? "," : "", s + 1,
+                S.after[s].serial ? "sql-serial" : S.after[s].k == K_SQL ? "sql" : S.after[s].k == K_WRITE ? "write"
+                : S.after[s].k == K_CONNECT ? "connect" : "close",
+                hdr_value_at_percentile(ha[s], 50) / 1e3, hdr_value_at_percentile(ha[s], 99) / 1e3);
     fprintf(f, "],\"errors\":%d}\n", g_nerr);
     fclose(f);
     printf("bbload %s: C=%d %s window %.2fs measured %llu ok %llu err %llu  tput %.1f/s  p50 %.1f us p99 %.1f us  client cpu %.2f cores -> %s\n",
