@@ -3071,6 +3071,40 @@ fn a_derived_tables_boolean_column_stays_boolean() {
     }
 }
 
+/// A `*` over a table beside a derived item's boolean column lines the result up with the table's
+/// width, so the boolean stays boolean (recorded, artie raw loud-20261015/pg18-diff/
+/// pg18-tablestar.out; the regress corpus's join.sql `p.*, linked`): the typing walk could not
+/// expand a table's `*` and left every column to the engine, which announced the boolean bytea.
+#[test]
+fn a_tables_star_beside_a_derived_boolean_keeps_it_boolean() {
+    let dir = Scratch::new("tablestar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE parent (k int primary key, pd int)").ok("parent");
+    a.q("CREATE TABLE child (k int unique, cd int)").ok("child");
+    a.q("INSERT INTO parent VALUES (1, 10), (2, 20)").ok("parent rows");
+    a.q("INSERT INTO child VALUES (1, 100), (4, 400)").ok("child rows");
+    for (sql, rows) in [
+        (
+            "SELECT p.*, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) \
+             AS ss ON (p.k = ss.k) ORDER BY p.k",
+            vec![vec![t("1"), t("10"), t("t")], vec![t("2"), t("20"), None]],
+        ),
+        (
+            "SELECT * FROM parent p, (SELECT true AS b) s ORDER BY p.k",
+            vec![vec![t("1"), t("10"), t("t")], vec![t("2"), t("20"), t("t")]],
+        ),
+        (
+            "SELECT * FROM (SELECT c.*, k > 1 AS big FROM child c) s ORDER BY k",
+            vec![vec![t("1"), t("100"), t("f")], vec![t("4"), t("400"), t("t")]],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![23, 23, 16]), rows), "{sql}");
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
