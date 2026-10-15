@@ -543,6 +543,13 @@ pub(crate) struct Catalog {
     /// Whether this catalog's `branch` table has the link columns (format 21/22, or a 17-20 one
     /// after its upgrade): `branch_get` reads them and `link_stmts` exist only then.
     links: bool,
+    /// The format version this handle knows the meta row to carry, committed (read by `meta`,
+    /// committed by its own `put_meta`, or another handle's commit, `note_recorded`): the row links
+    /// are valid only when it carries them (links adversary L2, `links_valid`). `None`: not known
+    /// (no meta row read or written), which never makes links valid.
+    recorded: Option<u32>,
+    /// A `put_meta`'s version, recorded at this handle's commit and dropped at its rollback.
+    pending_recorded: Option<u32>,
     link_stmts: Option<LinkStmts>,
     /// Every row's (id, parent, fork epoch) in the children index's order: the upgrade's fill.
     child_ids_all: Stmt,
@@ -659,7 +666,9 @@ impl Catalog {
     /// connection keeps serving on-demand reads from a pinned snapshot.
     pub(crate) fn writer(&self, sync: SyncClass) -> Result<Catalog> {
         let conn = self._db.connect()?;
-        Self::prepared(self._db.clone(), conn, sync)
+        let mut w = Self::prepared(self._db.clone(), conn, sync)?;
+        w.recorded = self.recorded;
+        Ok(w)
     }
 
     /// Set a connection's pragmas and prepare every statement on it.
@@ -678,6 +687,8 @@ impl Catalog {
         let links = has_link_columns(&conn)?;
         Ok(Catalog {
             links,
+            recorded: None,
+            pending_recorded: None,
             link_stmts: if links { Some(Self::link_stmts(&conn)?) } else { None },
             child_ids_all: p("SELECT id, parent, fork_epoch FROM branch ORDER BY parent, fork_epoch")?,
             meta_all: p("SELECT k, v FROM meta")?,
@@ -778,9 +789,24 @@ impl Catalog {
         })
     }
 
-    /// Whether the `branch` table has the link columns.
+    /// Whether the `branch` table has the link columns (test builds: their accessor; the store
+    /// reads `links_valid`).
+    #[cfg(test)]
     pub(crate) fn links(&self) -> bool {
         self.links
+    }
+
+    /// Whether the rows' links are valid (links adversary L2): the columns exist AND the meta row
+    /// carries a version that keeps them (21, 22). Columns under an older meta row (a state no build
+    /// writes) hold nothing meaningful: their NULLs are not "no neighbour", and the upgrade fills
+    /// them as any 17-20 catalog's.
+    pub(crate) fn links_valid(&self) -> bool {
+        self.links && self.recorded.is_some_and(super::journal::carries_links)
+    }
+
+    /// Another handle on this catalog (the checkpoint writer) committed the meta row at `format`.
+    pub(crate) fn note_recorded(&mut self, format: u32) {
+        self.recorded = Some(format);
     }
 
     /// Read the table's columns again and prepare the statements that use the link columns: after
@@ -802,8 +828,12 @@ impl Catalog {
     /// columns added, no row linked) and `ckpt.upgrade.rows` (every row linked, before the meta row
     /// and the commit): a kill at either leaves the catalog as it was, by the transaction.
     pub(crate) fn upgrade_links(&mut self) -> Result<()> {
-        for sql in LINK_COLUMNS {
-            self.conn.execute(sql)?;
+        // Columns already there under an older meta row (L2: no build writes that) are filled
+        // like new ones.
+        if !self.links {
+            for sql in LINK_COLUMNS {
+                self.conn.execute(sql)?;
+            }
         }
         // Mutant `l4_upgrade_columns_committed_alone` (test builds only): the columns committed in a
         // transaction of their own (the kill test's fire-check: a kill after it leaves 17 with them).
@@ -1033,6 +1063,10 @@ impl Catalog {
                 m.format
             )));
         }
+        // Committed, as read; a write of this handle's own not yet committed is still pending.
+        if self.pending_recorded.is_none() {
+            self.recorded = Some(m.format);
+        }
         Ok(Some(m))
     }
 
@@ -1148,6 +1182,9 @@ impl Catalog {
 
     pub(crate) fn commit(&mut self) -> Result<()> {
         self.conn.execute("COMMIT")?;
+        if let Some(format) = self.pending_recorded.take() {
+            self.recorded = Some(format);
+        }
         Ok(())
     }
 
@@ -1197,10 +1234,12 @@ impl Catalog {
     }
 
     pub(crate) fn rollback(&mut self) {
+        self.pending_recorded = None;
         let _ = self.conn.execute("ROLLBACK");
     }
 
     pub(crate) fn put_meta(&mut self, m: &Meta) -> Result<()> {
+        self.pending_recorded = Some(m.format);
         for (k, v) in [
             (META_GENERATION, m.generation),
             (META_PAGE_SIZE, (u64::from(m.format) << 32) | u64::from(m.page_size)),
@@ -1313,7 +1352,7 @@ impl Catalog {
             current: Vec::new(),
             retained: Vec::new(),
             name: None,
-            links: if self.links {
+            links: if self.links_valid() {
                 Some(Links { lo: get_opt(row, 6)?, hi: get_opt(row, 7)?, child_max: get_opt(row, 8)? })
             } else {
                 None

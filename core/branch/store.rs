@@ -2787,6 +2787,9 @@ impl ChildIndex {
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
         let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
+        // A spliced child's key goes with it: no capture can name it again, so no install would
+        // clear it (links adversary L1). Its delete already asked the catalog (the caller's `known`).
+        self.relinked.remove(&(parent.0, f));
         // LEAP L4 slice 3: when every catalog child of `parent` is older than `f` (`newest`, the
         // newest one's epoch, exact), the catalog's nearest below is that one and none is above:
         // both are answered without asking. Else asked, as before.
@@ -2891,10 +2894,14 @@ impl ChildIndex {
     /// The zombie's key is REPLACED, never removed, so no removal link names a key a live child
     /// holds; the zombie's own links (children of it removed since the last checkpoint) go with it,
     /// since no query names it as a parent again.
-    fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
+    /// `catalog`: a catalog store, whose next checkpoint consumes the splice records (`moved`,
+    /// `relinked`); no other store keeps them, since nothing would drain them (links adversary L1).
+    fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId, catalog: bool) {
         self.map.remove(&(zombie.0, f));
-        self.moved.push((zombie.0, f));
-        self.relinked.insert((parent.0, zf));
+        if catalog {
+            self.moved.push((zombie.0, f));
+            self.relinked.insert((parent.0, zf));
+        }
         self.map.insert((parent.0, zf), child);
         let links: Vec<(u64, u64)> = self
             .removed
@@ -3330,10 +3337,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // relinked (the oracle's plant).
         let mut links = Vec::new();
         let mut upgraded = false;
-        if super::journal::carries_links(cap.meta.format) && !catalog.links() {
+        if super::journal::carries_links(cap.meta.format) && !catalog.links_valid() {
             catalog.upgrade_links()?;
             upgraded = true;
-        } else if catalog.links() && !fe_mutant("l4_stale_sibling_link") {
+        } else if catalog.links_valid() && !fe_mutant("l4_stale_sibling_link") {
             kill_point("ckpt.unlinked");
             let mut rows: BTreeSet<(u64, u64)> = BTreeSet::new();
             let mut parents: BTreeSet<u64> = BTreeSet::new();
@@ -3684,7 +3691,8 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
             if guard.journal.as_ref()?.log_len() < cap.log_from {
                 return None;
             }
-            let src = match guard.journal.as_ref()?.cut_source(cap.log_from) {
+            // The new log at the version the commit just recorded (one authority).
+            let src = match guard.journal.as_ref()?.cut_source(cap.log_from, cap.meta.format) {
                 Ok(Some(src)) => src,
                 _ => return None,
             };
@@ -4477,8 +4485,9 @@ impl BranchStore {
         // build's format (r13-compose S-6: 5/6 composed, 7 before F7's merge, 3/4 F7-durable alone,
         // 2 the base, 0 before the key). A refused open pays no catalog prewarm.
         let arm = super::journal::format_version(inner.splice);
-        // The version this store reads and keeps writing: its catalog's, its arm's own or legacy
-        // one (LEAP L4: a 17/18 catalog opens by the older path), else the log's.
+        // The version this store reads and writes its files at: its catalog's, its arm's own or an
+        // older one (LEAP L4: a 17-20 catalog opens by the older path, and stays at it until this
+        // build's first checkpoint upgrades it: one authority), else the log's.
         let format = match meta {
             Some(m) if super::journal::accepts_format(m.format, arm) => m.format,
             Some(_) => arm,
@@ -10582,6 +10591,13 @@ impl StoreInner {
                 "a branch catalog checkpoint lost its log".to_string(),
             ));
         };
+        // ONE AUTHORITY (links adversary H1): the meta row this checkpoint committed carries the
+        // store's version (an upgrade's, in its own transaction), and the files follow it: the cut
+        // below is the first file written at it. Before the commit nothing was (a recovery's rewrite
+        // is at the version the store was opened at), so neither build sees a file ahead of its
+        // catalog. The store's catalog handle takes the recorded version too (link validity, L2).
+        journal.advance_format(cap.meta.format);
+        cat.catalog.note_recorded(cap.meta.format);
         if cap.fail_after_commit {
             journal.defer_compaction();
             journal.poison();
@@ -11330,7 +11346,7 @@ impl StoreInner {
             // 4. U6: the child takes the zombie's place, in the index as in the lineage.
             c.parent = zp;
             c.fork_epoch = zf;
-            children.relink(zid, cf, zp, zf, cid);
+            children.relink(zid, cf, zp, zf, cid, cat.is_some());
             if let Some(cat) = cat.as_mut() {
                 cat.dirty.remove(&zid);
                 cat.removed.insert(zid);

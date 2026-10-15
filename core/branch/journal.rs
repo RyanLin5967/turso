@@ -125,8 +125,15 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// by the checkpoint writer, so a delete asks the catalog nothing for its neighbours. ONE WRITE
 /// PATH (the same ruling's class fix): this build reads 17-20 only to upgrade them, at the store's
 /// first checkpoint, in the checkpoint's own transaction (the catalog's columns and every row's
-/// links, and the meta row at this version); every file it writes after an open is 21/22 (the log
-/// and snapshot layouts are 17's and 18's, so a 21/22 store's older log reads as one).
+/// links, and the meta row at this version). ONE AUTHORITY for the version (links adversary H1,
+/// DECISIONS 7e77068514): the catalog's meta row. Every file is written at the version it records;
+/// it advances only in the checkpoint transaction that upgrades the catalog, and the log is cut
+/// after that commit, at it (`Journal::advance_format`). A recovery's rewrite before then stays at
+/// the recorded 17-20, so the older build still opens the store until this build's first
+/// checkpoint. An open reads a file at its record's version or an older one of its arm (a log not
+/// yet cut since the upgrade: the layouts are 17's and 18's), and refuses a file newer than its
+/// record, which no build writes (`reads_at`). A snapshot store has no record to upgrade and
+/// nothing that differs by version, so it stays at the version it was made at.
 const FORMAT_VERSION: u32 = 21;
 const SPLICE_FORMAT_VERSION: u32 = 22;
 /// The versions this build reads, to upgrade them: per arm, the L4 meta facts' (19, 20) and the
@@ -179,6 +186,15 @@ fn older_formats(format: u32) -> &'static [u32] {
 /// `legacy_format_refused` (test builds only): its own only.
 pub(crate) fn accepts_format(version: u32, format: u32) -> bool {
     version == format || (older_formats(format).contains(&version) && !super::store::fe_mutant("legacy_format_refused"))
+}
+
+/// Whether a file of version `version` belongs to a store whose record carries `recorded` (ONE
+/// AUTHORITY, links adversary H1): `recorded` itself, or an older version of its arm this build
+/// reads: a file not rewritten since the record advanced (the record moves first, in the upgrading
+/// checkpoint's transaction, and the files after it). A file NEWER than its record, or of the other
+/// arm, is one no build writes, and is refused (`version_hint` says which).
+pub(crate) fn reads_at(version: u32, recorded: u32) -> bool {
+    version == recorded || (version < recorded && accepts_format(version, current_format_of(recorded)))
 }
 
 /// The version this build writes for the arm of a file read at `version` (17, 19, 21 -> 21; 18, 20,
@@ -1362,6 +1378,8 @@ pub(crate) struct CutPrep {
     old_nonce: u32,
     /// The raised class the new header was written with: a raise since is written at the install.
     raised: SyncClass,
+    /// The version the new header was written at: usable only by a journal at it (one authority).
+    format: u32,
     /// Every flight the prep kept is tagged synced (`reframe_tagged`): the install may confirm a
     /// delta's last flight only then (engine review 7 #1).
     all_synced: bool,
@@ -1561,11 +1579,18 @@ impl Journal {
         })
     }
 
-    /// The format version this journal writes: set by a store in the splice arm before `start`.
-    /// One write path (DECISIONS e977c1d010): a log or snapshot this journal writes from here on is
-    /// at this build's version of its arm, whatever version it was read at.
-    pub(crate) fn upgrade_format(&mut self) {
-        self.format = current_format_of(self.format);
+    /// ONE AUTHORITY (links adversary H1, DECISIONS 7e77068514): the store's record, a catalog's
+    /// meta row, now carries `recorded`, committed, and every file this journal writes from here on
+    /// is at it. Only the install of the checkpoint whose transaction upgraded the catalog moves it,
+    /// before that checkpoint's cut; nothing else does (a recovery's rewrite, a cut or a compaction
+    /// writes at the version the journal was opened at), so no file is ever ahead of its record.
+    pub(crate) fn advance_format(&mut self, recorded: u32) {
+        let at = self.format;
+        crate::turso_assert!(
+            reads_at(at, recorded),
+            "a branch journal at version {at} advanced to {recorded}, not a later version of its arm"
+        );
+        self.format = recorded;
     }
 
     pub(crate) fn set_format(&mut self, format: u32) {
@@ -2101,7 +2126,6 @@ impl Journal {
     /// (a D0 store over flights synced by an earlier run; engine review 7 #1).
     pub(crate) fn rewrite_from_as(&mut self, from: u64, generation: u64, class: SyncClass) -> Result<()> {
         self.check_live()?;
-        self.upgrade_format();
         let end = self.mark();
         if from < LOG_HEADER_LEN as u64 || from > end {
             return Err(LimboError::InternalError(format!(
@@ -2191,8 +2215,9 @@ impl Journal {
     /// A cut's first phase, under the store mutex with no flight in the air and none to start (the
     /// group's `cutting`): what `prepare_cut` copies off the mutex. `None` when the records the cut
     /// keeps do not all lie in the file yet (some before `from` are still buffered): the install
-    /// then cuts the whole way under the mutex (`rewrite_from`).
-    pub(crate) fn cut_source(&self, from: u64) -> Result<Option<CutSource>> {
+    /// then cuts the whole way under the mutex (`rewrite_from`). `format`: the version the new log
+    /// is written at, the store's record's (a catalog checkpoint's committed meta row; one authority).
+    pub(crate) fn cut_source(&self, from: u64, format: u32) -> Result<Option<CutSource>> {
         self.check_live()?;
         if from < LOG_HEADER_LEN as u64 || from > self.len {
             return Ok(None);
@@ -2202,8 +2227,7 @@ impl Journal {
             log,
             upto: self.len,
             rewrites: self.rewrites,
-            // One write path: the cut log is written at this build's version of the arm.
-            format: current_format_of(self.format),
+            format,
             page_size: self.page_size,
             raised: self.header_class(),
             class: self.rewrite_class(),
@@ -2248,6 +2272,7 @@ impl Journal {
                 nonce,
                 old_nonce: src.nonce,
                 raised: src.raised,
+                format: src.format,
                 all_synced,
                 synced: src.class.syncs(),
                 tmp: src.tmp,
@@ -2270,8 +2295,6 @@ impl Journal {
     /// for another cut — is dropped and the whole cut done here instead.
     pub(crate) fn finish_cut(&mut self, prep: CutPrep, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
-        // The prepared log's header is at this build's version (`cut_source`): the journal is now.
-        self.upgrade_format();
         let usable = self.cut_usable(&prep, from, generation) && !super::store::fe_mutant("cut_under_mutex");
         if !usable {
             let tmp = prep.tmp.clone();
@@ -2353,6 +2376,7 @@ impl Journal {
             && prep.from == from
             && prep.generation == generation
             && prep.upto <= self.len
+            && prep.format == self.format
     }
 
     /// A cut's catch-up, holding NO lock (DECISIONS bd0d845f97): the old log's whole flights in
@@ -2450,7 +2474,7 @@ impl Journal {
 
     /// A background compaction's cut source (`cut_source`), prepared into its own temp log.
     pub(crate) fn bg_cut_source(&self, bg: &BgCompaction) -> Result<Option<CutSource>> {
-        Ok(self.cut_source(bg.from)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
+        Ok(self.cut_source(bg.from, self.format)?.map(|src| src.with_tmp(bg.log_tmp.clone())))
     }
 
     /// The snapshot's length, after a cut (`finish_cut` zeroes it, as a catalog store has none).
@@ -3096,7 +3120,6 @@ impl Journal {
         fail_after_rename: bool,
     ) -> Result<()> {
         self.check_live()?;
-        self.upgrade_format();
         // Every record the snapshot replaces stays as durable as it was, raised ones included
         // (review B-F3).
         let class = self.rewrite_class();
@@ -4150,8 +4173,9 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>
     }
     let field = |at: usize| bytes.get(at..at + 4).map(|f| u32::from_le_bytes(f.try_into().unwrap()));
     let version = field(8).expect("16 bytes read");
-    // An older version of this arm (17-20) has this layout: read as this one (one write path).
-    let foreign = !accepts_format(version, format);
+    // An older version of this arm (17-20) has this layout: read as this one, when the store's
+    // record is at least as new (one authority: `reads_at`).
+    let foreign = !reads_at(version, format);
     let other = if super::store::fe_mutant("old_layout_checked_below_11_only") { version < 11 } else { foreign };
     let old = other
         && bytes.len() >= 28
@@ -4176,9 +4200,23 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>
 /// What a refused format version is (review 2 #13): the other arm's, or one written before the log
 /// nonce (format 11), or before flight framing (format 9), which this build cannot read.
 pub(crate) fn version_hint(version: u32, format: u32) -> String {
-    let other = if format == FORMAT_VERSION { SPLICE_FORMAT_VERSION } else { FORMAT_VERSION };
-    if version == other {
-        format!(" ({other} is the other F7 splice arm's: open with that arm's DatabaseOpts::with_branch_splice)")
+    // The arm of a version this build knows (17 to 22); the hint before this fix took any version
+    // but `format`'s pair for the other arm's (links adversary H1: 21 under a 17 record).
+    let arm = |v: u32| match v {
+        17 | 19 | 21 => Some(false),
+        18 | 20 | 22 => Some(true),
+        _ => None,
+    };
+    let newest = FORMAT_VERSION.max(SPLICE_FORMAT_VERSION);
+    if arm(version).is_some() && arm(format).is_some() && arm(version) != arm(format) {
+        format!(" ({version} is the other F7 splice arm's: open with that arm's DatabaseOpts::with_branch_splice)")
+    } else if arm(version).is_some() && version > format {
+        format!(
+            " (newer than the store's recorded version {format}: no build writes a file ahead of its \
+             store's record, so these files are not one store's, or are damaged)"
+        )
+    } else if version > newest {
+        " (written by a newer build)".to_string()
     } else if version < 9 {
         " (written before flight framing; recreate the branch files)".to_string()
     } else if version < 11 {
@@ -4380,7 +4418,7 @@ fn read_snapshot(path: &Path, format: u32) -> Result<(u32, u64, SnapshotState, u
     if crc32c::crc32c(body) != u32::from_le_bytes(trailer.try_into().unwrap()) {
         return Err(corrupt("snapshot checksum"));
     }
-    if !accepts_format(u32::from_le_bytes(body[8..12].try_into().unwrap()), format) {
+    if !reads_at(u32::from_le_bytes(body[8..12].try_into().unwrap()), format) {
         return Err(corrupt("snapshot format version (8 is the F7 splice arm's)"));
     }
     let page_size = u32::from_le_bytes(body[12..16].try_into().unwrap());
