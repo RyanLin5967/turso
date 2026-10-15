@@ -55,7 +55,9 @@ CLIENTS=${FT_CLIENTS:-1 4}
 # comp review 1 MED 8: the PG kept arm's creates per C=1 cell (kept_arm), a count or nothing runs
 KEPT_K=${FT_KEPT_K:-10}
 [[ $KEPT_K =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_KEPT_K [$KEPT_K] is not a positive count" >&2; exit 2; }
-# Comp review 1 LOW 21: the prebranch runs at FT_PREBRANCH_C clients (C=1 cannot reach N = 1e5 or 1e6 within CAP_S)
+# Comp review 1 LOW 21: the prebranch runs at FT_PREBRANCH_C clients (C=1 cannot reach N = 1e5 or 1e6 within CAP_S),
+# bounded by its own FT_PREBRANCH_S (default: the cap; unregistered: the PREREG names no prebranch bound, a lead ruling
+# owed before a real run at 1e5 or more)
 PREBRANCH_C=${FT_PREBRANCH_C:-4}
 [[ $PREBRANCH_C =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_PREBRANCH_C [$PREBRANCH_C] is not a positive count" >&2; exit 2; }
 # The warm-up of every timed and labelling run (gate-6 review, t3run item 3): PREREG :210's one rule,
@@ -134,6 +136,9 @@ done
 # >= 1000 ok ops is complete with reduced n), and one outer timeout above it, the same for every system, bounds each
 # invocation (gate-6 review, t3run item 16).
 OUTER_S=$((${CAP_S%.*} + 600))
+# LOW 21's prebranch bound, whole seconds (prebrun_bound's shell arithmetic)
+PREBRANCH_S=${FT_PREBRANCH_S:-${CAP_S%.*}}
+[[ $PREBRANCH_S =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_PREBRANCH_S [$PREBRANCH_S] is not a whole number of seconds" >&2; exit 2; }
 # LOW 14: a time budget for the whole job (FT_BUDGET_S, seconds; 0 or unset = none). A cell not STARTED by then is
 # recorded "NOT RUN: budget" (cell.json and timed.json; reduce.py counts it, never a silent MISSING), so a job-level
 # timeout of at least BUDGET + 2 x OUTER_S (a cell's two bounded runs) + slack can never cut a cell mid-way. The
@@ -211,7 +216,7 @@ for spec in $SPECLIST; do
     if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
   done
 done >"$RAW/expected-cells.txt"
-{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY ops_total=$OPS_TOTALS age=$AGE prebranch=$PREBRANCH parent_sum=$PSUM";
+{ echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS] cap_s=$CAP_S warmup=$WARMUP dry=$DRY ops_total=$OPS_TOTALS age=$AGE prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S parent_sum=$PSUM";
   [ "$KIND" = pg ] && echo "pg_systems=pg18-d2 (with pg18-create-copy) pg18-defaults=DROPPED on Linux (lead ruling artie 6b0bef481b)"
   echo "$DRIVE"
   echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
@@ -661,10 +666,18 @@ live_excl_main() {
   if [ "$KIND" = dolt ] || [ "$KIND" = doltgres ]; then echo $((LIVE0 - 1)); else echo "$LIVE0"; fi
 }
 # prebranch_server -- PREBRANCH live branches before the cells, each with one private write: the system's own M1 op
-# (bbload --skip-after, so the branches stay; C=1 and no warm-up, so exactly PREBRANCH ops; untraced, untimed). Then
-# LIVE0 is READ (count_branches), and the job fails unless it is exactly PREBRANCH (+ main for Dolt/Doltgres): every
-# cell runs at that N (lead review 62430d8bf..b49fb656a HIGH 1, MED 3: the requested count used to be recorded, and a
-# C=4 run with a warm tick overshot it by about C).
+# (bbload --skip-after, so the branches stay; no warm-up; untraced, untimed). Then LIVE0 is READ (count_branches), and
+# the job fails unless it is exactly PREBRANCH (+ main for Dolt/Doltgres): every cell runs at that N (lead review
+# 62430d8bf..b49fb656a HIGH 1, MED 3: the requested count used to be recorded, and a C=4 run with a warm tick
+# overshot it by about C). Comp review 1 LOW 21: it runs at PREBRANCH_C clients (C=1 cannot reach N = 1e5 or 1e6 within
+# CAP_S) with --no-drain, so exactly --max-ops ops run (claim_op's drain ops would each keep one more), bounded by its
+# own PREBRANCH_S, and its duration is recorded.
+prebrun_bound() { # BBA or CBA's timeout and --max-window-s -> PREBRANCH_S (the arrays name the array to edit)
+  local -n arr=$1
+  local i
+  arr[1]=$((PREBRANCH_S + 300))
+  for i in "${!arr[@]}"; do [ "${arr[$i]}" = --max-window-s ] && arr[$((i + 1))]=$PREBRANCH_S; done
+}
 prebranch_server() {
   local sp want
   want=$PREBRANCH
@@ -672,8 +685,10 @@ prebranch_server() {
   if [ "$PREBRANCH" -gt 0 ]; then
     case $KIND in pg) sp=pg18-m1 ;; dolt) sp=dolt-b-m1 ;; doltgres) sp=doltgres-b-m1 ;; esac
     bb_args "$sp" "$PREBRANCH_C" "$PREBRANCH" "$RAW/prebranch" nowarm  # LOW 21: at C>1, exactly PREBRANCH
-    "${BBA[@]}" --skip-after >"$RAW/prebranch.txt" 2>&1 || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
+    prebrun_bound BBA
+    "${BBA[@]}" --skip-after --no-drain >"$RAW/prebranch.txt" 2>&1 || fail "prebranch: $sp x $PREBRANCH ($(tail -1 "$RAW/prebranch.txt"))"
     if [ "$KIND" = pg ]; then sqlq "CHECKPOINT" >/dev/null 2>&1 || fail "prebranch CHECKPOINT"; fi
+    fun "prebranch: $PREBRANCH branches at C=$PREBRANCH_C in $(jf "$RAW/prebranch/summary.json" window_s) s (bound ${PREBRANCH_S} s, capped $(jf "$RAW/prebranch/summary.json" capped))"
   fi
   LIVE0=$(count_branches)
   expect "live branches before the cells (LIVE0, read back)" "$LIVE0" "$want"
@@ -871,9 +886,12 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
   # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
   if [ "$PREBRANCH" -gt 0 ]; then
     mkdir -p "$ROOT/branches/prebranch"
-    timeout "$OUTER_S" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" --dir "$ROOT/branches/prebranch" \
-      --clients "$PREBRANCH_C" --max-ops "$PREBRANCH" --rows "$ROWS" --max-window-s "$CAP_S" --out "$RAW/prebranch" \
+    # LOW 21: at PREBRANCH_C clients with --no-drain (exactly PREBRANCH ops), bounded by PREBRANCH_S, duration recorded
+    timeout "$((PREBRANCH_S + 300))" "$CB" run --mode b1 --op m1 --sync d2 --parent "$ROOT/parent.db" \
+      --dir "$ROOT/branches/prebranch" --clients "$PREBRANCH_C" --max-ops "$PREBRANCH" --rows "$ROWS" \
+      --max-window-s "$PREBRANCH_S" --no-drain --out "$RAW/prebranch" \
       >"$RAW/prebranch.txt" 2>&1 || fail "prebranch ($(tail -1 "$RAW/prebranch.txt"))"
+    fun "prebranch: $PREBRANCH branches at C=$PREBRANCH_C in $(jf "$RAW/prebranch/summary.json" window_s) s (bound ${PREBRANCH_S} s, capped $(jf "$RAW/prebranch/summary.json" capped))"
   fi
   LIVE0=$(count_branches)
   expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"

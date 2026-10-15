@@ -31,7 +31,10 @@
  *                                                    timedrun.py applies PREREG's tiers (MED 5)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
  *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
- *          [--max-send-late-us U]                    open loop: a p99 send or pool lateness above U (default 100) is
+ *          [--no-drain]                              claims stop at the window's end: exactly --max-ops ops run (the
+ *                                                    driver's prebranch at C>1; summary.json no_drain; comp review 1
+ *                                                    LOW 21) -- a measured cell keeps the drain load (timedrun.py)
+ *          [--max-send-late-us U]                  open loop: a p99 send or pool lateness above U (default 100) is
  *                                                    VOID, exit 3 (the macOS bbload's amendment 48 rule)
  *   Every numeric flag takes the whole string, finite and in range, or exits 2 (the macOS num_d/num_u, review 4 M8).
  *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
@@ -204,6 +207,7 @@ typedef struct {
 static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
 static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
+static int NO_DRAIN = 0;   /* --no-drain: claims stop at the window's end (the prebranch; comp review 1 LOW 21) */
 static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120, MAX_SEND_LATE_US = 100;
 static const double CLOSE_TIMEOUT_S = 5;
 static char WARM_RULE[64] = "";
@@ -882,6 +886,9 @@ static claim_t claim_op(int cid) {
         k.closed = 1;
         if (g_meas_done >= g_meas_final) { all_done_locked(); k.stop = 1; goto out; }
     }
+    /* comp review 1 LOW 21: --no-drain (the driver's prebranch, at C>1): claims stop at the window's end, so exactly
+     * --max-ops ops run and every one is kept; a measured cell keeps the drain (timedrun.py refuses no_drain) */
+    if (NO_DRAIN) { k.stop = 1; goto out; }
     g_drain_claimed++;
     k.ph = PH_DRAIN; /* a drain op: keeps the load on while measured ops are still running */
 out:
@@ -1146,6 +1153,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(a, "--allow-errors")) ALLOW_ERR = 1;
         else if (!strcmp(a, "--skip-after")) SKIP_AFTER = 1;
+        else if (!strcmp(a, "--no-drain")) NO_DRAIN = 1;
         else if (!strcmp(a, "--set") && v) {
             char *eq = strchr(argv[++i], '=');
             if (!eq || NSET >= MAXLIST) { fprintf(stderr, "bbload: --set k=v\n"); return 2; }
@@ -1426,7 +1434,8 @@ int main(int argc, char **argv) {
             v1run ? v1run : "", (unsigned long long)MARKB);
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
-    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
+    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,\"no_drain\":%s,", S.nafter, SKIP_AFTER ? "true" : "false",
+            NO_DRAIN ? "true" : "false");
     /* comp review 1 MED 9: what tput_* count. A client claims its next op only after this op's untimed after-steps,
      * so with after-steps run they count CYCLES (an op and its after-steps), not ops. A branch connection's close
      * with no after-step (--skip-after, or pg18-m1-c1b) is also untimed client work before the next claim, and is

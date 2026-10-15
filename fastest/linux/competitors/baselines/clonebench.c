@@ -5,6 +5,8 @@
  *       [--max-ops N | --duration-s S [--min-ops N]] [--warmup-ops W] [--hold-us U] [--sync d2|d0] [--rows R]
  *       [--warmup OPS:S:MAX_S] [--max-window-s S]
  *       [--drop] [--seed S] [--v1-run NAME [--v1-mark-base B]] [--mutant-early-ack]
+ *       [--no-drain]   claims stop at the window's end, exactly --max-ops ops (the driver's prebranch at C>1; summary
+ *                      no_drain; comp review 1 LOW 21); a measured cell keeps the drain load (timedrun.py)
  *   clonebench --warmup-replay OPS:S:MAX_S < TRACE
  *       the warm-up decision (warm_ends, the one each claim makes) replayed on claim times, for the shared
  *       cross-driver test fastest/linux/gates/warmup_conformance.py (PREREG annex A23)
@@ -286,6 +288,7 @@ typedef struct { uint64_t t0, t1, riders, last_ticket; } flight_t;
 typedef struct { int id; pthread_t th; uint64_t rng; rec_t *rec; size_t n, cap; } client_t;
 
 static int MODE_B0, OP_M1, SYNC_D0, DROP, MUTANT_EARLY, BRANCH_SHARED, MUTANT_BNOSYNC, C = 1;
+static int NO_DRAIN; /* --no-drain: claims stop at the window's end (the driver's prebranch; comp review 1 LOW 21) */
 static c1b_client g_c1b;
 static int g_have_c1b;
 static const char *PARENT, *BDIR;
@@ -586,6 +589,8 @@ static claim_t claim_op(int cid) {
         k.closed = 1;
         if (g_meas_done >= g_meas_final) { all_done_locked(); k.stop = 1; goto out; }
     }
+    /* comp review 1 LOW 21: --no-drain (the prebranch at C>1): exactly --max-ops ops run, every one kept */
+    if (NO_DRAIN) { k.stop = 1; goto out; }
     g_drain_claimed++;
     k.ph = PH_DRAIN; /* a drain op: keeps the load on while measured ops are still running */
 out:
@@ -725,6 +730,7 @@ static int cmd_run(int argc, char **argv) {
         else if (!strcmp(a, "--v1-run") && v) v1run = argv[++i];
         else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(a, "--drop")) DROP = 1;
+        else if (!strcmp(a, "--no-drain")) NO_DRAIN = 1;
         else if (!strcmp(a, "--branch-shared")) BRANCH_SHARED = 1;
         else if (!strcmp(a, "--mutant-branch-nosync")) MUTANT_BNOSYNC = 1;
         else if (!strcmp(a, "--mutant-early-ack")) MUTANT_EARLY = 1;
@@ -921,9 +927,10 @@ static int cmd_run(int argc, char **argv) {
     uint64_t ndrain = 0;
     for (size_t i = 0; i < total; i++) ndrain += all[i].phase == PH_DRAIN;
     fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"closed\",\"t0_ns\":%llu,\"tm0_ns\":%llu,\"tm1_ns\":%llu,"
-               "\"drain_ops\":%llu,\"drain_claims\":%llu,",
+               "\"drain_ops\":%llu,\"drain_claims\":%llu,\"no_drain\":%s,",
             (unsigned long long)g_warm.backsteps, (unsigned long long)g_t0, (unsigned long long)tm0,
-            (unsigned long long)tm1, (unsigned long long)ndrain, (unsigned long long)g_drain_claimed);
+            (unsigned long long)tm1, (unsigned long long)ndrain, (unsigned long long)g_drain_claimed,
+            NO_DRAIN ? "true" : "false");
     fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"

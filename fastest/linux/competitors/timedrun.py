@@ -337,6 +337,11 @@ def record_problems(nm, sm):
                 why.append(f"{nm} run is clonebench (mode {mode!r}), closed loop only, but says loop {loop!r}")
         else:
             why.append(f"{nm} run's mode {mode!r} is neither bbload's (closed, open) nor clonebench's (b1, b0)")
+    nd = sm.get("no_drain")  # comp review 1 LOW 21: --no-drain is the prebranch's flag, never a measured cell's
+    if not isinstance(nd, bool):
+        why.append(f"{nm} run has no no_drain record ({nd!r})")
+    elif nd:
+        why.append(f"{nm} run ran with --no-drain: its last measured ops ran under falling load (LOW 40's drain off)")
     if loop == "open":
         bound = sm.get("max_send_late_us")
         if not isinstance(bound, (int, float)) or isinstance(bound, bool):
