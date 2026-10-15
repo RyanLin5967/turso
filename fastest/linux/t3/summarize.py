@@ -1176,6 +1176,14 @@ def self_test():
          lambda s: any("header_raise_exclusive" in x for x in s["parity_refusals"])),
         ("exception counters: ours whose summary.json has no windows fails", {"ours_counters": "nowindows"}, False,
          lambda s: any("windows" in x for x in s["parity_refusals"])),
+        # the lead's ruling on f2abbc8cb (fail closed until fastest_profile emits the counters; Rust HELD): the gap is
+        # LOUD-OWED in summary.json next to the sweeper window stamps, and only while some run lacks the record
+        ("exception counters: no windows puts the fastest_profile emission on loud_owed", {"ours_counters": "nowindows"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a window without exception_counters puts it on loud_owed", {"ours_counters": "missing"},
+         False, lambda s: any("exception_counters" in x and "fastest_profile" in x for x in s.get("loud_owed") or [])),
+        ("exception counters: a complete record owes nothing", {}, True,
+         lambda s: not any("exception_counters" in x for x in s.get("loud_owed") or [])),
         ("exception counters: a competitor run (not the turso engine) carries none and is not refused for it",
          {"cell": "comp"}, True, lambda s: s["runs"][0].get("exception_counter_deltas") is None
          and s.get("uncredited_cells") == []),
