@@ -8732,6 +8732,13 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
         }
     }
     let _d = Disarm;
+    struct BigMin;
+    impl Drop for BigMin {
+        fn drop(&mut self) {
+            super::store::CKPT_BIG_MIN.store(16 << 10, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _b = BigMin;
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(&dir.path().join("ckpt-diag.db"), opts(true, SyncClass::FullFsync));
     let trunk = db.connect().unwrap();
@@ -8748,8 +8755,16 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
             t.clear();
             t.reserve(32);
         }
+        // Round 0 is the recorder's fire-check: every allocation and free of the span recorded.
+        super::store::CKPT_BIG_MIN.store(if round == 0 { 1 } else { 16 << 10 }, std::sync::atomic::Ordering::Release);
         assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
         db.branch_checkpoint_wait();
+        if round == 0 {
+            assert!(
+                !super::store::CKPT_BIG.lock().unwrap().is_empty(),
+                "premise: the span recorder recorded nothing at a 1-byte threshold: it cannot be trusted at 16 KiB"
+            );
+        }
         let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
         let tables = super::store::CKPT_HELD_THREADS.lock().unwrap().clone();
         assert_eq!(points.len(), tables.len(), "premise: round {round}: a point without its thread table");

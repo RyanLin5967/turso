@@ -3235,6 +3235,10 @@ pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
 /// KiB or more between the last install's `install.cut_finished` and `install.installed`.
 #[cfg(test)]
 pub(crate) static CKPT_BIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Test builds: the smallest allocation or free `CKPT_BIG` records (16 KiB unless a test lowers it,
+/// as the diagnostic's fire-check does).
+#[cfg(test)]
+pub(crate) static CKPT_BIG_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16 << 10);
 #[cfg(test)]
 pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<Vec<(&'static str, [super::budget_probe::ThreadCpu; 48])>> =
     std::sync::Mutex::new(Vec::new());
@@ -3250,7 +3254,7 @@ fn ckpt_held(label: &'static str) {
             // The span from the cut's finish to the install's end: big allocations and frees on
             // this thread, with backtraces (`CKPT_BIG`), for the span that grows past two syscalls.
             if label == "install.cut_finished" {
-                super::budget_probe::record_big(16 << 10);
+                super::budget_probe::record_big(CKPT_BIG_MIN.load(Ordering::Acquire));
             } else if label == "install.installed" {
                 let (_, _, traces) = super::budget_probe::recorded_allocs();
                 super::budget_probe::record_allocs(false, usize::MAX);
