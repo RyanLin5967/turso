@@ -302,6 +302,13 @@ def self_test():
         ("tracerpid: tracerpid_tm1 as a string fails", check(rec() | {"tracerpid_tm1": "0"}, 33, 4, "1000000:0:2") != []),
         ("tracerpid: null on a platform without /proc keeps the contract",
          check(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, 33, 4, "1000000:0:2") == []),
+        # second fresh read (0802dd739..79c58561f) LOW 2 and 4: on Linux the driver can read its TracerPid, so null is
+        # refused there; tie refuses a summary or warm-up that is not an object instead of crashing
+        ("tracerpid: null on Linux fails (the driver could read /proc)",
+         tracerpid_problems(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, linux=True) != []),
+        ("tracerpid: 0 on Linux keeps the contract", tracerpid_problems(rec(), linux=True) == []),
+        ("tie: a summary that is not an object is refused, not a crash", tie([], LIVE) != []),
+        ("tie: a summary whose warmup is not an object is refused", tie(rec() | {"warmup": 5}, LIVE) != []),
         # fresh read of 7a8c3a817..0802dd739, finding 2: the live record shares warm_ends with the replay, so replaying it
         # alone can only catch a claim-handling split; it must also be the run's own warm-up (summary.json warmup):
         # one claim per warm-up op plus the stop's, its stop at ops_at_stop == ops, its last claim at stop_secs, capped
