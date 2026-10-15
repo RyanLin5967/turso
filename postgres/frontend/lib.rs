@@ -4,6 +4,7 @@ mod copy;
 mod functions;
 mod information_schema;
 mod pg_settings;
+pub mod phase;
 mod result_types;
 pub use result_types::{element_of, StatementTypes};
 mod session;

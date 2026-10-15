@@ -17,6 +17,8 @@ budget-plant-split-reply = []
 # The wire budget's allocation counter (budget.py work): the binaries install counters::CountingAlloc.
 # Never in a credited build: every allocation pays a shared atomic add.
 alloc-count = []
+# The L5 phase table (turso_pg's phase.rs; turso_branch_phases()): a diagnostic build only.
+phase-count = ["turso_pg/phase-count"]
 
 [dependencies]
 anyhow.workspace = true

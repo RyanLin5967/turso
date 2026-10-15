@@ -1,6 +1,6 @@
 use std::num::NonZero;
 use std::str;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
@@ -747,6 +747,8 @@ fn prepare_statement_checked(
     describe: bool,
     check_keys: bool,
 ) -> Result<Option<Statement>> {
+    use crate::phase::{enter, Phase};
+    let parsing = enter(Phase::Parse);
     // PostgreSQL's whitespace only (wire review 13 item 1).
     let sql = turso_pg_parser::pg_trim(sql);
     if sql.is_empty() {
@@ -790,6 +792,7 @@ fn prepare_statement_checked(
         Vec::new()
     };
     let special = Special::of(&parse_result);
+    drop(parsing);
     let performs = special.as_ref().is_some_and(Special::performs);
     if describe && performs {
         return Ok(None);
@@ -801,7 +804,9 @@ fn prepare_statement_checked(
     // review 16 item 10); DELETE ... USING's column lookup missed a column; and the parameter types
     // were fixed stale at the first Describe, every later Execute refused 0A000 (wire review 18
     // item 8). compile_cmd's own adoption then finds nothing new.
+    let planning = enter(Phase::Plan);
     pg_conn.conn.maybe_update_schema();
+    drop(planning);
     // A statement this prepare performs, or whose prerequisites it runs (a SERIAL column's
     // sequence), reads no parameter: one holding a $n is refused before anything of it runs,
     // 42P02 "there is no parameter $n" on both protocols, as PostgreSQL answers a utility
@@ -821,6 +826,7 @@ fn prepare_statement_checked(
     }
     // A CREATE TABLE's foreign keys: their parents checked now, every key resolved by the server
     // once the table exists, in the CREATE's own transaction (wire review 13 item 2).
+    let translating = enter(Phase::Translate);
     let new_table_keys = if check_keys {
         precheck_create_keys(&pg_conn.conn, &parse_result)?
     } else {
@@ -911,6 +917,7 @@ fn prepare_statement_checked(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    drop(translating);
     // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) is performed below, keys
     // and all, so the server has no keys left to resolve.
     let performs = !translated.prereqs.is_empty();
@@ -945,6 +952,7 @@ fn prepare_statement_checked(
         }
     };
     if !performs {
+        let _planning = enter(Phase::Plan);
         let prepared = pg_conn
             .conn
             .prepare_translated_cmd_with_options(translated.cmd, sql, &options);

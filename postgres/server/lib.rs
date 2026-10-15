@@ -645,6 +645,7 @@ async fn serve_session(
                 msg = socket.next() => msg,
             }
         } else {
+            let _reading = turso_pg::phase::enter(turso_pg::phase::Phase::Read);
             socket.next().await
         };
         let msg = match msg {
@@ -1320,7 +1321,10 @@ impl Session {
         // refusal rolls it back and leaves the session idle, success commits it. The fast path
         // left the block open, and a refusal left the session failed (wire review 16 item 6);
         // with no block open it costs one look at the session's flag.
-        if let Some(call) = branch_call(query) {
+        let parsing = turso_pg::phase::enter(turso_pg::phase::Phase::Parse);
+        let call = branch_call(query);
+        drop(parsing);
+        if let Some(call) = call {
             let result = self.run(query, Some(call), None, &Format::UnifiedText);
             let open = self.state().implicit;
             if open {
@@ -1338,7 +1342,10 @@ impl Session {
         }
         // One statement (no separator but a trailing one): run as it stands in the query, with no
         // split Vec or copy (L5). It is no branch call (read above).
-        if let Some(sql) = single_statement(query) {
+        let parsing = turso_pg::phase::enter(turso_pg::phase::Phase::Parse);
+        let single = single_statement(query);
+        drop(parsing);
+        if let Some(sql) = single {
             let result = self.run(sql, None, None, &Format::UnifiedText);
             self.after_implicit(sql, result.is_err());
             let mut responses = Replies::new();
@@ -2253,6 +2260,7 @@ impl Session {
     /// default busy schedule (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) for up to
     /// the server's lock wait. Only this session's thread sleeps.
     fn waiting<T>(&self, f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+        let _executing = turso_pg::phase::enter(turso_pg::phase::Phase::Execute);
         // A schema change committed under the call (SchemaUpdated, which the engine leaves to the
         // caller to retry: fork_trunk_registered; wire review 1 item 11) is waited out on the same
         // schedule and bound: retried 50 times back to back it outran nothing, and the next one
@@ -2936,12 +2944,32 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[at..]
 }
 
+#[cfg(not(feature = "phase-count"))]
 const WORK_COLUMNS: [&str; 5] = [
     "unix_syscalls",
     "instructions",
     "allocations",
     "thread_instructions",
     "confirms_written",
+];
+/// A phase build (feature phase-count, a diagnostic: budget.py work --phases) adds this session
+/// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
+/// is unchanged.
+#[cfg(feature = "phase-count")]
+const WORK_COLUMNS: [&str; 13] = [
+    "unix_syscalls",
+    "instructions",
+    "allocations",
+    "thread_instructions",
+    "confirms_written",
+    "phase_session",
+    "phase_read",
+    "phase_parse",
+    "phase_translate",
+    "phase_plan",
+    "phase_execute",
+    "phase_encode",
+    "phase_write",
 ];
 
 /// turso_branch_work(): this process's system calls and instructions (counters::process_counters),
@@ -2971,8 +2999,15 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
         .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
         .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
         .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
-        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
-        .and_then(|()| encoder.finish());
+        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)));
+    #[cfg(feature = "phase-count")]
+    let row = row.and_then(|()| {
+        let phases = turso_pg::phase::totals().unwrap_or_default();
+        phases
+            .iter()
+            .try_for_each(|n| encoder.encode_field(&(*n as i64)))
+    });
+    let row = row.and_then(|()| encoder.finish());
     Ok(Response::Query(QueryResponse::new(header, stream::iter(vec![row]))))
 }
 
@@ -3405,6 +3440,7 @@ impl SimpleQueryHandler for Session {
         } else {
             self.simple_with_notices(&query.query)
         };
+        let encoding = turso_pg::phase::enter(turso_pg::phase::Phase::Encode);
         for (notices, response) in responses {
             for notice in notices {
                 client
@@ -3487,6 +3523,8 @@ impl SimpleQueryHandler for Session {
                 status,
             )))
             .await?;
+        drop(encoding);
+        let _writing = turso_pg::phase::enter(turso_pg::phase::Phase::Write);
         client.flush().await?;
         Ok(())
     }
@@ -4466,7 +4504,9 @@ fn execute_non_query(
     backoff: &mut Backoff,
     simple: bool,
 ) -> PgWireResult<Response> {
+    let executing = turso_pg::phase::enter(turso_pg::phase::Phase::Execute);
     run_waiting(stmt, backoff, |_| Ok(())).map_err(engine_error)?;
+    drop(executing);
 
     let affected = stmt.n_change();
     // A simple Query's INSERT, UPDATE or DELETE completes with its tag encoded inline, with no

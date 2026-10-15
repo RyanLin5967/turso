@@ -14,6 +14,9 @@ path = "lib.rs"
 # Test failpoints (fail_next_undo): only turso_pg_server's dev-dependency enables it, so never in a
 # credited build.
 failpoints = []
+# The L5 phase table (phase.rs): every phase boundary reads the thread's instruction counter, a system
+# call, so a phase build is a diagnostic and never a verdict or a credited build.
+phase-count = []
 
 [dependencies]
 smallvec = "1.15.1"
