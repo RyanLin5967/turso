@@ -641,6 +641,37 @@ def self_test():
 
     SHAS = {"bbload": "b" * 64, "clonebench": "c" * 64, "fastest_profile": "f" * 64}
 
+    EXC = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
+
+    def ours_windows(kind="ok"):
+        """fastest_profile's summary.json windows with the engine's four branch exception counters read at each window's
+        open and close (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z; Database::branch_exception_counters()).
+        kind: ok (two windows, every counter 7 -> 7), nonzero (the write window's compaction_waits 3 -> 5), missing (the
+        write window has no exception_counters), noname (its after lacks compaction_waits), backwards (hardcap_upgrades
+        4 -> 2), notint (inline_compaction_syncs after is "9"), boolean (header_raise_exclusive before is true),
+        nowindows (no windows at all)"""
+        if kind == "nowindows":
+            return []
+        out = []
+        for name in ("create", "write"):
+            before, after = {k: 7 for k in EXC}, {k: 7 for k in EXC}
+            win = {"window": name, "secs": 1.0}
+            if name == "write":
+                if kind == "nonzero":
+                    before["compaction_waits"], after["compaction_waits"] = 3, 5
+                elif kind == "noname":
+                    del after["compaction_waits"]
+                elif kind == "backwards":
+                    before["hardcap_upgrades"], after["hardcap_upgrades"] = 4, 2
+                elif kind == "notint":
+                    after["inline_compaction_syncs"] = "9"
+                elif kind == "boolean":
+                    before["header_raise_exclusive"] = True
+            if not (name == "write" and kind == "missing"):
+                win["exception_counters"] = {"before": before, "after": after}
+            out.append(win)
+        return out
+
     def sweeper_files(a1, kind="ok"):
         """ours' timed-run records under the shared sweeper (the lead's MED 12 ruling; t3lib.sh ours_timed_run and
         ours_timed_record): timed.tracer.tsv in gates/sweeper.sh's format and timed.json. By hand: sweeps every 0.05 s
@@ -685,7 +716,7 @@ def self_test():
              plan_ops=None, plan_cols=9, drift_json_us=None, bound=False, timed=None, age=200, live=20,
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
-             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04):
+             loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -710,8 +741,11 @@ def self_test():
                 w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
                 fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
+                # TEST EDIT, flagged (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): ours' summary.json
+                # gains its windows with the four exception counters, a new required record at its passing value
                 w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": ours_rule, "ops_total": ours_ops[0],
-                                                           "ops_total_asked": ours_ops[1]}
+                                                           "ops_total_asked": ours_ops[1],
+                                                           "windows": ours_windows(ours_counters)}
                                                           | ({"fixture": fx} if fx is not None else {})))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
@@ -991,6 +1025,33 @@ def self_test():
         ("MED 12 fix 4: a competitor timed.json with sweeper_cpu_s Infinity fails", {"cell": "comp",
                                                                                     "comp_sweeper": float("inf")},
          False, lambda s: any("sweeper_cpu_s" in x for x in s["parity_refusals"])),
+        # the lead's routing ruling (DECISIONS 2026-10-15T05:16:51Z): every Linux T3 run records the engine's four branch
+        # exception counters; summarize records each window's delta (after - before, re-derived), and a nonzero delta
+        # inside a credited window labels the cell uncredited. A missing or unreadable record is a refusal
+        ("exception counters: ours with every window's counters unchanged passes, credited, with each window's deltas",
+         {}, True, lambda s: s["runs"][0].get("exception_counter_deltas") == {w: {k: 0 for k in EXC}
+                                                                             for w in ("create", "write")}
+         and s["runs"][0].get("counters_credited") is True and s.get("uncredited_cells") == []),
+        ("exception counters: compaction_waits 3 -> 5 in the write window labels the cell uncredited, naming it; the "
+         "package still passes", {"ours_counters": "nonzero"}, True,
+         lambda s: s["runs"][0].get("counters_credited") is False
+         and s["runs"][0]["exception_counter_deltas"]["write"]["compaction_waits"] == 2
+         and any("write" in x and "compaction_waits" in x and "+2" in x for x in s.get("uncredited_cells") or [])),
+        ("exception counters: a window with no exception_counters fails, naming it", {"ours_counters": "missing"}, False,
+         lambda s: any("exception_counters" in x and "write" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter missing from a window's after fails, naming it", {"ours_counters": "noname"},
+         False, lambda s: any("compaction_waits" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that went backwards (4 -> 2) fails", {"ours_counters": "backwards"}, False,
+         lambda s: any("hardcap_upgrades" in x and "backwards" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that is not an integer (\"9\") fails", {"ours_counters": "notint"}, False,
+         lambda s: any("inline_compaction_syncs" in x for x in s["parity_refusals"])),
+        ("exception counters: a counter that is a bool (true) fails", {"ours_counters": "boolean"}, False,
+         lambda s: any("header_raise_exclusive" in x for x in s["parity_refusals"])),
+        ("exception counters: ours whose summary.json has no windows fails", {"ours_counters": "nowindows"}, False,
+         lambda s: any("windows" in x for x in s["parity_refusals"])),
+        ("exception counters: a competitor run (not the turso engine) carries none and is not refused for it",
+         {"cell": "comp"}, True, lambda s: s["runs"][0].get("exception_counter_deltas") is None
+         and s.get("uncredited_cells") == []),
         ("MED 12: a clean competitor run carries each timed run's sweeper_cpu_s over its measured window",
          {"cell": "comp"}, True, lambda s: s["runs"][0].get("sweeper_cpu_s") == [0.04, 0.04]
          and s["runs"][0].get("sweeper_windows") == ["measured", "measured"]),
@@ -1045,7 +1106,8 @@ def self_test():
                 a1 = f"{out}/fs-{fs}/cells/{cell}/a1"
                 if system == "ours":
                     w(f"{a1}/result/summary.json", json.dumps({"warmup_rule": RULE, "ops_total": int(ops),
-                                                               "ops_total_asked": int(ops)}))
+                                                               "ops_total_asked": int(ops),
+                                                               "windows": ours_windows()}))  # TEST EDIT, flagged
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
                     w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
