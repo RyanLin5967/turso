@@ -10,6 +10,49 @@ pub use pg_query;
 pub enum ParseError {
     #[error("{0}")]
     ParseError(String),
+    /// A recursive entry of the translator found its thread's stack nearly spent
+    /// (`turso_stack_guard::check`): PostgreSQL's 54001, which the frontend reports as the engine's
+    /// `LimboError::StackDepthLimitExceeded`.
+    #[error("stack depth limit exceeded")]
+    StackDepthLimitExceeded,
+}
+
+/// The stack libpg_query's calls on `sql` run with (`turso_stack_guard::with_stack`). Its C code
+/// recurses over the tree with no check: the protobuf output functions (`_outNode`) overflowed an
+/// 8 MiB session thread at 3,000 nested scalar subqueries (stack-guard class, lldb), where
+/// PostgreSQL 18 answers 54001 (raw artie pg18-nesting-depth.txt). The tree's depth is bounded by
+/// the text's length (each level takes at least one byte), so the stack is sized from it:
+/// `PG_QUERY_BASE` plus `PG_QUERY_PER_BYTE` per byte, at most `PG_QUERY_MAX` (bison refuses past
+/// 10,000 levels, "memory exhausted"). A statement of a few KiB needs less than a session thread
+/// has, so only a long one runs on a segment of its own. The base holds the protobuf decode of the
+/// tree, which prost bounds at 100 nested messages but which overflowed a 1 MiB thread at 56 in a
+/// debug build (about 18 KiB a message).
+fn pg_query_stack(sql: &str) -> usize {
+    PG_QUERY_BASE.saturating_add(sql.len().saturating_mul(PG_QUERY_PER_BYTE)).min(PG_QUERY_MAX)
+}
+const PG_QUERY_BASE: usize = 4 << 20;
+const PG_QUERY_PER_BYTE: usize = 1 << 10;
+const PG_QUERY_MAX: usize = 256 << 20;
+
+/// A deparse walks a tree this crate decoded, at most prost's recursion limit (100 messages) deep.
+const PG_DEPARSE_STACK: usize = 4 << 20;
+
+/// libpg_query's refusals of a statement nested too deeply, in PostgreSQL's class (54001): prost's
+/// recursion limit on the decode of the tree (PostgreSQL answers some of these: a REGISTERED
+/// DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses past about 24), and
+/// the C parser's own stack check.
+fn pg_query_error(e: pg_query::Error) -> ParseError {
+    let text = e.to_string();
+    if text.contains("recursion limit reached") || text.contains("stack depth limit exceeded") {
+        ParseError::StackDepthLimitExceeded
+    } else {
+        ParseError::ParseError(text)
+    }
+}
+
+/// The translator's stack check at a recursive entry: `?` it first.
+pub(crate) fn check_stack() -> Result<(), ParseError> {
+    turso_stack_guard::check().map_err(|_| ParseError::StackDepthLimitExceeded)
 }
 
 thread_local! {
@@ -30,13 +73,13 @@ fn count_libpg_query_call() {
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     count_libpg_query_call();
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::parse(sql)).map_err(pg_query_error)
 }
 
 /// Deparse a parse tree back to SQL text (libpg_query's deparser).
 pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(PG_DEPARSE_STACK, || pg_query::deparse(protobuf)).map_err(pg_query_error)
 }
 
 /// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
@@ -393,7 +436,7 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_scanner(sql)).map_err(pg_query_error)?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
     let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
@@ -428,15 +471,15 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::normalize(sql)).map_err(pg_query_error)
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::fingerprint(sql)
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::fingerprint(sql))
         .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+        .map_err(pg_query_error)
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()

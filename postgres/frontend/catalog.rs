@@ -69,11 +69,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
@@ -101,11 +101,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
             _ => Err(LimboError::ParseError(

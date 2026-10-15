@@ -6,6 +6,8 @@ mod information_schema;
 mod result_types;
 pub use result_types::{element_of, StatementTypes};
 mod session;
+#[cfg(all(test, unix))]
+mod stack_guard_tests;
 
 pub use session::PgConnection as Connection;
 pub use session::{

@@ -2674,6 +2674,9 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ReadOnly => "25006",
         LimboError::DatabaseFull(_) => "53100",
         LimboError::Interrupt => "57014",
+        // The stack-guard class (fastest-engine): a statement nested too deeply for the session's
+        // thread is refused, as PostgreSQL's check_stack_depth() refuses it.
+        LimboError::StackDepthLimitExceeded => "54001",
         _ => "XX000",
     }
 }

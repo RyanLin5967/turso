@@ -37,6 +37,14 @@ pub fn check() -> Result<(), StackDepthExceeded> {
     }
 }
 
+/// Run `f` with at least `needs` bytes of stack: on this thread's stack when it has that much
+/// left, otherwise on a new stack segment of `needs` bytes (`stacker::maybe_grow`). For code with no
+/// `check` of ours inside it whose depth is bounded but large (libpg_query's protobuf decode,
+/// bounded by prost's recursion limit), where a refusal cannot be placed.
+pub fn with_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(needs, needs, f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

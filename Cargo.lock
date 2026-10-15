@@ -7500,6 +7500,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.16",
  "turso_parser",
+ "turso_stack_guard",
 ]
 
 [[package]]
