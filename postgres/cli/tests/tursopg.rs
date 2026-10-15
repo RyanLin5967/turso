@@ -967,27 +967,57 @@ fn start_tursopg_server() -> (Child, u16) {
 }
 
 /// One attempt on `port`: the ready child, or None (it exited, or never became ready), reaped.
+/// Ready means the server's own stdout line "PostgreSQL server listening on ADDR", printed after
+/// its bind; a connect probe was answered by any listener on the port. Its stdout and stderr go to
+/// files under WIRE_SERVER_LOG_DIR, or temp/tursopg_cli_server_logs/<pid>/, kept after the test
+/// (the pipes they used were never read, so a chatty server could block on a full one).
 fn start_tursopg_server_on(port: u16) -> Option<Child> {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
     let addr = format!("127.0.0.1:{port}");
+    let logs = std::env::var_os("WIRE_SERVER_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tursopg_cli_server_logs")
+                .join(std::process::id().to_string())
+        });
+    std::fs::create_dir_all(&logs).expect("server log dir");
+    let stderr = std::fs::File::create(logs.join(format!("server-{port}.stderr")))
+        .expect("server stderr log");
+    let mut stdout_log = std::fs::File::create(logs.join(format!("server-{port}.stdout")))
+        .expect("server stdout log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
         .arg(":memory:")
         .arg("--server")
         .arg(&addr)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("failed to start tursopg server");
-
-    // Wait for the server to be ready by polling TCP connect, bailing out
-    // to a new port if the child exited (lost a bind race).
-    for _ in 0..50 {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let listening = format!("PostgreSQL server listening on {addr} ");
+    let stdout = child.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let _ = writeln!(stdout_log, "{line}");
+            if line.starts_with(&listening) {
+                let _ = ready_tx.send(());
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match ready_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) => return Some(child),
+            // The reader ended: stdout closed, so the server is exiting.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-            return Some(child);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     child.kill().ok();
     child.wait().ok();
