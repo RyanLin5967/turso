@@ -790,8 +790,12 @@ def self_test():
     def case_m11_failed_base_dropped():
         partial = arm_of(trace(1), 10)
         del partial["strace"]
-        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": partial}, budget, art2, cpu="cpu-A",
-                     identity=ident, base_ok=False)
+        # TEST EDIT, flagged (review 7 / C21 finding 2, the lead's order): the head runs BOTH arms art2 holds. With
+        # full-snap-c1 alone, dropping the base rightly FAILs the missing full-cat-c1 (MED 10's lost-arm gate), which
+        # contradicted this positive case; the lost-arm negative is case_m10_head_lost_arm, and every assertion here
+        # stands
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": arm_of(trace(1), 10)},
+                     {"full-snap-c1": partial}, budget, art2, cpu="cpu-A", identity=ident, base_ok=False)
         r = by_id(rows)
         sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
         return (sv is not None and sv[3] == "PASS" and f"baseline artifact of {art_sha}" in sv[1]
@@ -800,6 +804,28 @@ def self_test():
     cases.append(("MED 11: a base whose run failed is dropped: a partial base, the artifact on cpu-A: both premises "
                   "compare against the artifact and PASS, regression_green true, an info row names the dropped base",
                   guarded(case_m11_failed_base_dropped)))
+    # review 7 / C21 finding 1: every C=1 arm the artifact (or an in-job base) holds an Ir count for is compared, not
+    # only the baseline arm: a full-cat-c1 regression with full-snap-c1 clean must FAIL
+    def case_ir_per_arm(cat_ir, cat_has_ir=True):
+        cat = arm_of(trace(1), 10)
+        if cat_has_ir:
+            cat["ir_per_op"]["create"] = cat_ir
+        else:
+            del cat["ir_per_op"]
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": cat}, None, budget, art2, cpu="cpu-A",
+                     identity=ident)
+        return by_id(rows).get("instructions/create/full-cat-c1"), regression_green(rows)
+
+    cases.append(("finding 1: no in-job base, the artifact at Ir 1000 on both C=1 arms, head full-cat-c1 at 10000: "
+                  "instructions/create/full-cat-c1 FAILs regression-kind and regression_green is false",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "FAIL" and r[0][4] == "regression"
+                                   and not r[1])(case_ir_per_arm(10000.0)))))
+    cases.append(("finding 1: the same with head full-cat-c1 at 1000: that row PASSes against the artifact's own arm",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "PASS" and art_sha in r[0][1]
+                                   and r[1])(case_ir_per_arm(1000.0)))))
+    cases.append(("finding 1: a head full-cat-c1 with no Ir count, the artifact holding one: FAILs regression-kind",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "FAIL" and r[0][4] == "regression"
+                                   and not r[1])(case_ir_per_arm(None, cat_has_ir=False)))))
     # review 5 LOW 27 (mutant-kill cases, not red): a cpu label missing on BOTH sides is a refusal, never a match of
     # None to None or "" to "" (a mutant comparing only baseline["cpu"] != cpu passed every case)
     for label in ("", None):
