@@ -285,14 +285,19 @@ GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
 # unchanged inside its windows
 EXCEPTION_COUNTERS = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
 PHASES = ("create", "connect", "write", "delete")  # fastest_profile's --mode phases windows, in order (main.rs PHASES)
+# what t3run.sh asks every run of ours for: --mode phases with no --phases, so every phase (fastest_profile's default)
+RUNNER_MODE, RUNNER_PHASES = "phases", len(PHASES)
 
 
 def exception_deltas(j):
     """({window: {counter: after - before}} or None, the refusals) from ours' result/summary.json: every window carries
     exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
     deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED). The windows
-    listed must be exactly, in order, the ones the run measured (its own mode and phases_run: PHASES[:phases_run], or
-    cycle), each named, and no counter may fall between one window's close and the next one's open."""
+    listed must be exactly, in order, the ones t3run asked for (RUNNER_MODE with RUNNER_PHASES phases, which the run's
+    own mode and phases_run must also say: a run's claim alone never narrows the coverage), each named, and no counter
+    may fall between one window's close and the next one's open. A rise between windows is not refused: the ruling
+    credits a cell on zero INSIDE its windows, and the gaps hold unmeasured work (the branch connections closing
+    before the delete window opens)."""
     if not isinstance(j, dict):
         return None, ["summary.json is not an object, so the engine's branch exception counters are unknown"]
     wins = j.get("windows")
@@ -300,13 +305,10 @@ def exception_deltas(j):
         return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
                       "(fastest_profile must record them per window: Rust, HELD)"]
     pr = j.get("phases_run")
-    if j.get("mode") == "cycle":
-        want = ["cycle"]
-    elif j.get("mode") == "phases" and type(pr) is int and 1 <= pr <= len(PHASES):
-        want = list(PHASES[:pr])
-    else:
-        return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} name no measured windows, so the "
-                      "exception counters' coverage cannot be judged"]
+    if j.get("mode") != RUNNER_MODE or type(pr) is not int or pr != RUNNER_PHASES:
+        return None, [f"summary.json's mode {j.get('mode')!r} and phases_run {pr!r} are not what t3run asked for "
+                      f"({RUNNER_MODE!r}, {RUNNER_PHASES}), so the exception counters' coverage cannot be judged"]
+    want = list(PHASES[:RUNNER_PHASES])
     out, bad, prev = {}, [], None
     names = [w.get("window") if isinstance(w, dict) else None for w in wins]
     if names != want:
@@ -1258,6 +1260,14 @@ def self_test():
                       and b["v3l"]["published"]["pooled_fsync_p50_us"] == 10.0, None))
     finally:
         shutil.rmtree(root)
+    # PIN (not a red): RUNNER_MODE/RUNNER_PHASES are what t3run.sh asks fastest_profile for, read from its source, so a
+    # runner that changed --mode or added --phases fails here instead of every package
+    runner = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "t3run.sh")).read()
+    fp = [ln for ln in runner.splitlines() if "fastest_profile" in ln or "--mode" in ln or "--phases" in ln]
+    cases.append(("exception counters: t3run.sh runs fastest_profile with --mode phases and no --phases "
+                  f"(RUNNER_MODE {RUNNER_MODE!r}, RUNNER_PHASES {RUNNER_PHASES})",
+                  RUNNER_MODE == "phases" and RUNNER_PHASES == len(PHASES)
+                  and any("--mode phases" in ln for ln in fp) and not any("--phases" in ln for ln in fp), fp))
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
