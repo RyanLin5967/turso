@@ -503,6 +503,35 @@ run_server_cell() { # run_server_cell SPEC C
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
 
+# du_total PATH... -> the allocated bytes of PATHs together (du -sB1 -c), empty when du fails
+du_total() { du -sB1 -c "$@" 2>/dev/null | awk '$2 == "total" {print $1}'; }
+# parent_du_paths / store_du_paths -- comp review 1 LOW 26: the parent's own files (what server_fixture's --du names:
+# PG the template p's directory, Dolt and Doltgres their whole store, which BEFORE the prebranch is the parent alone)
+# and the whole store (PG the cluster's data directory), each into the array DUP
+parent_du_paths() {
+  local oid
+  case $KIND in
+    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'"); DUP=("$DATA/base/$oid") ;;
+    dolt) DUP=("$DATA/dbs/bench") ;;
+    doltgres) DUP=("$DATA/databases") ;;
+    b1) DUP=("$ROOT/parent.db") ;;
+  esac
+}
+store_du_paths() {
+  case $KIND in
+    pg) DUP=("$DATA") ;;
+    dolt) DUP=("$DATA/dbs/bench") ;;
+    doltgres) DUP=("$DATA/databases") ;;
+    b1) DUP=("$ROOT/parent.db" "$ROOT/branches") ;;
+  esac
+}
+# parent_du_before_prebranch -> PARENT_DU0 (LOW 26), or the job fails
+parent_du_before_prebranch() {
+  local -a DUP
+  parent_du_paths
+  PARENT_DU0=$(du_total "${DUP[@]}")
+  [[ $PARENT_DU0 =~ ^[1-9][0-9]*$ ]] || fail "parent du before the prebranch [$PARENT_DU0] of ${DUP[*]} is not a count"
+}
 # server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
 # parent's own files, the size as the engine reports it (or why it cannot), the extent count of its data files.
 server_fixture() {
@@ -544,9 +573,12 @@ server_fixture() {
   rb=$(sqlp "$(python3 -B "$HERE/gen_seed.py" readback-sql --dialect "$dial")" | tr '\t' '|' | tail -1)
   echo "$rb" >"$RAW/readback.txt"
   cp "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" "$RAW/" 2>/dev/null || fail "seed stream digests missing"
+  local -a DUP
+  store_du_paths  # LOW 26: the whole store at N
   if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} \
     ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" --evidence "$mev" \
+    --parent-du-bytes "${PARENT_DU0:-}" --store-du "${DUP[@]}" \
     --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null 2>"$RAW/fixture-write.err"; then
     pass "parent read back by the engine (count|sum|row hash) and its piped streams are the generator's: $rb"
   else
@@ -742,6 +774,7 @@ server_main() {
   for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict "$DATA".gc-settings.txt; do
     [ -e "$f" ] && cp "$f" "$RAW/seed-$(basename "$f")"
   done
+  parent_du_before_prebranch  # LOW 26: the parent's du, comparable across systems, before any branch exists
   prebranch_server
   server_fixture  # after prebranch: it records the live-branch count read back there (HIGH 1, MED 3)
   if [ "$KIND" = pg ]; then
@@ -985,6 +1018,7 @@ b1_main() {
   # PREBRANCH live branches first, each with one private write (untraced, untimed; C=1 and no warm-up, so exactly
   # PREBRANCH ops; bounded by the outer timeout and the cap like every run), kept: no --drop. LIVE0 is then READ (the
   # branch files under branches/) and must be PREBRANCH (HIGH 1, MED 3).
+  parent_du_before_prebranch  # LOW 26
   if [ "$PREBRANCH" -gt 0 ]; then
     mkdir -p "$ROOT/branches/prebranch"
     # LOW 21: at PREBRANCH_C clients with --no-drain (exactly PREBRANCH ops), bounded by PREBRANCH_S, duration recorded
@@ -996,8 +1030,11 @@ b1_main() {
   fi
   LIVE0=$(count_branches)
   expect "live branches before the cells (LIVE0, branch files read back)" "$LIVE0" "$PREBRANCH"
+  local -a DUP
+  store_du_paths  # LOW 26: the whole store at N (the parent and the branch files)
   if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
+    --parent-du-bytes "${PARENT_DU0:-}" --store-du "${DUP[@]}" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
     --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
     --evidence "$(jf "$RAW/mkparent.json" evidence)" \

@@ -7,16 +7,22 @@ cells (each with one private write: the system's own M1 op, untimed). Each job w
 
   {"system", "rows", "age_updates", "prebranch", "live_branches" (MEASURED after prebranch: the live-branch count N
    every cell runs at, main excluded; lead review HIGH 1), "gen_seed_sha256" (gen_seed.py's digest of the SQL stream
-   for these rows and aging), "du_bytes" (du of the parent's files), "engine_bytes" (as the engine reports it; null
-   only with "engine_bytes_why"), "extents" (data file -> extent count), "maintenance" (the post-load steps run)}
+   for these rows and aging), "du_bytes" (du of the --du paths when the record is written, AFTER the prebranch: the
+   parent's files for PG and B1, but the WHOLE store, branches included, for Dolt and Doltgres -- not comparable
+   across systems), "parent_du_bytes" (comp review 1 LOW 26: the same paths' du BEFORE the prebranch, the parent
+   alone on every system: the comparable size), "store_du_at_n_bytes" and "store_du_paths" (the whole store at N,
+   after the prebranch), "engine_bytes" (as the engine reports it; null only with "engine_bytes_why"), "extents" (data
+   file -> extent count), "maintenance" (the post-load steps run)}
 
   fixture.py compare JSON...   exit 0 only when every fixture.json names the same rows, age_updates, prebranch,
                                live_branches and gen_seed_sha256, each one's live_branches equals its prebranch, and
                                each has du_bytes and either engine_bytes or a reason
   fixture.py write OUT --system S --rows R --age K --prebranch N --live L --du PATH... [--engine-bytes B |
-                   --engine-why W] [--extents FILE...] [--maintenance TEXT]
+                   --engine-why W] [--extents FILE...] [--maintenance TEXT] --parent-du-bytes B --store-du PATH...
                                OUT = fixture.json: du_bytes = `du -sB1` over the PATHs (allocated bytes), extents =
-                               filefrag's count per FILE, gen_seed_sha256 = gen_seed.py's digest for (R, K, seed 1)
+                               filefrag's count per FILE, gen_seed_sha256 = gen_seed.py's digest for (R, K, seed 1);
+                               parent_du_bytes = B, run_system.sh's du of the same paths before the prebranch, and
+                               store_du_at_n_bytes = `du -sB1` over the --store-du PATHs now (LOW 26)
   fixture.py sqlite FILE --rows R --age K --sqlite3 BIN [--digest-dir DIR]
                                the parent as an SQLite file, the way B1 (and ours, which opens SQLite files) get it:
                                journal_mode=WAL, gen_seed.py's SQL, its K aging UPDATEs (each autocommitted), then
@@ -136,13 +142,16 @@ def compare(fixtures):
             why.append(mp)
         if not isinstance(f.get("du_bytes"), int) or f["du_bytes"] <= 0:
             why.append(f"{s}: no du_bytes")
+        for k in ("parent_du_bytes", "store_du_at_n_bytes"):  # LOW 26: the comparable sizes
+            if not isinstance(f.get(k), int) or isinstance(f.get(k), bool) or f[k] <= 0:
+                why.append(f"{s}: no {k} ({f.get(k)!r})")
         eb = f.get("engine_bytes")
         if not (isinstance(eb, int) and eb > 0) and not f.get("engine_bytes_why"):
             why.append(f"{s}: no engine_bytes and no reason")
     return why
 
 
-def opts(av, multi=("--du", "--extents", "--streams")):
+def opts(av, multi=("--du", "--extents", "--streams", "--store-du")):
     o, i, key = {}, 0, None
     while i < len(av):
         a = av[i]
@@ -185,6 +194,11 @@ def write(av):
           # MED 11: the table's schema line, by itself (a schema change no longer hides inside the stream digest)
           "schema_sha256": hashlib.sha256((gen_seed.SCHEMA + "\n").encode()).hexdigest(),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
+          # LOW 26: the parent's du measured BEFORE the prebranch (run_system.sh), comparable across systems, and the
+          # whole store's du now, at N (Dolt's and Doltgres's du_bytes above covers their whole store already)
+          "parent_du_bytes": int(o["--parent-du-bytes"]) if o.get("--parent-du-bytes", "").isdigit() else None,
+          "store_du_paths": o.get("--store-du", []),
+          "store_du_at_n_bytes": du_bytes(o.get("--store-du", [])) if o.get("--store-du") else None,
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,
           "extents": {p: extent_count(p) for p in o.get("--extents", [])},
           "maintenance": o.get("--maintenance", ""),
