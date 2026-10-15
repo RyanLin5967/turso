@@ -3173,6 +3173,22 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
 #[cfg(test)]
 pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// Test builds (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
+/// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
+/// the capture's (`start_flight`) and the install's. Observation only.
+#[cfg(test)]
+pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn ckpt_held(label: &'static str) {
+    #[cfg(test)]
+    if let Some(n) = super::budget_probe::unix_syscalls() {
+        CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
+
 fn ckpt_phase(label: &'static str) {
     #[cfg(test)]
     {
@@ -3285,6 +3301,7 @@ fn run_flight(
     ckpt_phase("cut");
     let installed = {
         let mut guard = inner.lock();
+        ckpt_held("install.locked");
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
@@ -3293,7 +3310,9 @@ fn run_flight(
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
+        ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
+        ckpt_held("install.installed");
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3326,6 +3345,7 @@ fn run_flight(
             cat.ckpt.hold(hold_ns);
             cat.ckpt.flight_ns += write_ns;
         }
+        ckpt_held("install.marked");
         // Set under the store mutex, so no capture can slip in before the truncation.
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
@@ -5475,6 +5495,7 @@ impl BranchStore {
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started, or why not.
     fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        ckpt_held("capture.begin");
         match inner.cat.as_ref() {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
@@ -5535,6 +5556,7 @@ impl BranchStore {
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
         let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
+        ckpt_held("capture.matured");
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -5542,6 +5564,7 @@ impl BranchStore {
                 return FlightStart::Failed;
             }
         };
+        ckpt_held("capture.captured");
         let cat = inner.cat.as_mut().expect("captured above");
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;

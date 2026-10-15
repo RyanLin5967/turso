@@ -8698,6 +8698,49 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
     assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
 }
 
+/// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
+/// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`, the
+/// task's count: every thread, each reading one call itself, subtracted here). A D2 catalog store,
+/// three checkpoints after 30 creates each; nothing else runs but the store's own threads.
+#[test]
+fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-held.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut over = Vec::new();
+    for round in 0..3 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
+        let at = |label: &str| points.iter().find(|(l, _)| *l == label).map(|(_, n)| *n);
+        let span = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(x), Some(y)) => (y - x).saturating_sub(1),
+            _ => u64::MAX,
+        };
+        let capture = (span("capture.begin", "capture.matured"), span("capture.matured", "capture.captured"));
+        let install = (
+            span("install.locked", "install.quiesced"),
+            span("install.quiesced", "install.installed"),
+            span("install.installed", "install.marked"),
+        );
+        let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
+        if total > 2 {
+            over.push(format!(
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {}, mark {}]",
+                capture.0, capture.1, install.0, install.1, install.2
+            ));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than two syscalls under the store mutex: {over:?}");
+}
+
 /// Checkpoint FIX (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3
 /// checkpoints in ckpt_n10, budget 3 each, review 1 #7): a fuzzy checkpoint of a D2 catalog store,
 /// its full flushes attributed to its thread's phases (`store::CKPT_PHASES`: start, settled,
