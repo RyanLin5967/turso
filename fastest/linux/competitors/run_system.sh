@@ -326,7 +326,7 @@ ops_line_ok() {
 timedrun_check() {
   local k
   k=$(create_step "$1")
-  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
+  python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" "$DRY" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" "$k" >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
     fail "$3 timed run: ops reader ($(tail -c 200 "$1/timed.ops.err" 2>/dev/null))"; echo "0 0 0" >"$1/timed.ops.txt"

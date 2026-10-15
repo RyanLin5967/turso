@@ -8,15 +8,23 @@ TracerPid of every task of the command's process tree and the server's at the st
 appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), and writes the run's exit status to CELLDIR/timed.rc;
 the load generator records its own TracerPid at the window's start and end (summary.json tracerpid_tm0/tm1).
 
-  timedrun.py check CELLDIR N RULE LIVE CAP
+  timedrun.py warm-check OUTDIR RULE
+                                one run dir's A23 warm-up record, its own fields (clock, loop and mode, open-loop
+                                lateness) and its raw rows (warm-up count, nothing measured at or after tm1): ok or
+                                REFUSED, exit 0 or 1 (run_system.sh's live warm-up plants)
+  timedrun.py check CELLDIR N RULE LIVE CAP DRY
+                                DRY is run_system.sh's FT_DRY (comp review 1 LOW 15): a clean smoke cell (1) is
+                                'ok-smoke', never 'ok'; any DRY but 0 or 1 refuses. Writes
                                 CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
                                 exactly N ops like the labelling run, the tracer record shows it untraced throughout
                                 (tracer_problems: no TracerPid, no gap over GAP_S, sweeps bracketing the window, both
                                 roles swept; MED 4), both runs recorded the warm-up RULE AND did it (run_problems,
                                 MED 6: the warm-up as decided at each claim by PREREG annex A23's rule, checked exactly
                                 from the record warmup_ops / warmup_end_ns / warmup_capped / warmup_last_claim_ns
-                                (warm_problems); the window bound is CAP, capped only with a window at its bound), and
-                                the live-branch count held at LIVE: CELLDIR/live.tsv's four
+                                (warm_problems); the window bound is CAP, capped only with a window at its bound, and
+                                never past it uncapped), each run's record (record_problems) and raw rows
+                                (raw_problems), both runs one command line (pair_problems: loop, mode, rate, clients,
+                                seed), and the live-branch count held at LIVE: CELLDIR/live.tsv's four
                                 counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
                                 review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
                                 so N is the same before and after each run and the same for every cell)
@@ -36,6 +44,7 @@ the load generator records its own TracerPid at the window's start and end (summ
                                 DECISIONS 6b0bef481b); anything else prints why and exits 2
   timedrun.py selftest          known-answer fixtures for check; exit 0 only if every verdict is as expected
 """
+import csv
 import json
 import os
 import re
@@ -131,10 +140,10 @@ def ops(c, n1, n4, total=""):
     (one number for every C and every system), else N1 at C=1 and N4 otherwise; None for a non-count."""
     def count(x):  # a positive decimal count, else None (LOW 13: int("0x10") raised and N=0 passed)
         return int(x) if str(x).isdigit() and int(x) > 0 else None
+    if count(c) is None:  # comp review 1 LOW 16: C first, even when the total is given (FT_CLIENTS=0 passed)
+        return None
     if total not in ("", None):
         return count(total)
-    if count(c) is None:
-        return None
     return count(n1) if int(c) == 1 else count(n4)
 
 
@@ -243,7 +252,8 @@ def warm_problems(nm, sm, warm_rule):
 
 def run_problems(nm, sm, warm_rule, cap):
     """MED 6: what the run DID against what it was told -- its warm-up as decided (warm_problems, PREREG annex A23),
-    its window bound must be the cap, and a run that says capped must have a window at least its bound."""
+    its window bound must be the cap, a run that says capped must have a window at least its bound, and (comp review 1
+    LOW 17) a run that does not say capped must not have run past it."""
     why = warm_problems(nm, sm, warm_rule)
     if cap is not None:
         mw, w = sm.get("max_window_s"), sm.get("window_s")
@@ -255,7 +265,92 @@ def run_problems(nm, sm, warm_rule, cap):
             why.append(f"{nm} run's window bound {mw!r} is not the cap {cap!r}")
         elif sm.get("capped") is True and (not isinstance(w, (int, float)) or w < mw):
             why.append(f"{nm} run says capped but its window {w!r} s is shorter than its bound {mw!r} s")
+        elif sm.get("capped") is not True and isinstance(w, (int, float)) and w > mw + 0.01:
+            why.append(f"{nm} run says not capped but its window {w!r} s ran past its bound {mw!r} s")
     return why
+
+
+CLOCKS = ("CLOCK_MONOTONIC", "CLOCK_BOOTTIME")  # clocks that never step back (bbload's _Static_assert)
+PAIR_KEYS = ("loop", "mode", "rate", "clients", "seed")  # one command line: both runs of a cell share these
+
+
+def record_problems(nm, sm):
+    """What the record must say about itself (competitors review 2): its clock never steps back (item 8); its loop
+    repeats bbload's mode, or is closed for clonebench (mode b1/b0; item 13); and an open-loop run carries its lateness
+    record within its own bound, the macOS bbload's VOID rule (item 3)."""
+    why = []
+    if sm.get("clock") not in CLOCKS:
+        why.append(f"{nm} run's clock {sm.get('clock')!r} is not one that never steps back ({' or '.join(CLOCKS)})")
+    loop, mode = sm.get("loop"), sm.get("mode")
+    if loop in ("closed", "open"):  # an invalid loop is warm_problems' refusal
+        if mode in ("closed", "open"):
+            if loop != mode:
+                why.append(f"{nm} run's loop {loop!r} does not repeat its mode {mode!r}")
+        elif mode in ("b1", "b0"):
+            if loop != "closed":
+                why.append(f"{nm} run is clonebench (mode {mode!r}), closed loop only, but says loop {loop!r}")
+        else:
+            why.append(f"{nm} run's mode {mode!r} is neither bbload's (closed, open) nor clonebench's (b1, b0)")
+    if loop == "open":
+        bound = sm.get("max_send_late_us")
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            why.append(f"{nm} run is open loop with no max_send_late_us")
+        else:
+            for k in ("send_late_us", "pool_late_us"):
+                v = sm.get(k)
+                p99 = v.get("p99") if isinstance(v, dict) else None
+                if not isinstance(p99, (int, float)) or isinstance(p99, bool):
+                    why.append(f"{nm} run is open loop with no {k} p99")
+                elif p99 > bound:
+                    why.append(f"{nm} run's {k} p99 {p99} us is over its bound {bound} us: VOID")
+    return why
+
+
+def raw_problems(nm, d, sm):
+    """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
+    per warm-up op, and (competitors review 2 item 1) no measured row intended at or after tm1_ns, the window's end as
+    claim_op stamped it in intended time."""
+    p = os.path.join(d, "raw.tsv")
+    try:
+        with open(p) as f:
+            rd = csv.DictReader(f, delimiter="\t")
+            rows = list(rd)
+            cols = rd.fieldnames or []
+    except OSError:
+        return [f"{nm} run has no raw.tsv"]
+    if "phase" not in cols or "intended_ns" not in cols:
+        return [f"{nm} run's raw.tsv has no phase or intended_ns column"]
+    why = []
+    wo = sm.get("warmup_ops")
+    nwarm = sum(1 for r in rows if r["phase"] == "warmup")
+    if _count(wo) and nwarm != wo:
+        why.append(f"{nm} run's raw.tsv holds {nwarm} warm-up rows, its summary warmup_ops {wo}")
+    tm1 = sm.get("tm1_ns")
+    if not _count(tm1) or not tm1:
+        why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
+    else:
+        try:
+            late = sum(1 for r in rows if r["phase"] == "measure" and int(r["intended_ns"]) >= tm1)
+        except ValueError:
+            return why + [f"{nm} run's raw.tsv has an intended_ns that is not a count"]
+        if late:
+            why.append(f"{nm} run measured {late} op(s) intended at or after tm1 {tm1}")
+    return why
+
+
+def pair_problems(lab, t):
+    """Both runs of a cell are one command line (run_system.sh bb_args / cb_args): they must agree on PAIR_KEYS
+    (competitors review 2 items 2 and 10)."""
+    return [f"the labelling and timed runs differ in {k}: {lab.get(k)!r} against {t.get(k)!r}"
+            for k in PAIR_KEYS if lab.get(k) != t.get(k)]
+
+
+def warm_check(d, warm_rule):
+    """One run dir's warm-up and record, as run_system.sh's live plants judge them (timedrun.py warm-check)."""
+    sm = load(os.path.join(d, "summary.json"))
+    if sm is None:
+        return [f"no {d}/summary.json"]
+    return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm)
 
 
 def check(celldir, n, warm_rule=None, live=None, cap=None):
@@ -292,12 +387,16 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     if rc != "0":
         why.append(f"timed run exit status {rc}")
     if warm_rule is not None:  # gate-6 review, t3run item 3: the registered rule, the same for both runs
-        for nm, sm in (("labelling", lab), ("timed", t)):
+        for nm, sm, sub in (("labelling", lab, "bb"), ("timed", t, "timed")):
             got = (sm or {}).get("warmup_rule")
             if got != warm_rule:
                 why.append(f"{nm} run warm-up rule {got!r}, not the registered {warm_rule!r}")
-            if sm:  # MED 6: and what each run DID against that rule and the cap
+            if sm:  # MED 6: and what each run DID against that rule and the cap, its record, and its raw rows
                 why += run_problems(nm, sm, warm_rule, cap)
+                why += record_problems(nm, sm)
+                why += raw_problems(nm, os.path.join(celldir, sub), sm)
+    if lab and t:
+        why += pair_problems(lab, t)
     why += tracer_problems(os.path.join(celldir, "timed.tracer.tsv"), t)  # MED 4
     if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
         got = {}
@@ -317,11 +416,17 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     return why
 
 
-def final_verdict(why, warm_rule=None, cap=None):
-    """MED 7: 'ok' only for a clean cell whose rule is the REGISTERED one at its cap, rule(CAP), compared as an exact
-    string; a clean cell warmed up by any other rule (the CI smoke cap) is 'ok-smoke-warmup', never 'ok'."""
+def final_verdict(why, warm_rule, cap, dry):
+    """MED 7: 'ok' only for a clean cell of a REAL run (DRY "0") whose rule is the REGISTERED one at its cap,
+    rule(CAP), compared as an exact string; a clean real cell warmed up by any other rule is 'ok-smoke-warmup'. Comp
+    review 1 LOW 15: a SMOKE run (DRY "1", run_system.sh FT_DRY) is 'ok-smoke' whatever its rule, so a smoke run can
+    never read 'ok'; any other DRY is refused (no default that can be wrong)."""
     if why:
         return "REFUSED: " + "; ".join(why)
+    if dry not in ("0", "1"):
+        return f"REFUSED: FT_DRY [{dry!r}] is neither 0 nor 1"
+    if dry == "1":
+        return "ok-smoke"
     try:
         registered = rule(cap) if cap is not None else None
     except (TypeError, ValueError):
@@ -329,10 +434,11 @@ def final_verdict(why, warm_rule=None, cap=None):
     return "ok" if registered is not None and warm_rule == registered else "ok-smoke-warmup"
 
 
-def write_verdict(celldir, n, why, warm_rule=None, cap=None):
+def write_verdict(celldir, n, why, warm_rule, cap, dry):
     lab = load(os.path.join(celldir, "bb", "summary.json")) or {}
     t = load(os.path.join(celldir, "timed", "summary.json")) or {}
-    out = {"verdict": final_verdict(why, warm_rule, cap), "latency_file": "timed/raw.tsv", "warmup_rule": warm_rule,
+    out = {"verdict": final_verdict(why, warm_rule, cap, dry), "dry": dry, "latency_file": "timed/raw.tsv",
+           "warmup_rule": warm_rule,
            "registered_rule": rule(cap) if cap is not None else None,
            "labelling_dir": "bb", "ops_total": n,
            "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
@@ -784,11 +890,17 @@ def selftest():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 7 and sys.argv[1] == "check":
+    if len(sys.argv) == 8 and sys.argv[1] == "check":
         n = int(sys.argv[3])
         why = check(sys.argv[2], n, sys.argv[4], sys.argv[5], sys.argv[6])
-        print(json.dumps(write_verdict(sys.argv[2], n, why, sys.argv[4], sys.argv[6])))
-        sys.exit(0 if not why else 1)  # ok and ok-smoke-warmup both exit 0; reduce.py tells them apart
+        out = write_verdict(sys.argv[2], n, why, sys.argv[4], sys.argv[6], sys.argv[7])
+        print(json.dumps(out))
+        # ok, ok-smoke and ok-smoke-warmup exit 0 (reduce.py tells them apart); a refused cell or DRY exits 1
+        sys.exit(0 if out["verdict"].startswith("ok") else 1)
+    if len(sys.argv) == 4 and sys.argv[1] == "warm-check":  # OUTDIR RULE: run_system.sh's live warm-up plants
+        why = warm_check(sys.argv[2], sys.argv[3])
+        print("ok" if not why else "REFUSED: " + "; ".join(why))
+        sys.exit(0 if not why else 1)
     if len(sys.argv) == 3 and sys.argv[1] == "tier":  # SUMMARY.JSON: run_system.sh's cap plants (MED 5)
         print(tier(load(sys.argv[2])) or "failed")
         sys.exit(0)
