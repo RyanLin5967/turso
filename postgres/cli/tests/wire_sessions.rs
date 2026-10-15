@@ -151,6 +151,8 @@ struct Reply {
     params: Option<Vec<u32>>,
     /// Every NoticeResponse of the reply, in order.
     notices: Vec<WireError>,
+    /// Every ParameterStatus of the reply, name and value, in order.
+    parameters: Vec<(String, String)>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
     status: u8,
 }
@@ -181,6 +183,8 @@ impl Reply {
 
 struct Wire {
     s: TcpStream,
+    /// The ParameterStatus values the server announced at startup, in order.
+    parameters: Vec<(String, String)>,
 }
 
 impl Wire {
@@ -188,7 +192,10 @@ impl Wire {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         s.set_nodelay(true).unwrap();
-        let mut w = Self { s };
+        let mut w = Self {
+            s,
+            parameters: Vec::new(),
+        };
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
         for (k, v) in [("user", "postgres"), ("database", database)] {
@@ -208,7 +215,10 @@ impl Wire {
                 code: String::new(),
                 message: "the server closed the connection during startup".to_string(),
             }),
-            None => Ok(w),
+            None => {
+                w.parameters = r.parameters;
+                Ok(w)
+            }
         }
     }
 
@@ -460,6 +470,11 @@ impl Wire {
                 }
                 b'C' => r.tags.push(cstr(&body)),
                 b'N' => r.notices.push(error_fields(&body)),
+                b'S' => {
+                    let name = cstr(&body);
+                    let value = cstr(&body[name.len() + 1..]);
+                    r.parameters.push((name, value));
+                }
                 b't' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     r.params = Some(
@@ -2193,6 +2208,67 @@ fn show_answers_from_the_settings_set_keeps() {
         assert_eq!(a.q(sql).err(sql).code, "42704", "{sql}");
     }
     assert_eq!(a.q("SHOW ALL").err("SHOW ALL").code, "0A000");
+}
+
+/// The settings the server announces at startup (ParameterStatus) are the ones SHOW answers, which
+/// are the ones it behaves by: DateStyle `ISO, MDY` (PostgreSQL's boot value), TimeZone UTC,
+/// IntervalStyle postgres, client_encoding UTF8, standard_conforming_strings on, and search_path as
+/// SHOW gives it before any SET. Startup announced pgwire's defaults (`ISO, YMD`, `Etc/UTC`,
+/// `public`) while SHOW answered otherwise (wire review 18 item 19). search_path is reported in
+/// PostgreSQL (GUC_REPORT), so a SET that changes it is followed by a ParameterStatus with the new
+/// path, and one that leaves it as it was by none. SET DateStyle keeps what it is accepted with:
+/// `ISO`, `MDY` and `ISO, MDY` all leave `ISO, MDY`, as in PostgreSQL, and an order or output
+/// style this server does not use (DMY, YMD, SQL, German) is 0A000, where `ISO, DMY` was accepted
+/// and SHOW still said MDY.
+#[test]
+fn startup_announces_the_settings_show_answers() {
+    let dir = Scratch::new("announce");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let announced = a.parameters.clone();
+    for name in [
+        "DateStyle",
+        "TimeZone",
+        "IntervalStyle",
+        "client_encoding",
+        "standard_conforming_strings",
+        "search_path",
+    ] {
+        let sent: Vec<&str> = announced
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let shown = a.q(&format!("SHOW {name}")).single(name);
+        assert_eq!(sent, vec![shown.as_str()], "{name}");
+    }
+    let path = |r: &Reply| {
+        r.parameters
+            .iter()
+            .filter(|(n, _)| n == "search_path")
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    let r = a.q("SET search_path TO s, public").ok("set the path");
+    assert_eq!(path(&r), vec!["s, public".to_string()], "a changed path");
+    let r = a.q("SET search_path TO s, public").ok("the same path");
+    assert_eq!(path(&r), Vec::<String>::new(), "an unchanged path");
+    for sql in [
+        "SET DateStyle = 'ISO'",
+        "SET DateStyle = 'MDY'",
+        "SET DateStyle = 'ISO, MDY'",
+    ] {
+        a.q(sql).ok(sql);
+        assert_eq!(a.q("SHOW DateStyle").single(sql), "ISO, MDY", "{sql}");
+    }
+    for sql in [
+        "SET DateStyle = 'ISO, DMY'",
+        "SET DateStyle = 'YMD'",
+        "SET DateStyle = 'SQL, MDY'",
+        "SET DateStyle = 'German'",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
 }
 
 /// encode(bytea, format) answers as PostgreSQL's does: 'abc' in hex is 616263 and 'ab' in base64
