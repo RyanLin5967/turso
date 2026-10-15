@@ -3450,8 +3450,10 @@ fn synced_flight_over(
 /// The record frames of `kept` (whole frames of an incarnation of nonce `old`, from a flight boundary
 /// or a mark inside a flight, to a flight boundary) framed again for an incarnation of nonce `new`:
 /// one end frame per kept flight, so every flight's boundary is kept (review 2 #3), and none for a
-/// flight with no kept record. A frame that is not whole is refused: the region was written whole
-/// before it was read. Returns the bytes and the last flight's checksum (for `HEADER_CONFIRM_AT`).
+/// flight with no kept record, but for an empty ordered end frame closing a kept flight, kept in a
+/// synced rewrite (engine review 21 MED 9). A frame that is not whole is refused: the region was
+/// written whole before it was read. Returns the bytes and the last flight's checksum (for
+/// `HEADER_CONFIRM_AT`).
 ///
 /// `synced`: the rewrite is synced. A kept flight is tagged synced only when its old end frame said
 /// so AND the rewrite syncs (engine review 7 #1): a flight written unsynced named slots no sync
@@ -3505,6 +3507,21 @@ fn reframe_tagged(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<
             let class = if tag_synced { was_class.max(SyncClass::Fsync) } else { SyncClass::Off };
             let base = !(super::store::fe_mutant("reframe_keeps_raised") && was.is_some_and(|k| k.synced() && !k.by_syncing_writer()));
             let frame = end_frame(new, EndKind::of_class(class, base), &out[flight_at..]);
+            last_crc = end_frame_crc(&frame);
+            out.extend_from_slice(&frame);
+            flight_at = out.len();
+        } else if let Some(kind) =
+            was.filter(|k| synced && flight_at > 0 && k.ordered() && !super::store::fe_mutant("reframe_drops_empty_end"))
+        {
+            // An empty ordered end frame closing the kept flight before it (a zero-byte ordered
+            // upgrade's, `Journal::take_ordered_flight`): that upgrade barriered the flight's slots
+            // ahead of its records, so open skips the flight's slot check. Kept as it was, so the
+            // rewrite keeps that closure (engine review 21 MED 9): dropped, the flight came back
+            // tagged from its own end frame alone, slot-checked at open, and a damaged slot of a
+            // record the upgrade made durable dropped it silently. Only in a rewrite that syncs,
+            // so the closure is never claimed for bytes no sync covered. Mutant
+            // `reframe_drops_empty_end` (test builds only): skipped, as before.
+            let frame = end_frame(new, kind, &[]);
             last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
             flight_at = out.len();
