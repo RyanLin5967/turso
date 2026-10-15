@@ -1075,6 +1075,35 @@ mod tests {
         );
     }
 
+    /// Engine review 20 item 6: the seek's catch region (1d8bf442e) caught every refusal of the
+    /// key's ENCODE and answered an empty seek, so with an index `x = 'abc'` on numeric answered 0
+    /// where NOT INDEXED, like PostgreSQL, raises (invalid input), and so did a well-formed numeric
+    /// blob operand, which the type's operator refuses (94a5dc65c). A refused key is compared with
+    /// itself under the type's '=' outside the catch region: what raises there raises, as the scan
+    /// does. Both plans asserted as premises. Mutant `seek_refusal_swallowed`.
+    #[test]
+    fn an_indexed_seek_raises_where_the_scan_raises() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34)")
+            .unwrap();
+        for pred in ["x = 'abc'", "x = X'0100020000000000000001000000E8030000'"] {
+            let seek = format!("SELECT count(*) FROM t WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM t NOT INDEXED WHERE {pred}");
+            assert!(seeks(&conn, &seek, "t", "tx"), "premise: {seek} seeks tx: {:?}", plan(&conn, &seek));
+            assert!(scans(&conn, &scan, "t"), "premise: {scan} scans: {:?}", plan(&conn, &scan));
+            let by_scan = count(&conn, &scan, None);
+            assert!(by_scan.is_err(), "premise: the scan raises for {pred}: {by_scan:?}");
+            let by_seek = count(&conn, &seek, None);
+            assert!(
+                by_seek.is_err(),
+                "CLAIM: the seek answered {by_seek:?} for {pred}, where the scan raises {by_scan:?}"
+            );
+        }
+    }
+
     /// Register the type `sql` creates as a built-in type, as the wire registers its bpchar.
     fn register_built_in(conn: &Arc<crate::Connection>, sql: &str) {
         let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
