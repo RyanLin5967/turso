@@ -22,6 +22,8 @@
 #              rc 0; fourth lane review LOW 14). That is the replay path only: the live loops' warm-ups are compared
 #              by live_check once the drivers record them (review 5 MED 8, LOUD-OWED; review 6 LOW 17), so rc 0 here
 #              does not yet mean an equal warm-up in the credited runs
+#   quiet      t3lib.sh host_quiet: every active systemd timer and clock adjuster stopped (recorded in quiet.tsv),
+#              then CLOCK_REALTIME - CLOCK_MONOTONIC watched for 30 s and refused if it steps; finish() restarts them
 #              Every timed run, ours and the competitors', runs under the ONE shared tracer sweeper (gates/sweeper.sh,
 #              read by gates/sweeper_record.py; the lead's MED 12 ruling): ours through t3lib.sh ours_timed_exec, its
 #              timed.json recording sweeper_cpu_s over fastest_profile's measured span (its summary.json
@@ -202,6 +204,9 @@ stage() { # stage <name> <function>: time it, record rc; a failed stage ends the
 finish() {
   local rc=$1 t
   t=$(( $(date +%s) - T_ALL ))
+  if declare -F host_unquiet > /dev/null; then
+    host_unquiet "$OUT/quiet.tsv" || echo "t3run: host_unquiet could not start every unit in $OUT/quiet.tsv again"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' TOTAL "$(date -u -d @"$T_ALL" +%FT%TZ)" "$(date -u +%FT%TZ)" "$t" "$rc" >> "$STAGES"
   python3 -B "$L/t3/summarize.py" "$OUT" "$SHA" "$DRY" "$MANIFEST" > "$OUT/summary.json" 2> "$OUT/summarize.stderr" ||
     { [ "$rc" = 0 ] && rc=1; }
@@ -235,6 +240,8 @@ preflight() {
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
   # the shared sweeper is loaded, not only committed (MED 12 ruling): every timed run, ours included, runs under it
+  declare -F host_quiet host_unquiet > /dev/null ||
+    { echo "REFUSED: t3lib.sh's host_quiet / host_unquiet is not defined: the quiet stage would not run"; return 2; }
   declare -F sweeper_start sweeper_wait ours_timed_run ours_timed_exec ours_timed_record > /dev/null ||
     { echo "REFUSED: the shared sweeper (gates/sweeper.sh: sweeper_start, sweeper_wait) or t3lib.sh's ours_timed_exec /"\
            "ours_timed_record is not defined: ours' timed runs would go unswept (MED 12 ruling)"; return 2; }
@@ -778,6 +785,10 @@ warmup_conformance() {
 }
 envchecks() { fcenv_check && warmup_conformance; }
 stage envchecks envchecks
+# The host acts on nothing during the cells (t3lib host_quiet: every systemd timer and clock adjuster stopped, then
+# the clocks watched for a step); finish() starts them again
+quiet() { host_quiet "$OUT/quiet.tsv"; }
+stage quiet quiet
 if [ $DRY = 1 ]; then
   echo "dry run: the runner image mounts / nobarrier; remount with barrier as a T3 box has it"
   sudo mount -o remount,barrier / && findmnt -n -o OPTIONS / | tee "$OUT/root-mount.txt"
