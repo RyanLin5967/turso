@@ -1315,6 +1315,42 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// Engine review 20 LOW 26: the 4c paths the first red never ran, each on its own: INSERT OR
+    /// IGNORE skips a NULL-key row (the others are written); INSERT ... SELECT of a NULL key raises
+    /// NOT NULL; UPDATE SET rowid = NULL raises it; UPDATE OR IGNORE SET id = NULL leaves the row as
+    /// it was. Mutant `null_key_takes_rowid` (all paths at once) fails every arm.
+    #[test]
+    fn every_null_key_path_of_a_frontend_table_is_refused_or_skipped() {
+        fn not_null(result: &crate::Result<()>) -> bool {
+            matches!(result, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id")
+        }
+        fn ids(conn: &Arc<crate::Connection>) -> Vec<i64> {
+            conn.prepare("SELECT id FROM k ORDER BY id")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_int().unwrap())
+                .collect()
+        }
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "pgkey-paths.db", Arc::new(PgKeyTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("CREATE TABLE src (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO src VALUES (NULL)").unwrap();
+        let ignored = conn.execute("INSERT OR IGNORE INTO k VALUES (1, 'a'), (NULL, 'skipped'), (2, 'b')");
+        assert!(ignored.is_ok(), "INSERT OR IGNORE with a NULL key failed: {ignored:?}");
+        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: INSERT OR IGNORE did not skip the NULL-key row alone");
+        let selected = conn.execute("INSERT INTO k (id, v) SELECT x, 's' FROM src");
+        assert!(not_null(&selected), "CLAIM: INSERT ... SELECT of a NULL key: {selected:?}");
+        let rowid = conn.execute("UPDATE k SET rowid = NULL WHERE id = 1");
+        assert!(not_null(&rowid), "CLAIM: UPDATE SET rowid = NULL: {rowid:?}");
+        let update_ignored = conn.execute("UPDATE OR IGNORE k SET id = NULL WHERE id = 2");
+        assert!(update_ignored.is_ok(), "UPDATE OR IGNORE SET id = NULL failed: {update_ignored:?}");
+        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: the refused and skipped statements changed the table");
+    }
+
     /// Engine review 20 LOW 24: a multi-row UPDATE inside BEGIN whose third row sets the NOT NULL
     /// key to NULL raises NOT NULL, and must undo the rows it already changed: the statement journal
     /// counted NOT NULL columns among the SET targets but skipped the rowid and its alias, so none was
