@@ -1931,6 +1931,44 @@ mod tests {
         assert!(bad.is_empty(), "CLAIM: an identifier bound by a custom type or domain matched only in its exact case: {bad:?}");
     }
 
+    /// The lead's correction to `a_domain_check_binds_value_in_any_case`: PostgreSQL's exact claim for a
+    /// failed domain CHECK, registered as a red of its own. PG 18.6 (artie raw frontier/fastest/lanes/
+    /// engine/raw/pg18-domain-check-message.txt 0673f158a3) fails a CAST, an INSERT and an UPDATE alike
+    /// with SQLSTATE 23514 and `value for domain <d> violates check constraint "<name>"`, the name being
+    /// the constraint's own, or `<d>_check`, `<d>_check1`, ... in declaration order. Here: the message
+    /// and the name, exactly; the SQLSTATE is the wire's (postgres/server `sqlstate`).
+    #[test]
+    fn a_failed_domain_check_reports_postgresqls_message_and_name() {
+        let mut bad = Vec::new();
+        let conn = open();
+        for ddl in [
+            "CREATE DOMAIN dm AS integer CHECK (VALUE > 0)",
+            "CREATE DOMAIN d2 AS integer CHECK (VALUE > 0) CHECK (VALUE < 100)",
+            "CREATE DOMAIN dn AS integer CONSTRAINT positive CHECK (VALUE > 0)",
+            "CREATE TABLE tm(id INTEGER PRIMARY KEY, x dm) STRICT",
+            "CREATE TABLE tn(id INTEGER PRIMARY KEY, x dn) STRICT",
+            "INSERT INTO tm VALUES (2, 5)",
+        ] {
+            conn.execute(ddl).unwrap();
+        }
+        for (sql, want) in [
+            ("SELECT CAST(-5 AS dm)", r#"value for domain dm violates check constraint "dm_check""#),
+            ("INSERT INTO tm VALUES (1, -5)", r#"value for domain dm violates check constraint "dm_check""#),
+            ("UPDATE tm SET x = -1 WHERE id = 2", r#"value for domain dm violates check constraint "dm_check""#),
+            ("SELECT CAST(500 AS d2)", r#"value for domain d2 violates check constraint "d2_check1""#),
+            ("SELECT CAST(-1 AS d2)", r#"value for domain d2 violates check constraint "d2_check""#),
+            ("SELECT CAST(-5 AS dn)", r#"value for domain dn violates check constraint "positive""#),
+            ("INSERT INTO tn VALUES (1, -5)", r#"value for domain dn violates check constraint "positive""#),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|_| ());
+            match &got {
+                Err(e) if e.to_string() == want => {}
+                other => bad.push(format!("{sql} gave {other:?}, not PostgreSQL 18's {want:?}")),
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a failed domain CHECK did not report PostgreSQL's message and constraint name: {bad:?}");
+    }
+
     /// Runs `steps` in order on a fresh connection, on a thread of its own: the first error, the last
     /// statement's first column as text, or `Err("timeout")` after 10 s (a red: it never finished).
     fn run_bounded(steps: Vec<String>) -> Result<Option<String>, String> {
