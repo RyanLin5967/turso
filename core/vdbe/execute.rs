@@ -724,10 +724,14 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
-            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
-            // failed drain of the device, acted on before the row reports busy (engine review 17
-            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
-            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            // A trunk sync the pager noted that failed after it yielded is a failed drain of the
+            // device, acted on before the row reports busy (engine review 17 HIGH 1): since
+            // e733305fd that includes the checkpoint's and the TRUNCATE's own WAL syncs, which
+            // `WalFile::watched` notes when they return (engine review 19 HIGH 1), so a busy row
+            // from one of them is acted on here, on async IO (review 19 LOW 8 found this arm with
+            // no reachable case before that fix). Mutant `pragma_checkpoint_failure_cleared` (test
+            // builds only): cleared unchecked, as before; its killer is meant to be the busy-row
+            // case of the a_yielded_*_reported_by_the_pragma_fail_stops arms, UNVERIFIED (QUIET).
             if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
                 pager.check_noted_syncs();
             }
