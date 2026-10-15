@@ -234,6 +234,46 @@ mod tests {
             .unwrap();
     }
 
+    /// A nested step that would leave less than one level's stack is refused on a small thread:
+    /// on a 256 KiB thread a quarter of the stack (64 KiB) is less than one level of the deepest
+    /// phase (a debug view expansion, about 93 KiB), so with the quarter-stack margin alone a
+    /// nested step was admitted with ~100 KiB left and a 120 KiB level then overflowed (fastest-
+    /// engine's review of ed4e4e9a5). Overflowing aborts the test process: that is the red.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_small_thread_refuses_a_nested_step_it_cannot_afford_one_level_for() {
+        #[inline(never)]
+        fn one_level() {
+            let mut frame = [0u8; 120 << 10];
+            std::hint::black_box(&mut frame);
+        }
+        #[inline(never)]
+        fn descend_to(left: usize) -> bool {
+            if remaining_stack().unwrap() > left {
+                let mut frame = [0u8; 1 << 10];
+                std::hint::black_box(&mut frame);
+                return descend_to(left);
+            }
+            match NestGuard::enter("nested") {
+                Ok(_guard) => {
+                    one_level();
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                let _outer = NestGuard::enter("outermost").unwrap();
+                assert!(!descend_to(100 << 10), "a nested step was admitted with ~100 KiB left");
+                assert!(descend_to(200 << 10), "premise: a nested step with ~200 KiB left runs");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// On an 8 MiB thread the margin is the full STACK_MARGIN, as before.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
