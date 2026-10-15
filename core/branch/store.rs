@@ -3231,6 +3231,10 @@ pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>>
 /// the vector's room first, so pushing allocates nothing.
 #[cfg(test)]
 pub(crate) static CKPT_THREADS_ARMED: AtomicBool = AtomicBool::new(false);
+/// Test builds, armed with `CKPT_THREADS_ARMED`: the backtraces of the allocations and frees of 16
+/// KiB or more between the last install's `install.cut_finished` and `install.installed`.
+#[cfg(test)]
+pub(crate) static CKPT_BIG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static CKPT_HELD_THREADS: std::sync::Mutex<Vec<(&'static str, [super::budget_probe::ThreadCpu; 48])>> =
     std::sync::Mutex::new(Vec::new());
@@ -3243,6 +3247,15 @@ fn ckpt_held(label: &'static str) {
             let mut table = [super::budget_probe::ThreadCpu::EMPTY; 48];
             let _ = super::budget_probe::thread_table(&mut table);
             CKPT_HELD_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push((label, table));
+            // The span from the cut's finish to the install's end: big allocations and frees on
+            // this thread, with backtraces (`CKPT_BIG`), for the span that grows past two syscalls.
+            if label == "install.cut_finished" {
+                super::budget_probe::record_big(16 << 10);
+            } else if label == "install.installed" {
+                let (_, _, traces) = super::budget_probe::recorded_allocs();
+                super::budget_probe::record_allocs(false, usize::MAX);
+                *CKPT_BIG.lock().unwrap_or_else(|e| e.into_inner()) = traces;
+            }
         }
     }
     #[cfg(not(test))]

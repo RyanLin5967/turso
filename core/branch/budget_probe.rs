@@ -99,11 +99,35 @@ thread_local! {
     static T_REC_N: Cell<usize> = const { Cell::new(0) };
     static T_TRACE_FROM: Cell<usize> = const { Cell::new(usize::MAX) };
     static T_TRACES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// With `record_big`: only allocations and frees of at least this many bytes are recorded, each
+    /// with a backtrace.
+    static T_REC_MIN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Record this thread's allocations AND frees of at least `min` bytes, each with a backtrace
+/// (`recorded_allocs` reads them; `record_allocs(false, ..)` stops). Diagnostics only.
+pub(crate) fn record_big(min: usize) {
+    record_allocs(true, 0);
+    T_REC_MIN.with(|m| m.set(min));
+}
+
+fn record_free(bytes: usize) {
+    if !T_REC_ON.try_with(|r| r.get()).unwrap_or(false) || T_REC_MIN.with(|m| m.get()) == 0 {
+        return;
+    }
+    if bytes < T_REC_MIN.with(|m| m.get()) {
+        return;
+    }
+    T_REC_ON.with(|r| r.set(false));
+    let trace = format!("free of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture());
+    T_TRACES.with(|t| t.borrow_mut().push(trace));
+    T_REC_ON.with(|r| r.set(true));
 }
 
 /// Start (or stop) recording this thread's allocations, cleared: sizes, and a backtrace of each
 /// from the `trace_from`-th (0-based) on. Diagnostics only: a backtrace costs milliseconds.
 pub(crate) fn record_allocs(on: bool, trace_from: usize) {
+    T_REC_MIN.with(|m| m.set(0));
     T_REC_N.with(|n| n.set(0));
     T_TRACES.with(|t| t.borrow_mut().clear());
     T_TRACE_FROM.with(|t| t.set(trace_from));
@@ -121,6 +145,9 @@ pub(crate) fn recorded_allocs() -> (usize, Vec<usize>, Vec<String>) {
 
 fn record_alloc(bytes: usize) {
     if !T_REC_ON.try_with(|r| r.get()).unwrap_or(false) {
+        return;
+    }
+    if bytes < T_REC_MIN.with(|m| m.get()) {
         return;
     }
     let n = T_REC_N.with(|n| n.get());
@@ -350,6 +377,7 @@ unsafe impl GlobalAlloc for Counting {
         LIVE_BYTES.fetch_sub(layout.size() as i64, Relaxed);
         bump(&T_FREES, 1);
         bump(&T_FREE_BYTES, layout.size() as u64);
+        record_free(layout.size());
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.dealloc(ptr, layout) }
     }

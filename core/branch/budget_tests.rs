@@ -535,9 +535,8 @@ fn diag_n1e4_create_allocations_by_site() {
                 // The frames inside this crate, the allocator's own left out: the site.
                 let frames: Vec<&str> = t
                     .lines()
-                    .filter(|l| l.contains("turso_core::") || l.contains("alloc::collections") || l.contains("hashbrown"))
-                    .filter(|l| !l.contains("budget_probe"))
-                    .take(8)
+                    .filter(|l| l.contains("turso_core::") && !l.contains("budget_probe"))
+                    .take(6)
                     .collect();
                 *sites.entry(format!("{} sizes={sizes:?}\n    {}", t.lines().next().unwrap_or(""), frames.join("\n    "))).or_default() += 1;
             }

@@ -8797,6 +8797,15 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
             }
         }
         line += &format!(" total={total}");
+        let big = std::mem::take(&mut *super::store::CKPT_BIG.lock().unwrap());
+        let frames = |t: &str| {
+            t.lines()
+                .take(1)
+                .chain(t.lines().filter(|l| l.contains("turso_core::") && !l.contains("budget_probe")).take(5))
+                .collect::<Vec<_>>()
+                .join(" <- ")
+        };
+        line += &format!(" | big in cut_finished..installed: {:?}", big.iter().map(|t| frames(t)).collect::<Vec<_>>());
         if total > 2 {
             over += 1;
             for (a, b, n, alone) in &spans_over {
@@ -8828,7 +8837,17 @@ fn diag_fuzzy_checkpoint_held_syscalls_by_thread() {
 fn diag_create_write_delete_syscalls_by_thread() {
     use super::budget_probe::{ran_between, thread_table, unix_syscalls, ThreadCpu};
     let _s = serial();
-    for catalog in [true, false] {
+    struct Quiet;
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            super::store::CONFIRM_QUIET_MS.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _q = Quiet;
+    // Second pass: the confirmation word held back (the budgets' regime, `hold_word`), so the
+    // writer is woken by the first landing only and sleeps after.
+    for (catalog, held) in [(true, false), (false, false), (true, true), (false, true)] {
+        super::store::CONFIRM_QUIET_MS.store(if held { 1 << 40 } else { 0 }, std::sync::atomic::Ordering::Release);
         let dir = tempfile::TempDir::new().unwrap();
         let db = open_at(&dir.path().join("ops-diag.db"), opts(catalog, SyncClass::FullFsync));
         let trunk = db.connect().unwrap();
@@ -8868,7 +8887,7 @@ fn diag_create_write_delete_syscalls_by_thread() {
             });
         }
         for ((op, n), (count, foreign, names)) in &by {
-            println!("catalog={catalog} {op}: {n} syscalls x{count}, {foreign} with another thread running {names:?}");
+            println!("catalog={catalog} word_held={held} {op}: {n} syscalls x{count}, {foreign} with another thread running {names:?}");
         }
     }
 }
