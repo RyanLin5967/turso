@@ -2378,14 +2378,18 @@ struct BranchState {
 /// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
 /// index still masks and still names what it did, and a capture that is never written (a write
 /// that failed, a thread that did not start) leaves nothing to restore.
+///
+/// Ordered maps, not hash maps (L2 slope, budget create_allocates_no_table_of_every_branch_under_the_store_mutex:
+/// a named create rehashed `map`, 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the
+/// store mutex at 33k branches): a B-tree grows a node at a time and never moves every name.
 #[derive(Default)]
 struct NameIndex {
-    map: HashMap<Arc<str>, BranchId>,
+    map: BTreeMap<Arc<str>, BranchId>,
     filter: NameFilter,
-    fresh: HashMap<Arc<str>, BranchId>,
+    fresh: BTreeMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
-    gone: HashMap<Arc<str>, u64>,
+    gone: BTreeMap<Arc<str>, u64>,
     releases: u64,
 }
 
@@ -2998,8 +3002,8 @@ struct Captured {
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
-    names_gone: HashMap<Arc<str>, u64>,
-    names_fresh: HashMap<Arc<str>, BranchId>,
+    names_gone: BTreeMap<Arc<str>, u64>,
+    names_fresh: BTreeMap<Arc<str>, BranchId>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -7777,9 +7781,10 @@ impl BranchStore {
             ("branches.chunks", inner.branches.chunks_for_test(), chunk),
             map("parked", &inner.parked),
             set("pending_holders", &inner.pending_holders),
-            map("names.map", &inner.names.map),
-            map("names.fresh", &inner.names.fresh),
-            map("names.gone", &inner.names.gone),
+            // Ordered maps: no regrowth (L2 slope, red 5aa62c9e7).
+            ("names.map", inner.names.map.len(), 0),
+            ("names.fresh", inner.names.fresh.len(), 0),
+            ("names.gone", inner.names.gone.len(), 0),
         ];
         if let Some(built) = inner.names.filter.built.as_ref() {
             out.push(set("names.filter.built", built));
