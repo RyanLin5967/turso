@@ -233,31 +233,57 @@ def fio_numbers(path):
     return out
 
 
+def labelling_problems(arm, want, v, fio):
+    """One strace-checked labelling run's checks (line 173), by V1L and by fio: exactly N writes to the data file, WANT
+    fsyncs of it, no fsync of another file, no other sync call, no failed call, no io_uring; fio's own error and
+    write count. gates() runs them on the record's labelling run; measure() and gates() run them on annex A27's second
+    one (review 7 finding 3), named by ARM."""
+    if not isinstance(v, dict) or not isinstance(fio, dict):
+        return [f"V1L {arm}: no trace parse or no fio record for this labelling run ({v!r:.60}, {fio!r:.60})"]
+    bad = []
+    if v.get("data_writes") != N:
+        bad.append(f"V1L {arm}: {v.get('data_writes')} writes to the data file, registered exactly {N}")
+    if v.get("data_fsyncs") != want:
+        bad.append(f"V1L {arm}: {v.get('data_fsyncs')} fsync of the data file, registered {want}")
+    if v.get("other_fsyncs"):
+        bad.append(f"V1L {arm}: {v['other_fsyncs']} fsync of other files")
+    for k in OTHER_SYNCS:
+        if v.get(k):
+            bad.append(f"V1L {arm}: {v[k]} {k}, registered 0")
+    if v.get("failed"):
+        bad.append(f"V1L {arm}: {v['failed']} failed write/sync calls")
+    if v.get("io_uring_setup"):
+        bad.append(f"V1L {arm}: io_uring_setup in a labelling run (refused, line 173)")
+    run = arm.split(" ")[0] + "/labelling_fio" + arm[len(arm.split(" ")[0]):]
+    if fio.get("fio_error"):
+        bad.append(f"fio {run}: error {fio['fio_error']}")
+    if fio.get("writes") != N:
+        bad.append(f"fio {run}: {fio.get('writes')} writes, registered exactly {N}")
+    return bad
+
+
+def second_labelling_problems(a):
+    """Annex A27's second labelling run (the fsync arm's v1l_2 and labelling_fio_2) judged as a labelling run, and
+    fio's sync count equal to the first labelling run's (one command): review 7 finding 3"""
+    bad = labelling_problems("fsync (A27 second labelling)", N, a.get("v1l_2"), a.get("labelling_fio_2"))
+    s1, s2 = (a.get("labelling_fio") or {}).get("syncs"), (a.get("labelling_fio_2") or {}).get("syncs")
+    if s2 != s1:
+        bad.append(f"fio fsync (A27 second labelling): {s2} syncs, the first labelling run {s1} (one command; they must "
+                   "agree)")
+    return bad
+
+
 def gates(rec):
     """The registered gates over a record; the list of failures (empty = VALID)."""
     bad = []
     for arm, want in (("fsync", N), ("control", 0)):
         a = rec["arms"][arm]
-        v = a["v1l"]
-        if v["data_writes"] != N:
-            bad.append(f"V1L {arm}: {v['data_writes']} writes to the data file, registered exactly {N}")
-        if v["data_fsyncs"] != want:
-            bad.append(f"V1L {arm}: {v['data_fsyncs']} fsync of the data file, registered {want}")
-        if v["other_fsyncs"]:
-            bad.append(f"V1L {arm}: {v['other_fsyncs']} fsync of other files")
-        for k in OTHER_SYNCS:
-            if v.get(k):
-                bad.append(f"V1L {arm}: {v[k]} {k}, registered 0")
-        if v["failed"]:
-            bad.append(f"V1L {arm}: {v['failed']} failed write/sync calls")
-        if v["io_uring_setup"]:
-            bad.append(f"V1L {arm}: io_uring_setup in a labelling run (refused, line 173)")
-        for run in ("labelling_fio", "timed"):
-            f = a[run]
-            if f.get("fio_error"):
-                bad.append(f"fio {arm}/{run}: error {f['fio_error']}")
-            if f.get("writes") != N:
-                bad.append(f"fio {arm}/{run}: {f.get('writes')} writes, registered exactly {N}")
+        bad += labelling_problems(arm, want, a["v1l"], a["labelling_fio"])
+        f = a["timed"]
+        if f.get("fio_error"):
+            bad.append(f"fio {arm}/timed: error {f['fio_error']}")
+        if f.get("writes") != N:
+            bad.append(f"fio {arm}/timed: {f.get('writes')} writes, registered exactly {N}")
         if arm == "control":
             for run in ("labelling_fio", "timed"):
                 if a[run].get("syncs", 0):
@@ -270,6 +296,9 @@ def gates(rec):
                 bad.append(f"fio fsync/timed: {a['timed'].get('syncs')} syncs, not {N - 1} or {N}")
             if a["timed"].get("fsync_p50_us") is None or not a["timed"].get("fsync_bins_ns"):
                 bad.append("fio fsync/timed: no fsync p50 or no latency histogram (the block's normaliser is unmeasured)")
+    # annex A27's second labelling run, wherever a record carries it, is judged as a labelling run (review 7 finding 3)
+    if "v1l_2" in rec["arms"]["fsync"] or "lab_pair" in rec["arms"]["fsync"]:
+        bad += second_labelling_problems(rec["arms"]["fsync"])
     for lay in rec["leaf"].get("layers") or []:
         bad += counter_gate(f"loop layer {lay.get('name')}", lay.get("write_cache"), lay.get("flush_ios_delta"),
                             lay.get("lab_flush_ios_delta"))
@@ -551,11 +580,19 @@ def measure(d, out, leafrec=None):
             if r2.returncode != 0:
                 raise RuntimeError(f"second labelling {arm} run rc {r2.returncode}: {r2.stderr[-400:]}")
             a["v1l_2"] = parse_v1l(open(tr2).read(), f)
+            a["labelling_fio_2"] = fio_numbers(lj2)
+            a["labelling_fio_2"].pop("fsync_bins_ns", None)
             os.unlink(f)
+            # judged as a labelling run first (review 7 finding 3): only a valid one may bind SLACK or let a timed run
+            # start; rc 0 is not the V1L shape proof the first run gets
+            run_bad = second_labelling_problems(a)
             pair = {"first": g1 - g0, "second": h1 - h0, "allowance": f"SLACK/2 = {float(SLACK / 2)} of the larger",
-                    "sync": sy_lab2}
+                    "sync": sy_lab2, "run_problems": run_bad}
             pair["problem"] = lab_pair_problem(pair["first"], pair["second"])
             a["lab_pair"] = pair
+            if run_bad and os.environ.get("V3L_REAL") == "1":
+                raise RuntimeError("the A27 second labelling run is not a valid labelling run, so it binds nothing "
+                                   "(review 7 finding 3): " + "; ".join(run_bad))
             if pair["problem"] and os.environ.get("V3L_REAL") == "1":
                 raise RuntimeError(pair["problem"])
         tj = os.path.join(out, f"{arm}-timed.json")

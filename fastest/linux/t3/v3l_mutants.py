@@ -127,7 +127,7 @@ MUTANTS = [
     ("A27c-second-run-not-refused", "review 7 finding 3: a real run refuses an invalid second labelling run",
      '            if run_bad and os.environ.get("V3L_REAL") == "1":\n', '            if False:\n', "UNRUN (QUIET)"),
     ("A27d-second-run-not-gated", "review 7 finding 3: gates() judges the second labelling run of a record",
-     '        bad += second_labelling_problems(rec["arms"]["fsync"])\n', '', "UNRUN (QUIET)"),
+     '        bad += second_labelling_problems(rec["arms"]["fsync"])\n', '        pass\n', "UNRUN (QUIET)"),
     ("A27b-pair-threshold-slack", "annex A27: the pair's allowance is SLACK/2 of the larger, not SLACK",
      '    if Fraction(abs(first - second)) > SLACK / 2 * big:\n',
      '    if Fraction(abs(first - second)) > SLACK * big:\n', "UNRUN (QUIET)"),
