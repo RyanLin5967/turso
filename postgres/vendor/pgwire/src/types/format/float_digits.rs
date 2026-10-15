@@ -34,16 +34,17 @@ impl ExtraFloatDigits {
         if value.is_nan() {
             return "NaN".to_string();
         }
+        // PostgreSQL's float8out / float4out spellings, and a negative zero keeps its sign.
         if value.is_infinite() {
             return if value.is_sign_positive() {
-                "inf".to_string()
+                "Infinity".to_string()
             } else {
-                "-inf".to_string()
+                "-Infinity".to_string()
             };
         }
 
         if value == 0.0 {
-            return "0".to_string();
+            return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
         }
 
         // For extra_float_digits >= 1, the shortest exact digits in PostgreSQL's layout
@@ -66,16 +67,17 @@ impl ExtraFloatDigits {
         if value.is_nan() {
             return "NaN".to_string();
         }
+        // PostgreSQL's float8out / float4out spellings, and a negative zero keeps its sign.
         if value.is_infinite() {
             return if value.is_sign_positive() {
-                "inf".to_string()
+                "Infinity".to_string()
             } else {
-                "-inf".to_string()
+                "-Infinity".to_string()
             };
         }
 
         if value == 0.0 {
-            return "0".to_string();
+            return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
         }
 
         // For extra_float_digits >= 1, the shortest exact digits in PostgreSQL's layout
@@ -210,8 +212,10 @@ mod tests {
         }
 
         assert_eq!(ExtraFloatDigits(0).format_f64(f64::NAN), "NaN");
-        assert_eq!(ExtraFloatDigits(0).format_f64(f64::INFINITY), "inf");
-        assert_eq!(ExtraFloatDigits(0).format_f64(-f64::INFINITY), "-inf");
+        // FLAGGED TEST EDIT (fastest-wire, lead ruling 2026-10-15T07:40:59Z; VENDORED.md item 6):
+        // upstream asserted "inf" / "-inf"; PostgreSQL 18.6 writes "Infinity" / "-Infinity".
+        assert_eq!(ExtraFloatDigits(0).format_f64(f64::INFINITY), "Infinity");
+        assert_eq!(ExtraFloatDigits(0).format_f64(-f64::INFINITY), "-Infinity");
 
         let v = std::f32::consts::PI; //3.1415926535897931
 
