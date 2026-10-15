@@ -311,8 +311,11 @@ def self_test():
         ("tracerpid: no tracerpid_tm0 fails", check({k: v for k, v in rec().items() if k != "tracerpid_tm0"}, 33, 4,
                                                     "1000000:0:2") != []),
         ("tracerpid: tracerpid_tm1 as a string fails", check(rec() | {"tracerpid_tm1": "0"}, 33, 4, "1000000:0:2") != []),
-        ("tracerpid: null on a platform without /proc keeps the contract",
-         check(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, 33, 4, "1000000:0:2") == []),
+        # TEST EDIT, flagged (its first Linux run, 2026-10-15, failed it: check() reads the platform, and on Linux null is
+        # refused by design, the case below): the no-/proc allowance is asked of the rule with that platform, not of
+        # whichever platform runs the self-test
+        ("tracerpid: null where there is no /proc keeps the contract",
+         tracerpid_problems(rec() | {"tracerpid_tm0": None, "tracerpid_tm1": None}, linux=False) == []),
         # second fresh read (0802dd739..79c58561f) LOW 2 and 4: on Linux the driver can read its TracerPid, so null is
         # refused there; tie refuses a summary or warm-up that is not an object instead of crashing
         ("tracerpid: null on Linux fails (the driver could read /proc)",

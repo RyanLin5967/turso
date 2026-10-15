@@ -125,11 +125,17 @@ def table_problems(rows, root=LINUX):
 
 
 def copy_of(d, top):
-    """a copy of fastest/linux/D under TOP, its testdata/ a symlink to the original"""
+    """a copy of fastest/linux/D under TOP, its testdata/ a symlink to the original, and every sibling directory of D
+    a symlink to the original, so a test that reaches a sibling (t3lib_test.sh's ../gates/sweeper.sh) finds it (the first
+    Linux run, 2026-10-15: the t3 control refused with 68/78, its sweeper cases finding no ../gates)"""
     dst = os.path.join(top, d)
     shutil.copytree(os.path.join(LINUX, d), dst, symlinks=True, ignore=shutil.ignore_patterns("testdata", "__pycache__"))
     if os.path.isdir(os.path.join(LINUX, d, "testdata")):
         os.symlink(os.path.join(LINUX, d, "testdata"), os.path.join(dst, "testdata"))
+    parent = os.path.dirname(dst)
+    for sib in os.listdir(LINUX):
+        if sib != d.split("/")[0] and os.path.isdir(os.path.join(LINUX, sib)) and not os.path.exists(os.path.join(parent, sib)):
+            os.symlink(os.path.join(LINUX, sib), os.path.join(parent, sib))
     return dst
 
 
