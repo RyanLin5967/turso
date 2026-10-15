@@ -6033,7 +6033,9 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         held_trace("fork.named");
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        // One allocation for a name, shared by its record and the name index.
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name_arc.as_ref());
         held_trace("fork.records");
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
@@ -6043,7 +6045,7 @@ impl BranchStore {
         let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         held_trace("fork.buffered");
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
         held_trace("fork.applied");
@@ -6127,13 +6129,14 @@ impl BranchStore {
             }
         }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now, name);
+        let name_arc: Option<Arc<str>> = name.map(Arc::from);
+        let (records, lease) = inner.fork_records(id, parent, now, name_arc.as_ref());
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         let lsn = self.buffer_records(&mut inner, records.iter().flatten())?;
         let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
-        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name.map(Arc::from)) {
+        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name_arc) {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
@@ -8677,7 +8680,7 @@ impl StoreInner {
         child: BranchId,
         parent: BranchId,
         now: u64,
-        name: Option<&str>,
+        name: Option<&Arc<str>>,
     ) -> ([Option<Record>; 2], Option<(u64, u64)>) {
         // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
         // trunk's child, whatever the parent was).
@@ -8692,7 +8695,7 @@ impl StoreInner {
             Some(name) => Record::ForkNamed {
                 child: child.0,
                 parent: logged_parent,
-                name: name.to_string(),
+                name: name.clone(),
             },
         }), None];
         let lease = self
@@ -10727,7 +10730,7 @@ impl StoreInner {
                     BranchId(*child),
                     None,
                     Handle::Detached,
-                    Some(Arc::from(name.as_str())),
+                    Some(name.clone()),
                 )
                 .map_err(corrupt),
             Record::Commit { branch, pages } => {

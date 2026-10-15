@@ -346,7 +346,9 @@ pub(crate) enum Record {
     ForkNamed {
         child: u64,
         parent: u64,
-        name: String,
+        /// Shared with the name index (`NameIndex::map`), so a named create allocates its name once
+        /// under the store mutex (budget create_allocates_at_most_once_under_the_store_mutex).
+        name: Arc<str>,
     },
     /// A branch commit: every dirty page and the fresh slot it was written to.
     Commit {
@@ -526,7 +528,7 @@ impl Record {
                 let child = r.u64()?;
                 let parent = r.u64()?;
                 let len = r.u32()? as usize;
-                let name = String::from_utf8(r.take(len)?.to_vec()).ok()?;
+                let name: Arc<str> = Arc::from(std::str::from_utf8(r.take(len)?).ok()?);
                 Record::ForkNamed {
                     child,
                     parent,
