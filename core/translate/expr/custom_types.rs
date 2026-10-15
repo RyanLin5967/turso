@@ -1441,6 +1441,44 @@ mod tests {
         );
     }
 
+    /// Engine review 20 item 7: after fa3f83cdc an IN list compares through the type's '=', but
+    /// with an index on the column the planner still chose an IN seek, which compares the raw
+    /// elements with the ENCODEd index keys: numeric's `x IN (7, 1.5)` found nothing where `x =
+    /// 1.5` finds the row, and tag's `w IN ('zz', 'b')` compared bytes where its '=' is instr. With
+    /// both columns indexed (tag given a bare `OPERATOR '<'`, without which no index is allowed),
+    /// each IN list answers as its elements' `=` do. Mutant `in_seek_on_custom_type`.
+    #[test]
+    fn an_indexed_in_list_answers_as_the_types_eq_does() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2), w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)")
+            .unwrap_or_else(|e| panic!("premise: numeric's column takes an index: {e}"));
+        conn.execute("CREATE INDEX tw ON t(w)")
+            .unwrap_or_else(|e| panic!("premise: tag's column takes an index: {e}"));
+        conn.execute("INSERT INTO t VALUES (1, 1.5, 'abc')").unwrap();
+        for (eq, in_list, param) in [
+            ("x = 1.5", "x IN (7, 1.5)", None),
+            ("x = ?1", "x IN (?1)", Some(Value::from_f64(1.5))),
+            ("w = 'b'", "w IN ('zz', 'b')", None),
+        ] {
+            let by_eq = count(&conn, &format!("SELECT count(*) FROM t WHERE {eq}"), param.clone());
+            let by_in = count(&conn, &format!("SELECT count(*) FROM t WHERE {in_list}"), param.clone());
+            assert!(matches!(by_eq, Ok(1)), "premise: {eq} finds the row: {by_eq:?}");
+            assert!(
+                matches!(by_in, Ok(1)),
+                "CLAIM: {in_list} answered {by_in:?} with the column indexed, where {eq} finds the row ({:?})",
+                plan(&conn, &format!("SELECT count(*) FROM t WHERE {in_list}"))
+            );
+        }
+    }
+
     /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
     /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
     /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
