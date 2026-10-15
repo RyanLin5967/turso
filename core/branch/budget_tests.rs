@@ -623,13 +623,21 @@ impl Drop for ReleaseArm<'_> {
 /// named creates (arm `shared_create`), then, at C <= 64, as many create-then-first-write cycles
 /// (arm `shared_cfw`), closed loop. One line per arm: the durable acknowledgements (creates, plus
 /// first writes in the cfw arm) and the flushes issued meanwhile, process-wide. Threads get 8 MiB
-/// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation).
+/// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation). At C = 8 also a
+/// serialised-schedule control (arm `shared_serial`, DECISIONS 6d491917d2 proposal 2): the clients
+/// take turns on a test-side mutex around each create, so no flight is shared and no waiter need
+/// wait; the contention budgets must judge it without a false refusal.
 fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     let rounds = shared_rounds(c);
-    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false)] {
+    for (arm, cfw) in [("shared_create", false), ("shared_cfw", true), ("shared_commits", false), ("shared_serial", false)] {
         if cfw && c > 64 {
             continue;
         }
+        let serial = arm == "shared_serial";
+        if serial && c != 8 {
+            continue;
+        }
+        let one_at_a_time = std::sync::Mutex::new(());
         // Review 2 M5: creates beside a trunk writer (one DDL, then UPDATEs until the creates end),
         // at C = 8 and 64 only.
         let commits = arm == "shared_commits";
@@ -678,7 +686,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                 })
             });
             for t in 0..c {
-                let go = &go;
+                let (go, one_at_a_time) = (&go, &one_at_a_time);
                 let client = move || {
                     let trunk = db.connect();
                     while !go.load(std::sync::atomic::Ordering::Acquire) {
@@ -690,7 +698,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
                     for i in 0..rounds {
                         let name = format!("{arm}-{t}-{i:04}");
                         let a0 = super::store::thread_waits();
+                        let turn = serial.then(|| one_at_a_time.lock().unwrap_or_else(|e| e.into_inner()));
                         retries += fork_one(&trunk, Some(&name));
+                        drop(turn);
                         max_ack = max_ack.max(delta(a0, super::store::thread_waits()));
                         if cfw {
                             let b = db.connect_named(&name).unwrap();
@@ -3541,11 +3551,11 @@ fn shared_lines() -> Vec<(String, u64, &'static str, Map)> {
     for c in SHARED_CS {
         let spec = format!("shared_c{c}");
         let data = cell(&spec);
-        for arm in ["shared_create", "shared_cfw", "shared_commits"] {
+        for arm in ["shared_create", "shared_cfw", "shared_commits", "shared_serial"] {
             match data.ops.get(arm).and_then(|v| v.first()) {
                 Some(s) => lines.push((spec.clone(), c, arm, s.clone())),
                 None => assert!(
-                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)),
+                    (arm == "shared_cfw" && c > 64) || (arm == "shared_commits" && !(c == 8 || c == 64)) || (arm == "shared_serial" && c != 8),
                     "{spec}: no {arm} line"
                 ),
             }
