@@ -8304,3 +8304,44 @@ fn a_damaged_slot_an_ordered_upgrade_made_durable_is_refused_after_a_cut() {
         "a damaged slot an ordered upgrade made durable was dropped silently after a cut, x read {got:?}"
     );
 }
+
+/// Engine review 21 LOW 19: in-place VACUUM (open once no branch exists, while D0 records may be
+/// undrained) syncs the trunk's WAL itself twice, its header's after a truncation and its image's
+/// before the image is published, and neither sync was watched, though on the branch files' device
+/// either is a drain. A D0 store with x's Release undrained, the trunk FULL with fullfsync (so the
+/// sync drains on Apple as well), the WAL's next sync failing at issue: the VACUUM fails and the
+/// next fork is refused as fail-stopped. Arms: the header's sync (the WAL truncated first) and the
+/// publish sync (it is the first WAL sync VACUUM issues over an initialized WAL). Both modes.
+/// Mutant `vacuum_sync_unwatched`.
+#[test]
+fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        for header in [true, false] {
+            let what = format!("catalog={catalog} header={header}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let (db, armed) = open_failing_wal(
+                &dir.path().join("vacuum-sync.db"),
+                opts(catalog, SyncClass::Off).with_vacuum(true),
+            );
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.fork_branch().unwrap().reap().unwrap();
+            assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+            if header {
+                trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            trunk.execute("PRAGMA synchronous = FULL").unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            armed.store(1, O::Release);
+            let vacuumed = trunk.execute("VACUUM");
+            assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the VACUUM reached a WAL sync");
+            assert!(vacuumed.is_err(), "{what}: premise: the failed WAL sync failed the VACUUM");
+            assert_fail_stopped(
+                db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+                &format!("{what}: the next fork after a failed VACUUM WAL sync with an undrained Release"),
+            );
+        }
+    }
+}
