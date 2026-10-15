@@ -2083,7 +2083,7 @@ impl Session {
             result_format(format, 0, 1)?;
             bad_code(&*st)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
-            return one_text(f, name, format);
+            return branch_text(f, name, portal.is_some(), format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
@@ -2132,7 +2132,7 @@ impl Session {
                     ));
                 }
                 match self.waiting(|| conn.inner().create_branch(&name)) {
-                    Ok(id) => one_int8(f, id.0 as i64, format),
+                    Ok(id) => branch_int8(f, id.0 as i64, portal.is_some(), format),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
             }
@@ -2154,7 +2154,7 @@ impl Session {
                         next.adopt_session_of(conn);
                         st.branch = Some((name.clone(), next));
                     }
-                    return one_text(f, &name, format);
+                    return branch_text(f, &name, portal.is_some(), format);
                 }
                 let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
@@ -2185,7 +2185,7 @@ impl Session {
                     drop(left_conn);
                     st.left = Some(left);
                 }
-                one_text(f, &name, format)
+                branch_text(f, &name, portal.is_some(), format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
                 "55006",
@@ -2199,7 +2199,7 @@ impl Session {
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
-                    Ok(_) => one_text(f, &name, format),
+                    Ok(_) => branch_text(f, &name, portal.is_some(), format),
                     Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
                 }
             }
@@ -2810,6 +2810,80 @@ fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
+/// A branch call's one-row, one-column text reply to a simple Query, encoded here into a fixed
+/// buffer: RowDescription (the column named `f`, of `pg_type`, text format), the DataRow holding
+/// `value`'s text, and CommandComplete `SELECT 1`, byte for byte what pgwire encodes for
+/// [`one_row`]'s response (inline_replies_are_the_messages_pgwire_encodes), with no heap
+/// allocation (L5: they cost the wire 7 of its 20 allocations a call). None when they do not fit.
+fn inline_one_row(f: &str, pg_type: &Type, value: &[u8]) -> Option<pgwire::messages::Inline> {
+    let mut m = pgwire::messages::Inline::default();
+    let t_len = 4 + 2 + f.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2;
+    let d_len = 4 + 2 + 4 + value.len();
+    let tag = b"SELECT 1\0";
+    let ok = m.push(b"T")
+        && m.push(&(i32::try_from(t_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(f.as_bytes())
+        && m.push(&[0])
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&pg_type.oid().to_be_bytes())
+        // pgwire's FieldInfo sends type size and modifier 0 (its From<&FieldInfo>), and so must this.
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(b"D")
+        && m.push(&(i32::try_from(d_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(&(i32::try_from(value.len()).ok()?).to_be_bytes())
+        && m.push(value)
+        && m.push(b"C")
+        && m.push(&((4 + tag.len()) as i32).to_be_bytes())
+        && m.push(tag);
+    ok.then_some(m)
+}
+
+/// A branch call's text reply: inline to a simple Query (`portal` None, text), else pgwire's.
+fn branch_text(f: &str, value: &str, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        if let Some(m) = inline_one_row(f, &Type::TEXT, value.as_bytes()) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_text(f, value, format)
+}
+
+/// [`branch_text`] for a branch id (int8).
+fn branch_int8(f: &str, value: i64, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        let mut digits = [0u8; 20];
+        let text = int_text(value, &mut digits);
+        if let Some(m) = inline_one_row(f, &Type::INT8, text) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_int8(f, value, format)
+}
+
+/// `value`'s decimal text in `buf`, no allocation.
+fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut n = value.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
 const STATS_COLUMNS: [&str; 10] = [
     "unix_syscalls",
     "mach_syscalls",
@@ -3273,6 +3347,8 @@ impl SimpleQueryHandler for Session {
                         ))
                         .await?;
                 }
+                // A branch call's reply, encoded by the fast path (inline_one_row).
+                Response::Inline(m) => client.feed(PgWireBackendMessage::Inline(m)).await?,
                 // This server answers COPY FROM a file itself and never streams COPY.
                 Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                     return Err(PgWireError::UserError(error(
@@ -3586,6 +3662,13 @@ impl ExtendedQueryHandler for Session {
                         client
                             .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                             .await?;
+                    }
+                    // The fast path encodes a simple Query's reply alone (branch, portal None).
+                    Response::Inline(_) => {
+                        return Err(PgWireError::UserError(error(
+                            "XX000",
+                            "internal error: an inline reply reached an Execute".to_string(),
+                        )));
                     }
                     // This server answers COPY FROM a file itself and never streams COPY.
                     Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
@@ -5123,6 +5206,58 @@ mod tests {
             1,
             std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
         )))
+    }
+
+    /// The fast path's inline replies are, byte for byte, the messages pgwire encodes for the same
+    /// reply through one_row (RowDescription, DataRow, CommandComplete `SELECT 1`), for a text and
+    /// an int8 column, an empty and a long value (L5, vendored change 8).
+    #[test]
+    fn inline_replies_are_the_messages_pgwire_encodes() {
+        use futures::StreamExt;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let encoded = |r: Response| -> Vec<u8> {
+            let Response::Query(mut results) = r else {
+                panic!("not a query response")
+            };
+            let mut buf = bytes::BytesMut::new();
+            let fields = results.row_schema().iter().map(Into::into).collect();
+            PgWireBackendMessage::RowDescription(RowDescription::new(fields))
+                .encode(&mut buf)
+                .unwrap();
+            let tag = results.command_tag().to_owned();
+            let mut rows = 0;
+            rt.block_on(async {
+                let data = results.data_rows();
+                while let Some(row) = data.next().await {
+                    PgWireBackendMessage::DataRow(row.unwrap())
+                        .encode(&mut buf)
+                        .unwrap();
+                    rows += 1;
+                }
+            });
+            PgWireBackendMessage::CommandComplete(Tag::new(&tag).with_rows(rows).into())
+                .encode(&mut buf)
+                .unwrap();
+            buf.to_vec()
+        };
+        let long = "x".repeat(150);
+        for (f, value) in [
+            ("turso_branch_current", "main"),
+            ("turso_branch_switch", ""),
+            ("turso_branch_delete", long.as_str()),
+        ] {
+            let inline = inline_one_row(f, &Type::TEXT, value.as_bytes()).expect("fits");
+            let slow = encoded(one_text(f, value, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "{f} {value:?}");
+        }
+        for v in [0i64, 7, 1234567890123, -5] {
+            let mut digits = [0u8; 20];
+            let inline =
+                inline_one_row("turso_branch_create", &Type::INT8, int_text(v, &mut digits)).unwrap();
+            let slow = encoded(one_int8("turso_branch_create", v, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "create {v}");
+        }
+        assert!(inline_one_row("f", &Type::TEXT, &[b'x'; 300]).is_none(), "too long fits");
     }
 
     /// L5's allocation budget in process (lead 2026-10-15; budget.py work's pre-registered rule,

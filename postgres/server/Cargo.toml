@@ -35,6 +35,8 @@ turso_parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The inline-reply test encodes pgwire's messages into a BytesMut (pgwire's own dependency).
+bytes = "1"
 # The frontend's test failpoints, for this crate's own tests alone (resolver 2 keeps a
 # dev-dependency's features out of every other build).
 turso_pg = { workspace = true, features = ["failpoints"] }
