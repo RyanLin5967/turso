@@ -3028,6 +3028,49 @@ fn a_right_join_using_puts_the_merged_column_first() {
     }
 }
 
+/// A boolean or float4 column of a derived table or a CTE keeps its type when the outer SELECT reads
+/// it, by name or through `*`, alone or across a join, as PostgreSQL 18.6 types it (recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-derivedbool.out). It was announced bytea (17) holding 1 and 0
+/// (the regress corpus's join.sql: `true AS linked` read through a LEFT JOIN).
+#[test]
+fn a_derived_tables_boolean_column_stays_boolean() {
+    let dir = Scratch::new("derivedbool");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("CREATE TABLE parent (k int primary key, pd int)").ok("parent");
+    a.q("CREATE TABLE child (k int unique, cd int)").ok("child");
+    a.q("INSERT INTO parent VALUES (1, 10), (2, 20)").ok("parent rows");
+    a.q("INSERT INTO child VALUES (1, 100), (4, 400)").ok("child rows");
+    for (sql, oids, rows) in [
+        ("SELECT linked FROM (SELECT true AS linked) s", vec![16], vec![vec![t("t")]]),
+        (
+            "SELECT s.b, s.c FROM (SELECT 1 = 1 AS b, 1.5::float4 AS c) s",
+            vec![16, 700],
+            vec![vec![t("t"), t("1.5")]],
+        ),
+        (
+            "SELECT p.k, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) \
+             AS ss ON (p.k = ss.k) ORDER BY p.k",
+            vec![23, 16],
+            vec![vec![t("1"), t("t")], vec![t("2"), None]],
+        ),
+        (
+            "WITH w AS (SELECT k > 1 AS big FROM parent) SELECT big FROM w ORDER BY big",
+            vec![16],
+            vec![vec![t("f")], vec![t("t")]],
+        ),
+        (
+            "SELECT * FROM (SELECT k, k = 1 AS one FROM parent) s ORDER BY k",
+            vec![23, 16],
+            vec![vec![t("1"), t("t")], vec![t("2"), t("f")]],
+        ),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(oids), rows), "{sql}");
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
