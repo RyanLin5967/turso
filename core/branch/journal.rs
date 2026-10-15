@@ -164,12 +164,6 @@ enum EndKind {
 }
 
 impl EndKind {
-    /// The kind of a flight synced in Fsync or not at all (`syncs`), written once every byte
-    /// before it was synced or not (`base_syncs`).
-    fn of(syncs: bool, base_syncs: bool) -> Self {
-        Self::of_class(if syncs { SyncClass::Fsync } else { SyncClass::Off }, base_syncs)
-    }
-
     /// The kind of a flight synced in `class`, written once every byte before it was synced or not
     /// (`base_syncs`).
     fn of_class(class: SyncClass, base_syncs: bool) -> Self {
@@ -4864,7 +4858,7 @@ mod tests {
     /// An end frame for the record frames `flight`, as the log at `path` would write it (a synced
     /// one as a writer whose class syncs tags it).
     pub(super) fn forged_end(path: &Path, synced: bool, flight: &[u8]) -> [u8; END_FRAME_LEN] {
-        end_frame(log_nonce(path), EndKind::of(synced, true), flight)
+        end_frame(log_nonce(path), EndKind::of_class(if synced { SyncClass::Fsync } else { SyncClass::Off }, true), flight)
     }
 
     /// Two whole SYNCED flights of `frames` each, as the log at `path` would write them: what proves,
