@@ -838,6 +838,28 @@ b1_main() {
   expect "warm-up plant b1 OPS-binding (C=4, 300:0:60): rc|warmup_ops|loop|warmup_backsteps|timedrun warm-check" \
     "$rco|$(jf "$wpo/summary.json" warmup_ops)|$(jf "$wpo/summary.json" loop)|$(jf "$wpo/summary.json" warmup_backsteps)|$(python3 -B "$HERE/timedrun.py" warm-check "$wpo" 300:0:60 2>&1 | tail -1)" \
     "0|300|closed|0|ok"
+  # Competitors review 2 item 4, clonebench's half: clonebench-plant-claim-early (build.sh; the time read before the
+  # claim lock, 20-200 us sleep on odd clients) at C=8 must count backsteps and be refused by warm-check, while the
+  # real binary, same arguments (d0 clones of about 100 us), records 0 and passes
+  local cbp vv wpc rcc bsc chkc
+  cbp="$(dirname "$CB")/clonebench-plant-claim-early"
+  for vv in real plant; do
+    local bin=$CB
+    [ $vv = plant ] && bin=$cbp
+    wpc="$RAW/plants/claim-time-b1-$vv" rcc=0
+    if [ ! -x "$bin" ]; then fail "claim-time plant b1: no $bin"; continue; fi
+    timeout 120 "$bin" run --mode b1 --op m1c --sync d0 --parent "$ROOT/parent.db" --dir "$ROOT/branches/warmup-plant" \
+      --clients 8 --max-ops 20 --rows "$ROWS" --warmup 200:0:60 --drop --out "$wpc" >"$wpc.txt" 2>&1 || rcc=$?
+    bsc=$(jf "$wpc/summary.json" warmup_backsteps)
+    chkc=$(python3 -B "$HERE/timedrun.py" warm-check "$wpc" 200:0:60 2>&1 | tail -1)
+    if [ $vv = real ]; then
+      expect "claim-time plant b1, the real binary at C=8: rc|warmup_backsteps|timedrun warm-check" "$rcc|$bsc|$chkc" "0|0|ok"
+    elif [ "$rcc" = 0 ] && [[ $bsc =~ ^[1-9][0-9]*$ ]] && [[ $chkc == REFUSED* ]]; then
+      pass "claim-time plant b1, the early-clock mutant at C=8: $bsc backsteps, timedrun refused it"
+    else
+      fail "claim-time plant b1, the early-clock mutant at C=8: rc $rcc, warmup_backsteps [$bsc], warm-check [$chkc] (want >0 and REFUSED)"
+    fi
+  done
   expect "warm-up plants b1: their branches dropped (LIVE0 unchanged)" "$(count_branches)" "$LIVE0"
   python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \

@@ -59,6 +59,10 @@ mv -f "$OUT/bbload-plant-claim-early.tmp.$$" "$OUT/bbload-plant-claim-early"
 clang "${CF[@]}" -I"$W/hdr/include" -I"$W/sqlite/include" \
   -o "$OUT/clonebench.tmp.$$" "$HERE/baselines/clonebench.c" "$W/sqlite/lib/libsqlite3.a" "$HDRLIB" -lpthread -ldl -lm
 mv -f "$OUT/clonebench.tmp.$$" "$OUT/clonebench"
+# clonebench's PLANT twin of bbload-plant-claim-early (competitors review 2 item 4: a mutant of each port)
+clang "${CF[@]}" -DPLANT_CLAIM_TIME_EARLY -I"$W/hdr/include" -I"$W/sqlite/include" \
+  -o "$OUT/clonebench-plant-claim-early.tmp.$$" "$HERE/baselines/clonebench.c" "$W/sqlite/lib/libsqlite3.a" "$HDRLIB" -lpthread -ldl -lm
+mv -f "$OUT/clonebench-plant-claim-early.tmp.$$" "$OUT/clonebench-plant-claim-early"
 install -m 0755 "$W/sqlite/bin/sqlite3" "$OUT/sqlite3"
 # A binary that resolved SQLite from the system (Ubuntu's libsqlite3) is not the pinned build: refuse.
 if ldd "$OUT/clonebench" | grep -q libsqlite3; then echo "REFUSED: clonebench links a shared libsqlite3" >&2; exit 2; fi
@@ -74,6 +78,6 @@ if ldd "$OUT/sqlite3" | grep -q libsqlite3; then echo "REFUSED: the sqlite3 CLI 
   echo "hdrhistogram_c=0.11.10 static=$HDRLIB"
   echo "## ldd bbload"; ldd "$OUT/bbload"
   echo "## ldd clonebench"; ldd "$OUT/clonebench"
-  (cd "$OUT" && sha256sum bbload clonebench sqlite3 bbload-plant-claim-early)
+  (cd "$OUT" && sha256sum bbload clonebench sqlite3 bbload-plant-claim-early clonebench-plant-claim-early)
 } | tee "$OUT/build-info.txt"
 rm -rf "$W"

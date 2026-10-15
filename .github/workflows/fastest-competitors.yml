@@ -211,7 +211,7 @@ jobs:
       - name: Run info
         run: |
           mkdir -p "$RAW"
-          chmod +x dist/bbload dist/clonebench dist/sqlite3 dist/bbload-plant-claim-early
+          chmod +x dist/bbload dist/clonebench dist/sqlite3 dist/bbload-plant-claim-early dist/clonebench-plant-claim-early
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP dry=$FT_DRY (smoke, uncredited) age=$FT_AGE prebranch=$FT_PREBRANCH";
