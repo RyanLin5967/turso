@@ -238,6 +238,13 @@ pub fn scan_params(sql: &str) -> ParamScan {
             Some(None) => break,
             None => {}
         }
+        // Empty statements before the first word (`;SELECT $1`, ` ; /* c */ ; SELECT ...`): the
+        // statement is the one after them, as PostgreSQL reads it (Claude C26 MED 1: the first
+        // token was `;`, so the statement was not counted as analysed and one value was refused).
+        if c == b';' && first.is_none() {
+            i += 1;
+            continue;
+        }
         let at_depth = depth;
         let token_start = i;
         let mut word: Option<&[u8]> = None;
@@ -287,8 +294,26 @@ pub fn scan_params(sql: &str) -> ParamScan {
                 }
                 let w = &b[token_start..i];
                 if w.eq_ignore_ascii_case(b"e") && b.get(i) == Some(&b'\'') {
-                    // E'..': a string whose backslash escapes the next byte.
-                    i = quoted(i, b'\'', true);
+                    // E'..': a string whose backslash escapes the next byte. A quote after
+                    // whitespace that holds a newline continues it in the same escape mode, as
+                    // PostgreSQL's lexer reads `'..'\n'..'` (quotecontinue): read as a standard
+                    // string, an escaped quote in the continuation ended it, and a `$2` after it
+                    // was counted (Claude C26 MED 1, recorded pg18-c26.out). Blind spot: a `--`
+                    // comment inside that whitespace, which the lexer also allows, ends the scan
+                    // of the continuation here.
+                    loop {
+                        i = quoted(i, b'\'', true);
+                        let mut j = i;
+                        let mut newline = false;
+                        while j < b.len() && pg_space(b[j]) {
+                            newline |= b[j] == b'\n' || b[j] == b'\r';
+                            j += 1;
+                        }
+                        if !(newline && b.get(j) == Some(&b'\'')) {
+                            break;
+                        }
+                        i = j;
+                    }
                 } else {
                     word = Some(w);
                 }
