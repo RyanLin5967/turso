@@ -465,6 +465,7 @@ fn a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21() {
             let links = db.branches.catalog_links_for_test();
             (format, links)
         };
+        println!("{point}: after the kill the catalog is format {format:?}, link columns {links}");
         match (format, links) {
             (Some(17), false) | (Some(21), true) => {}
             other => panic!("{point}: after the kill the catalog is {other:?} (format, link columns): neither 17 nor 21"),

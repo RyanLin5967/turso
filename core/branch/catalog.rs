@@ -805,6 +805,12 @@ impl Catalog {
         for sql in LINK_COLUMNS {
             self.conn.execute(sql)?;
         }
+        // Mutant `l4_upgrade_columns_committed_alone` (test builds only): the columns committed in a
+        // transaction of their own (the kill test's fire-check: a kill after it leaves 17 with them).
+        if super::store::fe_mutant("l4_upgrade_columns_committed_alone") {
+            self.conn.execute("COMMIT")?;
+            self.conn.execute("BEGIN")?;
+        }
         self.refresh_links()?;
         super::store::kill_point("ckpt.upgrade.columns");
         let rows = self.child_ids_all.rows(&[], &mut self.counters)?;
