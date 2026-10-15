@@ -248,12 +248,37 @@ jobs:
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
-        # LOW 14: the job's budget, derived from this step's own timeout so no cell can be cut mid-way: a cell not
-        # started by 12600 - 2 x (cap + 600) - 600 s is recorded "NOT RUN: budget" (at the 1800 s cap: 7200 s)
+        # LOW 14: the job's budget, derived from this step's own timeout: run_system.sh starts a cell only while the
+        # budget, 12600 - 2 x (cap + 600) - 600 s (at the 1800 s cap: 7200 s), still holds the longest cell it has run
+        # (comp review 1 LOW 32); the rest of the step's time is for a cell longer than all before it and for the work
+        # after the cells. A cell this step's timeout does cut fails the job and reads MISSING in reduce.
         run: |
           export FT_BUDGET_S=$(( 12600 - 2 * (${FT_CAP_S%.*} + 600) - 600 ))
           [ "$FT_BUDGET_S" -gt 0 ] || { echo "the cap leaves no budget under the 12600 s step timeout"; exit 1; }
           timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
+      # Comp review 1 LOW 32's plant: a budget of 1 s must leave every B1 cell "NOT RUN: budget" and fail the run (the
+      # budget path had never run). Its own directory on the same filesystem, so the measured run above is untouched.
+      - name: Budget plant (b1, FT_BUDGET_S=1)
+        if: ${{ !cancelled() && matrix.system == 'b1' && steps.fs.outcome == 'success' && steps.fc.outcome == 'success' }}
+        env:
+          FT_BBLOAD: ${{ github.workspace }}/dist/bbload
+          FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
+          FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
+          FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
+        run: |
+          mkdir -p "$MNT/budget-plant"
+          rc=0
+          FT_BUDGET_S=1 timeout 3600 bash fastest/linux/competitors/run_system.sh b1 "$MNT/budget-plant" "$RAW/budget-plant" \
+            >"$RAW/budget-plant.txt" 2>&1 || rc=$?
+          n=0 bad=0
+          for cj in "$RAW"/budget-plant/cells/*/cell.json; do
+            [ -e "$cj" ] || continue
+            n=$((n + 1))
+            python3 -B -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["verdict"].startswith("NOT RUN: budget") else 1)' "$cj" ||
+              { echo "budget plant: $cj is not NOT RUN: budget"; bad=$((bad + 1)); }
+          done
+          echo "budget plant: rc $rc, $n cells, $bad not 'NOT RUN: budget'"
+          [ "$rc" != 0 ] && [ "$n" -gt 0 ] && [ "$bad" = 0 ]
       - name: Compress traces
         if: always()
         run: find "$RAW" -name '*.strace' -exec gzip -9 {} + || true

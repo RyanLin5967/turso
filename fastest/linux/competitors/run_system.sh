@@ -139,15 +139,29 @@ OUTER_S=$((${CAP_S%.*} + 600))
 # LOW 21's prebranch bound, whole seconds (prebrun_bound's shell arithmetic)
 PREBRANCH_S=${FT_PREBRANCH_S:-${CAP_S%.*}}
 [[ $PREBRANCH_S =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: FT_PREBRANCH_S [$PREBRANCH_S] is not a whole number of seconds" >&2; exit 2; }
-# LOW 14: a time budget for the whole job (FT_BUDGET_S, seconds; 0 or unset = none). A cell not STARTED by then is
-# recorded "NOT RUN: budget" (cell.json and timed.json; reduce.py counts it, never a silent MISSING), so a job-level
-# timeout of at least BUDGET + 2 x OUTER_S (a cell's two bounded runs) + slack can never cut a cell mid-way. The
-# workflow derives it from its own `timeout`.
+# LOW 14: a time budget for the whole job (FT_BUDGET_S, seconds; 0 or unset = none). Comp review 1 LOW 32: a cell
+# is STARTED only while the budget still holds the longest cell this job has run so far (CELL_MAX_SEEN, measured over
+# whole cells: conncheck, idle window, both runs, the CHECKPOINTs, the counts, the kept arm); a cell it does not
+# start is recorded "NOT RUN: budget" (cell.json and timed.json; reduce.py counts it, never a silent MISSING). Every
+# step of a cell is bounded: the load generators by OUTER_S, every SQL statement (the CHECKPOINTs included) by
+# SQL_TIMEOUT_S, every stracecount count by COUNT_TIMEOUT_S. What this does NOT promise (the old comment's "can
+# never cut a cell" was false: a cell has three OUTER_S-bounded runs and the CHECKPOINTs and counts had no bound): a
+# cell longer than every earlier one can still overrun the budget, and the work after the cells (the plants since
+# LOW 25, the designated branches, the functional checks) is outside it; the workflow's step timeout leaves room for
+# that, and if it fires the job fails and reduce.py reports the cells it cut as MISSING.
+SQL_TIMEOUT_S=600
+COUNT_TIMEOUT_S=1800
 BUDGET_S=${FT_BUDGET_S:-0}
 [[ $BUDGET_S =~ ^[0-9]+$ ]] || { echo "REFUSED: FT_BUDGET_S [$BUDGET_S] is not a number of seconds" >&2; exit 2; }
-over_budget() { # over_budget CELLDIR NAME -> 0 (and the cell recorded NOT RUN) when the budget is spent
-  [ "$BUDGET_S" -gt 0 ] && [ "$SECONDS" -ge "$BUDGET_S" ] || return 1
-  local v="NOT RUN: budget (${SECONDS} s elapsed of FT_BUDGET_S ${BUDGET_S} s)"
+CELL_MAX_SEEN=0
+cell_done() { # cell_done START_SECONDS -- a cell begun at START has ended: the longest so far is the next reserve
+  local dt=$((SECONDS - $1))
+  [ "$dt" -gt "$CELL_MAX_SEEN" ] && CELL_MAX_SEEN=$dt
+  return 0
+}
+over_budget() { # over_budget CELLDIR NAME -> 0 (and the cell recorded NOT RUN) when the budget cannot hold another cell
+  [ "$BUDGET_S" -gt 0 ] && [ $((SECONDS + CELL_MAX_SEEN)) -ge "$BUDGET_S" ] || return 1
+  local v="NOT RUN: budget (${SECONDS} s elapsed + ${CELL_MAX_SEEN} s for the longest cell so far >= FT_BUDGET_S ${BUDGET_S} s)"
   mkdir -p "$1"
   printf '{"name": "%s", "verdict": "%s"}\n' "$SYSTEM/$2" "$v" >"$1/cell.json"
   printf '{"verdict": "%s"}\n' "$v" >"$1/timed.json"
@@ -237,14 +251,15 @@ srv() { # srv CMD ARGS... -- the system's own script
 }
 sqlq() { # sqlq SQL -- one statement on the home database (PG: postgres, NEVER the template: a session on p makes
          # a concurrent CREATE DATABASE wait in CountOtherDBBackends); columns joined by '|'
-  case $KIND in
-    pg) srv sql "$DATA" postgres "$1" ;;
-    dolt|doltgres) srv sql "$DATA" "$1" | tr '\t' '|' ;;
+  case $KIND in  # LOW 32: every statement bounded (a CHECKPOINT had no bound)
+    pg) timeout "$SQL_TIMEOUT_S" bash "$HERE/pg18.sh" sql "$DATA" postgres "$1" ;;
+    dolt) timeout "$SQL_TIMEOUT_S" bash "$HERE/dolt.sh" sql "$DATA" "$1" | tr '\t' '|' ;;
+    doltgres) timeout "$SQL_TIMEOUT_S" bash "$HERE/doltgres.sh" sql "$DATA" "$1" | tr '\t' '|' ;;
   esac
 }
 sqlp() { # sqlp SQL -- on the parent: PG's template p (only after every cell), Dolt/Doltgres main
   case $KIND in
-    pg) srv sql "$DATA" p "$1" ;;
+    pg) timeout "$SQL_TIMEOUT_S" bash "$HERE/pg18.sh" sql "$DATA" p "$1" ;;
     *) sqlq "$1" ;;
   esac
 }
@@ -343,8 +358,8 @@ count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of 
   [ -n "${2:-}" ] && cl=(--clients "$2")
   [ -n "${3:-}" ] && { pt=(--part "$3"); js=$4; }
   [ -n "${CPHASES:-}" ] && ph=(--phases "$CPHASES")
-  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} \
-    ${pt[@]+"${pt[@]}"} ${ph[@]+"${ph[@]}"} >"$js" || rc=$?
+  timeout "$COUNT_TIMEOUT_S" python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" \
+    ${cl[@]+"${cl[@]}"} ${pt[@]+"${pt[@]}"} ${ph[@]+"${ph[@]}"} >"$js" || rc=$?  # LOW 32: bounded
   [ $rc -eq 0 ] || fail "count $js: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$js" 2>&1 | tail -1))"
 }
 # ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
@@ -815,9 +830,12 @@ server_main() {
       "$(python3 -B "$HERE/pins.py" get postgresql any pgdg_package)"
   fi
   no_plant_before_cells
+  local t0c
   for spec in $SPECLIST; do
     for c in $CLIENTS; do
+      t0c=$SECONDS
       run_server_cell "$spec" "$c"
+      cell_done "$t0c"  # LOW 32: the measured reserve
     done
   done
   # comp review 1 LOW 25: PG's cap, warm-up and claim-time plants run AFTER the measured cells, so none perturbs them
@@ -1055,6 +1073,7 @@ b1_main() {
       n=$(nops "$c")
       d="$RAW/cells/b1-$spec-c$c"
       over_budget "$d" "b1-$spec-c$c" && continue  # LOW 14
+      local t0c=$SECONDS  # LOW 32: the measured reserve
       # LOW 20: both runs create in the prebranch directory, among its PREBRANCH live branches (clonebench names each
       # branch b_<run tag>_<client>_<seq>.db with a per-run tag, so a cell's names never meet the prebranch's)
       bdir="$ROOT/branches/prebranch"
@@ -1096,6 +1115,7 @@ b1_main() {
       timedrun_check "$d" "$n" "b1-$spec-c$c"
       expect "b1-$spec-c$c branch files after the timed run (every created branch deleted: the $PREBRANCH remain)" \
         "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$PREBRANCH"
+      cell_done "$t0c"
     done
   done
   # comp review 1 LOW 25: the test plants run AFTER the measured cells, so none perturbs them
