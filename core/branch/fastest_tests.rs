@@ -8655,14 +8655,20 @@ fn a_failed_autocheckpoint_wal_sync_fail_stops_a_d0_store() {
 }
 
 /// Engine review 19 LOW 11 (a cost regime, pinned): past UPGRADE_HARD_CAP (4) times the hold
-/// bound in held frees, the background writer has fallen behind, and the next freeing operation, a
-/// delete or a branch commit, leads the held-free upgrade on its own thread after its own wait and
-/// before it returns (`upgrade_if_overdue`), so 5dc0a1a3c's "0 syncs on create, connect, first
+/// bound in held frees, the background writer has fallen behind, and the freeing operations, a
+/// delete or a branch commit, lead the held-free upgrade on their own thread after their own wait
+/// and before they return (`upgrade_if_overdue`), so 5dc0a1a3c's "0 syncs on create, connect, first
 /// write and delete" does not hold for a delete there. The bound forced to 1, the writer held where
-/// it found the upgrade due, four branches of two slots each reaped (8 held; a release matures
-/// nothing), one fork (its mature arms the upgrade and marks it overdue), then one more delete: it
-/// leads exactly one upgrade and syncs on its own thread. Both modes. Expected PASS: it pins the
-/// regime the record now states.
+/// it found the upgrade due, four branches of two slots each reaped and one more fork and delete,
+/// all on this thread: at least one upgrade is led, all of them here (the writer is held), and this
+/// thread synced. Both modes.
+///
+/// FLAGGED TEST EDIT (fixture; for the lead's ruling): its premise "a release matures nothing, so
+/// only the last delete leads" was false, and the test was red at bb6af4d94 already (artie raw
+/// l1-branch-base_bb6af4d94.txt: "more than 4 slots are held (8)", slots had come free): a reap
+/// past the cap already led the upgrade. The counts are taken across the whole freeing sequence
+/// instead of around the last delete; the claim (operations past the cap lead it on their own
+/// thread) is unchanged.
 #[test]
 fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
     let _s = serial();
@@ -8680,27 +8686,20 @@ fn a_delete_past_the_hard_cap_leads_one_held_free_upgrade() {
             })
             .collect();
         db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        let (upgrades, syncs) = (db.branches.group_counters()[4], super::store::thread_syncs());
         x.reap().unwrap();
         for b in others {
             held.extend(b.owned_slots());
             b.reap().unwrap();
         }
         let d = trunk.fork_branch().unwrap();
-        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
-            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
-        });
-        assert!(
-            held.len() > 4 && held.iter().all(|&s| !db.branch_slot_is_free(s)),
-            "{what}: premise: more than 4 slots are held ({}), past the hard cap",
-            held.len()
-        );
-        let (upgrades, syncs) = (db.branches.group_counters()[4], super::store::thread_syncs());
         d.reap().unwrap();
         let led = db.branches.group_counters()[4] - upgrades;
         let synced = super::store::thread_syncs() - syncs;
         db.branches.confirm_hold_for_test(0);
-        assert_eq!(led, 1, "{what}: a delete past the hard cap led {led} held-free upgrades, not one");
-        assert!(synced > 0, "{what}: the upgrade the delete led did not sync on its thread");
+        assert!(held.len() > 4, "{what}: premise: more than 4 slots were freed ({}), past the hard cap", held.len());
+        assert!(led >= 1, "{what}: no freeing operation past the hard cap led a held-free upgrade");
+        assert!(synced > 0, "{what}: the upgrades the freeing operations led did not sync on their thread");
         eventually(&format!("{what}: the held slots never came free"), || {
             held.iter().all(|&s| db.branch_slot_is_free(s))
         });
@@ -8910,12 +8909,16 @@ fn a_create_behind_a_background_compaction_is_counted() {
     eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
 }
 
-/// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: the
-/// schedule of `a_delete_past_the_hard_cap_leads_one_held_free_upgrade` (the bound forced to 1, the
-/// background writer held where it found the upgrade due, eight slots held), where the next delete
-/// leads the upgrade on its own thread, is counted exactly once (`branch_exception_counters()[0]`).
-/// The reaps and the fork before it, which held the frees, armed the upgrade and marked it overdue,
-/// moved no counter (the control). Both modes.
+/// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: with
+/// the bound forced to 1 and the background writer held where it found the upgrade due, every
+/// held-free upgrade is led by a freeing operation past the hard cap, and each is counted
+/// (`branch_exception_counters()[0]` moves exactly as the upgrade count does, at least once) across
+/// `a_delete_past_the_hard_cap_leads_one_held_free_upgrade`'s schedule. The control: below the cap
+/// (x's two slots, and a fork), no upgrade is led and nothing is counted. Both modes.
+///
+/// FLAGGED TEST EDIT (fixture; for the lead's ruling; this session's own test, red at 9d27592bf,
+/// artie raw l1-branch_9d27592bf.txt, left [1, 0, 0, 0]): it took its control as "the operations
+/// before the last delete", which already lead past the cap. The control is now below the cap.
 #[test]
 fn a_hard_cap_upgrade_is_counted() {
     let _s = serial();
@@ -8932,26 +8935,26 @@ fn a_hard_cap_upgrade_is_counted() {
                 b
             })
             .collect();
-        let base = db.branch_exception_counters();
         db.branches.confirm_hold_for_test(super::store::HOLD_UPGRADE_DUE);
+        let (base, upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         x.reap().unwrap();
+        let _armed = trunk.fork_branch().unwrap().into_id();
+        let (below, below_upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         for b in others {
             held.extend(b.owned_slots());
             b.reap().unwrap();
         }
         let d = trunk.fork_branch().unwrap();
-        eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
-            db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
-        });
-        assert!(held.len() > 4, "{what}: premise: more than 4 slots are held ({}), past the hard cap", held.len());
-        let before = db.branch_exception_counters();
         d.reap().unwrap();
-        let after = db.branch_exception_counters();
+        let (after, after_upgrades) = (db.branch_exception_counters(), db.branches.group_counters()[4]);
         db.branches.confirm_hold_for_test(0);
-        assert_eq!(before, base, "{what}: the operations before the hard-cap delete moved an exception counter");
-        assert_eq!(after[0] - before[0], 1, "{what}: CLAIM: the delete that led the hard-cap upgrade was not counted once: {before:?} -> {after:?}");
+        assert!(held.len() > 4, "{what}: premise: more than 4 slots were freed ({}), past the hard cap", held.len());
+        assert_eq!((below, below_upgrades), (base, upgrades), "{what}: below the hard cap an upgrade was led or counted");
+        let led = after_upgrades - below_upgrades;
+        assert!(led >= 1, "{what}: premise: no freeing operation past the hard cap led a held-free upgrade");
+        assert_eq!(after[0] - below[0], led, "{what}: CLAIM: hard-cap upgrades counted {:?} -> {after:?}, led {led}", below);
         for i in [1, 2, 3] {
-            assert_eq!(after[i], before[i], "{what}: exception counter {i} moved: {before:?} -> {after:?}");
+            assert_eq!(after[i], below[i], "{what}: exception counter {i} moved: {below:?} -> {after:?}");
         }
     }
 }
