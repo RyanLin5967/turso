@@ -245,6 +245,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Cross datatype hashing support | ❌ Not supported | |
 | Distributed checkpointing | ❌ Not supported | |
 | Foreign keys marked as NOT VALID | ❌ Not supported | |
+| Foreign keys in a schema other than public (the child or the parent) | ❌ Not supported | Refused with 0A000 before anything is created, in CREATE TABLE and ALTER TABLE ADD CONSTRAINT: the key checks read public's catalog alone (wire review 16 item 11) |
 | Frozen page map | ❌ Not supported | |
 | Full text search | ❌ Not supported | tsvector/tsquery degrade to TEXT |
 | Hash aggregation can use disk | ❌ Not supported | |
