@@ -1586,6 +1586,11 @@ pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
 /// review 14 MED 9: a drop that lands in between).
 #[cfg(test)]
 pub(crate) const HOLD_CONNECT_LOOKED_UP: u8 = 12;
+
+/// fastest-engine (test hook `checkpoint_hold`): a fuzzy checkpoint's phase 4 waits here, its
+/// catalog WAL's PASSIVE backfill done and its TRUNCATE not begun (engine review 21 MED 5).
+#[cfg(test)]
+pub(crate) const HOLD_AFTER_WAL_PASSIVE: u8 = 14;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -2724,11 +2729,15 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
 /// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
 /// (test builds only): logged only, as before.
-fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group) {
+fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&AtomicU8>) {
+    #[cfg(not(test))]
+    let _ = hold;
     let failed_before = catalog.sync_failures();
     if let Err(e) = catalog.wal_passive() {
         tracing::warn!("branch catalog WAL backfill failed: {e}");
     }
+    #[cfg(test)]
+    pause_at(hold, HOLD_AFTER_WAL_PASSIVE);
     match catalog.truncate_wal() {
         Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
             tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
@@ -2896,7 +2905,7 @@ fn run_flight(
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
             // A panic here must not leave `truncating` set: no checkpoint would start again.
             let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                truncate_catalog_wal(&mut writer.lock(), &group)
+                truncate_catalog_wal(&mut writer.lock(), &group, Some(&*hold))
             }));
             truncating.store(false, Ordering::Release);
             if truncated.is_err() {
@@ -8527,7 +8536,7 @@ impl StoreInner {
         let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
-            truncate_catalog_wal(&mut w, group);
+            truncate_catalog_wal(&mut w, group, None);
         }
         drop(w);
         if let Some(cat) = self.cat.as_mut() {

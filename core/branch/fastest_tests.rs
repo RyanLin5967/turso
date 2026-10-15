@@ -7283,6 +7283,58 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     );
 }
 
+/// Engine review 21 MED 5: the failed catalog sync was decided late, once the PASSIVE backfill and
+/// the whole TRUNCATE had returned, so a flight in the air when the sync failed could land in
+/// between (accepted: the store was not yet fail-stopped), and the late decision then saw nothing
+/// at risk. The D2 arm above with the fork's flight released between the PASSIVE backfill, whose
+/// sync fails, and the TRUNCATE (`HOLD_AFTER_WAL_PASSIVE`): the fork in the air must be refused,
+/// and so must the next. Mutant `catalog_sync_failure_decided_late`.
+#[test]
+fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    *super::catalog::NEXT_CATALOG_IO.lock().unwrap() = Some(Arc::new(FailWalSyncIo {
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        armed: armed.clone(),
+        held: Arc::new(std::sync::Mutex::new(None)),
+    }));
+    let db = open_at(&dir.path().join("cat-sync-late.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _x = trunk.fork_branch().unwrap().into_id();
+    assert!(super::catalog::NEXT_CATALOG_IO.lock().unwrap().is_none(), "premise: the store's catalog opened through the failing IO");
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_WAL_TRUNCATE);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("premise: the checkpoint never installed", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_WAL_TRUNCATE | super::store::HOLD_ARRIVED
+    });
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+    let forker = db.connect().unwrap();
+    let forking = std::thread::spawn(move || forker.fork_branch().map(|x| x.into_id()));
+    eventually("premise: the fork's flight was never taken", || {
+        hold.load(O::Acquire) == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+    });
+    armed.store(1, O::Release);
+    // Moving the hook releases phase 4's first stop; it stops again after the PASSIVE backfill.
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_WAL_PASSIVE);
+    eventually("premise: phase 4 never finished its PASSIVE backfill", || {
+        db.branch_checkpoint_held() == super::store::HOLD_AFTER_WAL_PASSIVE | super::store::HOLD_ARRIVED
+    });
+    assert_eq!(armed.load(O::Acquire), 0, "premise: the PASSIVE backfill reached the catalog's WAL sync");
+    hold.store(0, O::Release);
+    let forked = forking.join().unwrap();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert_fail_stopped(forked, "the fork whose flight landed after the catalog's WAL sync failed");
+    assert_fail_stopped(
+        db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+        "the next fork after the catalog's WAL sync failed with a flight in the air",
+    );
+}
+
 /// Engine review 11 MED 8: a raised D0 store's fuzzy checkpoint settles in the store's class
 /// (Off), so it took an ORDERED flight in the air (landed, its trunk commit's WAL F_FULLFSYNC still
 /// to come) as settled, and committed the catalog over records whose callers may yet be told they
