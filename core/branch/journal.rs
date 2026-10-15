@@ -2424,10 +2424,14 @@ impl Journal {
     /// A held-free upgrade (`BranchStore::sync_upgrade`; engine review 18 HIGH 1): a sync in
     /// `class`, or this journal's own when stronger, of everything the log holds, taken under the
     /// store mutex with no flight in the air. Nothing buffered is taken and no log region is
-    /// reserved, so flights that only write go on while it syncs. The arena's dirty file (slots
-    /// written so far, whether their records are written or still buffered) and the directory a
-    /// cut left unsynced come along, and the class is noted in the header as a flight's would be.
-    /// A take that fails fail-stops the journal, as a flight's does.
+    /// reserved, so flights go on while it syncs. The arena (slots written so far, whether their
+    /// records are written or still buffered) and the directory a cut left unsynced are synced
+    /// through handles of their own, and their dirty marks are LEFT SET (engine review 21 MED 3): a
+    /// flight that syncs while the upgrade is in the air syncs them itself rather than wait, at the
+    /// cost of one repeated plain fsync of each by the next syncing flight per upgrade. When the
+    /// upgrade raises the class the header records, it writes that field, and is then `exclusive`
+    /// (it holds the flight slot), so no flight's own header write can race it; the first raise of
+    /// a store only. A take that fails fail-stops the journal, as a flight's does.
     pub(crate) fn take_upgrade(&mut self, arena: &mut Arena, class: SyncClass) -> Result<Upgrade> {
         self.check_live()?;
         let class = class.max(self.sync);
@@ -2442,7 +2446,8 @@ impl Journal {
                 .file
                 .try_clone()
                 .map_err(|e| io_error(e, "dup branch log"))?;
-            Ok((log, arena.take_dirty_file()?))
+            let arena = if arena.is_dirty() { arena.sync_handle()? } else { None };
+            Ok((log, arena))
         })();
         let (log, arena) = match taken {
             Ok(taken) => taken,
@@ -2451,7 +2456,7 @@ impl Journal {
                 return Err(e);
             }
         };
-        let dir = match self.take_dirty_dir(class) {
+        let dir = match self.dirty_dir_handle(class) {
             Ok(dir) => dir,
             Err(e) => {
                 self.set_poisoned();
@@ -2464,20 +2469,26 @@ impl Journal {
             log,
             arena,
             dir,
+            exclusive: header.is_some(),
             header,
             class,
             at: self.len,
             rewrites: self.rewrites,
+            fail: false,
         })
     }
 
-    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed: when no flight
-    /// was taken and no rewrite ran since, every byte the log holds was synced, so the next flight's
-    /// end frame says so (`prev_synced`), as after an upgrade flight.
-    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) {
-        if self.len == at && self.rewrites == rewrites {
+    /// A held-free upgrade taken at log length `at` after `rewrites` rewrites landed. Returns whether
+    /// the log is still the one it synced (no rewrite ran since), the condition for its landing to
+    /// mark anything (engine review 21 MED 2). When no flight was taken either, every byte the log
+    /// holds was synced, so the next flight's end frame says so (`prev_synced`), as after an
+    /// upgrade flight.
+    pub(crate) fn upgrade_landed(&mut self, at: u64, rewrites: u64) -> bool {
+        let same_log = self.rewrites == rewrites;
+        if same_log && self.len == at {
             self.prev_synced = true;
         }
+        same_log
     }
 
     /// Whether every byte the log holds was synced before a flight written now (`prev_synced`), or
@@ -2489,6 +2500,15 @@ impl Journal {
 
     /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
     fn take_dirty_dir(&mut self, class: SyncClass) -> Result<Option<File>> {
+        let d = self.dirty_dir_handle(class)?;
+        if d.is_some() {
+            self.dir_dirty = false;
+        }
+        Ok(d)
+    }
+
+    /// `take_dirty_dir`, leaving `dir_dirty` set (a held-free upgrade's; `take_upgrade`).
+    fn dirty_dir_handle(&self, class: SyncClass) -> Result<Option<File>> {
         // Mutant `no_cut_dir_sync` (test builds only, review 4 #10): the directory entry a cut's
         // rename made is never synced. Only a crash model that undoes an unsynced rename (C1b)
         // can see it; C1's power-loss simulation does not model renames.
@@ -2499,9 +2519,9 @@ impl Journal {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
         };
-        let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
-        self.dir_dirty = false;
-        Ok(Some(d))
+        File::open(dir)
+            .map(Some)
+            .map_err(|e| io_error(e, "open branch directory"))
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -3065,32 +3085,51 @@ impl Flight {
 }
 
 /// A held-free upgrade's sync (`Journal::take_upgrade`; engine review 18 HIGH 1): the log, the
-/// arena's dirty file and the directory a cut left unsynced, synced by `Upgrade::sync` holding no
-/// lock and no flight slot. It writes no frame.
+/// arena when slots were written since its last sync, and the directory a cut left unsynced, each
+/// through a handle of its own, synced by `Upgrade::sync` holding no lock. It writes no frame and
+/// holds no flight slot, unless `exclusive`.
 pub(crate) struct Upgrade {
     log: File,
     arena: Option<File>,
     dir: Option<File>,
     /// The header's raised-class field, when this upgrade is the first sync in a stronger class.
     header: Option<[u8; 4]>,
+    /// It writes `header`, so it holds the flight slot while it syncs (`take_upgrade`).
+    pub(crate) exclusive: bool,
     pub(crate) class: SyncClass,
     /// The log's length and its rewrite count when taken (`Journal::upgrade_landed`).
     pub(crate) at: u64,
     pub(crate) rewrites: u64,
+    /// The `UpgradeSyncFails` failpoint (engine review 21 MED 4): the sync fails.
+    pub(crate) fail: bool,
 }
 
 impl Upgrade {
     /// The slots first, a plain fsync (ruling 85a032f01, as a flight's), then the header's raised
-    /// class, the directory, and the log in `class`: the order `Flight::write` keeps.
+    /// class, the directory, and the log in `class`: the order `Flight::write` keeps. Mutants (test
+    /// builds only; engine review 21 MED 4): `upgrade_no_arena_sync` and `upgrade_no_log_sync`, each
+    /// sync left out; killed by `a_held_free_upgrade_syncs_the_arena_and_the_log`. No mutant drops
+    /// the directory's sync: no test reaches a dirty directory under an upgrade (a raised store's
+    /// rewrites sync and leave it clean), so one would have no killer.
     pub(crate) fn sync(self) -> Result<()> {
+        if self.fail {
+            return Err(LimboError::InternalError(
+                "failpoint: the held-free upgrade's sync failed".to_string(),
+            ));
+        }
         if let Some(arena) = &self.arena {
-            fsync_file(arena, SyncClass::Fsync)?;
+            if !super::store::fe_mutant("upgrade_no_arena_sync") {
+                fsync_file(arena, SyncClass::Fsync)?;
+            }
         }
         if let Some(raised) = &self.header {
             write_at(&self.log, raised, HEADER_RAISED_AT)?;
         }
         if let Some(dir) = &self.dir {
             fsync_dir(dir, SyncClass::Fsync)?;
+        }
+        if super::store::fe_mutant("upgrade_no_log_sync") {
+            return Ok(());
         }
         fsync_file(&self.log, self.class)
     }

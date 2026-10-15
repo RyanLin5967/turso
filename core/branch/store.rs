@@ -407,6 +407,11 @@ const UPGRADE_IN_AIR: u64 = u64::MAX;
 /// upgrade itself (`Group::upgrade_overdue`).
 const UPGRADE_HARD_CAP: usize = 4;
 
+/// How long the held-free upgrade's leader waits for the Release it was armed for to be written by
+/// its own operation's flight (`BranchStore::lead_upgrade`; engine review 21 LOW 15). Past it the
+/// upgrade covers what is written, and the frees still held arm the next one.
+const UPGRADE_WRITE_WAIT: Duration = Duration::from_millis(100);
+
 /// Test hook stage (`Group::confirm_hold`): the confirmation writer has taken a word to write.
 #[cfg(test)]
 pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
@@ -443,9 +448,10 @@ struct GroupState {
     /// own) go on; so does the confirmation writer.
     arena_syncing: bool,
     /// A held-free upgrade is syncing what the log holds, outside any flight (`BranchStore::
-    /// sync_upgrade`; engine review 18 HIGH 1): it took the arena's dirty mark and the directory's,
-    /// so, as for `arena_syncing`, no flight that syncs is taken, and no rewrite or checkpoint arena
-    /// sync starts, until it lands. Flights that only write go on.
+    /// sync_upgrade`; engine review 18 HIGH 1, review 21 MEDs 2, 3, 17): it leaves the arena's and
+    /// the directory's dirty marks set, so nothing waits for it, flights that sync included (they
+    /// sync both themselves); a rewrite meanwhile makes its landing mark nothing. Read by
+    /// `drain_failed` alone: a sync in the air.
     upgrading: bool,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
@@ -470,14 +476,6 @@ struct GroupState {
     /// proved confirmation pending and went back to waiting.
     #[cfg(test)]
     confirm_wakeups: u64,
-}
-
-impl GroupState {
-    /// A sync is in the air outside any flight: a checkpoint's arena sync (`arena_syncing`) or a
-    /// held-free upgrade's (`upgrading`). Neither holds the flight slot.
-    fn syncing_outside_flight(&self) -> bool {
-        self.arena_syncing || self.upgrading
-    }
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -562,7 +560,8 @@ impl Group {
             || g.ordered > full
             || g.pending_full.is_some()
             || g.flushing
-            || g.syncing_outside_flight();
+            || g.arena_syncing
+            || g.upgrading;
         let stop = (drains && at_risk) || fe_mutant("drain_failure_ignores_risk");
         if !stop {
             return;
@@ -582,18 +581,19 @@ impl Group {
         self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wait until no flight is in the air, nor a sync outside any flight (`syncing_outside_flight`).
-    /// Called under the store mutex (so none can start); a flight's leader, and those syncs, need
-    /// only this group's lock to land, so this cannot deadlock.
+    /// Wait until no flight is in the air, nor a checkpoint's arena sync (`arena_syncing`). Called
+    /// under the store mutex (so none can start); a flight's leader, and that sync, need only this
+    /// group's lock to land, so this cannot deadlock. A held-free upgrade's sync is not waited for
+    /// (`upgrading`; engine review 21 MED 2): a rewrite meanwhile makes its landing mark nothing.
     fn quiesce(&self) -> std::sync::MutexGuard<'_, GroupState> {
         self.quiesce_for(true)
     }
 
     /// `quiesce`, for a flush under the store mutex whose flight `syncs` or not: one that only
-    /// writes does not wait for a sync outside any flight (engine review 9 #8, review 18 HIGH 1).
+    /// writes does not wait for a checkpoint's arena sync (engine review 9 #8).
     fn quiesce_for(&self, syncs: bool) -> std::sync::MutexGuard<'_, GroupState> {
         let mut g = self.lock();
-        while g.flushing || (syncs && g.syncing_outside_flight()) {
+        while g.flushing || (syncs && g.arena_syncing) {
             g = self.wait(g);
         }
         g
@@ -632,23 +632,33 @@ impl Group {
         accepted
     }
 
-    /// A held-free upgrade's outcome (`BranchStore::sync_upgrade`): on success every byte below
-    /// `end` is durable in `class` and every weaker one. It held no flight slot, so a flight in the
-    /// air is left alone, and it had no frames, so the last flight's confirmation is kept. Returns
-    /// whether the landing was accepted, as `land` does.
-    fn land_upgrade(&self, end: u64, class: SyncClass, ok: bool) -> bool {
+    /// A held-free upgrade's sync returned (`BranchStore::sync_upgrade`): it is no longer in the air,
+    /// and an `exclusive` one (it wrote the header's raised class) releases the flight slot it held.
+    /// A failed one fail-stops the store, as a failed flight does. Marks nothing: the upgrade does
+    /// that under the store mutex (`mark_upgraded`), once no rewrite has run since its take.
+    fn end_upgrade(&self, exclusive: bool, ok: bool) {
         let mut g = self.lock();
         g.upgrading = false;
-        let accepted = ok && self.accepts();
-        if accepted {
-            for c in 0..=class_index(class) {
-                self.set_durable(&mut g, c, end);
-            }
-        } else {
+        if exclusive {
+            g.flushing = false;
+        }
+        if !ok {
             self.failed.store(true, Ordering::Release);
         }
         self.cv.notify_all();
-        accepted
+    }
+
+    /// A held-free upgrade's landing (`BranchStore::sync_upgrade`), called holding the store mutex:
+    /// every byte below `end` is durable in `class` and every weaker one, unless the store
+    /// fail-stopped meanwhile. It had no frames, so the last flight's confirmation is kept.
+    fn mark_upgraded(&self, end: u64, class: SyncClass) {
+        let mut g = self.lock();
+        if self.accepts() {
+            for c in 0..=class_index(class) {
+                self.set_durable(&mut g, c, end);
+            }
+        }
+        self.cv.notify_all();
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
@@ -4186,7 +4196,7 @@ impl BranchStore {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    let blocked = g.flushing || g.cutting || (gated && g.syncing_outside_flight());
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
                     // An ordered flight carries these bytes and a trunk commit's WAL flush is
                     // about to make them durable (lead review 1 item 6): waited for, briefly,
                     // rather than led past with an upgrade flight, a second flusher.
@@ -4203,7 +4213,7 @@ impl BranchStore {
                             && g.pending_full.is_some_and(|p| p >= lsn)
                             && !g.flushing
                             && !g.cutting
-                            && !(gated && g.syncing_outside_flight())
+                            && !(gated && g.arena_syncing)
                         {
                             break;
                         }
@@ -4237,7 +4247,7 @@ impl BranchStore {
                     super::budget_probe::futile_lead();
                     continue;
                 }
-                if g.syncing_outside_flight()
+                if g.arena_syncing
                     && !ungated
                     && inner.journal.as_ref().is_some_and(|j| j.flight_syncs(class))
                 {
@@ -4339,7 +4349,7 @@ impl BranchStore {
         let file = loop {
             {
                 let mut g = group.lock();
-                while g.flushing || g.syncing_outside_flight() {
+                while g.flushing || g.arena_syncing {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
@@ -4351,7 +4361,7 @@ impl BranchStore {
             if group.poisoned() {
                 return Err(group_poisoned());
             }
-            if g.flushing || g.syncing_outside_flight() {
+            if g.flushing || g.arena_syncing {
                 continue;
             }
             let Some(arena) = inner.arena.as_mut() else {
@@ -4449,9 +4459,10 @@ impl BranchStore {
     /// Lead the held-free upgrade `mature` found due (`Group::upgrade_due`), if one is and none is
     /// in the air: the store's background writer (`run_confirm_writer`), or a freeing operation
     /// after its own wait once the held frees pass the hard cap (engine review 13 MED 2). A Release
-    /// it was armed for that is still buffered is first written by a flight in the store's own
-    /// class, which in D0 only writes; then one sync of what the log holds, in the free class read
-    /// at its take (`sync_upgrade`), and the frees it covers are returned. Its outcome is no
+    /// it was armed for that is still buffered is waited for, at most `UPGRADE_WRITE_WAIT`: its own
+    /// operation's flight writes it (engine review 21 LOW 15: the writer led a flight of its own
+    /// for it, which held the flight slot). Then one sync of what the log holds, in the free class
+    /// read at its take (`sync_upgrade`), and the frees it covers are returned. Its outcome is no
     /// operation's: a failed upgrade fail-stops the store as any failed flight does, and is only
     /// logged here. Mutant `upgrade_takes_flight_slot` (test builds only): an ordinary flight in
     /// the free class, taking what is buffered and holding the flight slot, as before engine
@@ -4477,13 +4488,16 @@ impl BranchStore {
             Self::wait_durable_on(store, group, hold, due, class)
                 .map(|()| store.lock().mature_frees(group.durable(class)))
         } else {
-            let written = if group.durable(SyncClass::Off) < due {
-                let class = store.lock().sync;
-                Self::wait_durable_on(store, group, None, due, class)
-            } else {
-                Ok(())
-            };
-            written.and_then(|()| Self::sync_upgrade(store, group, hold))
+            let started = Instant::now();
+            let mut g = group.lock();
+            while g.durable[0] < due && !group.poisoned() && !g.confirm_stop {
+                let Some(left) = UPGRADE_WRITE_WAIT.checked_sub(started.elapsed()) else {
+                    break;
+                };
+                g = group.cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            drop(g);
+            Self::sync_upgrade(store, group, hold, due)
         };
         if let Err(e) = led {
             tracing::warn!("branch store: the upgrade for held frees failed: {e}");
@@ -4493,23 +4507,29 @@ impl BranchStore {
             .compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// The held-free upgrade's sync (engine review 18 HIGH 1, review 19 MED 5): with no flight in
-    /// the air and no cut, take under the store mutex what the log holds (`Journal::take_upgrade`:
-    /// the log, the arena's dirty file and the directory a cut left unsynced, nothing buffered),
-    /// mark it in the air (`GroupState::upgrading`) and sync it holding no lock, as `settle_arena`
-    /// does. It holds no flight slot: D0 creates, connects, first writes and deletes, whose flights
-    /// only write, go on and ride nothing; a flight that syncs, a rewrite and a checkpoint's arena
-    /// sync wait for it. On success every byte the log held is durable in the free class read at
-    /// the take, and the frees that covers are returned; nothing is taken when what is written is
-    /// durable in that class already. A failed sync fail-stops the store, as a failed flight does.
-    /// `hold` is the test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`).
-    fn sync_upgrade(store: &StoreMutex, group: &Group, hold: Option<&AtomicU8>) -> Result<()> {
+    /// The held-free upgrade's sync (engine review 18 HIGH 1, review 19 MED 5, review 21 MEDs 2-4
+    /// and LOWs 15-17). With no flight in the air, no cut and no checkpoint arena sync (which took
+    /// the arena's mark), it takes under the store mutex what the log holds (`Journal::take_upgrade`:
+    /// handles on the log, the arena when dirty and the directory a cut left unsynced; nothing
+    /// buffered; the dirty marks left set), marks it in the air (`GroupState::upgrading`) and syncs
+    /// holding no lock. Nothing waits for it: flights go on and sync the arena and directory
+    /// themselves, and a rewrite or an install goes on too, after which this upgrade marks nothing
+    /// (the rewrite replaced the log it synced, and made durable itself what it kept). Only the
+    /// first raise of the header's class makes it `exclusive`: it then holds the flight slot, once
+    /// per store. On success it marks every byte written at its take durable in the free class read
+    /// then, under the store mutex and only over the same log, and returns the frees that covers.
+    /// Nothing is taken when what it was armed for (`due`) or everything written is durable in that
+    /// class already (a FULL trunk commit's flush covered it; engine review 21 LOW 16). A failed sync
+    /// fail-stops the store, as a failed flight does (failpoint `UpgradeSyncFails`). `hold` is the
+    /// test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`). Kill points `upgrade.taken` and
+    /// `upgrade.landed`.
+    fn sync_upgrade(store: &StoreMutex, group: &Group, hold: Option<&AtomicU8>, due: u64) -> Result<()> {
         #[cfg(not(test))]
         let _ = hold;
         let (upgrade, end) = loop {
             {
                 let mut g = group.lock();
-                while g.flushing || g.cutting || g.syncing_outside_flight() {
+                while g.flushing || g.cutting || g.arena_syncing {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
@@ -4521,25 +4541,33 @@ impl BranchStore {
             if group.poisoned() {
                 return Err(group_poisoned());
             }
-            if g.flushing || g.cutting || g.syncing_outside_flight() {
+            if g.flushing || g.cutting || g.arena_syncing {
                 continue;
             }
             let class = inner.free_class();
             // No flight is in the air, so every byte below the Off mark is in a landed one.
             let end = g.durable[0];
-            if !class.syncs() || g.durable[class_index(class)] >= end {
-                let durable = g.durable[class_index(class)];
+            let durable = g.durable[class_index(class)];
+            if !class.syncs() || durable >= due.min(end) {
                 drop(g);
                 inner.mature_frees(durable);
                 return Ok(());
+            }
+            let fail = inner.failpoint == Some(BranchFailpoint::UpgradeSyncFails);
+            if fail {
+                inner.failpoint = None;
             }
             let StoreInner { journal, arena, .. } = &mut *inner;
             let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
                 return Ok(());
             };
             match journal.take_upgrade(arena, class) {
-                Ok(upgrade) => {
+                Ok(mut upgrade) => {
+                    upgrade.fail = fail;
                     g.upgrading = true;
+                    if upgrade.exclusive {
+                        g.flushing = true;
+                    }
                     g.upgrades += 1;
                     break (upgrade, end);
                 }
@@ -4549,19 +4577,22 @@ impl BranchStore {
                 }
             }
         };
+        kill_point("upgrade.taken");
         #[cfg(test)]
         pause_at(hold, HOLD_FLIGHT_TAKEN);
-        let (class, at, rewrites) = (upgrade.class, upgrade.at, upgrade.rewrites);
+        let (class, at, rewrites, exclusive) = (upgrade.class, upgrade.at, upgrade.rewrites, upgrade.exclusive);
         let synced = upgrade.sync();
-        let accepted = group.land_upgrade(end, class, synced.is_ok());
+        group.end_upgrade(exclusive, synced.is_ok());
         synced?;
-        if !accepted {
-            return Err(group_poisoned());
-        }
         let mut inner = store.lock();
-        if let Some(journal) = inner.journal.as_mut() {
-            journal.upgrade_landed(at, rewrites);
+        let same_log = inner
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.upgrade_landed(at, rewrites));
+        if same_log {
+            group.mark_upgraded(end, class);
         }
+        kill_point("upgrade.landed");
         inner.mature_frees(group.durable(class));
         Ok(())
     }
@@ -6367,7 +6398,7 @@ impl BranchStore {
                     if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    let blocked = g.flushing || g.cutting || (gated && g.syncing_outside_flight());
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
                     if !blocked {
                         break;
                     }
@@ -6383,7 +6414,7 @@ impl BranchStore {
                 if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
-                if g.flushing || g.cutting || (gated && g.syncing_outside_flight()) {
+                if g.flushing || g.cutting || (gated && g.arena_syncing) {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
