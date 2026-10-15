@@ -3032,23 +3032,25 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
 }
 
 #[cfg(not(feature = "phase-count"))]
-const WORK_COLUMNS: [&str; 5] = [
+const WORK_COLUMNS: [&str; 6] = [
     "unix_syscalls",
     "instructions",
     "allocations",
     "thread_instructions",
     "confirms_written",
+    "thread_allocations",
 ];
 /// A phase build (feature phase-count, a diagnostic: budget.py work --phases) adds this session
 /// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
 /// is unchanged.
 #[cfg(feature = "phase-count")]
-const WORK_COLUMNS: [&str; 13] = [
+const WORK_COLUMNS: [&str; 14] = [
     "unix_syscalls",
     "instructions",
     "allocations",
     "thread_instructions",
     "confirms_written",
+    "thread_allocations",
     "phase_session",
     "phase_read",
     "phase_parse",
@@ -3086,7 +3088,10 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
         .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
         .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
         .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
-        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)));
+        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
+        // This session thread's own allocations (counters::thread_allocations; 0 without the
+        // alloc-count feature): the work budget judges every counter by the operation's own thread.
+        .and_then(|()| encoder.encode_field(&(counters::thread_allocations() as i64)));
     #[cfg(feature = "phase-count")]
     let row = row.and_then(|()| {
         let phases = turso_pg::phase::totals().unwrap_or_default();
