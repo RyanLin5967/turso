@@ -4628,8 +4628,13 @@ impl BranchStore {
     /// may still be told they failed, and the catalog must not hold their records before that
     /// (review 4 #1). While such a flush is still to come (`pending_full`), this waits for it and
     /// leads nothing: it lands, or it fails and fail-stops the store, which refuses the commit. An
-    /// ordered flight whose flush will not come (its commit ended without one) is left to the
-    /// waiters it covers, which lead their own flush. The wait is bounded as a rider's is
+    /// ordered flight whose flush will not come (its commit ended without one, `pending_full`
+    /// cleared) is not waited for. SCOPE (engine review 18 LOW 11): "the waiters it covers lead their
+    /// own flush" holds in D1 and D2 only; in D0 they need nothing, so the catalog may then commit,
+    /// and likewise when this checkpoint's capture ran between a trunk commit's `begin_trunk_commit`
+    /// and its barrier, a pre-image before that commit's outcome is decided. The pre-image is the
+    /// page the trunk still holds, so a commit that then fails leaves the catalog naming a correct
+    /// copy; nothing a caller was told is contradicted. The wait is bounded as a rider's is
     /// (`pending_full_wait`): the trunk commit can itself be waiting on this checkpoint's install
     /// (`Backpressure`, after its barrier), so past the bound the checkpoint fails, which releases
     /// that wait, and a later one retries. Mutant `settle_ignores_ordered` (test builds only): no
