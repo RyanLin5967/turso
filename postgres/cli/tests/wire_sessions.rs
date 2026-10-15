@@ -5139,6 +5139,39 @@ fn the_parameter_refusals_can_be_told_apart() {
     );
 }
 
+/// A BEGIN inside an open block, bound with a value it has no parameter for, is 08P01 at Bind
+/// (status E: the block fails, as any error there does), never run as the engine's nested BEGIN
+/// nor answered with the 25001 warning; ROLLBACK then ends the block. This is the case
+/// every_statement_checks_its_bind_arity's fix was for, which its rows never sent: its
+/// BEGIN-with-a-value row ran outside a block, refused at the base already, and its two-codes
+/// CHECKPOINT row is refused by check_bind whatever the fix (wire review 14 item 19; the failed
+/// block's ROLLBACK bound with a value is pinned by a_block_exit_bound_with_a_value_is_refused_
+/// before_bind_complete).
+#[test]
+fn a_begin_bound_with_a_value_in_an_open_block_is_08p01() {
+    let dir = Scratch::new("beginvalue");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("a write in the block");
+    let (types, e) = a.bind_round("BEGIN", &[], &[Some(b"v")], &[]);
+    assert_eq!(e.map(|e| e.code), Some("08P01".to_string()));
+    assert!(
+        !types.contains(&b'2'),
+        "BindComplete came before the refusal: {:?}",
+        String::from_utf8_lossy(&types)
+    );
+    assert_eq!(types.last(), Some(&b'Z'));
+    let r = a.q("SELECT 1");
+    assert_eq!(r.err("in the failed block").code, "25P02", "the block failed");
+    a.q("ROLLBACK").ok("end");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+        "0",
+        "the block was rolled back"
+    );
+}
+
 /// A statement's parameters are every $n its text holds, whatever the engine compiles: a $n in a
 /// clause the engine folds away (a false AND, an OR with a true side) or a HAVING still counts, is
 /// described and is bound, as in PostgreSQL. They were read from the engine's slots, so
