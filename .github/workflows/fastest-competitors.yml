@@ -201,7 +201,8 @@ jobs:
           # step's bash -e stops on that.
           pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
           [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
-          sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
+          # comp review 1 LOW 37: postgresql-18-jit, which postgresql-18 pulls in, is pinned to the same build
+          sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-18-jit=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
           pg_lsclusters || true
       # The servers' ports (PG 55432, Doltgres 55433, Dolt 53306) lie inside the ephemeral range 32768-60999, so a
