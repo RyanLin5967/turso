@@ -16,7 +16,12 @@
 //! finds only the shapes it runs. (2) Where the platform cannot report the stack's bounds
 //! (`stacker::remaining_stack` returns `None`: wasm, some targets), `check` cannot refuse and
 //! allows; the parser's and the planner's fixed depth bounds (`MAX_EXPR_DEPTH`) remain the only
-//! limit there.
+//! limit there. (3) A thread whose whole stack is near the red zone can overflow before its first
+//! check: a 64 KiB thread died opening a database (measured; the class test starts at 128 KiB,
+//! where every case is an answer or a refusal). (4) The red zone was sized in a debug build, whose
+//! frames are the largest; per nesting level a debug build used about 128-256 KiB (`SELECT` nested
+//! d deep: d = 2 refused at 384 KiB, d = 8 answered at 2 MiB). (5) `with_stack` sizes a segment
+//! from a bound the caller states; a wrong bound is an overflow the class test must find.
 
 /// The stack, in bytes, that must be left when a recursive entry begins.
 pub const RED_ZONE: usize = 128 * 1024;
