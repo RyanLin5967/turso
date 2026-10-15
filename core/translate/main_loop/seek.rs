@@ -132,6 +132,7 @@ struct SeekKeyEncode<'a> {
 ///   Goto done
 /// refused:
 ///   CatchEnd
+///   equal   = eq_func(key, key)    ; raises as the scan would (engine review 20 item 6)
 ///   Goto loop_end
 /// ```
 fn emit_seek_key_encode_or_empty(
@@ -189,7 +190,7 @@ fn emit_seek_key_encode_or_empty(
         start_reg: args,
         dest: equal,
         func: crate::function::FuncCtx {
-            func,
+            func: func.clone(),
             arg_count: 2,
         },
     });
@@ -209,6 +210,30 @@ fn emit_seek_key_encode_or_empty(
     });
     program.preassign_label_to_next_insn(refused);
     program.emit_insn(Insn::CatchEnd);
+    // Engine review 20 item 6: a refusal was caught whole, so a key the type's own '=' raises on
+    // (numeric's 'abc', a blob operand) answered an empty seek where a scan raises. The key is
+    // compared with itself under that '=', outside the catch region: what raises there raises, as
+    // the scan's first comparison would; a key it accepts equals no stored value (its ENCODE
+    // refused it), so the seek is empty. Mutant `seek_refusal_swallowed` (test builds only): no
+    // comparison, as before.
+    if !crate::branch::store::fe_mutant("seek_refusal_swallowed") {
+        program.emit_insn(Insn::Copy {
+            src_reg: key.reg,
+            dst_reg: args,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: key.reg,
+            dst_reg: args + 1,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: args,
+            dest: equal,
+            func: crate::function::FuncCtx { func, arg_count: 2 },
+        });
+    }
     program.emit_insn(Insn::Goto {
         target_pc: key.loop_end,
     });
