@@ -350,3 +350,129 @@ fn every_l4_fact_equals_the_catalog_query_it_replaces() {
         "premise (legacy 17): every fact was set at some check: {legacy:?}"
     );
 }
+
+/// The child process of the kill tests below: open the store at `FE_LINKS_CHILD`, delete the
+/// branch `FE_LINKS_DELETE` names (if any), and run a sharp checkpoint, which the parent's
+/// `FE_KILL_AT` kills at its point. Returns at once in any other test run.
+#[test]
+fn links_kill_child() {
+    let Ok(path) = std::env::var("FE_LINKS_CHILD") else {
+        return;
+    };
+    let db = open(std::path::Path::new(&path));
+    db.branch_wait_name_filter();
+    if let Ok(name) = std::env::var("FE_LINKS_DELETE") {
+        db.drop_branch(&name).unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    // Not killed: the point was never reached, which the parent refuses.
+    std::process::exit(3);
+}
+
+/// Run `links_kill_child` on `path`, killed at `point`'s first hit; the child's exit status.
+fn kill_child_at(path: &std::path::Path, point: &str, delete: Option<&str>) -> std::process::ExitStatus {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["branch::l4_oracle_tests::links_kill_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_LINKS_CHILD", path)
+        .env("FE_KILL_AT", format!("{point}:1"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(name) = delete {
+        cmd.env("FE_LINKS_DELETE", name);
+    }
+    cmd.status().unwrap()
+}
+
+/// The facts and the links of the store at `path`, reopened, checked against the catalog; then a
+/// checkpoint, and the same checks. `what` names the case.
+fn reopen_and_check(path: &std::path::Path, what: &str) -> Arc<Database> {
+    let db = open(path);
+    db.branch_wait_name_filter();
+    if let Err(e) = db.branches.l4_facts_check_for_test() {
+        panic!("{what}: after the kill, an L4 fact disagrees with the catalog: {e}");
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    if let Err(e) = db.branches.l4_facts_check_for_test() {
+        panic!("{what}: after the next checkpoint, an L4 fact disagrees with the catalog: {e}");
+    }
+    db
+}
+
+/// DECISIONS e977c1d010: a kill between a child's removal and its siblings' relink (kill point
+/// `ckpt.unlinked`, inside the checkpoint writer's transaction) leaves the catalog as it was, and
+/// the reopened store's links equal the catalog's rows; the next checkpoint relinks them. Three
+/// named trunk children, checkpointed; the child process deletes the middle one and checkpoints.
+#[cfg(unix)]
+#[test]
+fn a_kill_between_a_removal_and_its_siblings_relink_leaves_the_links_true() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("links.db");
+    {
+        let db = open(&path);
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        for name in ["k0", "k1", "k2"] {
+            trunk.create_branch(name).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    let status = kill_child_at(&path, "ckpt.unlinked", Some("k1"));
+    assert_eq!(status.code(), None, "premise: the child was killed at ckpt.unlinked ({status:?})");
+    let db = reopen_and_check(&path, "killed at ckpt.unlinked");
+    assert!(db.connect_named("k1").is_err(), "the delete, logged before the kill, was lost");
+    for name in ["k0", "k2"] {
+        db.connect_named(name).unwrap_or_else(|e| panic!("{name} is gone after the kill: {e}"));
+    }
+}
+
+/// DECISIONS e977c1d010 (one write path): a 17 store (made as an older build made it,
+/// `CREATE_LEGACY`) is upgraded at its first checkpoint in ONE transaction. Killed at every step
+/// of it (the columns added; every row linked; committed before the install; installed), the
+/// reopened store is either still 17 with no link column, or 21 with every row's links true, and
+/// its next checkpoint leaves it 21 with true links.
+#[cfg(unix)]
+#[test]
+fn a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21() {
+    for point in ["ckpt.upgrade.columns", "ckpt.upgrade.rows", "ckpt.written", "ckpt.installed"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let db = open(&path);
+            let trunk = db.connect().unwrap();
+            trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+            super::journal::CREATE_LEGACY.with(|c| c.set(true));
+            trunk.create_branch("first").unwrap();
+            super::journal::CREATE_LEGACY.with(|c| c.set(false));
+            for name in ["u0", "u1", "u2"] {
+                trunk.create_branch(name).unwrap();
+            }
+            // A 17 catalog with rows: written by a checkpoint while the test still makes legacy.
+            super::journal::CREATE_LEGACY.with(|c| c.set(true));
+            db.branch_compact_now().unwrap();
+            db.branch_checkpoint_wait();
+            super::journal::CREATE_LEGACY.with(|c| c.set(false));
+            assert_eq!(db.branches.links_known_and_catalog_format_for_test().1, Some(17), "{point}: premise: a 17 catalog");
+        }
+        let status = kill_child_at(&path, point, None);
+        assert_eq!(status.code(), None, "{point}: premise: the child was killed there ({status:?})");
+        let (format, links) = {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            let format = db.branches.links_known_and_catalog_format_for_test().1;
+            let links = db.branches.catalog_links_for_test();
+            (format, links)
+        };
+        match (format, links) {
+            (Some(17), false) | (Some(21), true) => {}
+            other => panic!("{point}: after the kill the catalog is {other:?} (format, link columns): neither 17 nor 21"),
+        }
+        let db = reopen_and_check(&path, point);
+        assert_eq!(db.branches.links_known_and_catalog_format_for_test().1, Some(21), "{point}: not upgraded by the next checkpoint");
+        for name in ["first", "u0", "u1", "u2"] {
+            db.connect_named(name).unwrap_or_else(|e| panic!("{point}: {name} is gone: {e}"));
+        }
+    }
+}

@@ -8801,6 +8801,12 @@ impl BranchStore {
         (known, format)
     }
 
+    /// Test builds: whether this store's catalog has the link columns (format 21/22 or upgraded).
+    #[cfg(test)]
+    pub(crate) fn catalog_links_for_test(&self) -> bool {
+        self.inner.lock().cat.as_ref().is_some_and(|c| c.catalog.links())
+    }
+
     pub(crate) fn name_mirror_built_for_test(&self) -> bool {
         self.inner.lock().names.catalog.is_some()
     }
