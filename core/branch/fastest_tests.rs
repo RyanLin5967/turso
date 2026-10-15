@@ -8646,6 +8646,33 @@ fn no_name_table_regrows_past_64_kib_inside_a_named_create() {
     assert!(over.is_empty(), "CLAIM: a named create regrew a per-branch table past 64 KiB under the store mutex: {over:?}");
 }
 
+/// C1 coverage question (engine review 20 LOW 16): the kill point `cut.dir_synced` (a syncing flight
+/// after a cut, between its directory sync and its log sync) never landed in any C1 run, D0 or D1
+/// (artie raws l14-low16d1_7076641a5.txt: 0 of 6 in a D1 child; earlier catalog C1 runs: 0 landed).
+/// Either no flight after a fuzzy cut syncs the log's directory, which would leave the cut's rename
+/// undurable under acknowledged flights, or the window is not reached in a C1 trial. Here, in
+/// process: a D1 catalog store, a fuzzy checkpoint that cut the log (premise: the log shortened),
+/// then one create, whose flight this thread leads: it must sync the log's directory.
+#[test]
+fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cut-dir.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..30 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let len = db.branches.log_len_for_test();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint cut the log");
+    let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+    let before = dirs();
+    let _ = trunk.fork_branch().unwrap().into_id();
+    assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
+}
+
 /// Checkpoint FIX (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3
 /// checkpoints in ckpt_n10, budget 3 each, review 1 #7): a fuzzy checkpoint of a D2 catalog store,
 /// its full flushes attributed to its thread's phases (`store::CKPT_PHASES`: start, settled,
