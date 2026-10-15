@@ -3291,6 +3291,33 @@ fn an_explicit_public_qualifier_names_public() {
     assert_eq!(a.q("SELECT count(*) FROM s.t").single("s.t"), "1");
 }
 
+/// An aggregate's result type comes from the relation the engine reads, through the search path:
+/// with public.t(c int) and s.t(c text), after `SET search_path TO s, public` `SELECT max(c) FROM
+/// t` reads s.t, so its column is text (OID 25), on both protocols, as its rows are; `SELECT
+/// max(c) FROM public.t` stays int4. aggregate_types read every FROM table in public alone, so the
+/// first announced int4 over s.t's text (wire review 17 item 15).
+#[test]
+fn an_aggregate_is_typed_from_the_relation_the_engine_reads() {
+    let dir = Scratch::new("aggpath");
+    cli_script(
+        &dir,
+        b"CREATE TABLE t(id INT PRIMARY KEY, c INT);\n\
+          CREATE SCHEMA s;\n\
+          CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT);\n\
+          INSERT INTO s.t VALUES (1, 'x');\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("SET search_path TO s, public").ok("search path");
+    let sql = "SELECT max(c) FROM t";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.rows, vec![vec![Some("x".to_string())]], "premise: s.t's rows");
+    assert_eq!(r.oids, Some(vec![25]), "simple protocol");
+    assert_eq!(a.x(sql, &[]).ok(sql).oids, Some(vec![25]), "extended protocol");
+    let sql = "SELECT max(c) FROM public.t";
+    assert_eq!(a.q(sql).ok(sql).oids, Some(vec![23]), "public.t");
+}
+
 /// A parameter only in an ON CONFLICT clause is typed from the target's row, `excluded` included:
 /// with public.t(c int) and s.t(c text), `INSERT INTO s.t ... DO UPDATE SET c = $1` and `... DO
 /// UPDATE SET c = 'z' WHERE excluded.c = $1` are refused 42P18 (the walk cannot read an attached
