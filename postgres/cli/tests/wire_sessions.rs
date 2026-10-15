@@ -2929,7 +2929,9 @@ fn an_explicit_public_qualifier_names_public() {
 /// s.t(c text), an undeclared '007' into s.t (INSERT, UPDATE SET, ON CONFLICT's excluded) or into
 /// t after `SET search_path TO s, public` is stored as '007' or refused 42P18 (the walk cannot read
 /// an attached schema), never typed int4 and stored as 7; a DML target is the table even when a
-/// CTE of its name is in scope; and a three-part `s.t.c` reference is refused 42P18, not text. The
+/// CTE of its name is in scope; and a three-part `s.t.c` reference with only public's t in FROM
+/// names no FROM entry, 42P01 as PostgreSQL's errorMissingRTE answers (FLAGGED edit, the lead's
+/// pre-approval of wire review 17 item 5: it asserted 42P18), not text. The
 /// walk read every target in public alone (wire review 14 item 3; psycopg3 sends str parameters
 /// with OID 0, so it reaches this with default settings). The schema is made by the non-server CLI
 /// before the server starts: the server refuses CREATE SCHEMA, and attaches a schema file present
@@ -3018,9 +3020,9 @@ fn a_parameter_is_typed_from_the_relation_the_engine_writes() {
         ));
     }
     let r = a.describe_statement("SELECT 1 FROM t WHERE s.t.c = $1");
-    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P18") {
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
         wrong.push(format!(
-            "a three-part reference: {:?} {:?}, want 42P18",
+            "a three-part reference: {:?} {:?}, want 42P01",
             r.params, r.error
         ));
     }
