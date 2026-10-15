@@ -9291,6 +9291,8 @@ impl BranchStore {
         for (id, what) in cap.dirty {
             *cat.dirty.entry(id).or_insert(0) |= what;
         }
+        // And its frozen names (L2(d) slice 1), as any capture that is not written.
+        inner.names.unfreeze();
         Ok(())
     }
 

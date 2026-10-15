@@ -9576,7 +9576,7 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
 /// the worst create's spans are printed, and the claim is that its allocations fall in
 /// `compact.flight_starting` .. `compact.flight_start_returned`.
 #[test]
-#[ignore = "diagnostic for class (b) step 1: run by name with --ignored --nocapture"]
+#[ignore = "class (b) step 1 and L2(d): run by name with --ignored --nocapture"]
 fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
@@ -9624,11 +9624,12 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
         })
         .collect();
     println!("FE_STALL worst create {name}: {total} allocations to its last trace point [{}]; {over_64} of 16384 creates over 64", steps.join(" "));
-    assert!(
-        in_start * 2 > total,
-        "CLAIM: the worst create's allocations are not mostly its checkpoint start: {in_start} of {total} [{}]",
-        steps.join(" ")
-    );
+    // Confirmed at 9c1f... (raw l82): 6,283 of the worst create's 6,288 held allocations were its
+    // checkpoint start. After L2(d) slice 1 (raw l92) the worst create allocates 60 (the capture's
+    // read snapshot 26, its rows 14, its hand-off 12) and none of 16,384 passes 64; the claim is now
+    // that bound, which the rows and the snapshot (slices 2-3) must bring to 0.
+    let _ = in_start;
+    assert_eq!(over_64, 0, "CLAIM: {over_64} creates allocated more than 64 times under the store mutex (worst {total}: [{}])", steps.join(" "));
 }
 
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
