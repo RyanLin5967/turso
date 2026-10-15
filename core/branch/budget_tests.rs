@@ -4181,3 +4181,47 @@ fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
         "exc_sharp was refused, but not as a moved exception counter (DECISIONS bd0d845f97):\n{text}"
     );
 }
+
+/// Diagnostic, not a budget (LEAP L4): name every catalog statement of the lifecycle's ops by its backtrace.
+#[test]
+#[ignore]
+fn trace_lifecycle_catalog() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("trace.db");
+    let inc = {
+        let db = open_at(&path);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, false);
+        for i in 0..10 {
+            trunk.create_branch(&format!("pop-{i}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        db.incarnation
+    };
+    eprintln!("=== OPEN");
+    probe::TRACE_CAT.store(true, Relaxed);
+    let db = open_at(&path);
+    assert_ne!(db.incarnation, inc);
+    probe::TRACE_CAT.store(false, Relaxed);
+    db.branch_wait_name_filter();
+    db.branch_checkpoint_wait();
+    let trunk = db.connect().unwrap();
+    eprintln!("=== CREATE");
+    probe::TRACE_CAT.store(true, Relaxed);
+    trunk.create_branch("m-0000").unwrap();
+    eprintln!("=== CONNECT_NAMED");
+    let c = db.connect_named("m-0000").unwrap();
+    eprintln!("=== FIRST_WRITE");
+    c.execute("UPDATE t SET v = 'w' WHERE id = 1").unwrap();
+    eprintln!("=== DISCONNECT");
+    drop(c);
+    eprintln!("=== DELETE");
+    db.drop_branch("m-0000").unwrap();
+    eprintln!("=== CONNECT_NAMED pop-3 (populated, not resident)");
+    let c = db.connect_named("pop-3").unwrap();
+    drop(c);
+    probe::TRACE_CAT.store(false, Relaxed);
+    eprintln!("=== END");
+}
