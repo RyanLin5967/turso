@@ -503,9 +503,13 @@ def self_test():
                                          "iostats": "1"},
              "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
              "arms": {"fsync": arm(fs, fs - 1), "control": arm(0, 0)}}
-        # the sync before each run, as v3l.py measure() records it since annex A24
+        # the sync before each run, as v3l.py measure() records it since annex A24. TEST EDIT, flagged (repairs an
+        # unseen break of b7de8cb22, review 6 MED 2 / annex A24-AM1): the record also carries its one `sync -f` entry
+        # (DIR's filesystem; no loop layer), rc 0, a new required field at its passing value. Without it v3l.block()'s
+        # gates re-run VOIDs every VALID fixture here on the coverage rule ("synced no filesystems")
         for a in r["arms"].values():
-            a["sync"] = {"labelling": {"ran": True, "rc": 0}, "timed": {"ran": True, "rc": 0}}
+            a["sync"] = {run: {"ran": True, "rc": 0, "layers": [{"path": "/mnt/t3-x/v3l", "rc": 0, "secs": 0.0}]}
+                         for run in ("labelling", "timed")}
         return json.dumps(r)
 
     def v3sum(rc, block, plp="no", a25=300.0, void=None):
