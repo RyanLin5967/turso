@@ -10056,13 +10056,14 @@ impl StoreInner {
         }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
-        } else if fe_mutant("l4_capture_pins_no_snapshot") {
-            // Mutant (test builds only): the catalog connection reads the live catalog in a flight,
-            // so a fact goes stale once the writer commits (fires `assert_facts_in_flight`).
-            Ok(())
         } else {
             cat.catalog.begin_read_snapshot()
         };
+        // Fire-check (test builds only) of `assert_facts_in_flight`: mutant
+        // `l4_flight_facts_planted_stale` makes a known trunk-version fact wrong for the flight.
+        if fe_mutant("l4_flight_facts_planted_stale") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
         if let Err(e) = snapshot {
             if let Some((dirty, _)) = early {
                 cat.dirty = dirty;
