@@ -1180,18 +1180,25 @@ def self_test():
     # fdatasync4k only (the frame arm runs with fsync and is not a candidate, even when registered), on raw nanosecond
     # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
 
-    def frp(sj, p50ns):
-        try:
-            return floor_reference_problems(sj, p50ns)
-        except TypeError as e:  # the base takes no raw p50s
-            return [("the floor rule reads no raw p50s", repr(e))]
+    def frp_run(fn, cases):
+        """[(name, ok, passed, got)] of the floor-reference cases with fn as floor_reference_problems. V3 review 13 item
+        14 RED: this keeps the a8b6e5d89 TypeError shim exactly, so a TypeError raised INSIDE fn reads as a problem
+        list and every ok=False case passes; the registered mutant below must fail every case."""
+        out = []
+        for name, sj, ns, ok in cases:
+            try:
+                got = fn(sj, ns)
+            except TypeError as e:  # the base takes no raw p50s
+                got = [("the floor rule reads no raw p50s", repr(e))]
+            out.append((name, ok, (got == []) is ok, got))
+        return out
 
     def fsj(p50us, fr, frame="ow4k", variant="fdatasync4k (ow4k + fdatasync)"):
         return {"arms": {a: {"p50_us": v} for a, v in p50us.items()}, "frame_arm": frame, "floor_frame_variant": variant,
                 "floor_reference": fr}
     cheap_ow4k = {"append25": 875.1, "fdatasync4k": 900.0, "ow4k": 800.3}
     cheap_ns = {"append25": 875100, "fdatasync4k": 900000, "ow4k": 800300}
-    for name, sj, ns, ok in (
+    frp_cases = (
             ("frame_arm ow4k registered and cheapest, the reference append25 (the probe's pick)",
              fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}), cheap_ns, True),
             ("frame_arm ow4k registered and cheapest, the reference ow4k (fsync, not a candidate)",
@@ -1211,9 +1218,15 @@ def self_test():
              cheap_ns, False),
             ("no frame arm registered, the variant label missing",
              fsj({"append25": 400.0, "fdatasync4k": 200.0}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 200.0},
-                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False)):
-        got = frp(sj, ns)
-        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), (got == []) is ok, got)
+                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False))
+    for name, ok, passed, got in frp_run(floor_reference_problems, frp_cases):
+        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), passed, got)
+
+    def frp_mutant(sj, p50ns):  # V3 review 13 item 14's registered mutant: a TypeError raised inside the rule
+        raise TypeError("planted inside floor_reference_problems")
+    survived = [name for name, ok, passed, got in frp_run(frp_mutant, frp_cases) if passed]
+    chk("floor reference (review 13 item 14): a rule that raises TypeError inside fails EVERY case (none passes as "
+        "'refused')", not survived, survived)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
     # sixth review H1: the box and the plan it selects
