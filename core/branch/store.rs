@@ -2437,6 +2437,36 @@ struct NameIndex {
 #[cfg(test)]
 pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hooks for the name filter's growth (review REVIEW-claude-namefilter H1): the growth's drain
+/// copy fails (`FILTER_DRAIN_FAILS`), and the growth thread pauses at stage `FILTER_PAUSE_AT`
+/// (`FILTER_PAUSED` reads the stage it waits at) until the stage is changed: 3 before the swap, 5
+/// after the drain copy, before its install.
+#[cfg(test)]
+pub(crate) static FILTER_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSE_AT: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) static FILTER_PAUSED: AtomicU8 = AtomicU8::new(0);
+
+fn filter_pause(stage: u8) {
+    #[cfg(test)]
+    if FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+        FILTER_PAUSED.store(stage, Ordering::Release);
+        while FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = stage;
+}
+
+fn filter_drain_fails() -> bool {
+    #[cfg(test)]
+    return FILTER_DRAIN_FAILS.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    false
+}
+
 /// A fixed-capacity set of nonzero `u64` keys (open addressing, linear probing): the name filter's
 /// table (lead ruling 2026-10-15). Its slots are allocated once, at construction, so an insert never
 /// allocates; a full table refuses instead of growing, and the filter grows by copying into a
@@ -8491,6 +8521,7 @@ impl BranchStore {
             }
             let copied = old.copy_into(&grown) && pending.copy_into(&grown);
             let grown = Arc::new(grown);
+            filter_pause(3);
             {
                 let mut inner = shared.lock();
                 let f = &mut inner.names.filter;
@@ -8505,11 +8536,12 @@ impl BranchStore {
                 f.builds += 1;
                 f.moved_max = f.moved_max.max(old.len() as u64);
             }
-            let copied = pending.copy_into(&grown);
+            let copied = pending.copy_into(&grown) && !filter_drain_fails();
             {
                 let mut inner = shared.lock();
                 inner.names.filter.draining = None;
             }
+            filter_pause(5);
             done(&shared, !copied);
         });
         match spawned {
@@ -8521,6 +8553,13 @@ impl BranchStore {
                 self.inner.lock().names.filter.growing = false;
             }
         }
+    }
+
+    /// Test builds: the name filter's own answer for `name` ("absent, ask no catalog"), the step
+    /// `name_lookup` takes after the resident names (`names.map`) miss.
+    #[cfg(test)]
+    pub(crate) fn name_filter_says_absent_for_test(&self, name: &str) -> bool {
+        self.inner.lock().names.filter.says_absent(name)
     }
 
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {

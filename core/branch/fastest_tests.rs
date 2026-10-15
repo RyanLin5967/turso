@@ -8711,6 +8711,52 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
     assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
 }
 
+/// Review REVIEW-claude-namefilter-729f78659..4cb167221 H1 (a fresh adversary): when the growth's drain
+/// copy failed, `draining` was cleared in one store-mutex hold and `overflowed` set in the next, so
+/// between them the filter answered "absent" for a name only the pending table held. A create then
+/// asked no catalog, and an evicted name was given twice. The adversary's interleaving, forced by the
+/// hooks: the growth paused before its swap (stage 3), so `victim` is noted after both first copies
+/// and lives in the pending table only; then the drain copy fails (`FILTER_DRAIN_FAILS`) and the
+/// growth pauses after it (stage 5). There, the filter must not answer "absent" for `victim`.
+#[test]
+fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
+    use super::store::{FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-drain.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    FILTER_DRAIN_FAILS.store(true, Release);
+    FILTER_PAUSE_AT.store(3, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 3 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no filter growth reached its swap ({n} creates)");
+    }
+    trunk.create_branch("victim").unwrap();
+    FILTER_PAUSE_AT.store(5, Release);
+    while FILTER_PAUSED.load(Acquire) != 5 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never finished its drain copy");
+    }
+    let absent = db.branches.name_filter_says_absent_for_test("victim");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
+}
+
 /// Lead ruling (DECISIONS 2026-10-15, after the attribution: the n1e4 create's extra allocation is
 /// the name filter's B-tree splitting a full leaf, raws l35-diag-alloc): a create allocates NOTHING
 /// in the name filter, by construction, also while the filter grows. A catalog store with 10,000
