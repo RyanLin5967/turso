@@ -56,6 +56,29 @@
 #   device_wipe PATH REAL SYS DEV ID FS UUID
 #                                       the one way block_cleanup wipes, REAL held open: dev_unchanged, fs_is_ours,
 #                                       wipefs. Returns 2 on a refusal, 1 when wipefs fails
+#
+# Ours' timed run under the shared sweeper (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z: SAME INSTRUMENT FOR
+# EVERY SYSTEM): gates/sweeper.sh, which t3run.sh sources and the competitors' trace.sh sources too, and its one reader,
+# gates/sweeper_record.py. Tested by t3lib_test.sh on the box's real /proc (Linux, bash 5).
+#   ours_timed_run D CMD...             CMD inside a wrapper whose process tree the sweeper sweeps into
+#                                       D/timed.tracer.tsv: the wrapper waits (at most SWEEP_START_WAIT_S) for the
+#                                       start sweep, stamps t0, runs CMD, stamps t1, so the start sweep is at or before
+#                                       t0 and the end sweep (after the wrapper is reaped) at or after t1.
+#                                       D/timed.window: "t0=T t1=T rc=R". Returns CMD's rc; 2, with CMD never run,
+#                                       when the sweeper is not sourced or its start sweep never came. Blind spot,
+#                                       stated: the window is fastest_profile's whole process (setup and warm-up
+#                                       included), not the measured windows it times, as the competitors' window is;
+#                                       those realtime bounds are fastest_profile's to stamp (Rust, HELD: LOUD-OWED)
+#   ours_timed_exec D CMD...            ours_timed_run in an EXEC'D bash that sources gates/sweeper.sh (beside this
+#                                       file's t3/) and this file: foreign_cpu.py classes a process as the run's own
+#                                       (sut) by FASTEST_CELL in /proc/PID/environ, which is the environment at exec,
+#                                       so a sweeper forked straight from t3run's shell would read as foreign while the
+#                                       competitors' (inside the exec'd run_system.sh) reads as sut. t3run calls this.
+#                                       Returns 2, CMD never run, when gates/sweeper.sh is not there
+#   ours_timed_record D READER          D/timed.json from D/timed.window and READER's (sweeper_record.py) reading of
+#                                       D/timed.tracer.tsv over [t0, t1]: sweeper_cpu_s and the reader's other fields,
+#                                       sweeper_window "process"; on a missing window or a refused record,
+#                                       sweeper_cpu_s null and sweeper_refused the reason, and rc 1
 
 T3LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -225,3 +248,76 @@ _device_wipe() { # _device_wipe PATH REAL SYS DEV ID FS UUID
 }
 
 device_wipe() { t3_pinned "$2" _device_wipe "$@"; }
+
+SWEEP_START_WAIT_S=5
+ours_timed_run() { # ours_timed_run D CMD...
+  local d=$1 pid rc=0
+  shift
+  declare -F sweeper_start > /dev/null && declare -F sweeper_wait > /dev/null ||
+    { echo "REFUSED: the shared sweeper (gates/sweeper.sh) is not sourced: ours' timed run would go unswept"; return 2; }
+  rm -f "$d/timed.window" "$d/timed.tracer.tsv"
+  (
+    st="" t0=""
+    for ((i = 0; i < SWEEP_START_WAIT_S * 20; i++)); do
+      { IFS= read -r -d '' st < "$d/timed.tracer.tsv"; } 2> /dev/null
+      [[ $st == *$'\nSWEEP start '* ]] && break
+      sleep 0.05
+    done
+    [[ $st == *$'\nSWEEP start '* ]] ||
+      { echo "no start sweep within ${SWEEP_START_WAIT_S}s: the command was not run" > "$d/timed.window"; exit 125; }
+    t0=$EPOCHREALTIME
+    "$@"
+    rc=$?
+    echo "t0=$t0 t1=$EPOCHREALTIME rc=$rc" > "$d/timed.window"
+    exit $rc
+  ) &
+  pid=$!
+  sweeper_start "$d/timed" "$pid" ""
+  wait "$pid" || rc=$?
+  sweeper_wait
+  if grep -q '^no start sweep' "$d/timed.window" 2> /dev/null; then
+    echo "REFUSED: $(cat "$d/timed.window")"; return 2
+  fi
+  return $rc
+}
+
+ours_timed_exec() { # ours_timed_exec D CMD...
+  local sw=$T3LIB_DIR/../gates/sweeper.sh
+  [ -f "$sw" ] || { echo "REFUSED: no shared sweeper at $sw: ours' timed run would go unswept"; return 2; }
+  bash -c 'source "$1" && source "$2" && shift 2 && ours_timed_run "$@"' ours-timed "$sw" "$T3LIB_DIR/t3lib.sh" "$@"
+}
+
+ours_timed_record() { # ours_timed_record D READER
+  python3 -B - "$1" "$2" << 'EOF'
+import json, os, sys
+d, reader = sys.argv[1:3]
+sys.path.insert(0, os.path.dirname(os.path.abspath(reader)))
+import sweeper_record  # noqa: E402
+rec = {"system": "ours", "sweeper_window": "process", "t0": None, "t1": None, "rc": None, "sweeper_cpu_s": None,
+       "sweeper_cpu_span_s": None, "sweeper_nice": None, "sweeper_clk_tck": None, "sweeper_refused": None}
+try:
+    w = open(os.path.join(d, "timed.window")).read().split()
+except OSError:
+    w = []
+kv = dict(x.split("=", 1) for x in w if "=" in x)
+try:
+    rec["t0"], rec["t1"], rec["rc"] = float(kv["t0"]), float(kv["t1"]), int(kv["rc"])
+except (KeyError, ValueError):
+    rec["sweeper_refused"] = f"no timed window in timed.window ({' '.join(w)!r})"
+if rec["sweeper_refused"] is None:
+    try:
+        lines = open(os.path.join(d, "timed.tracer.tsv")).read().splitlines()
+    except OSError as e:
+        lines, rec["sweeper_refused"] = None, f"timed.tracer.tsv unreadable ({type(e).__name__})"
+    if lines is not None:
+        r, why = sweeper_record.sweeper_record(lines, rec["t0"], rec["t1"])
+        if r is None:
+            rec["sweeper_refused"] = "; ".join(why)
+        else:
+            rec.update(r)
+with open(os.path.join(d, "timed.json"), "w") as f:
+    json.dump(rec, f)
+print("timed.json: sweeper_cpu_s", rec["sweeper_cpu_s"], rec["sweeper_refused"] or "")
+sys.exit(0 if rec["sweeper_cpu_s"] is not None else 1)
+EOF
+}
