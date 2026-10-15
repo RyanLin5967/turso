@@ -367,13 +367,25 @@ fn trunk_versions_are_read_in_place_whatever_a_page_holds() {
 /// equals the crashed store's, and the next checkpoint and reopen keep all of it.
 #[test]
 fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
+    // FLAGGED SPEC CHANGE, format-derived (lead, DECISIONS 88d8cda203; LEAP L4 slice 2): a store of
+    // format 19 (this build's) and one made at the legacy 17 (`journal::CREATE_LEGACY`), each over
+    // the same history.
+    for legacy in [false, true] {
+        crash_after_commits_to_old_branches(legacy);
+    }
+}
+
+fn crash_after_commits_to_old_branches(legacy: bool) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
     let (ids, image, slots_before);
     {
         let db = open_at(&path, catalog()).unwrap();
         seed(&db.connect().unwrap());
+        // The store (and its catalog) is made at the first fork: at 17 when asked.
+        super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
         ids = grow(&db, 60);
+        super::journal::CREATE_LEGACY.with(|c| c.set(false));
         // A child of every tenth branch, so some committing branches retain versions for a child.
         for &id in ids.iter().step_by(10) {
             let b = db.branch(id).unwrap();
@@ -399,12 +411,21 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
     let s = db.branch_open_stats();
     assert_eq!(s.branch_loads, 0, "recovery read branches: {s:?}");
     assert_eq!(s.parked_records, 60, "20 branches x 3 rounds were not all parked: {s:?}");
-    // No branch state read: exactly the rows an open with an empty tail reads (meta, lease floor,
-    // released list). The queries also hold one free-table probe per slot the tail names below the
-    // checkpoint's high-water mark (the arena rebuild's `free_has`, which returns no row for a slot
-    // in use), so they are bounded by the tail's slots, not by its records' branches.
-    // (Was `cat_queries <= 5`: a wrong premise, which the free-table probes broke: PREREG A8.)
-    assert_eq!(s.cat_rows_read, 9, "recovery read catalog rows beyond the open's own: {s:?}");
+    // No branch state read: exactly the rows an open with an empty tail reads. At format 19 that is
+    // the meta row alone, its 11 keys (the L4 facts carry the lease floor and the held releases),
+    // in ONE query; at 17 the meta row's 9 keys and the two queries the facts replace (lease
+    // floor, released list), three in all. The queries also hold one free-table probe per slot the
+    // tail names below the checkpoint's high-water mark (the arena rebuild's `free_has`, which
+    // returns no row for a slot in use; `free_probes`), so they are bounded by the tail's slots,
+    // not by its records' branches. (Was `cat_queries <= 5`: a wrong premise, which the free-table
+    // probes broke: PREREG A8. Was `cat_rows_read == 9` before the 19/20 meta row.)
+    let (meta_rows, own_queries) = if legacy { (9, 3) } else { (11, 1) };
+    assert_eq!(s.cat_rows_read, meta_rows, "legacy {legacy}: recovery read catalog rows beyond the open's own: {s:?}");
+    assert_eq!(
+        s.cat_queries - s.free_probes,
+        own_queries,
+        "legacy {legacy}: the open's own catalog queries, the free-table probes apart: {s:?}"
+    );
     assert!(s.cat_queries <= 3 + s.touched_slots, "recovery queried the catalog beyond the tail's slots: {s:?}");
     assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, slots_before, "the slot count moved");
     for (i, &id) in ids.iter().enumerate() {
@@ -1618,17 +1639,27 @@ fn the_catalog_census_counts_every_row_once() {
 /// auto_vacuum), so a freelist count of zero in the run is a reading, not a blind spot.
 #[test]
 fn the_catalog_shape_closes_its_ledger_and_sees_freed_pages() {
+    // FLAGGED SPEC CHANGE, format-derived (lead, DECISIONS 88d8cda203; LEAP L4 slice 2): the meta
+    // row has 11 keys at format 19 and 9 at the legacy 17; each store runs the same history.
+    for legacy in [false, true] {
+        catalog_shape_closes_its_ledger(legacy);
+    }
+}
+
+fn catalog_shape_closes_its_ledger(legacy: bool) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
     let db = open_at(&path, catalog()).unwrap();
     seed(&db.connect().unwrap());
+    super::journal::CREATE_LEGACY.with(|c| c.set(legacy));
     let ids = grow(&db, 300);
+    super::journal::CREATE_LEGACY.with(|c| c.set(false));
     db.branch_compact_now().unwrap();
     let grown = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
     assert_eq!(grown.unaccounted, 0, "the ledger does not close: {grown:?}");
     let rows = |s: &CatalogShape, t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n);
     assert_eq!(rows(&grown, "branch"), Some(300), "{grown:?}");
-    assert_eq!(rows(&grown, "meta"), Some(9), "{grown:?}");
+    assert_eq!(rows(&grown, "meta"), Some(if legacy { 9 } else { 11 }), "legacy {legacy}: {grown:?}");
     assert!(rows(&grown, "cur").unwrap() >= 300, "each branch wrote a page: {grown:?}");
     let cur = grown.trees.iter().find(|(n, _)| n == "cur").expect("the cur table's tree");
     assert_eq!(cur.1[0], 1, "a tree has one root: {grown:?}");
