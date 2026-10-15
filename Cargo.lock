@@ -7523,6 +7523,7 @@ dependencies = [
  "bytes",
  "compact_str",
  "futures",
+ "getrandom 0.4.2",
  "libc",
  "pgwire",
  "smallvec",
