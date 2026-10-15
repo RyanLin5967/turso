@@ -254,12 +254,19 @@ check "MED 12: ours_timed_run returns the command's rc (3) and records its windo
    swnums "$T/sw1" | tr "\n" " " | awk "{ exit !(\$1 < \$2 && \$3 <= \$1 && \$2 <= \$4) }"'
 check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
   'python3 -B "$SR" record "$T/sw1/timed.tracer.tsv" $(swnums "$T/sw1" | head -1)'
-check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number, the window process, the reader's own value" \
+# TEST EDIT, flagged as a SPEC CHANGE (bb96279f3: fastest_profile stamps its measured span): the record is read over
+# result/summary.json's tm0/tm1_realtime_s, here the wrapper's own bounds (inside the sweeps), not the process window
+swsum() { mkdir -p "$1/result"; awk '{for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "t0") a = kv[2]
+          if (kv[1] == "t1") b = kv[2] }} END { printf "{\"tm0_realtime_s\": %s, \"tm1_realtime_s\": %s}\n", a, b }' \
+          "$1/timed.window" > "$1/result/summary.json"; }
+swsum "$T/sw1"
+check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number over the MEASURED span, the reader's own value" \
   '( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw1" "$SR" ) && python3 -B -c "
 import json, sys; sys.path.insert(0, \"$HERE/../gates\"); import sweeper_record as s
-j = json.load(open(\"$T/sw1/timed.json\"))
+j = json.load(open(\"$T/sw1/timed.json\")); m = json.load(open(\"$T/sw1/result/summary.json\"))
 r, why = s.sweeper_record(open(\"$T/sw1/timed.tracer.tsv\").read().splitlines(), j[\"t0\"], j[\"t1\"])
-sys.exit(not (isinstance(j[\"sweeper_cpu_s\"], float) and j[\"sweeper_window\"] == \"process\" and j[\"rc\"] == 3
+sys.exit(not (isinstance(j[\"sweeper_cpu_s\"], float) and j[\"sweeper_window\"] == \"measured\" and j[\"rc\"] == 3
+              and (j[\"t0\"], j[\"t1\"]) == (m[\"tm0_realtime_s\"], m[\"tm1_realtime_s\"])
               and r is not None and j[\"sweeper_cpu_s\"] == r[\"sweeper_cpu_s\"] and j[\"sweeper_refused\"] is None))"'
 check "MED 12: ours_timed_run without the sweeper sourced refuses (rc 2) and never runs the command" \
   '( mkdir -p "$T/sw2"; unset -f sweeper_start sweeper_wait; ours_timed_run "$T/sw2" touch "$T/sw2/ran" ); [ $? = 2 ] &&
@@ -270,7 +277,7 @@ check "MED 12: a sweeper whose start sweep never comes: refused (rc 2) within it
    grep -q "no start sweep" "$T/sw3/timed.window"'
 check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
   'mkdir -p "$T/sw4" && sed "s/ nice=19 / nice=0 /" "$T/sw1/timed.tracer.tsv" > "$T/sw4/timed.tracer.tsv" &&
-   cp "$T/sw1/timed.window" "$T/sw4/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
+   cp "$T/sw1/timed.window" "$T/sw4/" && swsum "$T/sw4" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw4/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"nice 0\" in (j[\"sweeper_refused\"] or \"\")))"'
 # foreign_cpu.py classes a process as the run's own (sut) by FASTEST_CELL in /proc/PID/environ, which is the environment
@@ -296,6 +303,30 @@ check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cp
   'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"window\" in (j[\"sweeper_refused\"] or \"\")))"'
+
+# ours_timed_record on a synthetic record (no /proc needed; the summarize self-test's hand-computed one: sweeps every
+# 0.05 s from 100.00, cpu = index, clk_tck 100; measured span [100.1, 100.3] gives 4 ticks = 0.04 s), in the process
+# window [100.05, 100.4]
+synth() { mkdir -p "$1/result"; { printf 'roles cmd=500 srv=none tree=children\nsweeper pid=600 nice=19 clk_tck=100\n'
+          for i in 0 1 2 3 4 5 6 7 8 9; do printf 'SWEEP mid %s cmd=3:0 srv=0:0 cpu=%s\n' "$(echo "100 + 0.05 * $i" | bc)" "$i"; done
+          } > "$1/timed.tracer.tsv"; echo "t0=100.05 t1=$2 rc=0" > "$1/timed.window"
+          [ -n "$3" ] && echo "$3" > "$1/result/summary.json"; return 0; }
+synth "$T/rec1" 100.4 '{"tm0_realtime_s": 100.1, "tm1_realtime_s": 100.3}'
+check "measured span: ours_timed_record over [100.1, 100.3] gives 0.04 s, window measured, process bounds kept" \
+  '( source "$HERE/t3lib.sh"; ours_timed_record "$T/rec1" "$SR" ) && python3 -B -c "import json, sys
+j = json.load(open(\"$T/rec1/timed.json\"))
+sys.exit(not (j[\"sweeper_cpu_s\"] == 0.04 and j[\"sweeper_window\"] == \"measured\" and (j[\"t0\"], j[\"t1\"]) == (100.1, 100.3)
+              and (j[\"process_t0\"], j[\"process_t1\"]) == (100.05, 100.4) and j[\"rc\"] == 0))"'
+synth "$T/rec2" 100.4 ""
+check "measured span: no result/summary.json tm0/tm1 gives sweeper_cpu_s null, naming tm0_realtime_s, rc 1" \
+  '! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/rec2" "$SR" ) && python3 -B -c "import json, sys
+j = json.load(open(\"$T/rec2/timed.json\"))
+sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"tm0_realtime_s\" in (j[\"sweeper_refused\"] or \"\")))"'
+synth "$T/rec3" 100.25 '{"tm0_realtime_s": 100.1, "tm1_realtime_s": 100.3}'
+check "measured span: a span ending after the process window gives sweeper_cpu_s null, naming outside, rc 1" \
+  '! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/rec3" "$SR" ) && python3 -B -c "import json, sys
+j = json.load(open(\"$T/rec3/timed.json\"))
+sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"outside\" in (j[\"sweeper_refused\"] or \"\")))"'
 
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]
