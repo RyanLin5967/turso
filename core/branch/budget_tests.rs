@@ -1130,8 +1130,10 @@ impl Drop for SchemaHoldDisarm {
 /// schema, parked there by its store's own hold (`HOLD_SCHEMA_PUBLISH` on `trunk_commit_hold`) —
 /// registers the child with no schema, and the child parses its own at its first connection
 /// (`connect_branch`, `force_reparse_schema_without_publish`). This arm counts, with the SQL-layer
-/// counters (`probe::sql_counts`), the create on a thread of its own and the child's first
-/// `connect_named` on the cell's thread.
+/// counters (`probe::sql_counts`), the create on a thread of its own and then the child's first
+/// `connect_named` on another, started while the DDL is still parked (review C08 #2) and released
+/// after 30 s if it waits (`connect_waited_for_ddl`), with its store waits and sleeps
+/// (`connect_store_waits`, `connect_sleeps`).
 ///
 /// Every sample is a fresh database of `tables` tables (`t` with one row, then fillers, in one
 /// transaction; the WAL checkpointed), bootstrapped before anything is counted: one throwaway branch
@@ -1227,27 +1229,42 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                         (made, s)
                     })
                 };
-                let t = std::time::Instant::now();
-                while !fork.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                let waited = !fork.is_finished();
+                let waited = !finished_within(&fork, std::time::Duration::from_secs(30));
+                // The child's first connection, on a thread of its own and while the DDL is still
+                // parked (review C08 #2: connected after the release, a connect that waits for the
+                // publication found it already done): under MED 8 a window child parses its schema
+                // here, and must not wait for the trunk's. (A fork that itself waited out the bound
+                // is connected after the release: that sample fails on the fork's wait.)
+                let spawn_connect = || {
+                    let db = db.clone();
+                    std::thread::spawn(move || {
+                        let (k0, b0, w0, z0) = (probe::sql_counts(), probe::thread_allocs(), super::store::thread_waits(), probe::sleeps());
+                        let branch = db.connect_named("m-0000").map_err(|e| e.to_string());
+                        let (k1, b1, w1, z1) = (probe::sql_counts(), probe::thread_allocs(), super::store::thread_waits(), probe::sleeps());
+                        let mut c = Sample::new();
+                        for (key, v) in sql_sample(&k0, &k1) {
+                            if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
+                                c.insert(*k, v);
+                            }
+                        }
+                        c.insert("connect_alloc_bytes", delta(b0.1, b1.1));
+                        c.insert("connect_store_waits", delta(w0, w1));
+                        c.insert("connect_sleeps", delta(z0, z1));
+                        (branch, c)
+                    })
+                };
+                let connect = (!waited).then(spawn_connect);
+                let connect_waited = connect.as_ref().is_some_and(|h| !finished_within(h, std::time::Duration::from_secs(30)));
                 hold.store(0, O::Release);
                 let (made, mut s) = fork.join().unwrap();
                 if let Some(commit) = parked {
                     commit.join().unwrap().unwrap_or_else(|e| panic!("{cell}: {op}: the parked ALTER failed: {e}"));
                 }
-                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed: {e}"));
-                // The child's first connection: under MED 8 a window child parses its schema here.
-                let (k0, b0) = (probe::sql_counts(), probe::thread_allocs());
-                let branch = db.connect_named("m-0000").unwrap();
-                let (k1, b1) = (probe::sql_counts(), probe::thread_allocs());
-                for (key, v) in sql_sample(&k0, &k1) {
-                    if let Some(k) = CONNECT_KEYS.iter().find(|k| k.strip_prefix("connect_") == Some(key)) {
-                        s.insert(*k, v);
-                    }
-                }
-                s.insert("connect_alloc_bytes", delta(b0.1, b1.1));
+                made.unwrap_or_else(|e| panic!("{cell}: {op}: the fork failed (waited for the DDL: {waited}): {e}"));
+                let (branch, c) = connect.unwrap_or_else(spawn_connect).join().unwrap();
+                let branch = branch.unwrap_or_else(|e| panic!("{cell}: {op}: the child's first connection failed: {e}"));
+                s.extend(c);
+                s.insert("connect_waited_for_ddl", u64::from(connect_waited));
                 // The branch has the schema its pages need (the engine's own test's check).
                 assert_eq!(query_int(&branch, "SELECT c FROM t WHERE id = 1"), 7, "{cell}: {op}: the branch read the new column wrong");
                 s.insert("waited_for_ddl", u64::from(waited));
@@ -1303,6 +1320,16 @@ fn first_create(cell: &str, out: &mut String) {
             line(out, cell, op, i, &s);
         }
     }
+}
+
+/// Whether the thread behind `h` finished within `bound` (polled every 1 ms; wall time only to
+/// bound a wait, nothing timed is measured).
+fn finished_within<T>(h: &std::thread::JoinHandle<T>, bound: std::time::Duration) -> bool {
+    let t = std::time::Instant::now();
+    while !h.is_finished() && t.elapsed() < bound {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    h.is_finished()
 }
 
 /// The first-connect keys of a schema-window sample (`sql_sample`'s, prefixed).
@@ -3255,9 +3282,12 @@ fn a_fork_outside_a_schema_window_rereads_nothing() {
 /// * the fork does not wait for the parked commit: not released at 30 s, and no more store waits and
 ///   no more sleeps (`crate::thread::sleep`, review 2 M3) than the control's. BLIND SPOT: a direct
 ///   `std::thread::sleep`, or a wait on a condition variable outside `Group::wait`, is not counted;
-///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet.
+///   a bounded wait followed by a re-read is caught anyway by the create's parse ratchet;
+/// * neither does the child's first connection, made while the DDL is still parked (review C08 #2):
+///   not released at 30 s, and no more store waits and sleeps than the control's first connection.
 /// On both paths, at 10 and at 10^3 tables. Mutants `schema_reread_twice`,
-/// `schema_window_waits_for_publish`, env `fork_rereads_schema_window`. WRITTEN NOT RUN.
+/// `schema_window_waits_for_publish`, `connect_waits_for_publish`, env `fork_rereads_schema_window`.
+/// WRITTEN NOT RUN.
 #[test]
 fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
     if in_child() {
@@ -3273,6 +3303,8 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
             let base = |k: &str| schema_min(&c, &control, k);
             let control_waits = values(&c, &control, &schema_samples(&c, &control), "store_waits").into_iter().max().unwrap();
             let control_sleeps = values(&c, &control, &schema_samples(&c, &control), "sleeps").into_iter().max().unwrap();
+            let control_connect_waits = values(&c, &control, &schema_samples(&c, &control), "connect_store_waits").into_iter().max().unwrap();
+            let control_connect_sleeps = values(&c, &control, &schema_samples(&c, &control), "connect_sleeps").into_iter().max().unwrap();
             for (i, s) in schema_samples(&c, &op).into_iter().enumerate() {
                 let (rows, scan) = (s["schema_table_rows"], s["ref_scan_page_reads"]);
                 for k in ["prepares", "schema_rows"] {
@@ -3299,6 +3331,17 @@ fn a_fork_inside_a_schema_window_rereads_the_schema_once() {
                 }
                 if s["sleeps"] > control_sleeps {
                     let _ = writeln!(failures, "  {spec}: {op} #{i}: {} sleeps against the control's at most {control_sleeps}; budget no more (review 2 M3: a bounded wait for the publication)", s["sleeps"]);
+                }
+                // Review C08 #2: the child's first connection, made while the DDL is still parked,
+                // does not wait for the trunk's publication either.
+                if s["connect_waited_for_ddl"] != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the child's first connection waited for the parked DDL commit (released after 30 s)");
+                }
+                if s["connect_store_waits"] > control_connect_waits {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the first connection made {} store waits against the control's at most {control_connect_waits}; budget no more", s["connect_store_waits"]);
+                }
+                if s["connect_sleeps"] > control_connect_sleeps {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: the first connection made {} sleeps against the control's at most {control_connect_sleeps}; budget no more", s["connect_sleeps"]);
                 }
             }
         }
