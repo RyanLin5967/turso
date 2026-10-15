@@ -2617,7 +2617,7 @@ def check_real(o3, rc, kv, leaf):
             if ua.get("foreign_fd") != 0:
                 dbad.append(("a sync by the probe on an fd no overlapping window's arm owns",
                              sy.get("unattributed")))
-        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")), kv.get("work", ""))
+        dbad += sync_fds_problems(sj, rows, n, os.path.join(OUT, "F1b", "real-all.trace.gz"), kv.get("work", ""))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
         rec["shared_devices"] = shared
@@ -2791,20 +2791,24 @@ def sync_fds_def_problems(sj, rows, n):
     return bad
 
 
-def sync_fds_problems(sj, rows, n, f1b_trace, work):
+def sync_fds_problems(sj, rows, n, f1b_path, work):
     """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
     match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
     clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
     the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
     fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
     (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
-    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
+    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows. V3 review
+    13 item 21: it takes the trace's PATH, so a trace that is there but cannot be read whole (a truncated gzip) refuses
+    as such, not as a missing one."""
     bad = sync_fds_def_problems(sj, rows, n)
     if bad and bad[0][1] == "missing or overflowed":
         return bad
     sf = sj.get("sync_fds")
+    f1b_trace = rd(f1b_path) if f1b_path else None
     if f1b_trace is None:
-        bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
+        bad.append(("the F1b real-all trace cannot be read whole" if f1b_path and os.path.lexists(f1b_path)
+                    else "no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad
     seen, probs, odd = f1b_window_syncs(f1b_trace, rows, work)
     if probs:
