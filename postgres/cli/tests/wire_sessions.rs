@@ -2807,6 +2807,58 @@ fn create_table_like_is_refused_not_dropped() {
     a.q("SELECT 1").ok("the session lives");
 }
 
+/// INSERT's VALUES lists are checked as PostgreSQL 18.6 checks them (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-insdef.out): lists of different lengths are 42601 "VALUES lists must
+/// all be the same length", and a list shorter or longer than the column list 42601 "INSERT has
+/// more target columns than expressions" / "... more expressions than target columns"; a DEFAULT
+/// in a positional list stands for that column, so the later values keep their columns. Here the
+/// all-DEFAULT positions were dropped first: `(c1, c2, c3) VALUES (DEFAULT, DEFAULT)` left an empty
+/// row and panicked the engine (core/translate/select.rs:868, the regress corpus's insert.sql), a
+/// ragged `VALUES (1, 2), (3)` inserted a row the engine made up, and a positional
+/// `VALUES (DEFAULT, 5, 'x')` was refused, its values shifted one column left.
+#[test]
+fn insert_values_lists_are_checked_as_postgresql_checks_them() {
+    let dir = Scratch::new("insdef");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table it (col1 int4, col2 int4, col3 text default 'testing')")
+        .ok("it");
+    for (sql, message) in [
+        (
+            "insert into it (col1, col2, col3) values (DEFAULT, DEFAULT)",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "insert into it (col1, col2) values (1, 2, 3)",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "insert into it (col1, col2) values (1, 2), (3)",
+            "VALUES lists must all be the same length",
+        ),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42601", "{sql}: {}", e.message);
+        assert!(e.message.contains(message), "{sql}: {}", e.message);
+    }
+    a.q("insert into it values (DEFAULT, 5, 'x')").ok("positional DEFAULT");
+    a.q("insert into it values (DEFAULT, DEFAULT)").ok("positional all DEFAULT");
+    a.q("insert into it (col1, col2, col3) values (DEFAULT, 7, DEFAULT)")
+        .ok("named DEFAULT");
+    let r = a
+        .q("select * from it order by col2 nulls first, col1")
+        .ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![None, None, t("testing")],
+            vec![None, t("5"), t("x")],
+            vec![None, t("7"), t("testing")],
+        ]
+    );
+}
+
 /// A result column that is a bare parameter is announced as the parameter's type, declared or
 /// inferred, as PostgreSQL 18.6 announces it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-types.out: `SELECT $1` declared float4 is 700 '1.5', declared bool 16 't'), on the
