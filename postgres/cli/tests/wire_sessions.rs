@@ -2634,13 +2634,16 @@ fn integer_division_by_zero_is_22012() {
 /// NUMERIC divide refuses a zero divisor as a constraint error with those words, which was mapped
 /// with every other constraint error to 23000, integrity_constraint_violation, so a driver raised an
 /// IntegrityError (wire review 16 item 2, the wire's half; the integer half is the engine's,
-/// integer_division_by_zero_is_22012).
+/// integer_division_by_zero_is_22012). The column is NUMERIC(10,2): only numeric(p,s) reaches the
+/// engine's NUMERIC divide, as a bare NUMERIC is REAL here (wire review 18 HIGH 2, a test change
+/// the lead ruled at 2026-10-15T02:59:32Z; bare NUMERIC's own divergence is the known red
+/// a_bare_numeric_division_by_zero_is_22012).
 #[test]
 fn a_numeric_division_by_zero_is_22012() {
     let dir = Scratch::new("numdiv0");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE nd(x NUMERIC)").ok("nd");
+    a.q("CREATE TABLE nd(x NUMERIC(10,2))").ok("nd");
     a.q("INSERT INTO nd VALUES (1.5)").ok("row");
     let sql = "SELECT x / 0 FROM nd";
     let e = a.q(sql).err(sql);
@@ -2649,6 +2652,25 @@ fn a_numeric_division_by_zero_is_22012() {
         "premise: the engine's NUMERIC divide refused the zero divisor"
     );
     assert_eq!(e.code, "22012");
+}
+
+/// KNOWN RED (known-red.txt; E5-QUEUE M1b): a bare NUMERIC's division by zero is 22012
+/// "division by zero" in PostgreSQL; here a bare NUMERIC is REAL (the translator's type map), so
+/// x / 0 answers one row holding NULL, as an integer's does (the cloud run at abefd2e71: "expected
+/// an error, got rows [[None]]"). It keeps the divergence a_numeric_division_by_zero_is_22012
+/// exposed watched after that test moved to NUMERIC(10,2) (wire review 18 HIGH 2; the lead's
+/// condition, 2026-10-15T02:59:32Z). Green when a bare NUMERIC is a numeric or its divide by zero
+/// raises 22012.
+#[test]
+fn a_bare_numeric_division_by_zero_is_22012() {
+    let dir = Scratch::new("barenumdiv0");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nd(x NUMERIC)").ok("nd");
+    a.q("INSERT INTO nd VALUES (1.5)").ok("row");
+    let sql = "SELECT x / 0 FROM nd";
+    let r = a.q(sql);
+    assert_eq!(r.err(sql).code, "22012", "rows {:?}", r.rows);
 }
 
 /// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer modulo by zero is 22012 in PostgreSQL; this
