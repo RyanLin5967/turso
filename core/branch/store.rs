@@ -8340,17 +8340,18 @@ fn name_taken(name: &str) -> LimboError {
 /// 14 LOW 13): each is the `InvalidArgument` it was before 620e69a81, with its old text, so
 /// `named_branch_refusals_are_typed` can be shown to fail on every assertion it makes.
 pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
-    if !fe_mutant("untyped_branch_errors") {
-        return e;
-    }
+    // Per kind too (engine review 20 LOW 20: the all-kinds mutant failed its test at the first
+    // assertion, NameTaken, so the other two were never shown to fail): mutants
+    // `untyped_branch_errors_no_such`, `_name_taken` and `_in_use` untype one kind each.
+    let all = fe_mutant("untyped_branch_errors");
     match e {
-        LimboError::NoSuchBranch(name) => {
+        LimboError::NoSuchBranch(name) if all || fe_mutant("untyped_branch_errors_no_such") => {
             LimboError::InvalidArgument(format!("no branch is named {name:?}"))
         }
-        LimboError::NameTaken(name) => LimboError::InvalidArgument(format!(
-            "branch name {name:?} already names an unreleased branch"
-        )),
-        LimboError::BranchInUse { id, .. } => LimboError::InvalidArgument(format!(
+        LimboError::NameTaken(name) if all || fe_mutant("untyped_branch_errors_name_taken") => {
+            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch"))
+        }
+        LimboError::BranchInUse { id, .. } if all || fe_mutant("untyped_branch_errors_in_use") => LimboError::InvalidArgument(format!(
             "branch {id} already has an open connection; a branch serves one connection at a \
              time, because a second one's page cache would silently miss the first one's commits"
         )),
