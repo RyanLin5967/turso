@@ -503,6 +503,11 @@ pub(crate) const HOLD_COMPACT_TAIL: u8 = 18;
 #[cfg(test)]
 pub(crate) const HOLD_COMPACT_PREPARED: u8 = 19;
 
+/// Test hook stage (`Group::confirm_hold`): the background compaction's snapshot is installed and
+/// its directory synced, its cut not yet taken, and the store mutex free (Codex C25 HIGH 1's window).
+#[cfg(test)]
+pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
+
 #[derive(Default)]
 struct GroupState {
     /// A flight is being written.
@@ -5948,6 +5953,8 @@ impl BranchStore {
             }
             bg.sync_dir()?;
             group.mark_committed(bg.lsn(), bg.class());
+            #[cfg(test)]
+            pause_at(hold, HOLD_COMPACT_INSTALLED);
             // Test builds: stop here, as a crash between the snapshot's rename and the log's cut
             // would (`COMPACT_STOP_BEFORE_CUT`).
             #[cfg(test)]
