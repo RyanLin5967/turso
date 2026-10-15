@@ -507,6 +507,9 @@ pub enum BranchFailpoint {
     /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
     /// #3: the capture's other fallible step, beside its read snapshot).
     ArenaHandleFails,
+    /// The next held-free upgrade's sync (`BranchStore::sync_upgrade`) fails as an I/O error would
+    /// (engine review 21 MED 4: nothing could fail it before).
+    UpgradeSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -1489,6 +1492,17 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_compact_now(&self) -> Result<()> {
         self.branches.compact_now()
+    }
+
+    /// A branch catalog checkpoint for a client that asks for one (a wire CHECKPOINT; wire review
+    /// 18 HIGH 3), which leaves the store mutex free while it writes, so no create, switch or
+    /// connect waits for it: a catalog store's fuzzy checkpoint, retried with back-off while one is
+    /// in flight, until `deadline`, then waited for. A store with no catalog compacts as
+    /// [`Database::branch_compact_now`] does. `Ok(true)`: a checkpoint installed; `Ok(false)`: none
+    /// did before the deadline. A fail-stopped store refuses.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_now(&self, deadline: std::time::Duration) -> Result<bool> {
+        self.branches.checkpoint_now(deadline)
     }
 
     /// Catalog checkpoint and settle counters (r11-restart-r2 instrument): `[checkpoints
