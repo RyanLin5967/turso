@@ -80,6 +80,45 @@ def check(j, t, c, rule, by_client=None):
             bad.append(f"not capped, stopped at {st} s before S {s}: only MAX_S ends a warm-up before S")
         if cap and oa >= ops and st >= s + 1e-3:
             bad.append(f"capped, but OPS {ops} and S {s} were both met ({oa} ops at {st} s): done is not capped")
+    # review 5 MED 8 (the driver half): the warm-up's clock starts after every client is ready (bbload's g_t0)
+    rd = w.get("t0_after_ready_ns")
+    if type(rd) is not int or rd < 0:
+        bad.append(f"warmup.t0_after_ready_ns {rd!r}: the warm-up's start must follow the last client's ready (an int "
+                   ">= 0 ns), so no connect or setup counts as warm-up")
+    return bad + stamp_problems(j)
+
+
+STAMP_SLACK_S = 0.05  # a window's realtime span vs its monotonic secs: two clocks read a few calls apart
+
+
+def stamp_problems(j):
+    """The MED 12 ruling's window stamps: every window's realtime bounds (CLOCK_REALTIME, as the shared sweeper's
+    EPOCHREALTIME), opening at or after the previous one closed, each span within STAMP_SLACK_S of its secs, and the
+    run's measured span tm0/tm1_realtime_s (the competitors' names) from the first window's open to the last's close."""
+    wins = j.get("windows")
+    if not isinstance(wins, list) or not wins:
+        return ["no windows: the measured span has no realtime bounds"]
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    bad, prev = [], None
+    for i, w in enumerate(wins):
+        a, b, secs = (w.get(k) if isinstance(w, dict) else None for k in ("t0_realtime_s", "t1_realtime_s", "secs"))
+        name = w.get("window") if isinstance(w, dict) else f"#{i}"
+        if not (num(a) and num(b) and num(secs)):
+            bad.append(f"window {name}: realtime bounds {a!r}, {b!r} and secs {secs!r} are not all numbers")
+            prev = None
+            continue
+        if b < a:
+            bad.append(f"window {name}: closes at {b} before it opens at {a}")
+        elif abs((b - a) - secs) > STAMP_SLACK_S:
+            bad.append(f"window {name}: realtime span {b - a:.6f} s vs secs {secs} (over {STAMP_SLACK_S} s apart)")
+        if prev is not None and a < prev:
+            bad.append(f"window {name}: opens at {a} before the previous window closed at {prev}")
+        prev = b
+    first, last = wins[0], wins[-1]
+    for k, want in (("tm0_realtime_s", first.get("t0_realtime_s") if isinstance(first, dict) else None),
+                    ("tm1_realtime_s", last.get("t1_realtime_s") if isinstance(last, dict) else None)):
+        if not num(j.get(k)) or j.get(k) != want:
+            bad.append(f"{k} {j.get(k)!r}, want {want!r} (the measured span's bound)")
     return bad
 
 
