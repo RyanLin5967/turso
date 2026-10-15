@@ -59,6 +59,9 @@ const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
 const CONFIRM_HELD_MS: u64 = 1 << 40;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
+/// The lead's third memory point (2026-10-15: the slope at 10^4, 10^5 AND 10^6 before any 10^6
+/// number is quoted): cell `mem_n1e6` only.
+const N_MILLION: u64 = 1_000_000;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
 const NAME_LEN: u64 = 6;
 
@@ -2080,6 +2083,7 @@ fn budget_child() {
             }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" | "wtail_n1e4" | "wfresh_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
+            "mem_n1e6" => (N_MILLION, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
                     10
@@ -3562,6 +3566,33 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
         slope <= 100.0,
         "an open keeps {slope:.1} B resident per live branch ({ra} B at {N_LARGE}, {rb} B at {N_HUGE}; physical footprint {foot}); budget 100 B [L4 memory ruling]"
     );
+}
+
+/// The L4 memory ruling at the third point (lead, 2026-10-15): from 10^5 to 10^6 named branches the
+/// open's resident heap grows by at most 100 B per live branch, as from 10^4 to 10^5 (cells
+/// `mem_n1e5`, `mem_n1e6`; the 10^4 -> 10^6 slope is reported beside it). The same count and blind
+/// spots as leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch.
+#[test]
+fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch_up_to_10_6() {
+    if in_child() {
+        return;
+    }
+    let (a, b, m) = (cell("mem_n1e4"), cell("mem_n1e5"), cell("mem_n1e6"));
+    let (sa, sb, sm) = (&a.ops["memory"][0], &b.ops["memory"][0], &m.ops["memory"][0]);
+    assert!(sa["quiet"] == 1 && sb["quiet"] == 1 && sm["quiet"] == 1, "a background thread outlived the wait: the heap was still moving");
+    let resident = |s: &Map, n: u64| {
+        *s.get("resident_bytes").unwrap_or_else(|| {
+            panic!("at {n}: the open's resident delta is negative ({:?} B): the measurement is broken", s.get("resident_negative"))
+        })
+    };
+    let (ra, rb, rm) = (resident(sa, N_LARGE), resident(sb, N_HUGE), resident(sm, N_MILLION));
+    let slope = |r0: u64, r1: u64, n0: u64, n1: u64| (r1 as f64 - r0 as f64) / (n1 - n0) as f64;
+    let (s45, s56, s46) = (slope(ra, rb, N_LARGE, N_HUGE), slope(rb, rm, N_HUGE, N_MILLION), slope(ra, rm, N_LARGE, N_MILLION));
+    assert!(
+        s56 <= 100.0,
+        "an open keeps {s56:.1} B resident per live branch from 10^5 to 10^6 ({rb} B, {rm} B; 10^4 -> 10^5 {s45:.1}, 10^4 -> 10^6 {s46:.1}); budget 100 B [L4 memory ruling]"
+    );
+    println!("L4 memory slopes: 10^4->10^5 {s45:.1} B, 10^5->10^6 {s56:.1} B, 10^4->10^6 {s46:.1} B per live branch ({ra}, {rb}, {rm} B)");
 }
 
 /// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): from 10^4 to 10^5
