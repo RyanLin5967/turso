@@ -5028,6 +5028,10 @@ impl PostgreSQLTranslator {
                         _ => None, // Default or undefined
                     };
 
+                    // PostgreSQL's default placement when none is written: NULLs sort as larger
+                    // than every value, last ascending and first descending (recorded,
+                    // pg18-diff/pg18-nullorder.out); the engine's own default (SQLite's) put them
+                    // first ascending (Claude C33, pg18-insdef.out's replay).
                     let nulls =
                         match pg_query::protobuf::SortByNulls::try_from(sort_by.sortby_nulls) {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => {
@@ -5036,7 +5040,10 @@ impl PostgreSQLTranslator {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
                                 Some(ast::NullsOrder::Last)
                             }
-                            _ => None,
+                            _ if order == Some(ast::SortOrder::Desc) => {
+                                Some(ast::NullsOrder::First)
+                            }
+                            _ => Some(ast::NullsOrder::Last),
                         };
 
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
@@ -9400,8 +9407,12 @@ mod tests {
     fn test_order_by_nulls_ordering() {
         let translator = PostgreSQLTranslator::new();
 
+        // FLAGGED TEST EDIT (lead to rule): the default case expected None, the subject's own
+        // output, which the engine reads as SQLite's NULLS FIRST; PostgreSQL 18.6's default is
+        // NULLS LAST ascending and FIRST descending (recorded, pg18-diff/pg18-nullorder.out).
         let cases = [
-            ("SELECT * FROM t ORDER BY a", None),
+            ("SELECT * FROM t ORDER BY a", Some(ast::NullsOrder::Last)),
+            ("SELECT * FROM t ORDER BY a DESC", Some(ast::NullsOrder::First)),
             (
                 "SELECT * FROM t ORDER BY a NULLS FIRST",
                 Some(ast::NullsOrder::First),

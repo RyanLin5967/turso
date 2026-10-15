@@ -493,6 +493,7 @@ impl Shared {
 
     /// Mark `name` as being deleted. A session on it is waited for (up to `in_use_wait`: one that is
     /// closing releases it within that), then refused with 55006.
+    #[cfg(test)]
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
         self.begin_delete_for(name, None)
     }
