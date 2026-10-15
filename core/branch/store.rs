@@ -1438,6 +1438,30 @@ impl Drop for StoreGuard<'_> {
     }
 }
 
+/// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
+/// use) and at its first touch (`first`: in use), which LEAP L4 2b reads as its state at the
+/// checkpoint the tail follows.
+#[derive(Default)]
+struct Touched {
+    now: HashMap<Slot, bool>,
+    first: HashMap<Slot, bool>,
+}
+
+impl Touched {
+    fn set(&mut self, slot: Slot, used: bool) {
+        self.now.insert(slot, used);
+        self.first.entry(slot).or_insert(used);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// LEAP L4 2b's oracle (test builds): an open on this thread also asks the catalog's free table
+    /// for every touched slot whose checkpoint state it inferred from the log, and records the
+    /// first disagreement (`CatState::free_inference_mismatch`).
+    pub(crate) static CHECK_FREE_INFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
@@ -1807,6 +1831,12 @@ struct CatState {
     /// The count of rows released while held open, from a format 19/20 meta row at the open
     /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
     held_released_at_open: Option<u64>,
+    /// LEAP L4 2b's oracle (test builds, `CHECK_FREE_INFERENCE`): the touched slots whose checkpoint
+    /// state the open inferred, and the first that disagreed with the catalog's free table.
+    #[cfg(test)]
+    free_inferred_at_open: u64,
+    #[cfg(test)]
+    free_inference_mismatch: Option<String>,
     /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
     /// catalog read and deleted by the next checkpoint (C-P).
     trunk_gone: HashSet<(u32, u64)>,
@@ -2123,6 +2153,10 @@ impl CatState {
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
             held_released_at_open: None,
+            #[cfg(test)]
+            free_inferred_at_open: 0,
+            #[cfg(test)]
+            free_inference_mismatch: None,
             trunk_child_max: None,
             trunk_versions: None,
             trunk_gone: HashSet::new(),
@@ -4130,7 +4164,7 @@ impl BranchStore {
         records: &[Record],
         sync: SyncClass,
         stats: &mut BranchOpenStats,
-    ) -> Result<HashMap<Slot, bool>> {
+    ) -> Result<Touched> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         inner.next_id = inner.next_id.max(meta.next_id);
         inner.trunk.lineage.epoch = meta.trunk_epoch;
@@ -4159,18 +4193,18 @@ impl BranchStore {
         cat.held_released_at_open = meta.held_released;
         inner.cat = Some(cat);
         let t = Instant::now();
-        let mut touched: HashMap<Slot, bool> = HashMap::new();
+        let mut touched = Touched::default();
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
             match record {
                 Record::Commit { pages, .. } => {
                     for &(_, slot, _) in pages {
-                        touched.insert(slot, true);
+                        touched.set(slot, true);
                         inner.named_at.insert(slot, pos);
                     }
                 }
                 Record::TrunkRetain { slot, .. } => {
-                    touched.insert(*slot, true);
+                    touched.set(*slot, true);
                     inner.named_at.insert(*slot, pos);
                 }
                 _ => {}
@@ -4182,7 +4216,7 @@ impl BranchStore {
             // A parked Commit applied during this record (C-R) freed its slots here, in order.
             freed.append(&mut inner.deferred_freed);
             for slot in freed {
-                touched.insert(slot, false);
+                touched.set(slot, false);
             }
         }
         stats.replay_ns = ns(t);
@@ -4308,7 +4342,7 @@ impl BranchStore {
             // read, as before review 5 #1.
             let named: Vec<(Slot, u32)> = check
                 .into_iter()
-                .filter(|(slot, _)| touched.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
+                .filter(|(slot, _)| touched.now.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
                 .collect();
             if !super::journal::slots_hold(&arena_file, page_size, &named)? {
                 scanned.drop_last_flight();
@@ -4328,7 +4362,7 @@ impl BranchStore {
         stats.released_scanned = scanned;
         freed.append(&mut inner.deferred_freed);
         for slot in freed {
-            touched.insert(slot, false);
+            touched.set(slot, false);
         }
         if inner.parked.is_empty() {
             inner.named_at = HashMap::new();
@@ -4343,10 +4377,48 @@ impl BranchStore {
         let mut free_mem = Vec::new();
         let mut taken = HashSet::new();
         let mut high_water = file_hw.max(meta.arena_hw);
-        for (&slot, &used) in &touched {
-            stats.touched_below_hw += u64::from(slot < meta.arena_hw);
-            stats.free_probes += u64::from(slot < meta.arena_hw);
-            let was_used = slot < meta.arena_hw && !cat.catalog.free_has(slot)?;
+        // LEAP L4 2b: at formats 19/20 a touched slot's state at the checkpoint is its FIRST touch
+        // in the tail, not a free-table probe. A Commit's or a TrunkRetain's slot is fresh, taken
+        // from the free list or the reserved set, each of which the checkpoint lists free (a
+        // reservation is written free: a crash loses it), or from past the high-water mark; a slot
+        // whose first touch frees it was in use at the checkpoint. Older formats probe, as before.
+        // Mutants (test builds only): `l4_free_probe_at_open` probes always; `l4_free_first_touch_
+        // inverted` reads every first touch the wrong way round (the oracle's plant).
+        let infer = super::journal::meta_carries_facts(meta.format) && !fe_mutant("l4_free_probe_at_open");
+        let inverted = fe_mutant("l4_free_first_touch_inverted");
+        #[cfg(test)]
+        let check = infer && CHECK_FREE_INFERENCE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        {
+            cat.free_inferred_at_open = 0;
+            cat.free_inference_mismatch = None;
+        }
+        for (&slot, &used) in &touched.now {
+            let below = slot < meta.arena_hw;
+            stats.touched_below_hw += u64::from(below);
+            let listed = if !below {
+                false
+            } else if infer {
+                let listed = touched.first[&slot] != inverted;
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open inferred slot {slot} {} at the checkpoint from its first touch (in use: {}), the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            touched.first[&slot],
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
+            } else {
+                stats.free_probes += 1;
+                cat.catalog.free_has(slot)?
+            };
+            let was_used = below && !listed;
             in_use += used as i64 - was_used as i64;
             if slot < meta.arena_hw && !was_used {
                 // The catalog lists it free; this process owns it now either way.
@@ -4364,13 +4436,13 @@ impl BranchStore {
             high_water = high_water.max(slot + 1);
         }
         for slot in meta.arena_hw..file_hw {
-            if !touched.contains_key(&slot) {
+            if !touched.now.contains_key(&slot) {
                 free_mem.push(slot);
             }
         }
-        stats.touched_slots = touched.len() as u64;
+        stats.touched_slots = touched.now.len() as u64;
         if super::arena::trace_slots() {
-            let mut t: Vec<(Slot, bool)> = touched.iter().map(|(&s, &u)| (s, u)).collect();
+            let mut t: Vec<(Slot, bool)> = touched.now.iter().map(|(&s, &u)| (s, u)).collect();
             t.sort_unstable();
             eprintln!(
                 "R11SLOT recover meta_hw={} file_hw={file_hw} meta_in_use={} touched={t:?} free_mem={free_mem:?} taken={taken:?} in_use={in_use} records={}",
@@ -8334,12 +8406,23 @@ impl BranchStore {
     /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
     /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
     #[cfg(test)]
+    /// Test builds (LEAP L4 2b): the touched slots whose checkpoint state the last open inferred and
+    /// checked against the free table (`CHECK_FREE_INFERENCE`).
+    #[cfg(test)]
+    pub(crate) fn free_inferred_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |cat| cat.free_inferred_at_open)
+    }
+
     pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let Some(cat) = inner.cat.as_mut() else {
             return Ok((0, false, false, false));
         };
+        // (6) 2b: the open's first-touch inference equalled the free table on every slot it read.
+        if let Some(m) = cat.free_inference_mismatch.clone() {
+            return Err(m);
+        }
         let rows = cat
             .catalog
             .trunk_born_range(None, u64::MAX, u64::MAX >> 1)
