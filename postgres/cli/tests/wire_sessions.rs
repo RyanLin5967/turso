@@ -2343,6 +2343,45 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// A text[] parameter is read as PostgreSQL 18.6's array_in reads it (recorded, artie raw
+/// loud-20261015/pg18-diff/pg18-r15.out; wire review 13 item 16): an escaped `NUL\L` is the string
+/// NULL, never SQL NULL (an unquoted, unescaped NULL is SQL NULL); a vertical tab is whitespace
+/// around an element; a stray `}` is 22P02 "malformed array literal" (a `{` inside an element
+/// stays the multidimensional refusal, 0A000). Read through INSERT into a text[] column, whose
+/// rows this server prints as PostgreSQL does.
+#[test]
+fn an_array_parameter_is_read_as_array_in_reads_it() {
+    let dir = Scratch::new("arrayin");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ar(id INT, x TEXT[])").ok("ar");
+    let sql = "INSERT INTO ar VALUES ($1, $2)";
+    for (id, value, want) in [
+        (1, &b"{\"NUL\\L\"}"[..], Some("{\"NULL\"}")),
+        (2, b"{NUL\\L}", Some("{\"NULL\"}")),
+        (3, b"{NULL}", Some("{NULL}")),
+        (4, b"{a,\x0bb}", Some("{a,b}")),
+    ] {
+        let id = id.to_string();
+        a.xt(sql, &[(23, 0, id.as_bytes()), (1009, 0, value)])
+            .ok(&format!("{:?}", String::from_utf8_lossy(value)));
+        let got = a
+            .q(&format!("SELECT x FROM ar WHERE id = {id}"))
+            .ok("read back")
+            .rows;
+        assert_eq!(
+            got,
+            vec![vec![want.map(str::to_string)]],
+            "{:?}",
+            String::from_utf8_lossy(value)
+        );
+    }
+    let r = a.xt(sql, &[(23, 0, b"5"), (1009, 0, b"{a}}")]);
+    assert_eq!(r.err("a stray }").code, "22P02");
+    let r = a.xt(sql, &[(23, 0, b"6"), (1009, 0, b"{{a}}")]);
+    assert_eq!(r.err("a nested array").code, "0A000");
+}
+
 /// AND CHAIN where PostgreSQL 18.6 answers it (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-r15.out; wire review 13 item 13, review 15 item 23): in an implicit block (`SELECT 1;
 /// COMMIT AND CHAIN`) it is 25P01 "... can only be used in transaction blocks" and the session ends
