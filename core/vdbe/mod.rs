@@ -201,6 +201,10 @@ pub enum StepResult {
 ///   primarily to the WAL, but also possibly checkpointing the WAL to the database file.
 enum CommitState {
     Ready,
+    /// `commit_txn`'s materialized-view merge yielded IO before the pager commit began, so a
+    /// re-entry resumes the merge (`view_delta_state`) instead of starting a new commit (engine
+    /// review 16 HIGH 1). Back to `Ready` once the deltas are applied.
+    ApplyingViewDeltas,
     Committing,
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
@@ -224,7 +228,10 @@ impl CommitState {
             CommitState::CommittingAttachedMvcc { state_machine, .. } => {
                 state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
             }
-            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+            CommitState::Ready
+            | CommitState::ApplyingViewDeltas
+            | CommitState::Committing
+            | CommitState::CommittingAttached => {}
         }
     }
 
@@ -452,6 +459,37 @@ impl Register {
 pub struct Row {
     values: *const Register,
     count: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test instrument (engine review 16 HIGH 1, red (i)): the next N materialized-view merges a
+    /// commit on this thread makes yield IO first, as a `merge_delta` that meets an uncached page
+    /// would. Thread-local, so a parallel test is never affected.
+    pub(crate) static VIEW_MERGE_YIELDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `err` ends an explicit transaction even when the failing statement wrote nothing. The
+/// engine's own state may be damaged after these: an I/O error, out of memory, a full database or
+/// page cache (SQLite's sqlite3VdbeHalt rolls a read-only statement's transaction back for
+/// SQLITE_IOERR, SQLITE_NOMEM and SQLITE_FULL only), corruption or an internal error, and an MVCC
+/// transaction the store has already ended. Every other error (a SQL evaluation error such as an
+/// integer overflow, a constraint, an interrupt) ends only a statement that wrote nothing
+/// (fastest-engine 4b).
+fn error_ends_the_transaction(err: &LimboError) -> bool {
+    matches!(
+        err,
+        LimboError::CompletionError(_)
+            | LimboError::OutOfMemory
+            | LimboError::DatabaseFull(_)
+            | LimboError::CacheError(_)
+            | LimboError::Corrupt(_)
+            | LimboError::NotADB
+            | LimboError::InternalError(_)
+            | LimboError::TxTerminated
+            | LimboError::CommitDependencyAborted
+            | LimboError::NoSuchTransactionID(_)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -817,6 +855,11 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
+    /// A part of this statement's COMMIT has committed: main's pager or MVCC transaction, or an
+    /// attached one (engine review 19 HIGH 2). A `Busy` after it is not a refusal of the whole
+    /// COMMIT, so its transition is never undone (`undo_commit_transition_after_busy`). Cleared at
+    /// reset.
+    commit_published: bool,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
     /// entry and drives it one step per opcode call, yielding
@@ -878,6 +921,9 @@ pub struct ProgramState {
     /// the promised outcome and drop staged work. The connection-level flag
     /// stays set and clears once no root statement is active.
     pub(crate) halt_in_progress: bool,
+    /// The open catch region's target ([Insn::CatchBegin]): while set, a catchable value error
+    /// an instruction raises jumps here instead of failing the statement (`normal_step`).
+    pub(crate) catch_target: Option<InsnReference>,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -888,6 +934,9 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// The recipe read path's per-statement state: compiled recipes and the current row's
+    /// decoded values (lane k1-recipe-build, see `crate::recipe`).
+    pub(crate) recipe_exec: crate::recipe::RecipeExec,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
@@ -952,6 +1001,7 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
+            commit_published: false,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
@@ -980,8 +1030,10 @@ impl ProgramState {
             pending_fail_error: None,
             pending_fail_prepare_error: None,
             halt_in_progress: false,
+            catch_target: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            recipe_exec: Default::default(),
         }
     }
 
@@ -1037,6 +1089,16 @@ impl ProgramState {
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         let i = index.get() - 1;
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
+    }
+
+    /// A COMMIT's attached half failed once a part of the COMMIT had committed
+    /// (`commit_published`): it stays in `CommittingAttached`, so a re-step finishes the attached
+    /// half instead of judging the COMMIT anew (engine review 19 HIGH 2). Mutant
+    /// `attached_commit_from_ready` (test builds only): left as it was.
+    fn keep_committing_attached(&mut self) {
+        if self.commit_published && !crate::branch::store::fe_mutant("attached_commit_from_ready") {
+            self.commit_state = CommitState::CommittingAttached;
+        }
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
@@ -1102,6 +1164,7 @@ impl ProgramState {
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.commit_state = CommitState::Ready;
+        self.commit_published = false;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
         // (we handle that on every code path inside
@@ -1130,8 +1193,16 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
+        self.catch_target = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        self.recipe_exec.clear();
+    }
+
+    /// Count `n` rows as changed by this statement at once (a recipe backfill's matched rows).
+    pub(crate) fn record_statement_changes(&self, n: i64) {
+        self.n_change.fetch_add(n, Ordering::SeqCst);
+        self.n_total_change.fetch_add(n, Ordering::SeqCst);
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2146,6 +2217,15 @@ impl Program {
                         // back, so auto-retrying can be useful.
                         return Ok(StepResult::Busy);
                     }
+                    // Inside a catch region (Insn::CatchBegin), a value an expression refuses
+                    // jumps to the region's target: the statement goes on (engine review 16
+                    // HIGH 2: a seek key its ENCODE refuses seeks nothing). Only value errors
+                    // (an allowlist); IO, corruption, interrupts and internal errors still fail.
+                    Err(err)
+                        if state.catch_target.is_some() && err.is_catchable_value_error() =>
+                    {
+                        state.pc = state.catch_target.take().expect("checked just above");
+                    }
                     Err(err)
                         if (matches!(err, LimboError::Constraint(_))
                             && self.resolve_type == ResolveType::Fail)
@@ -2244,6 +2324,18 @@ impl Program {
                             delta_set.insert(table_name, delta);
                         }
 
+                        // Test instrument (engine review 16 HIGH 1, red (i)): yield here, as a
+                        // merge_delta that meets an uncached page would, leaving this index.
+                        #[cfg(test)]
+                        if VIEW_MERGE_YIELDS.with(|n| {
+                            let left = n.get();
+                            n.set(left.saturating_sub(1));
+                            left > 0
+                        }) {
+                            return Ok(IOResult::IO(crate::types::IOCompletions(
+                                crate::io::Completion::new_yield(),
+                            )));
+                        }
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(_) => {
@@ -2285,10 +2377,21 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
+        // Apply view deltas with I/O handling. A yield is recorded in `commit_state`, so the
+        // statement's re-entry resumes this commit rather than judging it a new one (an explicit
+        // COMMIT has already made its transition; engine review 16 HIGH 1).
         match self.apply_view_deltas(program_state, rollback, &pager)? {
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            IOResult::Done(_) => {}
+            IOResult::IO(io) => {
+                if matches!(program_state.commit_state, CommitState::Ready) {
+                    program_state.commit_state = CommitState::ApplyingViewDeltas;
+                }
+                return Ok(IOResult::IO(io));
+            }
+            IOResult::Done(_) => {
+                if matches!(program_state.commit_state, CommitState::ApplyingViewDeltas) {
+                    program_state.commit_state = CommitState::Ready;
+                }
+            }
         }
 
         // Reset state for next use
@@ -2381,7 +2484,7 @@ impl Program {
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock() {
@@ -2403,7 +2506,11 @@ impl Program {
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    let attached = self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published);
+                    if attached.is_err() {
+                        program_state.keep_committing_attached();
+                    }
+                    match attached? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -2415,7 +2522,11 @@ impl Program {
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => {
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    let attached = self.end_attached_write_txns(&connection, rollback, &mut program_state.commit_published);
+                    if attached.is_err() {
+                        program_state.keep_committing_attached();
+                    }
+                    match attached? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -2485,6 +2596,9 @@ impl Program {
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
                     program_state.commit_state = CommitState::Ready;
+                    // Main's half is committed: a later Busy undoes no transition (engine review
+                    // 19 HIGH 2).
+                    program_state.commit_published |= !rollback;
                     // Fall through to attached phase
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2516,6 +2630,7 @@ impl Program {
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
+                    program_state.commit_published |= !rollback;
                     // Fall through to look for more
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2553,6 +2668,7 @@ impl Program {
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
+                    program_state.commit_published |= !rollback;
                     continue;
                 }
                 IOResult::IO(io) => {
@@ -2571,7 +2687,7 @@ impl Program {
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(&conn, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     self.end_attached_read_txns(&conn);
@@ -2581,7 +2697,11 @@ impl Program {
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        let attached = self.end_attached_write_txns(&conn, rollback, &mut program_state.commit_published);
+        if attached.is_err() {
+            program_state.keep_committing_attached();
+        }
+        match attached? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
@@ -2605,7 +2725,7 @@ impl Program {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
-            match self.end_attached_write_txns(connection, rollback)? {
+            match self.end_attached_write_txns(connection, rollback, &mut program_state.commit_published)? {
                 IOResult::Done(_) => {
                     *commit_state = CommitState::Ready;
                 }
@@ -2627,8 +2747,18 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
-                // Main pager commit done, now commit attached database pagers
-                match self.end_attached_write_txns(connection, rollback)? {
+                // Main pager commit done, now commit attached database pagers. Main's half is
+                // durable, so the COMMIT is marked past its point of no return before the attached
+                // pagers run: a Busy from one of them (its decision pass refused) leaves this
+                // state, and a re-step resumes the attached half instead of judging the COMMIT
+                // anew (engine review 19 HIGH 2). Blind spot: a main write transaction with no
+                // dirty page counts as committed too. Mutant `attached_commit_from_ready` (test
+                // builds only): from Ready, as before.
+                if !rollback && !crate::branch::store::fe_mutant("attached_commit_from_ready") {
+                    program_state.commit_published = true;
+                    *commit_state = CommitState::CommittingAttached;
+                }
+                match self.end_attached_write_txns(connection, rollback, &mut program_state.commit_published)? {
                     IOResult::Done(_) => {
                         *commit_state = CommitState::Ready;
                     }
@@ -2655,10 +2785,12 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
+    /// `published` is set once an attached pager's commit is done (engine review 19 HIGH 2).
     fn end_attached_write_txns(
         &self,
         connection: &Connection,
         rollback: bool,
+        published: &mut bool,
     ) -> Result<IOResult<()>> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
@@ -2688,12 +2820,21 @@ impl Program {
                         }
                         Err(e) => return Err(e),
                     }
+                    *published = true;
                     // WAL commit succeeded — publish the connection-local schema
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);
+                    // The trunk commit's epilogue, as a main pager's (review 3 #20): its merge
+                    // writes stamped while its commit gate is open, then the gate closed. Mutant
+                    // `attached_unstamped` (test builds only).
+                    let stamped = !crate::branch::store::fe_mutant("attached_unstamped")
+                        && attached_pager.finish_trunk_write(true);
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
                     attached_pager.commit_wal_end();
+                    if stamped {
+                        attached_pager.prune_branch_stamps();
+                    }
                 } else {
                     // Discard any local schema changes on rollback
                     connection.database_schemas().write().remove(&db_id);
@@ -3120,8 +3261,22 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
+                        // Inside an explicit transaction a statement with no statement
+                        // savepoint cannot be undone alone, so its error rolls back the
+                        // transaction, unless the statement never began writing (a read, or a
+                        // writer refused before its first write): it changed nothing, so its
+                        // error ends only itself, as PostgreSQL's statement does and SQLite's
+                        // read-only one does (fastest-engine 4b). Errors that may have damaged
+                        // the engine's own state still roll back
+                        // (`error_ends_the_transaction`). Mutant `read_error_rolls_back_txn`
+                        // (test builds only): every error rolls back, as before.
+                        let ends_only_the_statement = !unfinished_writer
+                            && err.is_some_and(|err| !error_ends_the_transaction(err))
+                            && !crate::branch::store::fe_mutant("read_error_rolls_back_txn");
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (!self.connection.get_auto_commit()
+                                && err.is_some()
+                                && !ends_only_the_statement)
                         {
                             self.rollback_current_txn(pager);
                         }

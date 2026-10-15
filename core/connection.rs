@@ -422,6 +422,9 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    /// Recipe backfill (lane k1-recipe-build, see `crate::recipe`): eligible bulk UPDATEs on this
+    /// connection become recipes instead of table rewrites. Reads honour recipes either way.
+    pub(super) recipe_backfill: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -587,6 +590,9 @@ impl Drop for Connection {
             let pager = self.pager.load();
             if let Some(wal) = &pager.wal {
                 if wal.holds_write_lock() {
+                    // A commit abandoned between its copy decisions and its publication left the
+                    // branch store's commit gate open (review A-F1).
+                    pager.close_trunk_gate();
                     wal.end_write_tx();
                 }
                 if wal.holds_read_lock() {
@@ -957,6 +963,8 @@ impl Connection {
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        #[cfg(test)]
+        crate::branch::budget_probe::statement_prepared();
         self.maybe_update_schema();
 
         let syms = self.syms.read();
@@ -2284,6 +2292,14 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
+        // A raw WAL session is the trunk's: a branch's writes never reach the WAL (review A-F1).
+        if pager.branch_id().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a raw WAL session cannot begin on a branch connection: a branch's writes never \
+                 reach the WAL"
+                    .to_string(),
+            ));
+        }
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
         // the WAL header here would invalidate the watermarks the caller has
@@ -2339,8 +2355,13 @@ impl Connection {
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
+            // The commit's stamps and its commit gate, before the WAL write lock goes.
+            let stamped = pager.end_raw_trunk_write(force_commit && commit_err.is_none());
             wal.end_write_tx();
             wal.end_read_tx();
+            if stamped {
+                pager.prune_branch_stamps();
+            }
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
@@ -3933,6 +3954,16 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    /// Turn recipe backfill on or off for this connection (see `crate::recipe`).
+    pub fn set_recipe_backfill(&self, value: bool) {
+        self.recipe_backfill.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn recipe_backfill(&self) -> bool {
+        self.recipe_backfill.load(Ordering::SeqCst)
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {

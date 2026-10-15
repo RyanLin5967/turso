@@ -15,6 +15,20 @@
 #                      slash, a trailing slash on DIR the same: /mnt/v3fx/n1 does not match n10/, n1x/ or a file named
 #                      n1 itself). teardown_nest's per-level sweep (V3 review 13 item 20: it kept its own copy).
 # BLIND SPOT, stated: a backing path holding runs of spaces is compared with single spaces (awk rebuilds the field).
+cell_nest_dir() {
+  local mnt src backing
+  mnt=$(readlink -m "${1:?cell_nest_dir MNT}") || return 2
+  src=$(findmnt -n -o SOURCE -T "$mnt") || return 2
+  case $src in
+    /dev/loop*)
+      backing=$(losetup -n -O BACK-FILE "$src") || return 2
+      case $backing in /*) ;; *) echo "cell_nest_dir: no absolute loop backing file" >&2; return 2 ;; esac
+      readlink -m "$(dirname "$backing")" ;;
+    /*) printf '%s\n' "$mnt" ;;
+    *) echo "cell_nest_dir: no mount source" >&2; return 2 ;;
+  esac
+}
+
 loop_list() {
   local out rc
   out=$(losetup --list -n -O NAME,BACK-FILE); rc=$?  # losetup's stderr is ours (V3 review 13 item 10)
@@ -80,6 +94,10 @@ nestloops_self_test() {
     "$(printf '%s\n' "$lvl" | nest_level_match /mnt/v3fx/n1/ | xargs)" "/dev/loop2 /dev/loop8"
   t "level: nest_level_match /mnt/v3fx/nb -> nb/x.img, not nbx.img" \
     "$(printf '%s\n' "$lvl" | nest_level_match /mnt/v3fx/nb | xargs)" "/dev/loop0"
+  t "root ext4 keeps the supplied cell directory" \
+    "$(findmnt() { echo /dev/sda1; }; cell_nest_dir /mnt/fastest-v3-ext4)" /mnt/fastest-v3-ext4
+  t "loop cell uses its backing directory" \
+    "$(findmnt() { echo /dev/loop0; }; losetup() { echo /var/tmp/cell.img; }; cell_nest_dir /mnt/cell)" /var/tmp
   td=$(mktemp -d) || { echo "FAIL mktemp"; return 1; }
   printf '#!/bin/sh\necho "losetup: cannot open /dev/loop-control" >&2\nexit 1\n' > "$td/losetup"
   chmod +x "$td/losetup"

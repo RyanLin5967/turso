@@ -406,6 +406,7 @@ mod tests {
                 branch_durability: crate::branch::BranchDurability::Volatile,
                 branch_lease: None,
                 branch_splice: false,
+                branch_checkpoint: None,
             },
             None,
             Arc::new(SqliteDialect),

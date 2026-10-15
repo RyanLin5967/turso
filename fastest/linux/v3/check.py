@@ -26,6 +26,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
 
+
+def current_f3_sync_record(sy):
+    """Shared acceptance predicate for banked F3 fixtures and their regenerator (codex C05), on V3 review 13 item 19's
+    schema (DECISIONS d9c7b1dc85): unattributed is exactly {"foreign_fd": 0} (an int 0), the nosync25 arm carries no
+    syncs_inside_any_fd key, and every arm's windows_over is 0. real_selftest and regen_f3.py both call this one."""
+    if not isinstance(sy, dict):
+        return False
+    ua = sy.get("unattributed")
+    arms = sy.get("arms")
+    return (isinstance(ua, dict) and list(ua) == ["foreign_fd"]
+            and type(ua["foreign_fd"]) is int and ua["foreign_fd"] == 0
+            and isinstance(arms, dict) and bool(arms)
+            and isinstance(arms.get("nosync25"), dict)
+            and "syncs_inside_any_fd" not in arms["nosync25"]
+            and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in arms.values()))
+
 # ---- the spec -----------------------------------------------------------------------------------------------
 # Syscalls each arm issues per op (per round, one op per arm), by definition. Copy arms: openat (create the clone in
 # the clones' directory), the copy (ioctl FICLONE or copy_file_range), close, fsync of the directory; clone2b and
@@ -1289,7 +1305,16 @@ def self_test():
     # loop cells), and an f_nest that ignores V3_NEST_DIR must fail on a block cell (the old check read the dir back
     # from the n1 it judged, so it could not)
     nnp = globals().get("nest_n1_problems")
+    # The original path fixtures describe two filesystems. Supply their stat
+    # evidence explicitly; preserve every original expected verdict.
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    def nest_fixture_stat(path):
+        return SimpleNamespace(st_dev=1 if canon_path(path) in ("/", "/mnt/fastest-v3-ext4") else 2)
     for name, cdir, first, rebuilt, ok in (
+            ("root ext4 cell directory has the root filesystem identity", "/", "/mnt/fastest-v3-ext4/v3fx-n1.img",
+             "/mnt/fastest-v3-ext4/v3fx-n1.img", True),
+            ("brd cell's first n1 is wrongly on root", "/mnt/brd", "/v3fx-n1.img", "/mnt/brd/v3fx-n1.img", False),
             ("a loop cell, dir '/': n1 /v3fx-n1.img both builds", "/", "/v3fx-n1.img", "/v3fx-n1.img", True),
             ("a block cell: n1 on the cell's filesystem both builds", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
              "/mnt/fastest-v3-xfs/v3fx-n1.img", True),
@@ -1306,7 +1331,8 @@ def self_test():
              "/v3fx-n1.img", "/mnt/fastest-v3-xfs/v3fx-n1.img", False),
             ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
             ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
-        got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
+        with patch.object(os, "stat", side_effect=nest_fixture_stat):
+            got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
         # [V3 review 13 item 6, disclosed STRENGTHENING: with the function absent, got was a one-element placeholder,
         # so `(got == []) is ok` passed every ok=False case at 167dd51be; an absent function now fails every case]
         chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), nnp is not None and ((got == []) is ok),
@@ -1496,11 +1522,11 @@ def real_selftest(chk):
             ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
             n00 = (sy0.get("arms") or {}).get("nosync25") or {}
             # [V3 review 13 item 19, disclosed: the shape is now unattributed exactly {foreign_fd: 0} and no
-            # syncs_inside_any_fd key; the hand-written list is codex card C05's to replace with regen_f3.py --check]
+            # syncs_inside_any_fd key. The one shared predicate, codex C05's current_f3_sync_record(), carries that
+            # schema (DECISIONS d9c7b1dc85); no second, hand-written predicate here]
             chk("real: %s's report has the current sync record (unattributed exactly {foreign_fd: 0}, no "
                 "syncs_inside_any_fd key, review 13 item 19; every arm's windows_over 0, review 12 item 8)" % fx,
-                "syncs_inside_any_fd" not in n00 and ua0 == {"foreign_fd": 0} and bool(sy0.get("arms"))
-                and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in (sy0.get("arms") or {}).values()),
+                current_f3_sync_record(sy0),
                 (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
         def both(f):  # a probe field: planted in the probe's summary and in the merged one, so only its rule fires
@@ -2118,7 +2144,9 @@ def main(argv):
     # V3 review 12 item 5: both builds' n1 image against the cell's own directory (firecheck derives it from the work
     # dir's mount, independently of the n1 it judges)
     n1p = nest_n1_problems((rd(os.path.join(nm, "cell_nest_dir.txt")) or "").strip(),
-                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1)
+                           (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1,
+                           devices=[(rd(os.path.join(nm, f)) or "").strip() for f in
+                                    ("cell_nest_dev.txt", "first_n1_dev.txt", "rebuilt_n1_dev.txt")])
     ast = rd(os.path.join(nm, "after_stray.txt"))
     # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
     # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown); V3 review 13 item 7:
@@ -2686,17 +2714,29 @@ def canon_path(p):
     return os.path.normpath(p) if p else ""
 
 
-def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
-    """V3 review 12 item 5: P_nest_modes' n1 image, first built and rebuilt, against the CELL's own directory, which
-    firecheck derives from the work dir's mount (a /dev/loop source: its backing file's directory; else the mount
-    target), never from the n1 under test (the old check read the directory back from it, so an f_nest that ignored
-    V3_NEST_DIR passed, and a loop cell's '//v3fx-n1.img' was a false red). [] when both are cell_dir/v3fx-n1.img."""
+def nest_n1_problems(cell_dir, first_n1, rebuilt_n1, devices=None):
+    """Judge the recorded stat -c %d identities, never pathname equality.
+
+    The live collector records all three while the directories exist. Direct
+    callers can stat directories themselves; offline fire-check judgment always
+    passes the recorded identities, so it never stats the reviewing machine.
+    """
     cd = canon_path(cell_dir)
     if not cd.startswith("/"):
         return ["no cell directory was derived (%r)" % (cell_dir,)]
-    want = canon_path(cd + "/v3fx-n1.img")
-    return ["the %s n1 image is %r, not the cell's %s" % (what, got, want)
-            for what, got in (("first-built", first_n1), ("rebuilt", rebuilt_n1)) if canon_path(got) != want]
+    images = [canon_path(first_n1), canon_path(rebuilt_n1)]
+    if any(not p.startswith("/") for p in images):
+        return ["missing or non-absolute n1 backing path"]
+    if devices is None:
+        try:
+            devices = [os.stat(p).st_dev for p in [cd] + [os.path.dirname(p) for p in images]]
+        except OSError as e:
+            return ["cannot stat n1 filesystem: %s" % e]
+    if len(devices) != 3 or any(re.fullmatch(r"[0-9]+", str(d)) is None for d in devices):
+        return ["missing or unreadable n1 filesystem identities: %r" % (devices,)]
+    cell_dev, first_dev, rebuilt_dev = map(int, devices)
+    return ["the %s n1 st_dev %s differs from leaf-holding st_dev %s" % (what, dev, cell_dev)
+            for what, dev in (("first-built", first_dev), ("rebuilt", rebuilt_dev)) if dev != cell_dev]
 
 
 def nest_plant_problems(before, after, mounted):

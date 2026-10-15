@@ -1991,10 +1991,12 @@ impl Schema {
                 foreign_keys: vec![],
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
+                rowid_alias_not_null: false,
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
+                recipes: None,
             })));
 
             // Only add to schema if compatible
@@ -2110,6 +2112,8 @@ impl Schema {
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
         dialect: &dyn crate::dialect::Dialect,
     ) -> Result<()> {
+        #[cfg(test)]
+        crate::branch::budget_probe::schema_row_parsed();
         match ty {
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
@@ -2400,6 +2404,9 @@ impl Schema {
                     ),
                     tbl_name.name.as_str(),
                 )?;
+            }
+            crate::recipe::SCHEMA_TYPE => {
+                crate::recipe::handle_schema_row(self, name, table_name, maybe_sql)?;
             }
             // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
@@ -2726,9 +2733,11 @@ impl TryClone for BTreeTable {
             foreign_keys: self.foreign_keys.try_clone()?,
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
+            rowid_alias_not_null: self.rowid_alias_not_null,
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
+            recipes: self.recipes.clone(),
         })
     }
 }
@@ -3326,9 +3335,20 @@ pub struct BTreeTable {
     /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
     pub rowid_alias_conflict_clause: Option<ResolveType>,
+    /// The table's rowid alias (its INTEGER PRIMARY KEY) is NOT NULL, as every primary key of the
+    /// frontend that created it is (PostgreSQL's): an explicit NULL into it, a literal or a bound
+    /// parameter, raises the NOT NULL constraint instead of taking a new rowid. An omitted key
+    /// still takes one, and the key stays the rowid alias with no index of its own. Set by a
+    /// dialect's `parse_table_sql` for the tables it created (the PG frontend's marked tables);
+    /// false for SQLite tables, whose INTEGER PRIMARY KEY turns a NULL into a new rowid
+    /// (fastest-engine 4c).
+    pub rowid_alias_not_null: bool,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+    /// Recipe backfills pending on this table (lane k1-recipe-build, see `crate::recipe`); `None`
+    /// when the table has none.
+    pub recipes: Option<Arc<crate::recipe::TableRecipes>>,
 }
 
 pub struct ColumnsMut<'a> {
@@ -3390,14 +3410,23 @@ impl BTreeTable {
             foreign_keys,
             check_constraints,
             rowid_alias_conflict_clause,
+            rowid_alias_not_null: false,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            recipes: None,
         }
     }
 
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// Whether an explicit NULL into this table's rowid alias raises the NOT NULL constraint
+    /// instead of taking a new rowid (`rowid_alias_not_null`, fastest-engine 4c). Mutant
+    /// `null_key_takes_rowid` (test builds only): never, as before.
+    pub fn rowid_alias_refuses_null(&self) -> bool {
+        self.rowid_alias_not_null && !crate::branch::store::fe_mutant("null_key_takes_rowid")
     }
 
     pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
@@ -3730,14 +3759,16 @@ impl BTreeTable {
             }
             sql.push_str(") REFERENCES ");
             sql.push_str(&fk.parent_table);
-            sql.push('(');
-            for (i, col) in fk.parent_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            if !fk.parent_columns.is_empty() {
+                sql.push('(');
+                for (i, col) in fk.parent_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(col);
                 }
-                sql.push_str(col);
+                sql.push(')');
             }
-            sql.push(')');
 
             // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
             if fk.on_delete != RefAct::NoAction {
@@ -4893,6 +4924,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                // A HIDDEN type marks a hidden column exactly as `Column::try_from` does at CREATE
+                // time; without this a table re-read from sqlite_schema lost the flag (found by the
+                // k1-recipe-build adversary: a recipe table could not be reopened).
+                let hidden = ty_str.contains("HIDDEN");
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -4908,7 +4943,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         notnull,
                         explicit_notnull,
                         unique,
-                        hidden: false,
+                        hidden,
                         notnull_conflict_clause,
                     },
                 );
@@ -5036,9 +5071,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
+        rowid_alias_not_null: false,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
+        recipes: None,
     };
     table.prepare_generated_columns()?;
     if !table.has_rowid {
@@ -5627,10 +5664,12 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
+        rowid_alias_not_null: false,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
         column_dependencies: Default::default(),
+        recipes: None,
     })
 }
 
@@ -6582,9 +6621,11 @@ mod tests {
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            rowid_alias_not_null: false,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            recipes: None,
         };
 
         let result = Index::automatic_from_primary_key(

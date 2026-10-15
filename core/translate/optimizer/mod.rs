@@ -2771,6 +2771,8 @@ fn apply_table_access_plan(
                         where_clause,
                         is_outer_join,
                         defer_cross_table_constraints,
+                        &table_references.joined_tables()[table_idx],
+                        resolver,
                     );
                     if let Some(index) = &index {
                         table_references.joined_tables_mut()[table_idx].op =
@@ -2862,6 +2864,8 @@ fn apply_table_access_plan(
                     where_clause,
                     false,
                     false,
+                    &table_references.joined_tables()[table_idx],
+                    resolver,
                 );
 
                 // Build seek definition from the constraints
@@ -3172,12 +3176,19 @@ fn build_vtab_scan_op(
 ///
 /// `defer_cross_table`: skip cross-table constraints for hash-join build-only
 /// tables that lack a main-loop cursor — the probe side will evaluate them.
+///
+/// An equality on a custom-type column whose type has a function '=' is never
+/// consumed (`seek_term_rechecked_by_type_eq`): the seek keys by the encoding,
+/// and the type's operator re-checks every row it returns, so a seek answers as
+/// a scan does (engine review 16 HIGH 2).
 fn mark_seek_constraints_consumed(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
     where_clause: &mut [WhereTerm],
     is_outer_join: bool,
     defer_cross_table: bool,
+    table: &JoinedTable,
+    resolver: &Resolver,
 ) {
     for cref in constraint_refs.iter() {
         for pos in [
@@ -3197,9 +3208,37 @@ fn mark_seek_constraints_consumed(
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
                 continue;
             }
+            if seek_term_rechecked_by_type_eq(constraint, table, resolver) {
+                continue;
+            }
             where_term.consumed = true;
         }
     }
+}
+
+/// Whether a seek constraint's WHERE term stays for the custom type's operator to
+/// re-check (engine review 16 HIGH 2): an equality on a column whose type has a
+/// function '=' (`seek_key_eq_function`, which the seek's round-trip check uses
+/// too, so the two decide together; its mutant `seek_key_encodes_raising` makes
+/// this false). An expression-index constraint (no column) is consumed as before.
+fn seek_term_rechecked_by_type_eq(
+    constraint: &Constraint,
+    table: &JoinedTable,
+    resolver: &Resolver,
+) -> bool {
+    let Some(pos) = constraint.table_col_pos else {
+        return false;
+    };
+    if constraint.operator != ast::Operator::Equals.into() {
+        return false;
+    }
+    let Some(column) = table.columns().get(pos) else {
+        return false;
+    };
+    resolver
+        .schema()
+        .get_type_def(&column.ty_str, table.table.is_strict())
+        .is_some_and(|type_def| crate::translate::expr::seek_key_eq_function(type_def).is_some())
 }
 
 fn mark_partial_index_predicate_terms_consumed(

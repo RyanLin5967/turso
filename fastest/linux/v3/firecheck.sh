@@ -728,17 +728,15 @@ mkdir -p "$NM"
 if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   nd=$(dirname "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
   echo "$nd" > "$NM/nest_dir"  # information only: read back from the n1 under test, so it judges nothing
-  # V3 review 12 item 5: the CELL's own directory for n1, derived here from the work dir's mount, never from the n1
-  # under test: a /dev/loop source's backing file's directory, otherwise the mount target; canonical (readlink -m)
-  wsrc=$(findmnt -n -o SOURCE -T "$W" | tail -1)
-  case $wsrc in
-    /dev/loop*) cdir=$(dirname "$(losetup -n -O BACK-FILE "$wsrc" | xargs)") ;;
-    *) cdir=$(findmnt -n -o TARGET -T "$W" | tail -1) ;;
-  esac
-  cdir=$(readlink -m "$cdir")
+  # Use the workflow's original MNT argument for the rebuild; judge the actual
+  # leaf-holding filesystem independently from the n1 images under test.
+  cdir=$(cell_nest_dir "${V3_CELL_MNT:-$W}") || exit 2
+  leafdir=$(cell_nest_dir "$W") || exit 2
   echo "$cdir" > "$NM/cell_nest_dir.txt"
+  stat -c %d "$leafdir" > "$NM/cell_nest_dev.txt"
   first1=$(readlink -m "$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" | xargs)")
   echo "$first1" > "$NM/first_n1_backing.txt"
+  stat -c %d "$(dirname "$first1")" > "$NM/first_n1_dev.txt"
   # the loops still backed by a file of the chain, judged against a list derived HERE, not by the shared matcher
   # (V3 review 12 item 1: a matcher copied verbatim cannot catch its own error): n1's image as built, and the level
   # images $FX/n1..n3/x.img, each " (deleted)" or not; a losetup that fails is reported, never "nothing attached"
@@ -798,6 +796,7 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   # the rebuilt n1's image is on the nest dir given, not anywhere else (tenth review MED 1)
   rb=$(losetup -n -O BACK-FILE "$(findmnt -n -o SOURCE "$FX/n1" | tail -1)" 2>/dev/null | xargs)
   if [ -n "$rb" ]; then readlink -m "$rb"; fi > "$NM/rebuilt_n1_backing.txt"
+  if [ -n "$rb" ]; then stat -c %d "$(dirname "$rb")"; fi > "$NM/rebuilt_n1_dev.txt"
   timeout 300 "$V3" --dir "$FX/n3/w" --out "$NM/probe.out" --n 5 --arms append25,nosync25 > "$NM/probe.txt" 2>&1; echo $? > "$NM/probe.rc"
   # tenth review MED 2's plant: a loop attached to a file on n1 and never mounted; --teardown-nest must detach it and
   # leave no loop backed by the chain

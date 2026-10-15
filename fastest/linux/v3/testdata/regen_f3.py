@@ -17,6 +17,9 @@ import json, os, shutil, subprocess, sys, tempfile
 
 TD = os.path.dirname(os.path.abspath(__file__))
 V3 = os.path.dirname(TD)
+sys.path.insert(0, V3)
+from check import current_f3_sync_record
+
 FIXTURES = ("f3-37812355435-x86-ext4loop", "f3-37812355435-arm-ext4loop")
 
 
@@ -25,9 +28,9 @@ def regen(f3, work):
     w = os.path.join(work, "F3")
     shutil.copytree(f3, w)
     sj = json.load(open(os.path.join(w, "summary.probe.json")))
-    r = subprocess.run([sys.executable, "-B", os.path.join(V3, "blkflush.py"), "report", os.path.join(w, "blkflush"),
-                        "--windows", os.path.join(w, "raw.tsv"), "--pid", str(sj["pid"]), "--summary",
-                        os.path.join(w, "summary.probe.json")], capture_output=True, text=True, timeout=600)
+    r = subprocess.run([sys.executable, "-B", os.path.join(V3, "blkflush.py"), "report", "blkflush",
+                        "--windows", "raw.tsv", "--pid", str(sj["pid"]), "--summary",
+                        "summary.probe.json"], cwd=w, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         raise SystemExit("blkflush report rc %d: %s" % (r.returncode, (r.stdout + r.stderr)[-400:]))
     open(os.path.join(w, "blkflush", "report.json"), "w").write(r.stdout)
@@ -44,28 +47,59 @@ def main(argv):
     if argv not in ([], ["--check"]):
         print(__doc__, file=sys.stderr)
         return 2
-    bad = []
+    bad, pending = [], []
     for fx in FIXTURES:
         f3 = os.path.join(TD, fx, "F3")
         work = tempfile.mkdtemp(prefix="regen_f3-")
         try:
             new, prc = regen(f3, work)
+            g = json.loads(new["gate.json"])
+            sy = json.loads(new["blkflush/report.json"]).get("syscalls")
+            valid = (prc == 0 and g.get("refusals") == [] and g.get("voids") == []
+                     and current_f3_sync_record(sy))
+            if not valid:
+                print(fx, "REFUSED: post rc", prc, "refusals", g.get("refusals"),
+                      "voids", g.get("voids"), "current sync record", current_f3_sync_record(sy))
+                bad.append(fx)
+                continue
             if check:
                 stale = [n for n, t in new.items() if open(os.path.join(f3, *n.split("/"))).read() != t]
                 print(fx, "stale:" if stale else "current", ", ".join(stale))
                 if stale:
                     bad.append(fx)
                 continue
-            for n, t in new.items():
-                open(os.path.join(f3, *n.split("/")), "w").write(t)
-            g = json.loads(new["gate.json"])
-            ua = (json.loads(new["blkflush/report.json"]).get("syscalls") or {}).get("unattributed") or {}
+            ua = sy["unattributed"]
             print(fx, "post rc", prc, "refusals", g.get("refusals"), "voids", g.get("voids"), "unattributed", ua)
-            if prc != 0 or g.get("refusals") or g.get("voids") or not ua or any(v != 0 for v in ua.values()):
-                bad.append(fx)
+            pending.extend((os.path.join(f3, *n.split("/")), t) for n, t in new.items())
         finally:
             shutil.rmtree(work)
-    return 1 if bad else 0
+    if bad:
+        return 1
+    if not check:
+        # No destination is touched until BOTH fixtures have passed the same
+        # precondition as check.py. Stage replacements before installing any.
+        staged, originals, installed = [], {}, []
+        try:
+            for path, text in pending:
+                with open(path, "rb") as f:
+                    originals[path] = f.read()
+                with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), delete=False) as f:
+                    staged.append((path, f.name))
+                    f.write(text.encode())
+                os.chmod(f.name, os.stat(path).st_mode & 0o777)
+            for path, scratch in staged:
+                os.replace(scratch, path)
+                installed.append(path)
+        except OSError:
+            for path in installed:
+                with open(path, "wb") as f:
+                    f.write(originals[path])
+            raise
+        finally:
+            for _, scratch in staged:
+                if os.path.exists(scratch):
+                    os.remove(scratch)
+    return 0
 
 
 if __name__ == "__main__":

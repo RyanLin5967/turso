@@ -2938,7 +2938,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .as_mut()
                         .expect("checkpoint_result should be set");
                     if let IOResult::IO(io) =
-                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
+                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type(), &self.pager)?
                     {
                         return Ok(TransitionResult::Io(io));
                     }

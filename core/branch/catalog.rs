@@ -293,7 +293,32 @@ impl Stmt {
         let rows = rows?;
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
+        // fastest-budgets instrument (test builds): catalog statements per thread, every connection.
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false, rows.len() as u64);
         Ok(rows)
+    }
+
+    /// Run with no parameters, handing each row to `f` as it is read (a scan too large to collect).
+    fn each_row(
+        &mut self,
+        counters: &mut CatalogCounters,
+        mut f: impl FnMut(&crate::Row) -> Result<()>,
+    ) -> Result<()> {
+        self.stmt.reset()?;
+        let mut n = 0u64;
+        let ran = self.stmt.run_with_row_callback(|row| {
+            n += 1;
+            f(row)
+        });
+        // Reset at once, finished or not (see `rows`).
+        self.stmt.reset()?;
+        ran?;
+        counters.queries += 1;
+        counters.rows_read += n;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false, n);
+        Ok(())
     }
 
     fn exec(&mut self, params: &[Value], counters: &mut CatalogCounters) -> Result<()> {
@@ -307,6 +332,8 @@ impl Stmt {
         done?;
         counters.queries += 1;
         counters.rows_written += 1;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(true, 1);
         Ok(())
     }
 }
@@ -422,9 +449,18 @@ mod census_tests {
     }
 }
 
+/// Test builds: the IO the next `Catalog::open` uses instead of a platform IO, taken once (engine
+/// review 17 MED 3: a catalog whose WAL sync fails).
+#[cfg(test)]
+pub(crate) static NEXT_CATALOG_IO: std::sync::Mutex<Option<Arc<dyn IO>>> = std::sync::Mutex::new(None);
+
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    /// The class this handle's commits sync in (`prepared`, `set_commit_sync`), and the one it was
+    /// opened in, below which `set_commit_sync` never goes.
+    sync: SyncClass,
+    opened_sync: SyncClass,
     pub(crate) counters: CatalogCounters,
     /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
     pub(crate) prewarm: PrewarmStats,
@@ -465,6 +501,7 @@ pub(crate) struct Catalog {
     free_del: Stmt,
     free_put: Stmt,
     name_get: Stmt,
+    name_all: Stmt,
     name_of: Stmt,
     name_put: Stmt,
     name_del: Stmt,
@@ -476,7 +513,14 @@ impl Catalog {
     /// `synchronous = FULL`, so a checkpoint's commit is durable before the log starts over; `Off`
     /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
     pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        #[cfg(test)]
+        let hooked = NEXT_CATALOG_IO.lock().unwrap().take();
+        #[cfg(not(test))]
+        let hooked: Option<Arc<dyn IO>> = None;
+        let io: Arc<dyn IO> = match hooked {
+            Some(io) => io,
+            None => Arc::new(PlatformIO::new()?),
+        };
         let path = path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
         })?;
@@ -590,6 +634,7 @@ impl Catalog {
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
+            name_all: p("SELECT name FROM branch_name")?,
             name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
             name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
             name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
@@ -598,7 +643,27 @@ impl Catalog {
             prewarm: PrewarmStats::default(),
             conn,
             _db: db,
+            sync,
+            opened_sync: sync,
         })
+    }
+
+    /// Sync this handle's commits in `class`, or in the class it was opened in if that is
+    /// stronger: a checkpoint replaces log records that were made durable in `class`, and its
+    /// commit must keep them that durable (fastest-engine review B-F3) and no more, so the class
+    /// the install claims for the commit is the one it synced in (engine review 16 LOW 13, review
+    /// 17 #14: this only raised, while the class a capture needs can drop). Blind spot: at
+    /// 8f11fa2af a capture's class never drops within a process (`synced_base` is sticky in the
+    /// free class), so no test reaches the lowering arm.
+    pub(crate) fn set_commit_sync(&mut self, class: SyncClass) -> Result<()> {
+        let class = class.max(self.opened_sync);
+        if class == self.sync {
+            return Ok(());
+        }
+        self.conn.execute(if class.syncs() { "PRAGMA synchronous = FULL" } else { "PRAGMA synchronous = OFF" })?;
+        self.conn.execute(if class == SyncClass::FullFsync { "PRAGMA fullfsync = ON" } else { "PRAGMA fullfsync = OFF" })?;
+        self.sync = class;
+        Ok(())
     }
 
     /// r12-catload: warm this catalog as `mode` says (see `super::prewarm`), once, at a store's
@@ -931,6 +996,17 @@ impl Catalog {
         }
     }
 
+    /// The failed syncs of this catalog's own files: its pager reports them, acting at issue, to
+    /// its Database's own (volatile) branch store, which counts them (engine review 17 MED 3).
+    pub(crate) fn sync_failures(&self) -> u64 {
+        self._db.branches.sync_failures()
+    }
+
+    /// The class this handle's commits sync in (`set_commit_sync`).
+    pub(crate) fn commit_sync(&self) -> SyncClass {
+        self.sync
+    }
+
     /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block
     /// nobody (F-FZ phase 4, before the TRUNCATE attempt).
     pub(crate) fn wal_passive(&mut self) -> Result<()> {
@@ -1001,6 +1077,31 @@ impl Catalog {
     }
 
     /// The unreleased branch named `name`, as of the last checkpoint.
+    /// `hash` of every name in the catalog, read as a stream (lead review 1 item 2: the name
+    /// filter's build, off the store mutex). Stops with an error when `stop` is set.
+    pub(crate) fn name_hashes(
+        &mut self,
+        hash: impl Fn(&str) -> u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        self.name_all.each_row(&mut self.counters, |row| {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LimboError::Interrupt);
+            }
+            match row.get_value(0) {
+                Value::Text(t) => out.push(hash(t.as_str())),
+                other => {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog: a branch name is not text: {other:?}"
+                    )))
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub(crate) fn name_get(&mut self, name: &str) -> Result<Option<u64>> {
         let rows = self.name_get.rows(&[Value::from_text(name.to_string())], &mut self.counters)?;
         rows.first().map(|row| get(row, 0)).transpose()
@@ -1353,6 +1454,12 @@ impl Catalog {
 
     pub(crate) fn free_delete_upto(&mut self, slot: Slot) -> Result<()> {
         self.free_del_upto.exec(&[int(slot as u64)], &mut self.counters)
+    }
+
+    /// Delete every row of the free table (an empty store's page-size restart; engine review 9
+    /// #9): every slot is at or below `Slot::MAX`, so the prepared range delete covers them all.
+    pub(crate) fn free_clear(&mut self) -> Result<()> {
+        self.free_delete_upto(Slot::MAX)
     }
 
     pub(crate) fn free_delete(&mut self, slot: Slot) -> Result<()> {

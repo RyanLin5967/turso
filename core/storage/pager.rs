@@ -1537,6 +1537,20 @@ pub struct Pager {
     /// took its copy decisions, cleared when the gate is closed (after publication, or when the
     /// write lock is released after a failed commit).
     trunk_gate_open: AtomicBool,
+    /// How far the branch journal was on the device when this commit issued its WAL F_FULLFSYNC
+    /// (`BranchStore::order_riders`): durable once that flush returns (lead review 1 item 6).
+    trunk_sync_frontier: AtomicU64,
+    /// What this commit's barrier must make durable, fixed at its decisions
+    /// (`BranchStore::begin_trunk_commit`; lead review 1 item 10).
+    trunk_required: AtomicU64,
+    /// This commit's barrier ordered the branch records ahead of its WAL flush (`pending_full` set
+    /// for it): cleared, with the store's `pending_full`, when the commit ends however it ends
+    /// (`close_trunk_gate`; review 3 #9).
+    trunk_ordered: AtomicBool,
+    /// The WAL sync this trunk commit issued last (its header's, or its frames'), when a branch
+    /// store is attached: a failure the statement reports without coming back here (a completion
+    /// that fails after it yielded) is seen when the commit ends (`close_trunk_gate`; review 6 #2).
+    trunk_wal_sync: Mutex<Option<Completion>>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1829,6 +1843,10 @@ impl Pager {
             trunk_pending: Mutex::new(TrunkPending::default()),
             trunk_pre_images: Mutex::new(HashMap::new()),
             trunk_gate_open: AtomicBool::new(false),
+            trunk_sync_frontier: AtomicU64::new(0),
+            trunk_required: AtomicU64::new(0),
+            trunk_ordered: AtomicBool::new(false),
+            trunk_wal_sync: Mutex::new(None),
         })
     }
 
@@ -3200,7 +3218,11 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
+        // Every path that released the last write lock closed its commit gate (review A-F1).
+        turso_debug_assert!(!self.trunk_gate_open.load(Ordering::Acquire));
         wal.begin_write_tx(allowed_auto_actions)?;
+        #[cfg(test)]
+        crate::branch::budget_probe::wal_write_locked();
         // A transaction that rolled back left its merge writes and its captures here; this one
         // starts from none.
         *self.trunk_pending.lock() = TrunkPending::default();
@@ -3330,13 +3352,7 @@ impl Pager {
                     // were taken at) and the WAL write lock is still held (no merge validation, which
                     // runs inside a trunk write transaction, falls between the commit and its
                     // stamps). Then the gate closes.
-                    let stamped = if let Some(store) = self.branch_store.get() {
-                        let tx = std::mem::take(&mut *self.trunk_pending.lock());
-                        store.stamp_committed(tx)
-                    } else {
-                        false
-                    };
-                    self.close_trunk_gate();
+                    let stamped = self.finish_trunk_write(true);
                     crate::branch::store::kill_point("trunk.published");
 
                     wal.end_write_tx();
@@ -3351,6 +3367,10 @@ impl Pager {
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
+                        #[cfg(test)]
+                        if let Some(store) = self.branch_store.get() {
+                            store.pause_schema_publish();
+                        }
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
@@ -3407,6 +3427,7 @@ impl Pager {
             }
             pages
         };
+        crate::recipe::count(crate::recipe::counter::BRANCH_DIRTY, dirty.len() as u64);
         branch.store.commit_pages(branch.id, &dirty)?;
         if schema_did_change {
             branch
@@ -3601,12 +3622,17 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        crate::recipe::count(crate::recipe::counter::PAGE_FETCH, 1);
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
         let pending = self.pending_reads.read().get(&page_idx).cloned();
+        #[cfg(test)]
+        if pending.is_none() {
+            crate::branch::budget_probe::page_read();
+        }
         let (page, c_disk) = if let Some(pending) = pending {
             // Re-entry: previous call yielded on spill before completing
             // `cache_insert`. Reuse the same PageRef and in-flight disk read
@@ -3874,13 +3900,117 @@ impl Pager {
         Ok(())
     }
 
+    /// End a raw WAL session's trunk write transaction (`Connection::wal_insert_end`), before its
+    /// caller releases the WAL write lock: a commit it made is stamped and its commit gate closed,
+    /// as `commit_dirty_pages` does; otherwise its merge writes and captures are dropped and a gate
+    /// a failed commit left open is closed (review A-F1: the session released the lock with the
+    /// gate open). Returns whether stamps were made, for `prune_branch_stamps` once the lock is
+    /// released.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub(crate) fn end_raw_trunk_write(&self, committed: bool) -> bool {
+        // fastest-engine mutant `raw_gate_left_open` (test builds only): as before review A-F1.
+        if crate::branch::store::fe_mutant("raw_gate_left_open") {
+            return false;
+        }
+        self.finish_trunk_write(committed)
+    }
+
+    /// The end of a trunk write transaction, still under its WAL write lock (review 3 #20): a commit
+    /// that `committed` has its merge writes stamped with the trunk's epoch while its commit gate is
+    /// open, then the gate closes; otherwise the pending writes and captures are dropped and a gate
+    /// a failed commit left open is closed. Every trunk commit path ends here: `commit_dirty_pages`,
+    /// a raw WAL session's end, and an attached pager's commit. Returns whether stamps were made,
+    /// for `prune_branch_stamps` once the lock is released.
+    pub(crate) fn finish_trunk_write(&self, committed: bool) -> bool {
+        let tx = std::mem::take(&mut *self.trunk_pending.lock());
+        self.trunk_pre_images.lock().clear();
+        let stamped = match self.branch_store.get() {
+            Some(store) if committed => store.stamp_committed(tx),
+            _ => false,
+        };
+        self.close_trunk_gate();
+        stamped
+    }
+
+    /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
+    /// lock, as `commit_dirty_pages` does).
+    pub(crate) fn prune_branch_stamps(&self) {
+        if let Some(store) = self.branch_store.get() {
+            store.prune_stamps();
+        }
+    }
+
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
-    fn close_trunk_gate(&self) {
+    pub(crate) fn close_trunk_gate(&self) {
+        // A trunk file's sync that failed after it yielded, which the statement reported without
+        // coming back to the commit: seen here, before the verdicts below are cleared. Mutant
+        // `wal_fail_stop_not_at_close` (test builds only; engine review 9 #10): not seen here.
+        if !crate::branch::store::fe_mutant("wal_fail_stop_not_at_close") {
+            self.check_noted_syncs();
+        }
+        self.trunk_sync_frontier.store(0, Ordering::Release);
+        let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
             if let Some(store) = self.branch_store.get() {
                 store.end_trunk_commit();
             }
+        } else if ordered && !crate::branch::store::fe_mutant("ordered_pending_kept") {
+            // A gate-less (childless) commit that ordered its barrier: no `end_trunk_commit` clears
+            // the `pending_full` it set (review 3 #9). Mutant `ordered_pending_kept` (test builds
+            // only).
+            if let Some(store) = self.branch_store.get() {
+                store.release_pending_full();
+            }
+        }
+    }
+
+    /// Keep a sync of a trunk file this pager just issued — a commit's WAL sync, a WAL header's (a
+    /// commit's, a cache flush's, a spill's), a checkpoint's database file, and the syncs the WAL
+    /// issues itself (`WalFile::watched`: a checkpoint's and a TRUNCATE's; engine review 19 HIGH 1)
+    /// — for `check_noted_syncs`: one that fails after it yielded is reported to the statement
+    /// without coming back here (review 6 #2, engine review 9 #2). Only with a branch store. A
+    /// noted sync that already failed is acted on before it is replaced.
+    pub(crate) fn note_trunk_wal_sync(&self, c: &Completion) {
+        if self.branch_store.get().is_some() {
+            let previous = self.trunk_wal_sync.lock().replace(c.clone());
+            if previous.is_some_and(|p| p.finished() && !p.succeeded()) {
+                self.trunk_wal_sync_failed();
+            }
+        }
+    }
+
+    /// Act on the noted sync if it finished and failed (`trunk_wal_sync_failed`); one still in
+    /// flight stays noted. Where the next trunk commit begins (before anything it does could
+    /// promote branch records over the failed drain), where every trunk write ends, and after a
+    /// failed checkpoint. The syncs the WAL issues itself are acted on where they fail at issue
+    /// (`Wal::checkpoint`, `Wal::truncate_wal`; engine review 17 HIGH 1), and noted here when they
+    /// were issued, for a failure after they yielded (engine review 19 HIGH 1).
+    pub(crate) fn check_noted_syncs(&self) {
+        let failed = {
+            let mut noted = self.trunk_wal_sync.lock();
+            match noted.as_ref() {
+                Some(c) if c.finished() => noted.take().is_some_and(|c| !c.succeeded()),
+                _ => false,
+            }
+        };
+        if failed {
+            self.trunk_wal_sync_failed();
+        }
+    }
+
+    /// A sync of a trunk file failed (review 6 #2, engine review 9 #2 and #5). On the branch
+    /// files' device it can be a failed DRAIN of that device — an F_FULLFSYNC on Apple, any sync
+    /// elsewhere — and branch records written and not yet drained may be lost with it, while a
+    /// later successful flush would report them durable. The store decides from its own state
+    /// whether any are (`BranchStore::trunk_wal_sync_failed`), and fail-stops only then. Blind
+    /// spot: the trunk files are assumed to share the branch files' device (a failure on another
+    /// device fail-stops a store with undrained records needlessly, never the reverse).
+    pub(crate) fn trunk_wal_sync_failed(&self) {
+        self.trunk_sync_frontier.store(0, Ordering::Release);
+        let drains = !cfg!(target_vendor = "apple") || self.get_sync_type() == FileSyncType::FullFsync;
+        if let Some(store) = self.branch_store.get() {
+            store.trunk_wal_sync_failed(drains);
         }
     }
 
@@ -4016,8 +4146,12 @@ impl Pager {
                 IOCompletions(completion),
             )),
             None => {
-                // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
+                // No async prep needed, go straight to finish. The header's sync is a trunk sync
+                // like a commit's (engine review 9 #2).
+                let completion = wal
+                    .prepare_wal_finish(self.get_sync_type())
+                    .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                self.note_trunk_wal_sync(&completion);
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -4047,7 +4181,10 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
+        let finish_completion = wal
+            .prepare_wal_finish(self.get_sync_type())
+            .inspect_err(|_| self.trunk_wal_sync_failed())?;
+        self.note_trunk_wal_sync(&finish_completion);
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -4309,7 +4446,11 @@ impl Pager {
                     // Header (and any truncate) durable — issue the fsync that
                     // marks the WAL initialized.
                     let wal = self.wal.as_ref().expect("PreparingWalStart requires a WAL");
-                    let finish_c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    // A trunk sync like a commit's (engine review 9 #2).
+                    let finish_c = wal
+                        .prepare_wal_finish(self.get_sync_type())
+                        .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&finish_c);
                     *self.spill_state.write() = SpillState::PreparingWalFinish {
                         pages,
                         completion: finish_c,
@@ -4530,28 +4671,77 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
+        // A branch pager commits to its branch (`commit_wal_inner` refuses it too): refused before
+        // it could open the TRUNK's commit gate without the WAL write lock (review A-F1).
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager must commit to its branch, never to the WAL".to_string(),
+            ));
+        }
         // The branch store's copy decisions for this commit, once (IO re-entry finds the gate open):
         // taken now, against the trunk's epoch now, from the pre-images captured at first write, and
         // the commit gate opened until the frames are published (F-L on the durable store).
         if let Some(store) = self.branch_store.get() {
-            if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
+            // A trunk with no live child, now or at any page's first write (the first child needs
+            // this commit's WAL write lock), takes no copy decision and opens no gate (lead review
+            // 1 item 10); its barrier still covers every early-released Release. Mutant
+            // `childless_commit_gated` (test builds only).
+            let childless = !self.trunk_gate_open.load(Ordering::Acquire)
+                && !store.trunk_has_children()
+                && self.trunk_pre_images.lock().is_empty()
+                && !crate::branch::store::fe_mutant("childless_commit_gated");
+            if childless {
+                self.trunk_required.store(store.barrier_floor(), Ordering::Release);
+            } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
-                let dirty = self.dirty_pages.read();
-                store.begin_trunk_commit(
-                    dirty
-                        .iter()
-                        .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
-                )?;
+                let decided = {
+                    let dirty = self.dirty_pages.read();
+                    store.begin_trunk_commit(
+                        dirty
+                            .iter()
+                            .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
+                    )
+                };
+                if let Ok(required) = decided {
+                    self.trunk_required.store(required, Ordering::Release);
+                }
+                if let Err(e) = decided {
+                    // fastest-engine mutant `decision_retry_skips` (test builds only): as before
+                    // review A-F2, the latch stays set and the retry takes no decision.
+                    if crate::branch::store::fe_mutant("decision_retry_skips") {
+                        return Err(e);
+                    }
+                    // A pass refused part-way (a catalog read's `Busy`, retried by the statement)
+                    // is taken again whole on the retry (review A-F2): the captures go back, and
+                    // the gate the store closed on its way out is no longer this pager's. A page
+                    // decided already is decided again harmlessly (its `written` is this epoch, or
+                    // a child forked since needs the copy too).
+                    let mut images = self.trunk_pre_images.lock();
+                    for (page, bytes) in captured {
+                        images.entry(page).or_insert(bytes);
+                    }
+                    self.trunk_gate_open.store(false, Ordering::Release);
+                    return Err(e);
+                }
             }
         }
         // Durable branches: every pre-image this transaction retained for a live branch must be
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
-            store.durability_barrier(crate::branch::SyncClass::of_trunk(
-                sync_mode,
-                self.get_sync_type(),
-            ))?;
+            // A trunk sync since the last commit that failed after it yielded (a cache flush's, a
+            // spill's, a checkpoint's) is acted on before this commit's barrier and its flush could
+            // promote branch records over that failed drain (engine review 9 #2).
+            self.check_noted_syncs();
+            let trunk = crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type());
+            // Whether this commit's WAL flush carries the branch files (ordered mode) is read from
+            // the WAL file it syncs, each time (review 3 #3).
+            if trunk == crate::branch::SyncClass::FullFsync {
+                store.note_trunk_wal(self.wal.as_ref().and_then(|wal| wal.full_fsync_device()));
+            }
+            if store.durability_barrier_ordered(trunk, self.trunk_required.load(Ordering::Acquire))? {
+                self.trunk_ordered.store(true, Ordering::Release);
+            }
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
@@ -4603,7 +4793,10 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    let c = wal
+                        .prepare_wal_finish(self.get_sync_type())
+                        .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&c);
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -4630,6 +4823,10 @@ impl Pager {
                         continue;
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
+                    crate::recipe::count(
+                        crate::recipe::counter::TRUNK_DIRTY,
+                        dirty_pages.len() as u64,
+                    );
                     let mut cache = self.page_cache.write();
 
                     for page_id in dirty_pages.iter() {
@@ -4824,7 +5021,20 @@ impl Pager {
                     let sync_c = match pending {
                         Some(c) => Some(c),
                         None if sync_mode == SyncMode::Full && need_fsync => {
-                            let sync_c = wal.sync(self.get_sync_type())?;
+                            // The branch records buffered since this commit's pre-image barrier ride
+                            // its WAL flush (lead review 1 item 6), and how far the branch journal is
+                            // on the device ahead of it is noted, to be marked durable when it returns.
+                            if let Some(store) = self.branch_store.get() {
+                                let frontier = store.order_riders(crate::branch::SyncClass::of_trunk(
+                                    sync_mode,
+                                    self.get_sync_type(),
+                                ));
+                                self.trunk_sync_frontier.store(frontier, Ordering::Release);
+                            }
+                            let sync_c = wal
+                                .sync(self.get_sync_type())
+                                .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                            self.note_trunk_wal_sync(&sync_c);
                             self.commit_info.write().completions.push(sync_c.clone());
                             Some(sync_c)
                         }
@@ -4840,6 +5050,15 @@ impl Pager {
                         if !sync_c.succeeded() {
                             commit_info.completions.clear();
                             commit_info.prepared_frames.clear();
+                            // Before the panic below too: a caught panic must not leave the branch
+                            // store acknowledging over the failed drain (review 6 #2). Acted on
+                            // here, so the noted copy is dropped (engine review 9 #10: once).
+                            self.trunk_wal_sync.lock().take();
+                            // Mutant `wal_fail_stop_not_inline` (test builds only): dropped, not
+                            // acted on.
+                            if !crate::branch::store::fe_mutant("wal_fail_stop_not_inline") {
+                                self.trunk_wal_sync_failed();
+                            }
 
                             if !data_sync_retry {
                                 panic!(
@@ -4853,6 +5072,14 @@ impl Pager {
                             )));
                         }
                         commit_info.completions.clear();
+                        // The WAL's F_FULLFSYNC drained the device: the branch journal noted before
+                        // it is durable too (lead review 1 item 6).
+                        let frontier = self.trunk_sync_frontier.swap(0, Ordering::AcqRel);
+                        if frontier > 0 {
+                            if let Some(store) = self.branch_store.get() {
+                                store.trunk_wal_synced(frontier);
+                            }
+                        }
                     }
                     let mut commit_info = self.commit_info.write();
                     if commit_info.prepared_frames.is_empty() {
@@ -4951,7 +5178,10 @@ impl Pager {
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
 
-        wal.write_frame_raw(
+        // The WAL header's sync, after a truncation, is a trunk-file sync like any other: watched
+        // (engine review 17 LOW 10).
+        wal.write_frame_raw_watched(
+            self,
             self.buffer_pool.clone(),
             frame_no,
             header.page_number as u64,
@@ -5033,6 +5263,8 @@ impl Pager {
     }
 
     pub fn cleanup_after_checkpoint_failure(&self) {
+        // A database-file sync that failed after it yielded (engine review 9 #2).
+        self.check_noted_syncs();
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
@@ -5279,11 +5511,15 @@ impl Pager {
                         continue;
                     }
 
+                    // The database file's sync is a trunk sync on the branch files' device too
+                    // (engine review 9 #2).
                     let c = sqlite3_ondisk::begin_sync(
                         self.db_file.as_ref(),
                         self.syncing.clone(),
                         self.get_sync_type(),
-                    )?;
+                    )
+                    .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&c);
                     self.checkpoint_state
                         .write()
                         .result
@@ -5359,12 +5595,25 @@ impl Pager {
                         super::wal::database_identity_from_header_bytes(
                             &read.header_buf.as_slice()[..DatabaseHeader::SIZE],
                         )?;
-                    if let Some(c) = wal.install_durable_backfill_proof(
-                        read.max_frame,
-                        db_size_pages,
-                        db_header_crc32c,
-                        self.get_sync_type(),
-                    )? {
+                    // The proof's sync of the -tshm file is noted like the trunk's other syncs
+                    // (engine review 10 #5). Unreachable with a branch store today: a store refuses
+                    // a multi-process WAL, the only kind that writes the proof; no test reaches it.
+                    let proof = wal
+                        .install_durable_backfill_proof(
+                            read.max_frame,
+                            db_size_pages,
+                            db_header_crc32c,
+                            self.get_sync_type(),
+                        )
+                        .inspect_err(|_| {
+                            if self.branch_store.get().is_some() {
+                                self.trunk_wal_sync_failed();
+                            }
+                        })?;
+                    if let Some(c) = &proof {
+                        self.note_trunk_wal_sync(c);
+                    }
+                    if let Some(c) = proof {
                         self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
                             clear_page_cache,
                             max_frame: read.max_frame,
@@ -5460,6 +5709,7 @@ impl Pager {
                             .as_mut()
                             .expect("result should be set"),
                         self.get_sync_type(),
+                        self,
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
@@ -5575,8 +5825,16 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync(self.get_sync_type())?;
-            self.io.wait_for_completion(c)?;
+            super::wal::wal_sync_site("shutdown");
+            // A failure is a failed drain of the trunk's device, acted on at once (engine review
+            // 10 #5). Mutant `shutdown_sync_unwatched` (test builds only): not acted on, as before.
+            let acted = |_: &LimboError| {
+                if !crate::branch::store::fe_mutant("shutdown_sync_unwatched") {
+                    self.trunk_wal_sync_failed();
+                }
+            };
+            let c = wal.sync(self.get_sync_type()).inspect_err(acted)?;
+            self.io.wait_for_completion(c).inspect_err(acted)?;
         }
         if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
@@ -6222,6 +6480,10 @@ impl Pager {
                     .expect("the branch is open, so it exists"),
                 None => connection.db.clone_schema(),
             };
+            // Statements prepared under the discarded schema carry its version, which the next
+            // schema change reuses; only a context bump makes them reprepare (k1-recipe-build
+            // adversary finding: a cached SELECT served a rolled-back recipe).
+            connection.bump_prepare_context_generation();
         }
         // A branch transaction never appended to the WAL, so there is nothing there to undo.
         if is_write && self.branch.get().is_none() {

@@ -2972,6 +2972,12 @@ pub fn translate_expr(
                             "RAISE() may only be used within a trigger-program"
                         );
                     }
+                    // Inside a catch region (a seek key's ENCODE, engine review 16 HIGH 2) the
+                    // refusal jumps to the region's target: a Halt would end the statement.
+                    if let Some(target_pc) = program.catch_raise_target {
+                        program.emit_insn(Insn::Goto { target_pc });
+                        return Ok(target_register);
+                    }
                     let err_code = if in_trigger {
                         SQLITE_CONSTRAINT_TRIGGER
                     } else {

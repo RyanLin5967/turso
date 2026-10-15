@@ -52,7 +52,10 @@ fn pump_step(stmt: &mut Statement, pager: &Pager) -> Result<StepOutcome> {
         match stmt.step()? {
             StepResult::Row => return Ok(StepOutcome::Row),
             StepResult::Done => return Ok(StepOutcome::Done),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => pager.io.step()?,
+            StepResult::IO | StepResult::Yield => pager.io.step()?,
+            StepResult::Sleep { duration } => {
+                crate::statement::wait_out_busy(&*pager.io, duration)?
+            }
             StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
         }
     }
@@ -297,6 +300,13 @@ impl Connection {
             let tbl = schema
                 .get_btree_table(table)
                 .ok_or_else(|| LimboError::InternalError(format!("no such table: {table}")))?;
+            // Recipe backfill: a blob handle reads and writes the stored bytes, bypassing the
+            // read-path upgrade and the write-path freeze (see `crate::recipe`). Refused.
+            if tbl.recipes.is_some() {
+                return Err(LimboError::InternalError(format!(
+                    "cannot open a blob on {table}: the table has recipe backfills"
+                )));
+            }
             if !tbl.has_rowid {
                 return Err(LimboError::InternalError(format!(
                     "cannot open table without rowid: {table}"

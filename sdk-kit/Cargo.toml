@@ -37,6 +37,8 @@ tracing-appender = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The busy-wait reds read the thread's CPU time (clock_gettime), as core's busy red does.
+libc = { version = "0.2.172" }
 
 [build-dependencies]
 bindgen = "0.69.5"
