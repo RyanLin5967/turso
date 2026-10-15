@@ -109,9 +109,10 @@ const STACK_MARGIN: usize = 512 << 10;
 /// ed4e4e9a5: a quarter of a 256 KiB stack is 64 KiB, less than one level).
 const LEVEL_COST: usize = 128 << 10;
 
-/// Where no stack bound is known (no platform answer): nested views and subqueries are refused past
-/// this depth instead, the only bound left.
-const FALLBACK_DEPTH: usize = 64;
+// Where no stack bound is known (no platform answer, and no `stacker` build to ask), nesting is
+// refused rather than bounded by a guessed depth (C32 MED: a 64-deep fallback admitted about 32
+// views, which overflow a 2 MiB thread). The outermost step still runs, so flat statements work.
+
 
 std::thread_local! {
     /// The lowest address of this thread's stack and its size, read once (`None` where the
@@ -167,7 +168,11 @@ pub(crate) fn remaining_stack() -> Option<usize> {
     if FORCE_UNKNOWN.with(|u| u.get()) {
         return None;
     }
-    STACK_BOUNDS.with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)))
+    let known = STACK_BOUNDS.with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)));
+    // A platform without the pthread answer: the `stacker` crate's, where it is built in.
+    #[cfg(feature = "stacker")]
+    let known = known.or_else(stacker::remaining_stack);
+    known
 }
 
 /// The stack a nested step must find left on this thread: `STACK_MARGIN`, or a quarter of a
@@ -187,8 +192,8 @@ fn margin() -> usize {
 /// refused: a statement with no nesting runs on whatever stack it was called with, as before the
 /// check, unless a statement is stepping on the thread ([`Executing`]): one prepared then (a
 /// schema reparse, a callback running SQL) starts deep in the stack, and is checked like a nested
-/// step (fastest-engine, on the NestGuard margin). Where the stack is unknown, the bound is
-/// `FALLBACK_DEPTH` nested steps. Leaving it, on every exit, pops it.
+/// step (fastest-engine, on the NestGuard margin). Where the stack is unknown, every nested step is
+/// refused (C32 MED). Leaving it, on every exit, pops it.
 pub(crate) struct NestGuard;
 
 impl NestGuard {
@@ -196,7 +201,7 @@ impl NestGuard {
         let depth = DEPTH.with(|d| d.get());
         let refuse = match remaining_stack() {
             Some(left) => (depth > 0 || EXECUTING.with(|e| e.get()) > 0) && left < margin(),
-            None => depth >= FALLBACK_DEPTH,
+            None => depth > 0 || EXECUTING.with(|e| e.get()) > 0,
         };
         if refuse {
             crate::bail_parse_error!("{STACK_DEPTH_EXCEEDED}: {what} nested too deep for this thread's stack");
