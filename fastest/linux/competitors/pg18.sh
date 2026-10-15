@@ -100,8 +100,14 @@ seed)
   # autocommits each statement), the same stream for every system, then PG's documented maintenance. AGE=0 pipes an
   # empty stream, so its digest is recorded too.
   "$FT_PY" -B "$FT_HERE/gen_seed.py" age --rows "$ROWS" --updates "$AGE" --digest-out "$DATA.seed-age.sha256" | psqlc -d p
-  psqlc -d p -c "VACUUM ANALYZE t" -c "CHECKPOINT"
+  psqlc -d p -c "VACUUM ANALYZE t"
+  # comp review 1 LOW 24: the maintenance's outcomes, read back: VACUUM and ANALYZE stamped t, and the CHECKPOINT's
+  # redo point is after the WAL position the VACUUM left (UNVERIFIED here that a new session sees last_vacuum at once:
+  # PG 15+ reports a VACUUM's stats to shared memory as it ends)
+  vlsn=$(psqlc -d p -At -c "SELECT pg_current_wal_lsn()")
+  psqlc -d p -c "CHECKPOINT"
   echo "maintenance: CHECKPOINT; aged $AGE; VACUUM ANALYZE; CHECKPOINT"
+  echo "evidence: $(psqlc -d p -At -F ' ' -c "SELECT 'last_vacuum=' || (last_vacuum IS NOT NULL)::text, 'last_analyze=' || (last_analyze IS NOT NULL)::text FROM pg_stat_user_tables WHERE relname = 't'") redo_after_vacuum=$(psqlc -d p -At -c "SELECT (redo_lsn >= '$vlsn'::pg_lsn)::text FROM pg_control_checkpoint()")"
   echo "seeded p.t rows=$(psqlc -d p -At -c 'SELECT count(*) FROM t') size=$(psqlc -d p -At -c "SELECT pg_size_pretty(pg_database_size('p'))")"
   ;;
 settings)

@@ -495,8 +495,9 @@ run_server_cell() { # run_server_cell SPEC C
 # server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
 # parent's own files, the size as the engine reports it (or why it cannot), the extent count of its data files.
 server_fixture() {
-  local du=() ext=() eb="" why="" maint
+  local du=() ext=() eb="" why="" maint mev
   maint=$(sed -n 's/^maintenance: //p' "$RAW/seed.txt" | tail -1)
+  mev=$(sed -n 's/^evidence: //p' "$RAW/seed.txt" | tail -1)  # comp review 1 LOW 24: the maintenance's outcomes
   # LOW 18: the extent record covers every data file: PG every fork (_fsm, _vm, _init) and segment (.1, .2, ...) of t
   # and t_pkey (it had segment 0 of t's main fork only); Dolt and Doltgres every regular file under noms, recursively
   # (it missed oldgen/*.darc after the GC). LOW 26: an empty or non-numeric oid or file path fails the job (it made du
@@ -534,7 +535,7 @@ server_fixture() {
   cp "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" "$RAW/" 2>/dev/null || fail "seed stream digests missing"
   if python3 "$HERE/fixture.py" write "$RAW/fixture.json" --system "$SYSTEM" --rows "$ROWS" --age "$AGE" \
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "${du[@]}" ${eb:+--engine-bytes "$eb"} \
-    ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" \
+    ${why:+--engine-why "$why"} --extents "${ext[@]}" --maintenance "$maint" --evidence "$mev" \
     --streams "$DATA.seed-sql.sha256" "$DATA.seed-age.sha256" --readback "$rb" >/dev/null 2>"$RAW/fixture-write.err"; then
     pass "parent read back by the engine (count|sum|row hash) and its piped streams are the generator's: $rb"
   else
@@ -981,6 +982,7 @@ sys.stdout.buffer.write(held)' "$HERE" 1000000 ) >/dev/null 2>"$RAW/plant-held-1
     --prebranch "$PREBRANCH" --live "$(live_excl_main)" --du "$ROOT/parent.db" \
     --engine-bytes "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['engine_bytes'])" "$RAW/mkparent.json")" \
     --extents "$ROOT/parent.db" --maintenance "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['maintenance'])" "$RAW/mkparent.json")" \
+    --evidence "$(jf "$RAW/mkparent.json" evidence)" \
     --streams "$RAW/seed-sql.sha256" "$RAW/seed-age.sha256" --readback "$rb" >/dev/null 2>"$RAW/fixture-write.err"; then
     pass "parent read back from the SQLite file (count|sum|row hash) and its fed streams are the generator's: $rb"
   else

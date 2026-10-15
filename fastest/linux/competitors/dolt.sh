@@ -72,6 +72,7 @@ seed)
     die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
   echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
   echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
+  echo "evidence: gc_verdict=$(head -1 "$DATA.gc.verdict" | tr -d ' ')"  # comp review 1 LOW 24: the GC's outcome
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)

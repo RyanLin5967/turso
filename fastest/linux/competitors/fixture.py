@@ -22,6 +22,11 @@ cells (each with one private write: the system's own M1 op, untimed). Each job w
                                journal_mode=WAL, gen_seed.py's SQL, its K aging UPDATEs (each autocommitted), then
                                the documented maintenance, a TRUNCATE checkpoint; prints the engine's size
                                (page_count x page_size) and the fed streams' digests (also DIR/seed-{sql,age}.sha256)
+  fixture.py write ... --evidence 'k=v ...'
+                               (comp review 1 LOW 24) the maintenance's outcomes as the seed read them back (PG
+                               last_vacuum, last_analyze, redo_after_vacuum; Dolt/Doltgres gc_verdict; B1 journal_mode,
+                               header_18_19, checkpoints), checked by compare with the steps before the aging
+                               (REGISTERED_PRE_AGE, REGISTERED_OUTCOMES)
   fixture.py write ... --streams SQL.sha256 AGE.sha256 --readback 'COUNT|SUM|ROW_HASH'
                                (MED 3) the write path's own stream digests and the engine's read-back of t (gen_seed.py
                                readback-sql / readback-sqlite), recorded beside the generator's expected values
@@ -54,8 +59,21 @@ REGISTERED_MAINT = {"pg18-d2": ["VACUUM ANALYZE", "CHECKPOINT"], "dolt": ["DOLT_
                     "doltgres": ["dolt_commit age", "dolt_gc"], "b1": ["wal_checkpoint(TRUNCATE)"]}
 
 
+# Comp review 1 LOW 24: the steps before the aging (PREREG §7: "loaded, checkpointed, then aged") and what each
+# system's maintenance must have DONE, read back by its seed (maintenance_evidence; the text alone was trusted):
+# PG's VACUUM and ANALYZE stamped t (pg_stat_user_tables) and the last checkpoint's redo point is after the VACUUM;
+# Dolt's and Doltgres's GC verdict (fthelp.py gcverdict) is ok; B1's file is in WAL mode (header bytes 18-19 = 2, 2)
+# and both TRUNCATE checkpoints replied 0|0|0 (not blocked, no frame left in the log).
+REGISTERED_PRE_AGE = {"pg18-d2": ["CHECKPOINT"], "dolt": ["DOLT_COMMIT seed"], "doltgres": ["dolt_commit seed"],
+                      "b1": ["journal_mode=WAL", "load", "wal_checkpoint(TRUNCATE)"]}
+REGISTERED_OUTCOMES = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
+                       "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
+                       "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0"}}
+
+
 def maint_problem(f):
-    """Why a fixture's maintenance record is not its system's registered one (None = it is)."""
+    """Why a fixture's maintenance record is not its system's registered one (None = it is): the steps after the aging
+    (MED 10), the steps before it, and the recorded outcomes (LOW 24)."""
     s = f.get("system")
     want = REGISTERED_MAINT.get(s)
     if want is None:
@@ -69,7 +87,23 @@ def maint_problem(f):
         return f"{s}: maintenance {m!r} has no aging step"
     if items[aged + 1:] != want:
         return f"{s}: post-load maintenance {items[aged + 1:]} is not the registered {want}"
+    if items[:aged] != REGISTERED_PRE_AGE[s]:
+        return f"{s}: the steps before the aging {items[:aged]} are not the registered {REGISTERED_PRE_AGE[s]}"
+    ev, wo = f.get("maintenance_evidence"), REGISTERED_OUTCOMES[s]
+    if not isinstance(ev, dict):
+        return f"{s}: no maintenance evidence (what the maintenance did, read back by the seed)"
+    bad = {k: ev.get(k) for k in wo if ev.get(k) != wo[k]}
+    if bad:
+        return f"{s}: maintenance outcomes {bad} are not the registered {({k: wo[k] for k in bad})}"
     return None
+
+
+def evidence(text):
+    """'k=v k=v ...' (a seed's 'evidence:' line) -> {k: v}; None for an empty or unparsable line."""
+    pairs = (text or "").split()
+    if not pairs or not all(re.fullmatch(r"[a-z0-9_]+=\S+", p) for p in pairs):
+        return None
+    return dict(p.split("=", 1) for p in pairs)
 
 
 def compare(fixtures):
@@ -153,7 +187,9 @@ def write(av):
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
           "engine_bytes": int(o["--engine-bytes"]) if o.get("--engine-bytes", "").isdigit() else None,
           "extents": {p: extent_count(p) for p in o.get("--extents", [])},
-          "maintenance": o.get("--maintenance", "")}
+          "maintenance": o.get("--maintenance", ""),
+          # LOW 24: what the maintenance did (the seed's 'evidence:' line), checked by compare
+          "maintenance_evidence": evidence(o.get("--evidence", ""))}
     # MED 3: the write path's own digest files (gen_seed.py --digest-out, or fixture.py sqlite's) and the engine's
     # read-back triple, recorded beside what the generator says they must be
     sd = {}
@@ -208,6 +244,8 @@ def sqlite(av):
                     b = ln + "\n"
                     p.stdin.write(b)
                     hs[k].update(b.encode())
+                if k == "sql":  # LOW 24: loaded, checkpointed, then aged (PREREG §7)
+                    p.stdin.write("PRAGMA wal_checkpoint(TRUNCATE);\n")
             p.stdin.write("PRAGMA wal_checkpoint(TRUNCATE);\n")
             p.stdin.close()
         except BrokenPipeError:
@@ -219,8 +257,15 @@ def sqlite(av):
             sys.exit(f"fixture.py sqlite: {sq3} did not finish in 3600 s")
         se.seek(0)
         err = se.read()
+        so.seek(0)
+        replies = so.read().split()  # LOW 24: sqlite3's replies, read: "wal", then one row per checkpoint
     if rc != 0:
         sys.exit(f"fixture.py sqlite: {sq3} rc {rc}: {err[-400:]}")
+    with open(path, "rb") as f:
+        hdr = f.read(100)
+    ev = {"journal_mode": replies[0] if replies else "none",
+          "header_18_19": f"{hdr[18]},{hdr[19]}" if len(hdr) >= 20 else "short",
+          "checkpoints": ";".join(replies[1:]) or "none"}
     dg = {k: h.hexdigest() for k, h in hs.items()}
     if o.get("--digest-dir"):  # written only after sqlite3 consumed the whole stream and exited 0
         for k, h in dg.items():
@@ -233,7 +278,8 @@ def sqlite(av):
     ok = q.returncode == 0 and len(lines) == 2 and all(x.isdigit() for x in lines)
     eng = int(lines[0]) * int(lines[1]) if ok else None
     print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng, "stream_sha256": dg,
-                      "maintenance": "journal_mode=WAL; load; aged %d; wal_checkpoint(TRUNCATE)" % age}))
+                      "maintenance": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged %d; wal_checkpoint(TRUNCATE)"
+                      % age, "evidence": " ".join(f"{k}={v}" for k, v in ev.items())}))
 
 
 def selftest():

@@ -84,6 +84,7 @@ seed)
     die "REFUSED: dolt_gc: $(cat "$DATA.gc.verdict")"
   echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/databases" | cut -f1)"
   echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
+  echo "evidence: gc_verdict=$(head -1 "$DATA.gc.verdict" | tr -d ' ')"  # comp review 1 LOW 24: the GC's outcome
   echo "seeded t rows=$(psqlc -At -c 'SELECT count(*) FROM t') branch=$(psqlc -At -c 'SELECT active_branch()')"
   ;;
 sql)
