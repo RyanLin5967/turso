@@ -2475,6 +2475,43 @@ mod tests {
         stmt.run_ignore_rows().unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
+    /// A multi-row UPDATE inside a block whose third row sets a primary key NULL fails the key's
+    /// NOT NULL and leaves every row as it was: the rows it already changed are undone by the
+    /// statement journal (engine fix c29eaa7f4, engine review 20 LOWs 24 and 26; the engine's own red
+    /// is 8a9f0aaad), here through the PostgresDialect and the translator, as a client's UPDATE
+    /// runs. Outside a block the whole transaction is undone, so the block is what discriminates.
+    #[test]
+    fn a_multi_row_update_that_nulls_a_key_changes_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        run(&conn, "CREATE TABLE k (id INT PRIMARY KEY, v INT)");
+        run(&conn, "INSERT INTO k VALUES (1, 10), (2, 20), (3, 30)");
+        run(&conn, "BEGIN");
+        let sql = "UPDATE k SET id = CASE WHEN id = 3 THEN NULL ELSE id + 100 END";
+        let e = conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.run_ignore_rows())
+            .expect_err("a NULL key was accepted");
+        assert!(
+            matches!(e, LimboError::Constraint(ref m) if m.starts_with("NOT NULL constraint failed")),
+            "{sql}: {e:?}"
+        );
+        let mut stmt = conn.prepare("SELECT id FROM k ORDER BY id").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        let ids: Vec<String> = rows.iter().map(|r| format!("{}", r[0])).collect();
+        assert_eq!(ids, ["1", "2", "3"], "the rows the UPDATE changed before the NULL stayed");
+        run(&conn, "COMMIT");
+    }
+
     /// A positional INSERT shorter than its table is filled from the in-memory schema, at prepare,
     /// with no catalog query (lead ruling, DECISIONS newest: "It must add NO catalog query"), also
     /// with a search path set, which sent the lookup through PRAGMA table_info once per path entry.

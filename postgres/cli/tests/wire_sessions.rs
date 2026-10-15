@@ -1445,10 +1445,9 @@ fn alter_table_add_constraint_takes_effect_and_keeps_the_rows() {
             a.q("INSERT INTO c (id) VALUES (10)").error.is_some(),
             "{on}: duplicate key accepted"
         );
-        assert!(
-            a.q("INSERT INTO c (id) VALUES (NULL)").error.is_some(),
-            "{on}: NULL key accepted"
-        );
+        // The NOT NULL refusal itself, 23502, not any error (engine review 20 LOW 26).
+        let e = a.q("INSERT INTO c (id) VALUES (NULL)").err("a NULL key");
+        assert_eq!(e.code, "23502", "{on}: NULL key: {}", e.message);
         assert!(
             a.q("INSERT INTO c (id, pid) VALUES (20, 99)")
                 .error
