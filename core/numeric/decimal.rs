@@ -136,21 +136,61 @@ const PG_MIN_SIG_DIGITS: i64 = 16;
 const PG_MAX_DISPLAY_SCALE: i64 = 1000;
 const PG_DEC_DIGITS: i64 = 4;
 
+/// PostgreSQL's numeric range (its documented limits: up to 131072 digits before the decimal
+/// point and up to 16383 after it).
+const PG_MAX_INTEGER_DIGITS: i128 = 131_072;
+const PG_MAX_FRACTION_DIGITS: i128 = 16_383;
+
+/// `v` within PostgreSQL's numeric range, or PostgreSQL's refusal, "value overflows numeric
+/// format" (engine review 21 MED 10): an operand's scale was bounded only by i64, so one division
+/// or rescale could build a power of ten with billions of digits, with no interrupt point, or
+/// overflow the scale arithmetic. Checked where a value enters numeric arithmetic from text or a
+/// real (`value_to_bigdecimal`) and where numeric's INSERT parses one (`numeric_encode`). The digit
+/// count is bounded from the integer's bit length first, so an ordinary value pays no conversion.
+pub fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
+    let (int, scale) = v.as_bigint_and_exponent();
+    if int.sign() == Sign::NoSign {
+        return Ok(());
+    }
+    let scale = i128::from(scale);
+    // At most this many decimal digits: bits * log10(2), rounded up.
+    let at_most = i128::from(int.bits()) * 30_103 / 100_000 + 1;
+    let fits = |digits: i128| scale <= PG_MAX_FRACTION_DIGITS && digits - scale <= PG_MAX_INTEGER_DIGITS;
+    if fits(at_most) || fits(int.magnitude().to_string().len() as i128) {
+        return Ok(());
+    }
+    Err(LimboError::Constraint("value overflows numeric format".to_string()))
+}
+
 /// `a / b` as PostgreSQL computes it (numeric.c `select_div_scale`, then `div_var` rounding at
 /// that scale): the result scale keeps at least 16 significant digits and is never below either
 /// operand's display scale, and the quotient is rounded half away from zero (lead ruling
-/// 2026-10-09 on e52f01422). `b` must not be zero.
-pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> BigDecimal {
+/// 2026-10-09 on e52f01422). `b` must not be zero. Both operands must be within PostgreSQL's
+/// numeric range (`check_numeric_range`); one that is not is refused here too, so the shift below
+/// stays a few hundred thousand digits at most (engine review 21 MED 10: it was unbounded, and the
+/// exponent past u32 was silently replaced by u32::MAX).
+pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> crate::Result<BigDecimal> {
+    // Mutant `numeric_range_unchecked` (test builds only) skips this check too.
+    if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
+        check_numeric_range(a)?;
+        check_numeric_range(b)?;
+    }
     let rscale = pg_div_scale(a, b);
     let (ai, sa) = a.as_bigint_and_exponent();
     let (bi, sb) = b.as_bigint_and_exponent();
     // a / b = (ai / bi) * 10^(sb - sa); the result's integer at `rscale` is that times 10^rscale.
-    let shift = rscale + sb - sa;
-    let pow10 = |k: i64| BigInt::from(10).pow(u32::try_from(k).unwrap_or(u32::MAX));
+    let overflow = || LimboError::Constraint("value overflows numeric format".to_string());
+    let shift = rscale
+        .checked_add(sb)
+        .and_then(|s| s.checked_sub(sa))
+        .ok_or_else(overflow)?;
+    let pow10 = |k: i64| -> crate::Result<BigInt> {
+        Ok(BigInt::from(10).pow(u32::try_from(k).map_err(|_| overflow())?))
+    };
     let (num, den) = if shift >= 0 {
-        (ai * pow10(shift), bi)
+        (ai * pow10(shift)?, bi)
     } else {
-        (ai, bi * pow10(-shift))
+        (ai, bi * pow10(-shift)?)
     };
     // Truncated toward zero, then rounded half away from zero on the remainder.
     let mut q = &num / &den;
@@ -163,7 +203,7 @@ pub fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> BigDecimal {
             q += BigInt::from(1);
         }
     }
-    BigDecimal::new(q, rscale)
+    Ok(BigDecimal::new(q, rscale))
 }
 
 /// numeric.c `select_div_scale`: the quotient's estimated weight from the two operands' weights

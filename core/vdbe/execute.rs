@@ -241,7 +241,14 @@ fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
             "invalid input for type numeric: \"{val}\""
         )));
     }
-    value_to_bigdecimal(val)
+    let value = value_to_bigdecimal(val)?;
+    // Within PostgreSQL's numeric range, or refused before any arithmetic (engine review 21 MED
+    // 10: a scale bounded only by i64 made one division build billions of digits). Mutant
+    // `numeric_range_unchecked` (test builds only): not checked, as before.
+    if !crate::branch::store::fe_mutant("numeric_range_unchecked") {
+        crate::numeric::decimal::check_numeric_range(&value)?;
+    }
+    Ok(value)
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
@@ -10606,6 +10613,9 @@ pub fn op_function(
                                 "invalid input for type numeric: \"{text}\""
                             ))
                         })?;
+                        // PostgreSQL's range first: a rescale of an unbounded scale is as
+                        // unbounded as a division (engine review 21 MED 10).
+                        crate::numeric::decimal::check_numeric_range(&bd)?;
                         let validated = validate_precision_scale(&bd, precision, scale)?;
                         Value::from_blob(bigdecimal_to_blob(&validated))
                     }
@@ -10658,7 +10668,7 @@ pub fn op_function(
                                 if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
                                     a / b
                                 } else {
-                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)?
                                 }
                             }
                             _ => unreachable!(),
