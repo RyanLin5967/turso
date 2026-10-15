@@ -712,6 +712,8 @@ def _post_batch(d, sha, mod):
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
     if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
         rep["syscalls"]["arms"]["append25"].update(windows_over=1)
+    if mod == "nosync-norec":  # V3 review 13 item 15: the batch ran nosync25 but the report has no nosync25 record
+        rep["syscalls"]["arms"].pop("nosync25")
     # [the eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an fd its
     # arm does not own is counted in foreign_fd as well, so each plant carries the foreign_fd a real report would.
     # AMENDED again at V3 review 13 item 19, disclosed: the descriptive keys they also set are deleted, and the two
@@ -787,6 +789,10 @@ def post_selftest(chk):
             ("A16: a write-back window with no fsync by the probe", "nosync", "smoke", 3, "VOID fsync:", {}),
             ("tenth review HIGH 1: a window short of one of its own syncs", "short", "smoke", 3, "VOID fsync:", {}),
             ("V3 review 12 item 8: a window over its own syncs (an extra own-fd sync)", "over", "smoke", 3, "VOID fsync:", {}),
+            # V3 review 13 item 15: post's nosync25 rule passed a MISSING record (check.py's fails it); every batch
+            # that reaches it ran nosync25, so a missing record is a VOID, as a non-zero one is
+            ("V3 review 13 item 15: the nosync25 sync record missing from the report", "nosync-norec", "smoke", 3,
+             "VOID fsync:", {}),
             ("eleventh review MED 1: an fsync on fd 7 wholly inside a nosync25 window", "nosync-anyfd", "smoke", 3,
              "VOID fsync:", {}),
             ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,
