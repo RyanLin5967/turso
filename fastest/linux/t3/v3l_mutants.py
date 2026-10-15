@@ -167,6 +167,36 @@ def selftest(path):
     return r.returncode, fails, total, r.stderr
 
 
+def main_case(kind):
+    """main() on a temp copy of v3l.py (review 6 LOW 14, 15), its printed lines captured: "stale" gives it a row that
+    breaks the syntax; "layout" gives it the real table's first row and a testdata path that does not exist, so the
+    temp layout's control fails where the in-place one passes. True when main() returns 2 for that reason and leaves
+    no v3lmut- directory behind (the layout case's control directory is removed with it)"""
+    import contextlib
+    import io
+    import shutil
+    d = tempfile.mkdtemp(prefix="v3lmut-case-")
+    before = {x for x in os.listdir(tempfile.gettempdir()) if x.startswith("v3lmut-")}
+    try:
+        cp = os.path.join(d, "v3l.py")
+        with open(SRC) as f, open(cp, "w") as g:
+            g.write(f.read())
+        os.symlink(os.path.join(HERE, "testdata"), os.path.join(d, "testdata"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if kind == "stale":
+                rc = main(["v3l_mutants.py"], src_path=cp,
+                          table=[("broken", "synthetic", "def _plant(res, name):\n", "def _plant(res, name)\n", "")])
+            else:
+                rc = main(["v3l_mutants.py"], src_path=cp, table=MUTANTS[:1], testdata=os.path.join(d, "no-testdata"))
+        out = buf.getvalue()
+        after = {x for x in os.listdir(tempfile.gettempdir()) if x.startswith("v3lmut-")}
+        want = "stale table" if kind == "stale" else "temp layout"
+        return rc == 2 and want in out and after - before == set()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def self_test():
     """the table guard on synthetic sources (review 5 MED 5): a mutant that does not compile, an indented target that
     matches inside a deeper indentation, and a target found twice are each refused as a stale table; a clean row and
@@ -182,6 +212,13 @@ def self_test():
          lambda: any("2 times" in x for x in table_problems(src + src, row("    return a\n", "    return 0\n")))),
         ("a clean row is not refused", lambda: table_problems(src, row("        y = 2\n", "        pass\n")) == []),
         ("the real table on the real v3l.py is not refused", lambda: table_problems(open(SRC).read(), MUTANTS) == []),
+        # review 6 LOW 14: main() itself refuses a stale table (rc 2), runs nothing and makes no v3lmut- directory
+        ("LOW 14: main() on a table with a row that breaks the syntax returns 2, says stale table, makes no v3lmut- dir",
+         lambda: main_case("stale")),
+        # review 6 LOW 15: the unmutated copy runs in the mutants' temp layout first and must match the in-place
+        # control, so a layout difference cannot kill every mutant for the wrong reason
+        ("LOW 15: main() whose temp layout lacks testdata returns 2 before any mutant runs",
+         lambda: main_case("layout")),
     ]
     bad = 0
     for name, f in cases:
