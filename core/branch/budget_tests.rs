@@ -1751,9 +1751,11 @@ fn run_instruments(cell: &str) -> String {
     }
     let after = probe::threads();
     let mut s = Sample::new();
-    s.insert("base", base.unwrap_or(0));
-    s.insert("with", with.unwrap_or(0));
-    s.insert("after", after.unwrap_or(0));
+    // DECISIONS 994f7d41e0: a thread count that could not be read is refused, never written as 0.
+    let read = |v: Option<u64>, what: &str| v.unwrap_or_else(|| panic!("instruments: the thread count {what} could not be read"));
+    s.insert("base", read(base, "before the spawn"));
+    s.insert("with", read(with, "with a thread parked"));
+    s.insert("after", read(after, "after the join"));
     // A parked thread the engine reported as a persistent store thread (`probe::persistent_started`,
     // as `start_confirm_writer` does; review 2 M6) is not counted, and a parked thread is blocked; a
     // spinning one is not.
@@ -1767,7 +1769,7 @@ fn run_instruments(cell: &str) -> String {
     while probe::others_blocked() != Some(true) && t.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    s.insert("with_persistent", probe::threads().unwrap_or(0));
+    s.insert("with_persistent", read(probe::threads(), "with a persistent thread"));
     s.insert("parked_blocked", u64::from(probe::others_blocked() == Some(true)));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let spinning = {
@@ -2230,7 +2232,12 @@ type Map = BTreeMap<String, u64>;
 /// budget read from a few samples is not one.
 fn quiet<'a>(c: &'a CellData, op: &str) -> Vec<&'a Map> {
     let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
-    let quiet: Vec<&Map> = all.iter().filter(|s| s.get("quiet").copied().unwrap_or(1) == 1).collect();
+    // DECISIONS 994f7d41e0 (the MEASUREMENT class): a sample without its quiet flag is refused, not
+    // taken as quiet.
+    let quiet: Vec<&Map> = all
+        .iter()
+        .filter(|s| *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a sample has no quiet flag", c.name)) == 1)
+        .collect();
     assert!(
         !quiet.is_empty() && 2 * quiet.len() >= all.len(),
         "{}: {op}: {} of {} samples quiet: not enough to read a budget from",
@@ -3048,7 +3055,8 @@ fn checkpoint_excess(spec: &str) -> (u64, BTreeMap<&'static str, i64>) {
         for s in samples.iter().filter(|s| s["ckpt_started"] > 0) {
             installed += s["ckpt_installed"];
             for k in ["syscalls", "held_syscalls", "held_syncs", "fsync", "full_fsync", "barrier", "locks_process", "catalog_queries"] {
-                let Some(&v) = s.get(k) else { continue };
+                // DECISIONS 994f7d41e0: a counter the sample lacks is refused, not skipped.
+                let v = *s.get(k).unwrap_or_else(|| panic!("{spec}: {op}: a sample has no {k}"));
                 let base = calm.iter().map(|m| m[k]).min().unwrap();
                 *excess.entry(k).or_default() += v as i64 - base as i64;
             }
@@ -3090,7 +3098,7 @@ fn a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
     }
     for spec in ["ckpt_n10", "ckpt_n1e4"] {
         let (n, excess) = checkpoint_excess(spec);
-        let held = excess.get("held_syscalls").copied().unwrap_or(0);
+        let held = excess["held_syscalls"];
         assert!(
             held <= 2 * n as i64,
             "{spec}: {n} checkpoints issued {held} syscalls under the store mutex; budget 2 each [review 2 #5, review 1 #7]"
@@ -3109,8 +3117,8 @@ fn a_checkpoint_flushes_at_most_three_times() {
     }
     for spec in ["ckpt_n10", "ckpt_n1e4"] {
         let (n, excess) = checkpoint_excess(spec);
-        let full = excess.get(FULL).copied().unwrap_or(0);
-        let other = excess.get(NOT_FULL).copied().unwrap_or(0) + excess.get("barrier").copied().unwrap_or(0);
+        let full = excess[FULL];
+        let other = excess[NOT_FULL] + excess["barrier"];
         assert!(
             full <= 3 * n as i64 && other <= n as i64,
             "{spec}: {n} checkpoints issued {full} full flushes and {other} other syncs; budget 3 and 1 each [review 1 #7]"
@@ -3544,7 +3552,7 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
 fn confirm_pairs<'a>(c: &'a CellData, op: &str) -> Vec<(&'a Map, &'a Map)> {
     let (a, r) = (&c.ops[op], &c.ops["confirm_reference"]);
     assert_eq!(a.len(), r.len(), "{}: {op} and confirm_reference rounds differ", c.name);
-    let q = |s: &Map| s.get("quiet").copied().unwrap_or(1) == 1;
+    let q = |s: &Map| *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a round has no quiet flag", c.name)) == 1;
     let pairs: Vec<(&Map, &Map)> = a.iter().zip(r).filter(|(x, y)| q(x) && q(y)).collect();
     assert!(!pairs.is_empty() && 2 * pairs.len() >= a.len(), "{}: {op}: {} of {} round pairs quiet", c.name, pairs.len(), a.len());
     pairs
@@ -4385,6 +4393,71 @@ fn contention_each_create_registers_once_at_any_client_count() {
 /// the header's class, compactions that synced inline on an operation, operations that waited
 /// behind a background compaction. Each is a window's delta.
 const EXC_KEYS: [&str; 4] = ["exc_hardcap_upgrades", "exc_header_raise_exclusive", "exc_inline_compaction_syncs", "exc_compaction_waits"];
+
+/// DECISIONS 994f7d41e0 (Ryan's class rule; the MEASUREMENT class): a counter a budget holds at 0
+/// must be seen to MOVE, or an instrument that reports 0 for a live structure passes every such
+/// budget. Every key this file budgets with `Want::Exactly(0)` (read from this file's own source,
+/// so a new zero budget joins at once; a key it cannot parse is refused) has a control cell, in
+/// `ZERO_BUDGET_CONTROLS`, in which some window reads it above 0. A zero-budgeted key with no
+/// control, or a control that reads 0 everywhere, fails.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn every_zero_budgeted_counter_is_seen_moving() {
+    if in_child() {
+        return;
+    }
+    let src = include_str!("budget_tests.rs");
+    let mut keys = std::collections::BTreeSet::new();
+    let marker = ", Want::Exactly(0)";
+    for (at, _) in src.match_indices(marker) {
+        let open = src[..at].rfind("every(").unwrap_or_else(|| panic!("a zero budget at byte {at} is not an every(..)"));
+        let arg = src[open + "every(".len()..at].trim();
+        let key = if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            lit
+        } else {
+            match arg {
+                "FULL" => FULL,
+                "NOT_FULL" => NOT_FULL,
+                // This test's own text, in the marker's definition above.
+                _ if arg.contains("marker") || arg.contains('\n') => continue,
+                other => panic!("a zero budget names a key this test cannot read: {other:?}"),
+            }
+        };
+        keys.insert(key);
+    }
+    assert!(keys.len() >= 10, "premise: the zero budgets parsed ({keys:?})");
+    let mut failures = String::new();
+    for key in &keys {
+        let Some(&(_, spec)) = ZERO_BUDGET_CONTROLS.iter().find(|(k, _)| k == key) else {
+            let _ = writeln!(failures, "  {key}: budgeted at 0, and no control cell shows it moving");
+            continue;
+        };
+        let c = cell(spec);
+        let moved: Vec<&String> = c.ops.iter().filter(|(_, v)| v.iter().any(|s| s.get(*key).is_some_and(|&x| x > 0))).map(|(op, _)| op).collect();
+        if moved.is_empty() {
+            let _ = writeln!(failures, "  {key}: its control cell {spec} reads it 0 in every window");
+        }
+    }
+    assert!(failures.is_empty(), "zero-budgeted counters not seen moving (keys {keys:?}):\n{failures}");
+}
+
+/// Each zero-budgeted counter's control: a cell in which it moves (the instruments cell's fire-checks,
+/// or an operation that pays it by design).
+#[cfg(target_vendor = "apple")]
+const ZERO_BUDGET_CONTROLS: &[(&str, &str)] = &[
+    ("barrier", "shared_c8"),
+    ("catalog_loads", "instruments"),
+    ("catalog_queries", "instruments"),
+    ("catalog_stmts", "instruments"),
+    ("catalog_writes", "instruments"),
+    ("fsync", "n10_small"),
+    ("full_fsync", "instruments"),
+    ("held_syncs", "instruments"),
+    ("held_syscalls", "instruments"),
+    ("locks", "instruments"),
+    ("log_bytes", "instruments"),
+    ("syscalls", "instruments"),
+];
 
 /// DECISIONS bd0d845f97 (the routing of `branch_exception_counters`): every run records the four
 /// counted exceptions, so every window of every engine cell carries all four keys. Checked here on
