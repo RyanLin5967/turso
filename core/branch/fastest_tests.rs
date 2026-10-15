@@ -8345,3 +8345,45 @@ fn a_failed_vacuum_wal_sync_fail_stops_a_store_with_an_undrained_record() {
         }
     }
 }
+
+/// Engine review 21 LOW 20: a raw-frame WAL header sync whose completion failed was reported
+/// twice: `watched` noted the completion, and `write_frame_raw_watched` reported the failed wait
+/// directly without taking that note, so the next check of the connection's noted syncs (the next
+/// trunk commit on it) reported it again. A second report re-reads the group's state and can
+/// fail-stop later, never less often. The recipe of
+/// `a_failed_raw_frame_header_sync_fail_stops_a_store_with_an_undrained_record`, its sync failing
+/// after issue (mode 2): the store counts exactly one trunk sync failure. Both modes. Mutant
+/// `raw_header_sync_reported_twice`.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_failed_raw_frame_header_sync_is_reported_once() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("raw-header-once.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let page_size = trunk.prepare("PRAGMA page_size").unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap() as usize;
+        let mut frame = vec![0u8; 24 + page_size];
+        trunk.wal_get_frame(1, &mut frame).unwrap();
+        trunk.fork_branch().unwrap().reap().unwrap();
+        trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        let failures = db.branches.sync_failures();
+        trunk.wal_insert_begin().unwrap();
+        armed.store(2, O::Release);
+        let inserted = trunk.wal_insert_frame(1, &frame);
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the WAL header's sync was reached");
+        assert!(inserted.is_err(), "{what}: premise: the failed header sync failed the insert");
+        let _ = trunk.wal_insert_end(false);
+        // The next trunk commit on the same connection checks its noted syncs.
+        let _ = trunk.execute("UPDATE t SET v = 'later' WHERE id = 9");
+        let reported = db.branches.sync_failures() - failures;
+        assert_eq!(reported, 1, "{what}: one failed raw WAL header sync was reported {reported} times");
+    }
+}
