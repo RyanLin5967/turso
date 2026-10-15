@@ -1206,6 +1206,14 @@ fn handle_pg_add_constraints(
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
+    // columns among them) is answered here, before anything is copied, dropped or locked: it came
+    // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
+    // write lock, so a refused key cost an O(rows) rebuild, or 55P03 after the lock wait (wire
+    // review 16 item 9). One translation of the tree already in hand, no parse.
+    PostgreSQLTranslator::new()
+        .translate_with_prereqs(&parsed)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
