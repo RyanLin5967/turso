@@ -21,38 +21,57 @@ Rules (all must hold):
     when nothing or several devices are at "/", when a top-level ancestor is not a disk, when lsblk prints no KNAME
     or PKNAME, or when a PKNAME is not the device lsblk nests the node under. This rule is evaluated first, so no
     rule that returns early can skip it;
-  - DEVICE resolves (symlinks followed) to /dev/<name> with name a whole NVMe namespace (nvmeXnY), SCSI disk (sdX) or
-    virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem or anything else is refused);
+  - DEVICE resolves (symlinks followed) to /dev/<name>, directly under /dev, with name a whole NVMe namespace
+    (nvmeXnY), SCSI disk (sdX) or virtio disk (vdX); lsblk TYPE is "disk" (a partition, loop, ram, dm, md, nbd, pmem
+    or anything else is refused); the node the O_EXCL open below opens is a block device whose st_rdev is the disk's
+    own /sys/block/<name>/dev, and each partition's its own (review 6 LOW 5: a hand-made /dev/<sub>/nvme1n1 carrying
+    the root disk's MAJ:MIN passed as the spare);
   - no partition or holder of it is mounted or in use: lsblk MOUNTPOINTS anywhere in its tree; every descendant is a
     bare partition (an LVM volume, md array, crypt or dm child refuses); the disk's AND each partition's
     /sys/block/<disk>/<part>/holders are empty; and an exclusive open (O_EXCL) of the disk and of each partition
     succeeds, so nothing in the kernel claims them (lane review MED 5; needs root, so t3run runs it under sudo -n);
   - it shares no controller with a disk that holds "/": /sys/block/<name>/device resolves to a different NVMe
     controller or SCSI device than every root disk's does, so a second namespace of the root drive is refused (its
-    queue and flush stream carry the root's writes; round-2 attack LOW 3). An unreadable link refuses;
+    queue and flush stream carry the root's writes; round-2 attack LOW 3). An unreadable link refuses. For NVMe the
+    subsystem NQN (/sys/block/<name>/device/subsysnqn) must also differ from every NVMe root disk's, so another
+    controller of the root drive (multipath=N, dual port, SR-IOV), which has its own device link, is refused; an
+    unreadable NQN refuses (review 5 LOW 19). For SCSI the link comparison cannot fire, each sdX being its own SCSI
+    device: a second path to a dual-ported SAS root drive is a blind spot of this rule, which the signature rule
+    covers by seeing the root's partition table through it;
   - it carries no signature at all: `blkid -p` (libblkid probing the device itself, not udev's database, which can lag
     a write) finds nothing on the disk or on any partition lsblk lists, so a partition table, a filesystem, an LVM
     PV, an md member, a LUKS header, an external journal or log, a btrfs or zfs member, swap: any of them refuses.
+    The probe first reads the first and last MiB of each device itself, because blkid exits 2 with nothing on stderr
+    for a device it could not read as for a blank one (review 5 LOW 20).
     This covers what neither the mount, holder nor O_EXCL rule sees: a PV of the root volume group holding no root
     extents, a detached LUKS header, a filesystem in fstab not mounted now (round-2 attack MED 2). A partition table
     alone refuses too, because a partition may hold raw data with no signature. A T3 disk must be blank: read what
     it holds, then `wipefs -a` it by hand. A failed probe refuses;
-  - it is not a native-multipath NVMe head (/sys/block/<name>/multipath non-empty): its flush counter may live on the
-    path devices, which V3L does not read (stated blind spot, refused rather than guessed).
+  - it is not a native-multipath NVMe head: /sys/block/<name>/multipath lists a path, or its sysfs node lives under
+    devices/virtual/nvme-subsystem/ (kernel 6.8 has no multipath directory; review 5 LOW 18), named with its hidden
+    nvme<S>c<C>n<N> paths, and a head whose paths cannot be listed is refused too. Its flush counter may live on the
+    path devices, which V3L does not read (stated blind spot, refused rather than guessed). This refuses a
+    single-path head as well, so a dual-port (CMIC) drive cannot be the T3 spare: stricter than review 5 LOW 18's
+    "two or more", because the head's own counters are unmeasured (owed: hwid.txt from a 6.8 box with a CMIC drive).
 Stated blind spots of the root rule. "/" is found only through lsblk's MOUNTPOINTS. A root that lsblk does not list
 (overlay, NFS, tmpfs) cannot be told apart, so every device is refused and none passes. A btrfs "/" spread over
 several disks shows "/" on one member only, so this rule does not refuse the other members. On a real box btrfs
 claims every member exclusively, so the O_EXCL rule refuses them instead. sysfs cannot name any btrfs root (its
 device number is anonymous), so t3run's fire refuses to run on such a box. Neither instrument names a disk that
 carries part of "/" without a holder link: an XFS logdev= or rtdev=, an ext4 journal_dev, a DRBD backing disk, a
-detached LUKS header, a PV of the root volume group with no root extents (round-2 attack MED 2). The kernel claims
-the first three, so the O_EXCL rule refuses them; the signature rule refuses all five. A signature libblkid does not
-know (a raw partition with no metadata, a disk holding only ciphertext) is not seen, and the partition-table rule
-covers it only when the raw data sits in a partition.
+detached LUKS header, a PV of the root volume group with no root extents (round-2 attack MED 2). While "/" is
+mounted the kernel claims its XFS log and rtdev and its ext4 journal device, so the O_EXCL rule refuses those three.
+The signature rule refuses each of the six that carries a signature libblkid knows. An XFS rtdev carries none before
+xfsprogs 6.13 (inferred, review 5 LOW 21; owed: `mkfs.xfs -r rtdev=` on 24.04, then `blkid -p`), so an rtdev not in
+use is in the next blind spot. A signature libblkid does not know (a raw partition with no metadata, a disk holding
+only ciphertext, an XFS rtdev) is not seen, and the partition-table rule covers it only when the raw data sits in a
+partition.
 """
+import errno
 import json
 import os
 import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -256,10 +275,13 @@ def descendants(node):
     return out
 
 
-def problems(name, devices, holders, multipath, part_holders=None, busy=None, ctrl=None, sigs=None, info=None):
+def problems(name, devices, holders, multipath, part_holders=None, busy=None, ctrl=None, sigs=None, info=None,
+             nodes=None, nqn=None, mp_error=None):
     """every reason NAME may not be destroyed. HOLDERS, MULTIPATH, PART_HOLDERS and BUSY are the sysfs and O_EXCL
     readings; CTRL maps disk -> realpath of /sys/block/<disk>/device; SIGS maps disk or partition -> blkid -p's
-    (rc, stdout); INFO is root_info(devices), computed here when not given. check() always passes all of them; the
+    (rc, stdout); INFO is root_info(devices), computed here when not given; NODES maps each device the O_EXCL open
+    opened -> (st_mode, st_rdev, its sysfs dev or None); NQN maps NVMe disk -> its subsysnqn (None when unreadable);
+    MP_ERROR says why a native-multipath head's paths cannot be listed. check() always passes all of them; the
     self-test passes None to leave a rule out of a case"""
     info = root_info(devices) if info is None else info
     # the root rule first, so the early return below cannot skip it (MED 13: a partition under an LVM root was
@@ -287,7 +309,7 @@ def problems(name, devices, holders, multipath, part_holders=None, busy=None, ct
     for dev, why in sorted((busy or {}).items()):
         bad.append(f"{dev} cannot be opened exclusively ({why}): the kernel claims it")
     if ctrl is not None:
-        bad += controller_rule(name, info, ctrl)
+        bad += controller_rule(name, info, ctrl, nqn)
     if sigs is not None:
         for dev in [name] + [c.get("name") for c in descendants(node)]:
             rc, out = sigs.get(dev, (None, "not probed"))
@@ -298,16 +320,27 @@ def problems(name, devices, holders, multipath, part_holders=None, busy=None, ct
                 bad.append(f"cannot probe {dev}'s signatures (blkid -p rc {rc}: {found or 'no output'}): refused")
     if multipath:
         bad.append(f"{name} is a multipath NVMe head ({multipath}): its flush counter may be on the path devices")
+    if mp_error:
+        bad.append(f"{name} is a native-multipath NVMe head whose paths cannot be listed ({mp_error}): refused")
+    for dev, (mode, rdev, sysdev) in sorted((nodes or {}).items()):
+        if not stat.S_ISBLK(mode):
+            bad.append(f"{dev}'s node is not a block device (st_mode {oct(mode)})")
+        elif sysdev is None:
+            bad.append(f"no sysfs dev for {dev}: its node cannot be matched to the disk (refused)")
+        elif f"{os.major(rdev)}:{os.minor(rdev)}" != sysdev:
+            bad.append(f"{dev}'s node is device {os.major(rdev)}:{os.minor(rdev)}, not its sysfs dev {sysdev}: another "
+                       "disk's numbers")
     return bad
 
 
 SIG_TEXT = "carries a signature"
 
 
-def controller_rule(name, info, ctrl):
-    """NAME shares an NVMe controller or SCSI device with a disk that holds "/" (round-2 attack LOW 3); INFO is
-    root_info(devices); CTRL maps disk -> realpath of /sys/block/<disk>/device. When the root disks cannot be told,
-    the root rule already refuses"""
+def controller_rule(name, info, ctrl, nqn=None):
+    """NAME shares an NVMe controller or SCSI device with a disk that holds "/" (round-2 attack LOW 3), or an NVMe
+    subsystem (review 5 LOW 19: another controller of the root drive); INFO is root_info(devices); CTRL maps disk ->
+    realpath of /sys/block/<disk>/device; NQN maps each NVMe disk among NAME and the roots -> its subsysnqn (None:
+    the NQN rule is left out). When the root disks cannot be told, the root rule already refuses"""
     if isinstance(info, CannotTell):
         return []
     roots = info[0]
@@ -316,7 +349,55 @@ def controller_rule(name, info, ctrl):
     if ctrl.get(name):
         bad += [f"{name} shares its controller ({ctrl[name]}) with {r}, which holds the root filesystem"
                 for r in roots if r != name and ctrl.get(r) == ctrl[name]]
+    if nqn is not None:
+        bad += [f"no subsysnqn for {d} (/sys/block/{d}/device/subsysnqn): another controller of the root drive "
+                "cannot be told apart (refused)" for d in sorted({name, *roots}) if d.startswith("nvme") and not nqn.get(d)]
+        if nqn.get(name):
+            bad += [f"{name}'s subsystem ({nqn[name]}) is {r}'s, which holds the root filesystem: another controller "
+                    "of the root drive" for r in roots if r != name and nqn.get(r) == nqn[name]]
     return bad
+
+
+def nvme_head(sys_root, name):
+    """(NAME is a native-multipath NVMe head, its path devices or None when they cannot be listed). A head's sysfs
+    node lives under devices/virtual/nvme-subsystem/nvme-subsys<S>/, and its paths are the hidden nvme<S>c<C>n<N>
+    disks under each controller its subsystem links (review 5 LOW 18: kernel 6.8 has no /sys/block/<head>/multipath).
+    A head with no path found is one whose paths cannot be listed"""
+    node = os.path.realpath(os.path.join(sys_root, "block", name))
+    virt = os.path.realpath(os.path.join(sys_root, "devices", "virtual", "nvme-subsystem"))
+    if not node.startswith(virt + os.sep):
+        return False, []
+    m = re.match(r"^nvme(\d+)n(\d+)$", name)
+    if not m:
+        return True, None
+    sub, paths = os.path.dirname(node), []
+    try:
+        for c in sorted(os.listdir(sub)):
+            if re.match(r"^nvme\d+$", c):
+                paths += [x for x in os.listdir(os.path.join(sub, c)) if re.match(rf"^nvme{m[1]}c\d+n{m[2]}$", x)]
+    except OSError:
+        return True, None
+    return True, sorted(paths) or None
+
+
+def ends_readable(path, span=1 << 20):
+    """why the first and last SPAN bytes of PATH cannot be read, or None when both read in full (review 5 LOW 20)"""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size = os.lseek(fd, 0, os.SEEK_END)
+            if size <= 0:
+                return f"size {size}"
+            n = min(span, size)
+            for off in (0, size - n):
+                got = len(os.pread(fd, n, off))
+                if got != n:
+                    return f"a short read at byte {off}: {got} of {n}"
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return f"{type(e).__name__}: {e}"
+    return None
 
 
 def blkid_probe(kname, dev_root="/dev"):
@@ -325,6 +406,9 @@ def blkid_probe(kname, dev_root="/dev"):
     path = os.path.join(dev_root, kname or "")
     if not kname or not os.path.exists(path):
         return None, f"no device node {path}"
+    why = ends_readable(path)
+    if why:
+        return None, f"cannot read {path}'s first and last MiB ({why}), so blkid's 'nothing found' would not mean blank"
     try:
         r = subprocess.run(["blkid", "-p", "-o", "export", path], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -335,19 +419,25 @@ def blkid_probe(kname, dev_root="/dev"):
 
 
 def excl_open(path):
-    """an exclusive open of PATH, closed at once; OSError (EBUSY) when the kernel claims the device"""
-    os.close(os.open(path, os.O_RDONLY | os.O_EXCL))
+    """an exclusive open of PATH, closed at once: the opened node's (st_mode, st_rdev), read from the fd itself (review
+    6 LOW 5); OSError (EBUSY) when the kernel claims the device"""
+    fd = os.open(path, os.O_RDONLY | os.O_EXCL)
+    try:
+        st = os.fstat(fd)
+        return st.st_mode, st.st_rdev
+    finally:
+        os.close(fd)
 
 
 def check(dev, sys_root="/sys", dev_root="/dev", lsblk=None, blkid=None, excl=excl_open):
     """every rule on DEV, as `devguard.py check` runs it: (name, reasons). Every input is injectable so the self-test
     runs this allow path on a fake box before a paid one does (review 5 MED 1): SYS_ROOT and DEV_ROOT, LSBLK (lsblk's
     JSON text; None runs lsblk), BLKID (kname -> (rc, stdout); None probes DEV_ROOT/kname with blkid -p), EXCL (the
-    O_EXCL opener)."""
+    O_EXCL opener, answering the opened node's (st_mode, st_rdev))."""
     droot = os.path.realpath(dev_root)
     real = os.path.realpath(dev)
     name = os.path.basename(real)
-    if not real.startswith(droot.rstrip("/") + "/") or not os.path.exists(real):
+    if os.path.dirname(real) != droot or not os.path.exists(real):
         return name, [f"{dev} does not resolve to a device node under {dev_root} ({real})"]
     try:
         devices = parse_lsblk(lsblk_text() if lsblk is None else lsblk)
@@ -358,30 +448,51 @@ def check(dev, sys_root="/sys", dev_root="/dev", lsblk=None, blkid=None, excl=ex
     holders = sorted(os.listdir(hp)) if os.path.isdir(hp) else []
     mp = os.path.join(blk, "multipath")
     multipath = sorted(os.listdir(mp)) if os.path.isdir(mp) else []
+    head, hpaths = nvme_head(sys_root, name)
+    mp_error = None
+    if head and hpaths is None:
+        mp_error = f"the subsystem of {os.path.realpath(blk)} lists no readable nvme<S>c<C>n<N> path"
+    elif head:
+        multipath = sorted(set(multipath) | set(hpaths))
     node = next((d for d in devices if d.get("name") == name), {}) or {}
     parts = [c.get("name") for c in descendants(node) if c.get("type") == "part"]
     part_holders = {}
     for p in parts:
         ph = os.path.join(blk, p, "holders")
         part_holders[p] = sorted(os.listdir(ph)) if os.path.isdir(ph) else []
-    busy = {}
+    busy, nodes = {}, {}
     for d in [name] + parts:
         try:
-            excl(os.path.join(droot, d))
+            got = excl(os.path.join(droot, d))
         except OSError as e:
             busy[d] = e.strerror
+            continue
+        sysdev = None
+        try:
+            with open(os.path.join(blk, *([] if d == name else [d]), "dev")) as f:
+                sysdev = f.read().strip() or None
+        except OSError:
+            pass
+        mode, rdev = got if isinstance(got, tuple) and len(got) == 2 else (0, 0)
+        nodes[d] = (mode, rdev, sysdev)
     info = root_info(devices)  # once, for the root rule, the controller rule and the links below
     roots = [] if isinstance(info, CannotTell) else info[0]
-    ctrl = {}
+    ctrl, nqn = {}, {}
     for d in [name] + roots:
         link = os.path.join(sys_root, "block", d, "device")
         if os.path.exists(link):
             ctrl[d] = os.path.realpath(link)
+        if d.startswith("nvme"):
+            try:
+                with open(os.path.join(link, "subsysnqn")) as f:
+                    nqn[d] = f.read().strip() or None
+            except OSError:
+                nqn[d] = None
     # every descendant lsblk lists, partition or not, by its kernel name: the rule refuses any it could not probe
     probe = blkid or (lambda k: blkid_probe(k, droot))
     sigs = {name: probe(name)}
     sigs.update({c.get("name"): probe(c.get("kname")) for c in descendants(node)})
-    return name, problems(name, devices, holders, multipath, part_holders, busy, ctrl, sigs, info)
+    return name, problems(name, devices, holders, multipath, part_holders, busy, ctrl, sigs, info, nodes, nqn, mp_error)
 
 
 def _node(name, typ, pkname=None, mounts=None, children=None, kname=None):
@@ -506,36 +617,117 @@ def self_test():
                            text=True, timeout=60, env=dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", "")))
         return r.returncode, r.stdout, r.stderr
 
-    def fake_box():
-        """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to two
+    # the fake box's block-device major: NVMe's 259 where the platform's dev_t keeps it (Linux), else a major it does
+    # keep (macOS dev_t holds 8 bits of major, signed, so os.makedev(259, 3) reads back as 3:3 and every case comparing the
+    # opened node with sysfs dev would refuse for the platform, not the rule). The identity rule is then tested on
+    # every platform; the Linux-only case below keeps NVMe's real 259 where it can exist
+    def fake_maj(want=259):
+        def keeps(m):
+            try:
+                return os.major(os.makedev(m, 3)) == m and os.minor(os.makedev(m, 3)) == 3
+            except (OverflowError, ValueError):  # macOS: a major of 128 or more overflows its signed 32-bit dev_t
+                return False
+        return want if keeps(want) else 8  # 8: sd's major, which every dev_t keeps
+
+    def fake_box(maj=None):
+        maj = fake_maj() if maj is None else maj
+        """a whole fake box for check() (review 5 MED 1): /dev nodes, sysfs block dirs whose device links resolve to
         controllers (nvme0 carries the root disk nvme0n1 and a second namespace nvme0n2; nvme1 carries the spare
-        nvme1n1), lsblk's JSON, blkid's answers and an O_EXCL opener that finds the root disk claimed"""
+        nvme1n1; review 6 LOW 8: nvme2 a multipath head nvme2n1, nvme3 a disk nvme3n1 held by dm-9), each disk's sysfs
+        dev, lsblk's JSON, blkid's answers and an O_EXCL opener that finds the root disk claimed. TEST EDIT, flagged
+        (review 6 LOW 5, LOW 8): the opener now opens the node it is handed, under the dev root only (a path elsewhere
+        is ENOENT, as the real opener's would be), and answers the opened node's (st_mode, st_rdev) as the real one
+        does; the box gains the nodes, sysfs dev files and the two disks above. No expectation changes."""
         top = tempfile.mkdtemp(dir=tmp)
         droot, sroot = os.path.join(top, "dev"), os.path.join(top, "sys")
-        os.makedirs(droot)
-        for d in ("nvme0n1", "nvme0n1p1", "nvme0n2", "nvme1n1"):
+        os.makedirs(os.path.join(droot, "sub"))
+        nums = {"nvme0n1": 0, "nvme0n1p1": 1, "nvme0n2": 2, "nvme1n1": 3, "nvme2n1": 4, "nvme3n1": 5, "nvme4n1": 7,
+                "nvme5n1": 6, "nvme6n1": 8, "nvme7n1": 9}
+        for d in nums:
             open(os.path.join(droot, d), "w").close()
+        open(os.path.join(droot, "sub", "nvme1n1"), "w").close()
         os.symlink(os.path.join(droot, "nvme1n1"), os.path.join(droot, "by-id-spare"))
-        for c in ("nvme0", "nvme1"):
+        os.symlink(os.path.join(droot, "sub", "nvme1n1"), os.path.join(droot, "by-id-sub"))
+        for c in ("nvme0", "nvme1", "nvme2", "nvme3", "nvme4", "nvme7"):
             os.makedirs(os.path.join(sroot, "devices", "pci", c))
-        for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1")):
+        # review 5 LOW 19 (TEST EDIT, flagged: new fixture files): each controller's subsysnqn; nvme4 is a second
+        # controller of the root drive (multipath=N, dual port: the root's subsysnqn), nvme7 has none readable
+        for c, q in (("nvme0", "root"), ("nvme1", "spare"), ("nvme2", "mp2"), ("nvme3", "held3"), ("nvme4", "root")):
+            with open(os.path.join(sroot, "devices", "pci", c, "subsysnqn"), "w") as f:
+                f.write(f"nqn.2014-08.org.nvmexpress:uuid:{q}\n")
+        for d, c in (("nvme0n1", "nvme0"), ("nvme0n2", "nvme0"), ("nvme1n1", "nvme1"), ("nvme2n1", "nvme2"),
+                     ("nvme3n1", "nvme3"), ("nvme4n1", "nvme4"), ("nvme7n1", "nvme7")):
             os.makedirs(os.path.join(sroot, "block", d, "holders"))
             os.symlink(os.path.join("..", "..", "devices", "pci", c), os.path.join(sroot, "block", d, "device"))
+            with open(os.path.join(sroot, "block", d, "dev"), "w") as f:
+                f.write(f"{maj}:{nums[d]}\n")
         os.makedirs(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "holders"))
+        with open(os.path.join(sroot, "block", "nvme0n1", "nvme0n1p1", "dev"), "w") as f:
+            f.write(f"{maj}:1\n")
+        os.makedirs(os.path.join(sroot, "block", "nvme2n1", "multipath"))
+        open(os.path.join(sroot, "block", "nvme2n1", "multipath", "nvme2c2n1"), "w").close()
+        open(os.path.join(sroot, "block", "nvme3n1", "holders", "dm-9"), "w").close()
+        # review 5 LOW 18: native-multipath heads as kernel 6.8 lays them out, with NO multipath directory: the head
+        # under devices/virtual/nvme-subsystem/nvme-subsysS (its device link is the subsystem), the subsystem linking
+        # each controller, the hidden path nvme<S>c<C>n<N> under its controller; nvme6's link dangles, so its paths
+        # cannot be listed
+        for hs, ok in ((5, True), (6, False)):
+            sub = os.path.join(sroot, "devices", "virtual", "nvme-subsystem", f"nvme-subsys{hs}")
+            head = os.path.join(sub, f"nvme{hs}n1")
+            os.makedirs(os.path.join(head, "holders"))
+            with open(os.path.join(head, "dev"), "w") as f:
+                f.write(f"{maj}:{nums[f'nvme{hs}n1']}\n")
+            with open(os.path.join(sub, "subsysnqn"), "w") as f:
+                f.write(f"nqn.2014-08.org.nvmexpress:uuid:cmic{hs}\n")
+            os.symlink("..", os.path.join(head, "device"))
+            if ok:
+                os.makedirs(os.path.join(sroot, "devices", "pci", f"nvme{hs}", f"nvme{hs}c{hs}n1"))
+            os.symlink(os.path.join("..", "..", "..", "pci", f"nvme{hs}"), os.path.join(sub, f"nvme{hs}"))
+            os.symlink(os.path.join("..", "devices", "virtual", "nvme-subsystem", f"nvme-subsys{hs}", f"nvme{hs}n1"),
+                       os.path.join(sroot, "block", f"nvme{hs}n1"))
         lsblk = json.dumps({"blockdevices": [N("nvme0n1", "disk", children=[N("nvme0n1p1", "part", "nvme0n1", ["/"])]),
-                                             N("nvme0n2", "disk"), N("nvme1n1", "disk")]})
+                                             N("nvme0n2", "disk"), N("nvme1n1", "disk"), N("nvme2n1", "disk"),
+                                             N("nvme3n1", "disk"), N("nvme4n1", "disk"), N("nvme5n1", "disk"),
+                                             N("nvme6n1", "disk"), N("nvme7n1", "disk")]})
         answers = {"nvme0n1": (0, "DEVNAME=/dev/nvme0n1\nPTTYPE=gpt\n"), "nvme0n1p1": (0, "TYPE=ext4\n")}
 
-        def excl(path):
-            if os.path.basename(path) in ("nvme0n1", "nvme0n1p1"):
-                raise OSError(16, "Device or resource busy")
-
-        def run(dev):
+        def run(dev, node=None):
+            """check() on DEV; NODE overrides the opened node's (st_mode, st_rdev) per name"""
+            def excl(path):
+                if os.path.dirname(os.path.realpath(path)) != os.path.realpath(droot):
+                    raise OSError(errno.ENOENT, "No such file or directory")
+                open(path, "rb").close()
+                b = os.path.basename(path)
+                if b in ("nvme0n1", "nvme0n1p1"):
+                    raise OSError(16, "Device or resource busy")
+                return (node or {}).get(b, (stat.S_IFBLK | 0o660, os.makedev(maj, nums[b])))
             return check(os.path.join(droot, dev) if not os.path.isabs(dev) else dev, sys_root=sroot, dev_root=droot,
                          lsblk=lsblk, blkid=lambda k: answers.get(k, (2, "")), excl=excl)
         return run
 
     box = fake_box()
+    M = fake_maj()
+
+    def ends_check(d):
+        big, empty = os.path.join(d, "ends-3m"), os.path.join(d, "ends-0")
+        with open(big, "wb") as f:
+            f.write(b"\0" * (3 << 20))
+        open(empty, "wb").close()
+        return ends_readable(big), ends_readable(empty)
+
+    def probe_unreadable(d):
+        """blkid_probe on a 0-byte node, with a blkid first on PATH that answers blank (rc 2, nothing printed)"""
+        b = tempfile.mkdtemp(dir=d)
+        with open(os.path.join(b, "blkid"), "w") as f:
+            f.write("#!/bin/sh\nexit 2\n")
+        os.chmod(os.path.join(b, "blkid"), 0o755)
+        open(os.path.join(b, "nvme9n9"), "wb").close()
+        path0 = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = b + os.pathsep + path0
+            return blkid_probe("nvme9n9", b)
+        finally:
+            os.environ["PATH"] = path0
     pci = {"pci/nvme0n1": "disk", "pci/nvme0n1/nvme0n1p1": "part", "pci/nvme0n1/nvme0n1p2": "part",
            "pci/nvme0n1/nvme0n1p3": "part", "pci/nvme1n1": "disk", "pci/nvme1n1/nvme1n1p2": "part", "pci/nvme2n1": "disk"}
     # round-2 attack LOW 2: an NVMe multipath head whose slaves are its path devices (the 4.15-era layout)
@@ -687,13 +879,70 @@ def self_test():
          lambda: (lambda r: (r == ("nvme1n1", []), r))(box("by-id-spare"))),
         ("MED 1: check() refuses nvme0n2, a second namespace on the root drive's controller, by the controller rule",
          lambda: (lambda r: (any("nvme0n2 shares its controller" in b for b in r[1]), r))(box("nvme0n2"))),
+        # TEST EDIT, flagged (review 6 LOW 8): the O_EXCL text now includes the kernel's EBUSY reason, as t3run's root
+        # fire requires; a strengthening
         ("MED 1: check() on the root disk gives the root, O_EXCL and signature texts and no 'cannot read' line",
          lambda: (lambda r: (all(any(t in b for b in r[1]) for t in (f"nvme0n1 {ROOT}", "nvme0n1 cannot be opened "
-                                                                     "exclusively", f"nvme0n1 {SIG}"))
+                                                                     "exclusively (Device or resource busy)",
+                                                                     f"nvme0n1 {SIG}"))
                              and not any("cannot read" in b for b in r[1]), r))(box("nvme0n1"))),
         ("MED 1: check() refuses a path that does not resolve under the dev root",
          lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("/etc/hosts"))),
+        # review 6 LOW 8: check()'s multipath and holder readings on the fake box (the self-test fed problems() only)
+        ("LOW 8: check() refuses nvme2n1, a multipath NVMe head (multipath/nvme2c2n1)",
+         lambda: (lambda r: (any("nvme2n1 is a multipath NVMe head" in b for b in r[1]), r))(box("nvme2n1"))),
+        ("LOW 8: check() refuses nvme3n1, held by dm-9",
+         lambda: (lambda r: (any("nvme3n1 is held by ['dm-9']" in b for b in r[1]), r))(box("nvme3n1"))),
+        # review 6 LOW 5: the node itself: directly under the dev root, a block device, and its st_rdev the disk's own
+        # sysfs dev (a hand-made /dev/<sub>/nvme1n1 carrying the root disk's MAJ:MIN passed as the spare)
+        ("LOW 5: check() refuses a by-id link to <dev root>/sub/nvme1n1 (a node not directly under the dev root)",
+         lambda: (lambda r: (any("does not resolve to a device node under" in b for b in r[1]), r))(box("by-id-sub"))),
+        # TEST EDIT, flagged (lead order 2026-10-15: the fake box Mac-safe, no assertion changed): the major is the fake
+        # box's own (259 on Linux), so the text names it
+        (f"LOW 5: check() refuses a spare whose opened node carries the root disk's MAJ:MIN ({M}:0, sysfs {M}:3)",
+         lambda: (lambda r: (any(f"nvme1n1's node is device {M}:0, not its sysfs dev {M}:3" in b for b in r[1]), r))(
+             box("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(M, 0))}))),
+        ("LOW 5: check() refuses a spare whose opened node is not a block device",
+         lambda: (lambda r: (any("nvme1n1's node is not a block device" in b for b in r[1]), r))(
+             box("nvme1n1", node={"nvme1n1": (stat.S_IFREG | 0o644, 0)}))),
+        # review 5 LOW 18: a native-multipath head is told by where its sysfs node lives, not by a multipath directory
+        # kernel 6.8 does not have
+        ("LOW 18: check() refuses nvme5n1, a native-multipath head (devices/virtual/nvme-subsystem) with no multipath "
+         "directory, naming its path nvme5c5n1",
+         lambda: (lambda r: (any("nvme5n1 is a multipath NVMe head (['nvme5c5n1'])" in b for b in r[1]), r))(
+             box("nvme5n1"))),
+        ("LOW 18: check() refuses nvme6n1, a head whose paths cannot be listed",
+         lambda: (lambda r: (any("nvme6n1 is a native-multipath NVMe head whose paths cannot be listed" in b
+                                 for b in r[1]), r))(box("nvme6n1"))),
+        # review 5 LOW 19: another controller of the root drive (multipath=N, dual port, SR-IOV) has its own device
+        # link, so only the subsystem NQN tells
+        ("LOW 19: check() refuses nvme4n1, on controller nvme4, which carries the root drive's subsysnqn",
+         lambda: (lambda r: (any("nvme4n1's subsystem (nqn.2014-08.org.nvmexpress:uuid:root) is nvme0n1's" in b
+                                 for b in r[1]), r))(box("nvme4n1"))),
+        ("LOW 19: check() refuses an NVMe spare whose subsysnqn cannot be read",
+         lambda: (lambda r: (any("no subsysnqn for nvme7n1" in b for b in r[1]), r))(box("nvme7n1"))),
+        ("LOW 18/19: the spare on its own single-path controller still passes (no head, its own subsysnqn)",
+         lambda: (lambda r: (r == ("nvme1n1", []), r))(box("nvme1n1"))),
+        # review 5 LOW 20: blkid exits 2 with nothing on stderr for a device it could not read as for a blank one, so
+        # the probe first reads the first and last MiB itself
+        ("LOW 20: ends_readable reads the first and last MiB of a 3 MiB file, and refuses a 0-byte one",
+         lambda: (lambda r: (r[0] is None and r[1] is not None, r))(ends_check(tmp))),
+        ("LOW 20: blkid_probe on a node it cannot read is a failed probe (rc None), though blkid answers blank",
+         lambda: (lambda r: (r[0] is None, r))(probe_unreadable(tmp))),
     ]
+    # NVMe's real major 259, where the platform's dev_t can hold it (Linux): the spare passes and LOW 5's refusal names
+    # 259:0 against 259:3. Elsewhere it is reported N/A, never counted as a pass
+    if fake_maj() == 259:
+        box259 = fake_box(259)
+        cases += [
+            ("Linux, major 259: check() allows the blank spare", lambda: (lambda r: (r == ("nvme1n1", []), r))(
+                box259("nvme1n1"))),
+            ("Linux, major 259: LOW 5's node 259:0 against sysfs 259:3 refuses",
+             lambda: (lambda r: (any("nvme1n1's node is device 259:0, not its sysfs dev 259:3" in b for b in r[1]), r))(
+                 box259("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(259, 0))})))]
+    else:
+        print(f"DEVGUARD self-test N/A-on-{sys.platform}: the two major-259 cases (this dev_t cannot hold major 259: "
+              f"os.makedev(259, 3) reads back {os.major(os.makedev(259, 3))}:{os.minor(os.makedev(259, 3))})")
     bad = []
     try:
         for n, fn in cases:

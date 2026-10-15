@@ -379,15 +379,22 @@ def gates(head, base, budget, baseline, cpu=None, base_ok=True, identity=None):
             "never reached: " + ("no such head arm" if BASELINE_ARM not in head else "the arm was cut short (rows above)"),
             "NOT-RUN", "regression")
     ins = budget["instructions"]
+
+    def ir_base(arm):
+        """(base Ir/create, its source, the refusal) for ARM: an in-job base outranks the artifact, which stands in for
+        an arm only when it holds that arm's count (the baseline arm: always tried) and artifact_refusal() passes it"""
+        if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
+            return base[arm]["ir_per_op"]["create"], "base built in this job", None
+        if baseline is not None and (arm == BASELINE_ARM or art_value(baseline, arm, "ir_create")):
+            refused = artifact_refusal(baseline, cpu, "ir_create", arm, identity)
+            if refused is None:
+                return art_value(baseline, arm, "ir_create"), f"baseline artifact of {baseline['sha']}", None
+            return None, None, refused
+        return None, None, None
+
     arm = BASELINE_ARM
     h = head.get(arm, {}).get("ir_per_op", {}).get("create")
-    b = src = why = None
-    if base and (base.get(arm) or {}).get("ir_per_op", {}).get("create"):
-        b, src = base[arm]["ir_per_op"]["create"], "base built in this job"
-    elif baseline is not None:
-        why = artifact_refusal(baseline, cpu, "ir_create", BASELINE_ARM, identity)
-        if why is None:
-            b, src = art_value(baseline, BASELINE_ARM, "ir_create"), f"baseline artifact of {baseline['sha']}"
+    b, src, why = ir_base(arm)
     # instructions/create is always emitted and always regression-kind: INFO (first run) blocks regression_green too
     if h is None:
         row("instructions/create", "a callgrind count", "none", "FAIL", "regression")
@@ -401,6 +408,31 @@ def gates(head, base, budget, baseline, cpu=None, base_ok=True, identity=None):
         g = h / b - 1
         row("instructions/create", f"growth <= {ins['create_growth_max']:.0%} vs {src}",
             f"head {h} base {b} growth {g:+.2%}", "PASS" if g <= ins["create_growth_max"] else "FAIL", "regression")
+    # review 7 / C21 finding 1: every other C=1 arm with an Ir count on either side, by the same rules (review 5 MED 10
+    # asks for both comparisons on every artifact C=1 arm); an arm the head lost already FAILs on its syscalls-vs-base
+    # row, and an arm with no count on either side has nothing to compare
+    others = {a for a, x in head.items() if a != BASELINE_ARM and (x or {}).get("clients", 1) == 1}
+    if base:
+        others |= {a for a, x in base.items() if a != BASELINE_ARM and (x or {}).get("clients", 1) == 1}
+    elif baseline is not None:
+        others |= {a for a in art_arms(baseline) if a != BASELINE_ARM and art_value(baseline, a, "ir_create")}
+    for a in sorted(others & set(head)):
+        h = (head.get(a) or {}).get("ir_per_op", {}).get("create")
+        b, src, why = ir_base(a)
+        gid = f"instructions/create/{a}"
+        if h is None and b is None and not why:
+            continue
+        if h is None:
+            row(gid, "a callgrind count, as the base has one", "none", "FAIL", "regression")
+        elif why:
+            row(gid, f"growth <= {ins['create_growth_max']:.0%} vs an in-job base or the baseline artifact of this cpu",
+                f"refused: {why}", "FAIL", "regression")
+        elif b is None:
+            row(gid, "a base to compare against", f"head {h} Ir/op; no base holds this arm (a new arm)", "INFO", "info")
+        else:
+            g = h / b - 1
+            row(gid, f"growth <= {ins['create_growth_max']:.0%} vs {src}", f"head {h} base {b} growth {g:+.2%}",
+                "PASS" if g <= ins["create_growth_max"] else "FAIL", "regression")
     return rows
 
 
@@ -790,8 +822,12 @@ def self_test():
     def case_m11_failed_base_dropped():
         partial = arm_of(trace(1), 10)
         del partial["strace"]
-        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": partial}, budget, art2, cpu="cpu-A",
-                     identity=ident, base_ok=False)
+        # TEST EDIT, flagged (review 7 / C21 finding 2, the lead's order): the head runs BOTH arms art2 holds. With
+        # full-snap-c1 alone, dropping the base rightly FAILs the missing full-cat-c1 (MED 10's lost-arm gate), which
+        # contradicted this positive case; the lost-arm negative is case_m10_head_lost_arm, and every assertion here
+        # stands
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": arm_of(trace(1), 10)},
+                     {"full-snap-c1": partial}, budget, art2, cpu="cpu-A", identity=ident, base_ok=False)
         r = by_id(rows)
         sv, ins = r.get("syscalls-vs-base/full-snap-c1"), r.get("instructions/create")
         return (sv is not None and sv[3] == "PASS" and f"baseline artifact of {art_sha}" in sv[1]
@@ -800,6 +836,50 @@ def self_test():
     cases.append(("MED 11: a base whose run failed is dropped: a partial base, the artifact on cpu-A: both premises "
                   "compare against the artifact and PASS, regression_green true, an info row names the dropped base",
                   guarded(case_m11_failed_base_dropped)))
+    # review 7 / C21 finding 1: every C=1 arm the artifact (or an in-job base) holds an Ir count for is compared, not
+    # only the baseline arm: a full-cat-c1 regression with full-snap-c1 clean must FAIL
+    def case_ir_per_arm(cat_ir, cat_has_ir=True):
+        cat = arm_of(trace(1), 10)
+        if cat_has_ir:
+            cat["ir_per_op"]["create"] = cat_ir
+        else:
+            del cat["ir_per_op"]
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10), "full-cat-c1": cat}, None, budget, art2, cpu="cpu-A",
+                     identity=ident)
+        return by_id(rows).get("instructions/create/full-cat-c1"), regression_green(rows)
+
+    cases.append(("finding 1: no in-job base, the artifact at Ir 1000 on both C=1 arms, head full-cat-c1 at 10000: "
+                  "instructions/create/full-cat-c1 FAILs regression-kind and regression_green is false",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "FAIL" and r[0][4] == "regression"
+                                   and not r[1])(case_ir_per_arm(10000.0)))))
+    cases.append(("finding 1: the same with head full-cat-c1 at 1000: that row PASSes against the artifact's own arm",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "PASS" and art_sha in r[0][1]
+                                   and r[1])(case_ir_per_arm(1000.0)))))
+    cases.append(("finding 1: a head full-cat-c1 with no Ir count, the artifact holding one: FAILs regression-kind",
+                  guarded(lambda: (lambda r: r[0] is not None and r[0][3] == "FAIL" and r[0][4] == "regression"
+                                   and not r[1])(case_ir_per_arm(None, cat_has_ir=False)))))
+    # review 5 LOW 27 (mutant-kill cases, not red): a cpu label missing on BOTH sides is a refusal, never a match of
+    # None to None or "" to "" (a mutant comparing only baseline["cpu"] != cpu passed every case)
+    for label in ("", None):
+        def case_cpu_both(label=label):
+            why = artifact_refusal(dict(art, cpu=label), label, "ir_create", BASELINE_ARM, art_ident)
+            ins = by_id(gates({"full-snap-c1": arm_of(trace(1), 10)}, None, budget, dict(art, cpu=label), cpu=label,
+                              identity=art_ident)).get("instructions/create")
+            return why is not None and "records no cpu" in why and ins is not None and ins[3] == "FAIL"
+        cases.append((f"LOW 27: the artifact's cpu and this runner's both {label!r}: refused (records no cpu), "
+                      "instructions/create FAIL", guarded(case_cpu_both)))
+
+    # review 5 LOW 28 (mutant-kill case): an in-job base with no Ir count and no artifact, while syscalls-vs-base PASSes
+    def case_no_ir_base():
+        nb = arm_of(trace(1), 10)
+        nb.pop("ir_per_op")
+        rows = gates({"full-snap-c1": arm_of(trace(1), 10)}, {"full-snap-c1": nb}, budget, None)
+        r = by_id(rows)
+        ins, sv = r.get("instructions/create"), r.get("syscalls-vs-base/full-snap-c1")
+        return (ins is not None and (ins[3], ins[4]) == ("INFO", "regression") and sv is not None and sv[3] == "PASS"
+                and not regression_green(rows))
+    cases.append(("LOW 28: no Ir base and no artifact, syscalls-vs-base PASS: instructions/create is ('INFO', "
+                  "'regression') and regression_green is false", guarded(case_no_ir_base)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")

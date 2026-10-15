@@ -51,7 +51,13 @@
 //!
 //! Output (`--out`): `ops.tsv` (client, op, phase, ns) and `summary.json` (per phase: ops,
 //! p50/p90/p99/max/mean ns, window seconds, ops/s, and the engine's own sync counter delta over
-//! the window). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
+//! the window; each window's CLOCK_REALTIME bounds `t0_realtime_s`/`t1_realtime_s` and the measured span
+//! `tm0_realtime_s`/`tm1_realtime_s`, the competitors' names, so the shared tracer sweeper's cost is read over the
+//! measured windows: the MED 12 ruling). Under `--warmup OPS:S:MAX_S`, `warmup-live.json` is the live warm-up's own
+//! record `{rule, claims_ns, stop_at, warm_ops, capped}`: every claim it judged, in ns since its start, in judging
+//! order, and the decision, which `warmup_conformance.py live` replays through `--warmup-replay` (review 5 MED 8). The
+//! warm-up's clock starts only after every client is ready (a ready barrier, then t0, then a go barrier, as bbload's
+//! g_t0), recorded as `warmup.t0_after_ready_ns` (t0 minus the last client's ready). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
 //! with `NOT AVAILABLE` while the engine has no async-durable class (SyncClass is Off, Fsync,
 //! FullFsync at the time of writing), so a caller records the arm as not run instead of
 //! measuring something else.
@@ -60,7 +66,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use turso_core::branch::{sync_counts, BranchDurability, SyncClass};
 use turso_core::{
@@ -340,8 +346,28 @@ struct Warm {
     t0: Option<Instant>,
     claimed: usize,
     end: Option<(bool, usize, u64)>,
+    /// every claim judged, ns since t0, in judging order (the stop's claim last): the live record (review 5 MED 8)
+    claims: Vec<u64>,
 }
-static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None });
+static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None, claims: Vec::new() });
+
+/// Each client's ready instant, pushed just before the ready barrier: the warm-up's t0 follows the latest of them.
+static READY: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+/// This process's TracerPid (/proc/self/status, read whole, as the shared sweeper reads each task's), or None where
+/// there is no /proc (macOS): recorded at the measured span's open and close, as bbload's tracerpid_tm0/tm1.
+fn tracer_pid() -> Option<u64> {
+    let st = std::fs::read_to_string("/proc/self/status").ok()?;
+    st.lines().find_map(|l| l.strip_prefix("TracerPid:")).and_then(|v| v.trim().parse().ok())
+}
+
+/// CLOCK_REALTIME in seconds, as the shared sweeper's EPOCHREALTIME reads it.
+fn realtime_s() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| not_a_result("the realtime clock is before 1970"))
+        .as_secs_f64()
+}
 
 /// bbload's warm-up decision, the definition (artie frontier/fastest/tools/loadgen/bbload.c claim_op at ec9bba5552,
 /// factored there as warm_ends; the lead's ruling on fourth lane review LOW 14, PREREG annex A23), made at a claim:
@@ -373,6 +399,7 @@ fn warm_claim(rule: &(usize, f64, f64, String)) -> bool {
         .t0
         .map(|t| t.elapsed().as_nanos() as u64)
         .unwrap_or_else(|| not_a_result("a warm-up claim before its start"));
+    w.claims.push(el);
     match warm_ends(w.claimed, el, rule.0, secs_ns(rule.1), secs_ns(rule.2)) {
         None => {
             w.claimed += 1;
@@ -533,7 +560,9 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
         }
     };
     let n = a.ops_of[id];
-    gate.wait(); // ready
+    READY.lock().unwrap_or_else(|e| e.into_inner()).push(Instant::now());
+    gate.wait(); // ready: every client connected and set up
+    gate.wait(); // go: the main thread has started the warm-up's clock
     if let Some(rule) = &a.warm_rule {
         let mut k = 0usize;
         while warm_claim(rule) {
@@ -650,8 +679,12 @@ fn main() {
     let gate = Barrier::new(a.clients + 1);
     // seconds from the warm-up's start to every client done (under a rule, the claim that ended it is in WARM)
     let mut warm_secs = 0.0f64;
-    // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
-    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
+    // the warm-up's start minus the last client's ready, ns (>= 0 by construction; recorded so a gate can see it)
+    let mut t0_after_ready_ns = 0i64;
+    // this process's TracerPid at the first window's open and the last one's close
+    let (mut tp0, mut tp1) = (None, None);
+    // (window, secs, engine sync counter deltas by field, busy retries in the window, realtime open and close)
+    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64, f64, f64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
     let per_client: Vec<[Vec<u64>; 4]> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..a.clients)
@@ -660,11 +693,25 @@ fn main() {
                 s.spawn(move || client(id, db, a, gate))
             })
             .collect();
-        // the warm-up's clock starts before the clients are let go, so no claim precedes it; the clients decide its
-        // end at their claims (warm_claim), as bbload's do
+        // the warm-up's clock starts after every client is ready and before any is let go (review 5 MED 8: bbload's
+        // g_t0), so no connect or setup counts as warm-up and no claim precedes it; the clients decide its end at
+        // their claims (warm_claim), as bbload's do
+        gate.wait(); // ready
         let t = Instant::now();
         WARM.lock().unwrap_or_else(|e| e.into_inner()).t0 = Some(t);
-        gate.wait(); // ready
+        let last_ready = READY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_else(|| not_a_result("no client recorded its ready"));
+        t0_after_ready_ns = if t >= last_ready {
+            (t - last_ready).as_nanos() as i64
+        } else {
+            -((last_ready - t).as_nanos() as i64)
+        };
+        gate.wait(); // go
         fence.marker("FASTEST_PHASE warmup begin");
         gate.wait(); // warm-up done
         warm_secs = t.elapsed().as_secs_f64();
@@ -672,18 +719,28 @@ fn main() {
         for w in &windows_wanted {
             let s0 = engine_syncs();
             let r0 = retries();
+            // the TracerPid reads sit outside every window's fences (no counted or marked syscall), the first before
+            // the first window opens and the last after the last one closes
+            if windows.is_empty() {
+                tp0 = Some(tracer_pid());
+            }
             fence.begin(w);
+            let rt0 = realtime_s();
             let t = Instant::now();
             gate.wait(); // every client starts the window
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
+            let rt1 = realtime_s();
             fence.end(w);
+            if windows.len() + 1 == windows_wanted.len() {
+                tp1 = Some(tracer_pid());
+            }
             let s1 = engine_syncs();
             if s1.is_empty() || s1.len() != s0.len() {
                 not_a_result(&format!("engine sync counters unreadable: {:?}", sync_counts()));
             }
             let delta = s1.iter().zip(&s0).map(|((k, b), (_, a))| (k.clone(), b - a)).collect();
-            windows.push((w.to_string(), secs, delta, retries() - r0));
+            windows.push((w.to_string(), secs, delta, retries() - r0, rt0, rt1));
         }
         handles
             .into_iter()
@@ -707,6 +764,7 @@ fn main() {
     }
 
     let ops_total: usize = a.ops_of.iter().sum();
+    let mut warm_live = None;
     let (rule_text, warm_rule) = match &a.warm_rule {
         // the claim that ended it (its cycles claimed, its time, capped), the cycles over the whole warm-up (read after
         // every client finished: the same count, as no claim after the end is counted), and the drain apart
@@ -714,10 +772,16 @@ fn main() {
             let w = WARM.lock().unwrap_or_else(|e| e.into_inner());
             let (capped, at_stop, stop_ns) = w.end.unwrap_or_else(|| not_a_result("the warm-up never ended"));
             let stop = stop_ns as f64 / 1e9;
+            let claims: Vec<String> = w.claims.iter().map(u64::to_string).collect();
+            warm_live = Some(format!(
+                "{{\"rule\":\"{text}\",\"claims_ns\":[{}],\"stop_at\":{at_stop},\"warm_ops\":{at_stop},\"capped\":{}}}\n",
+                claims.join(","),
+                u8::from(capped)
+            ));
             (
                 text.clone(),
                 format!(
-                    "{{\"rule\":\"{text}\",\"ops_at_stop\":{at_stop},\"ops\":{},\"stop_secs\":{stop:.3},\"drain_secs\":{:.3},\"secs\":{:.3},\"capped\":{capped}}}",
+                    "{{\"rule\":\"{text}\",\"ops_at_stop\":{at_stop},\"ops\":{},\"stop_secs\":{stop:.3},\"drain_secs\":{:.3},\"secs\":{:.3},\"capped\":{capped},\"t0_after_ready_ns\":{t0_after_ready_ns}}}",
                     w.claimed,
                     warm_secs - stop,
                     warm_secs
@@ -727,17 +791,23 @@ fn main() {
         None => (
             format!("cycles_per_client:{}", a.warmup),
             format!(
-                "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3}}}",
+                "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3},\"t0_after_ready_ns\":{t0_after_ready_ns}}}",
                 a.warmup,
                 a.clients * a.warmup,
                 warm_secs
             ),
         ),
     };
+    // the measured span's bounds are the first window's open and the last one's close: a run with no window has none
+    // (unreachable: --phases is 1-4 and cycle mode has one window), and is refused rather than printed as NaN
+    let (Some(first), Some(last)) = (windows.first(), windows.last()) else {
+        not_a_result("no measured window, so no measured span")
+    };
+    let (tm0, tm1) = (first.4, last.5);
     let even = a.ops_of.iter().all(|&n| n == a.ops_of[0]);
     let by_client: Vec<String> = a.ops_of.iter().map(|n| n.to_string()).collect();
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"tm0_realtime_s\":{:.6},\"tm1_realtime_s\":{:.6},\"tracerpid_tm0\":{},\"tracerpid_tm1\":{},\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
@@ -747,13 +817,17 @@ fn main() {
         if a.warm_rule.is_some() { "null".into() } else { a.warmup.to_string() },
         a.rows,
         a.phases,
-        if a.mode == Mode::Phases { "phases" } else { "cycle" }
+        if a.mode == Mode::Phases { "phases" } else { "cycle" },
+        tm0,
+        tm1,
+        tp0.flatten().map_or("null".to_string(), |v| v.to_string()),
+        tp1.flatten().map_or("null".to_string(), |v| v.to_string())
     );
-    for (k, (name, secs, syncs, busy)) in windows.iter().enumerate() {
+    for (k, (name, secs, syncs, busy, rt0, rt1)) in windows.iter().enumerate() {
         let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();
         let total: u64 = syncs.iter().map(|(_, v)| v).sum();
         json.push_str(&format!(
-            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total}}}",
+            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total},\"t0_realtime_s\":{rt0:.6},\"t1_realtime_s\":{rt1:.6}}}",
             if k > 0 { "," } else { "" },
             fields.join(",")
         ));
@@ -790,5 +864,9 @@ fn main() {
         std::fs::create_dir_all(out).unwrap_or_else(|e| not_a_result(&format!("mkdir out: {e}")));
         std::fs::write(out.join("summary.json"), &json).unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
         std::fs::write(out.join("ops.tsv"), &tsv).unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
+        if let Some(live) = &warm_live {
+            std::fs::write(out.join("warmup-live.json"), live)
+                .unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
+        }
     }
 }
