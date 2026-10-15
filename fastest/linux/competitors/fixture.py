@@ -287,6 +287,7 @@ def selftest():
     rb = {"count": 10000, "sum": 0, "row_hash": 83937210371}
     base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "live_branches": 0,
             "gen_seed_sha256": "ab" * 32, "schema_sha256": "5c" * 32, "du_bytes": 9000000, "engine_bytes": 8900000,
+            "parent_du_bytes": 9000000, "store_du_at_n_bytes": 41000000,
             "extents": {"t": 3},
             "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
             "readback": dict(rb), "expected_readback": dict(rb)}
@@ -365,6 +366,11 @@ def selftest():
          [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], header_18_19="1,1"))], False),
         ("a B1 checkpoint that left frames (reply 0|5|5)",
          [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], checkpoints="0|0|0;0|5|5"))], False),
+        # comp review 1 LOW 26: the parent's du BEFORE the prebranch (comparable across systems: Dolt's and
+        # Doltgres's du after it covers the whole store, branches included) and the whole store's at N after it
+        ("no parent du before the prebranch", [v(), v(system="dolt", parent_du_bytes=KeyError)], False),
+        ("no store du at N", [v(), v(system="doltgres", store_du_at_n_bytes=KeyError)], False),
+        ("a store du at N that is not a count", [v(), v(system="b1", store_du_at_n_bytes="x")], False),
         ("a B1 parent with one checkpoint reply of two",
          [v(), v(system="b1", maintenance_evidence=dict(ev["b1"], checkpoints="0|0|0"))], False),
         ("a system with no registered maintenance", [v(), v(system="mystery", maintenance="none")], False),
