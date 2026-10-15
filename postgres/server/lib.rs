@@ -4750,6 +4750,44 @@ mod tests {
         );
     }
 
+    /// bind_portal_parameters refuses parameter types and values that differ in number, where it
+    /// zipped them short: a value bound under another's type, or a parameter left unbound, which
+    /// the engine reads as NULL. check_bind_arity makes them equal before it is called, so this
+    /// guards an invariant, refused XX000 (wire review 18 item 23). Equal counts bind (the
+    /// control).
+    #[test]
+    fn binding_refuses_types_and_values_that_differ_in_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        let sql = "SELECT v FROM t WHERE id = $1 OR v = $2";
+        let stored = Arc::new(StoredStatement::new(
+            String::new(),
+            Parsed::new(sql.to_string()),
+            vec![],
+        ));
+        let bind = Bind::new(
+            None,
+            None,
+            vec![],
+            vec![Some(b"1".to_vec().into()), Some(b"2".to_vec().into())],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, stored).unwrap();
+        let conn = s.current(&mut s.state()).unwrap();
+        let (mut stmt, _) = conn.prepare_typed(sql).unwrap();
+        assert!(
+            bind_portal_parameters(&mut stmt, &portal, &[Type::INT4, Type::INT4]).is_ok(),
+            "the control: two types for two values"
+        );
+        for types in [vec![Type::INT4], vec![Type::INT4, Type::INT4, Type::INT4]] {
+            match bind_portal_parameters(&mut stmt, &portal, &types) {
+                Err(PgWireError::UserError(e)) => assert_eq!(e.code, "XX000", "{types:?}"),
+                other => panic!("{} types for 2 values: {other:?}", types.len()),
+            }
+        }
+    }
+
     type Stmt = <Session as ExtendedQueryHandler>::Statement;
 
     /// A client of the extended-protocol handlers in memory: pgwire's DefaultClient holds the
