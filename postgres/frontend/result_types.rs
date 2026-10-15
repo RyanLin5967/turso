@@ -286,8 +286,8 @@ const STAR: &str = "*";
 /// column reference resolves innermost first, as PostgreSQL resolves a correlated reference.
 type Scope = Vec<Vec<Rel>>;
 
-/// A column's type: `Some(Some(t))` resolved, `Some(None)` found with no type the walk knows,
-/// `None` not found (or ambiguous).
+/// A column's type: `Some(Some(t))` resolved, `Some(None)` found with no type the walk knows (or in
+/// two relations of one level with types that differ), `None` not found.
 type Found = Option<Option<u32>>;
 
 struct Infer<'a> {
@@ -1331,7 +1331,8 @@ impl Infer<'_> {
     }
 
     /// A column reference's type: `t.c` from the innermost level naming t, a bare `c` from the
-    /// innermost level holding it (ambiguous within one level: none).
+    /// innermost level holding it (in two of its relations: their type when they agree, else
+    /// untyped).
     fn column(&self, node: &PgNode, scope: &Scope) -> Found {
         let Some(Node::ColumnRef(c)) = node.node.as_ref() else {
             return None;
@@ -1373,9 +1374,12 @@ impl Infer<'_> {
                         return Some(None);
                     }
                     // In two relations of the level: one column a join merged (USING, NATURAL)
-                    // when they agree on its type, which it then has; untyped when they do not. A
-                    // column no join merges is the engine's 42702 whichever is returned. It was
-                    // read as not found, which fell to text (wire review 14 item 9).
+                    // when they agree on its type, which it then has; untyped when they do not, so
+                    // a USING over int4 and int8, which PostgreSQL types int8, is refused 42P18. A
+                    // column no join merges is the engine's 42702 whichever is returned, except in
+                    // ON CONFLICT DO UPDATE, where the engine binds a bare name to the target and
+                    // PostgreSQL refuses it 42702 (both recorded in COMPAT.md; wire review 17 item
+                    // 16). It was read as not found, which fell to text (wire review 14 item 9).
                     let found: Vec<Option<u32>> =
                         level.iter().filter_map(|rel| of(rel, column)).collect();
                     if let [first, rest @ ..] = found.as_slice() {

@@ -38,7 +38,7 @@ Basics not enumerated by the official feature matrix.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
-| JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
+| JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | A parameter compared with a column USING or NATURAL merges from columns of different types (int4 and int8) is refused 42P18, unless declared; PostgreSQL types it as their common type (int8) |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial (fixes unbuilt) | Including ORDER BY/LIMIT on compounds, PostgreSQL's grouping (INTERSECT binds tighter; parentheses group), an arm's own ORDER BY/LIMIT/OFFSET/WITH and a WITH on the whole set operation (non-left-spine and clause-bearing arms run as subqueries), and a VALUES arm. INTERSECT ALL and EXCEPT ALL are rejected (0A000): the engine has neither. ✅ once the reds (570cbe2c8, 68e5afaf6) run green |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
 | INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
@@ -201,7 +201,7 @@ INTEGER. Unknown type names pass through as custom types.
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
-| Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
+| Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets). A bare column in DO UPDATE's SET values or its WHERE names the target's column here, where PostgreSQL refuses it (42702: the target and EXCLUDED both hold it, analyze.c adds both to the namespace); qualify it (`t.c`, `excluded.c`) to mean the same in both |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
 | WITH ORDINALITY clause | ❌ Not supported | Rejected with an error; column aliases on a table function other than generate_series are rejected too |
