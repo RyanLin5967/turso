@@ -2006,10 +2006,16 @@ def main(argv):
                            (rd(os.path.join(nm, "first_n1_backing.txt")) or "").strip(), rb1)
     ast = rd(os.path.join(nm, "after_stray.txt"))
     # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
-    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
+    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown); V3 review 13 item 7:
+    # judged on NAME,BACK-FILE,AUTOCLEAR (a `losetup -d` on a mounted loop changed nothing the old record held), and
+    # nbx itself the same way (firecheck writes "absent" when this cell built no nbx; a missing record fails)
     pb = (rd(os.path.join(nm, "plant_before.txt")) or "").strip()
     pa = (rd(os.path.join(nm, "plant_after.txt")) or "").strip()
-    plant_ok = bool(pb) and pa == pb and (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip() == "yes"
+    plant_p = nest_plant_problems(pb, pa, rd(os.path.join(nm, "plant_mounted.txt")))
+    nbb = (rd(os.path.join(nm, "nbx_before.txt")) or "").strip()
+    nbx_p = [] if nbb == "absent" else nest_plant_problems(nbb, rd(os.path.join(nm, "nbx_after.txt")),
+                                                            rd(os.path.join(nm, "nbx_mounted.txt")))
+    plant_ok = not plant_p and not nbx_p
     check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
           and plant_ok
           and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
@@ -2026,6 +2032,7 @@ def main(argv):
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
            "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
            "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
+           "plant_problems": plant_p, "nbx_before": nbb, "nbx_problems": nbx_p,
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
            "n1extra": (rd(os.path.join(nm, "n1extra.dev")) or "").strip(),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
@@ -2569,6 +2576,28 @@ def nest_n1_problems(cell_dir, first_n1, rebuilt_n1):
     want = canon_path(cd + "/v3fx-n1.img")
     return ["the %s n1 image is %r, not the cell's %s" % (what, got, want)
             for what, got in (("first-built", first_n1), ("rebuilt", rebuilt_n1)) if canon_path(got) != want]
+
+
+def nest_plant_problems(before, after, mounted):
+    """V3 review 13 item 7: a loop --teardown-nest must leave alone (P_nest_modes' plant under $FX/nb/, and nbx), from
+    its `losetup -n -O NAME,BACK-FILE,AUTOCLEAR` line (xargs-joined) before and after the teardown and its mount after.
+    On a MOUNTED loop `losetup -d` changes neither the device, the backing file nor the mount; it only sets AUTOCLEAR
+    (the last field). So the line must be the same before and after, with AUTOCLEAR 0, and the mount still there; a
+    line without the AUTOCLEAR field cannot be judged. [] when untouched."""
+    b, a = (before or "").strip(), (after or "").strip()
+    if not b:
+        return ["no record of the loop before the teardown"]
+    if len(b.split()) < 3 or b.split()[-1] not in ("0", "1"):
+        return ["the record %r has no AUTOCLEAR field (want NAME BACK-FILE AUTOCLEAR)" % b]
+    probs = []
+    if b.split()[-1] != "0":
+        probs.append("AUTOCLEAR was already set before the teardown: %r" % b)
+    if a != b:
+        probs.append("the loop changed across the teardown (a `losetup -d` on a mounted loop sets AUTOCLEAR): %r, then %r"
+                     % (b, a))
+    if (mounted or "").strip() != "yes":
+        probs.append("the loop's mount is gone after the teardown")
+    return probs
 
 
 def f1b_window_syncs(text):

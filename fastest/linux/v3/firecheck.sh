@@ -754,10 +754,23 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   sudo mkdir -p "$FX/nb" "$FX/nbplant"
   sudo truncate -s 64M "$FX/nb/teardown-plant.img" && pl=$(sudo losetup --find --show "$FX/nb/teardown-plant.img") \
     && sudo mkfs.ext4 -q -F "$pl" && sudo mount "$pl" "$FX/nbplant" \
-    && echo "$pl $(losetup -n -O BACK-FILE "$pl" | xargs)" > "$NM/plant_before.txt"
+    && losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$pl" | xargs > "$NM/plant_before.txt"
+  # V3 review 13 item 7: NAME,BACK-FILE,AUTOCLEAR, since on a MOUNTED loop `losetup -d` only sets AUTOCLEAR (device,
+  # backing file and mount unchanged); and nbx, the real loop backed under $FX/nb/, recorded the same way
+  nbxd=""
+  if [ -f "$FX/nbx.ok" ] && mountpoint -q "$FX/nbx" 2>/dev/null; then
+    nbxd=$(findmnt -n -o SOURCE "$FX/nbx" | tail -1)
+    losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$nbxd" | xargs > "$NM/nbx_before.txt"
+  else
+    echo absent > "$NM/nbx_before.txt"
+  fi
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
-  if [ -n "$pl" ]; then echo "$pl $(losetup -n -O BACK-FILE "$pl" 2>/dev/null | xargs)" > "$NM/plant_after.txt"; fi
+  if [ -n "$pl" ]; then losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$pl" 2>/dev/null | xargs > "$NM/plant_after.txt"; fi
   mountpoint -q "$FX/nbplant" 2>/dev/null && echo yes > "$NM/plant_mounted.txt"
+  if [ -n "$nbxd" ]; then
+    losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$nbxd" 2>/dev/null | xargs > "$NM/nbx_after.txt"
+    mountpoint -q "$FX/nbx" 2>/dev/null && echo yes > "$NM/nbx_mounted.txt"
+  fi
   # the plant is removed now, whatever the teardown did to it
   sudo umount "$FX/nbplant" 2>/dev/null; [ -n "$pl" ] && sudo losetup -d "$pl" 2>/dev/null; sudo rm -f "$FX/nb/teardown-plant.img"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
