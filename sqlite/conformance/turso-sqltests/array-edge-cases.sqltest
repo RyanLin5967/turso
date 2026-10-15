@@ -899,6 +899,27 @@ expect error {
     cannot store TEXT value in INTEGER
 }
 
+# Through a domain too: a domain over float8 has no ENCODE either (fresh-context review of the
+# ultrareview fixes).
+test float8-domain-array-rejects-a-text-element {
+    CREATE DOMAIN d8 AS float8;
+    CREATE TABLE fa5 (id INTEGER PRIMARY KEY, vals d8[]) STRICT;
+    INSERT INTO fa5 VALUES (1, '{1.5,abc}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+# A bytea[] keeps what it took before: only integer and real bases are checked as their base.
+test bytea-array-keeps-a-text-element {
+    CREATE TABLE fa6 (id INTEGER PRIMARY KEY, vals bytea[]) STRICT;
+    INSERT INTO fa6 VALUES (1, '{abc}');
+    SELECT count(*) FROM fa6;
+}
+expect {
+    1
+}
+
 test float8-array-keeps-its-numbers {
     CREATE TABLE fa4 (id INTEGER PRIMARY KEY, vals float8[]) STRICT;
     INSERT INTO fa4 VALUES (1, '{1.5,2}');
