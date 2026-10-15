@@ -1406,6 +1406,18 @@ impl Session {
                     ))
                 }
                 TxVerb::RollbackTo => {}
+                // AND CHAIN ends a failed block as its COMMIT or ROLLBACK does, answered
+                // ROLLBACK, and chains a new block, as PostgreSQL does (recorded on 18.6; it was
+                // 25P02, the block left failed: wire review 15 item 23).
+                TxVerb::Chain { .. } => {
+                    if in_tx {
+                        conn.execute("ROLLBACK").map_err(|e| engine_info(&e))?;
+                    }
+                    st.aborted = false;
+                    conn.engine_tx(TxStmt::Begin)
+                        .map_err(|e| engine_info(&e))?;
+                    return Ok(Response::Execution(Tag::new("ROLLBACK")));
+                }
                 _ => return Err(aborted_error()),
             }
         }
@@ -1452,7 +1464,9 @@ impl Session {
             // AND CHAIN outside a block is PostgreSQL's error, not its warning; inside one the
             // chain is not supported (below). It was read as an ordinary COMMIT, which committed
             // and left the session idle (wire review 11 item 7).
-            TxVerb::Chain { commit } if !in_tx => {
+            // In an implicit block too, as PostgreSQL answers there (it was 0A000: wire review 13
+            // item 13); the error rolls the implicit block back.
+            TxVerb::Chain { commit } if !in_tx || st.implicit => {
                 let what = if commit {
                     "COMMIT AND CHAIN"
                 } else {
