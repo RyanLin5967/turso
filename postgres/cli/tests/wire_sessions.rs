@@ -468,6 +468,29 @@ impl Wire {
         self.read_reply()
     }
 
+    /// [`Wire::x`] with NO declared parameter types (the Parse lists none) and `values` bound as
+    /// text, no Describe: what a client that lets the server infer every type sends.
+    fn x_undeclared(&mut self, sql: &str, values: &[&str]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v.as_bytes());
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        self.send(b'B', &bind);
+        let mut exec = vec![0u8];
+        exec.extend_from_slice(&0i32.to_be_bytes());
+        self.send(b'E', &exec);
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+
     /// [`Wire::x`] with each parameter's declared type OID (0: unspecified), format code (0 text,
     /// 1 binary) and bytes.
     fn xt(&mut self, sql: &str, params: &[(u32, i16, &[u8])]) -> Reply {
@@ -818,6 +841,63 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
         closed_after < Duration::from_secs(3),
         "the trickled startup was ended only after {closed_after:?}"
     );
+}
+
+/// A Parse that declares no types and the statement's parameters counted as PostgreSQL 18.6 counts
+/// them (recorded, pg18-diff/pg18-c26.out, c26.py; Claude C26 MED 1): an empty statement or a comment
+/// before the SELECT, and an E-string continued over a newline (`$2` inside it is text, not a
+/// parameter), each take ONE value; two values for the E-string statement are refused 08P01 with
+/// PostgreSQL's words. 745585f27's count began at the first token (`;`) and read the continuation
+/// as a standard string, so one value was refused.
+#[test]
+fn a_bind_counts_the_parameters_postgresql_counts_after_an_empty_prefix_and_in_an_e_string() {
+    let dir = Scratch::new("bindcount");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, want) in [
+        (";SELECT $1::int", "41"),
+        (" ; /* c */ ; SELECT $1::int", "41"),
+        ("SELECT E'one'\n'\\'$2' || $1::text", "one'$241"),
+    ] {
+        let r = a.x_undeclared(sql, &["41"]).ok(sql);
+        assert_eq!(r.rows, [[Some(want.to_string())]], "{sql:?}");
+    }
+    let sql = "SELECT E'one'\n'\\'$2' || $1::text";
+    let e = a.x_undeclared(sql, &["41", "2"]).err(sql);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        (
+            "08P01",
+            "bind message supplies 2 parameters, but prepared statement \"\" requires 1"
+        )
+    );
+}
+
+/// lock_timeout and client_min_messages follow the transaction as PostgreSQL 18.6's do (recorded,
+/// pg18-diff/pg18-c26.out; Claude C26 MED 3): a SET inside a block that rolls back, and SET LOCAL in
+/// a block that commits, leave the session's value; a SET in a block that commits keeps it. Ours
+/// kept every one for the session (later warnings dropped, later lock waits failing early).
+#[test]
+fn lock_timeout_and_client_min_messages_follow_the_transaction() {
+    let dir = Scratch::new("settingscope");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let show = |a: &mut Wire, name: &str| a.q(&format!("SHOW {name}")).ok("SHOW").rows[0][0].clone();
+    for (script, name, want) in [
+        (["BEGIN", "SET client_min_messages = error", "ROLLBACK"], "client_min_messages", "notice"),
+        (["BEGIN", "SET LOCAL client_min_messages = error", "COMMIT"], "client_min_messages", "notice"),
+        (["BEGIN", "SET LOCAL lock_timeout = '100ms'", "COMMIT"], "lock_timeout", "0"),
+        (["BEGIN", "SET lock_timeout = '100ms'", "ROLLBACK"], "lock_timeout", "0"),
+        (["BEGIN", "SET lock_timeout = '100ms'", "COMMIT"], "lock_timeout", "100ms"),
+        (["BEGIN", "SET client_min_messages = error", "COMMIT"], "client_min_messages", "error"),
+    ] {
+        for sql in script {
+            a.q(sql).ok(sql);
+        }
+        assert_eq!(show(&mut a, name).as_deref(), Some(want), "{script:?}");
+        a.q("SET lock_timeout = 0").ok("reset lock_timeout");
+        a.q("SET client_min_messages = notice").ok("reset client_min_messages");
+    }
 }
 
 /// A branch call waiting for another session to leave its branch (the in-use wait, up to 5 s) is
