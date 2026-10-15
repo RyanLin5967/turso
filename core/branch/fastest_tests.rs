@@ -9307,3 +9307,55 @@ fn a_connect_racing_a_failed_drop_is_not_refused_as_no_such_branch() {
         );
     }
 }
+
+/// DECISIONS bd0d845f97 (lead, ordered after c9c821dd8d): the background writer synced the snapshot
+/// compaction holding the store mutex, so `compaction_waits` counted a stall it did not remove: at
+/// C=1 the next operation after the threshold-crossing create waited behind the compaction's syncs.
+/// With the writer held mid-compaction (`HOLD_COMPACT_LOCKED`, the stage that held the mutex at
+/// c9c821dd8d), a create on another connection is acknowledged at once, having waited for nothing
+/// and synced nothing on its thread; released, the compaction completes (the log shrinks), and no
+/// operation was counted waiting behind it. Raised D0 snapshot store. Mutant
+/// `compaction_syncs_under_mutex`.
+#[test]
+fn a_create_does_not_wait_for_a_background_compaction() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("compact-no-wait.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_LOCKED);
+    let _t = Threshold::set(8 << 10);
+    let base = db.branch_exception_counters();
+    let longest = db.branches.log_len_for_test();
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never reached its hold", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_LOCKED | super::store::HOLD_ARRIVED
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let (waits, syncs) = (super::store::thread_waits(), super::store::thread_syncs());
+            let created = db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id());
+            let _ = tx.send((created.is_ok(), super::store::thread_waits() - waits, super::store::thread_syncs() - syncs));
+        })
+    };
+    let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+    db.branches.confirm_hold_for_test(0);
+    creator.join().unwrap();
+    assert_eq!(
+        created,
+        Ok((true, 0, 0)),
+        "CLAIM: a create during the background compaction was not acknowledged at once \
+         (created, waits, syncs on its thread; a timeout: it waited behind the compaction)"
+    );
+    eventually("the background compaction never shrank the log", || {
+        !db.branches.compaction_owed_for_test() && db.branches.log_len_for_test() < longest.max(8 << 10)
+    });
+    let after = db.branch_exception_counters();
+    assert_eq!(after[3], base[3], "an operation was counted waiting behind the background compaction");
+    assert_eq!(after[2], base[2], "a compaction synced inline on an operation");
+}
