@@ -222,7 +222,10 @@ mod tests {
                     "premise: a known stack under 512 KiB, got {size:?}"
                 );
                 let outer = NestGuard::enter("outermost");
-                assert!(outer.is_ok(), "the outermost step was refused on a {size:?} B thread");
+                assert!(
+                    outer.is_ok(),
+                    "the outermost step was refused on a {size:?} B thread"
+                );
                 let levels = nest_until_refused(1);
                 assert!(levels >= 2, "only {levels} levels on a {size:?} B thread");
             })

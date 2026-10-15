@@ -35,8 +35,11 @@ pub struct PostgreSQLTranslator {
     /// The CTEs in scope, one list per statement with a WITH, innermost last: each CTE's name and
     /// the names of its output columns when its query names them all. An unqualified FROM name a
     /// CTE holds is the CTE, not a table of the same name.
-    cte_scopes: std::cell::RefCell<Vec<Vec<(String, Option<Vec<String>>)>>>,
+    cte_scopes: std::cell::RefCell<Vec<CteScope>>,
 }
+
+/// One WITH's CTEs: each name, with its output columns when its query names them all.
+type CteScope = Vec<(String, Option<Vec<String>>)>;
 
 /// A relation's declared columns by (schema, as written or empty; name), or None when they cannot
 /// be read.
@@ -1604,7 +1607,9 @@ impl PostgreSQLTranslator {
         &self,
         insert: &pg_query::protobuf::InsertStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        self.in_cte_scope(&insert.with_clause, || self.translate_insert_in_scope(insert))
+        self.in_cte_scope(&insert.with_clause, || {
+            self.translate_insert_in_scope(insert)
+        })
     }
 
     fn translate_insert_in_scope(
@@ -1820,7 +1825,9 @@ impl PostgreSQLTranslator {
         &self,
         update: &pg_query::protobuf::UpdateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        self.in_cte_scope(&update.with_clause, || self.translate_update_in_scope(update))
+        self.in_cte_scope(&update.with_clause, || {
+            self.translate_update_in_scope(update)
+        })
     }
 
     fn translate_update_in_scope(
@@ -1948,7 +1955,9 @@ impl PostgreSQLTranslator {
         &self,
         delete: &pg_query::protobuf::DeleteStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        self.in_cte_scope(&delete.with_clause, || self.translate_delete_in_scope(delete))
+        self.in_cte_scope(&delete.with_clause, || {
+            self.translate_delete_in_scope(delete)
+        })
     }
 
     fn translate_delete_in_scope(
@@ -2076,7 +2085,9 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        self.in_cte_scope(&select.with_clause, || self.translate_select_in_scope(select))
+        self.in_cte_scope(&select.with_clause, || {
+            self.translate_select_in_scope(select)
+        })
     }
 
     fn translate_select_in_scope(
@@ -7048,7 +7059,6 @@ fn default_in_every_row(lists: &[pg_query::protobuf::Node]) -> bool {
         })
     })
 }
-
 
 /// A CTE's output column names, as the engine names them: its column list over its query's own
 /// names. None when its query has a column whose name the engine would derive from the

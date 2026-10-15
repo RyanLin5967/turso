@@ -783,7 +783,8 @@ fn a_trickled_startup_ends_at_the_authentication_timeout() {
     let dir = Scratch::new("startuptrickle");
     let server = Server::start(&dir.db(), &["--authentication-timeout", "1"]);
     let mut slow = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
-    slow.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(1)))
+        .unwrap();
     let mut startup = Vec::new();
     startup.extend_from_slice(&1024i32.to_be_bytes());
     startup.extend_from_slice(&196608i32.to_be_bytes());
@@ -3174,15 +3175,24 @@ fn a_from_alias_column_list_on_a_cte_renames_the_ctes_columns() {
     let r = a
         .q("WITH t AS (SELECT 1 AS k, 2 AS m) SELECT * FROM t AS a (x)")
         .ok("a CTE named like a table");
-    assert_eq!((r.names, r.rows), (names(&["x", "m"]), vec![vec![t("1"), t("2")]]));
+    assert_eq!(
+        (r.names, r.rows),
+        (names(&["x", "m"]), vec![vec![t("1"), t("2")]])
+    );
     let r = a
         .q("WITH c (p, q) AS (SELECT id, v FROM t) SELECT a.y, q FROM c a (y)")
         .ok("a CTE with no table of its name, its own column list");
-    assert_eq!((r.names, r.rows), (names(&["y", "q"]), vec![vec![t("10"), t("20")]]));
+    assert_eq!(
+        (r.names, r.rows),
+        (names(&["y", "q"]), vec![vec![t("10"), t("20")]])
+    );
     let r = a
         .q("SELECT * FROM t AS a (x) WHERE EXISTS (WITH t AS (SELECT 1 AS k) SELECT 1 FROM t)")
         .ok("a CTE out of the FROM's scope");
-    assert_eq!((r.names, r.rows), (names(&["x", "v"]), vec![vec![t("10"), t("20")]]));
+    assert_eq!(
+        (r.names, r.rows),
+        (names(&["x", "v"]), vec![vec![t("10"), t("20")]])
+    );
 }
 
 /// KNOWN RED (ENGINE; known-red.txt): `SELECT *` over a RIGHT JOIN ... USING or a NATURAL RIGHT
@@ -3477,7 +3487,9 @@ fn a_statement_waiting_on_a_lock_stops_on_statement_timeout_and_on_cancel() {
     b.s.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
     b.q("SET statement_timeout = 500").ok("statement_timeout");
     let started = Instant::now();
-    let e = b.q("INSERT INTO t VALUES (2)").err("statement_timeout during a lock wait");
+    let e = b
+        .q("INSERT INTO t VALUES (2)")
+        .err("statement_timeout during a lock wait");
     assert_eq!(
         e.code,
         "57014",
@@ -3485,7 +3497,11 @@ fn a_statement_waiting_on_a_lock_stops_on_statement_timeout_and_on_cancel() {
         e.message,
         started.elapsed()
     );
-    assert!(started.elapsed() < Duration::from_secs(5), "timeout took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "timeout took {:?}",
+        started.elapsed()
+    );
     b.q("SET statement_timeout = 0").ok("statement_timeout off");
     let key = b.key.clone().expect("BackendKeyData at startup");
     for sql in ["INSERT INTO t VALUES (3)", "CHECKPOINT"] {
@@ -3518,7 +3534,9 @@ fn a_statement_waiting_on_a_lock_stops_on_statement_timeout_and_on_cancel() {
     }
     b.q("SET statement_timeout = 500").ok("statement_timeout");
     let started = Instant::now();
-    let e = b.q("CHECKPOINT").err("statement_timeout during CHECKPOINT's lock wait");
+    let e = b
+        .q("CHECKPOINT")
+        .err("statement_timeout during CHECKPOINT's lock wait");
     assert_eq!(
         e.code,
         "57014",
@@ -3526,7 +3544,11 @@ fn a_statement_waiting_on_a_lock_stops_on_statement_timeout_and_on_cancel() {
         e.message,
         started.elapsed()
     );
-    assert!(started.elapsed() < Duration::from_secs(5), "timeout took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "timeout took {:?}",
+        started.elapsed()
+    );
     b.q("SET statement_timeout = 0").ok("statement_timeout off");
     holder.q("COMMIT").ok("commit");
     b.q("INSERT INTO t VALUES (4)").ok("the lock is free again");

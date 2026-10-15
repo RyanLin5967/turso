@@ -2639,7 +2639,10 @@ mod tests {
         let conn = crate::Connection::new(db.connect().unwrap());
         run(&conn, "CREATE TABLE m (a int, b int, c text default 'm')");
         run(&conn, "CREATE SCHEMA app");
-        run(&conn, "CREATE TABLE app.w (a int, b int, c text default 'w')");
+        run(
+            &conn,
+            "CREATE TABLE app.w (a int, b int, c text default 'w')",
+        );
         let before = table_info_reads();
         run(&conn, "SET search_path TO \"$user\", public");
         run(&conn, "INSERT INTO m VALUES (DEFAULT, 1)");
@@ -2650,13 +2653,22 @@ mod tests {
         run(&conn, "INSERT INTO m VALUES (5)");
         run(&conn, "SET search_path TO public");
         run(&conn, "INSERT INTO app.w VALUES (DEFAULT, 6)");
-        assert_eq!(table_info_reads() - before, 0, "a positional INSERT read the catalog");
+        assert_eq!(
+            table_info_reads() - before,
+            0,
+            "a positional INSERT read the catalog"
+        );
         let rows = |sql: &str| -> Vec<String> {
             let mut stmt = conn.prepare(sql).unwrap();
             stmt.run_collect_rows()
                 .unwrap()
                 .iter()
-                .map(|r| r.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join("|"))
+                .map(|r| {
+                    r.iter()
+                        .map(|v| format!("{v}"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
                 .collect()
         };
         assert_eq!(
