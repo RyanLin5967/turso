@@ -5421,6 +5421,49 @@ mod tests {
         assert!(over.is_empty(), "over the budget: {over:#?}");
     }
 
+    /// L5's allocation budget for a write over the simple protocol (the cycle's write step,
+    /// budget.py work): an UPDATE allocates, beyond the engine's own prepare and run of the same
+    /// statement on the session's connection, no more than the empty query does. At 4f28b42c6 it
+    /// paid 5: the statement split's Vec and String, the command tag's upper-cased copy of the
+    /// query, its Tag String and the CommandComplete's.
+    #[test]
+    fn a_write_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "INSERT INTO t VALUES (1, 0)");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let mut wire = |sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(&mut c, q)).unwrap();
+            n() - a0
+        };
+        let sql = "UPDATE t SET v = v + 1 WHERE id = 1";
+        for _ in 0..3 {
+            wire(";");
+            wire(sql);
+        }
+        let empty = wire(";");
+        let own = s.current(&mut s.state()).unwrap();
+        let a0 = n();
+        let mut stmt = own.prepare(sql).unwrap();
+        stmt.run_ignore_rows().unwrap();
+        drop(stmt);
+        let engine = n() - a0;
+        let write = wire(sql);
+        assert!(
+            write.saturating_sub(engine) <= empty,
+            "the write: wire {write}, engine {engine}, excess {} > the empty query's {empty}",
+            write.saturating_sub(engine)
+        );
+    }
+
     fn ok(session: &Session, sql: &str) {
         for r in session.simple(sql) {
             if let Response::Error(e) = r {
