@@ -22,6 +22,12 @@ three-driver conformance record (warmup-conformance.json, rc 0) naming this pack
 fastest_profile by sha256 (binaries.txt), and with no competitor warm-up claim judged out of time order
 (warmup_backsteps 0 in either loop mode; the loop is reported in runs[].warmup_loops): otherwise a parity refusal and
 a loud_owed line (review 5 MED 6; PREREG annex A23).
+The engine's four branch exception counters (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): every
+window of ours' result/summary.json carries exception_counters {before, after} (hardcap_upgrades,
+header_raise_exclusive, inline_compaction_syncs, compaction_waits; fastest_profile must emit them: Rust, HELD);
+runs[].exception_counter_deltas holds each window's re-derived delta. A missing or unreadable record is a parity
+refusal; a nonzero delta labels the cell uncredited (runs[].counters_credited false, listed in uncredited_cells),
+which does not fail the package. Competitor runs are not the turso engine and carry none.
 The shared sweeper (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): every measured run's timed.json
 records sweeper_cpu_s (ours: t3lib.sh ours_timed_record, re-derived here from the run's own timed.tracer.tsv by
 gates/sweeper_record.py; a competitor: each timed.json timedrun.py wrote); a missing or refused one is a parity
@@ -222,7 +228,9 @@ def run_parity(d, system, adapter_rc=None):
         except (OSError, ValueError):
             j = {}
         cpu, win, sw = ours_sweeper(d, adapter_rc)
+        exc, exc_bad = exception_deltas(j)
         return {"warmup_rules": [j.get("warmup_rule")], "ops_measured": [j.get("ops_total")],
+                "exception_counter_deltas": exc, "exception_counter_problems": exc_bad,
                 "ops_total_asked": j.get("ops_total_asked"), "sweeper_cpu_s": [cpu], "sweeper_windows": [win],
                 "sweeper_problems": sw}
     # A competitor's timed run is judged by timedrun.py check (its timed.json: verdict ok, ops = the N it ran for),
@@ -269,6 +277,43 @@ def run_parity(d, system, adapter_rc=None):
 
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates")
+
+
+# the engine's branch exception counters, in Database::branch_exception_counters()'s order (the lead's routing ruling,
+# DECISIONS 2026-10-15T05:16:51Z): each counts a path that stalls or widens a create, so a credited cell needs all four
+# unchanged inside its windows
+EXCEPTION_COUNTERS = ("hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits")
+
+
+def exception_deltas(j):
+    """({window: {counter: after - before}} or None, the refusals) from ours' result/summary.json: every window carries
+    exception_counters {before, after}, each naming all four counters as non-negative ints, none going backwards. The
+    deltas are re-derived here from the raw reads; fastest_profile must emit them (Rust, HELD, LOUD-OWED)."""
+    wins = j.get("windows") if isinstance(j, dict) else None
+    if not isinstance(wins, list) or not wins:
+        return None, ["summary.json has no windows, so the engine's branch exception counters are unknown "
+                      "(fastest_profile must record them per window: Rust, HELD)"]
+    out, bad = {}, []
+    for i, w in enumerate(wins):
+        name = w.get("window") if isinstance(w, dict) and isinstance(w.get("window"), str) else f"#{i}"
+        ec = w.get("exception_counters") if isinstance(w, dict) else None
+        if not isinstance(ec, dict) or not isinstance(ec.get("before"), dict) or not isinstance(ec.get("after"), dict):
+            bad.append(f"window {name}: no exception_counters {{before, after}} (the engine's branch exception "
+                       "counters; fastest_profile must record them: Rust, HELD)")
+            continue
+        d = {}
+        for k in EXCEPTION_COUNTERS:
+            a, b = ec["before"].get(k), ec["after"].get(k)
+            if type(a) is not int or type(b) is not int or a < 0 or b < 0:
+                bad.append(f"window {name}: exception counter {k} before {a!r} after {b!r}, not two non-negative ints")
+            elif b < a:
+                bad.append(f"window {name}: exception counter {k} went backwards ({a} -> {b})")
+            else:
+                d[k] = b - a
+        if name in out:
+            bad.append(f"window {name}: named twice")
+        out[name] = d
+    return (None, bad) if bad else (out, [])
 
 
 COMPETITORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "competitors")
@@ -420,6 +465,7 @@ def summarize(out, sha, dry, manifest):
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
     warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
+    uncredited = []  # every nonzero exception-counter delta inside a window: labels its cell uncredited
     sweeper_bad = []  # every sweeper refusal (MED 12 ruling): sweeper_creditable is derived from them and the windows
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
@@ -478,6 +524,15 @@ def summarize(out, sha, dry, manifest):
                 parity.append(f"{fs}/{cell}: ops_total_asked {r.get('ops_total_asked')!r}, planned {want!r}")
             for x in r.get("expected_missing") or []:
                 parity.append(f"{fs}/{cell}: {x}")
+            # the engine's branch exception counters (routing ruling 05:16:51Z): recorded for every run of ours; a
+            # missing or unreadable record refuses, a nonzero delta in any (credited) window labels the cell uncredited
+            for x in r.get("exception_counter_problems") or []:
+                parity.append(f"{fs}/{cell}: {x}")
+            if system == "ours":
+                hot = [f"{fs}/{cell}: window {wn}: {k} +{v}" for wn, dd in (r.get("exception_counter_deltas") or {}).items()
+                       for k, v in dd.items() if v]
+                r["counters_credited"] = r.get("exception_counter_deltas") is not None and not hot
+                uncredited += hot
             # MED 12 ruling: the shared sweeper's cost is known for every timed run (ours re-derived, theirs read)
             for x in r.get("sweeper_problems") or []:
                 parity.append(f"{fs}/{cell}: sweeper (MED 12): {x}")
@@ -532,7 +587,7 @@ def summarize(out, sha, dry, manifest):
                "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
                "failed_checks": failed_checks, "failed_blocks": failed_blocks, "warmup_rule": rule,
                "parity_refusals": parity, "fixture_refusals": fixture, "normaliser_missing": normaliser,
-               "unquiet_runs": unquiet,
+               "unquiet_runs": unquiet, "uncredited_cells": uncredited,
                "failed_stages": failed, "blocks": blocks, "runs": runs}
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
