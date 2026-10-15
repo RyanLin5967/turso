@@ -1471,14 +1471,47 @@ fn c1_sigkill_at_aimed_points() {
     assert!(landed > 0, "{summary}: no kill landed where it was aimed");
 }
 
-// FLAGGED TEST REMOVAL (engine review 20 LOW 16; my own test from 11129a4f8, never green): the arm
-// c1_d1_log_reopened_in_d0_survives_a_power_cut_at_cut_dir_synced is REMOVED as unreachable, measured:
-// 0 of 8 trials landed at cut.dir_synced (6 at 0631dc2de, 2 at 1c58a6f25; artie raws l7-low16, l8-low16),
-// each child running about 1,200 creates and 3,100 trunk commits. cut.dir_synced sits in
-// Flight::write between a flight's directory sync and its log sync, and a D0 child's flights sync
-// nothing (Journal::dirty_dir_handle returns None below a syncing class); the inherited D1 floor
-// raises only the first rewrite, not the flights. So the window LOW 16 names does not occur in a D0
-// child. The harness extension c1_trial_from stays (seed class, power) for later arms.
+/// Engine review 20 LOW 16, MOVED to a D1 child (lead ruling 2026-10-15T09:02:47Z: the arm's removal
+/// stands only if cut.dir_synced is unreachable in a D1 child too). In a D0 child it was unreachable,
+/// measured (0 of 8 aimed kills; artie raws l7-low16, l8-low16): D0 flights sync nothing. Here a
+/// catalog store in D1 throughout, fuzzy checkpoints cutting the log, a SIGKILL at `cut.dir_synced`
+/// (the syncing flight after a cut, between its directory sync and its log sync) under simulated
+/// power loss, which holds a rename until its directory is synced. Every acknowledged operation
+/// survives the recovery (I1-I7). Mutant `no_cut_dir_sync` (test builds only: a cut's rename is never
+/// made durable) must turn it red. Size: `FE_C1_TRIALS` (default 6).
+#[cfg(unix)]
+#[test]
+fn c1_d1_cut_survives_a_power_cut_at_cut_dir_synced() {
+    if std::env::var_os("FE_C1_CHILD").is_some() {
+        return;
+    }
+    let _s = serial();
+    let fuzzy = super::BranchCheckpoint::resolve(None, std::env::var_os("R11_SPLICE").is_some())
+        .is_ok_and(|m| m == super::BranchCheckpoint::Fuzzy);
+    assert!(fuzzy, "premise: catalog checkpoints are fuzzy in this build (the cut points are reachable)");
+    let exe = std::env::current_exe().unwrap();
+    let trials = env_u64("FE_C1_TRIALS", 6);
+    let mut rng = Rng(0x16 | 1);
+    let (mut landed, mut violations) = (0u64, Vec::new());
+    for trial in 0..trials {
+        let n = 1 + rng.below(4);
+        let (hit, bad, what, _) =
+            c1_trial_from(&exe, true, SyncClass::Fsync, SyncClass::Fsync, true, 4, "cut.dir_synced", n, 0x16 ^ trial, None);
+        landed += u64::from(hit);
+        if !hit {
+            println!("C1 LOW 16 trial {trial} unaimed: {what}");
+        }
+        for b in bad {
+            violations.push(format!("trial {trial} [{what}]: {b}"));
+        }
+    }
+    assert!(landed > 0, "premise: no kill landed at cut.dir_synced in {trials} trials");
+    assert!(
+        violations.is_empty(),
+        "CLAIM: a D1 cut lost acknowledged operations to a power cut at cut.dir_synced ({landed} of {trials} landed):\n{}",
+        violations.join("\n")
+    );
+}
 
 // ---- E3: create, kill -9, restart, connect by name from a new process (PREREG M1 exit 5) ----
 
