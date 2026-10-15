@@ -35,5 +35,10 @@ check "an ordinary --dry-run carries no stamp" \
 check "preflight asks virt_ok real unless --dry-block, and nothing else decides virtualization" \
   'grep -n "systemd-detect-virt" "$HERE/t3run.sh"; [ "$(grep -c "systemd-detect-virt" "$HERE/t3run.sh")" = 1 ] &&
    grep -q "virt_ok \"\$VIRT_MODE\" \"\$virt\"" "$HERE/t3run.sh" && grep -q "VIRT_MODE=real" "$HERE/t3run.sh"'
+# the virtio identity (t3lib.sh dev_identity under T3_IDENTITY_MODE=virtio) is a DRY-VIRT run's only: t3run drops any
+# inherited value before anything, and sets it in the --dry-block branch alone
+check "t3run unsets an inherited T3_IDENTITY_MODE and sets virtio only under --dry-block" \
+  'grep -n "T3_IDENTITY_MODE" "$HERE/t3run.sh"; [ "$(grep -c "T3_IDENTITY_MODE=virtio" "$HERE/t3run.sh")" = 1 ] &&
+   awk "/^unset T3_IDENTITY_MODE/{u=NR} /T3_IDENTITY_MODE=virtio/{v=NR} /^if \\[ -n \"\\\$DRYB_GIVEN\" \\]; then/{b=NR} END{exit !(u && b && v > b && u < b)}" "$HERE/t3run.sh"'
 echo "T3RUN-ARGS SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

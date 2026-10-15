@@ -113,6 +113,25 @@ echo "ST4000NM" > "$T/sys/block/sdc/device/model"; echo "SN04" > "$T/sys/block/s
 printf '\000\200\000\010ZC10XYZ9' > "$T/sys/block/sdc/device/vpd_pg80"
 check "MED 3: a SCSI disk's identity takes the device wwid, the printable vpd_pg80 serial and rev" \
   '[ "$(dev_identity "$T/sys" sdc)" = "wwid=naa.5000c500${NL}dev=8:32${NL}model=ST4000NM${NL}serial=ZC10XYZ9${NL}firmware=SN04" ]'
+# --dry-block on a VM (its first probe, 2026-10-15, lima vz): a virtio-blk disk has no wwid, model, serial or firmware
+# in sysfs (block/serial is empty), so dev_identity refuses it. Under T3_IDENTITY_MODE=virtio, which t3run sets only
+# for a DRY-VIRT run, a virtio-blk disk (device/modalias virtio:d00000002...) is identified by its diskseq, which the
+# kernel gives each disk it attaches and never reuses while it runs, plus its MAJ:MIN and the virtio vendor
+mkdir -p "$T/sys/block/vdb/device"; echo 253:16 > "$T/sys/block/vdb/dev"; echo 10 > "$T/sys/block/vdb/diskseq"
+: > "$T/sys/block/vdb/serial"; echo 0x1af4 > "$T/sys/block/vdb/device/vendor"
+echo "virtio:d00000002v00001AF4" > "$T/sys/block/vdb/device/modalias"
+check "dry-block: a virtio-blk disk with no wwid still refuses by default (rc 2, naming wwid): a real run is unchanged" \
+  'refuses2 dev_identity "$T/sys" vdb && grep -q wwid "$T/out.txt"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk is its diskseq, MAJ:MIN and vendor" \
+  '[ "$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb)" = "wwid=virtio-diskseq:10${NL}dev=253:16${NL}model=virtio-blk 0x1af4${NL}serial=diskseq-10${NL}firmware=virtio" ]'
+mkdir -p "$T/sys/block/sdz/device"; echo 8:96 > "$T/sys/block/sdz/dev"; echo 11 > "$T/sys/block/sdz/diskseq"
+check "dry-block: under T3_IDENTITY_MODE=virtio a disk that is not virtio-blk still refuses (rc 2)" \
+  'refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" sdz"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk with no diskseq refuses (rc 2)" \
+  'mv "$T/sys/block/vdb/diskseq" "$T/vdb-diskseq"; refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" vdb"; r=$?; mv "$T/vdb-diskseq" "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
+check "dry-block: a re-attached virtio disk (diskseq 10 -> 12) is not the recorded one: dev_unchanged's identity check refuses" \
+  'T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb > "$T/idv.txt" && echo 12 > "$T/sys/block/vdb/diskseq" &&
+   now=$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb) && [ "$now" != "$(cat "$T/idv.txt")" ]; r=$?; echo 10 > "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
 ident nvme6n1 "" 259:6 PM9A3 S2 GDC5
 check "MED 3: an empty wwid refuses (rc 2)" 'refuses2 dev_identity "$T/sys" nvme6n1 && grep -q wwid "$T/out.txt"'
 ident nvme7n1 eui.0007 259:7 PM9A3 "" GDC5
