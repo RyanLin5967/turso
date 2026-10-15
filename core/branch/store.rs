@@ -1451,6 +1451,49 @@ impl Drop for StoreGuard<'_> {
     }
 }
 
+/// The arena slots a catalog store's log tail touched: each one's state after the tail (`now`: in
+/// use) and at its first touch (`first`: in use), which LEAP L4 2b reads as its state at the
+/// checkpoint the tail follows; and the slots first touched in use AFTER a parked Commit (C-R),
+/// whose state that does not settle (`after_park`): a parked Commit frees its pages' old slots
+/// only when its branch is loaded, so a slot it freed in the live process and a later record
+/// reused reads, at the open, as first touched in use, though it was in use at the checkpoint
+/// (the oracle's seed 1 at step 61, slot 13). Those are asked.
+#[derive(Default)]
+struct Touched {
+    now: HashMap<Slot, bool>,
+    first: HashMap<Slot, bool>,
+    after_park: HashSet<Slot>,
+    parked: bool,
+}
+
+impl Touched {
+    fn set(&mut self, slot: Slot, used: bool) {
+        self.now.insert(slot, used);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.first.entry(slot) {
+            e.insert(used);
+            if used && self.parked {
+                self.after_park.insert(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Review L4 M1 (test builds): `l4_facts_check_for_test` on this thread also checks the facts a
+    /// checkpoint in flight keeps the store from using (checks (4) and (5)), against the catalog
+    /// connection, which reads the snapshot the capture pinned.
+    pub(crate) static CHECK_FACTS_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// LEAP L4 2b's oracle (test builds): an open on this thread also asks the catalog's free table
+    /// for every touched slot whose checkpoint state it inferred from the log, and records the
+    /// first disagreement (`CatState::free_inference_mismatch`).
+    pub(crate) static CHECK_FREE_INFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many store-mutex guards this thread holds (test builds).
@@ -1809,9 +1852,31 @@ struct CatState {
     /// Every trunk page is complete (`trunk_complete`): a catalog this process created, which held
     /// no trunk version when it was made. Cleared with the cache.
     trunk_all_complete: bool,
+    /// Trims of `trunk_cache` past the resident cap, which clear the complete marks (instrument).
+    trunk_trims: u64,
+    /// Slice 3's facts used while a checkpoint was in flight (only under mutant
+    /// `l4_child_facts_in_flight`; instrument).
+    facts_used_in_flight: u64,
+    /// Test builds (review L4 M1): see `CatState::assert_facts_in_flight`.
+    #[cfg(test)]
+    in_flight_fact_checks: u64,
+    /// LEAP L4 slice 3, while no checkpoint is in the air (`flight`): the fork epoch of the
+    /// trunk's newest child row in the catalog (`Some(None)`: none), and whether the catalog holds
+    /// any trunk version; `None` unknown (asked once, then kept). Each changes only when a checkpoint
+    /// commits, and its install sets both from what its writer read in that transaction. A delete
+    /// of a trunk child forked after the newest row then asks the catalog nothing for its
+    /// neighbours, and none for the trunk's catalog garbage when there is no trunk version.
+    trunk_child_max: Option<Option<u64>>,
+    trunk_versions: Option<bool>,
     /// The count of rows released while held open, from a format 19/20 meta row at the open
     /// (LEAP L4), for that open's `close_held` only (taken there); `None` otherwise.
     held_released_at_open: Option<u64>,
+    /// LEAP L4 2b's oracle (test builds, `CHECK_FREE_INFERENCE`): the touched slots whose checkpoint
+    /// state the open inferred, and the first that disagreed with the catalog's free table.
+    #[cfg(test)]
+    free_inferred_at_open: u64,
+    #[cfg(test)]
+    free_inference_mismatch: Option<String>,
     /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
     /// catalog read and deleted by the next checkpoint (C-P).
     trunk_gone: HashSet<(u32, u64)>,
@@ -2031,6 +2096,15 @@ pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::at
 pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds (review L4 M1): a name filter builder STARTED on this thread waits, after its
+    /// scan and before its install, while this holds 1 (it stores `1 | HOLD_ARRIVED` on arrival;
+    /// the test stores 0 to release it). Per opening thread, so no other test's builder waits.
+    pub(crate) static NAME_INSTALL_HOLD: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
 fn pause_name_scan() {
     #[cfg(test)]
@@ -2108,6 +2182,34 @@ fn fuzzy_checkpoints() -> bool {
 }
 
 impl CatState {
+    /// Review L4 M1, the construction argument for slice 3's `!flight` guards, checked where the
+    /// facts are used (test builds, with `CHECK_FACTS_IN_FLIGHT` set on the thread). Inside a flight
+    /// the facts cannot be stale against `catalog`: (1) they change only at an install (which ends
+    /// the flight in the same mutex hold: `checkpoint_install` clears them, then sets them from its
+    /// writer's transaction) or at these use sites when unknown; (2) `catalog` reads the snapshot
+    /// the capture pinned (`begin_read_snapshot`, ended at the install), and writes nothing in a
+    /// flight, so what it answers cannot move until the install either; (3) out of a flight the
+    /// oracle's check (4) holds them equal to their queries, so they are equal at the capture. So
+    /// a fact used in a flight answers what the guarded path's own catalog query answers, and the
+    /// guard changes no decision: mutant `l4_child_facts_in_flight` is equivalent. This asserts
+    /// (1)-(3)'s conclusion at the use site itself.
+    #[cfg(test)]
+    fn assert_facts_in_flight(&mut self) -> Result<()> {
+        if !self.flight || !CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        self.in_flight_fact_checks += 1;
+        if let Some(known) = self.trunk_child_max {
+            let asked = self.catalog.children_below(0, u64::MAX, 1)?.first().copied();
+            assert_eq!(known, asked, "in a flight, the trunk's newest catalog child is known stale");
+        }
+        if let Some(known) = self.trunk_versions {
+            let asked = !self.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty();
+            assert_eq!(known, asked, "in a flight, whether the catalog holds a trunk version is known stale");
+        }
+        Ok(())
+    }
+
     fn new(catalog: Catalog, sync: SyncClass, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
         Ok(Self {
@@ -2122,10 +2224,20 @@ impl CatState {
             trunk_known: HashSet::new(),
             trunk_cache: HashMap::new(),
             trunk_complete: HashSet::new(),
+            trunk_trims: 0,
+            facts_used_in_flight: 0,
+            #[cfg(test)]
+            in_flight_fact_checks: 0,
             // Mutant `l4_all_complete_at_open` (test builds only): every page taken as complete in
             // a reopened catalog that holds trunk versions (the oracle's plant at a reopen).
             trunk_all_complete: fe_mutant("l4_all_complete_at_open"),
             held_released_at_open: None,
+            #[cfg(test)]
+            free_inferred_at_open: 0,
+            #[cfg(test)]
+            free_inference_mismatch: None,
+            trunk_child_max: None,
+            trunk_versions: None,
             trunk_gone: HashSet::new(),
             lease_floor: None,
             lease_cursor: None,
@@ -2415,11 +2527,23 @@ struct BranchState {
 struct NameIndex {
     map: BTreeMap<Arc<str>, BranchId>,
     filter: NameFilter,
+    /// LEAP L4 slice 4, a catalog store: an exact mirror of the catalog's `branch_name` table as of
+    /// its last committed checkpoint, built off the mutex after open with the name filter
+    /// (`start_name_filter`) and kept by every install, which applies the names the checkpoint
+    /// wrote and deleted. Under the overlays (`map`, `gone`) it answers a lookup the catalog would,
+    /// asking nothing; `None` until built (the catalog answers). Oracle: `l4_facts_check_for_test`.
+    catalog: Option<HashMap<Arc<str>, BranchId>>,
+    /// The name the last lookup found, with its branch, so that branch's load reads no name (names
+    /// and ids are each unique, and an id's name never changes).
+    last_found: Option<(BranchId, Arc<str>)>,
     fresh: BTreeMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
     gone: BTreeMap<Arc<str>, u64>,
     releases: u64,
+    /// Mirrors built and discarded, a checkpoint having committed while their scan ran (review L4
+    /// L1): the mirror then stays unbuilt and the catalog answers lookups (instrument).
+    mirror_misses: u64,
 }
 
 /// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
@@ -2596,6 +2720,7 @@ impl ChildIndex {
         parent: BranchId,
         f: u64,
         catalog: bool,
+        newest: Option<Option<u64>>,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
         let listed = self.map.remove(&(parent.0, f)).is_some();
         if !catalog {
@@ -2607,8 +2732,16 @@ impl ChildIndex {
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
         let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
-        let lo = self.below(cat.as_deref_mut(), parent, f)?;
-        let hi = self.above(cat, parent, f)?;
+        // LEAP L4 slice 3: when every catalog child of `parent` is older than `f` (`newest`, the
+        // newest one's epoch, exact), the catalog's nearest below is that one and none is above:
+        // both are answered without asking. Else asked, as before.
+        let (lo, hi) = match newest {
+            Some(n) if n.is_none_or(|n| n < f) => {
+                let mem = self.map.range((parent.0, 0)..(parent.0, f)).next_back().map(|(&(_, e), _)| e);
+                (mem.max(self.resolve(parent.0, n, true)), self.above(None, parent, f)?)
+            }
+            _ => (self.below(cat.as_deref_mut(), parent, f)?, self.above(cat, parent, f)?),
+        };
         self.removed.insert((parent.0, f), (lo, hi));
         Ok((listed || fresh, lo, hi))
     }
@@ -3034,9 +3167,21 @@ struct Captured {
     shape_rows_written: u64,
 }
 
+/// What a checkpoint's writer read of the catalog in its own transaction, after every row it
+/// committed (LEAP L4): its earliest lease deadline, the fork epoch of the trunk's newest child row,
+/// and whether it holds any trunk version. Exact as of that commit, so the install sets the facts
+/// from it and asks the catalog nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CkptFacts {
+    lease_min: Option<u64>,
+    trunk_child_max: Option<u64>,
+    trunk_versions: bool,
+}
+
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
-/// transaction. Holds no store lock: nothing here reads the store.
-fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<()> {
+/// transaction, and return what it read there after its rows (`CkptFacts`). Holds no store lock:
+/// nothing here reads the store.
+fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<CkptFacts> {
     if cap.fail_write {
         return Err(LimboError::InternalError(
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
@@ -3067,7 +3212,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.set_commit_sync(cap.arena_sync)?;
     catalog.begin()?;
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<CkptFacts> {
         for (b, what) in &cap.rows {
             if what & DIRTY_NEW != 0 {
                 catalog.put_branch(b)?;
@@ -3121,13 +3266,23 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // they summarize exactly those rows. Mutant `l4_stale_meta_facts` (test builds only): the
         // facts read before the rows are written (the oracle's plant).
         let mut meta = cap.meta;
+        let lease_min = catalog.lease_min()?;
         if super::journal::meta_carries_facts(meta.format) {
-            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { catalog.lease_min()? });
+            meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { lease_min });
             meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
         }
-        catalog.put_meta(&meta)
+        // LEAP L4 slice 3: the facts a delete of a trunk child reads instead of the catalog. Mutant
+        // `l4_stale_child_facts` (test builds only): none, whatever the rows say (the oracle's plant).
+        let stale = fe_mutant("l4_stale_child_facts");
+        let facts = CkptFacts {
+            lease_min,
+            trunk_child_max: if stale { None } else { catalog.children_below(0, u64::MAX, 1)?.first().copied() },
+            trunk_versions: !stale && !catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty(),
+        };
+        catalog.put_meta(&meta)?;
+        Ok(facts)
     })()
-    .and_then(|()| {
+    .and_then(|facts| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
         // A store fail-stopped since the capture commits nothing more (review 4 #1); checked
         // last, so no failure before the commit is missed. Mutant `commit_poisoned` (test builds
@@ -3137,13 +3292,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // A failed commit may or may not have reached the catalog: from here on, only a reopen
         // can tell, so the store fail-stops.
-        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))
+        catalog.commit().inspect_err(|_| cap.fail_stop.store(true, Ordering::Release))?;
+        Ok(facts)
     });
     if let Err(e) = written {
         catalog.rollback();
         return Err(e);
     }
-    Ok(())
+    written
 }
 
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
@@ -3336,7 +3492,7 @@ fn run_flight(
     // Inside a panic guard too (review 4 #16): a panic in the cut must still reach the install, or
     // `flight` would stay set. Safe to catch: the cut leads no flight, and its gate's drop, which
     // unwinding runs, lets group flights start again. Mutant `cut_unguarded` (test builds only).
-    let cut = written.as_ref().ok().and_then(|()| {
+    let cut = written.as_ref().ok().and_then(|_| {
         if fe_mutant("cut_unguarded") {
             return begin_cut(&inner, &group, &cap);
         }
@@ -4252,7 +4408,7 @@ impl BranchStore {
         records: &[Record],
         sync: SyncClass,
         stats: &mut BranchOpenStats,
-    ) -> Result<HashMap<Slot, bool>> {
+    ) -> Result<Touched> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         inner.next_id = inner.next_id.max(meta.next_id);
         inner.trunk.lineage.epoch = meta.trunk_epoch;
@@ -4281,18 +4437,20 @@ impl BranchStore {
         cat.held_released_at_open = meta.held_released;
         inner.cat = Some(cat);
         let t = Instant::now();
-        let mut touched: HashMap<Slot, bool> = HashMap::new();
+        let mut touched = Touched::default();
+        let parked_before = inner.parked_records;
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
+            touched.parked = inner.parked_records > parked_before;
             match record {
                 Record::Commit { pages, .. } => {
                     for &(_, slot, _) in pages {
-                        touched.insert(slot, true);
+                        touched.set(slot, true);
                         inner.named_at.insert(slot, pos);
                     }
                 }
                 Record::TrunkRetain { slot, .. } => {
-                    touched.insert(*slot, true);
+                    touched.set(*slot, true);
                     inner.named_at.insert(*slot, pos);
                 }
                 _ => {}
@@ -4304,7 +4462,7 @@ impl BranchStore {
             // A parked Commit applied during this record (C-R) freed its slots here, in order.
             freed.append(&mut inner.deferred_freed);
             for slot in freed {
-                touched.insert(slot, false);
+                touched.set(slot, false);
             }
         }
         stats.replay_ns = ns(t);
@@ -4430,7 +4588,7 @@ impl BranchStore {
             // read, as before review 5 #1.
             let named: Vec<(Slot, u32)> = check
                 .into_iter()
-                .filter(|(slot, _)| touched.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
+                .filter(|(slot, _)| touched.now.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
                 .collect();
             if !super::journal::slots_hold(&arena_file, page_size, &named)? {
                 scanned.drop_last_flight();
@@ -4450,7 +4608,7 @@ impl BranchStore {
         stats.released_scanned = scanned;
         freed.append(&mut inner.deferred_freed);
         for slot in freed {
-            touched.insert(slot, false);
+            touched.set(slot, false);
         }
         if inner.parked.is_empty() {
             inner.named_at = HashMap::new();
@@ -4465,9 +4623,82 @@ impl BranchStore {
         let mut free_mem = Vec::new();
         let mut taken = HashSet::new();
         let mut high_water = file_hw.max(meta.arena_hw);
-        for (&slot, &used) in &touched {
-            stats.free_probes += u64::from(slot < meta.arena_hw);
-            let was_used = slot < meta.arena_hw && !cat.catalog.free_has(slot)?;
+        // LEAP L4 2b: at formats 19/20 a touched slot's state at the checkpoint is its FIRST touch
+        // in the tail, not a free-table probe. A Commit's or a TrunkRetain's slot is fresh, taken
+        // from the free list or the reserved set, each of which the checkpoint lists free (a
+        // reservation is written free: a crash loses it), or from past the high-water mark; a slot
+        // whose first touch frees it was in use at the checkpoint; one first touched in use after a
+        // parked Commit is asked (see `Touched`). Older formats probe, as before.
+        // Mutants (test builds only): `l4_free_probe_at_open` probes always; `l4_free_first_touch_
+        // inverted` reads every first touch the wrong way round (the oracle's plant).
+        let infer = super::journal::meta_carries_facts(meta.format) && !fe_mutant("l4_free_probe_at_open");
+        let inverted = fe_mutant("l4_free_first_touch_inverted");
+        #[cfg(test)]
+        let check = infer && CHECK_FREE_INFERENCE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        {
+            cat.free_inferred_at_open = 0;
+            cat.free_inference_mismatch = None;
+        }
+        // DECISIONS 81152ec501: the slots the first touch cannot settle (first used after a parked
+        // Commit) are asked together, one statement per `FREE_HAS_CHUNK`, not one each. Mutant
+        // `l4_free_probe_one_by_one` (test builds only): one probe each, as before.
+        let batched: Option<HashSet<Slot>> = if infer && !fe_mutant("l4_free_probe_one_by_one") {
+            let mut ask: Vec<Slot> = touched
+                .after_park
+                .iter()
+                .copied()
+                .filter(|&s| s < meta.arena_hw && touched.now.contains_key(&s))
+                .collect();
+            ask.sort_unstable();
+            // Probe STATEMENTS, as at 17/18 (one per chunk here): `cat_queries - free_probes` is
+            // the open's own reads (catalog_tests).
+            stats.free_probes += ask.len().div_ceil(super::catalog::FREE_HAS_CHUNK) as u64;
+            Some(cat.catalog.free_has_many(&ask)?)
+        } else {
+            None
+        };
+        for (&slot, &used) in &touched.now {
+            let below = slot < meta.arena_hw;
+            stats.touched_below_hw += u64::from(below);
+            let listed = if !below {
+                false
+            } else if let (Some(listed), true) = (batched.as_ref(), touched.after_park.contains(&slot)) {
+                let listed = listed.contains(&slot);
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open's batched probe read slot {slot} {} at the checkpoint, the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
+            } else if infer && !touched.after_park.contains(&slot) {
+                let listed = touched.first[&slot] != inverted;
+                #[cfg(test)]
+                if check {
+                    cat.free_inferred_at_open += 1;
+                    let asked = cat.catalog.free_has(slot)?;
+                    if asked != listed && cat.free_inference_mismatch.is_none() {
+                        cat.free_inference_mismatch = Some(format!(
+                            "the open inferred slot {slot} {} at the checkpoint from its first touch (in use: {}), the catalog's free table says {}",
+                            if listed { "free" } else { "in use" },
+                            touched.first[&slot],
+                            if asked { "free" } else { "in use" }
+                        ));
+                    }
+                }
+                listed
+            } else {
+                stats.free_probes += 1;
+                cat.catalog.free_has(slot)?
+            };
+            let was_used = below && !listed;
             in_use += used as i64 - was_used as i64;
             if slot < meta.arena_hw && !was_used {
                 // The catalog lists it free; this process owns it now either way.
@@ -4485,13 +4716,13 @@ impl BranchStore {
             high_water = high_water.max(slot + 1);
         }
         for slot in meta.arena_hw..file_hw {
-            if !touched.contains_key(&slot) {
+            if !touched.now.contains_key(&slot) {
                 free_mem.push(slot);
             }
         }
-        stats.touched_slots = touched.len() as u64;
+        stats.touched_slots = touched.now.len() as u64;
         if super::arena::trace_slots() {
-            let mut t: Vec<(Slot, bool)> = touched.iter().map(|(&s, &u)| (s, u)).collect();
+            let mut t: Vec<(Slot, bool)> = touched.now.iter().map(|(&s, &u)| (s, u)).collect();
             t.sort_unstable();
             eprintln!(
                 "R11SLOT recover meta_hw={} file_hw={file_hw} meta_in_use={} touched={t:?} free_mem={free_mem:?} taken={taken:?} in_use={in_use} records={}",
@@ -8188,8 +8419,9 @@ impl BranchStore {
                 pending.insert(names.filter.hash(name));
             }
             names.filter.pending = Some(pending);
-            reader
+            (reader, cat.generation)
         };
+        let (reader, scan_generation) = reader;
         let hasher = self.inner.lock().names.filter.hasher.clone();
         #[cfg(test)]
         let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -8197,6 +8429,8 @@ impl BranchStore {
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
+        #[cfg(test)]
+        let install_hold = NAME_INSTALL_HOLD.with(|h| h.borrow().clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
@@ -8206,8 +8440,32 @@ impl BranchStore {
                 let scanned = if fail_scan {
                     Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
                 } else {
-                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                    reader.name_pairs(&stop)
                 };
+                // LEAP L4 slice 4: the exact mirror of `branch_name`, built here off the mutex from
+                // the same scan as the filter's hashes, and installed only if no checkpoint
+                // committed since the scan began (the install would apply its names to a mirror
+                // that predates them; one that committed before the scan read them is applied
+                // twice, which is idempotent).
+                let (scanned, mirror) = match scanned {
+                    Ok(pairs) => {
+                        let hashes: Vec<u64> = pairs.iter().map(|(name, _)| hasher.hash_one(&**name)).collect();
+                        let mirror: HashMap<Arc<str>, BranchId> =
+                            pairs.into_iter().map(|(name, id)| (name, BranchId(id))).collect();
+                        (Ok(hashes), Some(mirror))
+                    }
+                    Err(e) => (Err(e), None),
+                };
+                #[cfg(test)]
+                if let Some(hold) = install_hold.as_ref() {
+                    use std::sync::atomic::Ordering as O;
+                    let arrived = 1 | HOLD_ARRIVED;
+                    if hold.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+                        while hold.load(O::Acquire) == arrived {
+                            crate::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
                 // The set of the scanned names is built here, off the store mutex: its one table of
                 // up to 2N buckets and its N inserts were the O(N) background hold (LEAP L4's build
                 // guard: 147,464 B held at 10^4 branches, 1,179,656 B at 10^5, the table to the
@@ -8225,6 +8483,20 @@ impl BranchStore {
                 // An ordered set needs no room made for the names applied meanwhile: joining them
                 // adds nodes, never moves the set (it was a hash table reserved off the mutex).
                 let mut inner = shared.lock();
+                // Review L4 L1: a mirror a checkpoint outdated is counted and freed after the mutex is
+                // dropped (its N frees are not a hold). Mutant `l4_mirror_ignores_generation` (test
+                // builds only): installed whatever committed meanwhile (the oracle's plant).
+                let mut discarded = None;
+                if let Some(mirror) = mirror {
+                    if inner.cat.as_ref().is_some_and(|c| c.generation == scan_generation)
+                        || fe_mutant("l4_mirror_ignores_generation")
+                    {
+                        inner.names.catalog = Some(mirror);
+                    } else {
+                        inner.names.mirror_misses += 1;
+                        discarded = Some(mirror);
+                    }
+                }
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
                 match scanned {
@@ -8239,6 +8511,8 @@ impl BranchStore {
                         tracing::debug!("branch name filter not built: {e}")
                     }
                 }
+                drop(inner);
+                drop(discarded);
             });
         match spawned {
             Ok(handle) => *self.name_filter_build.lock() = Some(handle),
@@ -8577,12 +8851,26 @@ impl BranchStore {
     /// first fact that disagrees; `Ok` says which facts were set: (complete pages, all complete,
     /// free exhausted, a meta fact not trivial), so a test can show they were exercised.
     #[cfg(test)]
+    /// Test builds (LEAP L4 2b): the touched slots whose checkpoint state the last open inferred and
+    /// checked against the free table (`CHECK_FREE_INFERENCE`).
+    #[cfg(test)]
+    pub(crate) fn free_inferred_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |cat| cat.free_inferred_at_open)
+    }
+
+    // Integration resolution (fastest-integrate step 15): #[cfg(test)], as L4's own C36 HIGH build-break fix
+    // d3157500d has it; at 8d46a25d0 the attribute had moved onto free_inferred_for_test (b6b670b68)
+    #[cfg(test)]
     pub(crate) fn l4_facts_check_for_test(&self) -> std::result::Result<(usize, bool, bool, bool), String> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let Some(cat) = inner.cat.as_mut() else {
             return Ok((0, false, false, false));
         };
+        // (6) 2b: the open's first-touch inference equalled the free table on every slot it read.
+        if let Some(m) = cat.free_inference_mismatch.clone() {
+            return Err(m);
+        }
         let rows = cat
             .catalog
             .trunk_born_range(None, u64::MAX, u64::MAX >> 1)
@@ -8612,6 +8900,37 @@ impl BranchStore {
                 ));
             }
         }
+        // (5) Slice 4: the name mirror, built and out of a flight, equals `branch_name`.
+        let in_flight_too = CHECK_FACTS_IN_FLIGHT.with(std::cell::Cell::get);
+        if let (Some(mirror), false) = (inner.names.catalog.as_ref(), cat.flight && !in_flight_too) {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let rows = cat.catalog.name_pairs(&stop).map_err(|e| format!("name_pairs: {e}"))?;
+            let asked: HashMap<Arc<str>, BranchId> = rows.into_iter().map(|(n, id)| (n, BranchId(id))).collect();
+            if *mirror != asked {
+                return Err(format!(
+                    "the name mirror holds {} names, the catalog {}; first difference: {:?}",
+                    mirror.len(),
+                    asked.len(),
+                    asked.iter().find(|(n, id)| mirror.get(*n) != Some(id)).or_else(|| mirror.iter().find(|(n, id)| asked.get(*n) != Some(id)))
+                ));
+            }
+        }
+        // (4) Slice 3, while no checkpoint is in the air: the trunk's newest catalog child and
+        // whether the catalog holds a trunk version, as known, equal their queries.
+        if !cat.flight || in_flight_too {
+            if let Some(known) = cat.trunk_child_max {
+                let asked = cat.catalog.children_below(0, u64::MAX, 1).map_err(|e| format!("children_below: {e}"))?.first().copied();
+                if known != asked {
+                    return Err(format!("the trunk's newest catalog child is known as {known:?}; the catalog answers {asked:?}"));
+                }
+            }
+            if let Some(known) = cat.trunk_versions {
+                let asked = !cat.catalog.trunk_born_range(None, u64::MAX, 1).map_err(|e| format!("trunk_born_range: {e}"))?.is_empty();
+                if known != asked {
+                    return Err(format!("the catalog is known to hold trunk versions: {known}; it answers {asked}"));
+                }
+            }
+        }
         // (3) A format 19/20 meta row's facts (LEAP L4 slice 2) equal the queries an open skips.
         let meta = cat.catalog.meta().map_err(|e| format!("reading the catalog's meta row: {e}"))?;
         let mut meta_set = false;
@@ -8627,6 +8946,33 @@ impl BranchStore {
             }
         }
         Ok((cat.trunk_complete.len(), cat.trunk_all_complete, cat.free_exhausted, meta_set))
+    }
+
+    /// Test builds: whether the exact name mirror is built (LEAP L4 slice 4).
+    #[cfg(test)]
+    pub(crate) fn name_mirror_built_for_test(&self) -> bool {
+        self.inner.lock().names.catalog.is_some()
+    }
+
+    /// Test builds (review L4): name mirrors discarded because a checkpoint committed during their
+    /// scan, and trims of the trunk-version cache past the resident cap.
+    #[cfg(test)]
+    pub(crate) fn mirror_misses_and_trims_for_test(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.names.mirror_misses, inner.cat.as_ref().map_or(0, |c| c.trunk_trims))
+    }
+
+    /// Test builds (review L4 M1): use sites of slice 3's facts reached inside a flight with
+    /// `CHECK_FACTS_IN_FLIGHT` set, each of which asserted the known facts equal their queries.
+    #[cfg(test)]
+    pub(crate) fn in_flight_fact_checks_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.in_flight_fact_checks)
+    }
+
+    /// Test builds (review L4 M1): slice 3's facts used while a checkpoint was in flight.
+    #[cfg(test)]
+    pub(crate) fn facts_used_in_flight_for_test(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.facts_used_in_flight)
     }
 
     /// Test builds: the format version this store writes (LEAP L4: 19/20 created, 17/18 kept).
@@ -9063,9 +9409,13 @@ impl StoreInner {
         let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
         if cached > cap {
             cat.trunk_cache.clear();
-            // What the cache held is no longer in memory (LEAP L4).
-            cat.trunk_complete.clear();
-            cat.trunk_all_complete = false;
+            cat.trunk_trims += 1;
+            // What the cache held is no longer in memory (LEAP L4). Mutant `l4_trim_keeps_complete`
+            // (test builds only): the complete marks outlive the cache (the oracle's plant).
+            if !fe_mutant("l4_trim_keeps_complete") {
+                cat.trunk_complete.clear();
+                cat.trunk_all_complete = false;
+            }
         }
     }
 
@@ -9171,9 +9521,23 @@ impl StoreInner {
             if self.names.filter.says_absent(name) {
                 return Ok(None);
             }
+            // The catalog's names, mirrored exactly (LEAP L4 slice 4).
+            if let Some(mirror) = self.names.catalog.as_ref().filter(|_| !fe_mutant("l4_probe_always")) {
+                let found = mirror.get(name).copied();
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                return Ok(found);
+            }
         }
         match self.cat.as_mut() {
-            Some(cat) => Ok(cat.catalog.name_get(name)?.map(BranchId)),
+            Some(cat) => {
+                let found = cat.catalog.name_get(name)?.map(BranchId);
+                if let Some(id) = found {
+                    self.names.last_found = Some((id, Arc::from(name)));
+                }
+                Ok(found)
+            }
             None => Ok(None),
         }
     }
@@ -9218,7 +9582,14 @@ impl StoreInner {
             let loaded = if cat.removed.contains(&next) {
                 None
             } else {
-                cat.catalog.load_branch(next.0)?
+                // The name a lookup just found this branch under, not read again (LEAP L4 slice 4).
+                let known = self
+                    .names
+                    .last_found
+                    .as_ref()
+                    .filter(|(found, _)| *found == next && !fe_mutant("l4_probe_always"))
+                    .map(|(_, name)| name.clone());
+                cat.catalog.load_branch_named(next.0, known.as_ref())?
             };
             let Some(b) = loaded else {
                 if chain.is_empty() {
@@ -9516,6 +9887,27 @@ impl StoreInner {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
+        // LEAP L4 slice 3: a catalog with no trunk version has no trunk garbage (asked once while
+        // unknown, never while a checkpoint is in the air).
+        // Mutant `l4_child_facts_in_flight` (test builds only): the facts used in a flight too
+        // (equivalent: `CatState::assert_facts_in_flight`). Fire-check mutant
+        // `l4_flight_facts_stale_at_use` (test builds only): a known trunk-version fact made wrong
+        // here, inside a flight, after the oracle's last check and before this use site's assertion.
+        #[cfg(test)]
+        if cat.flight && fe_mutant("l4_flight_facts_stale_at_use") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
+        #[cfg(test)]
+        cat.assert_facts_in_flight()?;
+        if (!cat.flight || fe_mutant("l4_child_facts_in_flight")) && !fe_mutant("l4_probe_always") {
+            cat.facts_used_in_flight += u64::from(cat.flight);
+            if cat.trunk_versions.is_none() {
+                cat.trunk_versions = Some(!cat.catalog.trunk_born_range(None, u64::MAX, 1)?.is_empty());
+            }
+            if cat.trunk_versions == Some(false) {
+                return Ok(());
+            }
+        }
         let only_f = |born: u64, died: u64| {
             lo.is_none_or(|lo| born > lo) && born <= f && f < died && hi.is_none_or(|hi| died <= hi)
         };
@@ -9724,6 +10116,10 @@ impl StoreInner {
                     // A catalog made now holds no trunk version (LEAP L4).
                     cat.trunk_all_complete = !fe_mutant("l4_probe_always");
                     self.cat = Some(cat);
+                    // A new catalog holds no name: its mirror is exact, empty, at once (LEAP L4).
+                    if self.names.catalog.is_none() && !fe_mutant("l4_probe_always") {
+                        self.names.catalog = Some(HashMap::default());
+                    }
                     // A new catalog holds no name: the filter is built, empty, at once.
                     if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
                         let mut built = BTreeSet::new();
@@ -10040,6 +10436,11 @@ impl StoreInner {
         } else {
             cat.catalog.begin_read_snapshot()
         };
+        // Fire-check (test builds only) of `assert_facts_in_flight`: mutant
+        // `l4_flight_facts_planted_stale` makes a known trunk-version fact wrong for the flight.
+        if fe_mutant("l4_flight_facts_planted_stale") {
+            cat.trunk_versions = cat.trunk_versions.map(|v| !v);
+        }
         if let Err(e) = snapshot {
             if let Some((dirty, _)) = early {
                 cat.dirty = dirty;
@@ -10224,32 +10625,52 @@ impl StoreInner {
     fn checkpoint_install(
         &mut self,
         cap: Box<Captured>,
-        written: Result<()>,
+        written: Result<CkptFacts>,
         prepared: Option<super::journal::CutPrep>,
     ) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
-            return written;
+            return written.map(|_| ());
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
         ckpt_held("install.snapshot_ended");
         cat.flight = false;
-        if let Err(e) = written {
-            // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
-            if !mutant("r13_install_err_drops_dirty") {
-                for (id, what) in cap.dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+        // A failed write may have reached the catalog or not: its trunk facts are unknown until
+        // asked again (LEAP L4 slice 3).
+        cat.trunk_child_max = None;
+        cat.trunk_versions = None;
+        let facts = match written {
+            Ok(facts) => facts,
+            Err(e) => {
+                // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
+                if !mutant("r13_install_err_drops_dirty") {
+                    for (id, what) in cap.dirty {
+                        *cat.dirty.entry(id).or_insert(0) |= what;
+                    }
                 }
+                // The capture copied the names; the index still holds them, for the next checkpoint.
+                // Not retried before another threshold's worth of log (review 2 #5).
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.defer_compaction();
+                }
+                return Err(e);
             }
-            // The capture copied the names; the index still holds them, for the next checkpoint.
-            // Not retried before another threshold's worth of log (review 2 #5).
-            if let Some(journal) = self.journal.as_mut() {
-                journal.defer_compaction();
-            }
-            return Err(e);
-        }
+        };
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
+        // LEAP L4 slice 4: the mirror takes what the writer did to `branch_name` (its gone names
+        // deleted, then its fresh ones put). Mutant `l4_names_stale` (test builds only): the fresh
+        // names are not put (the oracle's plant).
+        if let Some(mirror) = self.names.catalog.as_mut() {
+            for name in cap.names_gone.keys() {
+                mirror.remove(name);
+            }
+            if !fe_mutant("l4_names_stale") {
+                for (name, id) in &cap.names_fresh {
+                    mirror.insert(name.clone(), *id);
+                }
+            }
+        }
         // The catalog holds the captured names now: drop each entry no release or create since
         // has moved (see `NameIndex`).
         for (name, release) in &cap.names_gone {
@@ -10364,7 +10785,10 @@ impl StoreInner {
         // whatever was written (the oracle's plant).
         let wrote_free = !(cap.free_list.is_empty() && cap.reserved.is_empty() && cap.deferred.is_empty());
         cat.free_exhausted = cap.free_exhausted && (!wrote_free || fe_mutant("l4_free_ignores_puts"));
-        cat.lease_floor = cat.catalog.lease_min()?;
+        // LEAP L4: what the writer read of the catalog in its commit's transaction (`CkptFacts`).
+        cat.lease_floor = facts.lease_min;
+        cat.trunk_child_max = Some(facts.trunk_child_max);
+        cat.trunk_versions = Some(facts.trunk_versions);
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
@@ -10738,8 +11162,28 @@ impl StoreInner {
                 )));
             }
             let catalog_mode = self.cat.is_some();
+            #[cfg(test)]
+            if let (Some(cat), true) = (self.cat.as_mut(), parent.is_trunk()) {
+                cat.assert_facts_in_flight()?;
+            }
+            // LEAP L4 slice 3: the trunk's newest child row in the catalog, known (asked once while
+            // unknown) whenever no checkpoint is in the air.
+            let newest = match self.cat.as_mut() {
+                Some(cat)
+                    if parent.is_trunk()
+                        && (!cat.flight || fe_mutant("l4_child_facts_in_flight"))
+                        && !fe_mutant("l4_probe_always") =>
+                {
+                    cat.facts_used_in_flight += u64::from(cat.flight);
+                    if cat.trunk_child_max.is_none() {
+                        cat.trunk_child_max = Some(cat.catalog.children_below(0, u64::MAX, 1)?.first().copied());
+                    }
+                    cat.trunk_child_max
+                }
+                _ => None,
+            };
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode, newest)?;
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint

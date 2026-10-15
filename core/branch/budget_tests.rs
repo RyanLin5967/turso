@@ -531,6 +531,14 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
         b.insert("quiet", u64::from(t0 == base && settled));
+        if cell.starts_with("wtail_") || cell.starts_with("wfresh_") {
+            // The written tail's premise and its free-table probes, from the open's own stats.
+            let st = opened.branch_open_stats();
+            b.insert("touched_below_hw", st.touched_below_hw);
+            b.insert("free_probes", st.free_probes);
+            b.insert("touched_slots", st.touched_slots);
+            b.insert("records", st.records);
+        }
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
@@ -564,6 +572,106 @@ fn rounds(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut S
             line(out, cell, "first_write", j, &s_write);
             line(out, cell, "disconnect", j, &s_disc);
             line(out, cell, "delete", j, &s_delete);
+        }
+    }
+}
+
+/// LEAP L4 slice 4's arm (lead, 2026-10-15): in a reopened store, `connect_named` of a populated
+/// branch no connection has touched since the open (`pop-<i>`, not resident: its state is read from
+/// the catalog on demand), one per round, after `WARMUP` unmeasured ones (`connect_cold`). The
+/// connection is dropped unmeasured. At most `n` rounds in all.
+/// Branches the written tail rewrites and first-writes (`written_tail`).
+const WTAIL: u64 = 8;
+
+/// The written tail (lead, 2026-10-15, L4 2b): over a built database, first writes on `WTAIL`
+/// populated branches, checkpointed, so their pages hold slots below the checkpoint's high-water
+/// mark; then, in the log only: a rewrite of each (its old slot freed, its new one taken), a first
+/// write and a rewrite on each of the build's tail branches (made before this checkpoint), and a
+/// create plus first write on `WTAIL` branches made after it. Closed when this returns.
+fn written_tail(built: &mut Built) {
+    let db = open_at(&built.path);
+    let trunk = db.connect().unwrap();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'p{i}' WHERE id = {}", 1 + i % 50));
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'q{i}' WHERE id = {}", 1 + i % 50));
+        drop(c);
+        let c = db.connect_named(&format!("tail-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'w{i}' WHERE id = {}", 1 + i % 50));
+        exec(&c, &format!("UPDATE t SET v = 'x{i}' WHERE id = {}", 1 + i % 50));
+        drop(c);
+        let name = format!("wnew-{i}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'n{i}' WHERE id = {}", 1 + i % 50));
+    }
+    built.incarnation = db.incarnation;
+}
+
+/// The fresh written tail (L4 2b, the case the first-touch rule settles with no probe): over a
+/// built database, first writes on `WTAIL` populated branches, then their deletes, checkpointed,
+/// so the checkpoint lists their pages' slots free; then, in the log only, `WTAIL` creates, each
+/// with a first write and a rewrite, which take those slots from the free list. No Commit of the
+/// tail is to a branch the open leaves on disk (none is parked). Closed when this returns.
+fn fresh_written_tail(built: &mut Built) {
+    let db = open_at(&built.path);
+    let trunk = db.connect().unwrap();
+    for i in 0..WTAIL {
+        let c = db.connect_named(&format!("pop-{i}")).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'p{i}' WHERE id = {}", 1 + i % 50));
+    }
+    for i in 0..WTAIL {
+        db.drop_branch(&format!("pop-{i}")).unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    for i in 0..WTAIL {
+        let name = format!("wnew-{i}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        exec(&c, &format!("UPDATE t SET v = 'n{i}' WHERE id = {}", 1 + i % 50));
+        exec(&c, &format!("UPDATE t SET v = 'm{i}' WHERE id = {}", 1 + i % 50));
+    }
+    built.incarnation = db.incarnation;
+}
+
+fn cold_connects(cell: &str, db: &Arc<Database>, base: Option<u64>, n: u64, k: u64, out: &mut String) {
+    for i in 0..(WARMUP + k).min(n) {
+        let (c, s) = measure(db, base, || db.connect_named(&format!("pop-{i}")).unwrap());
+        drop(c);
+        if i >= WARMUP {
+            line(out, cell, "connect_cold", i - WARMUP, &s);
+        }
+    }
+}
+
+/// The delete arms MCTS-shaped workloads make (lead, 2026-10-15, after LEAP L4 slice 3): per round,
+/// two named trunk children (`older-i`, then `newer-i`) and a child of `newer-i` (`kid-i`, made on a
+/// connection of it), all checkpointed into the catalog, then measured: the delete of `older-i`, a
+/// trunk child OLDER than the trunk's newest catalog child (`delete_older`), and the delete of
+/// `kid-i`, a child of a branch (`delete_grandchild`). `newer-i` is dropped unmeasured.
+fn deletes(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut String) {
+    let trunk = db.connect().unwrap();
+    for i in 0..WARMUP + k {
+        trunk.create_branch(&format!("older-{i:04}")).unwrap();
+        trunk.create_branch(&format!("newer-{i:04}")).unwrap();
+        {
+            let newer = db.connect_named(&format!("newer-{i:04}")).unwrap();
+            newer.create_branch(&format!("kid-{i:04}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        let (_, s_older) = measure(db, base, || db.drop_branch(&format!("older-{i:04}")).unwrap());
+        let (_, s_kid) = measure(db, base, || db.drop_branch(&format!("kid-{i:04}")).unwrap());
+        db.drop_branch(&format!("newer-{i:04}")).unwrap();
+        if i >= WARMUP {
+            line(out, cell, "delete_older", i - WARMUP, &s_older);
+            line(out, cell, "delete_grandchild", i - WARMUP, &s_kid);
         }
     }
 }
@@ -1920,10 +2028,10 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "exc_sharp" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+            "ckpt_n10" | "exc_sharp" | "del_n10" | "cold_n10" | "wtail_n10" | "wfresh_n10" | "confirm_n10" | "confirm_load" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
                 (10, false, true)
             }
-            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" | "del_n1e4" | "cold_n1e4" | "wtail_n1e4" | "wfresh_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
@@ -1937,6 +2045,11 @@ fn budget_child() {
             }
         };
         let mut built = build(&spec, n, large, named);
+        if spec.starts_with("wtail_") {
+            written_tail(&mut built);
+        } else if spec.starts_with("wfresh_") {
+            fresh_written_tail(&mut built);
+        }
         // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
         // Mach traps per hold inside the measured mutex otherwise).
         probe::arm(!spec.starts_with("shared_"));
@@ -1956,6 +2069,10 @@ fn budget_child() {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
+        } else if spec.starts_with("cold_") {
+            cold_connects(&spec, &db, base, n, k, &mut text);
+        } else if spec.starts_with("del_") {
+            deletes(&spec, &db, base, k, &mut text);
         } else if spec.starts_with("ckpt") || spec == "exc_sharp" {
             checkpoints(&spec, &db, base, &mut text);
         } else if named {
@@ -3211,6 +3328,116 @@ fn leap_l4_an_open_reads_only_the_catalog_meta_row() {
     assert!(failures.is_empty(), "LEAP L4 not reached at open (budget: 1 query, the meta row):\n{failures}");
 }
 
+/// LEAP L4 2b (lead, 2026-10-15): an open over a WRITTEN tail (rewrites of checkpointed branches,
+/// first writes and rewrites of branches made before the checkpoint, creates and first writes after
+/// it; `written_tail`) reads the catalog for its meta row only, at 10 and 10^4 live branches (cells
+/// `wtail_n10`, `wtail_n1e4`): the arena rebuild knows each touched slot's state at the checkpoint
+/// without a free-table probe. Premise: the tail touched at least `WTAIL` slots below the
+/// checkpoint's high-water mark (the rewrites' freed slots). Expected RED at bcac1c6f2: 1 + one probe
+/// per such slot. leap_l4_an_open_reads_only_the_catalog_meta_row is green for a writeless tail only.
+#[test]
+fn leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wtail_n10", "wtail_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["recovery"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 1 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probes, {} touched slots below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached at a written tail's open (budget: 1 query, the meta row):\n{failures}");
+}
+
+/// LEAP L4 2b, batched (lead, DECISIONS 81152ec501): over the written tail (`wtail_n10`,
+/// `wtail_n1e4`), the slots the first-touch rule cannot settle (first used after a parked Commit) are
+/// asked in ONE statement per fixed-size chunk, not one each: at most 2 catalog queries at WTAIL = 8
+/// (the meta row and one chunk). Expected RED at 6991d6296: 1 + one probe per such slot (9).
+/// leap_l4_an_open_after_a_written_tail_reads_only_the_catalog_meta_row stays registered beside it.
+#[test]
+fn leap_l4_an_open_after_a_written_tail_asks_its_reused_slots_in_one_statement() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wtail_n10", "wtail_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["recovery"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 2 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probe statements, {} touched below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "the written tail's reused slots are not asked in one statement (budget: 2 queries, the meta row and one chunk):\n{failures}");
+}
+
+/// LEAP L4 2b, the case its first-touch rule settles: an open over a tail of creates, first writes
+/// and rewrites that take slots the checkpoint lists free (`fresh_written_tail`; cells `wfresh_n10`,
+/// `wfresh_n1e4`) reads the catalog for its meta row only. Premise: the tail touched at least
+/// `WTAIL` slots below the checkpoint's high-water mark. Red at bcac1c6f2 (one probe per such slot)
+/// and under mutant `l4_free_probe_at_open`.
+#[test]
+fn leap_l4_an_open_after_a_fresh_written_tail_reads_only_the_catalog_meta_row() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["wfresh_n10", "wfresh_n1e4"] {
+        let c = cell(spec);
+        let f = &c.ops["recovery"][0];
+        assert!(
+            f["touched_below_hw"] >= WTAIL && f["records"] > 0,
+            "{spec}: premise: the tail touched {} slots below the high-water mark ({} records); want >= {WTAIL}",
+            f["touched_below_hw"],
+            f["records"]
+        );
+        for (i, s) in c.ops["recovery"].iter().enumerate() {
+            let q = s["catalog_queries"];
+            if q > 1 {
+                let _ = writeln!(
+                    failures,
+                    "  {spec}: open {i}: {q} catalog queries, {} rows ({} free-table probes, {} touched slots below the high-water mark)",
+                    s["catalog_rows"],
+                    f["free_probes"],
+                    f["touched_below_hw"]
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 2b not reached at a fresh written tail's open (budget: 1 query, the meta row):\n{failures}");
+}
+
 /// The L4 memory ruling (DECISIONS.md 2026-10-06T02:55Z (i): "about 50-100 MB at 10^6 live branches
 /// ... a budget test measures resident bytes per live branch at 10^4 and 10^5 and asserts the
 /// slope"): the heap an open leaves resident once its background work has settled grows by at most
@@ -4273,4 +4500,52 @@ fn open_free_probe_census() {
             s.cat_queries, s.free_probes, s.touched_slots, s.cat_rows_read, s.records
         );
     }
+}
+
+/// LEAP L4 for the deletes an MCTS-shaped workload makes (lead, 2026-10-15): the delete of a trunk
+/// child older than the trunk's newest catalog child, and of a child of a branch, each with every
+/// branch involved in the catalog, ask the catalog nothing, at 10 and at 10^4 live branches (cells
+/// `del_n10`, `del_n1e4`). Expected RED after slice 3, whose neighbour fact covers only a trunk child
+/// newer than every catalog child: these ask the catalog for their neighbours. WRITTEN, red first.
+#[test]
+fn leap_l4_an_older_or_a_grandchild_delete_asks_the_catalog_nothing() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["del_n10", "del_n1e4"] {
+        let c = cell(spec);
+        for op in ["delete_older", "delete_grandchild"] {
+            let samples = quiet(&c, op);
+            for (i, v) in values(&c, op, &samples, "catalog_queries").into_iter().enumerate() {
+                if v != 0 {
+                    let _ = writeln!(failures, "  {spec}: {op} #{i}: {v} catalog queries; budget 0");
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached for the MCTS deletes:\n{failures}");
+}
+
+/// LEAP L4 slice 4 (lead, 2026-10-15): a `connect_named` of a branch that is not resident reads
+/// from the catalog its own state and nothing else: the three statements of its load (its branch
+/// row, its current pages, its retained ones), no name lookup (`name_get`) and no name read
+/// (`name_of`), at 10 and at 10^4 live branches (cells `cold_n10`, `cold_n1e4`). Expected RED: the
+/// name is asked twice (5 statements). WRITTEN, red first.
+#[test]
+fn leap_l4_a_cold_connect_named_reads_only_its_branch_state() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    for spec in ["cold_n10", "cold_n1e4"] {
+        let c = cell(spec);
+        let samples = quiet(&c, "connect_cold");
+        for (i, v) in values(&c, "connect_cold", &samples, "catalog_queries").into_iter().enumerate() {
+            if v != 3 {
+                let _ = writeln!(failures, "  {spec}: connect_cold #{i}: {v} catalog queries; budget 3 (the branch's load)");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "LEAP L4 not reached for a cold connect_named:\n{failures}");
 }

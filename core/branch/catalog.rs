@@ -142,6 +142,10 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM branch_name WHERE id = ?1",
 ];
 
+/// Slots one `free_has_many` statement asks (LEAP L4 2b, DECISIONS 81152ec501: fixed, so its
+/// statement is prepared once).
+pub(crate) const FREE_HAS_CHUNK: usize = 16;
+
 const META_GENERATION: i64 = 1;
 const META_PAGE_SIZE: i64 = 2;
 const META_NEXT_ID: i64 = 3;
@@ -543,12 +547,15 @@ pub(crate) struct Catalog {
     free_after: Stmt,
     free_first: Stmt,
     free_has: Stmt,
+    free_has_many: Stmt,
     free_all: Stmt,
     free_del_upto: Stmt,
     free_del: Stmt,
     free_put: Stmt,
     name_get: Stmt,
     name_all: Stmt,
+    /// LEAP L4 slice 4: every name with its branch, for the exact name mirror's build.
+    name_pairs: Stmt,
     name_of: Stmt,
     name_put: Stmt,
     name_del: Stmt,
@@ -700,12 +707,24 @@ impl Catalog {
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
             free_first: p("SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1")?,
             free_has: p("SELECT 1 FROM free WHERE slot = ?1")?,
+            // Integration resolution (fastest-integrate step 15): the engine's lazy Stmt keeps its SQL as
+            // &'static str (compiled at first use); L4 2b's chunked probe is built once per process
+            free_has_many: p({
+                static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                SQL.get_or_init(|| {
+                    format!(
+                        "SELECT slot FROM free WHERE slot IN ({})",
+                        (1..=FREE_HAS_CHUNK).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
+                    )
+                })
+            })?,
             free_all: p("SELECT slot FROM free")?,
             free_del_upto: p("DELETE FROM free WHERE slot <= ?1")?,
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
             name_all: p("SELECT name FROM branch_name")?,
+            name_pairs: p("SELECT name, id FROM branch_name")?,
             name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
             name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
             name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
@@ -1125,6 +1144,12 @@ impl Catalog {
 
     /// One branch, whole: its row, its current map and its retained versions.
     pub(crate) fn load_branch(&mut self, id: u64) -> Result<Option<CatBranch>> {
+        self.load_branch_named(id, None)
+    }
+
+    /// `load_branch`, with the branch's name already known (`known`: the name a lookup just found
+    /// this id under; names and ids are each unique), so it is not read again (LEAP L4 slice 4).
+    pub(crate) fn load_branch_named(&mut self, id: u64, known: Option<&Arc<str>>) -> Result<Option<CatBranch>> {
         let rows = self.branch_get.rows(&[int(id)], &mut self.counters)?;
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -1179,7 +1204,10 @@ impl Catalog {
                 get(&row, 4)? as u32,
             ));
         }
-        b.name = self.name_of(id)?;
+        b.name = match known {
+            Some(name) => Some(name.to_string()),
+            None => self.name_of(id)?,
+        };
         Ok(Some(b))
     }
 
@@ -1204,6 +1232,32 @@ impl Catalog {
                     )))
                 }
             }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every `(name, id)` row of `branch_name`, read in one scan (LEAP L4 slice 4: the exact name
+    /// mirror's build, off the store mutex); `stop` interrupts it.
+    pub(crate) fn name_pairs(&mut self, stop: &std::sync::atomic::AtomicBool) -> Result<Vec<(Arc<str>, u64)>> {
+        let mut out = Vec::new();
+        self.name_pairs.each_row(&mut self.counters, |row| {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LimboError::Interrupt);
+            }
+            let name = match row.get_value(0) {
+                Value::Text(t) => Arc::<str>::from(t.as_str()),
+                other => {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog: a branch name is not text: {other:?}"
+                    )))
+                }
+            };
+            let Some(id) = row.get_value(1).as_int() else {
+                return Err(LimboError::Corrupt("branch catalog: a branch name's id is not an integer".to_string()));
+            };
+            let id = id as u64;
+            out.push((name, id));
             Ok(())
         })?;
         Ok(out)
@@ -1542,6 +1596,21 @@ impl Catalog {
             None => self.free_first.rows(&[int(limit as u64)], &mut self.counters)?,
         };
         rows.iter().map(|row| get(row, 0).map(|s| s as Slot)).collect()
+    }
+
+    /// Which of `slots` the free table lists: one statement per `FREE_HAS_CHUNK` slots (LEAP L4 2b:
+    /// an open's slots that its log tail cannot settle), the unused places bound to -1, which no
+    /// slot is.
+    pub(crate) fn free_has_many(&mut self, slots: &[Slot]) -> Result<std::collections::HashSet<Slot>> {
+        let mut listed = std::collections::HashSet::new();
+        for chunk in slots.chunks(FREE_HAS_CHUNK) {
+            let mut params: Vec<Value> = chunk.iter().map(|&s| int(s as u64)).collect();
+            params.resize(FREE_HAS_CHUNK, Value::from_i64(-1));
+            for row in self.free_has_many.rows(&params, &mut self.counters)? {
+                listed.insert(get(&row, 0)? as Slot);
+            }
+        }
+        Ok(listed)
     }
 
     pub(crate) fn free_has(&mut self, slot: Slot) -> Result<bool> {
