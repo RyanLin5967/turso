@@ -5,7 +5,12 @@
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
 //!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra|extra-write]
-//!                [--name-prefix P] --out FILE
+//!                [--name-prefix P] [--stepwise] --out FILE
+//!
+//! `--stepwise` runs one cycle per line read from stdin (`cycle <seq>`), answering `done <seq>` on
+//! stdout after it, and says `ready` once the seed is in: the work budget drives the embedded and wire
+//! sides cycle by cycle inside one run (lead's pre-registered amendment, 2026-10-15), as their flush
+//! steps' cost drifted between two runs one after the other.
 //!
 //! `--name-prefix P` (default `b_`) names op k's branch `P<k>`: the budget passes the prefix the wire
 //! side's spec names its branches with (`b_{run}_{c}_{i}`, so `b_w_0_` for run tag w and one
@@ -107,6 +112,7 @@ struct Args {
     plant_extra: bool,
     plant_extra_write: bool,
     name_prefix: String,
+    stepwise: bool,
     out: String,
 }
 
@@ -118,7 +124,12 @@ fn args() -> Args {
     let mut plant_extra = false;
     let mut plant_extra_write = false;
     let mut name_prefix = "b_".to_string();
+    let mut stepwise = false;
     while let Some(k) = a.next() {
+        if k == "--stepwise" {
+            stepwise = true;
+            continue;
+        }
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
         match k.as_str() {
             "--db" => db = Some(v()),
@@ -159,6 +170,7 @@ fn args() -> Args {
         plant_extra,
         plant_extra_write,
         name_prefix,
+        stepwise,
         out: out.expect("--out"),
     }
 }
@@ -223,7 +235,16 @@ fn main() {
         )
         .unwrap();
     };
+    let mut control = std::io::stdin().lines();
+    if a.stepwise {
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+    }
     for seq in 0..a.warmup + a.ops {
+        if a.stepwise {
+            let line = control.next().expect("--stepwise: stdin ended").unwrap();
+            assert_eq!(line, format!("cycle {seq}"), "--stepwise: out of step");
+        }
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
         let name = format!("{}{seq}", a.name_prefix);
         let id = 1 + (seq * 7919) % a.rows;
@@ -266,6 +287,10 @@ fn main() {
         let p0 = Probe::now(&db);
         db.drop_branch(&name).unwrap();
         rec(seq, phase, "delete", p0, Probe::now(&db));
+        if a.stepwise {
+            println!("done {seq}");
+            std::io::stdout().flush().unwrap();
+        }
     }
     out.flush().unwrap();
 }
