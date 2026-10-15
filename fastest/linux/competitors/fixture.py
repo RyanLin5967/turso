@@ -54,7 +54,7 @@ sys.path.insert(0, HERE)
 import gen_seed  # noqa: E402
 
 
-KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "schema_sha256", "stream_sha256",
+KEYS = ("rows", "age_updates", "prebranch", "live_branches", "gen_seed_sha256", "stream_sha256",
         "readback")
 
 
@@ -69,12 +69,15 @@ REGISTERED_MAINT = {"pg18-d2": ["VACUUM ANALYZE", "CHECKPOINT"], "dolt": ["DOLT_
 # system's maintenance must have DONE, read back by its seed (maintenance_evidence; the text alone was trusted):
 # PG's VACUUM and ANALYZE stamped t (pg_stat_user_tables) and the last checkpoint's redo point is after the VACUUM;
 # Dolt's and Doltgres's GC verdict (fthelp.py gcverdict) is ok; B1's file is in WAL mode (header bytes 18-19 = 2, 2)
-# and both TRUNCATE checkpoints replied 0|0|0 (not blocked, no frame left in the log).
+# and both TRUNCATE checkpoints replied 0|0|0 (not blocked, no frame left in the log), and (comp review 1 LOW 30) its
+# table as SQLite reads it has no sqlite_autoindex_t% (id is the rowid: MED 11; schema_sha256, which hashed the
+# generator's own CREATE line and could never fire, is gone).
 REGISTERED_PRE_AGE = {"pg18-d2": ["CHECKPOINT"], "dolt": ["DOLT_COMMIT seed"], "doltgres": ["dolt_commit seed"],
                       "b1": ["journal_mode=WAL", "load", "wal_checkpoint(TRUNCATE)"]}
 REGISTERED_OUTCOMES = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
                        "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
-                       "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0"}}
+                       "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0",
+                              "autoindex": "0"}}
 
 
 def maint_problem(f):
@@ -191,8 +194,6 @@ def write(av):
     fx = {"system": o["--system"], "rows": rows, "age_updates": age, "prebranch": int(o["--prebranch"]),
           "live_branches": int(lv) if lv.isdigit() else None,
           "gen_seed_sha256": gf["digest"], "du_paths": o.get("--du", []),
-          # MED 11: the table's schema line, by itself (a schema change no longer hides inside the stream digest)
-          "schema_sha256": hashlib.sha256((gen_seed.SCHEMA + "\n").encode()).hexdigest(),
           "du_bytes": du_bytes(o.get("--du", [])) if o.get("--du") else None,
           # LOW 26: the parent's du measured BEFORE the prebranch (run_system.sh), comparable across systems, and the
           # whole store's du now, at N (Dolt's and Doltgres's du_bytes above covers their whole store already)
@@ -287,10 +288,14 @@ def sqlite(av):
                 f.write(h + "\n")
     # the engine's own size; the parent's contents are judged by the read-back triple (gen_seed.py readback-sqlite,
     # MED 3), so no count|sum is recorded here (LOW 27: count_sum had no reader)
-    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size;"], capture_output=True, text=True, timeout=600)
+    # ... and (comp review 1 LOW 30) the schema as SQLite reads it: the autoindexes on t (0 when id is the rowid)
+    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size; "
+                        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%';"],
+                       capture_output=True, text=True, timeout=600)
     lines = q.stdout.split()
-    ok = q.returncode == 0 and len(lines) == 2 and all(x.isdigit() for x in lines)
+    ok = q.returncode == 0 and len(lines) == 3 and all(x.isdigit() for x in lines)
     eng = int(lines[0]) * int(lines[1]) if ok else None
+    ev["autoindex"] = lines[2] if ok else "unread"
     print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng, "stream_sha256": dg,
                       "maintenance": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged %d; wal_checkpoint(TRUNCATE)"
                       % age, "evidence": " ".join(f"{k}={v}" for k, v in ev.items())}))
@@ -300,7 +305,7 @@ def selftest():
     streams = {"sql": "aa" * 32, "age": "bb" * 32}
     rb = {"count": 10000, "sum": 0, "row_hash": 83937210371}
     base = {"system": "pg18-d2", "rows": 10000, "age_updates": 0, "prebranch": 0, "live_branches": 0,
-            "gen_seed_sha256": "ab" * 32, "schema_sha256": "5c" * 32, "du_bytes": 9000000, "engine_bytes": 8900000,
+            "gen_seed_sha256": "ab" * 32, "du_bytes": 9000000, "engine_bytes": 8900000,
             "parent_du_bytes": 9000000, "store_du_at_n_bytes": 41000000,
             "extents": {"t": 3},
             "maintenance": ["VACUUM", "CHECKPOINT"], "stream_sha256": dict(streams), "expected_streams": dict(streams),
