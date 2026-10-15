@@ -5063,7 +5063,12 @@ mod tests {
     /// walk, however often the statements over it are prepared and however often it is reached:
     /// v5 joins v4 twice, v4 joins v3 twice, and so on, so the walk opened 2^5 - 1 views (31
     /// parses beside the statement's own) at every prepare. The first Describe of a statement over
-    /// v5 may parse each view once (6 calls with the statement's), the second only the statement.
+    /// v5 may parse each view once (6 calls with the statement's), the second, after a Sync, only
+    /// the statement. Without the Sync the second Describe reused the statement the first one kept
+    /// and prepared nothing (measured [6, 0]), so it showed nothing about the memo. The memo is
+    /// the snapshot's: after DDL replaces the snapshot (v5 dropped and created again) and after a
+    /// SET search_path, a Describe parses the views again, as the first one did (wire review 18
+    /// HIGH 1; the lead's ruling 2026-10-15T02:59:32Z).
     #[test]
     fn a_view_is_parsed_once_per_schema_snapshot() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5095,6 +5100,9 @@ mod tests {
                     .await
                     .unwrap();
                 calls.push(turso_pg_parser::libpg_query_calls() - before);
+                // The round ends, so the next Describe prepares the statement again rather than
+                // reuse the one this Describe kept.
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
                 for reply in c.replies.drain(..) {
                     if let PgWireBackendMessage::ErrorResponse(e) = reply {
                         panic!("Describe: {e:?}");
@@ -5107,6 +5115,31 @@ mod tests {
                 calls[0]
             );
             assert_eq!(calls[1], 1, "second Describe: the statement's parse only");
+            // Invalidation: a new snapshot, then a new search path, each parse the views again.
+            for change in [
+                "DROP VIEW v5; CREATE VIEW v5 AS SELECT a.id, a.n FROM v4 AS a JOIN v4 AS b ON a.id = b.id",
+                "SET search_path TO public",
+            ] {
+                ok(&s, change);
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await
+                    .unwrap();
+                let after_change = turso_pg_parser::libpg_query_calls() - before;
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
+                for reply in c.replies.drain(..) {
+                    if let PgWireBackendMessage::ErrorResponse(e) = reply {
+                        panic!("Describe after {change:?}: {e:?}");
+                    }
+                }
+                assert_eq!(
+                    after_change, calls[0],
+                    "after {change:?}: the views were not parsed again, as at the first Describe"
+                );
+            }
         });
     }
 
