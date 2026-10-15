@@ -3036,9 +3036,12 @@ impl PostgreSQLTranslator {
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
+                            // Every unaliased expression is named as PostgreSQL names it: left
+                            // unnamed, the engine named it by its own text of the translation.
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                derived_column_name(val)
-                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
+                                Some(ast::As::Elided(ast::Name::from_string(figure_colname(
+                                    val,
+                                ))))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -5085,6 +5088,90 @@ impl PostgreSQLTranslator {
             not_null,
             constraints,
         })
+    }
+}
+
+/// The name PostgreSQL gives a result column with no alias (FigureColname, parser/parse_target.c,
+/// recalled from its source and checked against PG 18.6's names, pg18-colnames.out): `?column?`
+/// when nothing names it.
+fn figure_colname(node: &pg_query::protobuf::Node) -> String {
+    figure_colname_strength(node)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| "?column?".to_string())
+}
+
+/// FigureColnameInternal: the name and its strength, 2 for a column, function or keyword, 1 for a
+/// cast's type name or CASE, which a stronger name inside them overrides; None for none.
+fn figure_colname_strength(node: &pg_query::protobuf::Node) -> Option<(String, u8)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{AExprKind, MinMaxOp, SubLinkType};
+    let last = |names: &[pg_query::protobuf::Node]| {
+        names.iter().rev().find_map(|n| match &n.node {
+            Some(Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+    };
+    let strong = |name: &str| Some((name.to_string(), 2));
+    match node.node.as_ref()? {
+        Node::ColumnRef(c) => match c.fields.last()?.node.as_ref()? {
+            Node::String(s) => Some((s.sval.clone(), 2)),
+            _ => None,
+        },
+        Node::AIndirection(i) => match i.indirection.last().and_then(|n| n.node.as_ref()) {
+            Some(Node::String(s)) => Some((s.sval.clone(), 2)),
+            _ => i.arg.as_deref().and_then(figure_colname_strength),
+        },
+        Node::FuncCall(f) => Some((last(&f.funcname)?, 2)),
+        Node::AExpr(e) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
+            strong("nullif")
+        }
+        Node::TypeCast(c) => {
+            let inner = c.arg.as_deref().and_then(figure_colname_strength);
+            match inner {
+                Some((_, 2)) => inner,
+                _ => c
+                    .type_name
+                    .as_ref()
+                    .and_then(|t| last(&t.names))
+                    .map(|name| (name, 1))
+                    .or(inner),
+            }
+        }
+        Node::CollateClause(c) => c.arg.as_deref().and_then(figure_colname_strength),
+        Node::GroupingFunc(_) => strong("grouping"),
+        Node::SubLink(l) => match SubLinkType::try_from(l.sub_link_type) {
+            Ok(SubLinkType::ExistsSublink) => strong("exists"),
+            Ok(SubLinkType::ArraySublink) => strong("array"),
+            Ok(SubLinkType::ExprSublink) => {
+                let Some(Node::SelectStmt(q)) = l.subselect.as_ref().and_then(|s| s.node.as_ref())
+                else {
+                    return None;
+                };
+                let Some(Node::ResTarget(t)) = q.target_list.first().and_then(|t| t.node.as_ref())
+                else {
+                    return None;
+                };
+                if !t.name.is_empty() {
+                    return Some((t.name.clone(), 2));
+                }
+                Some((t.val.as_deref().map_or("?column?".to_string(), figure_colname), 2))
+            }
+            _ => None,
+        },
+        Node::CaseExpr(c) => match c.defresult.as_deref().and_then(figure_colname_strength) {
+            Some((name, 2)) => Some((name, 2)),
+            _ => Some(("case".to_string(), 1)),
+        },
+        Node::AArrayExpr(_) => strong("array"),
+        Node::RowExpr(_) => strong("row"),
+        Node::CoalesceExpr(_) => strong("coalesce"),
+        Node::MinMaxExpr(m) => match MinMaxOp::try_from(m.op) {
+            Ok(MinMaxOp::IsGreatest) => strong("greatest"),
+            Ok(MinMaxOp::IsLeast) => strong("least"),
+            _ => None,
+        },
+        Node::SqlvalueFunction(_) => derived_column_name(node).map(|name| (name, 2)),
+        _ => None,
     }
 }
 
