@@ -77,6 +77,17 @@ def refuse(msg):
     sys.exit(2)
 
 
+def concurrency_row(cell, record, timed_summary):
+    """Report the timed run's effective concurrency; preserve its validity verdict."""
+    if timed_summary.get("concurrency_label") != "REDUCED-CONCURRENCY":
+        return cell, stracecount.table_row(record)
+    effective = timed_summary["effective_c"]
+    label = re.sub(r"-c\d+$", "", cell) + f" REDUCED-CONCURRENCY effective_c={effective:.6g}"
+    record = dict(record, name=label,
+                  notes=list(record.get("notes", [])) + [timed_summary.get("serial_delete_note", "")])
+    return label, stracecount.table_row(record)
+
+
 def run_param(job_dir, key):
     """KEY=VALUE from the job's run/run-info.txt first line (run_system.sh's), or None."""
     try:
@@ -276,7 +287,17 @@ def main(argv):
         if c is None:
             print(f"CELLS\t{name}\t{cell}" + "\tMISSING" * len(stracecount.TABLE_COLS))
             continue
-        print("CELLS\t" + "\t".join([name, cell] + [str(x) for x in stracecount.table_row(c)]))
+        summary_path = os.path.join(d, name, "run", "cells", cell, "timed", "summary.json")
+        try:
+            with open(summary_path) as f:
+                sm = json.load(f)
+            label, row = concurrency_row(cell, c, sm)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            # Missing/unreadable concurrency evidence cannot earn a registered-C label.
+            print(f"CELLS\t{name}\t{cell} MISSING timed concurrency ({e.__class__.__name__})")
+            bad += 1
+            continue
+        print("CELLS\t" + "\t".join([name, label] + [str(x) for x in row]))
         if c.get("verdict") != "ok":
             bad += 1
     if missing or bad:
