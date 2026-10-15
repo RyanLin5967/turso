@@ -3659,8 +3659,8 @@ fn encode_answers_as_postgresql_does() {
 /// The parameters SET accepted as no-ops but which change PostgreSQL's answers act as they do
 /// there: `SET lock_timeout = '100ms'` makes a branch create behind another session's write
 /// transaction fail 55P03 within a second, not wait out the server's lock wait (5 s here, 60 s
-/// by default); statement_timeout and idle_in_transaction_session_timeout are accepted at 0 alone
-/// (another value is 0A000, as this server enforces neither); and client_min_messages filters the
+/// by default); idle_in_transaction_session_timeout is accepted at 0 alone (another value is
+/// 0A000, as this server does not enforce it); and client_min_messages filters the
 /// warnings a session is sent (COMMIT outside a block warns 25P01 at the default, at warning, not
 /// at error). Each answered SET and changed nothing (wire review 16 item 12).
 #[test]
@@ -3679,10 +3679,10 @@ fn settings_that_change_answers_act_as_in_postgresql() {
     assert_eq!(r.err("create behind the lock").code, "55P03");
     assert!(took < Duration::from_secs(1), "the create waited {took:?}");
     a.q("ROLLBACK").ok("release");
-    for sql in [
-        "SET statement_timeout = '1ms'",
-        "SET idle_in_transaction_session_timeout = '5s'",
-    ] {
+    // FLAGGED TEST EDIT (lead's cancel check, 2026-10-15): statement_timeout is enforced now
+    // (a_long_statement_stops_on_cancel_and_on_statement_timeout), so its refusal at a nonzero
+    // value is dropped from this list; the refusal pinned "this server enforces no such timeout".
+    for sql in ["SET idle_in_transaction_session_timeout = '5s'"] {
         assert_eq!(b.q(sql).err(sql).code, "0A000", "{sql}");
     }
     b.q("SET statement_timeout = 0").ok("statement_timeout 0");
