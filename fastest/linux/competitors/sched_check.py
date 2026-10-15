@@ -17,7 +17,8 @@ Python's math.log is the platform libm's log, the same one the C build calls on 
                                                 sorted intended_ns - t0_ns of their measured rows are equal (the
                                                 window is defined in intended time, so a slower system must not
                                                 measure more or other arrivals)
-  sched_check.py after-tm1 OUTDIR               exit 0 only when no measured row has intended_ns >= summary tm1_ns
+  sched_check.py after-tm1 OUTDIR               exit 0 only when no measured row has claim_ns (closed loop) or
+                                                intended_ns (open loop) >= summary tm1_ns
   sched_check.py selftest
 """
 import csv
@@ -112,8 +113,11 @@ def check_after_tm1(d):
     tm1 = sm.get("tm1_ns")
     if not isinstance(tm1, int) or not tm1:
         return [f"no tm1_ns in {d}/summary.json"]
-    late = [r for r in rows if r["phase"] == "measure" and int(r["intended_ns"]) >= tm1]
-    return [f"{len(late)} measured row(s) intended at or after tm1 {tm1}"] if late else []
+    # the lead's claim_ns ruling, timedrun.py raw_problems' rule: the field tm1 was stamped with -- the claim (claim_ns)
+    # in closed loop, the claimed arrival's intended time in open loop and without claim_ns
+    key, word = ("claim_ns", "claimed") if sm.get("loop") == "closed" and rows and "claim_ns" in rows[0] else ("intended_ns", "intended")
+    late = [r for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1]
+    return [f"{len(late)} measured row(s) {word} at or after tm1 {tm1}"] if late else []
 
 
 def selftest():
