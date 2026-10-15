@@ -1628,6 +1628,12 @@ def real_selftest(chk):
             ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
              "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
             # V3 review 12 item 8: an extra own-fd sync in a floor-reference arm's window (append25)
+            # V3 review 13 item 17: windows_over on EVERY arm of the sync record, not only the flush-gated ones: an
+            # extra sync on clean's fd 14 within 500 ns of the edge it shares with a nosync25 window is attributed to
+            # clean, raising clean's windows_over, which nothing read
+            ("a clean window over its own syncs (an ungated arm)",
+             {"report": lambda j: j["syscalls"]["arms"]["clean"].update(windows_over=1)},
+             "F3:devflush", ["an arm's window holds more than its own syncs"]),
             ("an append25 window over its own syncs", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_over=1)},
              "F3:devflush", ["a flush-gated op's window holds more than its own syncs"]),
             # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate

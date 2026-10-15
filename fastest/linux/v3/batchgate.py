@@ -714,6 +714,8 @@ def _post_batch(d, sha, mod):
         rep["syscalls"]["arms"]["append25"].update(windows_short=1)
     if mod == "over":  # V3 review 12 item 8: an append25 window holding an extra sync of its own fd
         rep["syscalls"]["arms"]["append25"].update(windows_over=1)
+    if mod == "ungated-over":  # V3 review 13 item 17: an UNGATED arm (nosync25 here) with windows_over 1
+        rep["syscalls"]["arms"]["nosync25"].update(windows_over=1)
     if mod == "nosync-norec":  # V3 review 13 item 15: the batch ran nosync25 but the report has no nosync25 record
         rep["syscalls"]["arms"].pop("nosync25")
     # [the eleventh-review plants AMENDED at V3 review 12 item 6, disclosed: a sync wholly inside a window on an fd its
@@ -795,6 +797,8 @@ def post_selftest(chk):
             # that reaches it ran nosync25, so a missing record is a VOID, as a non-zero one is
             ("V3 review 13 item 15: the nosync25 sync record missing from the report", "nosync-norec", "smoke", 3,
              "VOID fsync:", {}),
+            ("V3 review 13 item 17: an ungated arm's window over its own syncs (windows_over on every arm)",
+             "ungated-over", "smoke", 3, "VOID fsync:", {}),
             ("eleventh review MED 1: an fsync on fd 7 wholly inside a nosync25 window", "nosync-anyfd", "smoke", 3,
              "VOID fsync:", {}),
             ("eleventh review MED 1: a sync on another fd wholly inside an append25 window", "inside-foreign", "smoke", 3,
