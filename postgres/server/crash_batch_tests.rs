@@ -194,3 +194,42 @@ fn find_killer() {
         println!("survived {} statements", stmts.len());
     });
 }
+
+/// The view limit's boundary (turso_core's MAX_VIEW_DEPTH, 32): a chain of exactly 32 views is
+/// planned on the 8 MiB stack and answers; one more is refused 54001. So the limit sits under the
+/// depth the stack takes in a debug build, which is what makes the refusal come before an overflow.
+#[test]
+fn a_view_chain_at_the_limit_answers_and_one_more_is_refused() {
+    on_session(|s| {
+        ok(s, "CREATE TABLE t(a int)");
+        ok(s, "INSERT INTO t VALUES (7)");
+        ok(s, "CREATE VIEW v0 AS SELECT a FROM t");
+        for i in 1..32 {
+            ok(s, &format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1));
+        }
+        // v31 expands 32 views.
+        let conn = s.shared.db.connect().unwrap();
+        let rows = conn.prepare("SELECT a FROM v31").unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(7)]], "the 32-view chain");
+        let more = first_error(s, "CREATE VIEW v32 AS SELECT a FROM v31")
+            .or_else(|| first_error(s, "SELECT a FROM v32"));
+        assert_eq!(more.map(|e| e.0), Some("54001".to_string()), "a 33-view chain");
+        alive(s);
+    });
+}
+
+/// The SQLite dialect keeps SQLite's rule: a text that is no number casts to 0.0, 'Infinity' and
+/// 'NaN' included (sqlite3 3.51.0 answers 0.0 for both). Only the PostgreSQL dialect reads them.
+#[test]
+fn the_sqlite_dialect_still_casts_infinity_text_to_zero() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect))
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let rows = conn
+        .prepare("SELECT CAST('Infinity' AS REAL), CAST('NaN' AS REAL), CAST('-inf' AS REAL)")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_f64(0.0); 3]]);
+}

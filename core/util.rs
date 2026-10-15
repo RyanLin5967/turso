@@ -1437,7 +1437,9 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
     Ok(int_val)
 }
 
-// we don't need to verify the numeric literal here, as it is already verified by the parser
+/// The value of a numeric literal's text. SQLite's grammar admits only well-formed literals here, but
+/// a caller that skipped it (the PostgreSQL translator) can pass any text, so a text that is no
+/// number is a parse error, never a panic (the crash batch, 2026-10-15).
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     // a single extra underscore ("_") character can exist between any two digits
     let text = if text.contains('_') {
@@ -1447,10 +1449,10 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     };
 
     if text.starts_with("0x") || text.starts_with("0X") {
-        let value = u64::from_str_radix(&text[2..], 16)? as i64;
+        let value = parse_hex_literal(&text, &text[2..])?;
         return Ok(Value::from_i64(value));
     } else if text.starts_with("-0x") || text.starts_with("-0X") {
-        let value = u64::from_str_radix(&text[3..], 16)? as i64;
+        let value = parse_hex_literal(&text, &text[3..])?;
         if value == i64::MIN {
             // Negating i64::MIN overflows. SQLite's codeInteger rejects this at
             // prepare time with "hex literal too big"; do the same.
@@ -1468,9 +1470,24 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
         crate::numeric::str_to_f64(text)
     else {
-        unreachable!();
+        return Err(LimboError::ParseError(format!(
+            "malformed numeric literal: {text}"
+        )));
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
+}
+
+/// A hex literal's digits as SQLite reads them: 64 bits, reinterpreted as signed. More digits than
+/// fit is SQLite's "hex literal too big"; no digits, or a non-hex one, is a malformed literal.
+fn parse_hex_literal(text: &str, digits: &str) -> Result<i64> {
+    u64::from_str_radix(digits, 16)
+        .map(|v| v as i64)
+        .map_err(|e| match e.kind() {
+            std::num::IntErrorKind::PosOverflow => {
+                LimboError::ParseError(format!("hex literal too big: {text}"))
+            }
+            _ => LimboError::ParseError(format!("malformed numeric literal: {text}")),
+        })
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -5077,7 +5094,7 @@ pub mod tests {
     /// '0b1000...' and hex past i64). It must be a parse error, never a panic.
     #[test]
     fn a_numeric_literal_that_is_no_number_is_a_parse_error() {
-        for text in ["0b1000", "0o17", "1_000", "abc", "", "0x", "1e", "--1"] {
+        for text in ["0b1000", "0o17", "abc", "", "0x", "1e", "--1", "0x1g"] {
             match std::panic::catch_unwind(|| parse_numeric_literal(text)) {
                 Ok(Err(LimboError::ParseError(_))) => {}
                 Ok(other) => panic!("{text:?}: {other:?}; want a ParseError"),
@@ -5086,6 +5103,8 @@ pub mod tests {
         }
         assert_eq!(parse_numeric_literal("12").unwrap(), Value::from_i64(12));
         assert_eq!(parse_numeric_literal("1.5").unwrap(), Value::from_f64(1.5));
+        // SQLite allows one underscore between digits.
+        assert_eq!(parse_numeric_literal("1_000").unwrap(), Value::from_i64(1000));
     }
 
     #[test]
