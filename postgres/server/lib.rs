@@ -4392,7 +4392,10 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
             format!("malformed array literal: \"{text}\""),
         ))
     };
-    let s = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    // PostgreSQL's array_in reads blanks as its scanner does (scanner_isspace, \v included; wire
+    // review 13 item 16: \v was not one).
+    let blank = |c: char| c.is_ascii() && pg_space(c as u8);
+    let s = text.trim_matches(blank);
     if s.starts_with('[') {
         return Err(PgWireError::UserError(error(
             "0A000",
@@ -4404,14 +4407,14 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
         .and_then(|r| r.strip_suffix('}'))
         .ok_or_else(malformed)?;
     let mut values = Vec::new();
-    if !inner
-        .trim_matches(|c: char| c.is_ascii_whitespace())
-        .is_empty()
-    {
+    if !inner.trim_matches(blank).is_empty() {
         let mut chars = inner.chars().peekable();
         loop {
-            while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+            while chars.next_if(|c| blank(*c)).is_some() {}
             let mut item = String::new();
+            // An element with any backslash escape is never SQL NULL (`NUL\L` is the string
+            // NULL, as in array_in; it bound NULL: wire review 13 item 16).
+            let mut escaped = false;
             let quoted = chars.next_if_eq(&'"').is_some();
             if quoted {
                 loop {
@@ -4421,26 +4424,30 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
                         c => item.push(c),
                     }
                 }
-                while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+                while chars.next_if(|c| blank(*c)).is_some() {}
             } else {
                 // Trailing whitespace is dropped, but not an escaped character's.
                 let mut kept = 0;
                 while let Some(c) = chars.next_if(|c| *c != ',') {
                     match c {
-                        '{' | '}' => {
+                        '{' => {
                             return Err(PgWireError::UserError(error(
                                 "0A000",
                                 "multidimensional array parameters are not supported".to_string(),
                             )))
                         }
+                        // A `}` with no `{` open is malformed, as array_in answers (22P02; it was
+                        // the multidimensional refusal: wire review 13 item 16).
+                        '}' => return Err(malformed()),
                         '"' => return Err(malformed()),
                         '\\' => {
                             item.push(chars.next().ok_or_else(malformed)?);
                             kept = item.len();
+                            escaped = true;
                         }
                         c => {
                             item.push(c);
-                            if !c.is_ascii_whitespace() {
+                            if !blank(c) {
                                 kept = item.len();
                             }
                         }
@@ -4455,7 +4462,7 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
             // with its element's input function's: it was always a generic 22P02, so an int4
             // element out of range or a bytea element's bad digit had the wrong code (wire review
             // 13 LOW 17).
-            values.push(if !quoted && item.eq_ignore_ascii_case("null") {
+            values.push(if !quoted && !escaped && item.eq_ignore_ascii_case("null") {
                 Value::Null
             } else {
                 pg_bytes_to_value(item.as_bytes(), element)?
