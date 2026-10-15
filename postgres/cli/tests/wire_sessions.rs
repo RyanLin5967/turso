@@ -3185,6 +3185,30 @@ fn conditional_expressions_over_integers_are_int4() {
     assert_eq!(r.rows, vec![vec![t("1"), t("1"), t("2"), t("1"), t("1")]], "{sql}");
 }
 
+/// A `*` or `alias.*` over a correlated generate_series names its column as PostgreSQL does, by the
+/// alias or the alias's column list (recorded, artie raw loud-20261015/pg18-diff/pg18-gsstar.out):
+/// the engine's table call names it `value`, and only a reference by name was renamed (the regress
+/// corpus's numeric.sql `generate_series(i, 3) j`).
+#[test]
+fn a_star_over_a_correlated_series_names_its_column() {
+    let dir = Scratch::new("gsstar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let names = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    a.q("CREATE TABLE gt (x int)").ok("gt");
+    a.q("INSERT INTO gt VALUES (2), (3)").ok("rows");
+    for (sql, want, rows) in [
+        ("select * from generate_series(1, 3) i, generate_series(i, 3) j order by 1, 2", ["i", "j"], 6),
+        ("select * from gt, generate_series(1, gt.x) g order by 1, 2", ["x", "g"], 5),
+        ("select * from gt, generate_series(1, gt.x) g(n) order by 1, 2", ["x", "n"], 5),
+        ("select gt.*, g.* from gt, generate_series(1, gt.x) g order by 1, 2", ["x", "g"], 5),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.names, names(&want), "{sql}");
+        assert_eq!(r.rows.len(), rows, "{sql}");
+    }
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
