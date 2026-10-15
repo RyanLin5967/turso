@@ -4183,7 +4183,7 @@ impl BranchStore {
         };
         stats.log_bytes = scanned.log_bytes();
         let arena_file = scanned.open_arena(meta.is_some_and(|m| m.in_use > 0 || m.states > 0))?;
-        let meta = meta.unwrap_or(Meta {
+        let meta = meta.unwrap_or_else(|| Meta {
             page_size: scanned.page_size() as u32,
             ..Meta::default()
         });
@@ -7057,7 +7057,7 @@ impl BranchStore {
         };
         if unsynced && *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
-            *orphans = journal.pending_slots.clone();
+            orphans.clone_from(&journal.pending_slots);
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: the trunk commit's branch barrier stopped before its records"

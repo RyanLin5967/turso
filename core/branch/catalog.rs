@@ -275,8 +275,11 @@ fn cur_key(branch: u64, page: u32) -> Result<i64> {
     Ok(((branch as i64) << 32) | page as i64)
 }
 
+/// One prepared catalog statement, boxed: a `Statement` is ~1.6 KB inline, so ~55 of them made
+/// `Catalog` 87 KB and every frame holding one (an open, a `CatState`) larger than clippy's
+/// `large_stack_frames` bound (lead order 6: turso_core's clippy errors blocked the wire's).
 struct Stmt {
-    stmt: Statement,
+    stmt: Box<Statement>,
 }
 
 impl Stmt {
@@ -570,7 +573,7 @@ impl Catalog {
             conn.execute("PRAGMA fullfsync = ON")?;
         }
         conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
-        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
+        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: Box::new(conn.prepare(sql)?) }) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
