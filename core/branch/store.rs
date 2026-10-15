@@ -797,6 +797,37 @@ impl Group {
         replaced
     }
 
+    /// Owe a held-free upgrade covering the frees up to `lsn` (`upgrade_due`), past the hard cap
+    /// marked overdue too (`overdue`). Called holding the store mutex. Atomic (engine review 18
+    /// MED 7): an upgrade in the air is never overwritten, so its landing's reset cannot be lost and
+    /// no second one is led for the same frees; a later lsn raises one owed and not yet taken. The
+    /// writer is woken only on the transition into owed, under the group's lock (it checks the word
+    /// holding that lock, then waits): one wake per crossing, where every `mature` past the bound
+    /// took the lock and notified it, on every create, first write and trunk commit. Mutant
+    /// `upgrade_rearms_in_air` (test builds only): stored over one in the air, as before.
+    fn arm_upgrade(&self, lsn: u64, overdue: bool) {
+        let due = &self.upgrade_due;
+        let lsn = lsn.min(UPGRADE_IN_AIR - 1);
+        let woken = if fe_mutant("upgrade_rearms_in_air") {
+            let current = due.load(Ordering::Acquire);
+            due.store(current.max(lsn), Ordering::Release);
+            current == 0
+        } else {
+            due.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != UPGRADE_IN_AIR && current < lsn).then_some(lsn)
+            }) == Ok(0)
+        };
+        if overdue {
+            self.upgrade_overdue.store(true, Ordering::Release);
+        }
+        if woken {
+            let _g = self.lock();
+            #[cfg(test)]
+            self.confirm_notified();
+            self.confirm_cv.notify_all();
+        }
+    }
+
     /// A held-free upgrade's landing (`BranchStore::sync_upgrade`), called holding the store mutex:
     /// every byte below `end` is durable in `class` and every weaker one, unless the store
     /// fail-stopped meanwhile. It had no frames, so it does not move the log's last flight;
@@ -1096,6 +1127,16 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// A held-free upgrade in the air (`Group::upgrade_due` == `UPGRADE_IN_AIR`), reset to none
+/// when its leader is done, however it is done (`BranchStore::lead_upgrade`).
+struct InAir<'a>(&'a AtomicU64);
+
+impl Drop for InAir<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -4688,19 +4729,8 @@ impl BranchStore {
         // only).
         if class != self.class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
             if let Some(&(lsn, _)) = inner.pending_free.back() {
-                let g = self.group.lock();
-                let due = &self.group.upgrade_due;
-                let current = due.load(Ordering::Acquire);
-                if current != UPGRADE_IN_AIR || fe_mutant("upgrade_rearms_in_air") {
-                    due.store(current.max(lsn).min(UPGRADE_IN_AIR - 1), Ordering::Release);
-                }
-                if inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP) {
-                    self.group.upgrade_overdue.store(true, Ordering::Release);
-                }
-                #[cfg(test)]
-                self.group.confirm_notified();
-                self.group.confirm_cv.notify_all();
-                drop(g);
+                let overdue = inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP);
+                self.group.arm_upgrade(lsn, overdue);
             }
         }
     }
@@ -4744,6 +4774,9 @@ impl BranchStore {
         {
             return false;
         }
+        // Reset from in the air however this returns, a panic included (engine review 18 MED 5's
+        // LOW): left set, no upgrade would ever be armed again and the held frees grow unbounded.
+        let in_air = InAir(&group.upgrade_due);
         // Test builds: the store's confirmation hook (`HOLD_FLIGHT_TAKEN`; engine review 18 HIGH 1).
         #[cfg(test)]
         let hold = Some(&group.confirm_hold);
@@ -4768,9 +4801,25 @@ impl BranchStore {
         if let Err(e) = led {
             tracing::warn!("branch store: the upgrade for held frees failed: {e}");
         }
-        let _ = group
-            .upgrade_due
-            .compare_exchange(UPGRADE_IN_AIR, 0, Ordering::AcqRel, Ordering::Acquire);
+        drop(in_air);
+        // Engine review 18 MED 7: frees made while it was in the air (after its take) were not
+        // armed (`arm_upgrade` leaves one in the air alone), so with more than the bound still held
+        // the next one is owed now, by the writer that will lead it, rather than at some later
+        // operation's `mature`. Only while the oldest held free is written (a sync can cover it):
+        // one still buffered is armed by the operation whose flight writes it, so no upgrade is led
+        // that can free nothing. Mutant `writer_upgrades_once` (test builds only): none, as before.
+        if !group.poisoned() && !fe_mutant("writer_upgrades_once") {
+            let inner = store.lock();
+            let written = group.durable(SyncClass::Off);
+            if inner.free_class() != inner.sync
+                && inner.pending_free_slots > hold_bound()
+                && inner.pending_free.front().is_some_and(|&(lsn, _)| lsn <= written)
+            {
+                if let Some(&(lsn, _)) = inner.pending_free.back() {
+                    group.arm_upgrade(lsn, inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP));
+                }
+            }
+        }
         true
     }
 
