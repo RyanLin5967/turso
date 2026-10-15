@@ -370,3 +370,20 @@ fn an_infinite_generate_series_bound_is_refused_22023_promptly() {
     }
     panic!("the finite control never reported");
 }
+
+/// The SQLite dialect keeps SQLite's clamp for an infinite generate_series bound (lead, 2026-10-15:
+/// the refusal is the PostgreSQL dialect's, as `cast_text_to_float` is): an infinite stop is
+/// i64::MAX, so `LIMIT 3` answers 0, 1, 2, as sqlite3 3.51.0 does.
+#[test]
+fn the_sqlite_dialect_still_clamps_an_infinite_series_bound() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect))
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let rows = conn
+        .prepare("SELECT value FROM generate_series(0, 9e999) LIMIT 3")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(0)], vec![Value::from_i64(1)], vec![Value::from_i64(2)]]);
+}
