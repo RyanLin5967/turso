@@ -223,6 +223,10 @@ fi
 # backing file's disk and records RAW/drive.json; a class it cannot determine refuses the run.
 DRIVE=$(python3 -B "$HERE/drive.py" record "$MNT" "$RAW/drive.json") ||
   { echo "REFUSED: the drive class under $MNT: [$DRIVE] (drive.py)" | tee "$FUN"; exit 2; }
+# comp review 1 LOW 35: a real run refuses a volatile RAM disk and any loop device in the chain
+if [ "$DRY" = 0 ]; then
+  RC_REAL=$(python3 -B "$HERE/drive.py" real-check "$RAW/drive.json") || { echo "$RC_REAL" | tee "$FUN"; exit 2; }
+fi
 # Every cell this run must produce, written BEFORE any runs: reduce.py reports a listed cell without a cell.json as
 # MISSING, so a cell that returns early cannot simply disappear (review finding 11).
 for spec in $SPECLIST; do

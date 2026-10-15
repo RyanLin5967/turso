@@ -303,6 +303,18 @@ def resolve(mnt, sysfs="/sys", devof=dev_of, mountof=mount_of):
             "flush_reaches_drive": flush, "flush_why": why}
 
 
+def real_problem(r):
+    """Comp review 1 LOW 35: why a REAL run (run_system.sh FT_DRY=0) may not run on the record R's storage (None = it
+    may): a volatile RAM disk, or a loop device anywhere in the chain (a file on another filesystem, whose flush is an
+    fsync of that file: not the drive the class names)."""
+    if r.get("drive_class") == "ram-volatile":
+        return "the drive class is ram-volatile: nothing survives power"
+    loops = [x for x in r.get("chain", []) if re.fullmatch(r"loop\d+", str(x))]
+    if loops:
+        return f"loop device(s) {loops} in the chain {'>'.join(map(str, r.get('chain', [])))}"
+    return None
+
+
 def summary(r):
     off = [f"{m['target']}({m['fstype']})" for m in r["mounts"] if m["barrier_off"]]
     return (f"drive_class={r['drive_class']} flush_reaches_drive={r['flush_reaches_drive'].replace(' ', '')} disks=" +
@@ -549,6 +561,13 @@ if __name__ == "__main__":
             json.dump(r, f, indent=1)
         print(summary(r))
         sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "real-check":  # DRIVE.JSON: may a real run use this storage? (LOW 35)
+        try:
+            why = real_problem(json.load(open(sys.argv[2])))
+        except (OSError, ValueError) as e:
+            why = f"unreadable drive record: {e}"
+        print("ok" if why is None else f"REFUSED: a real run (FT_DRY=0) on {why}")
+        sys.exit(0 if why is None else 2)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(selftest())
     sys.exit(__doc__)
