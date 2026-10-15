@@ -223,11 +223,12 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | TEMP itself is silently ignored |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Stored generated columns | ❌ Not supported | Refused 0A000, no table created (the clause was dropped and the column read NULL) |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | TEMP silently ignored — the table is persistent |
 | Typed tables | ❌ Not supported | |
-| Virtual generated columns | ❌ Not supported | GENERATED ... AS silently ignored |
+| Virtual generated columns | ❌ Not supported | PostgreSQL 18's VIRTUAL is a syntax error in the vendored libpg_query grammar (42601); GENERATED ALWAYS AS (expr) without it is refused 0A000 |
+| Identity columns (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) | 🟡 Partial | Numbered by a sequence, as a serial column is (1, 2, ...); sequence options are refused 0A000; a GENERATED ALWAYS column takes an explicit value, which PostgreSQL refuses (428C9) |
 
 ## Performance
 

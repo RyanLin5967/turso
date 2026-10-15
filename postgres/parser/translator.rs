@@ -590,7 +590,13 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
 
-        let is_serial = is_serial_type(&pg_type);
+        // An identity column (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) is numbered as a serial
+        // one is, by its own sequence: the clause was dropped, so its rows had no id.
+        let is_identity = col_def.constraints.iter().any(|c| {
+            matches!(&c.node, Some(Node::Constraint(k))
+                if ConstrType::try_from(k.contype) == Ok(ConstrType::ConstrIdentity))
+        });
+        let is_serial = is_serial_type(&pg_type) || is_identity;
 
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
@@ -648,6 +654,20 @@ impl PostgreSQLTranslator {
                 }
                 ConstrType::ConstrForeign => {
                     foreign_key = extract_foreign_key(constraint);
+                }
+                // The sequence options (START WITH, INCREMENT BY, ...) would be dropped; a GENERATED
+                // ALWAYS column still takes an explicit value here, where PostgreSQL refuses it
+                // (428C9: COMPAT).
+                ConstrType::ConstrIdentity if !constraint.options.is_empty() => {
+                    return Err(ParseError::ParseError(
+                        "identity column sequence options are not supported".into(),
+                    ));
+                }
+                // The engine holds no stored generated column; dropped, the column read NULL.
+                ConstrType::ConstrGenerated => {
+                    return Err(ParseError::ParseError(
+                        "generated columns are not supported".into(),
+                    ));
                 }
                 // A column constraint's deferral arrives as attribute nodes after it in the raw
                 // parse (wire review 3 item 6); those after the foreign key set its deferral.
