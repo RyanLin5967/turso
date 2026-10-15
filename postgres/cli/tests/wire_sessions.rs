@@ -2343,6 +2343,29 @@ fn a_type_name_before_a_parameter_is_refused() {
         .ok("prod was not deleted");
 }
 
+/// A parameter compared with an inet[], cidr[], macaddr[] or oid[] column takes that array type,
+/// and one compared with ANY of an inet[] column the element type, as PostgreSQL 18.6 types them
+/// (recorded, artie raw loud-20261015/pg18-diff/pg18-arrays.out: 1041, 651, 1040, 1028, 869). The
+/// array table lacked these four, so the first three were 42P18, oid[] was int4[] and ANY's
+/// element text (wire review 13 item 18).
+#[test]
+fn network_and_oid_array_columns_type_their_parameters() {
+    let dir = Scratch::new("netarrays");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE n(a INET[], c CIDR[], m MACADDR[], o OID[])").ok("n");
+    for (sql, oid) in [
+        ("SELECT 1 FROM n WHERE a = $1", 1041),
+        ("SELECT 1 FROM n WHERE c = $1", 651),
+        ("SELECT 1 FROM n WHERE m = $1", 1040),
+        ("SELECT 1 FROM n WHERE o = $1", 1028),
+        ("SELECT 1 FROM n WHERE $1 = ANY(a)", 869),
+    ] {
+        let r = a.describe_statement(sql);
+        assert_eq!(r.params, Some(vec![oid]), "{sql}: {:?}", r.error);
+    }
+}
+
 /// A text[] parameter is read as PostgreSQL 18.6's array_in reads it (recorded, artie raw
 /// loud-20261015/pg18-diff/pg18-r15.out; wire review 13 item 16): an escaped `NUL\L` is the string
 /// NULL, never SQL NULL (an unquoted, unescaped NULL is SQL NULL); a vertical tab is whitespace
