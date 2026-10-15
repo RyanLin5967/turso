@@ -2909,6 +2909,40 @@ fn identity_columns_number_rows_and_stored_generated_is_refused() {
     assert_eq!(a.q(probe).err(probe).code, "42P01", "the generated table was created");
 }
 
+/// A positional VALUES list shorter than the table fills its leading columns, the rest taking
+/// their defaults, and one longer is 42601 "INSERT has more expressions than target columns", as
+/// PostgreSQL 18.6 answers (recorded, artie raw loud-20261015/pg18-diff/pg18-short.out); the engine
+/// refused a short list ("table s3 has 3 columns but 2 values were supplied").
+#[test]
+fn a_short_positional_values_list_fills_the_leading_columns() {
+    let dir = Scratch::new("shortvalues");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    a.q("create table s3 (a int, b int, c text default 'd')").ok("s3");
+    a.q("insert into s3 values (1, 2)").ok("two of three");
+    a.q("insert into s3 values (3)").ok("one of three");
+    a.q("insert into s3 values (4, 5), (6, 7)").ok("two rows");
+    let sql = "insert into s3 values (1, 2, 'x', 9)";
+    let e = a.q(sql).err(sql);
+    assert_eq!(e.code, "42601", "{sql}: {}", e.message);
+    assert!(
+        e.message.contains("INSERT has more expressions than target columns"),
+        "{sql}: {}",
+        e.message
+    );
+    let r = a.q("select * from s3 order by a").ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![t("1"), t("2"), t("d")],
+            vec![t("3"), None, t("d")],
+            vec![t("4"), t("5"), t("d")],
+            vec![t("6"), t("7"), t("d")],
+        ]
+    );
+}
+
 /// random() is PostgreSQL's: a float8 (701) in [0, 1), so `(random()*3)::int` is 0 to 3 (recorded,
 /// artie raw loud-20261015/pg18-diff/pg18-random.out). The engine's random() is SQLite's, a 64-bit
 /// integer, so `random()*3` overflowed and the regress corpus's union script drew
